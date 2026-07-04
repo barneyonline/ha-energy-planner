@@ -9,7 +9,15 @@ cleanup() {
   if [[ "${KEEP_HA_SMOKE:-0}" == "1" ]]; then
     echo "Preserving Home Assistant smoke config at $TMP_DIR"
   else
-    rm -rf "$TMP_DIR"
+    chmod -R u+rwX "$TMP_DIR" 2>/dev/null || true
+    if ! rm -rf "$TMP_DIR" 2>/dev/null; then
+      docker run --rm \
+        -v "$TMP_DIR:/cleanup" \
+        --entrypoint /bin/sh \
+        ghcr.io/home-assistant/home-assistant:stable \
+        -c 'find /cleanup -mindepth 1 -exec rm -rf {} +' >/dev/null 2>&1 || true
+      rm -rf "$TMP_DIR" 2>/dev/null || true
+    fi
   fi
 }
 trap cleanup EXIT
