@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Home Assistant custom integration documentation
+    url: https://developers.home-assistant.io/docs/creating_integration_manifest/
+    about: Review Home Assistant custom integration packaging and manifest expectations.
+  - name: Home Assistant community
+    url: https://community.home-assistant.io/
+    about: Ask general Home Assistant setup and automation questions.

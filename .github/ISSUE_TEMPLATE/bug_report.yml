@@ -1,0 +1,87 @@
+name: Bug report
+description: Report a problem with the Energy Planner Home Assistant integration.
+title: "[Bug]: "
+labels: ["bug", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Do not include API keys, tokens, addresses, private location history, or raw AI prompt/response content.
+  - type: dropdown
+    id: primary_area
+    attributes:
+      label: Primary affected area
+      options:
+        - Configuration, setup, or entities
+        - Energy tariffs, load, battery, or core planning
+        - Solar forecast, weather, or forecast confidence
+        - EV charging or trip history
+        - Climate control, presence, or thermal model
+        - Enphase profile or battery mode control
+        - AI advisory service
+        - HAEO optimizer integration
+        - Diagnostics, repairs, or logs
+        - Documentation
+        - Developer workflow / repository tooling
+        - Other / unsure
+    validations:
+      required: true
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Installation method
+      options:
+        - Manual install in custom_components
+        - Development checkout
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: homeassistant_version
+    attributes:
+      label: Home Assistant version
+      description: "Example: 2026.3.0"
+      placeholder: "2026.3.0"
+    validations:
+      required: true
+  - type: input
+    id: integration_version
+    attributes:
+      label: Energy Planner integration version
+      description: Use the release tag, manifest version, or commit SHA.
+      placeholder: "0.1.27"
+    validations:
+      required: true
+  - type: textarea
+    id: affected_entities
+    attributes:
+      label: Affected entity, device, service, or workflow
+      description: Include relevant Energy Planner entities, source entities, service names, planner mode, and scenario.
+      placeholder: "Example: EV charging plan using sensor.car_soc and switch.ev_charge"
+    validations:
+      required: false
+  - type: dropdown
+    id: diagnostics_status
+    attributes:
+      label: Diagnostics attached?
+      options:
+        - Yes, config-entry diagnostics attached
+        - Not yet, but I can upload them
+        - I cannot capture diagnostics
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the expected behavior, actual behavior, and when it started.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or tracebacks
+      description: Paste redacted Home Assistant logs, repair issue text, or service call errors.
+      render: text
+    validations:
+      required: false

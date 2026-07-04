@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest an improvement for the Energy Planner integration.
+title: "[Feature]: "
+labels: ["enhancement", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Include the Home Assistant workflow this would enable and any relevant integration behavior.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Configuration, setup, or entities
+        - Energy tariffs, load, battery, or core planning
+        - Solar forecast, weather, or forecast confidence
+        - EV charging or trip history
+        - Climate control, presence, or thermal model
+        - Enphase profile or battery mode control
+        - AI advisory service
+        - HAEO optimizer integration
+        - Diagnostics, repairs, or logs
+        - Documentation
+        - Developer workflow / repository tooling
+        - Other / unsure
+    validations:
+      required: true
+  - type: input
+    id: related_docs
+    attributes:
+      label: Related Home Assistant or integration documentation
+      description: Link to API docs, Home Assistant docs, vendor docs, or a related discussion if useful.
+      placeholder: https://developers.home-assistant.io/
+    validations:
+      required: false
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What workflow or limitation should this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior, configuration, action, entity, or documentation change you expect.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Optional. Mention current workarounds or other designs you considered.
+    validations:
+      required: false

@@ -4,6 +4,8 @@ __pycache__/
 .ruff_cache/
 .coverage
 .coverage.*
+coverage.xml
+junit.xml
 .DS_Store
 
 docker/

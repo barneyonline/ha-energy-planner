@@ -1,0 +1,81 @@
+name: Codespell
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    paths:
+      - "custom_components/ha_energy_planner/**/*.py"
+      - "custom_components/ha_energy_planner/**/*.yaml"
+      - "custom_components/ha_energy_planner/**/*.yml"
+      - "custom_components/ha_energy_planner/strings.json"
+      - "custom_components/ha_energy_planner/translations/en*.json"
+      - "scripts/**/*.py"
+      - "scripts/**/*.sh"
+      - "tests/**/*.py"
+      - ".codespellignore"
+      - "pyproject.toml"
+      - "*.md"
+      - "*.yaml"
+      - "*.yml"
+      - "**/*.md"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - ".github/workflows/codespell.yml"
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "custom_components/ha_energy_planner/**/*.py"
+      - "custom_components/ha_energy_planner/**/*.yaml"
+      - "custom_components/ha_energy_planner/**/*.yml"
+      - "custom_components/ha_energy_planner/strings.json"
+      - "custom_components/ha_energy_planner/translations/en*.json"
+      - "scripts/**/*.py"
+      - "scripts/**/*.sh"
+      - "tests/**/*.py"
+      - ".codespellignore"
+      - "pyproject.toml"
+      - "*.md"
+      - "*.yaml"
+      - "*.yml"
+      - "**/*.md"
+      - "**/*.yaml"
+      - "**/*.yml"
+      - ".github/workflows/codespell.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codespell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Install codespell
+        run: python -m pip install codespell
+      - name: Run codespell
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git fetch origin "${{ github.base_ref }}" --depth=1
+            changed_files="$(git diff --name-only "origin/${{ github.base_ref }}" HEAD)"
+            if printf '%s\n' "$changed_files" | grep -Eq '^(\.codespellignore|pyproject\.toml)$'; then
+              codespell --ignore-words=.codespellignore
+            else
+              printf '%s\n' "$changed_files" |
+                grep -E '(\.py|\.md|\.ya?ml|\.json|\.sh|\.toml)$' |
+                xargs -r codespell --ignore-words=.codespellignore
+            fi
+          else
+            codespell --ignore-words=.codespellignore
+          fi

@@ -1,0 +1,199 @@
+name: Auto Label Issues
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+      - edited
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  label_issue:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.event.issue.title, '[Bug]:') ||
+      startsWith(github.event.issue.title, '[Feature]:')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile automation labels
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const labelDefinitions = {
+              "status/needs-triage": {
+                color: "FBCA04",
+                description: "New or reopened issue awaiting maintainer triage",
+              },
+              "status/needs-diagnostics": {
+                color: "D93F0B",
+                description: "More diagnostics or evidence are needed before triage can finish",
+              },
+              "area/configuration": {
+                color: "1D76DB",
+                description: "Config flow, options flow, entities, or integration setup",
+              },
+              "area/energy": {
+                color: "1D76DB",
+                description: "Tariffs, load, battery, solar, and deterministic planning",
+              },
+              "area/solar-forecast": {
+                color: "1D76DB",
+                description: "PV forecasts, Solcast, HAFO, weather, or forecast confidence",
+              },
+              "area/ev": {
+                color: "1D76DB",
+                description: "EV charging, readiness, trip history, or charge-state planning",
+              },
+              "area/climate": {
+                color: "1D76DB",
+                description: "Climate control, presence, thermal model, or HVAC planning",
+              },
+              "area/enphase": {
+                color: "1D76DB",
+                description: "Enphase profile monitoring, profile switching, or battery control",
+              },
+              "area/ai": {
+                color: "1D76DB",
+                description: "AI advisory service, task entities, prompts, or rejected advice",
+              },
+              "area/haeo": {
+                color: "1D76DB",
+                description: "HAEO optimizer integration, fallback, or imported schedules",
+              },
+              "area/diagnostics": {
+                color: "1D76DB",
+                description: "Diagnostics, repair issues, logs, or troubleshooting output",
+              },
+              "area/docs": {
+                color: "1D76DB",
+                description: "Documentation and setup guidance",
+              },
+              "area/tooling": {
+                color: "1D76DB",
+                description: "Developer workflow, tests, CI, release, or repository tooling",
+              },
+              "source/manual-install": {
+                color: "5319E7",
+                description: "Installed manually in custom_components",
+              },
+              "source/dev-checkout": {
+                color: "5319E7",
+                description: "Running from a development checkout",
+              },
+            };
+            const areaMap = {
+              "Configuration, setup, or entities": "area/configuration",
+              "Energy tariffs, load, battery, or core planning": "area/energy",
+              "Solar forecast, weather, or forecast confidence": "area/solar-forecast",
+              "EV charging or trip history": "area/ev",
+              "Climate control, presence, or thermal model": "area/climate",
+              "Enphase profile or battery mode control": "area/enphase",
+              "AI advisory service": "area/ai",
+              "HAEO optimizer integration": "area/haeo",
+              "Diagnostics, repairs, or logs": "area/diagnostics",
+              "Documentation": "area/docs",
+              "Developer workflow / repository tooling": "area/tooling",
+            };
+            const sourceMap = {
+              "Manual install in custom_components": "source/manual-install",
+              "Development checkout": "source/dev-checkout",
+            };
+            const diagnosticsNeedsLabel = new Set([
+              "Not yet, but I can upload them",
+              "I cannot capture diagnostics",
+            ]);
+
+            const { owner, repo } = context.repo;
+
+            async function ensureLabel(name) {
+              const def = labelDefinitions[name];
+              if (!def) return;
+              await github.rest.issues.createLabel({
+                owner, repo, name, color: def.color, description: def.description,
+              }).catch(async (error) => {
+                if (error.status !== 422) throw error;
+                await github.rest.issues.updateLabel({
+                  owner, repo, name, new_name: name, color: def.color, description: def.description,
+                }).catch(() => {});
+              });
+            }
+
+            function firstFormValue(body, heading) {
+              const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const match = (body || "").match(new RegExp(`^### ${escaped}\\s*\\n([\\s\\S]*?)(?=^### |$)`, "m"));
+              if (!match) return "";
+              return match[1]
+                .split(/\r?\n/)
+                .map((line) => line.trim().replace(/^- /, ""))
+                .find((line) => line && line !== "_No response_" && !line.startsWith("<!--")) || "";
+            }
+
+            async function reconcileIssue(issue) {
+              const title = issue.title || "";
+              if (!title.startsWith("[Bug]:") && !title.startsWith("[Feature]:")) {
+                return;
+              }
+              const body = issue.body || "";
+              const desired = new Set(["status/needs-triage"]);
+              const area = title.startsWith("[Bug]:")
+                ? firstFormValue(body, "Primary affected area")
+                : firstFormValue(body, "Area");
+              if (areaMap[area]) desired.add(areaMap[area]);
+
+              if (title.startsWith("[Bug]:")) {
+                const source = firstFormValue(body, "Installation method");
+                const diagnostics = firstFormValue(body, "Diagnostics attached?");
+                if (sourceMap[source]) desired.add(sourceMap[source]);
+                if (diagnosticsNeedsLabel.has(diagnostics)) {
+                  desired.add("status/needs-diagnostics");
+                }
+              }
+
+              for (const label of desired) {
+                await ensureLabel(label);
+              }
+
+              const existing = new Set(issue.labels.map((label) => typeof label === "string" ? label : label.name));
+              const managedExisting = [...existing].filter((label) =>
+                label === "status/needs-triage" ||
+                label === "status/needs-diagnostics" ||
+                label.startsWith("area/") ||
+                label.startsWith("source/")
+              );
+              const toRemove = managedExisting.filter((label) => !desired.has(label));
+              const toAdd = [...desired].filter((label) => !existing.has(label));
+
+              if (toRemove.length) {
+                await Promise.all(toRemove.map((label) =>
+                  github.rest.issues.removeLabel({
+                    owner, repo, issue_number: issue.number, name: label,
+                  }).catch(() => {})
+                ));
+              }
+              if (toAdd.length) {
+                await github.rest.issues.addLabels({
+                  owner, repo, issue_number: issue.number, labels: toAdd,
+                });
+              }
+            }
+
+            if (context.eventName === "workflow_dispatch") {
+              const issues = await github.paginate(github.rest.issues.listForRepo, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+              for (const issue of issues.filter((item) => !item.pull_request)) {
+                await reconcileIssue(issue);
+              }
+              return;
+            }
+
+            await reconcileIssue(context.payload.issue);

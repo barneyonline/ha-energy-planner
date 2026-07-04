@@ -8,6 +8,7 @@ on:
     paths:
       - "custom_components/ha_energy_planner/**"
       - "quality_scale.yaml"
+      - "README.md"
       - ".github/workflows/hassfest.yml"
   push:
     branches:
@@ -16,6 +17,7 @@ on:
     paths:
       - "custom_components/ha_energy_planner/**"
       - "quality_scale.yaml"
+      - "README.md"
       - ".github/workflows/hassfest.yml"
   schedule:
     - cron: "0 0 * * *"

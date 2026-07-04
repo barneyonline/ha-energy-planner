@@ -1,0 +1,79 @@
+name: Validate
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "custom_components/ha_energy_planner/manifest.json"
+      - "custom_components/ha_energy_planner/strings.json"
+      - "custom_components/ha_energy_planner/translations/**"
+      - "README.md"
+      - "pyproject.toml"
+      - ".github/workflows/validate.yaml"
+  pull_request:
+    paths:
+      - "custom_components/ha_energy_planner/manifest.json"
+      - "custom_components/ha_energy_planner/strings.json"
+      - "custom_components/ha_energy_planner/translations/**"
+      - "README.md"
+      - "pyproject.toml"
+      - ".github/workflows/validate.yaml"
+  schedule:
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-manifest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate custom integration metadata
+        run: |
+          python - <<'PY'
+          import json
+          import tomllib
+          from pathlib import Path
+
+          manifest_path = Path("custom_components/ha_energy_planner/manifest.json")
+          manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+          required = {
+              "domain",
+              "name",
+              "codeowners",
+              "config_flow",
+              "documentation",
+              "integration_type",
+              "iot_class",
+              "quality_scale",
+              "version",
+          }
+          missing = sorted(required - set(manifest))
+          if missing:
+              raise SystemExit(f"manifest.json missing required keys: {', '.join(missing)}")
+          if manifest["domain"] != "ha_energy_planner":
+              raise SystemExit(f"unexpected manifest domain: {manifest['domain']}")
+          if manifest["quality_scale"] != "platinum":
+              raise SystemExit(f"unexpected quality scale: {manifest['quality_scale']}")
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          project_version = pyproject["project"]["version"]
+          if manifest["version"] != project_version:
+              raise SystemExit(
+                  f"manifest version {manifest['version']} does not match pyproject {project_version}"
+              )
+          if Path("hacs.json").exists():
+              raise SystemExit("hacs.json is intentionally not supported for this repository")
+          for path in [
+              Path("custom_components/ha_energy_planner/strings.json"),
+              Path("custom_components/ha_energy_planner/translations/en.json"),
+          ]:
+              json.loads(path.read_text(encoding="utf-8"))
+          PY

@@ -22,6 +22,12 @@ on:
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
       - ".github/workflows/quality-scale.yml"
+      - ".github/workflows/codespell.yml"
+      - ".github/workflows/hassfest.yml"
+      - ".github/workflows/validate.yaml"
+      - ".github/workflows/release-assets.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
