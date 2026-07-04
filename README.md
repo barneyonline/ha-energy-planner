@@ -1,13 +1,167 @@
-# Energy Planner
+# Energy Planner - Home Assistant Custom Integration
 
-Home Assistant custom integration for the `ha-energy-planner` specification.
+<!-- Badges -->
+[![Release](https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&sort=semver)](https://github.com/barneyonline/ha-energy-planner/releases)
+[![Stars](https://img.shields.io/github/stars/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/stargazers)
+[![License](https://img.shields.io/github/license/barneyonline/ha-energy-planner)](LICENSE)
 
-The current implementation is fail-closed by default: planner execution starts
-disabled, dry-run starts enabled, and device control only occurs after the user
-maps the required Home Assistant entities/services and explicitly enables
-active mode.
+[![CI](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/ci.yml?branch=main&label=ci)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/barneyonline/ha-energy-planner/graph/badge.svg)](https://codecov.io/gh/barneyonline/ha-energy-planner)
+[![Hassfest](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/hassfest.yml?branch=main&label=hassfest)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/hassfest.yml)
+[![Codespell](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/codespell.yml?branch=main&label=codespell)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/codespell.yml)
 
-## Docker validation
+[![Quality Scale](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbarneyonline%2Fha-energy-planner%2Fmain%2Fcustom_components%2Fha_energy_planner%2Fmanifest.json&query=%24.quality_scale&label=quality%20scale&cacheSeconds=3600)](https://developers.home-assistant.io/docs/integration_quality_scale_index)
+[![Install](https://img.shields.io/badge/install-manual-blue)](#installation)
+
+[![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
+![Development Status](https://img.shields.io/badge/development-active-success?style=flat-square)
+
+Local-first Home Assistant integration for planning and safely coordinating household energy decisions across tariffs, solar forecasts, battery state, EV charging, climate comfort, Enphase profiles, HAEO optimization, and optional local AI advice.
+
+> [!IMPORTANT]
+> Energy Planner is an unofficial community project. It is not affiliated with, endorsed by, or supported by Home Assistant, HAEO, Amber, Solcast, Enphase, Daikin, BMW, or any other third-party integration or vendor.
+>
+> The integration is designed to fail closed. Active device control starts disabled, dry-run starts enabled, and production control must be explicitly armed before real service calls are allowed.
+
+## Supported device categories
+
+- Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
+- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, weather, and battery state of charge
+- EV charging plan, current/next charging state, ready-by planning, charge energy estimates, and start/stop controls
+- Climate plan, current/next climate state, comfort targets, HVAC power modeling, manual override handling, and presence-aware control
+- Presence as a separate device, including multi-person occupancy inputs
+- Enphase profile monitoring and planned current/next battery profile state
+- HAEO optimization service integration with deterministic fallback behavior
+- Optional local AI advisory device for structured advice, accepted/rejected status, and rejection reasons
+- System safety controls, including dry-run, active control, production arming, pause/resume, preflight, and safe-state restore
+
+## Key features
+
+- Guided setup with no required inputs on initial install; add Energy, Climate, Presence, Enphase, AI, and EV inputs separately from the integration page
+- Device structure aligned with Home Assistant hub-style integrations: each planning area appears as its own device with relevant sub-entities
+- Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
+- HAEO service support for optimization, with bounded fallback planning when HAEO is unavailable or returns an unhealthy result
+- Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
+- EV planning with connected state, SOC, start/stop entities, daily trip-history replay, and estimated charging kWh
+- Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, and manual override blocking
+- 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
+- Forecast confidence breakdown across required inputs so stale, missing, or invalid data is visible
+- Optional AI advice through supported Home Assistant AI task or conversation entities, rate-limited and treated as advisory only
+- AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
+- Execution audit and support bundle services for production review without reading Home Assistant storage files directly
+- Home Assistant diagnostics, system health, repair/preflight evidence, entity translations, and icons for all exposed entities
+- Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and a smoke-tested Home Assistant container
+
+## Screenshots
+
+Screenshots have not been committed yet. The integration currently exposes hub-level devices for System, Energy, Presence, Climate, Enphase, AI, and EV planning, with each device showing only the entities relevant to that planning area.
+
+## Installation
+
+Energy Planner is currently a manual custom integration install. It is intentionally not packaged for HACS at this stage.
+
+1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
+2. Restart Home Assistant.
+3. Go to **Settings -> Devices & services -> Add integration**.
+4. Search for **Energy Planner**.
+5. Add the integration. Initial setup does not require any mapped entities.
+6. Open the integration page and add the planning areas you want to use:
+   - **Energy** for tariffs, solar/load forecasts, battery SOC, weather, and HAEO.
+   - **Presence** for person entities used by occupancy-aware planning.
+   - **Climate** for Daikin climate and HVAC power inputs.
+   - **Enphase** for profile monitoring and profile scenario mapping.
+   - **AI** for optional local advisory service selection.
+   - **EV** for vehicle SOC, connected state, and charge start/stop controls.
+
+## Compatibility
+
+- Integration domain: `ha_energy_planner`
+- Integration display name: `Energy Planner`
+- Current manifest version: `0.1.27`
+- Integration type: `hub`
+- IoT class: `local_polling`
+- Claimed Home Assistant quality scale: `platinum`
+- Python: `3.11+`
+- Home Assistant setup: custom integration installed under `custom_components`
+
+Energy Planner does not authenticate directly with vendor cloud APIs. It reads existing Home Assistant entities and calls configured Home Assistant services. Vendor-specific behavior depends on the entities and services exposed by the integrations already installed in your Home Assistant instance.
+
+## Recommended companion integrations
+
+Energy Planner can be useful with different source integrations, but the current implementation is built around these common inputs:
+
+- Amber Electric price sensors for import/export tariffs
+- Solcast or HAFO-style PV forecast sensors
+- Baseline load forecast sensors
+- Bureau of Meteorology or another weather provider
+- HAEO for response-capable optimization through `haeo.optimize`
+- Enphase profile entity/control exposed through an Enphase integration
+- EV Smart Charging or equivalent start/stop controls
+- BMW/vehicle entities or equivalent EV connected/SOC sensors
+- Daikin climate and HVAC power entities
+- Extended OpenAI Conversation or another supported local AI task/conversation provider for optional advice
+
+## Safety model
+
+Energy Planner is built around conservative production controls:
+
+- The **Planner enabled** switch starts off.
+- The **Dry run** switch starts on.
+- Active control requires mapped inputs, healthy preflight status, production arming, and dry-run review.
+- The executor revalidates hard constraints immediately before every device service call.
+- Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
+- AI advice is optional, rate-limited, redacted, and advisory only.
+- Restore-safe-state support is available through both a service and button entity.
+
+Run preflight before enabling active control:
+
+```yaml
+service: ha_energy_planner.run_preflight
+```
+
+Only proceed when the response shows the integration is ready, required entities and services are available, and production control has been intentionally armed.
+
+## Services
+
+Energy Planner registers these Home Assistant services:
+
+- `ha_energy_planner.replan`: request an immediate planner refresh.
+- `ha_energy_planner.run_preflight`: check active-mode readiness without issuing device commands.
+- `ha_energy_planner.export_diagnostics`: return redacted diagnostic state.
+- `ha_energy_planner.export_support_bundle`: return preflight plus redacted diagnostics for production review.
+- `ha_energy_planner.restore_safe_state`: restore planner-owned EV, Enphase, and HVAC state where supported.
+- `ha_energy_planner.arm_production_control`: acknowledge production readiness and allow active device commands when other checks pass.
+- `ha_energy_planner.disarm_production_control`: block active device commands until production control is armed again.
+- `ha_energy_planner.pause_control`: temporarily pause planner-owned active control for all devices or a device class.
+- `ha_energy_planner.resume_control`: clear the active-control pause.
+- `ha_energy_planner.set_ev_ready_by`: set a runtime EV ready-by override.
+- `ha_energy_planner.set_manual_hvac_override`: block planner HVAC control for a bounded manual override window.
+
+## Production setup checklist
+
+1. Install Energy Planner and add it from **Devices & services**.
+2. Add planning areas from the integration page.
+3. Map the required source entities and services for the planning areas you want to use.
+4. Leave active control disabled and dry-run enabled.
+5. Run `ha_energy_planner.run_preflight`.
+6. Fix missing, unavailable, stale, or invalid inputs.
+7. Run several dry-run cycles and review plan, confidence, cost, timeline, next-state, AI advice, and execution audit entities.
+8. Export a support bundle with `ha_energy_planner.export_support_bundle`.
+9. Arm production control only after the dry-run plan matches your expectations.
+10. Keep dry-run enabled for the first production-readiness review, then disable dry-run only when you are ready for real service calls.
+
+## Rollback and manual recovery
+
+If active control behaves unexpectedly:
+
+1. Call `ha_energy_planner.restore_safe_state` or press the **Restore safe state** button.
+2. Turn off the **Planner enabled** switch.
+3. Turn on the **Dry run** switch.
+4. Confirm EV charging, Enphase profile, and climate automation state manually in Home Assistant.
+5. Review `ha_energy_planner.run_preflight`, `ha_energy_planner.export_support_bundle`, and the execution audit entity.
+6. Leave active control disabled until the cause is understood.
+
+## Development and validation
 
 Run the full local validation gate:
 
@@ -15,69 +169,41 @@ Run the full local validation gate:
 scripts/docker-validate.sh
 ```
 
-This runs Python compile checks, the full pytest suite inside the Home
-Assistant Docker image, replay fixtures, live-schema fixture validation,
-Home Assistant `check_config`, and the Docker smoke test.
+This runs:
 
-Run only the automated Docker smoke test:
+- Python compile checks
+- Shell syntax checks
+- Quality-scale evidence validation
+- Pytest inside the Home Assistant Docker image with 100% coverage
+- Replay fixtures
+- Live-schema fixture validation
+- Real-history fixture validation
+- Home Assistant `check_config`
+- Docker smoke test against a real Home Assistant container
+
+Run only the smoke test:
 
 ```bash
 scripts/docker-ha-smoke.sh
 ```
 
-Start a disposable Home Assistant Core container with the integration mounted:
+Start a local Home Assistant Core container with the integration mounted:
 
 ```bash
 docker compose up
 ```
 
-Then open <http://localhost:8124> and add **Energy Planner** from Devices &
-services. The test container uses `docker/homeassistant/config` as its config
-directory.
+Then open <http://localhost:8124> and add **Energy Planner** from **Devices & services**. The local container uses `docker/homeassistant/config` as its config directory.
 
-## Safety defaults
+## Replay and real-evidence validation
 
-- `switch.ha_energy_planner_enabled` defaults off.
-- `switch.ha_energy_planner_dry_run` defaults on.
-- New config entries are created with active control disabled and dry-run
-  enabled. Active device control requires an explicit options/switch change by
-  the operator after preflight review.
-- The executor revalidates constraints and discovered capabilities before every
-  device service call.
-- `ha_energy_planner.run_preflight` checks entity/service readiness, capability
-  discovery, Recorder availability, first-run safety mode, and recent execution
-  audit outcomes without issuing device commands.
-- `ha_energy_planner.restore_safe_state` restores planner-owned EV,
-  Enphase, and climate automation state where supported, clears ownership, and
-  creates a persistent notification.
+Sanitized replay fixtures can be checked with:
 
-## Real Home Assistant hookup checklist
+```bash
+scripts/replay-fixture.py tests/fixtures/replay/*.json
+```
 
-1. Install the integration files under
-   `custom_components/ha_energy_planner/`.
-2. Restart Home Assistant and add **Energy Planner** from Devices & services.
-3. Map the required entities and services:
-   - HAEO optimize service.
-   - Amber import and export price sensors.
-   - PV/HAFO forecast sensor.
-   - Baseline load forecast sensor.
-   - Battery SOC sensor.
-   - Daikin climate entity and climate target helpers.
-   - Occupancy/person entities.
-   - EV Smart Charging start/stop controls and EV SOC/connected entities, if EV
-     control is enabled.
-   - Enphase profile entity/control service and profile names, if Enphase
-     profile control is enabled.
-4. Leave `planner_enabled` off and `dry_run` on.
-5. Call `ha_energy_planner.run_preflight` and confirm:
-   - `active_control_ready` is `true`.
-   - `entities.missing` and `entities.unavailable` are empty.
-   - `services.missing` and `services.unavailable` are empty.
-   - `mode.safe_first_run_mode` is `true`.
-6. Run a dry-run replan with `ha_energy_planner.replan`.
-7. Review `ha_energy_planner.export_diagnostics`, the entity states, and the
-   `audit.recent_outcomes` returned by `ha_energy_planner.run_preflight`.
-8. Export real validation evidence:
+Export and validate a real production evidence bundle:
 
 ```bash
 HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
@@ -96,196 +222,20 @@ HEP_DAIKIN_POWER_ENTITY=sensor.daikin_power \
 scripts/export-real-validation-bundle.sh
 ```
 
-Good output means all three profiles pass:
-`ha-energy-planner-v1-real`, `ha-energy-planner-haeo-value-v1-real`, and
-`ha-energy-planner-history-v1-real`.
-9. Only after several dry-run cycles look correct, turn on
-   `switch.ha_energy_planner_enabled`. Keep `switch.ha_energy_planner_dry_run`
-   on for the first active-readiness review, then turn dry-run off only when
-   you are ready for real device service calls.
+Good output means the real live-schema, HAEO value-evidence, and real-history profiles pass:
 
-## Execution audit
+- `ha-energy-planner-v1-real`
+- `ha-energy-planner-haeo-value-v1-real`
+- `ha-energy-planner-history-v1-real`
 
-The integration stores a bounded execution audit in
-`.storage/ha_energy_planner_state` under `execution_audit`. Each entry includes
-the attempted action, plan ID, result, compact reason code, and configured HA
-service/entity target. The `ha_energy_planner.run_preflight` response includes
-the latest audit entries so real-world dry-run and active-control behavior can
-be reviewed without opening the storage file.
-
-## Rollback and manual recovery
-
-If active control behaves unexpectedly:
-
-1. Call `ha_energy_planner.restore_safe_state` or press
-   `button.ha_energy_planner_restore_safe_state`.
-2. Turn off `switch.ha_energy_planner_enabled`.
-3. Turn on `switch.ha_energy_planner_dry_run`.
-4. Confirm EV Smart Charging is back in the desired manual or automation mode.
-5. Confirm the Enphase profile is restored to the configured AI profile.
-6. Confirm mapped climate automations are back in their prior enabled state.
-7. Review `ha_energy_planner.run_preflight` and
-   `ha_energy_planner.export_diagnostics` for the last action reason.
-8. Leave `switch.ha_energy_planner_enabled` off, or keep
-   `switch.ha_energy_planner_dry_run` on, until the audit outcome is reviewed.
-
-## Replay validation
-
-Run sanitized replay fixtures through the shared hard-constraint validator:
-
-```bash
-scripts/replay-fixture.py tests/fixtures/replay/*.json
-```
-
-The fixture suite includes stale inputs, battery floor violations, HVAC
-occupancy rules, manual override rejection, Enphase profile holds, negative
-price EV scheduling, and physically infeasible ready-by evidence.
-
-## Live-schema validation
-
-Export all sanitized real evidence and run every real validation profile:
-
-```bash
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
-HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
-HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
-HEP_BASELINE_LOAD_ENTITY=sensor.baseline_load_forecast \
-HEP_WEATHER_ENTITY=weather.burwood_east_hourly \
-HEP_HAEO_SERVICE=haeo.optimize \
-HEP_EV_CONNECTED_ENTITY=binary_sensor.mini_connected \
-HEP_EV_SOC_ENTITY=sensor.mini_soc \
-HEP_THERMAL_INDOOR_ENTITY=climate.daikinap02966 \
-HEP_THERMAL_INDOOR_ATTRIBUTE=current_temperature \
-HEP_DAIKIN_POWER_ENTITY=sensor.daikinap02966_power \
-HEP_OUTDOOR_TEMPERATURE_ENTITY=sensor.outdoor_temperature \
-scripts/export-real-validation-bundle.sh
-```
-
-The bundle runs both lower-level real exporters, then validates all real
-profiles: `ha-energy-planner-v1-real`,
-`ha-energy-planner-haeo-value-v1-real`, and
-`ha-energy-planner-history-v1-real`.
-If fixtures were exported or redacted separately, validate them without calling
-Home Assistant again:
+If fixtures were exported separately, validate them without calling Home Assistant:
 
 ```bash
 scripts/export-real-validation-bundle.sh --validate-only
 ```
 
-For one-off live-schema exports, use:
+## Documentation
 
-```bash
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
-HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
-HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
-HEP_BASELINE_LOAD_ENTITY=sensor.baseline_load_forecast \
-HEP_WEATHER_ENTITY=weather.burwood_east_hourly \
-HEP_HAEO_SERVICE=haeo.optimize \
-scripts/export-real-live-schema.sh
-```
-
-The live-schema wrapper exports all required `real_*` fixtures and runs the
-`ha-energy-planner-v1-real` validation profile plus the stricter
-`ha-energy-planner-haeo-value-v1-real` profile, which requires the real HAEO
-response to include Enphase-relevant grid import/export and battery
-charge/discharge evidence. For one-off exports, use the lower-level exporter
-directly:
-
-```bash
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-scripts/export-live-schema-fixture.py \
-  --out tests/fixtures/live_schema/real_amber_import.json \
-  --validate \
-  --redact-key serial \
-  forecast-state \
-  --name real_amber_import \
-  --entity-id sensor.amber_express_home_general_price \
-  --value-kind price \
-  --value-keys import_price,general_price,per_kwh,price,value
-
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-scripts/export-live-schema-fixture.py \
-  --out tests/fixtures/live_schema/real_haeo_response.json \
-  --validate \
-  --redact-key serial \
-  haeo-response \
-  --name real_haeo_response \
-  --service haeo.optimize \
-  --service-data-json '{"source":"schema_export"}'
-
-scripts/validate-live-schema-fixture.py tests/fixtures/live_schema/*.json
-
-scripts/validate-live-schema-fixture.py \
-  --profile ha-energy-planner-v1-real \
-  tests/fixtures/live_schema/real_*.json
-
-scripts/validate-live-schema-fixture.py \
-  --profile ha-energy-planner-haeo-value-v1-real \
-  tests/fixtures/live_schema/real_*.json
-```
-
-The exporter redacts sensitive keys and does not store Home Assistant tokens.
-With `--validate`, it checks the sanitized payload with the same parser used by
-`scripts/validate-live-schema-fixture.py` before writing the fixture. The
-`ha-energy-planner-v1-real` profile verifies that the required real Amber
-import/export, PV/HAFO, baseline-load, weather, and HAEO response fixture names
-are present with the expected fixture type, value kind, and exported source
-entity/service metadata. Use repeated `--redact-key` arguments for
-site-specific identifiers that should not be committed in fixtures.
-Only run the `haeo-response` subcommand against response-capable planning
-services that are safe to call for validation. Set `HEP_HAEO_SERVICE_DATA_JSON`
-when the real HAEO service needs a specific non-commanding scenario to return
-both grid-charge and discharge/export evidence.
-
-## Real history replay validation
-
-Export sanitized Home Assistant Recorder history for MINI trip import and Daikin
-thermal-model replay:
-
-```bash
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-HEP_EV_CONNECTED_ENTITY=binary_sensor.mini_connected \
-HEP_EV_SOC_ENTITY=sensor.mini_soc \
-HEP_THERMAL_INDOOR_ENTITY=climate.daikinap02966 \
-HEP_THERMAL_INDOOR_ATTRIBUTE=current_temperature \
-HEP_DAIKIN_POWER_ENTITY=sensor.daikinap02966_power \
-HEP_OUTDOOR_TEMPERATURE_ENTITY=sensor.outdoor_temperature \
-scripts/export-real-history-fixtures.sh
-```
-
-The wrapper writes `real_mini_trip_history.json` and
-`real_daikin_thermal_history.json`, validates each replay, and runs the
-`ha-energy-planner-history-v1-real` coverage profile. The exporter stores only
-sanitized state, timestamps, selected attributes, and source entity metadata; it
-does not store Home Assistant tokens. Use `HEP_HISTORY_START`/`HEP_HISTORY_END`
-or `HEP_HISTORY_DAYS` to control the Recorder window, and `HEP_REDACT_KEYS` for
-site-specific identifiers. For one-off checks:
-
-```bash
-scripts/validate-real-history-fixture.py tests/fixtures/history/*.json
-
-scripts/validate-real-history-fixture.py \
-  --profile ha-energy-planner-history-v1-real \
-  tests/fixtures/history/real_*.json
-```
-
-## HAEO integration
-
-The integration calls only the configured Home Assistant service, defaulting to
-`haeo.optimize`. If the service is unavailable, planning degrades and records a
-compact HAEO run reason instead of importing HAEO internals or controlling
-devices on stale optimizer state.
-
-## Local AI advisor
-
-AI advice is disabled by default. When enabled, the integration calls only the
-configured local Home Assistant service, sends a compact redacted summary, and
-accepts JSON fields from the whitelisted soft-policy schema. AI output is stored
-as advice metadata and cannot call services or change hard constraints.
+- Requirement evidence: [docs/requirements-audit.md](docs/requirements-audit.md)
+- Quality evidence: [quality_scale.yaml](quality_scale.yaml)
+- Issue tracker: [GitHub Issues](https://github.com/barneyonline/ha-energy-planner/issues)
