@@ -131,17 +131,16 @@ def async_consolidate_subentries(hass: HomeAssistant, entry: ConfigEntry) -> boo
         if subentry.subentry_type in _TARGET_TITLES
     }
     changed = False
-    for required_subentry in (SUBENTRY_SYSTEM, SUBENTRY_PRESENCE):
-        if required_subentry not in existing_by_type:
-            subentry = ConfigSubentry(
-                data=MappingProxyType({}),
-                subentry_id=_TARGET_IDS[required_subentry],
-                subentry_type=required_subentry,
-                title=_TARGET_TITLES[required_subentry],
-                unique_id=None,
-            )
-            changed |= hass.config_entries.async_add_subentry(entry, subentry)
-            existing_by_type[required_subentry] = subentry
+    if SUBENTRY_SYSTEM not in existing_by_type:
+        subentry = ConfigSubentry(
+            data=MappingProxyType({}),
+            subentry_id=_TARGET_IDS[SUBENTRY_SYSTEM],
+            subentry_type=SUBENTRY_SYSTEM,
+            title=_TARGET_TITLES[SUBENTRY_SYSTEM],
+            unique_id=None,
+        )
+        changed |= hass.config_entries.async_add_subentry(entry, subentry)
+        existing_by_type[SUBENTRY_SYSTEM] = subentry
 
     if not needs_subentry_consolidation(entry):
         return changed

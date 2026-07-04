@@ -741,35 +741,6 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
       {
         "created_at": "2026-06-27T00:00:00+00:00",
         "data": {
-          "haeo_optimize_service": "fake_haeo.optimize",
-          "amber_import_price_entity": "sensor.smoke_import_price_forecast",
-          "amber_export_price_entity": "sensor.smoke_export_price_forecast",
-          "pv_forecast_entity": "sensor.smoke_pv_forecast_series",
-          "baseline_load_forecast_entity": "sensor.smoke_baseline_load_forecast_series",
-          "battery_soc_entity": "input_number.battery_soc",
-          "enphase_profile_entity": "input_select.enphase_profile",
-          "enphase_profile_control_service": "input_select.select_option",
-          "enphase_ai_profile": "AI Optimisation",
-          "enphase_self_consumption_profile": "Self-Consumption",
-          "enphase_full_backup_profile": "Full Backup",
-          "daikin_climate_entity": "climate.fake_daikin",
-          "daikin_power_entity": "input_number.daikin_power",
-          "climate_automation_entities": "automation.fake_climate_conflict",
-          "climate_change_from_scheduler_entity": "input_boolean.climate_change_from_scheduler",
-          "climate_manual_override_entity": "input_boolean.climate_manual_override",
-          "climate_target_low_entity": "input_number.climate_target_low",
-          "climate_target_high_entity": "input_number.climate_target_high",
-          "person_entities": "input_select.fake_person",
-          "ev_soc_entity": "input_number.ev_soc",
-          "ev_charging_entity": "",
-          "ev_connected_entity": "input_boolean.ev_connected",
-          "ev_smart_charging_entity": "input_boolean.ev_smart_charging_start",
-          "ev_smart_charging_start_entity": "input_boolean.ev_smart_charging_start",
-          "ev_smart_charging_stop_entity": "input_boolean.ev_smart_charging_stop",
-          "ev_smart_charging_target_soc_entity": "input_number.ev_target_soc",
-          "ev_smart_charging_ready_by_entity": "input_datetime.ev_ready_by",
-          "weather_entity": "sensor.smoke_weather_forecast",
-          "ai_advisor_service": "fake_haeo.ai_advice",
           "api_token": "docker-smoke-secret-token",
           "home_address": "1 Secret Smoke Street"
         },
@@ -815,7 +786,92 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
         "pref_disable_new_entities": false,
         "pref_disable_polling": false,
         "source": "user",
-        "subentries": [],
+        "subentries": [
+          {
+            "data": {},
+            "subentry_id": "haep_system",
+            "subentry_type": "system",
+            "title": "System",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "haeo_optimize_service": "fake_haeo.optimize",
+              "amber_import_price_entity": "sensor.smoke_import_price_forecast",
+              "amber_export_price_entity": "sensor.smoke_export_price_forecast",
+              "pv_forecast_entity": "sensor.smoke_pv_forecast_series",
+              "baseline_load_forecast_entity": "sensor.smoke_baseline_load_forecast_series",
+              "battery_soc_entity": "input_number.battery_soc"
+            },
+            "subentry_id": "haep_energy",
+            "subentry_type": "energy",
+            "title": "Energy",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "person_entities": "input_select.fake_person"
+            },
+            "subentry_id": "haep_presence",
+            "subentry_type": "presence",
+            "title": "Presence",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "daikin_climate_entity": "climate.fake_daikin",
+              "daikin_power_entity": "input_number.daikin_power",
+              "climate_automation_entities": "automation.fake_climate_conflict",
+              "climate_change_from_scheduler_entity": "input_boolean.climate_change_from_scheduler",
+              "climate_manual_override_entity": "input_boolean.climate_manual_override",
+              "climate_target_low_entity": "input_number.climate_target_low",
+              "climate_target_high_entity": "input_number.climate_target_high",
+              "weather_entity": "sensor.smoke_weather_forecast"
+            },
+            "subentry_id": "haep_climate",
+            "subentry_type": "climate",
+            "title": "Climate",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "enphase_profile_entity": "input_select.enphase_profile",
+              "enphase_profile_control_service": "input_select.select_option",
+              "enphase_ai_profile": "AI Optimisation",
+              "enphase_self_consumption_profile": "Self-Consumption",
+              "enphase_full_backup_profile": "Full Backup"
+            },
+            "subentry_id": "haep_enphase",
+            "subentry_type": "enphase",
+            "title": "Enphase",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "ai_advisor_service": "fake_haeo.ai_advice"
+            },
+            "subentry_id": "haep_ai",
+            "subentry_type": "ai",
+            "title": "AI",
+            "unique_id": null
+          },
+          {
+            "data": {
+              "ev_soc_entity": "input_number.ev_soc",
+              "ev_charging_entity": "",
+              "ev_connected_entity": "input_boolean.ev_connected",
+              "ev_smart_charging_entity": "input_boolean.ev_smart_charging_start",
+              "ev_smart_charging_start_entity": "input_boolean.ev_smart_charging_start",
+              "ev_smart_charging_stop_entity": "input_boolean.ev_smart_charging_stop",
+              "ev_smart_charging_target_soc_entity": "input_number.ev_target_soc",
+              "ev_smart_charging_ready_by_entity": "input_datetime.ev_ready_by"
+            },
+            "subentry_id": "haep_ev",
+            "subentry_type": "ev",
+            "title": "EV",
+            "unique_id": null
+          }
+        ],
         "title": "HA Energy Planner",
         "unique_id": "ha_energy_planner",
         "version": 1

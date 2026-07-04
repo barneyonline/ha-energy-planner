@@ -277,7 +277,9 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
         DEVICE_NAMES,
         DEVICE_PRESENCE,
         DEVICE_SYSTEM,
+        OPTIONAL_DEVICE_KEYS,
         planner_device_identifier,
+        planner_device_configured,
         planner_device_key_for_entity,
     )
 
@@ -303,6 +305,8 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
         DEVICE_AI,
         DEVICE_EV,
     ):
+        if device_key in OPTIONAL_DEVICE_KEYS and device_subentry_ids[device_key] is None:
+            continue
         devices[device_key] = dev_reg.async_get_or_create(
             config_entry_id=entry.entry_id,
             config_subentry_id=device_subentry_ids[device_key],
@@ -323,6 +327,8 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
             continue
         entity_key = _planner_entity_key(entry.entry_id, entity)
         device_key = planner_device_key_for_entity(entity_key)
+        if not planner_device_configured(entry, device_key):
+            continue
         device = devices[device_key]
         config_subentry_id = device_subentry_ids[device_key]
         if entity.device_id != device.id or getattr(entity, "config_subentry_id", None) != config_subentry_id:

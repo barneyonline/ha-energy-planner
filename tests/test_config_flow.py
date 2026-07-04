@@ -969,7 +969,7 @@ def test_migration_removes_source_group_when_all_fields_moved() -> None:
 
     assert async_consolidate_subentries(hass, entry) is True
 
-    assert [subentry.subentry_type for subentry in hass.config_entries.added] == ["system", "presence", "climate"]
+    assert [subentry.subentry_type for subentry in hass.config_entries.added] == ["system", "climate"]
     assert hass.config_entries.removed == ["energy"]
 
 

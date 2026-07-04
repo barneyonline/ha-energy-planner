@@ -43,20 +43,32 @@ DEVICE_MODELS = {
 ENTITY_DEVICE_BY_KEY = {
     "ai_enabled": DEVICE_AI,
     "ai_advice": DEVICE_AI,
+    "climate_control_enabled": DEVICE_CLIMATE,
     "climate_current_state": DEVICE_CLIMATE,
     "climate_next_state": DEVICE_CLIMATE,
     "climate_plan": DEVICE_CLIMATE,
+    "enphase_control_enabled": DEVICE_ENPHASE,
     "presence_state": DEVICE_PRESENCE,
     "enphase_current_state": DEVICE_ENPHASE,
     "enphase_next_state": DEVICE_ENPHASE,
     "enphase_plan": DEVICE_ENPHASE,
     "estimated_daily_cost": DEVICE_ENERGY,
+    "ev_control_enabled": DEVICE_EV,
     "ev_current_charge_state": DEVICE_EV,
     "ev_current_state": DEVICE_EV,
     "ev_charging_plan": DEVICE_EV,
     "ev_next_charge_state": DEVICE_EV,
     "ev_next_state": DEVICE_EV,
     "forecast_confidence": DEVICE_ENERGY,
+}
+
+OPTIONAL_DEVICE_KEYS = {
+    DEVICE_AI,
+    DEVICE_CLIMATE,
+    DEVICE_ENERGY,
+    DEVICE_ENPHASE,
+    DEVICE_EV,
+    DEVICE_PRESENCE,
 }
 
 
@@ -78,6 +90,11 @@ def planner_config_subentry_id(entry: EnergyPlannerConfigEntry, device_key: str)
     return None
 
 
+def planner_device_configured(entry: EnergyPlannerConfigEntry, device_key: str) -> bool:
+    """Return whether a planner device group should be exposed."""
+    return device_key not in OPTIONAL_DEVICE_KEYS or planner_config_subentry_id(entry, device_key) is not None
+
+
 def async_add_planner_entities(
     entry: EnergyPlannerConfigEntry,
     async_add_entities: Any,
@@ -86,7 +103,10 @@ def async_add_planner_entities(
     """Add planner entities under their matching config subentry."""
     grouped: dict[str | None, list[Any]] = {}
     for entity in entities:
-        subentry_id = planner_config_subentry_id(entry, entity.planner_device_key)
+        device_key = entity.planner_device_key
+        if not planner_device_configured(entry, device_key):
+            continue
+        subentry_id = planner_config_subentry_id(entry, device_key)
         grouped.setdefault(subentry_id, []).append(entity)
     for subentry_id, group in grouped.items():
         async_add_entities(group, config_subentry_id=subentry_id)

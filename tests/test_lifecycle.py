@@ -339,3 +339,81 @@ def test_sync_planner_devices_creates_group_devices_and_relinks_entities(monkeyp
         ("ev_device", {"remove_config_entry_id": "test_entry", "remove_config_subentry_id": None}),
     ]
     assert removed == ["old_controls_device"]
+
+
+def test_sync_planner_devices_does_not_create_optional_devices_without_subentries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    updated: list[tuple[str, dict[str, Any]]] = []
+    updated_devices: list[tuple[str, dict[str, Any]]] = []
+    created: list[dict[str, Any]] = []
+
+    class FakeEntityRegistry:
+        entities = {
+            "sensor.ha_energy_planner_plan_status": type(
+                "Entity",
+                (),
+                {
+                    "platform": "ha_energy_planner",
+                    "device_id": None,
+                    "entity_id": "sensor.ha_energy_planner_plan_status",
+                    "unique_id": "test_entry_plan_status",
+                    "config_subentry_id": None,
+                },
+            )(),
+            "sensor.ha_energy_planner_estimated_daily_cost": type(
+                "Entity",
+                (),
+                {
+                    "platform": "ha_energy_planner",
+                    "device_id": None,
+                    "entity_id": "sensor.ha_energy_planner_estimated_daily_cost",
+                    "unique_id": "test_entry_estimated_daily_cost",
+                    "config_subentry_id": None,
+                },
+            )(),
+        }
+
+        def async_update_entity(self, entity_id: str, **kwargs: Any) -> None:
+            updated.append((entity_id, kwargs))
+
+    class FakeDeviceRegistry:
+        def async_get_or_create(self, **kwargs: Any) -> Any:
+            created.append(kwargs)
+            device_key = next(iter(kwargs["identifiers"]))[1].removeprefix("test_entry_")
+            return type("Device", (), {"id": f"{device_key}_device"})()
+
+        def async_get_device(self, identifiers: Any) -> None:
+            return None
+
+        def async_remove_device(self, device_id: str) -> None:
+            raise AssertionError(f"Unexpected device removal: {device_id}")
+
+        def async_update_device(self, device_id: str, **kwargs: Any) -> None:
+            updated_devices.append((device_id, kwargs))
+
+    monkeypatch.setattr("homeassistant.helpers.entity_registry.async_get", lambda hass: FakeEntityRegistry())
+    monkeypatch.setattr("homeassistant.helpers.device_registry.async_get", lambda hass: FakeDeviceRegistry())
+
+    entry = FakeEntry(
+        subentries={
+            "system": type(
+                "Subentry",
+                (),
+                {"subentry_id": "haep_system", "subentry_type": "system", "data": {}},
+            )(),
+        }
+    )
+
+    _async_sync_planner_devices(FakeHass(FakeConfigEntries()), entry)
+
+    assert [(item["name"], item["config_subentry_id"]) for item in created] == [("System", "haep_system")]
+    assert updated == [
+        (
+            "sensor.ha_energy_planner_plan_status",
+            {"device_id": "system_device", "config_subentry_id": "haep_system"},
+        ),
+    ]
+    assert updated_devices == [
+        ("system_device", {"remove_config_entry_id": "test_entry", "remove_config_subentry_id": None}),
+    ]

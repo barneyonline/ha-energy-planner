@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Energy Planner",
-        "description": "Create the planner hub. Add energy, climate, EV, and Enphase inputs from the integration page after setup.",
+        "description": "Click Submit to create the Planner Hub. Add energy, climate, EV, and Enphase inputs from the integration page after setup.",
         "data": {
           "amber_import_price_entity": "Amber import price sensor",
           "amber_export_price_entity": "Amber export price sensor",
