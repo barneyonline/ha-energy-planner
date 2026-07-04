@@ -53,20 +53,36 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 
 ## Installation
 
-Energy Planner is currently a manual custom integration install. It is intentionally not packaged for HACS at this stage.
+Energy Planner is currently installed as a custom integration. It is not in the default HACS catalog, but you can add this repository to HACS manually.
 
-1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
-2. Restart Home Assistant.
-3. Go to **Settings -> Devices & services -> Add integration**.
-4. Search for **Energy Planner**.
-5. Add the integration. Initial setup does not require any mapped entities.
-6. Open the integration page and add the planning areas you want to use:
+### HACS custom repository
+
+1. Open Home Assistant.
+2. Go to **HACS -> Integrations**.
+3. Open the three-dot menu and select **Custom repositories**.
+4. Add `https://github.com/barneyonline/ha-energy-planner` as an **Integration** repository.
+5. Search for **Energy Planner** in HACS.
+6. Select **Download**.
+7. Restart Home Assistant.
+8. Go to **Settings -> Devices & services -> Add integration**.
+9. Search for **Energy Planner**.
+10. Add the integration. Initial setup does not require any mapped entities.
+11. Open the integration page and add the planning areas you want to use:
    - **Energy** for tariffs, solar/load forecasts, battery SOC, weather, and HAEO.
    - **Presence** for person entities used by occupancy-aware planning.
    - **Climate** for Daikin climate and HVAC power inputs.
    - **Enphase** for profile monitoring and profile scenario mapping.
    - **AI** for optional local advisory service selection.
    - **EV** for vehicle SOC, connected state, and charge start/stop controls.
+
+### Manual file copy
+
+1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
+2. Restart Home Assistant.
+3. Go to **Settings -> Devices & services -> Add integration**.
+4. Search for **Energy Planner**.
+5. Add the integration. Initial setup does not require any mapped entities.
+6. Open the integration page and add the planning areas you want to use.
 
 ## Compatibility
 
