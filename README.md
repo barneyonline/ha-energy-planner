@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/icon.svg" alt="Energy Planner icon" width="96" height="96">
+</p>
+
 # Energy Planner - Home Assistant Custom Integration
 
 <!-- Badges -->
@@ -72,7 +76,7 @@ Energy Planner is currently a manual custom integration install. It is intention
 - Integration type: `hub`
 - IoT class: `local_polling`
 - Claimed Home Assistant quality scale: `platinum`
-- Python: `3.11+`
+- Python: `3.14+`
 - Home Assistant setup: custom integration installed under `custom_components`
 
 Energy Planner does not authenticate directly with vendor cloud APIs. It reads existing Home Assistant entities and calls configured Home Assistant services. Vendor-specific behavior depends on the entities and services exposed by the integrations already installed in your Home Assistant instance.

@@ -20,7 +20,7 @@
 - Real evidence bundle, optional for operator validation: `scripts/export-real-validation-bundle.sh`
 
 ## Coding Style & Naming Conventions
-- Python 3.11+, 4-space indentation, typed functions where practical.
+- Python 3.14+, 4-space indentation, typed functions where practical.
 - Keep Home Assistant I/O async and fail closed on service/network errors.
 - Use `snake_case` modules/functions and `UPPER_SNAKE_CASE` constants.
 - Avoid logging or persisting secrets, tokens, raw prompts, raw AI output, addresses, or unnecessary location history.
