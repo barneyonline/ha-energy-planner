@@ -8,9 +8,27 @@ PYCACHE_DIR="$(mktemp -d "$ROOT_DIR/.pycache-validate.XXXXXX")"
 CHECK_CONFIG_DIR="$(mktemp -d "$ROOT_DIR/.ha-check-config.XXXXXX")"
 
 cleanup() {
-  rm -rf "$PYCACHE_DIR" "$CHECK_CONFIG_DIR"
+  cleanup_path "$PYCACHE_DIR"
+  cleanup_path "$CHECK_CONFIG_DIR"
 }
 trap cleanup EXIT
+
+cleanup_path() {
+  local path="$1"
+
+  [[ -e "$path" ]] || return 0
+  chmod -R u+rwX "$path" 2>/dev/null || true
+  if rm -rf "$path" 2>/dev/null; then
+    return 0
+  fi
+
+  docker run --rm \
+    -v "$path:/cleanup" \
+    --entrypoint /bin/sh \
+    ghcr.io/home-assistant/home-assistant:stable \
+    -c 'find /cleanup -mindepth 1 -exec rm -rf {} +' >/dev/null 2>&1 || true
+  rm -rf "$path" 2>/dev/null || true
+}
 
 run() {
   printf '\n==> %s\n' "$*"
@@ -80,6 +98,7 @@ logger:
   logs:
     custom_components.ha_energy_planner: debug
 YAML
+mkdir -p "$CHECK_CONFIG_DIR/custom_components/ha_energy_planner"
 run docker run --rm \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -v "$CHECK_CONFIG_DIR:/config" \
