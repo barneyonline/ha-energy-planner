@@ -23,12 +23,29 @@ class FakeConfigEntries:
         entry.options = options
 
 
+class FakeServices:
+    """Capture service calls."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, dict[str, object], bool]] = []
+
+    async def async_call(
+        self,
+        domain: str,
+        service: str,
+        service_data: dict[str, object],
+        *,
+        blocking: bool = False,
+    ) -> None:
+        self.calls.append((domain, service, service_data, blocking))
+
+
 class FakeCoordinator:
     """Minimal coordinator for entity methods."""
 
     def __init__(self, options: dict[str, object] | None = None) -> None:
         self.entry = SimpleNamespace(entry_id="entry-1", options=options or {})
-        self.hass = SimpleNamespace(config_entries=FakeConfigEntries())
+        self.hass = SimpleNamespace(config_entries=FakeConfigEntries(), services=FakeServices())
         self.replan_count = 0
         self.restore_calls: list[str] = []
         self.arm_calls: list[str] = []
@@ -161,6 +178,59 @@ def test_restore_button_restores_safe_state() -> None:
 
     assert coordinator.restore_calls == ["button_pressed"]
     assert coordinator.replan_count == 0
+
+
+def test_preflight_button_creates_notification(monkeypatch: object) -> None:
+    coordinator = FakeCoordinator()
+    button = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "run_preflight"),
+    )
+
+    monkeypatch.setattr(
+        button_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "ok": False,
+            "active_control_ready": False,
+            "checks": [
+                {
+                    "check": "configured_entities_available",
+                    "ok": False,
+                    "blocking": True,
+                    "message": "Configured entities are missing.",
+                }
+            ],
+        },
+    )
+
+    asyncio.run(PlannerButton.async_press(button))
+
+    assert coordinator.hass.services.calls == [
+        (
+            "persistent_notification",
+            "create",
+            {
+                "title": "Energy Planner preflight failed",
+                "message": (
+                    "Active control is not ready.\n\n"
+                    "Failing checks:\n"
+                    "- Configured entities available (blocking): Configured entities are missing."
+                ),
+                "notification_id": "ha_energy_planner_preflight",
+            },
+            False,
+        )
+    ]
+
+
+def test_preflight_notification_message_reports_success() -> None:
+    assert (
+        button_module._preflight_notification_message(
+            {"ok": True, "active_control_ready": True, "checks": [{"check": "recorder_available", "ok": True}]}
+        )
+        == "Active control is ready.\n\nAll preflight checks passed."
+    )
 
 
 def test_production_control_buttons_call_coordinator() -> None:

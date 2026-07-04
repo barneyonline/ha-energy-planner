@@ -122,9 +122,9 @@ Energy Planner is built around conservative production controls:
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
 - AI advice is optional, rate-limited, redacted, and advisory only.
-- Restore-safe-state support is available through both a service and button entity.
+- Preflight and restore-safe-state support are available through both services and button entities.
 
-Run preflight before enabling active control:
+Run preflight before enabling active control from the integration **Run preflight** button or service:
 
 ```yaml
 service: ha_energy_planner.run_preflight
@@ -137,7 +137,7 @@ Only proceed when the response shows the integration is ready, required entities
 Energy Planner registers these Home Assistant services:
 
 - `ha_energy_planner.replan`: request an immediate planner refresh.
-- `ha_energy_planner.run_preflight`: check active-mode readiness without issuing device commands.
+- `ha_energy_planner.run_preflight`: check active-mode readiness without issuing device commands. The same check is also exposed as the **Run preflight** button entity.
 - `ha_energy_planner.export_diagnostics`: return redacted diagnostic state.
 - `ha_energy_planner.export_support_bundle`: return preflight plus redacted diagnostics for production review.
 - `ha_energy_planner.restore_safe_state`: restore planner-owned EV, Enphase, and HVAC state where supported.
@@ -154,7 +154,7 @@ Energy Planner registers these Home Assistant services:
 2. Add planning areas from the integration page.
 3. Map the required source entities and services for the planning areas you want to use.
 4. Leave active control disabled and dry-run enabled.
-5. Run `ha_energy_planner.run_preflight`.
+5. Press the **Run preflight** button or run `ha_energy_planner.run_preflight`.
 6. Fix missing, unavailable, stale, or invalid inputs.
 7. Run several dry-run cycles and review plan, confidence, cost, timeline, next-state, AI advice, and execution audit entities.
 8. Export a support bundle with `ha_energy_planner.export_support_bundle`.

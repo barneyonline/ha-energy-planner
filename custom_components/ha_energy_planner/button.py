@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.const import EntityCategory
@@ -12,7 +13,10 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .preflight import build_preflight_report
 from .type_defs import EnergyPlannerConfigEntry
+
+_PREFLIGHT_NOTIFICATION_ID = "ha_energy_planner_preflight"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -28,6 +32,20 @@ async def _replan(coordinator: EnergyPlannerCoordinator) -> None:
 
 async def _restore(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_restore_safe_state("button_pressed")
+
+
+async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
+    report = build_preflight_report(coordinator.hass, coordinator)
+    await coordinator.hass.services.async_call(
+        "persistent_notification",
+        "create",
+        {
+            "title": "Energy Planner preflight passed" if report.get("ok") else "Energy Planner preflight failed",
+            "message": _preflight_notification_message(report),
+            "notification_id": _PREFLIGHT_NOTIFICATION_ID,
+        },
+        blocking=False,
+    )
 
 
 async def _arm(coordinator: EnergyPlannerCoordinator) -> None:
@@ -64,6 +82,13 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         icon="mdi:backup-restore",
         entity_category=EntityCategory.CONFIG,
         press_fn=_restore,
+    ),
+    PlannerButtonDescription(
+        key="run_preflight",
+        translation_key="run_preflight",
+        icon="mdi:clipboard-check-outline",
+        entity_category=EntityCategory.CONFIG,
+        press_fn=_run_preflight,
     ),
     PlannerButtonDescription(
         key="arm_production_control",
@@ -132,3 +157,23 @@ class PlannerButton(EnergyPlannerEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Handle button press."""
         await self.entity_description.press_fn(self.coordinator)
+
+
+def _preflight_notification_message(report: dict[str, Any]) -> str:
+    """Return a concise persistent-notification message for a preflight report."""
+    status = "Active control is ready." if report.get("active_control_ready") else "Active control is not ready."
+    failing_checks = [check for check in report.get("checks", []) if not check.get("ok")]
+    if not failing_checks:
+        check_summary = "All preflight checks passed."
+    else:
+        check_summary = "Failing checks:\n" + "\n".join(
+            f"- {_preflight_check_name(check)} ({'blocking' if check.get('blocking') else 'advisory'}): "
+            f"{check.get('message', 'No detail available.')}"
+            for check in failing_checks[:8]
+        )
+    return f"{status}\n\n{check_summary}"
+
+
+def _preflight_check_name(check: dict[str, Any]) -> str:
+    """Return a readable preflight check name."""
+    return str(check.get("check", "unknown_check")).replace("_", " ").capitalize()

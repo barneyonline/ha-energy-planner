@@ -438,6 +438,7 @@
     "button": {
       "replan": { "name": "Replan" },
       "restore_safe_state": { "name": "Restore safe state" },
+      "run_preflight": { "name": "Run preflight" },
       "arm_production_control": { "name": "Arm production control" },
       "disarm_production_control": { "name": "Disarm production control" },
       "pause_control_1h": { "name": "Pause control 1 hour" },
