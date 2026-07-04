@@ -23,17 +23,22 @@ class FakeState:
     """Minimal HA state."""
 
     state: str
+    attributes: dict[str, Any] | None = None
 
 
 class FakeStates:
     """Minimal HA states registry."""
 
-    def __init__(self, values: dict[str, str]) -> None:
+    def __init__(self, values: dict[str, str | FakeState]) -> None:
         self.values = values
 
     def get(self, entity_id: str) -> FakeState | None:
         value = self.values.get(entity_id)
-        return None if value is None else FakeState(value)
+        if value is None:
+            return None
+        if isinstance(value, FakeState):
+            return value
+        return FakeState(value)
 
 
 class FakeServices:
@@ -50,6 +55,8 @@ class FakeServices:
             self.states.values[entity_id] = "on"
         elif service == "turn_off":
             self.states.values[entity_id] = "off"
+        elif "option" in data:
+            self.states.values[entity_id] = str(data["option"])
         elif "value" in data:
             self.states.values[entity_id] = str(data["value"])
         elif "time" in data:
@@ -76,7 +83,7 @@ class FailingServices(FakeServices):
 class FakeHass:
     """Minimal HA object."""
 
-    def __init__(self, values: dict[str, str]) -> None:
+    def __init__(self, values: dict[str, str | FakeState]) -> None:
         self.states = FakeStates(values)
         self.services = FakeServices(self.states)
 
@@ -173,6 +180,98 @@ def test_ev_schedule_skips_helper_writes_when_values_already_match() -> None:
     assert hass.services.calls == [
         ("switch", "turn_on", {"entity_id": "switch.ev_start"}),
     ]
+
+
+def test_ev_schedule_sets_select_target_soc_and_ready_by_helpers() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_start": "off",
+            "select.ev_target_soc": FakeState("70%", {"options": ["70%", "80%", "90%"]}),
+            "input_select.ev_ready_by": FakeState("06:00", {"options": ["06:00", "07:00:00", "08:00"]}),
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "select.ev_target_soc",
+            CONF_EV_SMART_CHARGING_READY_BY: "input_select.ev_ready_by",
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"target_soc_percent": 80, "ready_by": "07:00"}))
+    )
+
+    assert result.applied is True
+    assert hass.services.calls == [
+        ("select", "select_option", {"entity_id": "select.ev_target_soc", "option": "80%"}),
+        ("input_select", "select_option", {"entity_id": "input_select.ev_ready_by", "option": "07:00:00"}),
+        ("switch", "turn_on", {"entity_id": "switch.ev_start"}),
+    ]
+
+
+def test_ev_schedule_accepts_matching_read_only_target_soc_sensor() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_start": "off",
+            "sensor.ev_target_soc": FakeState(
+                "80",
+                {
+                    "state_class": "measurement",
+                    "unit_of_measurement": "%",
+                    "device_class": "battery",
+                    "friendly_name": "JCW Aceman E Battery EV Target state of charge",
+                },
+            ),
+            "input_text.ev_ready_by": "07:00",
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target_soc",
+            CONF_EV_SMART_CHARGING_READY_BY: "input_text.ev_ready_by",
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"target_soc_percent": 80, "ready_by": "07:00"}))
+    )
+
+    assert result.applied is True
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.ev_start"}),
+    ]
+
+
+def test_ev_schedule_rejects_select_target_soc_without_matching_option() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_start": "off",
+            "select.ev_target_soc": FakeState("70%", {"options": ["70%", "90%"]}),
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "select.ev_target_soc",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"target_soc_percent": 80})))
+
+    assert result.applied is False
+    assert result.reason == "ev_target_soc_helper_unsupported"
+    assert hass.services.calls == []
 
 
 def test_ev_schedule_skips_every_command_when_helpers_and_start_state_match() -> None:
@@ -516,6 +615,8 @@ def test_ev_value_match_helpers_handle_invalid_values() -> None:
                 "time.bad": "also-bad",
                 "input_text.note": "hello",
                 "select.unsupported": "hello",
+                "select.no_match": FakeState("hello", {"options": ["hello", "world"]}),
+                "unknown.entity": "on",
             }
         ),
         {},
@@ -525,5 +626,9 @@ def test_ev_value_match_helpers_handle_invalid_values() -> None:
     assert adapter._entity_value_matches("input_datetime.bad", "07:00") is False
     assert adapter._entity_value_matches("time.bad", "07:00") is False
     assert adapter._entity_value_matches("input_text.note", "hello") is True
-    assert adapter._entity_value_matches("select.unsupported", "hello") is False
+    assert adapter._entity_value_matches("select.unsupported", "hello") is True
+    assert adapter._entity_value_matches("unknown.entity", "on") is False
+    assert adapter._select_option_for_value("select.unsupported", "hello") == "hello"
+    assert adapter._select_option_for_value("select.missing", "hello") is None
+    assert adapter._select_option_for_value("select.no_match", "missing") is None
     assert adapter._can_set_entity_value(None) is False

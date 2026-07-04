@@ -101,12 +101,12 @@ class EVSmartChargingAdapter:
         if target_soc is not None:
             if not target_entity:
                 return EVCommandResult(False, "ev_target_soc_helper_not_configured", self._snapshot(), self._snapshot())
-            if not self._can_set_entity_value(target_entity):
+            if not self._entity_value_matches(target_entity, target_soc) and not self._can_set_entity_value(target_entity):
                 return EVCommandResult(False, "ev_target_soc_helper_unsupported", self._snapshot(), self._snapshot())
         if ready_by is not None:
             if not ready_by_entity:
                 return EVCommandResult(False, "ev_ready_by_helper_not_configured", self._snapshot(), self._snapshot())
-            if not self._can_set_entity_value(ready_by_entity):
+            if not self._entity_value_matches(ready_by_entity, ready_by) and not self._can_set_entity_value(ready_by_entity):
                 return EVCommandResult(False, "ev_ready_by_helper_unsupported", self._snapshot(), self._snapshot())
         if target_soc is not None and not await self._async_set_entity_value(target_entity, target_soc):
             return EVCommandResult(False, "ev_target_soc_helper_unsupported", self._snapshot(), self._snapshot())
@@ -165,6 +165,14 @@ class EVSmartChargingAdapter:
                     domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
                 )
                 return True
+            if domain in {"select", "input_select"}:
+                option = self._select_option_for_value(entity_id, value)
+                if option is None:
+                    return False
+                await self.hass.services.async_call(
+                    domain, "select_option", {ATTR_ENTITY_ID: entity_id, "option": option}, blocking=True
+                )
+                return True
         return False
 
     def _entity_value_matches(self, entity_id: str, value: Any) -> bool:
@@ -178,6 +186,12 @@ class EVSmartChargingAdapter:
             return _time_value_matches(state.state, value)
         if domain == "input_text":
             return str(state.state) == str(value)
+        if domain == "sensor":
+            return _float_equal(state.state, value)
+        if domain in {"select", "input_select"}:
+            return str(state.state) == str(value) or _float_equal(state.state, value) or _time_value_matches(
+                state.state, value
+            )
         return False
 
     def _can_set_entity_value(self, entity_id: str | None) -> bool:
@@ -189,10 +203,27 @@ class EVSmartChargingAdapter:
             service = "set_value"
         elif domain == "input_datetime":
             service = "set_datetime"
+        elif domain in {"select", "input_select"}:
+            service = "select_option"
         if service is None:
             return False
         has_service = getattr(self.hass.services, "has_service", None)
         return not callable(has_service) or has_service(domain, service)
+
+    def _select_option_for_value(self, entity_id: str, value: Any) -> str | None:
+        """Return the option matching a target SOC or ready-by value."""
+        state = self._state(entity_id)
+        if state is None:
+            return None
+        attributes = getattr(state, "attributes", {}) or {}
+        options = attributes.get("options")
+        candidates = [str(option) for option in options] if isinstance(options, list) else []
+        if str(state.state) not in candidates:
+            candidates.append(str(state.state))
+        for option in candidates:
+            if str(option) == str(value) or _float_equal(option, value) or _time_value_matches(option, value):
+                return option
+        return None
 
     def _snapshot(self) -> dict[str, Any]:
         entity_ids = {
@@ -243,7 +274,7 @@ def _truthy_state(state: State) -> bool:
 
 def _float_equal(left: Any, right: Any) -> bool:
     try:
-        return abs(float(left) - float(right)) < 0.05
+        return abs(float(str(left).strip().removesuffix("%")) - float(str(right).strip().removesuffix("%"))) < 0.05
     except (TypeError, ValueError):
         return False
 

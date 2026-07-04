@@ -57,8 +57,8 @@
           "ev_smart_charging_entity": "Legacy single EV Smart Charging control, if separate start and stop controls are not used.",
           "ev_smart_charging_start_entity": "Switch, button, input_boolean, or input_button used to start EV Smart Charging.",
           "ev_smart_charging_stop_entity": "Switch, button, input_boolean, or input_button used to stop EV Smart Charging.",
-          "ev_smart_charging_target_soc_entity": "Optional number helper used to set EV target SOC.",
-          "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, or text helper used for EV ready-by time.",
+          "ev_smart_charging_target_soc_entity": "Optional number, input_number, select, input_select, or battery percentage sensor used for EV target SOC. Sensors are read-only and only validate the current target; use a writable helper if Energy Planner must change the target.",
+          "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, input_text, select, or input_select helper used for EV ready-by time.",
           "ai_advisor_service": "Optional response-capable local AI advisory service.",
           "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points."
         }
@@ -253,8 +253,8 @@
             "ev_smart_charging_entity": "Legacy single EV Smart Charging control, if separate start and stop controls are not used.",
             "ev_smart_charging_start_entity": "Switch, button, input_boolean, or input_button used to start EV Smart Charging.",
             "ev_smart_charging_stop_entity": "Switch, button, input_boolean, or input_button used to stop EV Smart Charging.",
-            "ev_smart_charging_target_soc_entity": "Optional number helper used to set EV target SOC.",
-            "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, or text helper used for EV ready-by time."
+            "ev_smart_charging_target_soc_entity": "Optional number, input_number, select, input_select, or battery percentage sensor used for EV target SOC. Sensors are read-only and only validate the current target; use a writable helper if Energy Planner must change the target.",
+            "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, input_text, select, or input_select helper used for EV ready-by time."
           }
         }
       }

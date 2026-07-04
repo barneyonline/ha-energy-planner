@@ -63,8 +63,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_SOC,
+    CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_PERSON_ENTITIES,
     CONF_PLANNING_HORIZON_HOURS,
@@ -427,6 +429,22 @@ def test_ev_start_stop_controls_accept_buttons_and_input_buttons() -> None:
     ]
 
 
+def test_ev_target_soc_and_ready_by_accept_select_and_sensor_entities() -> None:
+    ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
+    schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
+
+    target_filter = schema_fields[CONF_EV_SMART_CHARGING_TARGET_SOC].serialize()["selector"]["entity"]["filter"]
+    ready_by_domains = schema_fields[CONF_EV_SMART_CHARGING_READY_BY].serialize()["selector"]["entity"]["domain"]
+
+    assert target_filter[0]["domain"] == ["number", "input_number", "select", "input_select"]
+    assert target_filter[1]["domain"] == ["sensor"]
+    assert target_filter[1]["device_class"] == ["battery"]
+    assert "%" in target_filter[1]["unit_of_measurement"]
+    assert target_filter[2]["domain"] == ["sensor"]
+    assert "%" in target_filter[2]["unit_of_measurement"]
+    assert ready_by_domains == ["time", "input_datetime", "input_text", "select", "input_select"]
+
+
 def test_validate_config_accepts_input_button_ev_controls() -> None:
     hass = FakeHass(
         {"input_button.ev_start", "input_button.ev_stop"},
@@ -439,6 +457,32 @@ def test_validate_config_accepts_input_button_ev_controls() -> None:
             {
                 CONF_EV_SMART_CHARGING_START: "input_button.ev_start",
                 CONF_EV_SMART_CHARGING_STOP: "input_button.ev_stop",
+            },
+        )
+        == {}
+    )
+
+
+def test_validate_config_accepts_ev_target_soc_sensor_and_ready_by_select() -> None:
+    hass = FakeHass(
+        {"sensor.ev_target_soc", "select.ev_ready_by"},
+        {("haeo", "optimize"), ("select", "select_option")},
+        {
+            "sensor.ev_target_soc": {
+                "state_class": "measurement",
+                "unit_of_measurement": "%",
+                "device_class": "battery",
+            },
+            "select.ev_ready_by": {"options": ["06:00", "07:00", "08:00"]},
+        },
+    )
+
+    assert (
+        _validate_config(
+            hass,
+            {
+                CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target_soc",
+                CONF_EV_SMART_CHARGING_READY_BY: "select.ev_ready_by",
             },
         )
         == {}

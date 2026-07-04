@@ -142,6 +142,11 @@ _PRICE_SENSOR_UNITS = ("$/kWh", "AUD/kWh", "A$/kWh", "c/kWh", "¢/kWh", "cent/kW
 _POWER_SENSOR_UNITS = ("W", "kW", "MW")
 _FORECAST_SENSOR_UNITS = (*_POWER_SENSOR_UNITS, "Wh", "kWh", "MWh")
 _PERCENT_SENSOR_UNITS = ("%", "percent", "percentage")
+_EV_TARGET_SOC_FILTER = [
+    {"domain": ["number", "input_number", "select", "input_select"]},
+    {"domain": "sensor", "device_class": "battery", "unit_of_measurement": list(_PERCENT_SENSOR_UNITS)},
+    {"domain": "sensor", "unit_of_measurement": list(_PERCENT_SENSOR_UNITS)},
+]
 
 
 def _sensor_filter(units: tuple[str, ...]) -> dict[str, Any]:
@@ -231,8 +236,10 @@ EV_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_EV_SMART_CHARGING_STOP): _entity_selector(
             ["switch", "button", "input_boolean", "input_button"]
         ),
-        vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(["number", "input_number"]),
-        vol.Optional(CONF_EV_SMART_CHARGING_READY_BY): _entity_selector(["time", "input_datetime", "input_text"]),
+        vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(entity_filter=_EV_TARGET_SOC_FILTER),
+        vol.Optional(CONF_EV_SMART_CHARGING_READY_BY): _entity_selector(
+            ["time", "input_datetime", "input_text", "select", "input_select"]
+        ),
     }
 )
 
@@ -918,8 +925,8 @@ _ENTITY_DOMAIN_RULES = {
     CONF_EV_SMART_CHARGING: {"switch", "button", "input_boolean", "input_button"},
     CONF_EV_SMART_CHARGING_START: {"switch", "button", "input_boolean", "input_button"},
     CONF_EV_SMART_CHARGING_STOP: {"switch", "button", "input_boolean", "input_button"},
-    CONF_EV_SMART_CHARGING_TARGET_SOC: {"number", "input_number"},
-    CONF_EV_SMART_CHARGING_READY_BY: {"time", "input_datetime", "input_text"},
+    CONF_EV_SMART_CHARGING_TARGET_SOC: {"number", "input_number", "sensor", "select", "input_select"},
+    CONF_EV_SMART_CHARGING_READY_BY: {"time", "input_datetime", "input_text", "select", "input_select"},
     CONF_AI_TASK_ENTITY: {"ai_task"},
     CONF_WEATHER: {"weather"},
 }
