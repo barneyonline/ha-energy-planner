@@ -297,7 +297,7 @@
           "ev_min_soc_percent": "Minimum EV SOC",
           "ev_max_soc_percent": "Maximum EV SOC",
           "ev_fallback_target_soc_percent": "Fallback EV target SOC",
-          "ev_charge_rate_kw": "EV charge rate",
+          "ev_charge_rate_kw": "EV charge rate (kW)",
           "ev_soc_per_kwh": "EV SOC gained per kWh",
           "grid_import_limit_kw": "Grid import limit",
           "grid_export_limit_kw": "Grid export limit"

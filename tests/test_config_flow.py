@@ -58,6 +58,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
+    CONF_EV_CHARGE_RATE_KW,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
@@ -540,6 +541,16 @@ def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
         assert "Bureau of Meteorology" in description
         assert "Hourly" in description
         assert "temperature forecast" in description
+
+
+def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
+    integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
+
+    for translations_path in (integration_dir / "translations").glob("en*.json"):
+        translations = json.loads(translations_path.read_text(encoding="utf-8"))
+        label = translations["options"]["step"]["ev_battery_grid"]["data"][CONF_EV_CHARGE_RATE_KW]
+
+        assert label == "EV charge rate (kW)"
 
 
 def test_options_flow_fields_have_readable_translation_labels() -> None:
