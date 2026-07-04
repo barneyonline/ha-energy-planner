@@ -106,5 +106,7 @@ jobs:
       pull-requests: write
     steps:
       - uses: actions/checkout@v6
-      - name: Run full Docker validation
+      - name: Run Docker validation
+        env:
+          HEP_SKIP_HA_SMOKE: "1"
         run: scripts/docker-validate.sh

@@ -45,7 +45,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly
 - Home Assistant diagnostics, system health, repair/preflight evidence, entity translations, and icons for all exposed entities
-- Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and a smoke-tested Home Assistant container
+- Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
 
 ## Installation
 
@@ -170,9 +170,11 @@ This runs:
 - Live-schema fixture validation
 - Real-history fixture validation
 - Home Assistant `check_config`
-- Docker smoke test against a real Home Assistant container
+- Docker smoke test against a real Home Assistant container, unless `HEP_SKIP_HA_SMOKE=1` is set
 
-Run only the smoke test:
+Routine GitHub CI skips the smoke test to keep normal push and pull-request feedback lighter. The heavier Home Assistant smoke test runs from the **Home Assistant Smoke** workflow on a weekly schedule or when started manually.
+
+Run only the smoke test locally:
 
 ```bash
 scripts/docker-ha-smoke.sh

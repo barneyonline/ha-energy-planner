@@ -105,6 +105,10 @@ run docker run --rm \
   -v "$PWD/custom_components/ha_energy_planner:/config/custom_components/ha_energy_planner:ro" \
   ghcr.io/home-assistant/home-assistant:stable \
   python3 -m homeassistant --config /config --script check_config
-run scripts/docker-ha-smoke.sh
+if [[ "${HEP_SKIP_HA_SMOKE:-0}" == "1" ]]; then
+  printf '\n==> scripts/docker-ha-smoke.sh (skipped: HEP_SKIP_HA_SMOKE=1)\n'
+else
+  run scripts/docker-ha-smoke.sh
+fi
 
 printf '\nHA Energy Planner Docker validation passed\n'
