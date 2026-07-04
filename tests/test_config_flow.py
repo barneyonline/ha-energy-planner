@@ -528,6 +528,20 @@ def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
         assert "detailedForecast" in description
 
 
+def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
+    integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
+
+    for translations_path in (integration_dir / "translations").glob("en*.json"):
+        translations = json.loads(translations_path.read_text(encoding="utf-8"))
+        description = translations["config_subentries"]["climate"]["step"]["user"]["data_description"][
+            CONF_WEATHER
+        ]
+
+        assert "Bureau of Meteorology" in description
+        assert "Hourly" in description
+        assert "temperature forecast" in description
+
+
 def test_options_flow_fields_have_readable_translation_labels() -> None:
     strings = _strings()
     labels: dict[str, str] = {}

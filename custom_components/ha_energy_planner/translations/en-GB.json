@@ -60,7 +60,7 @@
           "ev_smart_charging_target_soc_entity": "Optional number helper used to set EV target SOC.",
           "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, or text helper used for EV ready-by time.",
           "ai_advisor_service": "Optional response-capable local AI advisory service.",
-          "weather_entity": "Optional weather entity used for outdoor temperature forecasts."
+          "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points."
         }
       }
     },
@@ -130,7 +130,7 @@
           "data_description": {
             "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
             "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
-            "weather_entity": "Optional weather entity used for outdoor temperature forecasts.",
+            "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
             "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
             "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
             "climate_manual_override_entity": "Optional input_boolean used to expose a manual HVAC override.",
