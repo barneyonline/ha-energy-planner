@@ -10,6 +10,7 @@ on:
       - "custom_components/ha_energy_planner/strings.json"
       - "custom_components/ha_energy_planner/translations/**"
       - "README.md"
+      - "hacs.json"
       - "pyproject.toml"
       - ".github/workflows/validate.yaml"
   pull_request:
@@ -18,6 +19,7 @@ on:
       - "custom_components/ha_energy_planner/strings.json"
       - "custom_components/ha_energy_planner/translations/**"
       - "README.md"
+      - "hacs.json"
       - "pyproject.toml"
       - ".github/workflows/validate.yaml"
   schedule:
@@ -69,8 +71,11 @@ jobs:
               raise SystemExit(
                   f"manifest version {manifest['version']} does not match pyproject {project_version}"
               )
-          if Path("hacs.json").exists():
-              raise SystemExit("hacs.json is intentionally not supported for this repository")
+          hacs = json.loads(Path("hacs.json").read_text(encoding="utf-8"))
+          if hacs.get("name") != manifest["name"]:
+              raise SystemExit(f"hacs name {hacs.get('name')} does not match manifest name {manifest['name']}")
+          if hacs.get("homeassistant") != "2026.6.0":
+              raise SystemExit(f"unexpected HACS minimum Home Assistant version: {hacs.get('homeassistant')}")
           for path in [
               Path("custom_components/ha_energy_planner/strings.json"),
               Path("custom_components/ha_energy_planner/translations/en.json"),
