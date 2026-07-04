@@ -5,9 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONDONTWRITEBYTECODE=1
 PYCACHE_DIR="$(mktemp -d "$ROOT_DIR/.pycache-validate.XXXXXX")"
+CHECK_CONFIG_DIR="$(mktemp -d "$ROOT_DIR/.ha-check-config.XXXXXX")"
 
 cleanup() {
-  rm -rf "$PYCACHE_DIR"
+  rm -rf "$PYCACHE_DIR" "$CHECK_CONFIG_DIR"
 }
 trap cleanup EXIT
 
@@ -71,7 +72,20 @@ else
   fi
 fi
 
-run docker compose run --rm homeassistant python3 -m homeassistant --config /config --script check_config
+cat > "$CHECK_CONFIG_DIR/configuration.yaml" <<'YAML'
+default_config:
+
+logger:
+  default: warning
+  logs:
+    custom_components.ha_energy_planner: debug
+YAML
+run docker run --rm \
+  -e PYTHONDONTWRITEBYTECODE=1 \
+  -v "$CHECK_CONFIG_DIR:/config" \
+  -v "$PWD/custom_components/ha_energy_planner:/config/custom_components/ha_energy_planner:ro" \
+  ghcr.io/home-assistant/home-assistant:stable \
+  python3 -m homeassistant --config /config --script check_config
 run scripts/docker-ha-smoke.sh
 
 printf '\nHA Energy Planner Docker validation passed\n'

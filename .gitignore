@@ -6,3 +6,4 @@ __pycache__/
 
 docker/
 .ha-smoke.*/
+.ha-check-config.*/
