@@ -138,20 +138,40 @@ _PRIORITY_LABELS = {
 }
 _PRIORITY_FORM_FIELDS = tuple(f"planning_priority_{index}" for index in range(1, len(_PRIORITY_OBJECTIVES) + 1))
 
+_PRICE_SENSOR_UNITS = ("$/kWh", "AUD/kWh", "A$/kWh", "c/kWh", "¢/kWh", "cent/kWh", "cents/kWh")
+_POWER_SENSOR_UNITS = ("W", "kW", "MW")
+_FORECAST_SENSOR_UNITS = (*_POWER_SENSOR_UNITS, "Wh", "kWh", "MWh")
+_PERCENT_SENSOR_UNITS = ("%", "percent", "percentage")
 
-def _entity_selector(domain: str | list[str] | None = None, *, multiple: bool = False) -> EntitySelector:
-    return EntitySelector(EntitySelectorConfig(domain=domain, multiple=multiple))
+
+def _sensor_filter(units: tuple[str, ...]) -> dict[str, Any]:
+    """Return a selector filter for sensors that expose one of the expected units."""
+    return {"domain": "sensor", "unit_of_measurement": list(units)}
+
+
+def _entity_selector(
+    domain: str | list[str] | None = None,
+    *,
+    multiple: bool = False,
+    entity_filter: dict[str, Any] | list[dict[str, Any]] | None = None,
+) -> EntitySelector:
+    config = EntitySelectorConfig(multiple=multiple)
+    if entity_filter is not None:
+        config["filter"] = entity_filter
+    elif domain is not None:
+        config["domain"] = domain
+    return EntitySelector(config)
 
 
 STEP_USER_DATA_SCHEMA = vol.Schema({})
 
 ENERGY_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_AMBER_IMPORT_PRICE): _entity_selector("sensor"),
-        vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector("sensor"),
-        vol.Required(CONF_PV_FORECAST): _entity_selector("sensor"),
-        vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector("sensor"),
-        vol.Required(CONF_BATTERY_SOC): _entity_selector("sensor"),
+        vol.Required(CONF_AMBER_IMPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
+        vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
+        vol.Required(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
+        vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Required(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
     }
 )
 
@@ -183,7 +203,7 @@ AI_DATA_SCHEMA = vol.Schema(
 CLIMATE_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_DAIKIN_CLIMATE): _entity_selector("climate"),
-        vol.Optional(CONF_DAIKIN_POWER): _entity_selector("sensor"),
+        vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
@@ -201,7 +221,7 @@ PRESENCE_DATA_SCHEMA = vol.Schema(
 
 EV_DATA_SCHEMA = vol.Schema(
     {
-        vol.Optional(CONF_EV_SOC): _entity_selector("sensor"),
+        vol.Optional(CONF_EV_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
         vol.Optional(CONF_EV_CHARGING): _entity_selector(["binary_sensor", "sensor", "switch"]),
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
         vol.Optional(CONF_EV_SMART_CHARGING): _entity_selector(["switch", "button", "input_boolean", "input_button"]),

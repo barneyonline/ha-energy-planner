@@ -51,6 +51,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
+    CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
@@ -60,6 +61,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
+    CONF_EV_SOC,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_HAEO_OPTIMIZE_SERVICE,
@@ -239,6 +241,40 @@ def test_climate_flow_uses_multi_entity_selector_for_automations() -> None:
         "multiple": True,
         "reorder": False,
     }
+
+
+def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
+    energy_schema = PLANNER_SUBENTRY_SCHEMAS["energy"]
+    schema_fields = {getattr(key, "schema", key): selector for key, selector in energy_schema.schema.items()}
+
+    import_filter = schema_fields[CONF_AMBER_IMPORT_PRICE].serialize()["selector"]["entity"]["filter"][0]
+    export_filter = schema_fields[CONF_AMBER_EXPORT_PRICE].serialize()["selector"]["entity"]["filter"][0]
+    pv_filter = schema_fields[CONF_PV_FORECAST].serialize()["selector"]["entity"]["filter"][0]
+    baseline_filter = schema_fields[CONF_BASELINE_LOAD_FORECAST].serialize()["selector"]["entity"]["filter"][0]
+    battery_filter = schema_fields[CONF_BATTERY_SOC].serialize()["selector"]["entity"]["filter"][0]
+
+    assert import_filter["domain"] == ["sensor"]
+    assert "AUD/kWh" in import_filter["unit_of_measurement"]
+    assert "c/kWh" in export_filter["unit_of_measurement"]
+    assert {"W", "kW", "kWh"} <= set(pv_filter["unit_of_measurement"])
+    assert "kW" in baseline_filter["unit_of_measurement"]
+    assert "kWh" not in baseline_filter["unit_of_measurement"]
+    assert battery_filter["unit_of_measurement"] == ["%", "percent", "percentage"]
+
+
+def test_related_power_and_soc_fields_filter_sensor_selectors_by_expected_units() -> None:
+    climate_schema = PLANNER_SUBENTRY_SCHEMAS["climate"]
+    ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
+    climate_fields = {getattr(key, "schema", key): selector for key, selector in climate_schema.schema.items()}
+    ev_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
+
+    daikin_filter = climate_fields[CONF_DAIKIN_POWER].serialize()["selector"]["entity"]["filter"][0]
+    ev_soc_filter = ev_fields[CONF_EV_SOC].serialize()["selector"]["entity"]["filter"][0]
+
+    assert daikin_filter["domain"] == ["sensor"]
+    assert daikin_filter["unit_of_measurement"] == ["W", "kW", "MW"]
+    assert ev_soc_filter["domain"] == ["sensor"]
+    assert ev_soc_filter["unit_of_measurement"] == ["%", "percent", "percentage"]
 
 
 def test_weather_entity_lives_in_climate_group_not_energy_group() -> None:
