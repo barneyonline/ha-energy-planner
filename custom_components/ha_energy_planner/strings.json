@@ -36,7 +36,7 @@
         "data_description": {
           "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices.",
           "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices.",
-          "pv_forecast_entity": "Sensor that exposes solar production forecast data.",
+          "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
           "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data.",
           "battery_soc_entity": "Battery state-of-charge sensor.",
           "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
@@ -99,7 +99,7 @@
           "data_description": {
             "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices.",
             "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices.",
-            "pv_forecast_entity": "Sensor that exposes solar production forecast data.",
+            "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
             "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data.",
             "battery_soc_entity": "Battery state-of-charge sensor."
           }

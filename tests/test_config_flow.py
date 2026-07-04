@@ -478,6 +478,20 @@ def test_english_locale_files_translate_reconfigure_success() -> None:
         assert translations["config_subentries"]["ai"]["abort"]["reconfigure_successful"] == "Reconfigure Successful"
 
 
+def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
+    integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
+
+    for translations_path in (integration_dir / "translations").glob("en*.json"):
+        translations = json.loads(translations_path.read_text(encoding="utf-8"))
+        description = translations["config_subentries"]["energy"]["step"]["user"]["data_description"][
+            CONF_PV_FORECAST
+        ]
+
+        assert "Forecast Today" in description
+        assert "Peak Forecast Today" in description
+        assert "detailedForecast" in description
+
+
 def test_options_flow_fields_have_readable_translation_labels() -> None:
     strings = _strings()
     labels: dict[str, str] = {}

@@ -504,7 +504,7 @@ automation:
           value: 35
       - action: ha_energy_planner.set_ev_ready_by
         data:
-          ready_by: "08:15:00"
+          ready_by: "23:45:00"
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_number.set_value
@@ -1076,7 +1076,7 @@ snapshot_actions = [
 if not any(
     str(action.get("action_id", "")).endswith("-ev-minimum-soc")
     and action.get("kind") == "ev_schedule"
-    and action.get("desired_state", {}).get("ready_by") == "08:15"
+    and action.get("desired_state", {}).get("ready_by") == "23:45"
     and action.get("desired_state", {}).get("target_soc_percent", 0) >= 80
     and action.get("desired_state", {}).get("allocated_slots")
     for action in snapshot_actions
@@ -1257,7 +1257,7 @@ if not any(
 if not any(
     item.get("result") == "applied"
     and str(item.get("action_id", "")).endswith("-ev-minimum-soc")
-    and item.get("post_state", {}).get("ev_smart_charging_ready_by_entity") == "08:15:00"
+    and item.get("post_state", {}).get("ev_smart_charging_ready_by_entity") == "23:45:00"
     for item in outcomes
 ):
     raise SystemExit("set_ev_ready_by service did not apply the normalized runtime ready-by value to EV Smart Charging")
