@@ -71,17 +71,20 @@
       "invalid_unit": "Entity unit is not compatible with this field.",
       "invalid_service_name": "Service name must use domain.service format.",
       "service_not_found": "Service was not found in Home Assistant."
-        },
-        "abort": {
-            "already_configured": "Energy Planner is already configured.",
-            "reconfigure_successful": "Energy Planner settings were updated."
-        }
+    },
+    "abort": {
+      "already_configured": "Energy Planner is already configured.",
+      "reconfigure_successful": "Reconfigure Successful"
+    }
   },
   "config_subentries": {
     "energy": {
       "flow_title": "Energy",
       "entry_type": "Energy",
-      "initiate_flow": { "user": "Energy", "reconfigure": "Energy" },
+      "initiate_flow": {
+        "user": "Energy",
+        "reconfigure": "Energy"
+      },
       "step": {
         "user": {
           "title": "Energy",
@@ -106,7 +109,10 @@
     "climate": {
       "flow_title": "Climate",
       "entry_type": "Climate",
-      "initiate_flow": { "user": "Climate", "reconfigure": "Climate" },
+      "initiate_flow": {
+        "user": "Climate",
+        "reconfigure": "Climate"
+      },
       "step": {
         "user": {
           "title": "Climate",
@@ -137,7 +143,10 @@
     "presence": {
       "flow_title": "Presence",
       "entry_type": "Presence",
-      "initiate_flow": { "user": "Presence", "reconfigure": "Presence" },
+      "initiate_flow": {
+        "user": "Presence",
+        "reconfigure": "Presence"
+      },
       "step": {
         "user": {
           "title": "Presence",
@@ -154,7 +163,10 @@
     "enphase": {
       "flow_title": "Enphase",
       "entry_type": "Enphase",
-      "initiate_flow": { "user": "Enphase", "reconfigure": "Enphase" },
+      "initiate_flow": {
+        "user": "Enphase",
+        "reconfigure": "Enphase"
+      },
       "step": {
         "user": {
           "title": "Enphase",
@@ -188,32 +200,38 @@
         }
       }
     },
-        "ai": {
-            "flow_title": "AI",
-            "entry_type": "AI",
-            "initiate_flow": { "user": "AI", "reconfigure": "AI" },
-            "abort": {
-                "reconfigure_successful": "AI settings were updated."
-            },
-            "step": {
-                "user": {
-                    "title": "AI",
-                    "description": "Configure the optional local AI advisory service. Prefer an AI task provider when one is available; it is designed for background data-generation tasks and is the most reliable option for Energy Planner. Use a conversation agent only as a fallback when your AI integration does not expose an AI task entity.",
-                    "data": {
-                        "ai_task_entity": "AI task provider",
-                        "ai_agent_id": "AI conversation agent"
-                    },
-                    "data_description": {
-                        "ai_task_entity": "Preferred. Select an AI Task entity for advisory JSON generation. Energy Planner calls ai_task.generate_data and validates the response before using it.",
-                        "ai_agent_id": "Fallback. Select a conversation agent only if no AI Task entity is available. Conversation agents are built for chat/voice responses, so Energy Planner has to parse their text output."
-                    }
-                }
-            }
-        },
+    "ai": {
+      "flow_title": "AI",
+      "entry_type": "AI",
+      "initiate_flow": {
+        "user": "AI",
+        "reconfigure": "AI"
+      },
+      "abort": {
+        "reconfigure_successful": "Reconfigure Successful"
+      },
+      "step": {
+        "user": {
+          "title": "AI",
+          "description": "Configure the optional local AI advisory service. Prefer an AI task provider when one is available; it is designed for background data-generation tasks and is the most reliable option for Energy Planner. Use a conversation agent only as a fallback when your AI integration does not expose an AI task entity.",
+          "data": {
+            "ai_task_entity": "AI task provider",
+            "ai_agent_id": "AI conversation agent"
+          },
+          "data_description": {
+            "ai_task_entity": "Preferred. Select an AI Task entity for advisory JSON generation. Energy Planner calls ai_task.generate_data and validates the response before using it.",
+            "ai_agent_id": "Fallback. Select a conversation agent only if no AI Task entity is available. Conversation agents are built for chat/voice responses, so Energy Planner has to parse their text output."
+          }
+        }
+      }
+    },
     "ev": {
       "flow_title": "EV",
       "entry_type": "EV",
-      "initiate_flow": { "user": "EV", "reconfigure": "EV" },
+      "initiate_flow": {
+        "user": "EV",
+        "reconfigure": "EV"
+      },
       "step": {
         "user": {
           "title": "EV",
@@ -403,47 +421,117 @@
   },
   "entity": {
     "sensor": {
-      "next_action": { "name": "Next action" },
-      "plan_status": { "name": "Plan status" },
-      "estimated_daily_cost": { "name": "Estimated daily cost" },
-      "forecast_confidence": { "name": "Forecast confidence" },
-      "confidence_breakdown": { "name": "Confidence breakdown" },
-      "production_readiness": { "name": "Production readiness" },
-      "control_block_reason": { "name": "Control block reason" },
-      "execution_audit": { "name": "Execution audit" },
-      "dry_run_comparison": { "name": "Dry-run comparison" },
-      "support_bundle_summary": { "name": "Support bundle summary" },
-      "ai_advice": { "name": "AI advice" },
-      "climate_plan": { "name": "Climate plan" },
-      "current_state": { "name": "Current state" },
-      "next_state": { "name": "Next state" },
-      "presence_state": { "name": "State" },
-      "enphase_plan": { "name": "Enphase plan" },
-      "ev_charging_plan": { "name": "EV charging plan" },
-      "current_charge_state": { "name": "Current charge state" },
-      "next_charge_state": { "name": "Next charge state" }
+      "next_action": {
+        "name": "Next action"
+      },
+      "plan_status": {
+        "name": "Plan status"
+      },
+      "estimated_daily_cost": {
+        "name": "Estimated daily cost"
+      },
+      "forecast_confidence": {
+        "name": "Forecast confidence"
+      },
+      "confidence_breakdown": {
+        "name": "Confidence breakdown"
+      },
+      "production_readiness": {
+        "name": "Production readiness"
+      },
+      "control_block_reason": {
+        "name": "Control block reason"
+      },
+      "execution_audit": {
+        "name": "Execution audit"
+      },
+      "dry_run_comparison": {
+        "name": "Dry-run comparison"
+      },
+      "support_bundle_summary": {
+        "name": "Support bundle summary"
+      },
+      "ai_advice": {
+        "name": "AI advice"
+      },
+      "climate_plan": {
+        "name": "Climate plan"
+      },
+      "current_state": {
+        "name": "Current state"
+      },
+      "next_state": {
+        "name": "Next state"
+      },
+      "presence_state": {
+        "name": "State"
+      },
+      "enphase_plan": {
+        "name": "Enphase plan"
+      },
+      "ev_charging_plan": {
+        "name": "EV charging plan"
+      },
+      "current_charge_state": {
+        "name": "Current charge state"
+      },
+      "next_charge_state": {
+        "name": "Next charge state"
+      }
     },
     "binary_sensor": {
-      "data_healthy": { "name": "Data health" },
-      "takeover_active": { "name": "Takeover active" }
+      "data_healthy": {
+        "name": "Data health"
+      },
+      "takeover_active": {
+        "name": "Takeover active"
+      }
     },
     "switch": {
-      "enabled": { "name": "Enabled" },
-      "dry_run": { "name": "Dry run" },
-      "ai_enabled": { "name": "AI enabled" },
-      "ev_control_enabled": { "name": "EV control enabled" },
-      "climate_control_enabled": { "name": "Climate control enabled" },
-      "enphase_control_enabled": { "name": "Enphase control enabled" }
+      "enabled": {
+        "name": "Enabled"
+      },
+      "dry_run": {
+        "name": "Dry run"
+      },
+      "ai_enabled": {
+        "name": "AI enabled"
+      },
+      "ev_control_enabled": {
+        "name": "EV control enabled"
+      },
+      "climate_control_enabled": {
+        "name": "Climate control enabled"
+      },
+      "enphase_control_enabled": {
+        "name": "Enphase control enabled"
+      }
     },
     "button": {
-      "replan": { "name": "Replan" },
-      "restore_safe_state": { "name": "Restore safe state" },
-      "run_preflight": { "name": "Run preflight" },
-      "arm_production_control": { "name": "Arm production control" },
-      "disarm_production_control": { "name": "Disarm production control" },
-      "pause_control_1h": { "name": "Pause control 1 hour" },
-      "pause_control_4h": { "name": "Pause control 4 hours" },
-      "resume_control": { "name": "Resume control" }
+      "replan": {
+        "name": "Replan"
+      },
+      "restore_safe_state": {
+        "name": "Restore safe state"
+      },
+      "run_preflight": {
+        "name": "Run preflight"
+      },
+      "arm_production_control": {
+        "name": "Arm production control"
+      },
+      "disarm_production_control": {
+        "name": "Disarm production control"
+      },
+      "pause_control_1h": {
+        "name": "Pause control 1 hour"
+      },
+      "pause_control_4h": {
+        "name": "Pause control 4 hours"
+      },
+      "resume_control": {
+        "name": "Resume control"
+      }
     }
   }
 }
