@@ -1,0 +1,93 @@
+{
+  "name": "invalid_actions_are_rejected",
+  "expected_rejected_action_count": 3,
+  "expected_action_violations": {
+    "ev-target-too-high": ["ev_target_soc_outside_bounds"],
+    "enphase-hold": ["enphase_takeover_savings_below_threshold", "enphase_profile_hold_active"],
+    "hvac-manual-override": ["manual_hvac_override_active"]
+  },
+  "now": "2026-06-27T00:10:00+00:00",
+  "options": {
+    "planner_enabled": true,
+    "dry_run": false,
+    "battery_min_soc_percent": 10,
+    "ev_min_soc_percent": 40,
+    "ev_max_soc_percent": 90,
+    "enphase_profile_min_hold_minutes": 30
+  },
+  "context": {
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "plan_id": "replay-plan-1",
+    "current_battery_soc_percent": 55,
+    "current_ev_soc_percent": 50,
+    "occupancy_state": "occupied",
+    "haeo_status": "ready",
+    "input_health": "healthy",
+    "slots": [
+      {
+        "valid_at": "2026-06-27T00:00:00+00:00",
+        "import_price": 0.25,
+        "export_price": 0.08,
+        "pv_forecast_kw": 1.2,
+        "baseline_load_forecast_kw": 2.0
+      },
+      {
+        "valid_at": "2026-06-27T00:05:00+00:00",
+        "import_price": 0.30,
+        "export_price": 0.08,
+        "pv_forecast_kw": 1.1,
+        "baseline_load_forecast_kw": 2.1
+      }
+    ]
+  },
+  "ownership": {
+    "enphase_profile": "Savings",
+    "enphase_profile_changed_at": "2026-06-27T00:00:00+00:00",
+    "manual_hvac_override_expires_at": "2026-06-27T02:00:00+00:00"
+  },
+  "plan": {
+    "plan_id": "replay-plan-1",
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "horizon_hours": 24,
+    "interval_minutes": 5,
+    "status": "current",
+    "health": "healthy",
+    "mode": "ACTIVE_HEALTHY",
+    "summary": "replay invalid actions",
+    "confidence": 1.0,
+    "estimated_daily_cost": 4.25,
+    "actions": [
+      {
+        "action_id": "ev-target-too-high",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:20:00+00:00",
+        "asset": "ev",
+        "kind": "ev_schedule",
+        "desired_state": {
+          "target_soc_percent": 95
+        }
+      },
+      {
+        "action_id": "enphase-hold",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:20:00+00:00",
+        "asset": "enphase",
+        "kind": "set_profile",
+        "desired_state": {
+          "profile": "Full Backup"
+        }
+      },
+      {
+        "action_id": "hvac-manual-override",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:20:00+00:00",
+        "asset": "daikin",
+        "kind": "set_hvac",
+        "desired_state": {
+          "hvac_mode": "heat",
+          "target_temperature": 20
+        }
+      }
+    ]
+  }
+}

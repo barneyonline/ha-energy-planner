@@ -1,0 +1,33 @@
+name: CI
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+on:
+  push:
+    branches:
+      - main
+      - "release/**"
+    paths:
+      - "custom_components/ha_energy_planner/**"
+      - "tests/**"
+      - "docs/**"
+      - "scripts/**"
+      - "README.md"
+      - "ha-energy-planner-spec.md"
+      - "pyproject.toml"
+      - "quality_scale.yaml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/tests.yml"
+      - ".github/workflows/quality-scale.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    uses: ./.github/workflows/tests.yml
+    secrets: inherit

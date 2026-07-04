@@ -1,0 +1,58 @@
+name: Tests
+
+on:
+  pull_request:
+    paths:
+      - "custom_components/ha_energy_planner/**"
+      - "tests/**"
+      - "docs/**"
+      - "scripts/**"
+      - "README.md"
+      - "ha-energy-planner-spec.md"
+      - "pyproject.toml"
+      - "quality_scale.yaml"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/tests.yml"
+      - ".github/workflows/quality-scale.yml"
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ${{ format('{0}-{1}', github.workflow_ref || github.workflow, github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  quality-scale:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate quality scale evidence in Home Assistant Docker
+        run: >
+          docker run --rm
+          -v "$PWD:/work"
+          -w /work
+          ghcr.io/home-assistant/home-assistant:stable
+          python3 scripts/validate_quality_scale.py
+      - name: Test quality scale and manifest contracts in Home Assistant Docker
+        run: >
+          docker run --rm
+          -v "$PWD:/work"
+          -w /work
+          ghcr.io/home-assistant/home-assistant:stable
+          python3 -m pytest -q
+          tests/scripts/test_validate_quality_scale.py
+          tests/test_manifest.py
+
+  docker-validate:
+    runs-on: ubuntu-latest
+    needs: quality-scale
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run full Docker validation
+        run: scripts/docker-validate.sh

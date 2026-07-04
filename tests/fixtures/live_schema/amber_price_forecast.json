@@ -1,0 +1,23 @@
+{
+  "kind": "forecast_state",
+  "name": "amber_price_forecast",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "price",
+  "value_keys": ["import_price", "general_price", "per_kwh", "price", "value"],
+  "state": "0.12",
+  "attributes": {
+    "forecasts": [
+      {
+        "period_start": "2026-06-27T00:00:00+00:00",
+        "per_kwh": 0.12
+      },
+      {
+        "period_start": "2026-06-27T00:30:00+00:00",
+        "per_kwh": 0.34
+      }
+    ]
+  },
+  "expected": [0.12, 0.12, 0.34, 0.34]
+}

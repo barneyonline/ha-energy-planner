@@ -1,0 +1,51 @@
+{
+  "kind": "haeo_response",
+  "name": "haeo_camel_case_slots",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "interval_minutes": 5,
+  "response": {
+    "result": {
+      "slots": [
+        {
+          "startTime": "2026-06-27T00:00:00+00:00",
+          "gridImportW": 1800,
+          "gridExportW": 0,
+          "batteryChargeW": 1200,
+          "batteryDischargeW": 0,
+          "batterySocPercent": 61
+        },
+        {
+          "startTime": "2026-06-27T00:05:00+00:00",
+          "gridImportW": 0,
+          "gridExportW": 1400,
+          "batteryChargeW": 0,
+          "batteryDischargeW": 900,
+          "batterySocPercent": 59
+        }
+      ]
+    }
+  },
+  "expected_counts": {
+    "haeo_grid_import_forecast_kw": 2,
+    "haeo_grid_export_forecast_kw": 2,
+    "haeo_battery_charge_forecast_kw": 2,
+    "haeo_battery_discharge_forecast_kw": 2,
+    "haeo_battery_soc_forecast_percent": 2
+  },
+  "expected_slots": [
+    {
+      "haeo_grid_import_forecast_kw": 1.8,
+      "haeo_grid_export_forecast_kw": 0.0,
+      "haeo_battery_charge_forecast_kw": 1.2,
+      "haeo_battery_discharge_forecast_kw": 0.0,
+      "haeo_battery_soc_forecast_percent": 61.0
+    },
+    {
+      "haeo_grid_import_forecast_kw": 0.0,
+      "haeo_grid_export_forecast_kw": 1.4,
+      "haeo_battery_charge_forecast_kw": 0.0,
+      "haeo_battery_discharge_forecast_kw": 0.9,
+      "haeo_battery_soc_forecast_percent": 59.0
+    }
+  ]
+}

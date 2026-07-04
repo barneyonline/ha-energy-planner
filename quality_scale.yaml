@@ -1,0 +1,467 @@
+levels:
+  bronze:
+    required:
+      - action-setup
+      - appropriate-polling
+      - brands
+      - common-modules
+      - config-flow-test-coverage
+      - config-flow
+      - dependency-transparency
+      - docs-actions
+      - docs-high-level-description
+      - docs-installation-instructions
+      - docs-removal-instructions
+      - entity-event-setup
+      - entity-unique-id
+      - has-entity-name
+      - runtime-data
+      - test-before-configure
+      - test-before-setup
+      - unique-config-entry
+  silver:
+    required:
+      - action-exceptions
+      - config-entry-unloading
+      - docs-configuration-parameters
+      - docs-installation-parameters
+      - entity-unavailable
+      - integration-owner
+      - log-when-unavailable
+      - parallel-updates
+      - reauthentication-flow
+      - test-coverage
+  gold:
+    required:
+      - devices
+      - diagnostics
+      - discovery-update-info
+      - discovery
+      - docs-data-update
+      - docs-examples
+      - docs-known-limitations
+      - docs-supported-devices
+      - docs-supported-functions
+      - docs-troubleshooting
+      - docs-use-cases
+      - dynamic-devices
+      - entity-category
+      - entity-device-class
+      - entity-disabled-by-default
+      - entity-translations
+      - exception-translations
+      - icon-translations
+      - reconfiguration-flow
+      - repair-issues
+      - stale-devices
+  platinum:
+    required:
+      - async-dependency
+      - inject-websession
+      - strict-typing
+
+rules:
+  action-setup:
+    status: done
+    comment: Integration services are registered from async_setup and are covered by service tests and Docker smoke automation.
+    references:
+      code:
+        - custom_components/ha_energy_planner/__init__.py
+        - custom_components/ha_energy_planner/services.yaml
+        - custom_components/ha_energy_planner/preflight.py
+      tests:
+        - tests/test_services.py
+        - scripts/docker-ha-smoke.sh
+  appropriate-polling:
+    status: done
+    comment: The coordinator schedules wall-clock planning interval refreshes and material-change replans instead of fixed blind polling.
+    references:
+      code:
+        - custom_components/ha_energy_planner/coordinator.py
+      tests:
+        - tests/test_coordinator.py
+  brands:
+    status: done
+    comment: Custom repository validation tracks the manifest and integration metadata; no upstream brand asset is required for this local custom integration.
+    references:
+      code:
+        - custom_components/ha_energy_planner/manifest.json
+      docs:
+        - README.md
+  common-modules:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/planner.py
+        - custom_components/ha_energy_planner/inputs.py
+        - custom_components/ha_energy_planner/forecasts.py
+        - custom_components/ha_energy_planner/storage.py
+        - custom_components/ha_energy_planner/preflight.py
+      tests:
+        - tests/test_planner.py
+        - tests/test_inputs.py
+        - tests/test_forecasts.py
+        - tests/test_storage.py
+        - tests/test_services.py
+  config-flow-test-coverage:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+      tests:
+        - tests/test_config_flow.py
+  config-flow:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+        - custom_components/ha_energy_planner/manifest.json
+      tests:
+        - tests/test_config_flow.py
+      docs:
+        - README.md
+  dependency-transparency:
+    status: done
+    comment: The manifest declares no Python package requirements; Home Assistant APIs and standard-library helpers are used directly.
+    references:
+      code:
+        - custom_components/ha_energy_planner/manifest.json
+  docs-actions:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/services.yaml
+      docs:
+        - README.md
+  docs-high-level-description:
+    status: done
+    references:
+      docs:
+        - README.md
+        - ha-energy-planner-spec.md
+  docs-installation-instructions:
+    status: done
+    references:
+      docs:
+        - README.md
+  docs-removal-instructions:
+    status: done
+    references:
+      docs:
+        - README.md
+  entity-event-setup:
+    status: done
+    comment: Entities are coordinator-backed and listeners are owned by the coordinator lifecycle.
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+        - custom_components/ha_energy_planner/coordinator.py
+      tests:
+        - tests/test_lifecycle.py
+  entity-unique-id:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+      tests:
+        - scripts/docker-ha-smoke.sh
+  has-entity-name:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+      tests:
+        - tests/test_sensor.py
+  runtime-data:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/__init__.py
+        - custom_components/ha_energy_planner/coordinator.py
+      tests:
+        - tests/test_lifecycle.py
+  test-before-configure:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+      tests:
+        - tests/test_config_flow.py
+  test-before-setup:
+    status: done
+    comment: Config-entry setup loads Store, performs the first coordinator refresh, and restores safe state on setup failure.
+    references:
+      code:
+        - custom_components/ha_energy_planner/__init__.py
+      tests:
+        - tests/test_lifecycle.py
+  unique-config-entry:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+      tests:
+        - tests/test_config_flow.py
+  action-exceptions:
+    status: done
+    comment: Adapters and executor record auditable failed/rejected outcomes instead of raising through planner execution.
+    references:
+      code:
+        - custom_components/ha_energy_planner/executor.py
+        - custom_components/ha_energy_planner/ev_adapter.py
+        - custom_components/ha_energy_planner/hvac_adapter.py
+        - custom_components/ha_energy_planner/enphase_adapter.py
+      tests:
+        - tests/test_executor.py
+        - tests/test_ev_adapter.py
+        - tests/test_hvac_adapter.py
+        - tests/test_enphase_adapter.py
+  config-entry-unloading:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/__init__.py
+      tests:
+        - tests/test_lifecycle.py
+  docs-configuration-parameters:
+    status: done
+    references:
+      docs:
+        - README.md
+        - ha-energy-planner-spec.md
+  docs-installation-parameters:
+    status: done
+    references:
+      docs:
+        - README.md
+  entity-unavailable:
+    status: done
+    comment: Required input health is surfaced as a binary sensor and unsafe inputs block execution.
+    references:
+      code:
+        - custom_components/ha_energy_planner/binary_sensor.py
+        - custom_components/ha_energy_planner/inputs.py
+      tests:
+        - tests/test_binary_sensor.py
+        - tests/test_inputs.py
+        - tests/fixtures/replay/stale_input_suppresses_control.json
+  integration-owner:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/manifest.json
+  log-when-unavailable:
+    status: done
+    comment: Unavailable required inputs and HAEO/service fallback classes are persisted and notified with compact reasons instead of noisy repeated logs.
+    references:
+      code:
+        - custom_components/ha_energy_planner/coordinator.py
+        - custom_components/ha_energy_planner/executor.py
+      tests:
+        - tests/test_executor.py
+        - scripts/docker-ha-smoke.sh
+  parallel-updates:
+    status: done
+    comment: Coordinator refreshes are serialized by lock, and device execution is rate-limited per asset/action kind.
+    references:
+      code:
+        - custom_components/ha_energy_planner/coordinator.py
+        - custom_components/ha_energy_planner/executor.py
+      tests:
+        - tests/test_coordinator.py
+        - tests/test_executor.py
+  reauthentication-flow:
+    status: n/a
+    comment: This local-first integration stores entity/service mappings and no remote account credential that requires Home Assistant reauthentication.
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+        - custom_components/ha_energy_planner/manifest.json
+  test-coverage:
+    status: done
+    comment: Dockerized pytest, replay fixtures, live-schema fixtures, real-history fixtures, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
+    references:
+      tests:
+        - tests/test_planner.py
+        - tests/test_executor.py
+        - tests/test_services.py
+        - tests/test_real_history_fixtures.py
+      code:
+        - scripts/docker-validate.sh
+  devices:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+      tests:
+        - scripts/docker-ha-smoke.sh
+  diagnostics:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/diagnostics.py
+      tests:
+        - tests/test_diagnostics.py
+        - scripts/docker-ha-smoke.sh
+  discovery-update-info:
+    status: done
+    comment: Non-commanding capability discovery is persisted and refreshed before active control.
+    references:
+      code:
+        - custom_components/ha_energy_planner/discovery.py
+        - custom_components/ha_energy_planner/coordinator.py
+      tests:
+        - tests/test_discovery.py
+        - scripts/docker-ha-smoke.sh
+  discovery:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/discovery.py
+      tests:
+        - tests/test_discovery.py
+  docs-data-update:
+    status: done
+    references:
+      docs:
+        - README.md
+        - docs/requirements-audit.md
+  docs-examples:
+    status: done
+    references:
+      docs:
+        - README.md
+  docs-known-limitations:
+    status: done
+    references:
+      docs:
+        - README.md
+        - docs/requirements-audit.md
+  docs-supported-devices:
+    status: done
+    references:
+      docs:
+        - README.md
+        - ha-energy-planner-spec.md
+  docs-supported-functions:
+    status: done
+    references:
+      docs:
+        - README.md
+        - ha-energy-planner-spec.md
+  docs-troubleshooting:
+    status: done
+    references:
+      docs:
+        - README.md
+  docs-use-cases:
+    status: done
+    references:
+      docs:
+        - ha-energy-planner-spec.md
+  dynamic-devices:
+    status: done
+    comment: Device and entity metadata are generated from config-entry runtime data and coordinator state.
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+        - custom_components/ha_energy_planner/coordinator.py
+      tests:
+        - scripts/docker-ha-smoke.sh
+  entity-category:
+    status: n/a
+    comment: Exposed entities are primary planner control/status entities rather than diagnostic/configuration-only entities.
+    references:
+      code:
+        - custom_components/ha_energy_planner/sensor.py
+        - custom_components/ha_energy_planner/binary_sensor.py
+        - custom_components/ha_energy_planner/switch.py
+        - custom_components/ha_energy_planner/button.py
+  entity-device-class:
+    status: n/a
+    comment: Planner status, cost, confidence, control, and health entities do not have matching Home Assistant device classes beyond their platform semantics.
+    references:
+      code:
+        - custom_components/ha_energy_planner/sensor.py
+        - custom_components/ha_energy_planner/binary_sensor.py
+  entity-disabled-by-default:
+    status: n/a
+    comment: The integration exposes only core planner status/control entities; no noisy diagnostic entities are created by default.
+    references:
+      code:
+        - custom_components/ha_energy_planner/sensor.py
+        - custom_components/ha_energy_planner/binary_sensor.py
+        - custom_components/ha_energy_planner/switch.py
+        - custom_components/ha_energy_planner/button.py
+  entity-translations:
+    status: done
+    references:
+      code:
+        - custom_components/ha_energy_planner/strings.json
+        - custom_components/ha_energy_planner/translations/en.json
+      tests:
+        - scripts/docker-ha-smoke.sh
+  exception-translations:
+    status: done
+    comment: Config-flow and options-flow errors use translation keys from strings.json and translations/en.json.
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+        - custom_components/ha_energy_planner/strings.json
+        - custom_components/ha_energy_planner/translations/en.json
+      tests:
+        - tests/test_config_flow.py
+  icon-translations:
+    status: n/a
+    comment: No custom icon translation file is required for the current entity set.
+    references:
+      code:
+        - custom_components/ha_energy_planner/strings.json
+  reconfiguration-flow:
+    status: n/a
+    comment: Configuration changes are handled through the options flow and Home Assistant config-entry editing of entity mappings.
+    references:
+      code:
+        - custom_components/ha_energy_planner/config_flow.py
+      tests:
+        - tests/test_config_flow.py
+  repair-issues:
+    status: n/a
+    comment: Planner fallback and recovery are exposed through persistent notifications and restore-safe-state services rather than Home Assistant Repairs.
+    references:
+      code:
+        - custom_components/ha_energy_planner/executor.py
+      tests:
+        - tests/test_executor.py
+        - scripts/docker-ha-smoke.sh
+  stale-devices:
+    status: n/a
+    comment: The integration has one config-entry device and no discovered device inventory to prune.
+    references:
+      code:
+        - custom_components/ha_energy_planner/entity.py
+  async-dependency:
+    status: done
+    comment: Integration I/O uses async Home Assistant services, async coordinators, and async HTTP export tooling; there are no synchronous third-party client dependencies.
+    references:
+      code:
+        - custom_components/ha_energy_planner/coordinator.py
+        - custom_components/ha_energy_planner/haeo_adapter.py
+        - custom_components/ha_energy_planner/ai_advisor.py
+  inject-websession:
+    status: n/a
+    comment: The integration does not maintain an aiohttp API client; external optimization and AI calls are delegated to configured Home Assistant services.
+    references:
+      code:
+        - custom_components/ha_energy_planner/haeo_adapter.py
+        - custom_components/ha_energy_planner/ai_advisor.py
+  strict-typing:
+    status: done
+    comment: Config-entry runtime data uses a typed ConfigEntry alias, platform setup paths consume that typed entry, and the Docker gate rejects generated artifacts while compiling the integration.
+    references:
+      code:
+        - custom_components/ha_energy_planner/type_defs.py
+        - custom_components/ha_energy_planner/__init__.py
+        - custom_components/ha_energy_planner/entity.py
+        - pyproject.toml
+        - scripts/docker-validate.sh

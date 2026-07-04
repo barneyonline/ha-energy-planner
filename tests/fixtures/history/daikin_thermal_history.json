@@ -1,0 +1,49 @@
+{
+  "end": "2026-06-27T01:00:00+00:00",
+  "expected_min_active_samples": 12,
+  "expected_min_passive_samples": 0,
+  "exported_at": "2026-06-27T01:00:00+00:00",
+  "hvac_power_key": "hvac_power",
+  "indoor_temperature_attribute": "current_temperature",
+  "indoor_temperature_key": "indoor_temperature",
+  "kind": "thermal_history",
+  "name": "daikin_thermal_history_replay",
+  "outdoor_temperature_key": "outdoor_temperature",
+  "source_entity_ids": {
+    "hvac_power": "sensor.daikinap02966_power",
+    "indoor_temperature": "climate.daikinap02966"
+  },
+  "start": "2026-06-27T00:00:00+00:00",
+  "states": {
+    "hvac_power": [
+      {"attributes": {}, "last_changed": "2026-06-27T00:00:00+00:00", "last_updated": "2026-06-27T00:00:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:05:00+00:00", "last_updated": "2026-06-27T00:05:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:10:00+00:00", "last_updated": "2026-06-27T00:10:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:15:00+00:00", "last_updated": "2026-06-27T00:15:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:20:00+00:00", "last_updated": "2026-06-27T00:20:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:25:00+00:00", "last_updated": "2026-06-27T00:25:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:30:00+00:00", "last_updated": "2026-06-27T00:30:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:35:00+00:00", "last_updated": "2026-06-27T00:35:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:40:00+00:00", "last_updated": "2026-06-27T00:40:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:45:00+00:00", "last_updated": "2026-06-27T00:45:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:50:00+00:00", "last_updated": "2026-06-27T00:50:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T00:55:00+00:00", "last_updated": "2026-06-27T00:55:00+00:00", "state": "1.8"},
+      {"attributes": {}, "last_changed": "2026-06-27T01:00:00+00:00", "last_updated": "2026-06-27T01:00:00+00:00", "state": "1.8"}
+    ],
+    "indoor_temperature": [
+      {"attributes": {"current_temperature": 20.0}, "last_changed": "2026-06-27T00:00:00+00:00", "last_updated": "2026-06-27T00:00:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.1}, "last_changed": "2026-06-27T00:05:00+00:00", "last_updated": "2026-06-27T00:05:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.2}, "last_changed": "2026-06-27T00:10:00+00:00", "last_updated": "2026-06-27T00:10:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.3}, "last_changed": "2026-06-27T00:15:00+00:00", "last_updated": "2026-06-27T00:15:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.4}, "last_changed": "2026-06-27T00:20:00+00:00", "last_updated": "2026-06-27T00:20:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.5}, "last_changed": "2026-06-27T00:25:00+00:00", "last_updated": "2026-06-27T00:25:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.6}, "last_changed": "2026-06-27T00:30:00+00:00", "last_updated": "2026-06-27T00:30:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.7}, "last_changed": "2026-06-27T00:35:00+00:00", "last_updated": "2026-06-27T00:35:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.8}, "last_changed": "2026-06-27T00:40:00+00:00", "last_updated": "2026-06-27T00:40:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 20.9}, "last_changed": "2026-06-27T00:45:00+00:00", "last_updated": "2026-06-27T00:45:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 21.0}, "last_changed": "2026-06-27T00:50:00+00:00", "last_updated": "2026-06-27T00:50:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 21.1}, "last_changed": "2026-06-27T00:55:00+00:00", "last_updated": "2026-06-27T00:55:00+00:00", "state": "heat"},
+      {"attributes": {"current_temperature": 21.2}, "last_changed": "2026-06-27T01:00:00+00:00", "last_updated": "2026-06-27T01:00:00+00:00", "state": "heat"}
+    ]
+  }
+}

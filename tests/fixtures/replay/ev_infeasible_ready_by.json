@@ -1,0 +1,67 @@
+{
+  "name": "ev_infeasible_ready_by_allowed_with_evidence",
+  "expected_rejected_action_count": 0,
+  "expected_action_violations": {
+    "ev-infeasible": []
+  },
+  "now": "2026-06-27T00:00:00+00:00",
+  "options": {
+    "planner_enabled": true,
+    "dry_run": false,
+    "battery_min_soc_percent": 10,
+    "ev_min_soc_percent": 70,
+    "ev_max_soc_percent": 90
+  },
+  "context": {
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "plan_id": "replay-plan-ev-infeasible",
+    "current_battery_soc_percent": 55,
+    "current_ev_soc_percent": 40,
+    "occupancy_state": "occupied",
+    "haeo_status": "ready",
+    "input_health": "healthy",
+    "slots": [
+      {
+        "valid_at": "2026-06-27T00:00:00+00:00",
+        "import_price": 0.10,
+        "export_price": 0.08,
+        "pv_forecast_kw": 1.2,
+        "baseline_load_forecast_kw": 2.0,
+        "projected_ev_load_kw": 6.0
+      }
+    ]
+  },
+  "plan": {
+    "plan_id": "replay-plan-ev-infeasible",
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "horizon_hours": 24,
+    "interval_minutes": 5,
+    "status": "current",
+    "health": "healthy",
+    "mode": "ACTIVE_HEALTHY",
+    "summary": "replay EV infeasible ready-by",
+    "confidence": 1.0,
+    "actions": [
+      {
+        "action_id": "ev-infeasible",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:05:00+00:00",
+        "asset": "ev",
+        "kind": "ev_schedule",
+        "desired_state": {
+          "target_soc_percent": 45,
+          "ready_by": "00:05",
+          "infeasible": true,
+          "allocated_slots": [
+            {
+              "valid_at": "2026-06-27T00:00:00+00:00",
+              "charge_kw": 6.0,
+              "added_soc_percent": 5.0,
+              "import_price": 0.10
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

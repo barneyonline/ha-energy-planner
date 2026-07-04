@@ -1,0 +1,13 @@
+services:
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: ha-energy-planner-test
+    volumes:
+      - ./docker/homeassistant/config:/config
+      - ./custom_components/ha_energy_planner:/config/custom_components/ha_energy_planner:ro
+    environment:
+      - TZ=Australia/Melbourne
+      - PYTHONPATH=/config/deps
+    ports:
+      - "8124:8123"
+    restart: unless-stopped

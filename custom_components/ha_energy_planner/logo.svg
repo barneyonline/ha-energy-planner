@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 537 256" role="img" aria-label="Energy Planner logo">
+  <defs>
+    <linearGradient id="badge" x1="48" y1="32" x2="208" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00a9ce"/>
+      <stop offset="1" stop-color="#43a047"/>
+    </linearGradient>
+  </defs>
+  <circle cx="128" cy="128" r="112" fill="url(#badge)"/>
+  <path d="M82 133h92" stroke="#ffffff" stroke-width="16" stroke-linecap="round"/>
+  <path d="M85 169c25 20 61 22 89 5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round"/>
+  <path d="M89 89c25-20 61-22 89-5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round"/>
+  <circle cx="64" cy="128" r="16" fill="#fdd835"/>
+  <circle cx="192" cy="128" r="16" fill="#fdd835"/>
+  <path d="M135 56l-42 82h34l-12 62 50-88h-36z" fill="#fdd835"/>
+  <text x="272" y="112" fill="#263238" font-family="Inter, Arial, sans-serif" font-size="38" font-weight="700">HA Energy</text>
+  <text x="272" y="160" fill="#546e7a" font-family="Inter, Arial, sans-serif" font-size="34" font-weight="500">Planner</text>
+</svg>

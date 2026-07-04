@@ -1,0 +1,56 @@
+{
+  "connected_key": "ev_connected",
+  "end": "2026-06-27T08:00:00+00:00",
+  "expected_min_records": 1,
+  "exported_at": "2026-06-27T08:00:00+00:00",
+  "kind": "ev_trip_history",
+  "name": "mini_trip_history_replay",
+  "soc_key": "ev_soc",
+  "source_entity_ids": {
+    "ev_connected": "binary_sensor.mini_connected",
+    "ev_soc": "sensor.mini_soc"
+  },
+  "start": "2026-06-27T00:00:00+00:00",
+  "states": {
+    "ev_connected": [
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T00:00:00+00:00",
+        "last_updated": "2026-06-27T00:00:00+00:00",
+        "state": "plugged_in"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T01:00:00+00:00",
+        "last_updated": "2026-06-27T01:00:00+00:00",
+        "state": "unplugged"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T03:00:00+00:00",
+        "last_updated": "2026-06-27T03:00:00+00:00",
+        "state": "connected_not_charging"
+      }
+    ],
+    "ev_soc": [
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T00:00:00+00:00",
+        "last_updated": "2026-06-27T00:00:00+00:00",
+        "state": "80 %"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T01:00:00+00:00",
+        "last_updated": "2026-06-27T01:00:00+00:00",
+        "state": "78%"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T03:00:00+00:00",
+        "last_updated": "2026-06-27T03:00:00+00:00",
+        "state": "70 %"
+      }
+    ]
+  }
+}

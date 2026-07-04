@@ -1,0 +1,66 @@
+{
+  "name": "negative_price_ev_allowed",
+  "expected_rejected_action_count": 0,
+  "expected_action_violations": {
+    "ev-negative-price": []
+  },
+  "now": "2026-06-27T00:00:00+00:00",
+  "options": {
+    "planner_enabled": true,
+    "dry_run": false,
+    "battery_min_soc_percent": 10,
+    "ev_min_soc_percent": 40,
+    "ev_max_soc_percent": 90
+  },
+  "context": {
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "plan_id": "replay-plan-negative-price",
+    "current_battery_soc_percent": 55,
+    "current_ev_soc_percent": 35,
+    "occupancy_state": "occupied",
+    "haeo_status": "ready",
+    "input_health": "healthy",
+    "slots": [
+      {
+        "valid_at": "2026-06-27T00:00:00+00:00",
+        "import_price": -0.05,
+        "export_price": 0.01,
+        "pv_forecast_kw": 4.0,
+        "baseline_load_forecast_kw": 1.0,
+        "projected_ev_load_kw": 6.0
+      }
+    ]
+  },
+  "plan": {
+    "plan_id": "replay-plan-negative-price",
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "horizon_hours": 24,
+    "interval_minutes": 5,
+    "status": "current",
+    "health": "healthy",
+    "mode": "ACTIVE_HEALTHY",
+    "summary": "negative price EV replay",
+    "confidence": 1.0,
+    "actions": [
+      {
+        "action_id": "ev-negative-price",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:05:00+00:00",
+        "asset": "ev",
+        "kind": "ev_schedule",
+        "desired_state": {
+          "target_soc_percent": 40,
+          "ready_by": "07:00",
+          "allocated_slots": [
+            {
+              "valid_at": "2026-06-27T00:00:00+00:00",
+              "charge_kw": 6.0,
+              "added_soc_percent": 5.0,
+              "import_price": -0.05
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

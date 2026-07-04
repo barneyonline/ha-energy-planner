@@ -1,0 +1,374 @@
+"""Forecast helpers for Energy Planner."""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from math import isfinite
+import re
+from typing import Any
+
+from .models import ForecastPoint
+
+_FORECAST_CONTAINER_KEYS = (
+    "forecast",
+    "forecasts",
+    "data",
+    "values",
+    "detailedForecast",
+    "detailed_forecast",
+    "predictions",
+)
+_TIME_KEYS = ("valid_at", "datetime", "start_time", "period_start", "from", "time", "date", "nem_time")
+
+
+def constant_forecast(
+    *,
+    issued_at: datetime,
+    source: str,
+    value: float,
+    unit: str,
+    horizon_hours: int,
+    interval_minutes: int,
+    confidence: float | None = None,
+) -> list[ForecastPoint]:
+    """Create a simple constant forecast series from a point sensor."""
+    fresh_until = issued_at + timedelta(minutes=interval_minutes)
+    return [
+        ForecastPoint(
+            issued_at=issued_at,
+            valid_at=issued_at + timedelta(minutes=offset),
+            source=source,
+            value=value,
+            unit=unit,
+            confidence=confidence,
+            fresh_until=fresh_until,
+        )
+        for offset in range(0, horizon_hours * 60, interval_minutes)
+    ]
+
+
+def forecast_series_from_state(
+    state: Any,
+    *,
+    issued_at: datetime,
+    horizon_hours: int,
+    interval_minutes: int,
+    value_keys: tuple[str, ...],
+    value_kind: str,
+) -> list[float] | None:
+    """Return a slot-aligned numeric forecast series from common HA attributes.
+
+    Supports two common integration shapes:
+    - list attributes such as ``forecast`` or ``forecasts`` with timestamped dicts
+    - list attributes with ordered numeric values and no timestamps
+    """
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    default_unit = str(
+        attributes.get(
+            "unit_of_measurement",
+            attributes.get("unit", attributes.get("temperature_unit", "")),
+        )
+    )
+    slot_count = int((horizon_hours * 60) / interval_minutes)
+    if not raw_items:
+        return None
+    if value_kind == "power":
+        raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
+
+    parsed = [
+        _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit)
+        for item in raw_items
+    ]
+    parsed = [item for item in parsed if item is not None]
+    if not parsed:
+        return None
+
+    if all(valid_at is None for valid_at, _value in parsed):
+        return [value for _valid_at, value in parsed[:slot_count]]
+
+    timestamped = sorted(
+        [(valid_at, value) for valid_at, value in parsed if valid_at is not None],
+        key=lambda item: item[0],
+    )
+    return [
+        _value_for_slot(issued_at + timedelta(minutes=offset), timestamped)
+        for offset in range(0, horizon_hours * 60, interval_minutes)
+    ]
+
+
+def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = "", unit: str = "") -> float:
+    """Normalize a scalar forecast/input value into planner units."""
+    if value_kind == "temperature":
+        return _normalize_temperature_value(value, unit)
+    if value_kind == "price":
+        return _normalize_price_value(value, unit)
+    if value_kind == "power":
+        return _normalize_power_value(value, value_key=value_key, unit=unit)
+    return value
+
+
+def _forecast_items(attributes: dict[str, Any], value_keys: tuple[str, ...]) -> list[Any]:
+    attributes = _with_canonical_keys(attributes)
+    for key in _FORECAST_CONTAINER_KEYS:
+        value = attributes.get(key)
+        items = _items_from_value(value, value_keys)
+        if items:
+            return items
+    for key in value_keys:
+        items = _items_from_value(attributes.get(key), value_keys, map_value_key=key)
+        if items:
+            return items
+    return []
+
+
+def _items_from_value(
+    value: Any,
+    value_keys: tuple[str, ...],
+    depth: int = 0,
+    map_value_key: str | None = None,
+) -> list[Any]:
+    if value is None or depth > 4:
+        return []
+    if isinstance(value, list):
+        return value
+    if not isinstance(value, dict):
+        return []
+    value = _with_canonical_keys(value)
+
+    mapped_items = _items_from_time_map(value, value_keys, map_value_key)
+    if mapped_items:
+        return mapped_items
+
+    for key in _FORECAST_CONTAINER_KEYS:
+        items = _items_from_value(value.get(key), value_keys, depth + 1)
+        if items:
+            return items
+    return []
+
+
+def _items_from_time_map(value: dict[str, Any], value_keys: tuple[str, ...], map_value_key: str | None) -> list[Any]:
+    items: list[dict[str, Any]] = []
+    value_key = map_value_key or value_keys[0]
+    for key, raw_value in value.items():
+        valid_at = _parse_datetime_or_none(key)
+        if valid_at is None:
+            continue
+        if isinstance(raw_value, dict):
+            item = dict(raw_value)
+            item.setdefault("valid_at", key)
+        else:
+            item = {"valid_at": key, value_key: raw_value}
+        items.append(item)
+    return items
+
+
+def _parse_item(
+    item: Any,
+    *,
+    value_keys: tuple[str, ...],
+    value_kind: str,
+    default_unit: str = "",
+) -> tuple[datetime | None, float] | None:
+    if isinstance(item, (int, float, str)):
+        try:
+            value = float(item)
+        except (TypeError, ValueError):
+            return None
+        if not isfinite(value):
+            return None
+        return None, normalize_scalar_value(value, value_kind=value_kind, unit=default_unit)
+    if not isinstance(item, dict):
+        return None
+
+    item = _flatten_item(item)
+    value_key = next((key for key in value_keys if key in item), None)
+    if value_key is None:
+        return None
+    try:
+        value = float(item[value_key])
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(value):
+        return None
+    unit = str(item.get("unit", item.get("units", item.get("unit_of_measurement", default_unit))))
+    value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_key, unit=unit)
+
+    valid_at = None
+    for key in _TIME_KEYS:
+        if key not in item:
+            continue
+        valid_at = _parse_datetime_or_none(item[key])
+        if valid_at is not None:
+            break
+    return valid_at, value
+
+
+def _energy_items_as_average_power(
+    raw_items: list[Any],
+    value_keys: tuple[str, ...],
+    default_unit: str,
+) -> list[Any]:
+    """Convert energy forecast buckets into average kW power values."""
+    prepared: list[tuple[Any, dict[str, Any] | None, datetime | None]] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            prepared.append((item, None, None))
+            continue
+        flattened = _flatten_item(item)
+        valid_at = None
+        for key in _TIME_KEYS:
+            if key not in flattened:
+                continue
+            valid_at = _parse_datetime_or_none(flattened[key])
+            if valid_at is not None:
+                break
+        prepared.append((item, flattened, valid_at))
+
+    timestamps = [valid_at for _item, _flattened, valid_at in prepared if valid_at is not None]
+    inferred_hours = _infer_bucket_hours(timestamps)
+    converted: list[Any] = []
+    for item, flattened, valid_at in prepared:
+        if flattened is None:
+            converted.append(item)
+            continue
+        value_key = next((key for key in value_keys if key in flattened), None)
+        unit = str(flattened.get("unit", flattened.get("units", flattened.get("unit_of_measurement", default_unit))))
+        if value_key is None or _normalize_unit(unit) not in _ENERGY_UNITS:
+            converted.append(item)
+            continue
+        bucket_hours = inferred_hours.get(valid_at, 1.0)
+        if bucket_hours <= 0:
+            converted.append(item)
+            continue
+        try:
+            energy = float(flattened[value_key])
+        except (TypeError, ValueError):
+            converted.append(item)
+            continue
+        if not isfinite(energy):
+            converted.append(item)
+            continue
+        converted_item = dict(item)
+        converted_item[value_key] = _energy_to_kwh(energy, unit) / bucket_hours
+        converted_item["unit"] = "kW"
+        converted.append(converted_item)
+    return converted
+
+
+def _infer_bucket_hours(timestamps: list[datetime]) -> dict[datetime | None, float]:
+    """Infer forecast bucket durations from adjacent timestamps."""
+    if not timestamps:
+        return {None: 1.0}
+    ordered = sorted(timestamps)
+    durations: dict[datetime | None, float] = {}
+    previous_duration = 1.0
+    for index, valid_at in enumerate(ordered):
+        if index + 1 < len(ordered):
+            duration = (ordered[index + 1] - valid_at).total_seconds() / 3600
+            if duration > 0:
+                previous_duration = duration
+        durations[valid_at] = previous_duration
+    durations[None] = previous_duration
+    return durations
+
+
+def _energy_to_kwh(value: float, unit: str) -> float:
+    unit_lower = _normalize_unit(unit)
+    if unit_lower in {"wh", "watt-hour", "watthour", "watt-hours", "watthours"}:
+        return value / 1000
+    if unit_lower in {"mwh", "megawatt-hour", "megawatthour", "megawatt-hours", "megawatthours"}:
+        return value * 1000
+    return value
+
+
+def _flatten_item(item: dict[str, Any]) -> dict[str, Any]:
+    flattened = _with_canonical_keys(item)
+    for key in ("value", "values", "forecast", "data", "prediction"):
+        nested = flattened.get(key)
+        if isinstance(nested, dict):
+            for nested_key, nested_value in _with_canonical_keys(nested).items():
+                flattened.setdefault(nested_key, nested_value)
+    return flattened
+
+
+def _with_canonical_keys(value: dict[str, Any]) -> dict[str, Any]:
+    canonical = dict(value)
+    for key, item_value in value.items():
+        canonical.setdefault(_canonical_key(key), item_value)
+    return canonical
+
+
+def _canonical_key(value: Any) -> str:
+    raw = str(value)
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw)
+    separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
+    return separated.strip("_").lower()
+
+
+def _normalize_price_value(value: float, unit: str) -> float:
+    unit_lower = _normalize_unit(unit)
+    if unit_lower in {"c/kwh", "¢/kwh", "cent/kwh", "cents/kwh"}:
+        return value / 100
+    return value
+
+
+def _normalize_power_value(value: float, *, value_key: str, unit: str) -> float:
+    unit_lower = _normalize_unit(unit)
+    if unit_lower in {"mw", "megawatt", "megawatts"}:
+        return value * 1000
+    if unit_lower in {"w", "watt", "watts"} or "watt" in value_key.lower():
+        return value / 1000
+    if unit_lower in _ENERGY_UNITS:
+        return _energy_to_kwh(value, unit)
+    return value
+
+
+def _normalize_temperature_value(value: float, unit: str) -> float:
+    unit_lower = _normalize_unit(unit)
+    if unit_lower in {"f", "°f", "fahrenheit"}:
+        return round((value - 32) * 5 / 9, 4)
+    return value
+
+
+def _normalize_unit(unit: str) -> str:
+    return unit.strip().lower().replace(" ", "")
+
+
+_ENERGY_UNITS = {
+    "wh",
+    "watt-hour",
+    "watthour",
+    "watt-hours",
+    "watthours",
+    "kwh",
+    "kilowatt-hour",
+    "kilowatthour",
+    "kilowatt-hours",
+    "kilowatthours",
+    "mwh",
+    "megawatt-hour",
+    "megawatthour",
+    "megawatt-hours",
+    "megawatthours",
+}
+
+
+def _value_for_slot(slot_time: datetime, timestamped: list[tuple[datetime, float]]) -> float:
+    selected = timestamped[0][1]
+    for valid_at, value in timestamped:
+        if valid_at > slot_time:
+            break
+        selected = value
+    return selected
+
+
+def _parse_datetime_or_none(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None

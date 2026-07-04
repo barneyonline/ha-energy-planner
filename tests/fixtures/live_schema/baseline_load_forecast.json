@@ -1,0 +1,21 @@
+{
+  "kind": "forecast_state",
+  "name": "baseline_load_timestamp_map",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "power",
+  "value_keys": ["baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"],
+  "state": "1.1",
+  "attributes": {
+    "values": {
+      "2026-06-27T00:00:00+00:00": {
+        "load_kw": 1.1
+      },
+      "2026-06-27T00:30:00+00:00": {
+        "load_kw": 1.8
+      }
+    }
+  },
+  "expected": [1.1, 1.1, 1.8, 1.8]
+}

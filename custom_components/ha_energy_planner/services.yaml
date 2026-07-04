@@ -1,0 +1,107 @@
+replan:
+  name: Replan
+  description: Request an immediate planner refresh.
+  fields: {}
+
+restore_safe_state:
+  name: Restore safe state
+  description: Restore planner-owned EV, Enphase, and HVAC state where supported.
+  fields:
+    reason:
+      required: false
+      selector:
+        text:
+
+set_ev_ready_by:
+  name: Set EV ready by
+  description: Set a runtime EV ready-by time override.
+  fields:
+    ready_by:
+      required: true
+      selector:
+        time:
+
+set_manual_hvac_override:
+  name: Set manual HVAC override
+  description: Block planner HVAC control for a bounded manual override window.
+  fields:
+    duration_minutes:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 1440
+          step: 1
+          mode: box
+    reason:
+      required: false
+      selector:
+        text:
+
+export_diagnostics:
+  name: Export diagnostics
+  description: Return redacted diagnostic state for this integration.
+  fields: {}
+
+export_support_bundle:
+  name: Export support bundle
+  description: Return preflight plus redacted diagnostics for production review.
+  fields: {}
+
+run_preflight:
+  name: Run preflight
+  description: Check active-mode readiness without issuing device commands.
+  fields: {}
+
+arm_production_control:
+  name: Arm production control
+  description: Acknowledge production readiness and allow active device commands when other safety checks pass.
+  fields:
+    reason:
+      required: false
+      selector:
+        text:
+
+disarm_production_control:
+  name: Disarm production control
+  description: Block active device commands until production control is armed again.
+  fields:
+    reason:
+      required: false
+      selector:
+        text:
+
+pause_control:
+  name: Pause control
+  description: Temporarily pause planner-owned active control for all devices or one device class.
+  fields:
+    duration_minutes:
+      required: true
+      selector:
+        number:
+          min: 1
+          max: 10080
+          step: 1
+          mode: box
+    asset:
+      required: false
+      selector:
+        select:
+          options:
+            - all
+            - ev
+            - daikin
+            - enphase
+    reason:
+      required: false
+      selector:
+        text:
+
+resume_control:
+  name: Resume control
+  description: Clear the active control pause.
+  fields:
+    reason:
+      required: false
+      selector:
+        text:

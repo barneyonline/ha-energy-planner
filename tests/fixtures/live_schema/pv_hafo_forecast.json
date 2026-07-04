@@ -1,0 +1,29 @@
+{
+  "kind": "forecast_state",
+  "name": "pv_hafo_nested_forecast",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "power",
+  "value_keys": ["pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"],
+  "state": "0",
+  "attributes": {
+    "detailedForecast": {
+      "data": [
+        {
+          "period_start": "2026-06-27T00:00:00+00:00",
+          "prediction": {
+            "watts": 500
+          }
+        },
+        {
+          "period_start": "2026-06-27T00:30:00+00:00",
+          "prediction": {
+            "watts": 1200
+          }
+        }
+      ]
+    }
+  },
+  "expected": [0.5, 0.5, 1.2, 1.2]
+}

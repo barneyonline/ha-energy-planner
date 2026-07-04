@@ -1,0 +1,24 @@
+{
+  "kind": "forecast_state",
+  "name": "weather_hourly_forecast",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "temperature",
+  "value_keys": ["outdoor_temperature_forecast_c", "temperature", "native_temperature", "temp", "value"],
+  "state": "sunny",
+  "attributes": {
+    "temperature_unit": "F",
+    "forecast": [
+      {
+        "datetime": "2026-06-27T00:00:00+00:00",
+        "native_temperature": 68
+      },
+      {
+        "datetime": "2026-06-27T00:30:00+00:00",
+        "native_temperature": 77
+      }
+    ]
+  },
+  "expected": [20.0, 20.0, 25.0, 25.0]
+}

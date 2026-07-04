@@ -1,0 +1,57 @@
+{
+  "name": "hvac_comfort_action_rejected_while_away",
+  "expected_rejected_action_count": 1,
+  "expected_action_violations": {
+    "hvac-heat-while-away": ["hvac_action_not_allowed_while_away"]
+  },
+  "now": "2026-06-27T00:10:00+00:00",
+  "options": {
+    "planner_enabled": true,
+    "dry_run": false,
+    "battery_min_soc_percent": 10,
+    "ev_min_soc_percent": 40,
+    "ev_max_soc_percent": 90
+  },
+  "context": {
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "plan_id": "replay-plan-hvac-away",
+    "current_battery_soc_percent": 55,
+    "current_ev_soc_percent": 50,
+    "occupancy_state": "away",
+    "haeo_status": "ready",
+    "input_health": "healthy",
+    "slots": [
+      {
+        "valid_at": "2026-06-27T00:00:00+00:00",
+        "import_price": 0.25,
+        "export_price": 0.08,
+        "pv_forecast_kw": 1.2,
+        "baseline_load_forecast_kw": 2.0
+      }
+    ]
+  },
+  "plan": {
+    "plan_id": "replay-plan-hvac-away",
+    "created_at": "2026-06-27T00:00:00+00:00",
+    "horizon_hours": 24,
+    "interval_minutes": 5,
+    "status": "current",
+    "health": "healthy",
+    "mode": "ACTIVE_HEALTHY",
+    "summary": "replay HVAC away rejection",
+    "confidence": 1.0,
+    "actions": [
+      {
+        "action_id": "hvac-heat-while-away",
+        "execute_not_before": "2026-06-27T00:00:00+00:00",
+        "execute_not_after": "2026-06-27T00:20:00+00:00",
+        "asset": "daikin",
+        "kind": "set_hvac",
+        "desired_state": {
+          "hvac_mode": "heat",
+          "target_temperature": 20
+        }
+      }
+    ]
+  }
+}
