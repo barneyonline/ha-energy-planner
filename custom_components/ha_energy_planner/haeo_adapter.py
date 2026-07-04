@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, tzinfo
 from math import isfinite
-import re
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -139,7 +139,9 @@ class HAEOAdapter:
             if real_haeo_entry_id:
                 response = await self.hass.services.async_call(domain, service, service_data, blocking=True)
             else:
-                response = await self.hass.services.async_call(domain, service, service_data, blocking=True, return_response=True)
+                response = await self.hass.services.async_call(
+                    domain, service, service_data, blocking=True, return_response=True
+                )
         except TypeError:
             try:
                 response = await self.hass.services.async_call(domain, service, service_data, blocking=True)
@@ -153,8 +155,8 @@ class HAEOAdapter:
             "haeo_service_called",
             context.plan_id,
             service_called=self.optimize_service,
-        response=response if isinstance(response, dict) else None,
-    )
+            response=response if isinstance(response, dict) else None,
+        )
 
 
 def _first_haeo_entry_id(hass: HomeAssistant) -> str | None:

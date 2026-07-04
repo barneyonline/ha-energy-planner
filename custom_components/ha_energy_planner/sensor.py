@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
 from homeassistant.const import EntityCategory
@@ -55,15 +56,17 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         value_fn=lambda coordinator: "Unknown" if not coordinator.data else _display_state(coordinator.data.status),
         attrs_fn=lambda coordinator: {}
         if not coordinator.data
-        else to_jsonable({
-            "plan_id": coordinator.data.plan_id,
-            "created_at": coordinator.data.created_at.isoformat(),
-            "mode": coordinator.data.mode,
-            "health": coordinator.data.health,
-            "summary": coordinator.data.summary,
-            "issues": coordinator.data.input_issues[:20],
-            "preview": coordinator.data.preview[:12],
-        }),
+        else to_jsonable(
+            {
+                "plan_id": coordinator.data.plan_id,
+                "created_at": coordinator.data.created_at.isoformat(),
+                "mode": coordinator.data.mode,
+                "health": coordinator.data.health,
+                "summary": coordinator.data.summary,
+                "issues": coordinator.data.input_issues[:20],
+                "preview": coordinator.data.preview[:12],
+            }
+        ),
     ),
     PlannerSensorDescription(
         key="estimated_daily_cost",
@@ -242,7 +245,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensors."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    async_add_planner_entities(entry, async_add_entities, (PlannerSensor(coordinator, description) for description in SENSORS))
+    async_add_planner_entities(
+        entry, async_add_entities, (PlannerSensor(coordinator, description) for description in SENSORS)
+    )
 
 
 class PlannerSensor(EnergyPlannerEntity, SensorEntity):
@@ -309,7 +314,9 @@ def _asset_plan_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, 
         "current_state": device_plan.get("current_state") if isinstance(device_plan, dict) else None,
         "current_state_label": device_plan.get("current_state_label") if isinstance(device_plan, dict) else None,
         "next_planned_state": device_plan.get("next_planned_state") if isinstance(device_plan, dict) else None,
-        "next_planned_state_label": device_plan.get("next_planned_state_label") if isinstance(device_plan, dict) else None,
+        "next_planned_state_label": device_plan.get("next_planned_state_label")
+        if isinstance(device_plan, dict)
+        else None,
         "planned_action_count": len(actions),
         "planned_actions": [_compact_action(action) for action in actions[:5]],
         "timeline_segment_count": len(timeline) if isinstance(timeline, list) else 0,
@@ -372,7 +379,9 @@ def _asset_timeline_state(device_plan: dict[str, Any], kind: str) -> dict[str, A
     for item in timeline[1:]:
         if not isinstance(item, dict):
             continue
-        if item.get("state") != current.get("state") or _timeline_payload_without_times(item) != _timeline_payload_without_times(current):
+        if item.get("state") != current.get("state") or _timeline_payload_without_times(
+            item
+        ) != _timeline_payload_without_times(current):
             return dict(item)
     return {"state": "idle"}
 
@@ -426,7 +435,9 @@ def _ev_current_charge_state(coordinator: EnergyPlannerCoordinator) -> str:
             return label
     if coordinator.data is None:
         return "Unknown"
-    return _charge_timeline_state_label(_asset_timeline_state(_device_plan_for_asset(coordinator.data, ActionAsset.EV), "current"))
+    return _charge_timeline_state_label(
+        _asset_timeline_state(_device_plan_for_asset(coordinator.data, ActionAsset.EV), "current")
+    )
 
 
 def _ev_next_charge_state(plan: EnergyPlan | None) -> str:
@@ -847,10 +858,7 @@ def _bounded_json(value: Any, *, depth: int = 0) -> Any:
         return "<truncated>"
     value = to_jsonable(value)
     if isinstance(value, dict):
-        return {
-            str(key): _bounded_json(item, depth=depth + 1)
-            for key, item in list(value.items())[:16]
-        }
+        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:16]}
     if isinstance(value, list):
         items = [_bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:

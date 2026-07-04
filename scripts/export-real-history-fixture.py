@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urljoin
@@ -36,8 +36,7 @@ SENSITIVE_KEY_PARTS = (
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Export sanitized Home Assistant Recorder history for EV trip and "
-            "Daikin HVAC thermal replay validation."
+            "Export sanitized Home Assistant Recorder history for EV trip and Daikin HVAC thermal replay validation."
         )
     )
     parser.add_argument("--ha-url", default=os.environ.get("HOME_ASSISTANT_URL"))
@@ -238,9 +237,7 @@ def _sanitize_state(
 ) -> dict[str, Any]:
     attributes = item.get("attributes", {})
     kept_attributes = {
-        key: attributes.get(key)
-        for key in keep_attributes
-        if isinstance(attributes, dict) and key in attributes
+        key: attributes.get(key) for key in keep_attributes if isinstance(attributes, dict) and key in attributes
     }
     return {
         "state": _sanitize(item.get("state"), extra_parts=extra_parts),

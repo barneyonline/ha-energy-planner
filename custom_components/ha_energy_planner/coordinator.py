@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
 import logging
 from collections.abc import Callable
+from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any
 
@@ -14,14 +14,15 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
+from .ai_advisor import AIAdviceResult, LocalAIAdvisor
 from .const import (
     AI_ADVICE_MIN_INTERVAL_SECONDS,
     CONF_AI_AGENT_ID,
+    CONF_AI_ENABLED,
+    CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_MANUAL_OVERRIDE,
-    CONF_AI_ENABLED,
-    CONF_AI_TASK_ENTITY,
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
@@ -31,19 +32,18 @@ from .const import (
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_PERSON_ENTITIES,
+    CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
     DEBOUNCE_SECONDS,
-    CONF_PLANNER_ENABLED,
     DEFAULT_HAEO_OPTIMIZE_SERVICE,
     DEFAULT_OPTIONS,
     DOMAIN,
 )
-from .ai_advisor import AIAdviceResult, LocalAIAdvisor
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
-from .executor import Executor
 from .ev import update_trip_history_from_values
+from .executor import Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
@@ -124,9 +124,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return
             self._schedule_debounced_refresh()
 
-        self._unsub_listeners.append(
-            async_track_state_change_event(self.hass, entity_ids, _handle_state_change)
-        )
+        self._unsub_listeners.append(async_track_state_change_event(self.hass, entity_ids, _handle_state_change))
 
     def async_shutdown(self) -> None:
         """Cancel listeners and pending debounced refresh."""
@@ -251,7 +249,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "service_called": baseline_result.service_called,
                     "evidence_counts": baseline_evidence_counts,
                 },
-                "second_pass": None if second_pass_result is None else {
+                "second_pass": None
+                if second_pass_result is None
+                else {
                     "phase": second_pass_result.phase,
                     "status": second_pass_result.status,
                     "reason": second_pass_result.reason,
@@ -271,7 +271,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.executor.async_notify_plan_fallback(plan, violations)
         ai_result = None
         if bool(options.get(CONF_AI_ENABLED, False)):
-            ai_result, should_store_ai_result = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
+            ai_result, should_store_ai_result = await self._async_get_throttled_ai_advice(
+                context, plan, entry_data, options
+            )
             if should_store_ai_result:
                 await self.store.async_add_ai_recommendation(
                     {
@@ -299,7 +301,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         "service_called": baseline_result.service_called,
                         "evidence_counts": baseline_evidence_counts,
                     },
-                    "second_pass": None if second_pass_result is None else {
+                    "second_pass": None
+                    if second_pass_result is None
+                    else {
                         "status": second_pass_result.status,
                         "reason": second_pass_result.reason,
                         "service_called": second_pass_result.service_called,
@@ -318,10 +322,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "forecast_training_slots": manager.forecast_training_slots,
                 "forecast_calibration": {
                     "pv_forecast_kw": _calibration_summary(forecast_calibration, "pv_forecast_kw"),
-                    "baseline_load_forecast_kw": _calibration_summary(forecast_calibration, "baseline_load_forecast_kw"),
+                    "baseline_load_forecast_kw": _calibration_summary(
+                        forecast_calibration, "baseline_load_forecast_kw"
+                    ),
                 },
                 "input_issues": context.input_issues[:20],
-                "ai": None if ai_result is None else {
+                "ai": None
+                if ai_result is None
+                else {
                     "status": ai_result.status,
                     "accepted_fields": sorted(ai_result.accepted),
                     "rejected_reason": ai_result.rejected_reason,
@@ -351,9 +359,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
         """Set a manual HVAC override."""
         expires_at = dt_util.utcnow() + timedelta(minutes=duration_minutes)
-        self.overrides = [
-            override for override in self.overrides if override.kind != "manual_hvac"
-        ]
+        self.overrides = [override for override in self.overrides if override.kind != "manual_hvac"]
         self.overrides.append(
             Override(
                 kind="manual_hvac",
@@ -556,7 +562,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         rejected_reason="ai_rate_limited",
                         rejected_detail={
                             "reason": "ai_rate_limited",
-                            "message": "AI advice was skipped because the last provider call was less than 5 minutes ago.",
+                            "message": (
+                                "AI advice was skipped because the last provider call "
+                                "was less than 5 minutes ago."
+                            ),
                             "retry_after_seconds": remaining_seconds,
                             "last_called_at": last_called_at.isoformat(),
                         },
@@ -597,11 +606,7 @@ def _latest_ai_service_call_at(recommendations: Any) -> datetime | None:
 def _seconds_until_next_interval_boundary(now: Any, interval_minutes: int) -> float:
     """Return seconds until the next wall-clock planning boundary."""
     interval_seconds = max(int(interval_minutes), 1) * 60
-    elapsed_seconds = (
-        now.minute * 60
-        + now.second
-        + (now.microsecond / 1_000_000)
-    )
+    elapsed_seconds = now.minute * 60 + now.second + (now.microsecond / 1_000_000)
     remainder = elapsed_seconds % interval_seconds
     if remainder == 0:
         return float(interval_seconds)
@@ -619,10 +624,7 @@ def _calibration_summary(model: dict[str, Any], field: str) -> dict[str, Any]:
 
 def _snapshot_actions(plan: EnergyPlan) -> list[dict[str, Any]]:
     """Return bounded action metadata for forecast/audit snapshots."""
-    return [
-        _snapshot_action(action)
-        for action in plan.actions[:8]
-    ]
+    return [_snapshot_action(action) for action in plan.actions[:8]]
 
 
 def _snapshot_action(action: Any) -> dict[str, Any]:
@@ -648,10 +650,7 @@ def _bounded_json(value: Any, *, depth: int = 0) -> Any:
         return "<truncated>"
     value = to_jsonable(value)
     if isinstance(value, dict):
-        return {
-            str(key): _bounded_json(item, depth=depth + 1)
-            for key, item in list(value.items())[:16]
-        }
+        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:16]}
     if isinstance(value, list):
         items = [_bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:

@@ -64,7 +64,9 @@ class FakeEntry:
             "system": type("Subentry", (), {"subentry_id": "haep_system", "subentry_type": "system", "data": {}})(),
             "energy": type("Subentry", (), {"subentry_id": "haep_energy", "subentry_type": "energy", "data": {}})(),
             "climate": type("Subentry", (), {"subentry_id": "haep_climate", "subentry_type": "climate", "data": {}})(),
-            "presence": type("Subentry", (), {"subentry_id": "haep_presence", "subentry_type": "presence", "data": {}})(),
+            "presence": type(
+                "Subentry", (), {"subentry_id": "haep_presence", "subentry_type": "presence", "data": {}}
+            )(),
             "enphase": type("Subentry", (), {"subentry_id": "haep_enphase", "subentry_type": "enphase", "data": {}})(),
             "ai": type("Subentry", (), {"subentry_id": "haep_ai", "subentry_type": "ai", "data": {}})(),
             "ev": type("Subentry", (), {"subentry_id": "haep_ev", "subentry_type": "ev", "data": {}})(),
@@ -195,7 +197,11 @@ def test_remove_legacy_device_clears_planner_entity_device_ids(monkeypatch: pyte
             "sensor.ha_energy_planner_plan_status": type(
                 "Entity",
                 (),
-                {"platform": "ha_energy_planner", "device_id": "device_1", "entity_id": "sensor.ha_energy_planner_plan_status"},
+                {
+                    "platform": "ha_energy_planner",
+                    "device_id": "device_1",
+                    "entity_id": "sensor.ha_energy_planner_plan_status",
+                },
             )(),
             "sensor.other": type(
                 "Entity",

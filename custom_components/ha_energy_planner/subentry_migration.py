@@ -93,9 +93,7 @@ def grouped_subentry_data(entry: ConfigEntry) -> dict[str, dict[str, Any]]:
         if subentry.subentry_type == SUBENTRY_ENPHASE:
             ai_data = {key: value for key, value in data.items() if key in _AI_KEYS}
             enphase_data = {
-                key: value
-                for key, value in data.items()
-                if key not in _AI_KEYS and key not in _ENPHASE_REMOVED_KEYS
+                key: value for key, value in data.items() if key not in _AI_KEYS and key not in _ENPHASE_REMOVED_KEYS
             }
             if enphase_data or any(key in data for key in _ENPHASE_REMOVED_KEYS):
                 for key, value in _ENPHASE_DEFAULTS.items():
@@ -116,7 +114,9 @@ def needs_subentry_consolidation(entry: ConfigEntry) -> bool:
         or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key in subentry.data for key in _AI_KEYS))
         or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key in subentry.data for key in _ENPHASE_REMOVED_KEYS))
         or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key not in subentry.data for key in _ENPHASE_DEFAULTS))
-        or (subentry.subentry_type == SUBENTRY_ENERGY and any(key in subentry.data for key in _CLIMATE_KEYS_FROM_ENERGY))
+        or (
+            subentry.subentry_type == SUBENTRY_ENERGY and any(key in subentry.data for key in _CLIMATE_KEYS_FROM_ENERGY)
+        )
         or (subentry.subentry_type == SUBENTRY_CLIMATE and any(key in subentry.data for key in _PRESENCE_KEYS))
         for subentry in getattr(entry, "subentries", {}).values()
         if subentry.subentry_type in _LEGACY_TO_TARGET
@@ -173,11 +173,7 @@ def async_consolidate_subentries(hass: HomeAssistant, entry: ConfigEntry) -> boo
             continue
 
         moved_keys = _MOVED_KEYS_BY_TARGET.get(subentry.subentry_type, set())
-        if (
-            moved_keys
-            and any(key in subentry.data for key in moved_keys)
-            and subentry.subentry_type not in grouped
-        ):
+        if moved_keys and any(key in subentry.data for key in moved_keys) and subentry.subentry_type not in grouped:
             changed |= hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
 
     return changed

@@ -6,8 +6,8 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from .const import (
-    ATTR_DURATION_MINUTES,
     ATTR_ASSET,
+    ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
     DEFAULT_OPTIONS,
@@ -15,14 +15,14 @@ from .const import (
     INTEGRATION_NAME,
     LEGACY_INTEGRATION_NAME,
     PLATFORMS,
-    SERVICE_EXPORT_DIAGNOSTICS,
-    SERVICE_EXPORT_SUPPORT_BUNDLE,
     SERVICE_ARM_PRODUCTION_CONTROL,
     SERVICE_DISARM_PRODUCTION_CONTROL,
+    SERVICE_EXPORT_DIAGNOSTICS,
+    SERVICE_EXPORT_SUPPORT_BUNDLE,
     SERVICE_PAUSE_CONTROL,
-    SERVICE_RESUME_CONTROL,
     SERVICE_REPLAN,
     SERVICE_RESTORE_SAFE_STATE,
+    SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
@@ -118,7 +118,9 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         DOMAIN,
         SERVICE_RESTORE_SAFE_STATE,
         handle_restore,
-        schema=vol.Schema({vol.Optional(ATTR_REASON, default="manual_service_call"): vol.All(cv.string, _validate_reason_code)}),
+        schema=vol.Schema(
+            {vol.Optional(ATTR_REASON, default="manual_service_call"): vol.All(cv.string, _validate_reason_code)}
+        ),
     )
     hass.services.async_register(
         DOMAIN,
@@ -159,13 +161,17 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         DOMAIN,
         SERVICE_ARM_PRODUCTION_CONTROL,
         handle_arm_production,
-        schema=vol.Schema({vol.Optional(ATTR_REASON, default="user_acknowledged"): vol.All(cv.string, _validate_reason_code)}),
+        schema=vol.Schema(
+            {vol.Optional(ATTR_REASON, default="user_acknowledged"): vol.All(cv.string, _validate_reason_code)}
+        ),
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_DISARM_PRODUCTION_CONTROL,
         handle_disarm_production,
-        schema=vol.Schema({vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}),
+        schema=vol.Schema(
+            {vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}
+        ),
     )
     hass.services.async_register(
         DOMAIN,
@@ -183,7 +189,9 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         DOMAIN,
         SERVICE_RESUME_CONTROL,
         handle_resume_control,
-        schema=vol.Schema({vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}),
+        schema=vol.Schema(
+            {vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}
+        ),
     )
     return True
 
@@ -275,10 +283,7 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
 
     ent_reg = er.async_get(hass)
     dev_reg = dr.async_get(hass)
-    subentries_by_type = {
-        subentry.subentry_type: subentry
-        for subentry in getattr(entry, "subentries", {}).values()
-    }
+    subentries_by_type = {subentry.subentry_type: subentry for subentry in getattr(entry, "subentries", {}).values()}
     device_subentry_ids = {
         DEVICE_SYSTEM: getattr(subentries_by_type.get(DEVICE_SYSTEM), "subentry_id", None),
         DEVICE_ENERGY: getattr(subentries_by_type.get(DEVICE_ENERGY), "subentry_id", None),

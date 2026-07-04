@@ -144,10 +144,7 @@ class DryRunPlanner:
         if enphase_action is not None:
             actions.append(enphase_action)
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
-        if (
-            context.ev_connected is not False
-            and context.current_ev_soc_percent is not None
-        ):
+        if context.ev_connected is not False and context.current_ev_soc_percent is not None:
             ready_by = _next_ready_by(context.created_at, str(self.options[CONF_DEFAULT_READY_BY]))
             charge_rate_kw = float(self.options[CONF_EV_CHARGE_RATE_KW])
             soc_per_kwh = float(self.options[CONF_EV_SOC_PER_KWH])
@@ -326,11 +323,7 @@ class DryRunPlanner:
             return None
         interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         lead_slots = max(1, lead_minutes // interval_minutes)
-        future_slots = [
-            slot
-            for slot in context.slots[1 : lead_slots + 1]
-            if slot.import_price is not None
-        ]
+        future_slots = [slot for slot in context.slots[1 : lead_slots + 1] if slot.import_price is not None]
         if not future_slots:
             return None
         future_peak_slot = max(future_slots, key=lambda slot: float(slot.import_price))
@@ -472,9 +465,7 @@ def _device_plan(
     interval_hours = interval_minutes / 60
     for slot in context.slots:
         slot_actions = [
-            action
-            for action in actions
-            if action.execute_not_before <= slot.valid_at < action.execute_not_after
+            action for action in actions if action.execute_not_before <= slot.valid_at < action.execute_not_after
         ]
         entry = entry_fn(slot, slot_actions, actions)
         _add_energy_estimates(entry, interval_hours)
@@ -583,7 +574,8 @@ def _timeline_payload(entry: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in entry.items()
-        if key not in {
+        if key
+        not in {
             "start",
             "end",
             "estimated_energy_kwh",
@@ -810,14 +802,10 @@ def _haeo_export_value(context: DecisionContext, interval_minutes: int) -> float
 
 def _arbitrage_spread(context: DecisionContext) -> float:
     import_prices = [
-        price
-        for price in (_float_or_none(slot.import_price) for slot in context.slots)
-        if price is not None
+        price for price in (_float_or_none(slot.import_price) for slot in context.slots) if price is not None
     ]
     export_prices = [
-        price
-        for price in (_float_or_none(slot.export_price) for slot in context.slots)
-        if price is not None
+        price for price in (_float_or_none(slot.export_price) for slot in context.slots) if price is not None
     ]
     if not import_prices or not export_prices:
         return 0.0

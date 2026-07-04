@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from math import isfinite
-import re
 from typing import Any
 
 from .models import ForecastPoint
@@ -77,8 +77,7 @@ def forecast_series_from_state(
         raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
 
     parsed = [
-        _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit)
-        for item in raw_items
+        _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit) for item in raw_items
     ]
     parsed = [item for item in parsed if item is not None]
     if not parsed:

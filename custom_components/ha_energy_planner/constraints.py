@@ -52,14 +52,14 @@ class ConstraintValidator:
         if context.input_health == InputHealth.UNSAFE:
             violations.append(_violation("input_health_unsafe", "Required inputs are stale, missing, or invalid."))
         battery_floor = float(self.options[CONF_BATTERY_MIN_SOC_PERCENT])
-        if (
-            context.current_battery_soc_percent is not None
-            and context.current_battery_soc_percent < battery_floor
-        ):
+        if context.current_battery_soc_percent is not None and context.current_battery_soc_percent < battery_floor:
             violations.append(
                 _violation(
                     "battery_soc_below_floor",
-                    f"Current battery SOC {context.current_battery_soc_percent:.1f}% is below floor {battery_floor:.1f}%.",
+                    (
+                        f"Current battery SOC {context.current_battery_soc_percent:.1f}% "
+                        f"is below floor {battery_floor:.1f}%."
+                    ),
                     ActionAsset.ENPHASE,
                 )
             )
@@ -67,7 +67,9 @@ class ConstraintValidator:
         ev_max = float(self.options[CONF_EV_MAX_SOC_PERCENT])
         if ev_min > ev_max:
             violations.append(_violation("ev_min_above_ev_max", "EV minimum SOC is above maximum SOC.", ActionAsset.EV))
-        if plan.actions and (plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN} or bool(self.options[CONF_DRY_RUN])):
+        if plan.actions and (
+            plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN} or bool(self.options[CONF_DRY_RUN])
+        ):
             violations.append(
                 _violation(
                     "dry_run_plan_must_not_generate_control_actions",
@@ -85,11 +87,7 @@ class ConstraintValidator:
         export_exceeded = False
         for slot in context.slots:
             import_kw, export_kw = _projected_grid_flows_kw(slot)
-            if (
-                not import_exceeded
-                and import_kw is not None
-                and import_kw > import_limit_kw
-            ):
+            if not import_exceeded and import_kw is not None and import_kw > import_limit_kw:
                 violations.append(
                     _violation(
                         "grid_import_limit_exceeded",
@@ -97,11 +95,7 @@ class ConstraintValidator:
                     )
                 )
                 import_exceeded = True
-            if (
-                not export_exceeded
-                and export_kw is not None
-                and export_kw > export_limit_kw
-            ):
+            if not export_exceeded and export_kw is not None and export_kw > export_limit_kw:
                 violations.append(
                     _violation(
                         "grid_export_limit_exceeded",
@@ -124,8 +118,7 @@ class ConstraintValidator:
     ) -> list[str]:
         """Return hard-constraint violation codes for an action."""
         return [
-            violation.code
-            for violation in self.evaluate_action(context, plan, action, now=now, ownership=ownership)
+            violation.code for violation in self.evaluate_action(context, plan, action, now=now, ownership=ownership)
         ]
 
     def evaluate_action(
@@ -147,9 +140,13 @@ class ConstraintValidator:
         if context.input_health != InputHealth.HEALTHY:
             violations.append(_action_violation(action, "input_health_not_healthy", "Inputs are not healthy."))
         if context.haeo_status != HAEOStatus.READY and action.requires_haeo_plan_id:
-            violations.append(_action_violation(action, "haeo_not_ready", "Action depends on HAEO but HAEO is not ready."))
+            violations.append(
+                _action_violation(action, "haeo_not_ready", "Action depends on HAEO but HAEO is not ready.")
+            )
         if not _action_window_contains(action, now):
-            violations.append(_action_violation(action, "action_outside_execution_window", "Action is not currently due."))
+            violations.append(
+                _action_violation(action, "action_outside_execution_window", "Action is not currently due.")
+            )
         if _plan_is_expired(plan, now):
             violations.append(_action_violation(action, "plan_expired", "Plan is older than the configured horizon."))
         violations.extend(self.evaluate_plan(context, replace(plan, actions=[])))
@@ -163,7 +160,9 @@ class ConstraintValidator:
             )
         )
         if manual_hvac_conflict:
-            violations.append(_action_violation(action, "manual_hvac_override_active", "Manual HVAC override is active."))
+            violations.append(
+                _action_violation(action, "manual_hvac_override_active", "Manual HVAC override is active.")
+            )
         if action.asset == ActionAsset.DAIKIN and not manual_hvac_conflict:
             violations.extend(self._evaluate_hvac_action(context, action, now, ownership))
         if action.asset == ActionAsset.EV:
@@ -198,9 +197,9 @@ class ConstraintValidator:
             return violations
         violations.append(
             _action_violation(
-                    action,
-                    "enphase_profile_hold_active",
-                    "Enphase profile minimum hold period has not elapsed.",
+                action,
+                "enphase_profile_hold_active",
+                "Enphase profile minimum hold period has not elapsed.",
             )
         )
         return violations
@@ -220,7 +219,9 @@ class ConstraintValidator:
             return violations
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         ev_max = float(self.options[CONF_EV_MAX_SOC_PERCENT])
-        infeasible_evidence = bool(action.desired_state.get("infeasible")) and action.desired_state.get("allocated_slots") is not None
+        infeasible_evidence = (
+            bool(action.desired_state.get("infeasible")) and action.desired_state.get("allocated_slots") is not None
+        )
         if not ev_min <= float(desired_soc) <= ev_max and not (infeasible_evidence and float(desired_soc) <= ev_max):
             violations.append(
                 _action_violation(

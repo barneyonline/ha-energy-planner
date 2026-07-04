@@ -23,11 +23,7 @@ def async_register(
 async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
     """Return compact non-sensitive system health information."""
     entries = hass.config_entries.async_entries(DOMAIN)
-    loaded_entries = [
-        entry
-        for entry in entries
-        if getattr(entry, "runtime_data", None) is not None
-    ]
+    loaded_entries = [entry for entry in entries if getattr(entry, "runtime_data", None) is not None]
     info: dict[str, Any] = {
         "configured_entries": len(entries),
         "loaded_entries": len(loaded_entries),

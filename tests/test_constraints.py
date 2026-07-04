@@ -338,7 +338,13 @@ def test_ev_target_below_current_and_infeasible_evidence_exception() -> None:
         ActionKind.EV_SCHEDULE,
         {"target_soc_percent": 60, "infeasible": True, "allocated_slots": []},
     )
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 80, "ev_max_soc_percent": 90}
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_min_soc_percent": 80,
+        "ev_max_soc_percent": 90,
+    }
 
     violations = ConstraintValidator(options).validate_action(context, _plan(now, action), action, now=now)
 

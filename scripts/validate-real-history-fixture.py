@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
-import json
 from pathlib import Path
-import sys
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,8 +46,7 @@ class FixtureState:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate ev_trip_history and thermal_history fixtures exported from "
-            "Home Assistant Recorder history."
+            "Validate ev_trip_history and thermal_history fixtures exported from Home Assistant Recorder history."
         )
     )
     parser.add_argument(
@@ -107,11 +106,7 @@ def _profile_errors(profile: str, fixtures: list[dict[str, Any]]) -> dict[str, A
         actual = {key: fixture.get(key) for key in expected}
         if actual != expected:
             mismatched.append({"name": name, "expected": expected, "actual": actual})
-        absent = [
-            key
-            for key in REAL_HISTORY_PROFILE_ENTITY_KEYS[name]
-            if not _has_source_entity(fixture, key)
-        ]
+        absent = [key for key in REAL_HISTORY_PROFILE_ENTITY_KEYS[name] if not _has_source_entity(fixture, key)]
         if absent:
             missing_source_entities.append({"name": name, "missing_source_entity_keys": absent})
     errors: dict[str, Any] = {}

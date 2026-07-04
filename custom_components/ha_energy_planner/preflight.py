@@ -8,8 +8,8 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
@@ -72,7 +72,9 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             "check": "recorder_available",
             "ok": recorder["available"],
             "blocking": False,
-            "message": "Recorder is available for history imports." if recorder["available"] else "Recorder is not detected.",
+            "message": "Recorder is available for history imports."
+            if recorder["available"]
+            else "Recorder is not detected.",
         },
         {
             "check": "production_gate_ready",
@@ -85,10 +87,12 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             ),
         },
     ]
-    active_control_ready = not blocking and all(
-        bool(discovery[area]["supported"])
-        for area in ("haeo", "ev", "hvac", "enphase")
-    ) and production["armed"] and production["device_controls_enabled"]
+    active_control_ready = (
+        not blocking
+        and all(bool(discovery[area]["supported"]) for area in ("haeo", "ev", "hvac", "enphase"))
+        and production["armed"]
+        and production["device_controls_enabled"]
+    )
     return {
         "ok": active_control_ready,
         "active_control_ready": active_control_ready,
@@ -143,9 +147,7 @@ def _service_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str
 def _configured_services(entry_data: dict[str, Any]) -> list[str]:
     configured = [str(entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) or DEFAULT_HAEO_OPTIMIZE_SERVICE)]
     configured.extend(
-        str(entry_data[key])
-        for key in _SERVICE_KEYS
-        if key != CONF_HAEO_OPTIMIZE_SERVICE and entry_data.get(key)
+        str(entry_data[key]) for key in _SERVICE_KEYS if key != CONF_HAEO_OPTIMIZE_SERVICE and entry_data.get(key)
     )
     return configured
 

@@ -47,13 +47,19 @@ class DaikinHVACAdapter:
             if not any(state == "on" for state in saved_automation_states.values()):
                 return HVACCommandResult(True, "already_in_desired_hvac_state", pre_state, self._snapshot(), {})
             if not await self._async_disable_automations(saved_automation_states):
-                return HVACCommandResult(False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states)
-            return HVACCommandResult(True, "hvac_automations_suppressed", pre_state, self._snapshot(), saved_automation_states)
+                return HVACCommandResult(
+                    False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states
+                )
+            return HVACCommandResult(
+                True, "hvac_automations_suppressed", pre_state, self._snapshot(), saved_automation_states
+            )
         if _already_in_desired_state(climate_state, action.desired_state):
             return HVACCommandResult(True, "already_in_desired_hvac_state", pre_state, self._snapshot(), {})
 
         if not await self._async_disable_automations(saved_automation_states):
-            return HVACCommandResult(False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states)
+            return HVACCommandResult(
+                False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states
+            )
         desired_mode = action.desired_state.get("hvac_mode")
         desired_temperature = action.desired_state.get("target_temperature")
         target_low = action.desired_state.get("target_temp_low")
@@ -61,7 +67,9 @@ class DaikinHVACAdapter:
 
         try:
             if desired_mode == "off":
-                await self.hass.services.async_call("climate", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: climate_entity}, blocking=True)
+                await self.hass.services.async_call(
+                    "climate", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: climate_entity}, blocking=True
+                )
             elif desired_mode:
                 await self.hass.services.async_call(
                     "climate",
@@ -84,7 +92,9 @@ class DaikinHVACAdapter:
                     blocking=True,
                 )
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-            return HVACCommandResult(False, "hvac_control_service_failed", pre_state, self._snapshot(), saved_automation_states)
+            return HVACCommandResult(
+                False, "hvac_control_service_failed", pre_state, self._snapshot(), saved_automation_states
+            )
         return HVACCommandResult(True, "hvac_action_applied", pre_state, self._snapshot(), saved_automation_states)
 
     async def async_restore(self, saved_automation_states: dict[str, str] | None = None) -> HVACCommandResult:
@@ -95,9 +105,13 @@ class DaikinHVACAdapter:
         for automation_id, state in states.items():
             try:
                 if state == "on":
-                    await self.hass.services.async_call("automation", SERVICE_TURN_ON, {ATTR_ENTITY_ID: automation_id}, blocking=True)
+                    await self.hass.services.async_call(
+                        "automation", SERVICE_TURN_ON, {ATTR_ENTITY_ID: automation_id}, blocking=True
+                    )
                 elif state == "off":
-                    await self.hass.services.async_call("automation", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: automation_id}, blocking=True)
+                    await self.hass.services.async_call(
+                        "automation", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: automation_id}, blocking=True
+                    )
             except Exception:  # noqa: BLE001 - restore must continue and report failure.
                 failed = True
         reason = "no_hvac_automation_state_saved"

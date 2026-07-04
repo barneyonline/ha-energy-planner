@@ -106,7 +106,9 @@ def test_switch_preserves_other_options_when_updated() -> None:
     coordinator = FakeCoordinator({CONF_DRY_RUN: True, CONF_AI_ENABLED: True})
     switch = SimpleNamespace(
         coordinator=coordinator,
-        entity_description=next(description for description in SWITCHES if description.option_key == CONF_PLANNER_ENABLED),
+        entity_description=next(
+            description for description in SWITCHES if description.option_key == CONF_PLANNER_ENABLED
+        ),
     )
     switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
     switch.async_write_ha_state = lambda: None

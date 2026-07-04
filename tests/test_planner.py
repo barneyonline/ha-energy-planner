@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 from custom_components.ha_energy_planner.models import (
@@ -223,7 +221,11 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
             "state": "charging",
             "charge_kw": 6,
             "estimated_energy_kwh": 0.5,
-            "reason_codes": ["ev_soc_below_target", "fallback_until_history_sufficient", "least_cost_slots_before_ready_by"],
+            "reason_codes": [
+                "ev_soc_below_target",
+                "fallback_until_history_sufficient",
+                "least_cost_slots_before_ready_by",
+            ],
             "target_soc_percent": 70.0,
             "ready_by": "00:20",
             "infeasible": False,
@@ -239,7 +241,11 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
             "state": "charging",
             "charge_kw": 6,
             "estimated_energy_kwh": 0.5,
-            "reason_codes": ["ev_soc_below_target", "fallback_until_history_sufficient", "least_cost_slots_before_ready_by"],
+            "reason_codes": [
+                "ev_soc_below_target",
+                "fallback_until_history_sufficient",
+                "least_cost_slots_before_ready_by",
+            ],
             "target_soc_percent": 70.0,
             "ready_by": "00:20",
             "infeasible": False,
@@ -286,10 +292,16 @@ def test_hvac_preconditioning_returns_none_without_future_slots_or_current_price
     context.occupied_temperature_high_c = 24
     context.slots = [DecisionSlot(context.created_at, None, 0.05, 0, 1)]
 
-    assert planner._hvac_preconditioning_action(context, context.created_at, context.created_at + timedelta(minutes=5)) is None
+    assert (
+        planner._hvac_preconditioning_action(context, context.created_at, context.created_at + timedelta(minutes=5))
+        is None
+    )
 
     context.slots = [DecisionSlot(context.created_at, 0.10, 0.05, 0, 1)]
-    assert planner._hvac_preconditioning_action(context, context.created_at, context.created_at + timedelta(minutes=5)) is None
+    assert (
+        planner._hvac_preconditioning_action(context, context.created_at, context.created_at + timedelta(minutes=5))
+        is None
+    )
 
 
 def test_estimated_cost_returns_none_when_slots_lack_required_data() -> None:

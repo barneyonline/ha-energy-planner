@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from argparse import Namespace
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from argparse import Namespace
+from pathlib import Path
 from typing import Any
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "history"
@@ -35,10 +35,7 @@ def _load_exporter() -> Any:
 
 
 def _fixtures() -> list[dict[str, Any]]:
-    return [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(FIXTURE_DIR.glob("*.json"))
-    ]
+    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(FIXTURE_DIR.glob("*.json"))]
 
 
 def test_history_fixtures_replay_successfully() -> None:

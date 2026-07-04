@@ -5,8 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 import voluptuous as vol
-from voluptuous import Invalid
-
 from homeassistant import config_entries
 from homeassistant.config_entries import (
     ConfigEntry,
@@ -15,8 +13,7 @@ from homeassistant.config_entries import (
     SubentryFlowResult,
     UnknownSubEntry,
 )
-from homeassistant.core import HomeAssistant
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     BooleanSelector,
@@ -33,11 +30,12 @@ from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
 )
+from voluptuous import Invalid
 
 from .const import (
-    CONF_AI_ENABLED,
-    CONF_AI_AGENT_ID,
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AI_AGENT_ID,
+    CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_AI_TIMEOUT_SECONDS,
     CONF_AMBER_EXPORT_PRICE,
@@ -47,49 +45,49 @@ from .const import (
     CONF_BATTERY_SOC,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
-    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
-    CONF_ENPHASE_CONTROL_ENABLED,
-    CONF_ENPHASE_MIN_SAVINGS,
     CONF_ENPHASE_AI_PROFILE,
+    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
+    CONF_ENPHASE_MIN_SAVINGS,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
-    CONF_EV_CHARGING,
-    CONF_EV_CONTROL_ENABLED,
-    CONF_EV_CONNECTED,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_CHARGING,
+    CONF_EV_CONNECTED,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
-    CONF_EV_SOC_PER_KWH,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
+    CONF_EV_SOC_PER_KWH,
     CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
+    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
-    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
+    CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
+    CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
-    CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
-    CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -207,8 +205,12 @@ EV_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_EV_CHARGING): _entity_selector(["binary_sensor", "sensor", "switch"]),
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
         vol.Optional(CONF_EV_SMART_CHARGING): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
-        vol.Optional(CONF_EV_SMART_CHARGING_START): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
-        vol.Optional(CONF_EV_SMART_CHARGING_STOP): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
+        vol.Optional(CONF_EV_SMART_CHARGING_START): _entity_selector(
+            ["switch", "button", "input_boolean", "input_button"]
+        ),
+        vol.Optional(CONF_EV_SMART_CHARGING_STOP): _entity_selector(
+            ["switch", "button", "input_boolean", "input_button"]
+        ),
         vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(["number", "input_number"]),
         vol.Optional(CONF_EV_SMART_CHARGING_READY_BY): _entity_selector(["time", "input_datetime", "input_text"]),
     }
@@ -301,11 +303,7 @@ _POLICY_SECTION_FIELDS = {
     POLICY_STEP_PRIORITIES: _PRIORITY_FORM_FIELDS,
 }
 
-_POLICY_ALL_FIELDS = tuple(
-    field
-    for step_id in _POLICY_MENU_OPTIONS
-    for field in _POLICY_SECTION_FIELDS[step_id]
-)
+_POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_MENU_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
 
 
 def _options_schema(options: dict[str, Any]) -> vol.Schema:
@@ -331,10 +329,7 @@ def _priority_selector() -> SelectSelector:
     """Return the planning objective selector."""
     return SelectSelector(
         SelectSelectorConfig(
-            options=[
-                {"value": value, "label": _PRIORITY_LABELS[value]}
-                for value in _PRIORITY_OBJECTIVES
-            ],
+            options=[{"value": value, "label": _PRIORITY_LABELS[value]} for value in _PRIORITY_OBJECTIVES],
             mode=SelectSelectorMode.DROPDOWN,
             custom_value=False,
             sort=False,
@@ -950,13 +945,7 @@ def _validate_entity_unit(hass: HomeAssistant, entity_id: str, config_key: str) 
 
 
 def _normalize_unit(unit: str) -> str:
-    return (
-        unit.strip()
-        .lower()
-        .replace(" ", "")
-        .replace("aud", "$")
-        .replace("a$", "$")
-    )
+    return unit.strip().lower().replace(" ", "").replace("aud", "$").replace("a$", "$")
 
 
 def _entity_values(value: Any) -> list[str]:
@@ -984,7 +973,9 @@ def _ready_by_valid(value: str) -> bool:
 
 def _priority_values_from_options(options: dict[str, Any]) -> list[str]:
     """Return a complete priority order from persisted options."""
-    values = _priority_values_from_string(str(options.get(CONF_PRIORITY_WEIGHTS, DEFAULT_OPTIONS[CONF_PRIORITY_WEIGHTS])))
+    values = _priority_values_from_string(
+        str(options.get(CONF_PRIORITY_WEIGHTS, DEFAULT_OPTIONS[CONF_PRIORITY_WEIGHTS]))
+    )
     return [*values, *[value for value in _PRIORITY_OBJECTIVES if value not in values]]
 
 

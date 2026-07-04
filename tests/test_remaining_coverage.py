@@ -12,37 +12,40 @@ import pytest
 
 from custom_components.ha_energy_planner import (
     _async_remove_legacy_device,
-    async_setup,
-    async_setup_entry,
     _planner_entity_key,
     _validate_ready_by_time,
     _validate_reason_code,
+    async_setup,
+    async_setup_entry,
 )
+from custom_components.ha_energy_planner import forecasts as forecasts_module
+from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.ai_advisor import _invalid_response_reason, _parse_response, _preview_summary
 from custom_components.ha_energy_planner.config_flow import _validate_config
+from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS, DOMAIN
+from custom_components.ha_energy_planner.constraints import ConstraintValidator, _projected_grid_flows_kw
 from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
-    _bounded_json as coordinator_bounded_json,
     _is_manual_hvac_change,
     _is_material_state_change,
     _latest_ai_service_call_at,
     _overrides_from_store,
 )
-from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS, DOMAIN
-from custom_components.ha_energy_planner.constraints import ConstraintValidator, _projected_grid_flows_kw
-from custom_components.ha_energy_planner.discovery import CapabilityEvidence, DiscoveryReport, _split_entity_values as discovery_split_entities
+from custom_components.ha_energy_planner.coordinator import (
+    _bounded_json as coordinator_bounded_json,
+)
 from custom_components.ha_energy_planner.diagnostics import (
     _latest_haeo_status,
     _recent_items,
     _store_summary,
     _trip_history_summary,
 )
+from custom_components.ha_energy_planner.discovery import CapabilityEvidence, DiscoveryReport
+from custom_components.ha_energy_planner.discovery import _split_entity_values as discovery_split_entities
 from custom_components.ha_energy_planner.entity import planner_device_key_for_entity
 from custom_components.ha_energy_planner.ev import update_trip_history_from_values
 from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter, _time_parts
 from custom_components.ha_energy_planner.executor import Executor, _profile_control_service_for_target
-from custom_components.ha_energy_planner import forecasts as forecasts_module
-from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.forecasts import _energy_items_as_average_power, _items_from_value, _parse_item
 from custom_components.ha_energy_planner.haeo_adapter import apply_haeo_response_to_context
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
@@ -54,9 +57,9 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     HAEOSolvePhase,
     HAEOSolveResult,
+    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -72,20 +75,20 @@ from custom_components.ha_energy_planner.preflight import (
 )
 from custom_components.ha_energy_planner.replay import ReplayActionResult, ReplayResult
 from custom_components.ha_energy_planner.subentry_migration import (
-    SUBENTRY_AI,
     SUBENTRY_CLIMATE,
     SUBENTRY_ENERGY,
     SUBENTRY_ENPHASE,
-    SUBENTRY_PRESENCE,
     async_consolidate_subentries,
     grouped_subentry_data,
 )
 from custom_components.ha_energy_planner.system_health import system_health_info
 from custom_components.ha_energy_planner.thermal_model import (
     _aligned_datetimes,
-    _parse_datetime_or_none as thermal_parse_datetime,
     thermal_hvac_load_kw,
     update_thermal_model,
+)
+from custom_components.ha_energy_planner.thermal_model import (
+    _parse_datetime_or_none as thermal_parse_datetime,
 )
 
 
@@ -126,7 +129,10 @@ def test_remaining_validation_and_small_helpers(monkeypatch: pytest.MonkeyPatch)
         _validate_reason_code("bad reason!")
     assert _validate_ready_by_time("7:05:30") == "07:05"
     assert _validate_reason_code("manual_service_call") == "manual_service_call"
-    assert _planner_entity_key("entry", SimpleNamespace(unique_id="", entity_id="sensor.ha_energy_planner_plan_status")) == "plan_status"
+    assert (
+        _planner_entity_key("entry", SimpleNamespace(unique_id="", entity_id="sensor.ha_energy_planner_plan_status"))
+        == "plan_status"
+    )
     assert planner_device_key_for_entity("unknown_entity") == "system"
     assert _time_parts("bad") is None
     assert _time_parts("aa:bb") is None
@@ -134,11 +140,14 @@ def test_remaining_validation_and_small_helpers(monkeypatch: pytest.MonkeyPatch)
     assert EnphaseProfileGuard(min_hold=timedelta(minutes=5), last_changed_at=None).can_change(datetime.now(UTC))
 
     assert _items_from_value({"data": {"unknown": []}}, ("value",)) == []
-    assert _energy_items_as_average_power(
-        [{"period_start": "2026-06-27T00:00:00+00:00", "value": 1, "unit": "kWh"}],
-        ("value",),
-        "kWh",
-    )[0]["value"] == 1
+    assert (
+        _energy_items_as_average_power(
+            [{"period_start": "2026-06-27T00:00:00+00:00", "value": 1, "unit": "kWh"}],
+            ("value",),
+            "kWh",
+        )[0]["value"]
+        == 1
+    )
 
     slot = DecisionSlot(datetime(2026, 6, 27, tzinfo=UTC), None, 0.05, 1, None)
     assert _projected_grid_flows_kw(slot) == (None, None)
@@ -160,9 +169,9 @@ def test_remaining_preflight_helpers() -> None:
     }
 
     assert _entity_report(hass, entry_data)["unavailable"] == ["sensor.a"]
-    assert _service_report(hass, {"haeo_optimize_service": "ok.service", "ai_advisor_service": "badservice"})["missing"] == [
-        "badservice"
-    ]
+    assert _service_report(hass, {"haeo_optimize_service": "ok.service", "ai_advisor_service": "badservice"})[
+        "missing"
+    ] == ["badservice"]
     assert _split_entities(["sensor.a", "bad"]) == ["sensor.a"]
     assert _split_entities(123) == []
     assert _audit_report({"execution_audit": ["bad", {"plan_id": "plan-1", "secret": "drop"}]})["recent_outcomes"] == [
@@ -180,7 +189,10 @@ def test_remaining_thermal_and_input_branches() -> None:
     )
     assert changed is True
     assert updated["last_sample"]["indoor_temperature_c"] == 21
-    assert thermal_hvac_load_kw({"enabled": True, "active_hvac_load_kw": {"sample_count": 12, "average": "bad"}}, 1.5) == 1.5
+    assert (
+        thermal_hvac_load_kw({"enabled": True, "active_hvac_load_kw": {"sample_count": 12, "average": "bad"}}, 1.5)
+        == 1.5
+    )
     assert thermal_parse_datetime(123) is None
     assert thermal_parse_datetime("bad") is None
     assert _aligned_datetimes(None, now) == (None, now)
@@ -190,41 +202,98 @@ def test_remaining_thermal_and_input_branches() -> None:
     manager = InputManager(
         SimpleNamespace(states=States({"weather.home": "20", "person.a": "home"})),
         {"weather_entity": "weather.home", "person_entities": "person.a"},
-        {"planning_interval_minutes": 5, "planning_horizon_hours": 1, "price_freshness_minutes": 30, "forecast_freshness_minutes": 60},
+        {
+            "planning_interval_minutes": 5,
+            "planning_horizon_hours": 1,
+            "price_freshness_minutes": 30,
+            "forecast_freshness_minutes": 60,
+        },
     )
     current, series, issue = manager._optional_weather_temperatures("weather_entity", now, 1, 5)
     assert current == 20
     assert series[0] == 20
     assert issue is None
     assert manager._occupancy_state() == OccupancyState.OCCUPIED
-    assert InputManager(SimpleNamespace(states=States({})), {}, manager.options)._occupancy_state() == OccupancyState.UNKNOWN
+    assert (
+        InputManager(SimpleNamespace(states=States({})), {}, manager.options)._occupancy_state()
+        == OccupancyState.UNKNOWN
+    )
 
 
 def test_remaining_coordinator_and_executor_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime.now(UTC)
     assert _is_material_state_change(SimpleNamespace(data={"old_state": None, "new_state": State("1")}), {}) is True
-    assert _is_material_state_change(SimpleNamespace(data={"old_state": State("0"), "new_state": State("1")}), {}) is True
-    assert _is_manual_hvac_change(
-        SimpleNamespace(states=States({})),
-        {"daikin_climate_entity": "climate.daikin"},
-        {},
-        SimpleNamespace(data={"entity_id": "climate.daikin", "old_state": None, "new_state": State("heat")}),
-        now,
-    ) is False
+    assert (
+        _is_material_state_change(SimpleNamespace(data={"old_state": State("0"), "new_state": State("1")}), {}) is True
+    )
+    assert (
+        _is_manual_hvac_change(
+            SimpleNamespace(states=States({})),
+            {"daikin_climate_entity": "climate.daikin"},
+            {},
+            SimpleNamespace(data={"entity_id": "climate.daikin", "old_state": None, "new_state": State("heat")}),
+            now,
+        )
+        is False
+    )
     assert _overrides_from_store({"overrides": ["bad"]}, now) == []
 
-    action = PlanAction("ev", "plan", now - timedelta(minutes=1), now + timedelta(minutes=1), ActionAsset.EV, ActionKind.EV_START, {}, [], [], None, 1.0, None)
-    plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "summary", 1, None, [action], [])
-    context = DecisionContext(now, "plan", [DecisionSlot(now, 0.2, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.UNSAFE)
-    store = SimpleNamespace(data={"outcomes": []}, async_add_outcome=lambda outcome: _append_async(store.data["outcomes"], outcome))
-    asyncio.run(Executor(store, options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).async_evaluate(plan, context))
+    action = PlanAction(
+        "ev",
+        "plan",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.EV,
+        ActionKind.EV_START,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "summary", 1, None, [action], []
+    )
+    context = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.UNSAFE,
+    )
+    store = SimpleNamespace(
+        data={"outcomes": []}, async_add_outcome=lambda outcome: _append_async(store.data["outcomes"], outcome)
+    )
+    asyncio.run(
+        Executor(store, options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).async_evaluate(
+            plan, context
+        )
+    )
     assert store.data["outcomes"][0].reason == "input_health_not_healthy,input_health_unsafe"
-    assert Executor(store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(action, now + timedelta(seconds=5)) is None
+    assert (
+        Executor(store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(
+            action, now + timedelta(seconds=5)
+        )
+        is None
+    )
 
 
 def test_remaining_coordinator_haeo_non_ready_branch(monkeypatch: pytest.MonkeyPatch) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = DecisionContext(now, "plan", [DecisionSlot(now, 0.2, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY)
+    context = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+    )
 
     class Store:
         def __init__(self) -> None:
@@ -232,35 +301,83 @@ def test_remaining_coordinator_haeo_non_ready_branch(monkeypatch: pytest.MonkeyP
             self.haeo_runs: list[dict[str, Any]] = []
             self.forecast_snapshots: list[dict[str, Any]] = []
 
-        async def async_save_discovery(self, data: dict[str, Any]) -> None: pass
-        async def async_add_haeo_run(self, run: dict[str, Any]) -> None: self.haeo_runs.append(run)
-        async def async_add_forecast_snapshot(self, snapshot: dict[str, Any]) -> None: self.forecast_snapshots.append(snapshot)
-        async def async_save_plan(self, plan: EnergyPlan) -> None: pass
+        async def async_save_discovery(self, data: dict[str, Any]) -> None:
+            pass
+
+        async def async_add_haeo_run(self, run: dict[str, Any]) -> None:
+            self.haeo_runs.append(run)
+
+        async def async_add_forecast_snapshot(self, snapshot: dict[str, Any]) -> None:
+            self.forecast_snapshots.append(snapshot)
+
+        async def async_save_plan(self, plan: EnergyPlan) -> None:
+            pass
 
     class HAEO:
-        def __init__(self, hass: Any, service: str) -> None: pass
+        def __init__(self, hass: Any, service: str) -> None:
+            pass
+
         async def async_solve_baseline(self, ctx: DecisionContext) -> HAEOSolveResult:
             return HAEOSolveResult(HAEOSolvePhase.BASELINE, HAEOStatus.READY, "baseline", "plan")
+
         async def async_solve_with_flexible_load(self, ctx: DecisionContext, projections: list[Any]) -> HAEOSolveResult:
             return HAEOSolveResult(HAEOSolvePhase.FLEXIBLE_LOAD, HAEOStatus.FAILED, "second_failed", "plan")
 
     class Planner:
-        def __init__(self, options: dict[str, Any], thermal_model: dict[str, Any]) -> None: pass
+        def __init__(self, options: dict[str, Any], thermal_model: dict[str, Any]) -> None:
+            pass
+
         def create_plan(self, ctx: DecisionContext) -> EnergyPlan:
-            return EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "summary", 1, None, [], [])
+            return EnergyPlan(
+                "plan",
+                now,
+                24,
+                5,
+                "current",
+                InputHealth.HEALTHY,
+                PlannerMode.ACTIVE_HEALTHY,
+                "summary",
+                1,
+                None,
+                [],
+                [],
+            )
+
         def project_flexible_loads(self, ctx: DecisionContext) -> list[str]:
             return ["projection"]
 
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.CapabilityDiscovery", lambda hass, data: SimpleNamespace(inspect=lambda: SimpleNamespace(as_dict=lambda: {})))
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder", _trip_import_noop)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.InputManager", lambda *a, **k: SimpleNamespace(current_forecast_observations=lambda: {}, build_context=lambda overrides: context, thermal_sample=lambda ctx: {}, forecast_training_slots=[], forecast_calibration={}))
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.update_forecast_calibration", lambda *a, **k: ({}, False))
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.update_thermal_model", lambda *a, **k: ({}, False))
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
+        lambda hass, data: SimpleNamespace(inspect=lambda: SimpleNamespace(as_dict=lambda: {})),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder", _trip_import_noop
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.InputManager",
+        lambda *a, **k: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context,
+            thermal_sample=lambda ctx: {},
+            forecast_training_slots=[],
+            forecast_calibration={},
+        ),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.update_forecast_calibration", lambda *a, **k: ({}, False)
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.update_thermal_model", lambda *a, **k: ({}, False)
+    )
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", HAEO)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", Planner)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.ConstraintValidator", lambda options: SimpleNamespace(validate_plan=lambda ctx, plan: []))
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.ConstraintValidator",
+        lambda options: SimpleNamespace(validate_plan=lambda ctx, plan: []),
+    )
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+
     class Hass:
         async def async_add_executor_job(self, fn: Any, *args: Any) -> Any:
             return fn(*args)
@@ -268,7 +385,9 @@ def test_remaining_coordinator_haeo_non_ready_branch(monkeypatch: pytest.MonkeyP
     coordinator.hass = Hass()
     coordinator.entry = SimpleNamespace(data={}, options={})
     coordinator.store = Store()
-    coordinator.executor = SimpleNamespace(entry_data={}, options={}, async_notify_plan_fallback=_noop_async, async_evaluate=_noop_async)
+    coordinator.executor = SimpleNamespace(
+        entry_data={}, options={}, async_notify_plan_fallback=_noop_async, async_evaluate=_noop_async
+    )
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0
@@ -298,10 +417,26 @@ def test_remaining_coordinator_haeo_non_ready_branch(monkeypatch: pytest.MonkeyP
 
 def test_remaining_subentry_migration_branches() -> None:
     subentries = {
-        "energy-old": SimpleNamespace(subentry_id="energy-old", subentry_type=SUBENTRY_ENERGY, data={"amber_import_price_entity": "sensor.price", "weather_entity": "weather.home"}),
-        "climate-old": SimpleNamespace(subentry_id="climate-old", subentry_type=SUBENTRY_CLIMATE, data={"person_entities": "person.a", "climate_target_low_entity": "input_number.low"}),
-        "enphase-old": SimpleNamespace(subentry_id="enphase-old", subentry_type=SUBENTRY_ENPHASE, data={"ai_task_entity": "ai_task.local", "enphase_profile_entity": "select.profile"}),
-        "optimizer-old": SimpleNamespace(subentry_id="optimizer-old", subentry_type="optimizer", data={"baseline_load_forecast_entity": "sensor.load"}),
+        "energy-old": SimpleNamespace(
+            subentry_id="energy-old",
+            subentry_type=SUBENTRY_ENERGY,
+            data={"amber_import_price_entity": "sensor.price", "weather_entity": "weather.home"},
+        ),
+        "climate-old": SimpleNamespace(
+            subentry_id="climate-old",
+            subentry_type=SUBENTRY_CLIMATE,
+            data={"person_entities": "person.a", "climate_target_low_entity": "input_number.low"},
+        ),
+        "enphase-old": SimpleNamespace(
+            subentry_id="enphase-old",
+            subentry_type=SUBENTRY_ENPHASE,
+            data={"ai_task_entity": "ai_task.local", "enphase_profile_entity": "select.profile"},
+        ),
+        "optimizer-old": SimpleNamespace(
+            subentry_id="optimizer-old",
+            subentry_type="optimizer",
+            data={"baseline_load_forecast_entity": "sensor.load"},
+        ),
         "ignore": SimpleNamespace(subentry_id="ignore", subentry_type="unknown", data={"x": 1}),
     }
     entry = SimpleNamespace(subentries=subentries)
@@ -317,13 +452,16 @@ def test_remaining_subentry_migration_branches() -> None:
             self.added: list[Any] = []
             self.updated: list[Any] = []
             self.removed: list[str] = []
+
         def async_add_subentry(self, entry: Any, subentry: Any) -> bool:
             self.added.append(subentry)
             entry.subentries[subentry.subentry_id] = subentry
             return True
+
         def async_update_subentry(self, entry: Any, subentry: Any, *, title: str, data: dict[str, Any]) -> bool:
             self.updated.append((subentry.subentry_type, title, data))
             return True
+
         def async_remove_subentry(self, entry: Any, subentry_id: str) -> bool:
             self.removed.append(subentry_id)
             return True
@@ -335,18 +473,28 @@ def test_remaining_subentry_migration_branches() -> None:
 
 
 def test_remaining_system_health_and_registry_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-    info = asyncio.run(system_health_info(SimpleNamespace(services=Services(), config_entries=SimpleNamespace(async_entries=lambda domain: []))))
+    info = asyncio.run(
+        system_health_info(
+            SimpleNamespace(services=Services(), config_entries=SimpleNamespace(async_entries=lambda domain: []))
+        )
+    )
     assert info["configured_entries"] == 0
 
     entry = SimpleNamespace(subentries={"energy": SimpleNamespace(subentry_type="energy", subentry_id="energy-id")})
     from custom_components.ha_energy_planner.entity import planner_config_subentry_id
+
     assert planner_config_subentry_id(entry, "missing") is None
 
     entity = SimpleNamespace(platform=DOMAIN, device_id="legacy", entity_id="sensor.x", unique_id="uid")
-    ent_reg = SimpleNamespace(entities={"sensor.x": entity}, async_update_entity=lambda entity_id, **kwargs: setattr(entity, "device_id", kwargs["device_id"]))
+    ent_reg = SimpleNamespace(
+        entities={"sensor.x": entity},
+        async_update_entity=lambda entity_id, **kwargs: setattr(entity, "device_id", kwargs["device_id"]),
+    )
     dev = SimpleNamespace(id="legacy")
     removed: list[str] = []
-    dev_reg = SimpleNamespace(async_get_device=lambda identifiers: dev, async_remove_device=lambda device_id: removed.append(device_id))
+    dev_reg = SimpleNamespace(
+        async_get_device=lambda identifiers: dev, async_remove_device=lambda device_id: removed.append(device_id)
+    )
     monkeypatch.setattr("homeassistant.helpers.entity_registry.async_get", lambda hass: ent_reg)
     monkeypatch.setattr("homeassistant.helpers.device_registry.async_get", lambda hass: dev_reg)
 
@@ -372,7 +520,9 @@ def test_remaining_setup_services_without_entries() -> None:
     )
 
     assert asyncio.run(async_setup(hass, {})) is True
-    assert asyncio.run(services.handlers["export_diagnostics"](SimpleNamespace(data={}))) == {"error": "no_config_entry"}
+    assert asyncio.run(services.handlers["export_diagnostics"](SimpleNamespace(data={}))) == {
+        "error": "no_config_entry"
+    }
     assert asyncio.run(services.handlers["run_preflight"](SimpleNamespace(data={}))) == {
         "ok": False,
         "error": "no_config_entry",
@@ -413,12 +563,14 @@ def test_remaining_planner_guard_branches() -> None:
 
 def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
     assert _invalid_response_reason({1: "bad"}) == "ai_response_unsupported_fields"
-    assert _parse_response({"response": {"data": "{\"confidence\": 0.5}"}}) == {"confidence": 0.5}
+    assert _parse_response({"response": {"data": '{"confidence": 0.5}'}}) == {"confidence": 0.5}
     assert _parse_response({"response": "bad json"}) is None
     assert _parse_response({"confidence": 0.5}) == {"confidence": 0.5}
     assert _parse_response(123) is None
     assert _preview_summary([]) == {}
-    assert _preview_summary([{"valid_at": "a", "import_price": 1, "occupied": "home"}, {"valid_at": "b", "import_price": 3}]) == {
+    assert _preview_summary(
+        [{"valid_at": "a", "import_price": 1, "occupied": "home"}, {"valid_at": "b", "import_price": 3}]
+    ) == {
         "samples": 2,
         "start": "a",
         "end": "b",
@@ -441,14 +593,31 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
     assert replay.rejected_action_count == 1
     assert replay.to_summary()["actions"][0]["violations"] == ["action_bad"]
 
-    plan = EnergyPlan("plan", datetime(2026, 6, 27, tzinfo=UTC), 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "summary", 1, None, [], [])
+    plan = EnergyPlan(
+        "plan",
+        datetime(2026, 6, 27, tzinfo=UTC),
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "summary",
+        1,
+        None,
+        [],
+        [],
+    )
     coordinator = SimpleNamespace(
         data=plan,
-        store=SimpleNamespace(data={"haeo_runs": [{"baseline": {"status": "ready"}}], "ai_recommendations": [{"status": "accepted"}]}),
+        store=SimpleNamespace(
+            data={"haeo_runs": [{"baseline": {"status": "ready"}}], "ai_recommendations": [{"status": "accepted"}]}
+        ),
         options={"planner_enabled": True, "dry_run": False},
     )
     entry = SimpleNamespace(runtime_data=coordinator, subentries={"a": object()})
-    info = asyncio.run(system_health_info(SimpleNamespace(config_entries=SimpleNamespace(async_entries=lambda domain: [entry]))))
+    info = asyncio.run(
+        system_health_info(SimpleNamespace(config_entries=SimpleNamespace(async_entries=lambda domain: [entry])))
+    )
     assert info["loaded_entries"] == 1
     assert info["latest_haeo_status"] == "ready"
     assert info["latest_ai_status"] == "accepted"
@@ -456,14 +625,20 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
 
 def test_remaining_config_and_adapter_tail_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     hass = SimpleNamespace(states=States({"sensor.value": "1"}), services=Services())
-    assert _validate_config(hass, {"amber_import_price_entity": "sensor.value", "haeo_optimize_service": "bad"})["haeo_optimize_service"]
+    assert _validate_config(hass, {"amber_import_price_entity": "sensor.value", "haeo_optimize_service": "bad"})[
+        "haeo_optimize_service"
+    ]
 
-    assert update_trip_history_from_values({"active_trip": {}}, connected=True, soc_percent=80, now=datetime.now(UTC))[1] is False
-    assert DaikinHVACAdapter(SimpleNamespace(states=States({}), services=Services()), {}). _automation_entities() == []
+    assert (
+        update_trip_history_from_values({"active_trip": {}}, connected=True, soc_percent=80, now=datetime.now(UTC))[1]
+        is False
+    )
+    assert DaikinHVACAdapter(SimpleNamespace(states=States({}), services=Services()), {})._automation_entities() == []
 
 
 def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     import voluptuous as vol
+
     from custom_components.ha_energy_planner import config_flow as config_flow_module
     from custom_components.ha_energy_planner import diagnostics as diagnostics_module
     from custom_components.ha_energy_planner import system_health as system_health_module
@@ -482,7 +657,12 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(diagnostics_module, "async_get_config_entry_diagnostics", fake_diagnostics)
     hass = SimpleNamespace(
         config_entries=SimpleNamespace(async_entries=lambda domain: [SimpleNamespace(runtime_data=fake_coordinator)]),
-        services=SimpleNamespace(handlers={}, async_register=lambda domain, service, handler, **kwargs: hass.services.handlers.setdefault(service, handler)),
+        services=SimpleNamespace(
+            handlers={},
+            async_register=lambda domain, service, handler, **kwargs: hass.services.handlers.setdefault(
+                service, handler
+            ),
+        ),
     )
     asyncio.run(async_setup(hass, {}))
     assert asyncio.run(hass.services.handlers["export_diagnostics"](SimpleNamespace(data={}))) == {"entry_id": "entry"}
@@ -500,12 +680,14 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert _energy_items_as_average_power([item], ("value",), "kWh") == [item]
 
     # Sensor labels and bounded JSON depth.
-    assert sensor_module._timeline_state_label({"state": "charging", "profile": "Full Backup"}) == "Charging: Full Backup"
+    assert (
+        sensor_module._timeline_state_label({"state": "charging", "profile": "Full Backup"}) == "Charging: Full Backup"
+    )
     assert sensor_module._charge_state_label_from_raw("charging") == "Charging"
     assert sensor_module._charge_timeline_state_label({"state": "paused"}) == "Paused"
-    assert sensor_module._presence_attrs(SimpleNamespace(entry_data={"person_entities": "person.a, person.b"}, data=None)) == {
-        "person_entities": ["person.a", "person.b"]
-    }
+    assert sensor_module._presence_attrs(
+        SimpleNamespace(entry_data={"person_entities": "person.a, person.b"}, data=None)
+    ) == {"person_entities": ["person.a", "person.b"]}
     assert sensor_module._display_state("   ") == "Unknown"
 
     # Discovery/system-health lower helpers.
@@ -522,7 +704,9 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert discovery_split_entities(["sensor.a", " bad "]) == ["sensor.a", "bad"]
     assert discovery_split_entities(123) == []
     registered: list[Any] = []
-    system_health_module.async_register(SimpleNamespace(), SimpleNamespace(async_register_info=lambda fn: registered.append(fn)))
+    system_health_module.async_register(
+        SimpleNamespace(), SimpleNamespace(async_register_info=lambda fn: registered.append(fn))
+    )
     assert registered == [system_health_info]
     assert system_health_module._latest_status([]) is None
     assert system_health_module._latest_status(["bad"]) is None
@@ -531,72 +715,205 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
 
     # Adapter and validator tails.
     now = datetime.now(UTC)
-    assert DaikinHVACAdapter(SimpleNamespace(states=States({}), services=Services()), {"climate_automation_entities": 123})._automation_entities() == []
+    assert (
+        DaikinHVACAdapter(
+            SimpleNamespace(states=States({}), services=Services()), {"climate_automation_entities": 123}
+        )._automation_entities()
+        == []
+    )
     assert DaikinHVACAdapter(SimpleNamespace(states=States({}), services=Services()), {})._state(None) is None
+
     class FailingHVACServices(Services):
         async def async_call(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError("failed")
 
-    suppress_action = PlanAction("hvac", "plan", now, now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"suppress_automations": True}, [], [], None, 1, None)
+    suppress_action = PlanAction(
+        "hvac",
+        "plan",
+        now,
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"suppress_automations": True},
+        [],
+        [],
+        None,
+        1,
+        None,
+    )
     suppress_result = asyncio.run(
         DaikinHVACAdapter(
-            SimpleNamespace(states=States({"climate.daikin": "heat", "automation.hvac": "on"}), services=FailingHVACServices()),
+            SimpleNamespace(
+                states=States({"climate.daikin": "heat", "automation.hvac": "on"}), services=FailingHVACServices()
+            ),
             {"daikin_climate_entity": "climate.daikin", "climate_automation_entities": "automation.hvac"},
         ).async_execute(suppress_action)
     )
     assert suppress_result.reason == "hvac_automation_service_failed"
     state = SimpleNamespace(state="cool", attributes={"target_temp_low": 20, "target_temp_high": "bad"})
     from custom_components.ha_energy_planner.hvac_adapter import _already_in_desired_state
+
     assert _already_in_desired_state(state, {"target_temp_high": 24}) is False
     assert EnphaseProfileAdapter(SimpleNamespace(states=States({}), services=Services()), {})._state(None) is None
 
     # Coordinator/executor final branches.
-    action = PlanAction("ev", "plan", now - timedelta(minutes=1), now + timedelta(minutes=1), ActionAsset.EV, ActionKind.EV_START, {}, [], [], None, 1.0, None)
+    action = PlanAction(
+        "ev",
+        "plan",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.EV,
+        ActionKind.EV_START,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
     store = SimpleNamespace(data={"command_rate_limits": {"ev:ev_start": now.isoformat()}})
-    assert Executor(store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(action, now + timedelta(seconds=5)) is None
-    expired_store = SimpleNamespace(data={"command_rate_limits": {"ev:ev_start": (now - timedelta(seconds=5)).isoformat()}})
+    assert (
+        Executor(store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(
+            action, now + timedelta(seconds=5)
+        )
+        is None
+    )
+    expired_store = SimpleNamespace(
+        data={"command_rate_limits": {"ev:ev_start": (now - timedelta(seconds=5)).isoformat()}}
+    )
     assert Executor(expired_store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(action, now) is None
     from custom_components.ha_energy_planner.executor import _service_target_for_action
-    assert _service_target_for_action(PlanAction("x", "p", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1, None), {"enphase_profile_control_service": "select.select_option"}) == "select.select_option"
-    assert _service_target_for_action(PlanAction("x", "p", now, now, ActionAsset.EV, ActionKind.SET_PROFILE, {}, [], [], None, 1, None), {}) is None
+
+    assert (
+        _service_target_for_action(
+            PlanAction("x", "p", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1, None),
+            {"enphase_profile_control_service": "select.select_option"},
+        )
+        == "select.select_option"
+    )
+    assert (
+        _service_target_for_action(
+            PlanAction("x", "p", now, now, ActionAsset.EV, ActionKind.SET_PROFILE, {}, [], [], None, 1, None), {}
+        )
+        is None
+    )
     assert _profile_control_service_for_target({}, "input_select.profile") == "input_select.select_option"
     assert _latest_ai_service_call_at([{"service_called": False}, "bad"]) is None
     assert coordinator_bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {"a": {"b": {"c": {"d": "<truncated>"}}}}
 
     # HAEO response skip branches.
-    context = DecisionContext(now, "plan", [DecisionSlot(now, 0.2, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY)
-    assert apply_haeo_response_to_context(context, {"slots": [{"valid_at": now.isoformat(), "grid_import_kw": 1e308, "unit": "MW"}]}) == {}
+    context = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+    )
+    assert (
+        apply_haeo_response_to_context(
+            context, {"slots": [{"valid_at": now.isoformat(), "grid_import_kw": 1e308, "unit": "MW"}]}
+        )
+        == {}
+    )
     assert apply_haeo_response_to_context(context, {"slots": [{"valid_at": "bad", "grid_import_kw": "nan"}]}) == {}
     assert apply_haeo_response_to_context(context, {"slots": ["bad"]}) == {}
     assert apply_haeo_response_to_context(context, {"outer": {"inner": {}}}) == {}
 
     # Input and planner small branches.
-    assert InputManager(SimpleNamespace(states=States({"binary_sensor.x": "charging"})), {"x": "binary_sensor.x"}, DEFAULT_OPTIONS)._optional_bool_state("x") == (True, None)
-    assert InputManager(SimpleNamespace(states=States({"binary_sensor.x": "unavailable"})), {"x": "binary_sensor.x"}, DEFAULT_OPTIONS)._optional_bool_state("x") == (None, "x_unavailable")
+    assert InputManager(
+        SimpleNamespace(states=States({"binary_sensor.x": "charging"})), {"x": "binary_sensor.x"}, DEFAULT_OPTIONS
+    )._optional_bool_state("x") == (True, None)
+    assert InputManager(
+        SimpleNamespace(states=States({"binary_sensor.x": "unavailable"})), {"x": "binary_sensor.x"}, DEFAULT_OPTIONS
+    )._optional_bool_state("x") == (None, "x_unavailable")
     assert InputManager._health_from_issues(["battery_soc_entity_unavailable"]) == InputHealth.UNSAFE
     from custom_components.ha_energy_planner.inputs import _attribute_value
+
     assert _attribute_value({"Camel Key": "value"}, "camel_key") == "value"
     assert _attribute_value({"Camel Key": "value"}, "camel key") == "value"
     assert _attribute_value({"direct": "value"}, "direct") == "value"
     planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5, "hvac_precondition_lead_minutes": 10})
-    ctx = DecisionContext(now, "plan", [DecisionSlot(now, 0.1, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY, current_hvac_temperature_c=17, occupied_temperature_low_c=20, occupied_temperature_high_c=24)
+    ctx = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+        current_hvac_temperature_c=17,
+        occupied_temperature_low_c=20,
+        occupied_temperature_high_c=24,
+    )
     assert planner._hvac_preconditioning_action(ctx, now, now + timedelta(minutes=5)) is None
-    ctx2 = DecisionContext(now, "plan", [DecisionSlot(now, 0.1, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY, current_hvac_temperature_c=22, occupied_temperature_low_c=20, occupied_temperature_high_c=24)
+    ctx2 = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+        current_hvac_temperature_c=22,
+        occupied_temperature_low_c=20,
+        occupied_temperature_high_c=24,
+    )
     assert planner._hvac_suppression_action(ctx2, now, now + timedelta(minutes=5)) is None
-    ctx3 = DecisionContext(now, "plan", [DecisionSlot(now, 0.1, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY, current_hvac_temperature_c=17, occupied_temperature_low_c=20, occupied_temperature_high_c=24)
+    ctx3 = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+        current_hvac_temperature_c=17,
+        occupied_temperature_low_c=20,
+        occupied_temperature_high_c=24,
+    )
     assert planner._hvac_preconditioning_action(ctx3, now, now + timedelta(minutes=5)) is None
-    ctx4 = DecisionContext(now, "plan", [DecisionSlot(now, 0.1, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY, current_hvac_temperature_c=22, occupied_temperature_low_c=20, occupied_temperature_high_c=24)
+    ctx4 = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+        current_hvac_temperature_c=22,
+        occupied_temperature_low_c=20,
+        occupied_temperature_high_c=24,
+    )
     assert planner._hvac_preconditioning_action(ctx4, now, now + timedelta(minutes=5)) is None
 
     # Subentry no-consolidation early return.
-    entry = SimpleNamespace(subentries={"system": SimpleNamespace(subentry_id="system", subentry_type="system", data={}), "presence": SimpleNamespace(subentry_id="presence", subentry_type="presence", data={})})
+    entry = SimpleNamespace(
+        subentries={
+            "system": SimpleNamespace(subentry_id="system", subentry_type="system", data={}),
+            "presence": SimpleNamespace(subentry_id="presence", subentry_type="presence", data={}),
+        }
+    )
     hass2 = SimpleNamespace(config_entries=SimpleNamespace(async_add_subentry=lambda entry, subentry: False))
     assert async_consolidate_subentries(hass2, entry) is False
 
-    assert EVSmartChargingAdapter(SimpleNamespace(states=States({}), services=Services()), {})._entity_value_matches("sensor.missing", "x") is False
+    assert (
+        EVSmartChargingAdapter(SimpleNamespace(states=States({}), services=Services()), {})._entity_value_matches(
+            "sensor.missing", "x"
+        )
+        is False
+    )
     assert EnphaseProfileGuard(min_hold=timedelta(minutes=5), last_changed_at=None).remaining_hold(now) == timedelta(0)
     monkeypatch.setattr(config_flow_module, "_ENTITY_DOMAIN_RULES", {"haeo_optimize_service": {"sensor"}})
-    assert _validate_config(SimpleNamespace(states=States({}), services=Services()), {"haeo_optimize_service": "missing.service"}) == {"haeo_optimize_service": "service_not_found"}
+    assert _validate_config(
+        SimpleNamespace(states=States({}), services=Services()), {"haeo_optimize_service": "missing.service"}
+    ) == {"haeo_optimize_service": "service_not_found"}
 
     class FailingServices:
         def has_service(self, domain: str, service: str) -> bool:
@@ -605,44 +922,100 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         async def async_call(self, *args: Any, **kwargs: Any) -> None:
             raise RuntimeError("failed")
 
-    ev_action = PlanAction("ev", "plan", now, now + timedelta(minutes=5), ActionAsset.EV, ActionKind.EV_SCHEDULE, {"ready_by": "07:00"}, [], [], None, 1, None)
+    ev_action = PlanAction(
+        "ev",
+        "plan",
+        now,
+        now + timedelta(minutes=5),
+        ActionAsset.EV,
+        ActionKind.EV_SCHEDULE,
+        {"ready_by": "07:00"},
+        [],
+        [],
+        None,
+        1,
+        None,
+    )
     ev_result = asyncio.run(
         EVSmartChargingAdapter(
-            SimpleNamespace(states=States({"time.ready": "06:00", "switch.ev": "off", "binary_sensor.connected": "on"}), services=FailingServices()),
-            {"ev_connected_entity": "binary_sensor.connected", "ev_smart_charging_start_entity": "switch.ev", "ev_smart_charging_ready_by_entity": "time.ready"},
+            SimpleNamespace(
+                states=States({"time.ready": "06:00", "switch.ev": "off", "binary_sensor.connected": "on"}),
+                services=FailingServices(),
+            ),
+            {
+                "ev_connected_entity": "binary_sensor.connected",
+                "ev_smart_charging_start_entity": "switch.ev",
+                "ev_smart_charging_ready_by_entity": "time.ready",
+            },
         ).async_execute(ev_action)
     )
     assert ev_result.reason == "ev_ready_by_helper_unsupported"
 
-    unsupported_enphase = PlanAction("bad", "plan", now, now, ActionAsset.ENPHASE, ActionKind.EV_START, {}, [], [], None, 1, None)
+    unsupported_enphase = PlanAction(
+        "bad", "plan", now, now, ActionAsset.ENPHASE, ActionKind.EV_START, {}, [], [], None, 1, None
+    )
     assert ConstraintValidator(DEFAULT_OPTIONS)._evaluate_enphase_action(unsupported_enphase, now, None) == []
-    invalid_context = DecisionContext(now, "plan", [DecisionSlot(now, 0.2, 0.05, 0, 1)], 50, 50, OccupancyState.OCCUPIED, HAEOStatus.READY, InputHealth.HEALTHY)
-    hvac_action = PlanAction("hvac", "plan", now, now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"suppress_automations": True}, [], [], None, 1, None)
-    assert ConstraintValidator(DEFAULT_OPTIONS)._evaluate_hvac_action(invalid_context, hvac_action, now, OwnershipState())[0].code == "hvac_comfort_not_valid_for_suppression"
+    invalid_context = DecisionContext(
+        now,
+        "plan",
+        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
+        50,
+        50,
+        OccupancyState.OCCUPIED,
+        HAEOStatus.READY,
+        InputHealth.HEALTHY,
+    )
+    hvac_action = PlanAction(
+        "hvac",
+        "plan",
+        now,
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"suppress_automations": True},
+        [],
+        [],
+        None,
+        1,
+        None,
+    )
+    assert (
+        ConstraintValidator(DEFAULT_OPTIONS)
+        ._evaluate_hvac_action(invalid_context, hvac_action, now, OwnershipState())[0]
+        .code
+        == "hvac_comfort_not_valid_for_suppression"
+    )
 
 
 def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     class Store:
         def __init__(self, hass: Any) -> None:
             pass
+
         async def async_load(self) -> None:
             pass
 
     class Coordinator:
         def __init__(self, hass: Any, entry: Any, store: Any) -> None:
             self.entry = entry
+
         async def async_config_entry_first_refresh(self) -> None:
             pass
+
         def async_start_listeners(self) -> None:
             pass
+
         def async_shutdown(self) -> None:
             pass
+
         async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> None:
             pass
 
     monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", Store)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", Coordinator)
-    monkeypatch.setattr("custom_components.ha_energy_planner.subentry_migration.async_consolidate_subentries", lambda hass, entry: False)
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.subentry_migration.async_consolidate_subentries", lambda hass, entry: False
+    )
     monkeypatch.setattr("custom_components.ha_energy_planner._async_remove_legacy_device", lambda hass, entry: None)
     monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_devices", lambda hass, entry: None)
     updates: list[dict[str, Any]] = []

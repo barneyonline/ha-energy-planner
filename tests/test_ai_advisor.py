@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 from custom_components.ha_energy_planner.ai_advisor import (
@@ -89,8 +89,7 @@ class FakeServices:
 
     def has_service(self, domain: str, service: str) -> bool:
         return self.available and (
-            (domain == "conversation" and service == "process")
-            or (domain == "ai_task" and service == "generate_data")
+            (domain == "conversation" and service == "process") or (domain == "ai_task" and service == "generate_data")
         )
 
     async def async_call(
@@ -250,9 +249,7 @@ def test_local_ai_advisor_accepts_home_assistant_conversation_response() -> None
         "conversation_id": "conv-1",
         "response": {
             "speech": {
-                "plain": {
-                    "speech": "```json\n{\"reasoning_summary\":\"Use the current plan.\",\"confidence\":0.61}\n```"
-                }
+                "plain": {"speech": '```json\n{"reasoning_summary":"Use the current plan.","confidence":0.61}\n```'}
             }
         },
     }
@@ -598,17 +595,17 @@ def test_single_ai_task_entity_supports_async_all_fallback() -> None:
 
 
 def test_parse_response_supports_common_nested_shapes() -> None:
-    assert _parse_response({"data": "{\"confidence\":0.4}"}) == {"confidence": 0.4}
-    assert _parse_response({"response": {"text": "{\"confidence\":0.5}"}}) == {"confidence": 0.5}
+    assert _parse_response({"data": '{"confidence":0.4}'}) == {"confidence": 0.4}
+    assert _parse_response({"response": {"text": '{"confidence":0.5}'}}) == {"confidence": 0.5}
     assert _parse_response({"confidence": 0.6}) == {"confidence": 0.6}
-    assert _parse_response("{\"confidence\":0.7}") == {"confidence": 0.7}
-    assert _parse_response({"speech": {"speech": "{\"confidence\":0.8}"}}) == {"confidence": 0.8}
-    assert _parse_response({"message": "{\"confidence\":0.9}"}) == {"confidence": 0.9}
+    assert _parse_response('{"confidence":0.7}') == {"confidence": 0.7}
+    assert _parse_response({"speech": {"speech": '{"confidence":0.8}'}}) == {"confidence": 0.8}
+    assert _parse_response({"message": '{"confidence":0.9}'}) == {"confidence": 0.9}
 
 
 def test_loads_extracts_fenced_and_embedded_json() -> None:
-    assert _loads("```json\n{\"confidence\":0.3}\n```") == {"confidence": 0.3}
-    assert _loads("prefix {\"confidence\":0.2} suffix") == {"confidence": 0.2}
+    assert _loads('```json\n{"confidence":0.3}\n```') == {"confidence": 0.3}
+    assert _loads('prefix {"confidence":0.2} suffix') == {"confidence": 0.2}
     assert _loads("```json\n{bad}\n```") is None
     assert _loads("prefix {bad} suffix") is None
 

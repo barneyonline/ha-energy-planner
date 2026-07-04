@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
-from pathlib import Path
 import sys
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from custom_components.ha_energy_planner.forecasts import forecast_series_from_state
@@ -32,10 +32,7 @@ class FakeState:
 
 
 def _fixtures() -> list[dict[str, Any]]:
-    return [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(FIXTURE_DIR.glob("*.json"))
-    ]
+    return [json.loads(path.read_text(encoding="utf-8")) for path in sorted(FIXTURE_DIR.glob("*.json"))]
 
 
 def test_representative_live_schema_fixtures_parse_successfully() -> None:

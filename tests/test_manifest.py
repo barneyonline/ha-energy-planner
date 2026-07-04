@@ -5,12 +5,7 @@ from pathlib import Path
 
 
 def _manifest() -> dict[str, object]:
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "custom_components"
-        / "ha_energy_planner"
-        / "manifest.json"
-    )
+    path = Path(__file__).resolve().parents[1] / "custom_components" / "ha_energy_planner" / "manifest.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 

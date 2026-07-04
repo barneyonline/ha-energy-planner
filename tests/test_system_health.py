@@ -60,9 +60,7 @@ def test_system_health_reports_loaded_planner_state() -> None:
 
 
 def test_system_health_handles_unloaded_entries() -> None:
-    hass = SimpleNamespace(
-        config_entries=FakeConfigEntries([SimpleNamespace(runtime_data=None)])
-    )
+    hass = SimpleNamespace(config_entries=FakeConfigEntries([SimpleNamespace(runtime_data=None)]))
 
     info = asyncio.run(system_health_info(hass))
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
-from typing import Any, Sequence
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 try:
     import yaml  # type: ignore[import-untyped]
@@ -106,9 +107,7 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     levels = quality.get("levels") or {}
     rules = quality.get("rules") or {}
     if claimed != EXPECTED_QUALITY_SCALE:
-        messages.append(
-            f"ERROR: Manifest must claim quality_scale {EXPECTED_QUALITY_SCALE!r}; got {claimed!r}"
-        )
+        messages.append(f"ERROR: Manifest must claim quality_scale {EXPECTED_QUALITY_SCALE!r}; got {claimed!r}")
     required_rules: list[str] = []
     for level in _required_levels_for_claim(claimed):
         level_entry = levels.get(level) or {}
@@ -124,8 +123,7 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     missing_na_comments = []
     broken_references = []
     generated_artifacts = [
-        str(path.relative_to(root))
-        for path in (root / "custom_components" / DOMAIN).rglob("__pycache__")
+        str(path.relative_to(root)) for path in (root / "custom_components" / DOMAIN).rglob("__pycache__")
     ]
 
     for rule, entry in rules.items():
@@ -139,10 +137,7 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
         if status == "n/a":
             if rule not in NA_ALLOWED_RULES:
                 bad_na_rules.append(rule)
-            if (
-                not isinstance(entry, dict)
-                or not str(entry.get("comment") or "").strip()
-            ):
+            if not isinstance(entry, dict) or not str(entry.get("comment") or "").strip():
                 missing_na_comments.append(rule)
         for refs in _references_for_rule(entry).values():
             for reference in refs:
@@ -150,28 +145,15 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
                     broken_references.append(f"{rule}: {reference}")
 
     if unknown_status_rules:
-        messages.append(
-            "ERROR: Rules have an unsupported status: "
-            + ", ".join(unknown_status_rules)
-        )
+        messages.append("ERROR: Rules have an unsupported status: " + ", ".join(unknown_status_rules))
     if incomplete_rules:
-        messages.append(
-            f"ERROR: Rules not marked done or n/a: {', '.join(incomplete_rules)}"
-        )
+        messages.append(f"ERROR: Rules not marked done or n/a: {', '.join(incomplete_rules)}")
     if bad_na_rules:
-        messages.append(
-            "ERROR: Rules marked n/a without an allowlist exception: "
-            + ", ".join(bad_na_rules)
-        )
+        messages.append("ERROR: Rules marked n/a without an allowlist exception: " + ", ".join(bad_na_rules))
     if missing_na_comments:
-        messages.append(
-            "ERROR: n/a rules missing explanatory comments: "
-            + ", ".join(missing_na_comments)
-        )
+        messages.append("ERROR: n/a rules missing explanatory comments: " + ", ".join(missing_na_comments))
     if broken_references:
-        messages.append(
-            "ERROR: Broken quality scale references: " + ", ".join(broken_references)
-        )
+        messages.append("ERROR: Broken quality scale references: " + ", ".join(broken_references))
     if generated_artifacts:
         messages.append(
             "ERROR: Generated cache directories must not be present in the integration: "

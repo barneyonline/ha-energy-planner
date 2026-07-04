@@ -12,8 +12,8 @@ from custom_components.ha_energy_planner.ev import (
     allocate_least_cost_charging,
     calculate_ev_target,
     import_trip_history_from_state_sequences,
-    summarize_trip_history,
     summarize_stored_trip_history,
+    summarize_trip_history,
     trip_records_from_store,
     update_trip_history_from_values,
 )
@@ -162,24 +162,30 @@ def test_ev_target_and_schedule_invalid_edge_cases() -> None:
 
     now = datetime(2026, 6, 27, tzinfo=UTC)
     slots = [DecisionSlot(now, 0.10, 0.05, 0, 1)]
-    assert allocate_least_cost_charging(
-        slots,
-        current_soc_percent=80,
-        target_soc_percent=80,
-        ready_by=now + timedelta(hours=1),
-        charge_rate_kw=6,
-        soc_per_kwh=10,
-        interval_minutes=5,
-    ).reason == "already_at_target"
-    assert allocate_least_cost_charging(
-        slots,
-        current_soc_percent=40,
-        target_soc_percent=80,
-        ready_by=now + timedelta(hours=1),
-        charge_rate_kw=0,
-        soc_per_kwh=10,
-        interval_minutes=5,
-    ).reason == "ev_charge_rate_invalid"
+    assert (
+        allocate_least_cost_charging(
+            slots,
+            current_soc_percent=80,
+            target_soc_percent=80,
+            ready_by=now + timedelta(hours=1),
+            charge_rate_kw=6,
+            soc_per_kwh=10,
+            interval_minutes=5,
+        ).reason
+        == "already_at_target"
+    )
+    assert (
+        allocate_least_cost_charging(
+            slots,
+            current_soc_percent=40,
+            target_soc_percent=80,
+            ready_by=now + timedelta(hours=1),
+            charge_rate_kw=0,
+            soc_per_kwh=10,
+            interval_minutes=5,
+        ).reason
+        == "ev_charge_rate_invalid"
+    )
 
 
 def test_ev_low_level_parsers_cover_missing_and_unknown_values() -> None:

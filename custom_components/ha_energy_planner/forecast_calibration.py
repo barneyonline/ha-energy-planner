@@ -44,10 +44,7 @@ def update_forecast_calibration(
     now: datetime,
 ) -> tuple[dict[str, Any], bool]:
     """Update compact calibration statistics from due forecast snapshots."""
-    updated = {
-        key: dict(value) if isinstance(value, Mapping) else value
-        for key, value in dict(model or {}).items()
-    }
+    updated = {key: dict(value) if isinstance(value, Mapping) else value for key, value in dict(model or {}).items()}
     if not any(_finite_float_or_none(actuals.get(field)) is not None for field in FORECAST_CALIBRATION_FIELDS):
         return updated, False
     changed = False

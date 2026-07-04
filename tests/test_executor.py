@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.const import (
     CONF_COMMAND_RATE_LIMIT_SECONDS,
-    CONF_CLIMATE_CONTROL_ENABLED,
-    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
@@ -22,14 +21,13 @@ from custom_components.ha_energy_planner.const import (
     CONF_MAX_DAILY_EV_ACTIONS,
     DEFAULT_OPTIONS,
 )
-from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.executor import (
     Executor,
     _clean_reason_codes,
     _daily_action_cap_reason,
     _device_control_disabled_reason,
-    _plan_fallback_message,
     _pause_rejection_reason,
+    _plan_fallback_message,
     _profile_control_service_for_target,
     _restore_notification_message,
     _service_target_for_action,
@@ -211,7 +209,10 @@ def test_restore_safe_state_creates_persistent_notification() -> None:
             "create",
             {
                 "title": "Energy Planner restored safe state",
-                "message": "Planner-owned EV, Enphase, and Daikin controls were restored where supported. Reason: test_restore_reason:enphase_ai_profile_not_configured.",
+                "message": (
+                    "Planner-owned EV, Enphase, and Daikin controls were restored where supported. "
+                    "Reason: test_restore_reason:enphase_ai_profile_not_configured."
+                ),
                 "notification_id": "ha_energy_planner_restore_safe_state",
             },
         )
@@ -265,7 +266,10 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
             "create",
             {
                 "title": "Energy Planner EV target infeasible",
-                "message": "The EV cannot reach the requested ready-by target with the current schedule. Planned target: 65%. Ready by: 07:00.",
+                "message": (
+                    "The EV cannot reach the requested ready-by target with the current schedule. "
+                    "Planned target: 65%. Ready by: 07:00."
+                ),
                 "notification_id": "ha_energy_planner_ev_infeasible_plan-1",
             },
         )
@@ -307,7 +311,11 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
             "create",
             {
                 "title": "Energy Planner plan unsafe",
-                "message": "Required inputs are stale, missing, or invalid. Device control remains blocked. Plan status: unsafe. Mode: ACTIVE_DEGRADED. Reason codes: input_health_unsafe, grid_import_limit_exceeded.",
+                "message": (
+                    "Required inputs are stale, missing, or invalid. Device control remains blocked. "
+                    "Plan status: unsafe. Mode: ACTIVE_DEGRADED. "
+                    "Reason codes: input_health_unsafe, grid_import_limit_exceeded."
+                ),
                 "notification_id": "ha_energy_planner_plan_unsafe",
             },
         ),
@@ -316,7 +324,11 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
             "create",
             {
                 "title": "Energy Planner grid limit fallback",
-                "message": "The current plan would exceed a configured grid import/export hard limit. Plan status: unsafe. Mode: ACTIVE_DEGRADED. Reason codes: grid_import_limit_exceeded.",
+                "message": (
+                    "The current plan would exceed a configured grid import/export hard limit. "
+                    "Plan status: unsafe. Mode: ACTIVE_DEGRADED. "
+                    "Reason codes: grid_import_limit_exceeded."
+                ),
                 "notification_id": "ha_energy_planner_grid_limit_fallback",
             },
         ),
@@ -367,10 +379,15 @@ def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() 
             "create",
             {
                 "title": "Energy Planner HAEO fallback",
-                "message": "HAEO did not return a healthy optimization result. The deterministic fallback remains constrained. Plan status: current. Mode: ACTIVE_HEALTHY. Reason codes: haeo_service_unavailable.",
+                "message": (
+                    "HAEO did not return a healthy optimization result. "
+                    "The deterministic fallback remains constrained. "
+                    "Plan status: current. Mode: ACTIVE_HEALTHY. "
+                    "Reason codes: haeo_service_unavailable."
+                ),
                 "notification_id": "ha_energy_planner_haeo_fallback",
             },
-        )
+        ),
     ]
 
 
@@ -585,9 +602,17 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     assert _pause_rejection_reason({"until": "bad"}, action, now) is None
     assert _pause_rejection_reason({"until": (now - timedelta(minutes=1)).isoformat()}, action, now) is None
     assert _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat()}, action, now) == "planner_paused"
-    assert _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": "ev"}, action, now) == "ev_control_paused"
-    assert _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": ["daikin"]}, action, now) is None
-    assert _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now) is None
+    assert (
+        _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": "ev"}, action, now)
+        == "ev_control_paused"
+    )
+    assert (
+        _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": ["daikin"]}, action, now)
+        is None
+    )
+    assert (
+        _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now) is None
+    )
 
     assert _device_control_disabled_reason(ActionAsset.EV, {}) == "ev_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.DAIKIN, {}) == "climate_control_disabled"
@@ -607,8 +632,14 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     assert _daily_action_cap_reason(ActionAsset.EV, {CONF_MAX_DAILY_EV_ACTIONS: 0}, audit, now) is None
     assert _daily_action_cap_reason(ActionAsset.EV, {CONF_MAX_DAILY_EV_ACTIONS: 1}, "bad", now) is None
     assert _daily_action_cap_reason(ActionAsset.EV, {CONF_MAX_DAILY_EV_ACTIONS: 4}, audit, now) is None
-    assert _daily_action_cap_reason(ActionAsset.EV, {CONF_MAX_DAILY_EV_ACTIONS: 3}, audit, now) == "ev_daily_action_cap_reached"
-    assert _daily_action_cap_reason(ActionAsset.DAIKIN, {CONF_MAX_DAILY_CLIMATE_ACTIONS: 1}, audit, now) == "climate_daily_action_cap_reached"
+    assert (
+        _daily_action_cap_reason(ActionAsset.EV, {CONF_MAX_DAILY_EV_ACTIONS: 3}, audit, now)
+        == "ev_daily_action_cap_reached"
+    )
+    assert (
+        _daily_action_cap_reason(ActionAsset.DAIKIN, {CONF_MAX_DAILY_CLIMATE_ACTIONS: 1}, audit, now)
+        == "climate_daily_action_cap_reached"
+    )
     assert _daily_action_cap_reason(ActionAsset.ENPHASE, {CONF_MAX_DAILY_ENPHASE_ACTIONS: 1}, audit, now) is None
 
     store = FakeStore()
@@ -749,7 +780,9 @@ def test_executor_returns_without_outcome_for_no_or_not_due_action() -> None:
     now = datetime.now(UTC)
     store = FakeStore()
     executor = Executor(store)
-    empty_plan = EnergyPlan("plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [], [])
+    empty_plan = EnergyPlan(
+        "plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [], []
+    )
     future_action = PlanAction(
         action_id="future",
         plan_id="plan-1",
@@ -764,7 +797,20 @@ def test_executor_returns_without_outcome_for_no_or_not_due_action() -> None:
         confidence=1.0,
         requires_haeo_plan_id=None,
     )
-    future_plan = EnergyPlan("plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [future_action], [])
+    future_plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [future_action],
+        [],
+    )
 
     asyncio.run(executor.async_evaluate(empty_plan))
     asyncio.run(executor.async_evaluate(future_plan))
@@ -820,10 +866,38 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
     now = datetime.now(UTC)
-    action = PlanAction("hvac", "plan-1", now - timedelta(minutes=1), now + timedelta(minutes=1), ActionAsset.DAIKIN, ActionKind.SET_HVAC, {}, [], [], None, 1.0, None)
-    plan = EnergyPlan("plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [action], [])
+    action = PlanAction(
+        "hvac",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
     store = FakeStore()
-    executor = Executor(store, hass=FakeHass({"climate.daikin": "off"}), entry_data={"daikin_climate_entity": "climate.daikin"})
+    executor = Executor(
+        store, hass=FakeHass({"climate.daikin": "off"}), entry_data={"daikin_climate_entity": "climate.daikin"}
+    )
 
     asyncio.run(executor.async_evaluate(plan))
 
@@ -853,10 +927,38 @@ def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object
 
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FakeEnphaseAdapter)
     now = datetime.now(UTC)
-    action = PlanAction("enphase", "plan-1", now - timedelta(minutes=1), now + timedelta(minutes=1), ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0, None)
-    plan = EnergyPlan("plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [action], [])
+    action = PlanAction(
+        "enphase",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.ENPHASE,
+        ActionKind.SET_PROFILE,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
     store = FakeStore()
-    executor = Executor(store, hass=FakeHass({"select.enphase": "AI Optimisation"}), entry_data={CONF_ENPHASE_PROFILE: "select.enphase"})
+    executor = Executor(
+        store, hass=FakeHass({"select.enphase": "AI Optimisation"}), entry_data={CONF_ENPHASE_PROFILE: "select.enphase"}
+    )
     executor.entry_data[CONF_ENPHASE_AI_PROFILE] = "AI Optimisation"
 
     asyncio.run(executor.async_evaluate(plan))
@@ -872,21 +974,33 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
             pass
 
         async def async_restore(self, state: dict[str, Any]) -> object:
-            return type("Result", (), {"applied": False, "reason": "ev_restore_failed", "pre_state": {"ev": "on"}, "post_state": {}})()
+            return type(
+                "Result",
+                (),
+                {"applied": False, "reason": "ev_restore_failed", "pre_state": {"ev": "on"}, "post_state": {}},
+            )()
 
     class FakeDaikinAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, state: dict[str, Any]) -> object:
-            return type("Result", (), {"applied": True, "reason": "hvac_restored", "pre_state": {}, "post_state": {"hvac": "on"}})()
+            return type(
+                "Result",
+                (),
+                {"applied": True, "reason": "hvac_restored", "pre_state": {}, "post_state": {"hvac": "on"}},
+            )()
 
     class FakeEnphaseAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore_ai(self) -> object:
-            return type("Result", (), {"applied": False, "reason": "enphase_profile_unavailable", "pre_state": {}, "post_state": {}})()
+            return type(
+                "Result",
+                (),
+                {"applied": False, "reason": "enphase_profile_unavailable", "pre_state": {}, "post_state": {}},
+            )()
 
     monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FakeEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -916,7 +1030,9 @@ def test_executor_notification_helpers_skip_when_unavailable() -> None:
 
     asyncio.run(executor._async_create_notification(title="Title", message="Message", notification_id="id"))
     asyncio.run(executor._async_dismiss_notification("id"))
-    asyncio.run(Executor(FakeStore())._async_create_notification(title="Title", message="Message", notification_id="id"))
+    asyncio.run(
+        Executor(FakeStore())._async_create_notification(title="Title", message="Message", notification_id="id")
+    )
     asyncio.run(Executor(FakeStore())._async_dismiss_notification("id"))
 
     assert hass.services.calls == []
@@ -926,17 +1042,24 @@ def test_executor_message_and_service_target_helpers_cover_edge_cases() -> None:
     now = datetime.now(UTC)
     ev_stop = PlanAction("ev-stop", "plan-1", now, now, ActionAsset.EV, ActionKind.EV_STOP, {}, [], [], None, 1.0, None)
     hvac = PlanAction("hvac", "plan-1", now, now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {}, [], [], None, 1.0, None)
-    enphase = PlanAction("enphase", "plan-1", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0, None)
+    enphase = PlanAction(
+        "enphase", "plan-1", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0, None
+    )
 
     assert _service_target_for_action(ev_stop, {CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop"}) == "switch.ev_stop"
     assert _service_target_for_action(hvac, {"daikin_climate_entity": "climate.daikin"}) == "climate.daikin"
-    assert _service_target_for_action(enphase, {CONF_ENPHASE_PROFILE: "select.enphase"}) == "select.select_option:select.enphase"
+    assert (
+        _service_target_for_action(enphase, {CONF_ENPHASE_PROFILE: "select.enphase"})
+        == "select.select_option:select.enphase"
+    )
     assert _profile_control_service_for_target({}, "sensor.enphase") is None
     assert _profile_control_service_for_target({}, None) is None
     assert f"{('x' * 497)}..." in _restore_notification_message("x" * 600)
     assert _clean_reason_codes(["", "  multi\n space  ", "x" * 100]) == ["multi space", ("x" * 77) + "..."]
     assert "not specified" in _plan_fallback_message(
-        EnergyPlan("plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [], []),
+        EnergyPlan(
+            "plan-1", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "test", 1.0, None, [], []
+        ),
         "Summary.",
         [],
     )

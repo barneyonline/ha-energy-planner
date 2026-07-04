@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-import json
 from pathlib import Path
-import sys
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -126,9 +126,7 @@ def _profile_errors(profile: str, fixtures: list[dict[str, Any]]) -> dict[str, A
         if actual != expected:
             mismatched.append({"name": name, "expected": expected, "actual": actual})
         absent = [
-            field
-            for field in V1_REAL_PROFILE_SOURCE_FIELDS[name]
-            if not _has_profile_source_field(fixture, field)
+            field for field in V1_REAL_PROFILE_SOURCE_FIELDS[name] if not _has_profile_source_field(fixture, field)
         ]
         if absent:
             missing_source_fields.append({"name": name, "missing_fields": absent})

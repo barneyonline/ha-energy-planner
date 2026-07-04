@@ -187,11 +187,7 @@ def import_trip_history_from_state_sequences(
         return updated, False
 
     records = list(updated.get("records") or [])
-    known_keys = {
-        _record_key(record)
-        for record in records
-        if isinstance(record, dict)
-    }
+    known_keys = {_record_key(record) for record in records if isinstance(record, dict)}
     active_start: datetime | None = None
     active_start_soc: float | None = None
     last_soc: float | None = None
@@ -294,11 +290,7 @@ def allocate_least_cost_charging(
     if soc_per_slot <= 0:
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, required, True, "ev_charge_rate_invalid")
 
-    feasible_slots = [
-        slot
-        for slot in slots
-        if slot.valid_at < ready_by and slot.import_price is not None
-    ]
+    feasible_slots = [slot for slot in slots if slot.valid_at < ready_by and slot.import_price is not None]
     ordered = sorted(feasible_slots, key=lambda slot: (slot.import_price, slot.valid_at))
     remaining = required
     allocations: list[EVChargeAllocation] = []

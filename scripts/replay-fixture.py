@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -33,8 +33,7 @@ def main() -> int:
             failed = True
         expected_action_violations = fixture_data.get("expected_action_violations", {})
         actual_action_violations = {
-            action.action_id: [violation.code for violation in action.violations]
-            for action in result.action_results
+            action.action_id: [violation.code for violation in action.violations] for action in result.action_results
         }
         for action_id, expected_violations in expected_action_violations.items():
             if actual_action_violations.get(action_id) != expected_violations:

@@ -7,7 +7,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from custom_components.ha_energy_planner import storage as storage_module
-from custom_components.ha_energy_planner.models import ActionOutcome, EnergyPlan, InputHealth, OutcomeResult, Override, PlannerMode
+from custom_components.ha_energy_planner.models import (
+    ActionOutcome,
+    EnergyPlan,
+    InputHealth,
+    OutcomeResult,
+    Override,
+    PlannerMode,
+)
 from custom_components.ha_energy_planner.storage import PlannerStore
 
 
@@ -175,9 +182,7 @@ def test_store_persists_production_pause_and_dry_run_comparison(monkeypatch: obj
 
     assert FakeStore.save_count == 3
     assert FakeStore.saved is not None
-    assert store.data["dry_run_comparisons"] == [
-        {"plan_id": "plan-1", "created_at": "2026-06-27T00:00:00+00:00"}
-    ]
+    assert store.data["dry_run_comparisons"] == [{"plan_id": "plan-1", "created_at": "2026-06-27T00:00:00+00:00"}]
     assert FakeStore.saved["production"] == {"armed": True, "armed_at": "2026-06-27T00:00:00+00:00"}
     assert FakeStore.saved["control_pause"] == {"active": True, "until": "2026-06-27T00:00:00+00:00"}
 

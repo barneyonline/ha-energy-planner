@@ -6,12 +6,12 @@ import asyncio
 from types import SimpleNamespace
 
 from custom_components.ha_energy_planner import binary_sensor as binary_sensor_module
-from custom_components.ha_energy_planner.models import InputHealth
 from custom_components.ha_energy_planner.binary_sensor import (
     BINARY_SENSORS,
     PlannerBinarySensor,
     _planner_ownership_active,
 )
+from custom_components.ha_energy_planner.models import InputHealth
 
 
 def test_data_health_uses_problem_semantics() -> None:

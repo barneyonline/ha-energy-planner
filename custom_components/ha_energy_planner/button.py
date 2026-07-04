@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.const import EntityCategory
@@ -110,7 +110,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up buttons."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    async_add_planner_entities(entry, async_add_entities, (PlannerButton(coordinator, description) for description in BUTTONS))
+    async_add_planner_entities(
+        entry, async_add_entities, (PlannerButton(coordinator, description) for description in BUTTONS)
+    )
 
 
 class PlannerButton(EnergyPlannerEntity, ButtonEntity):

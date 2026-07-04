@@ -41,12 +41,16 @@ async def async_get_config_entry_diagnostics(
             "options": _redact(dict(entry.options)),
         },
         "entity_mapping": _redact(_entity_mapping(entry_data)),
-        "input_health": None if plan is None else {
+        "input_health": None
+        if plan is None
+        else {
             "health": str(plan.health),
             "confidence": plan.confidence,
             "issues": plan.input_issues[:20],
         },
-        "plan": None if plan is None else {
+        "plan": None
+        if plan is None
+        else {
             "plan_id": plan.plan_id,
             "created_at": plan.created_at.isoformat(),
             "status": plan.status,
@@ -56,7 +60,9 @@ async def async_get_config_entry_diagnostics(
             "summary": plan.summary,
             "estimated_daily_cost": plan.estimated_daily_cost,
             "action_count": len(plan.actions),
-            "next_action": None if plan.next_action is None else {
+            "next_action": None
+            if plan.next_action is None
+            else {
                 "action_id": plan.next_action.action_id,
                 "asset": str(plan.next_action.asset),
                 "kind": str(plan.next_action.kind),
@@ -93,10 +99,7 @@ def _entity_mapping(entry_data: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in entry_data.items()
-        if key.endswith("_entity")
-        or key.endswith("_entities")
-        or key.endswith("_service")
-        or "service" in key
+        if key.endswith("_entity") or key.endswith("_entities") or key.endswith("_service") or "service" in key
     }
 
 
@@ -117,14 +120,20 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         "active_plan_present": bool(store_data.get("active_plan")),
         "outcome_count": len(store_data.get("outcomes", [])) if isinstance(store_data.get("outcomes"), list) else 0,
         "forecast_snapshot_count": (
-            len(store_data.get("forecast_snapshots", [])) if isinstance(store_data.get("forecast_snapshots"), list) else 0
+            len(store_data.get("forecast_snapshots", []))
+            if isinstance(store_data.get("forecast_snapshots"), list)
+            else 0
         ),
         "haeo_run_count": len(store_data.get("haeo_runs", [])) if isinstance(store_data.get("haeo_runs"), list) else 0,
         "dry_run_comparison_count": (
-            len(store_data.get("dry_run_comparisons", [])) if isinstance(store_data.get("dry_run_comparisons"), list) else 0
+            len(store_data.get("dry_run_comparisons", []))
+            if isinstance(store_data.get("dry_run_comparisons"), list)
+            else 0
         ),
         "ai_recommendation_count": (
-            len(store_data.get("ai_recommendations", [])) if isinstance(store_data.get("ai_recommendations"), list) else 0
+            len(store_data.get("ai_recommendations", []))
+            if isinstance(store_data.get("ai_recommendations"), list)
+            else 0
         ),
         "discovery": store_data.get("discovery", {}),
         "ownership": store_data.get("ownership", {}),
@@ -140,11 +149,7 @@ def _trip_history_summary(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
     records = value.get("records", [])
-    return {
-        key: item
-        for key, item in value.items()
-        if key != "records"
-    } | {
+    return {key: item for key, item in value.items() if key != "records"} | {
         "record_count": len(records) if isinstance(records, list) else 0,
     }
 

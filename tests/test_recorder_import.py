@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
 import types
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import custom_components.ha_energy_planner.recorder_import as recorder_import
@@ -278,4 +278,7 @@ def test_recorder_import_due_handles_invalid_and_naive_timestamps() -> None:
     assert recorder_import._import_due({}, aware_now) is True
     assert recorder_import._import_due({"recorder_imported_at": "bad"}, aware_now) is True
     assert recorder_import._import_due({"recorder_imported_at": 123}, aware_now) is True
-    assert recorder_import._import_due({"recorder_imported_at": datetime(2026, 6, 26, 0, 0, tzinfo=UTC)}, naive_now) is True
+    assert (
+        recorder_import._import_due({"recorder_imported_at": datetime(2026, 6, 26, 0, 0, tzinfo=UTC)}, naive_now)
+        is True
+    )

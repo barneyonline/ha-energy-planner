@@ -65,7 +65,12 @@ class EVSmartChargingAdapter:
                 if entity_id and state in {"on", "off"} and entity_id.split(".", 1)[0] in {"switch", "input_boolean"}:
                     await self._async_call_control(entity_id, turn_on=state == "on")
                     applied = True
-            return EVCommandResult(applied, "ev_saved_state_restored" if applied else "ev_saved_state_not_restorable", pre_state, self._snapshot())
+            return EVCommandResult(
+                applied,
+                "ev_saved_state_restored" if applied else "ev_saved_state_not_restorable",
+                pre_state,
+                self._snapshot(),
+            )
         result = await self._async_stop()
         return EVCommandResult(result.applied, result.reason, pre_state, self._snapshot())
 
@@ -141,16 +146,24 @@ class EVSmartChargingAdapter:
             return True
         with suppress(Exception):
             if domain in {"number", "input_number"}:
-                await self.hass.services.async_call(domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": value}, blocking=True)
+                await self.hass.services.async_call(
+                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": value}, blocking=True
+                )
                 return True
             if domain == "input_datetime":
-                await self.hass.services.async_call(domain, "set_datetime", {ATTR_ENTITY_ID: entity_id, "time": str(value)}, blocking=True)
+                await self.hass.services.async_call(
+                    domain, "set_datetime", {ATTR_ENTITY_ID: entity_id, "time": str(value)}, blocking=True
+                )
                 return True
             if domain == "input_text":
-                await self.hass.services.async_call(domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True)
+                await self.hass.services.async_call(
+                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
+                )
                 return True
             if domain == "time":
-                await self.hass.services.async_call(domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True)
+                await self.hass.services.async_call(
+                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
+                )
                 return True
         return False
 
@@ -197,10 +210,7 @@ class EVSmartChargingAdapter:
             }
             and entity_id
         }
-        return {
-            key: self._state_value(entity_id)
-            for key, entity_id in entity_ids.items()
-        }
+        return {key: self._state_value(entity_id) for key, entity_id in entity_ids.items()}
 
     def _state(self, entity_id: str | None) -> State | None:
         if not entity_id:

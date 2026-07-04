@@ -90,7 +90,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up switches."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    async_add_planner_entities(entry, async_add_entities, (PlannerSwitch(coordinator, description) for description in SWITCHES))
+    async_add_planner_entities(
+        entry, async_add_entities, (PlannerSwitch(coordinator, description) for description in SWITCHES)
+    )
 
 
 class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):

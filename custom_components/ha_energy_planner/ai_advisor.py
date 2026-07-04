@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from dataclasses import dataclass, field
 import json
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from .const import (
@@ -17,7 +17,6 @@ from .const import (
     CONF_ENPHASE_MIN_SAVINGS,
 )
 from .models import DecisionContext, EnergyPlan, InputHealth, PlannerMode
-
 
 ALLOWED_ADJUSTMENTS = {
     "suggested_precondition_lead_minutes": (0, 120),
@@ -163,7 +162,9 @@ class LocalAIAdvisor:
             )
         accepted = validate_ai_response(parsed, takeover_bounds=_takeover_bounds(self.options))
         if not accepted:
-            return _with_provider(_rejected_result("rejected", "ai_response_no_accepted_fields", service_name), entry_data)
+            return _with_provider(
+                _rejected_result("rejected", "ai_response_no_accepted_fields", service_name), entry_data
+            )
         return _with_provider(AIAdviceResult("accepted", accepted, None, service_name), entry_data)
 
 

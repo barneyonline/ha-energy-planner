@@ -15,8 +15,7 @@ def test_replay_fixtures_match_expected_outcomes() -> None:
         assert result.rejected_action_count == expected_rejected
         expected_action_violations = fixture.get("expected_action_violations", {})
         actual_action_violations = {
-            action.action_id: [violation.code for violation in action.violations]
-            for action in result.action_results
+            action.action_id: [violation.code for violation in action.violations] for action in result.action_results
         }
         for action_id, expected_violations in expected_action_violations.items():
             assert actual_action_violations[action_id] == expected_violations

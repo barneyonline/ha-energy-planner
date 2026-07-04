@@ -444,9 +444,9 @@ def test_ev_controls_fail_closed_for_unavailable_and_unsupported_domains() -> No
         )
     )
     unsupported = asyncio.run(
-        EVSmartChargingAdapter(FakeHass({"sensor.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "sensor.ev_start"}).async_execute(
-            _action(ActionKind.EV_START)
-        )
+        EVSmartChargingAdapter(
+            FakeHass({"sensor.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "sensor.ev_start"}
+        ).async_execute(_action(ActionKind.EV_START))
     )
 
     assert missing.reason == "ev_control_unavailable"
@@ -455,14 +455,14 @@ def test_ev_controls_fail_closed_for_unavailable_and_unsupported_domains() -> No
 
 def test_ev_control_service_errors_fail_closed() -> None:
     button = asyncio.run(
-        EVSmartChargingAdapter(FailingHass({"button.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "button.ev_start"}).async_execute(
-            _action(ActionKind.EV_START)
-        )
+        EVSmartChargingAdapter(
+            FailingHass({"button.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "button.ev_start"}
+        ).async_execute(_action(ActionKind.EV_START))
     )
     switch = asyncio.run(
-        EVSmartChargingAdapter(FailingHass({"switch.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "switch.ev_start"}).async_execute(
-            _action(ActionKind.EV_START)
-        )
+        EVSmartChargingAdapter(
+            FailingHass({"switch.ev_start": "off"}), {CONF_EV_SMART_CHARGING_START: "switch.ev_start"}
+        ).async_execute(_action(ActionKind.EV_START))
     )
 
     assert button.reason == "ev_control_service_failed"
@@ -499,7 +499,11 @@ def test_ev_schedule_writes_all_supported_helper_domains() -> None:
     hass.states.values["switch.ev_start"] = "off"
     assert asyncio.run(time_adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"ready_by": "08:00"}))).applied
 
-    assert ("input_datetime", "set_datetime", {"entity_id": "input_datetime.ev_ready_by", "time": "07:00"}) in hass.services.calls
+    assert (
+        "input_datetime",
+        "set_datetime",
+        {"entity_id": "input_datetime.ev_ready_by", "time": "07:00"},
+    ) in hass.services.calls
     assert ("time", "set_value", {"entity_id": "time.ev_ready_by", "value": "08:00"}) in hass.services.calls
 
 

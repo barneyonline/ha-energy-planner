@@ -112,15 +112,11 @@ def test_forecast_calibration_rejects_invalid_factors_and_samples() -> None:
         {"plan_id": "plan-2", "forecast_training_slots": [{"valid_at": "bad", "pv_forecast_kw": 1.0}]},
         {
             "plan_id": "plan-3",
-            "forecast_training_slots": [
-                {"valid_at": (now + timedelta(hours=1)).isoformat(), "pv_forecast_kw": 1.0}
-            ],
+            "forecast_training_slots": [{"valid_at": (now + timedelta(hours=1)).isoformat(), "pv_forecast_kw": 1.0}],
         },
         {
             "plan_id": "plan-4",
-            "forecast_training_slots": [
-                {"valid_at": (now - timedelta(minutes=5)).isoformat(), "pv_forecast_kw": -1.0}
-            ],
+            "forecast_training_slots": [{"valid_at": (now - timedelta(minutes=5)).isoformat(), "pv_forecast_kw": -1.0}],
         },
     ]
 
@@ -134,8 +130,12 @@ def test_forecast_calibration_rejects_invalid_factors_and_samples() -> None:
     assert changed is False
     assert model == {"pv_forecast_kw": "bad-shape"}
     assert update_forecast_calibration({}, [], {"pv_forecast_kw": None}, now=now) == ({}, False)
-    assert apply_forecast_calibration([1.0], {"pv_forecast_kw": {"enabled": True, "factor": "bad"}}, "pv_forecast_kw") == [1.0]
-    assert apply_forecast_calibration(["bad", -2.0], {"pv_forecast_kw": {"enabled": True, "factor": 1.2}}, "pv_forecast_kw") == [None, 0.0]
+    assert apply_forecast_calibration(
+        [1.0], {"pv_forecast_kw": {"enabled": True, "factor": "bad"}}, "pv_forecast_kw"
+    ) == [1.0]
+    assert apply_forecast_calibration(
+        ["bad", -2.0], {"pv_forecast_kw": {"enabled": True, "factor": 1.2}}, "pv_forecast_kw"
+    ) == [None, 0.0]
     assert _bounded_factor(float("nan")) == 1.0
     assert _finite_float_or_none("bad") is None
     assert _parse_datetime_or_none(datetime(2026, 6, 27, tzinfo=UTC)) == datetime(2026, 6, 27, tzinfo=UTC)

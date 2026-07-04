@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from argparse import Namespace
 import importlib.util
+from argparse import Namespace
 from pathlib import Path
 from typing import Any
 
@@ -61,9 +61,7 @@ def test_main_validate_writes_only_parseable_fixture(monkeypatch: Any, tmp_path:
     def fake_request_json(*args: Any, **kwargs: Any) -> dict[str, Any]:
         return {
             "state": "0.12",
-            "attributes": {
-                "forecasts": [{"period_start": "2026-06-27T00:00:00+00:00", "per_kwh": 0.12}]
-            },
+            "attributes": {"forecasts": [{"period_start": "2026-06-27T00:00:00+00:00", "per_kwh": 0.12}]},
         }
 
     out = tmp_path / "real_amber_import.json"

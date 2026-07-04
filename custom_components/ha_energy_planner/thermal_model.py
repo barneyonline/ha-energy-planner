@@ -19,10 +19,7 @@ def update_thermal_model(
     current_sample: Mapping[str, Any],
 ) -> tuple[dict[str, Any], bool]:
     """Update compact HVAC thermal model statistics from adjacent samples."""
-    updated = {
-        key: dict(value) if isinstance(value, Mapping) else value
-        for key, value in dict(model or {}).items()
-    }
+    updated = {key: dict(value) if isinstance(value, Mapping) else value for key, value in dict(model or {}).items()}
     previous = dict(previous_sample or {})
     current = dict(current_sample or {})
     updated["last_sample"] = current

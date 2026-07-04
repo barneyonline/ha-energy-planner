@@ -305,7 +305,9 @@ def test_hvac_already_state_checks_temperature_ranges_and_invalid_numbers() -> N
         {CONF_DAIKIN_CLIMATE: "climate.daikin"},
     )
 
-    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool", "target_temp_low": 20, "target_temp_high": 24})))
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "cool", "target_temp_low": 20, "target_temp_high": 24}))
+    )
 
     assert result.applied is True
     assert result.reason == "hvac_action_applied"

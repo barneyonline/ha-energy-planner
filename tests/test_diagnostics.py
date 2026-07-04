@@ -8,7 +8,14 @@ from datetime import UTC, datetime
 from typing import Any
 
 from custom_components.ha_energy_planner.diagnostics import async_get_config_entry_diagnostics
-from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, PlannerMode
+from custom_components.ha_energy_planner.models import (
+    ActionAsset,
+    ActionKind,
+    EnergyPlan,
+    InputHealth,
+    PlanAction,
+    PlannerMode,
+)
 
 
 @dataclass(slots=True)

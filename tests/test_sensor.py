@@ -6,6 +6,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -14,7 +15,6 @@ from custom_components.ha_energy_planner.models import (
     PlanAction,
     PlannerMode,
 )
-from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.sensor import SENSORS, PlannerSensor
 
 
@@ -26,15 +26,15 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     assert values == {
         "next_action": "None",
         "plan_status": "Unknown",
-            "estimated_daily_cost": None,
-            "forecast_confidence": None,
-            "confidence_breakdown": "Unknown",
-            "production_readiness": "Not Ready",
-            "control_block_reason": "Production Gate Not Armed",
-            "execution_audit": "No Activity",
-            "dry_run_comparison": "No Dry Run",
-            "support_bundle_summary": "No Plan",
-            "ai_advice": "Disabled",
+        "estimated_daily_cost": None,
+        "forecast_confidence": None,
+        "confidence_breakdown": "Unknown",
+        "production_readiness": "Not Ready",
+        "control_block_reason": "Production Gate Not Armed",
+        "execution_audit": "No Activity",
+        "dry_run_comparison": "No Dry Run",
+        "support_bundle_summary": "No Plan",
+        "ai_advice": "Disabled",
         "climate_plan": "Unknown",
         "climate_current_state": "Unknown",
         "climate_next_state": "Unknown",
@@ -415,10 +415,15 @@ def test_asset_state_sensors_expose_current_and_next_labels() -> None:
     )
     coordinator = _coordinator(plan)
 
-    assert next(item for item in SENSORS if item.key == "climate_current_state").value_fn(coordinator) == "Heat (21.5 C)"
+    assert (
+        next(item for item in SENSORS if item.key == "climate_current_state").value_fn(coordinator) == "Heat (21.5 C)"
+    )
     assert next(item for item in SENSORS if item.key == "climate_next_state").value_fn(coordinator) == "Off"
     assert next(item for item in SENSORS if item.key == "enphase_current_state").value_fn(coordinator) == "Idle"
-    assert next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator) == "Charge Battery (2.5 kW)"
+    assert (
+        next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator)
+        == "Charge Battery (2.5 kW)"
+    )
     assert next(item for item in SENSORS if item.key == "ev_current_state").value_fn(coordinator) == "Charging to 80%"
     assert next(item for item in SENSORS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
 
@@ -450,7 +455,10 @@ def test_asset_state_sensors_fall_back_to_timeline_labels() -> None:
 
     assert next(item for item in SENSORS if item.key == "climate_current_state").value_fn(coordinator) == "Unknown"
     assert next(item for item in SENSORS if item.key == "enphase_current_state").value_fn(coordinator) == "Unknown"
-    assert next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator) == "Consume Battery (1.25 kW)"
+    assert (
+        next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator)
+        == "Consume Battery (1.25 kW)"
+    )
     assert next(item for item in SENSORS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
 
 
@@ -517,21 +525,30 @@ def test_ev_charge_state_sensors_handle_live_and_plan_fallbacks() -> None:
     next_charge = next(item for item in SENSORS if item.key == "ev_next_charge_state")
 
     assert current.value_fn(_coordinator(None, entry_data={"ev_charging_entity": "binary_sensor.missing"})) == "Unknown"
-    assert current.value_fn(_coordinator(plan, entry_data={"ev_charging_entity": "binary_sensor.ev"}, hass=None)) == "Charging (7 kW)"
-    assert current.value_fn(
-        _coordinator(
-            plan,
-            entry_data={"ev_charging_entity": "binary_sensor.ev"},
-            hass=_hass_with_states({"binary_sensor.ev": "connected_not_charging"}),
+    assert (
+        current.value_fn(_coordinator(plan, entry_data={"ev_charging_entity": "binary_sensor.ev"}, hass=None))
+        == "Charging (7 kW)"
+    )
+    assert (
+        current.value_fn(
+            _coordinator(
+                plan,
+                entry_data={"ev_charging_entity": "binary_sensor.ev"},
+                hass=_hass_with_states({"binary_sensor.ev": "connected_not_charging"}),
+            )
         )
-    ) == "Connected Not Charging"
-    assert current.value_fn(
-        _coordinator(
-            plan,
-            entry_data={"ev_charging_entity": "binary_sensor.ev"},
-            hass=_hass_with_states({"binary_sensor.ev": "vehicle_sleeping"}),
+        == "Connected Not Charging"
+    )
+    assert (
+        current.value_fn(
+            _coordinator(
+                plan,
+                entry_data={"ev_charging_entity": "binary_sensor.ev"},
+                hass=_hass_with_states({"binary_sensor.ev": "vehicle_sleeping"}),
+            )
         )
-    ) == "Vehicle Sleeping"
+        == "Vehicle Sleeping"
+    )
     assert next_charge.value_fn(_coordinator(plan)) == "Charging"
 
 
@@ -706,35 +723,53 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
     ) == {"state": "charging", "target_soc_percent": 80}
     assert sensor_module._timeline_state_label({"state": "charging", "charge_kw": 7}) == "Charging (7 kW)"
     assert sensor_module._timeline_state_label({"state": "charging", "battery_charge_kw": 3}) == "Charging (3 kW)"
-    assert sensor_module._timeline_state_label({"state": "discharging", "battery_discharge_kw": 2}) == "Discharging (2 kW)"
-    assert sensor_module._timeline_state_label({"state": "preconditioning", "hvac_mode": "heat"}) == "Preconditioning: Heat"
+    assert (
+        sensor_module._timeline_state_label({"state": "discharging", "battery_discharge_kw": 2}) == "Discharging (2 kW)"
+    )
+    assert (
+        sensor_module._timeline_state_label({"state": "preconditioning", "hvac_mode": "heat"})
+        == "Preconditioning: Heat"
+    )
     assert sensor_module._charge_state_label_from_raw("unknown") is None
-    assert sensor_module._charge_timeline_state_label({"state": "charging", "target_soc_percent": 80}) == "Charging to 80%"
+    assert (
+        sensor_module._charge_timeline_state_label({"state": "charging", "target_soc_percent": 80}) == "Charging to 80%"
+    )
     assert sensor_module._charge_timeline_state_label({"state": "idle"}) == "Not Charging"
     assert sensor_module._display_state("") == "Unknown"
     assert sensor_module._display_state("ev_soc_ai_hvac") == "EV SOC AI HVAC"
-    assert sensor_module._bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {"a": {"b": {"c": {"d": "<truncated>"}}}}
+    assert sensor_module._bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {
+        "a": {"b": {"c": {"d": "<truncated>"}}}
+    }
 
 
 def test_sensor_configured_state_and_presence_helpers_cover_fallbacks() -> None:
     assert sensor_module._configured_state_value(_coordinator(_plan()), "missing") is None
-    assert sensor_module._configured_state_value(
-        _coordinator(_plan(), entry_data={"ev_charging_entity": "sensor.ev"}, hass=_hass_with_states({})),
-        "ev_charging_entity",
-    ) is None
-    assert sensor_module._configured_state_value(
-        _coordinator(
-            _plan(),
-            entry_data={"ev_charging_entity": "sensor.ev"},
-            hass=_hass_with_states({"sensor.ev": "charging"}),
-        ),
-        "ev_charging_entity",
-    ) == "charging"
+    assert (
+        sensor_module._configured_state_value(
+            _coordinator(_plan(), entry_data={"ev_charging_entity": "sensor.ev"}, hass=_hass_with_states({})),
+            "ev_charging_entity",
+        )
+        is None
+    )
+    assert (
+        sensor_module._configured_state_value(
+            _coordinator(
+                _plan(),
+                entry_data={"ev_charging_entity": "sensor.ev"},
+                hass=_hass_with_states({"sensor.ev": "charging"}),
+            ),
+            "ev_charging_entity",
+        )
+        == "charging"
+    )
 
     assert sensor_module._presence_attrs(
         _coordinator(None, entry_data={"person_entities": ["person.a", "person.b"]})
     ) == {"person_entities": ["person.a", "person.b"]}
-    assert sensor_module._presence_attrs(_coordinator(_plan(), entry_data={"person_entities": 123}))["person_entities"] == []
+    assert (
+        sensor_module._presence_attrs(_coordinator(_plan(), entry_data={"person_entities": 123}))["person_entities"]
+        == []
+    )
 
 
 def test_sensor_asset_attrs_handle_missing_actions_and_non_dict_device_plan() -> None:
@@ -768,9 +803,7 @@ def _coordinator(
 def _hass_with_states(values: dict[str, str]) -> SimpleNamespace:
     return SimpleNamespace(
         states=SimpleNamespace(
-            get=lambda entity_id: None
-            if entity_id not in values
-            else SimpleNamespace(state=values[entity_id])
+            get=lambda entity_id: None if entity_id not in values else SimpleNamespace(state=values[entity_id])
         )
     )
 

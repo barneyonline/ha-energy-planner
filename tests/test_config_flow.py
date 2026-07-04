@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,13 +13,6 @@ from unittest.mock import AsyncMock, Mock
 import voluptuous as vol
 
 from custom_components.ha_energy_planner.config_flow import (
-    AISubentryFlow,
-    ClimateSubentryFlow,
-    ConfigFlow,
-    EnergySubentryFlow,
-    EnphaseSubentryFlow,
-    EVSubentryFlow,
-    OptionsFlow,
     PLANNER_SUBENTRY_SCHEMAS,
     POLICY_STEP_AI_SAFETY,
     POLICY_STEP_CLIMATE,
@@ -29,6 +22,13 @@ from custom_components.ha_energy_planner.config_flow import (
     POLICY_STEP_PRIORITIES,
     POLICY_STEP_SCHEDULE,
     STEP_USER_DATA_SCHEMA,
+    AISubentryFlow,
+    ClimateSubentryFlow,
+    ConfigFlow,
+    EnergySubentryFlow,
+    EnphaseSubentryFlow,
+    EVSubentryFlow,
+    OptionsFlow,
     _enphase_profile_options,
     _entity_values,
     _form_suggested_values,
@@ -40,8 +40,8 @@ from custom_components.ha_energy_planner.config_flow import (
     _validate_options,
 )
 from custom_components.ha_energy_planner.const import (
-    CONF_AI_AGENT_ID,
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AI_AGENT_ID,
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -194,15 +194,18 @@ def test_validate_config_accepts_available_entities_and_services() -> None:
 
 
 def test_validate_config_accepts_multi_entity_selector_lists() -> None:
-    assert _validate_config(
-        _valid_hass(),
-        _valid_input(
-            {
-                CONF_PERSON_ENTITIES: ["person.james", "person.cath"],
-                CONF_CLIMATE_AUTOMATIONS: ["automation.heat", "automation.cool"],
-            }
-        ),
-    ) == {}
+    assert (
+        _validate_config(
+            _valid_hass(),
+            _valid_input(
+                {
+                    CONF_PERSON_ENTITIES: ["person.james", "person.cath"],
+                    CONF_CLIMATE_AUTOMATIONS: ["automation.heat", "automation.cool"],
+                }
+            ),
+        )
+        == {}
+    )
 
 
 def test_initial_config_schema_requires_no_inputs() -> None:
@@ -211,21 +214,14 @@ def test_initial_config_schema_requires_no_inputs() -> None:
 
 def test_config_schema_does_not_default_environment_specific_people() -> None:
     presence_schema = PLANNER_SUBENTRY_SCHEMAS["presence"]
-    schema_key = next(
-        key
-        for key in presence_schema.schema
-        if getattr(key, "schema", None) == CONF_PERSON_ENTITIES
-    )
+    schema_key = next(key for key in presence_schema.schema if getattr(key, "schema", None) == CONF_PERSON_ENTITIES)
 
     assert getattr(schema_key, "default", None) is vol.UNDEFINED
 
 
 def test_presence_flow_uses_multi_entity_selector_for_people() -> None:
     presence_schema = PLANNER_SUBENTRY_SCHEMAS["presence"]
-    schema_fields = {
-        getattr(key, "schema", key): selector
-        for key, selector in presence_schema.schema.items()
-    }
+    schema_fields = {getattr(key, "schema", key): selector for key, selector in presence_schema.schema.items()}
 
     assert schema_fields[CONF_PERSON_ENTITIES].serialize()["selector"]["entity"] == {
         "domain": ["person"],
@@ -236,10 +232,7 @@ def test_presence_flow_uses_multi_entity_selector_for_people() -> None:
 
 def test_climate_flow_uses_multi_entity_selector_for_automations() -> None:
     climate_schema = PLANNER_SUBENTRY_SCHEMAS["climate"]
-    schema_fields = {
-        getattr(key, "schema", key): selector
-        for key, selector in climate_schema.schema.items()
-    }
+    schema_fields = {getattr(key, "schema", key): selector for key, selector in climate_schema.schema.items()}
 
     assert schema_fields[CONF_CLIMATE_AUTOMATIONS].serialize()["selector"]["entity"] == {
         "domain": ["automation"],
@@ -294,8 +287,7 @@ def test_enphase_flow_uses_profile_entity_options_for_profile_roles() -> None:
     assert profile_step["type"] == "form"
     assert profile_step["step_id"] == "profiles"
     profile_fields = {
-        getattr(key, "schema", key): selector
-        for key, selector in profile_step["data_schema"].schema.items()
+        getattr(key, "schema", key): selector for key, selector in profile_step["data_schema"].schema.items()
     }
     restore_selector = profile_fields[CONF_ENPHASE_AI_PROFILE].serialize()["selector"]["select"]
     assert restore_selector["options"][:3] == ["Self-Consumption", "AI Optimisation", "Full Backup"]
@@ -342,10 +334,7 @@ def test_enphase_reconfigure_opens_profile_role_selection_when_entity_exists() -
 
     assert result["type"] == "form"
     assert result["step_id"] == "profiles"
-    profile_fields = {
-        getattr(key, "schema", key): selector
-        for key, selector in result["data_schema"].schema.items()
-    }
+    profile_fields = {getattr(key, "schema", key): selector for key, selector in result["data_schema"].schema.items()}
     assert set(profile_fields) == {
         CONF_ENPHASE_AI_PROFILE,
         CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
@@ -385,10 +374,7 @@ def test_enphase_profile_entity_form_prefills_current_selection() -> None:
 
 def test_ev_start_stop_controls_accept_buttons_and_input_buttons() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
-    schema_fields = {
-        getattr(key, "schema", key): selector
-        for key, selector in ev_schema.schema.items()
-    }
+    schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
 
     assert schema_fields[CONF_EV_SMART_CHARGING_START].serialize()["selector"]["entity"]["domain"] == [
         "switch",
@@ -410,13 +396,16 @@ def test_validate_config_accepts_input_button_ev_controls() -> None:
         {("haeo", "optimize"), ("select", "select_option")},
     )
 
-    assert _validate_config(
-        hass,
-        {
-            CONF_EV_SMART_CHARGING_START: "input_button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_button.ev_stop",
-        },
-    ) == {}
+    assert (
+        _validate_config(
+            hass,
+            {
+                CONF_EV_SMART_CHARGING_START: "input_button.ev_start",
+                CONF_EV_SMART_CHARGING_STOP: "input_button.ev_stop",
+            },
+        )
+        == {}
+    )
 
 
 def test_form_suggested_values_convert_legacy_comma_lists_for_multi_selectors() -> None:
@@ -435,10 +424,7 @@ def test_config_flow_fields_have_readable_translation_labels() -> None:
     strings = _strings()
     labels = strings["config"]["step"]["user"]["data"]
     descriptions = strings["config"]["step"]["user"]["data_description"]
-    schema_keys = {
-        str(getattr(key, "schema", key))
-        for key in STEP_USER_DATA_SCHEMA.schema
-    }
+    schema_keys = {str(getattr(key, "schema", key)) for key in STEP_USER_DATA_SCHEMA.schema}
 
     assert schema_keys <= labels.keys()
     assert schema_keys <= descriptions.keys()
@@ -454,10 +440,7 @@ def test_subentry_fields_have_readable_translation_labels() -> None:
         subentry_strings = strings["config_subentries"][subentry_type]
         labels = subentry_strings["step"]["user"]["data"]
         descriptions = subentry_strings["step"]["user"]["data_description"]
-        schema_keys = {
-            str(getattr(key, "schema", key))
-            for key in schema.schema
-        }
+        schema_keys = {str(getattr(key, "schema", key)) for key in schema.schema}
 
         assert subentry_strings["flow_title"]
         assert subentry_strings["entry_type"]
@@ -482,9 +465,7 @@ def test_english_locale_files_include_subentry_button_labels() -> None:
         for subentry_type in expected_subentry_types:
             initiate_flow = subentries[subentry_type]["initiate_flow"]
             assert initiate_flow["user"], f"{translations_path.name} missing {subentry_type} user label"
-            assert initiate_flow["reconfigure"], (
-                f"{translations_path.name} missing {subentry_type} reconfigure label"
-            )
+            assert initiate_flow["reconfigure"], f"{translations_path.name} missing {subentry_type} reconfigure label"
 
 
 def test_options_flow_fields_have_readable_translation_labels() -> None:
@@ -494,10 +475,7 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
     for step in strings["options"]["step"].values():
         labels.update(step.get("data", {}))
         descriptions.update(step.get("data_description", {}))
-    schema_keys = {
-        str(getattr(key, "schema", key))
-        for key in _options_schema(dict(DEFAULT_OPTIONS)).schema
-    }
+    schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
 
     assert schema_keys <= labels.keys()
     assert schema_keys <= descriptions.keys()
@@ -639,7 +617,9 @@ def test_options_flow_stores_ordered_priority_dropdowns_as_priority_weights() ->
 
     normalized = _normalize_options_input(user_input)
 
-    assert normalized[CONF_PRIORITY_WEIGHTS] == "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon"
+    assert (
+        normalized[CONF_PRIORITY_WEIGHTS] == "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon"
+    )
     assert "planning_priority_1" not in normalized
 
 
@@ -1065,12 +1045,16 @@ def test_enphase_profile_options_are_empty_when_entity_missing() -> None:
 
 
 def test_validate_config_rejects_empty_service_domain_or_service() -> None:
-    assert _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: ".optimize"}))[
-        CONF_HAEO_OPTIMIZE_SERVICE
-    ] == "invalid_service_name"
-    assert _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: "haeo."}))[
-        CONF_HAEO_OPTIMIZE_SERVICE
-    ] == "invalid_service_name"
+    assert (
+        _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: ".optimize"}))[
+            CONF_HAEO_OPTIMIZE_SERVICE
+        ]
+        == "invalid_service_name"
+    )
+    assert (
+        _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: "haeo."}))[CONF_HAEO_OPTIMIZE_SERVICE]
+        == "invalid_service_name"
+    )
 
 
 def test_validate_config_rejects_invalid_or_missing_entities() -> None:

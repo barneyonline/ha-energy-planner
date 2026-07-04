@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.util import dt as dt_util
 
-from .constraints import ConstraintValidator
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
@@ -20,6 +18,7 @@ from .const import (
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
 )
+from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .enphase_adapter import EnphaseProfileAdapter
 from .ev_adapter import EVSmartChargingAdapter
@@ -234,7 +233,10 @@ class Executor:
             enphase_result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_restore_ai()
         await self.store.async_clear_ownership()
         restore_failed = any(
-            result is not None and not result.applied and "not_configured" not in result.reason and "unavailable" not in result.reason
+            result is not None
+            and not result.applied
+            and "not_configured" not in result.reason
+            and "unavailable" not in result.reason
             for result in (ev_result, hvac_result, enphase_result)
         )
         pre_state = {}
@@ -328,9 +330,7 @@ class Executor:
         """Create persistent notifications for major plan fallback classes."""
         clean_violations = _clean_reason_codes(violations)
         grid_violations = [
-            code
-            for code in clean_violations
-            if code in {"grid_import_limit_exceeded", "grid_export_limit_exceeded"}
+            code for code in clean_violations if code in {"grid_import_limit_exceeded", "grid_export_limit_exceeded"}
         ]
         haeo_issues = _haeo_fallback_issues(plan.input_issues)
         if plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN}:
@@ -365,7 +365,10 @@ class Executor:
                 title="Energy Planner HAEO fallback",
                 message=_plan_fallback_message(
                     plan,
-                    "HAEO did not return a healthy optimization result. The deterministic fallback remains constrained.",
+                    (
+                        "HAEO did not return a healthy optimization result. "
+                        "The deterministic fallback remains constrained."
+                    ),
                     haeo_issues,
                 ),
                 notification_id=_HAEO_FALLBACK_NOTIFICATION_ID,
@@ -592,11 +595,7 @@ def _plan_fallback_message(plan: EnergyPlan, summary: str, reason_codes: list[st
 
 
 def _haeo_fallback_issues(issues: list[str]) -> list[str]:
-    return [
-        code
-        for code in _clean_reason_codes(issues)
-        if code.startswith("haeo_") or "haeo" in code
-    ]
+    return [code for code in _clean_reason_codes(issues) if code.startswith("haeo_") or "haeo" in code]
 
 
 def _clean_reason_codes(codes: list[str]) -> list[str]:

@@ -15,12 +15,11 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
-    CONF_EV_CONNECTED,
-    CONF_EV_SOC,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
+    CONF_EV_CONNECTED,
     CONF_PERSON_ENTITIES,
     CONF_PV_FORECAST,
     CONF_WEATHER,
@@ -515,7 +514,10 @@ def test_input_manager_optional_state_edge_cases() -> None:
     assert manager._optional_string_state("string_key") == (None, "string_key_unavailable")
     assert manager._optional_climate_state("missing") == (None, None, None)
     assert manager._optional_climate_state("climate_key") == (None, None, "climate_key_unavailable")
-    assert manager._optional_weather_temperatures("weather_key", datetime(2026, 6, 27, tzinfo=UTC), 1, 15)[2] == "weather_key_unavailable"
+    assert (
+        manager._optional_weather_temperatures("weather_key", datetime(2026, 6, 27, tzinfo=UTC), 1, 15)[2]
+        == "weather_key_unavailable"
+    )
     bad_weather = manager._optional_weather_temperatures("bad_weather_key", datetime(2026, 6, 27, tzinfo=UTC), 1, 15)
     assert bad_weather[0] is None
     assert bad_weather[2] == "bad_weather_key_non_numeric_temperature"
@@ -556,8 +558,14 @@ def test_input_manager_required_series_and_freshness_edge_cases() -> None:
     assert manager._numeric_state("missing") == (None, "missing_not_configured")
     assert manager._numeric_state(CONF_BATTERY_SOC) == (None, "battery_soc_entity_unavailable")
     assert manager._required_series("missing", ("value",), "price", now, 1, 15)[1] == "missing_not_configured"
-    assert manager._required_series(CONF_PV_FORECAST, ("value",), "power", now, 1, 15)[1] == "pv_forecast_entity_unavailable"
-    assert manager._required_series(CONF_AMBER_IMPORT_PRICE, ("value",), "price", now, 1, 15)[1] == "amber_import_price_entity_non_numeric"
+    assert (
+        manager._required_series(CONF_PV_FORECAST, ("value",), "power", now, 1, 15)[1]
+        == "pv_forecast_entity_unavailable"
+    )
+    assert (
+        manager._required_series(CONF_AMBER_IMPORT_PRICE, ("value",), "price", now, 1, 15)[1]
+        == "amber_import_price_entity_non_numeric"
+    )
     assert "amber_import_price_entity_stale" in manager._freshness_issues(now)
     assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
 

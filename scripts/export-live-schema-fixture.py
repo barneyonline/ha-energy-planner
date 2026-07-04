@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
 import importlib.util
 import json
 import os
-from pathlib import Path
 import sys
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urljoin

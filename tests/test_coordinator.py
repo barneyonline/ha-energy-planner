@@ -9,6 +9,15 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
+from custom_components.ha_energy_planner.const import (
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_DAIKIN_CLIMATE,
+    CONF_DEFAULT_READY_BY,
+    CONF_EV_CONNECTED,
+    CONF_EV_SOC,
+    CONF_PLANNING_INTERVAL_MINUTES,
+)
 from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
     _bool_state_value,
@@ -23,23 +32,14 @@ from custom_components.ha_energy_planner.coordinator import (
     _snapshot_actions,
     _split_entity_values,
 )
-from custom_components.ha_energy_planner.const import (
-    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
-    CONF_CLIMATE_MANUAL_OVERRIDE,
-    CONF_DAIKIN_CLIMATE,
-    CONF_DEFAULT_READY_BY,
-    CONF_EV_CONNECTED,
-    CONF_EV_SOC,
-    CONF_PLANNING_INTERVAL_MINUTES,
-)
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     HAEOSolvePhase,
     HAEOSolveResult,
+    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -258,10 +258,16 @@ def test_manual_hvac_change_ignored_during_planner_grace() -> None:
 
 
 def test_material_state_change_uses_configured_percent_threshold() -> None:
-    assert not _is_material_state_change(FakeEvent("sensor.price", "100", "104"), {"material_change_threshold_percent": 5})
+    assert not _is_material_state_change(
+        FakeEvent("sensor.price", "100", "104"), {"material_change_threshold_percent": 5}
+    )
     assert _is_material_state_change(FakeEvent("sensor.price", "100", "105"), {"material_change_threshold_percent": 5})
-    assert _is_material_state_change(FakeEvent("person.james", "home", "not_home"), {"material_change_threshold_percent": 5})
-    assert not _is_material_state_change(FakeEvent("sensor.price", "on", "on"), {"material_change_threshold_percent": 5})
+    assert _is_material_state_change(
+        FakeEvent("person.james", "home", "not_home"), {"material_change_threshold_percent": 5}
+    )
+    assert not _is_material_state_change(
+        FakeEvent("sensor.price", "on", "on"), {"material_change_threshold_percent": 5}
+    )
 
 
 def test_material_state_change_treats_non_finite_numbers_as_material() -> None:
@@ -297,14 +303,20 @@ def test_overrides_restored_only_when_active() -> None:
 
 
 def test_seconds_until_next_interval_boundary() -> None:
-    assert _seconds_until_next_interval_boundary(
-        datetime(2026, 6, 27, 10, 3, 30, tzinfo=UTC),
-        5,
-    ) == 90.0
-    assert _seconds_until_next_interval_boundary(
-        datetime(2026, 6, 27, 10, 5, 0, tzinfo=UTC),
-        5,
-    ) == 300.0
+    assert (
+        _seconds_until_next_interval_boundary(
+            datetime(2026, 6, 27, 10, 3, 30, tzinfo=UTC),
+            5,
+        )
+        == 90.0
+    )
+    assert (
+        _seconds_until_next_interval_boundary(
+            datetime(2026, 6, 27, 10, 5, 0, tzinfo=UTC),
+            5,
+        )
+        == 300.0
+    )
 
 
 def test_start_listeners_schedules_configured_boundary_refresh_without_entities(monkeypatch: object) -> None:
@@ -333,7 +345,9 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
 
 
 def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(monkeypatch: object) -> None:
-    def fake_data_update_init(self: object, hass: object, *, logger: object, name: str, update_interval: object) -> None:
+    def fake_data_update_init(
+        self: object, hass: object, *, logger: object, name: str, update_interval: object
+    ) -> None:
         self.hass = hass
         self.data = None
 
@@ -509,9 +523,7 @@ def test_ai_advice_is_rate_limited_to_five_minutes() -> None:
     )
     context = SimpleNamespace(created_at=now)
 
-    result, should_store = asyncio.run(
-        coordinator._async_get_throttled_ai_advice(context, _plan("plan-1"), {}, {})
-    )
+    result, should_store = asyncio.run(coordinator._async_get_throttled_ai_advice(context, _plan("plan-1"), {}, {}))
 
     assert should_store is False
     assert result.status == "skipped"
@@ -555,9 +567,7 @@ def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
     )
     context = SimpleNamespace(created_at=now)
 
-    result, should_store = asyncio.run(
-        coordinator._async_get_throttled_ai_advice(context, _plan("plan-1"), {}, {})
-    )
+    result, should_store = asyncio.run(coordinator._async_get_throttled_ai_advice(context, _plan("plan-1"), {}, {}))
 
     assert calls == 1
     assert should_store is True
@@ -821,13 +831,16 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
         lambda hass, data: SimpleNamespace(inspect=lambda: SimpleNamespace(as_dict=lambda: {})),
     )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.InputManager", lambda *args, **kwargs: SimpleNamespace(
-        current_forecast_observations=lambda: {},
-        build_context=lambda overrides: context,
-        thermal_sample=lambda built_context: {},
-        forecast_training_slots=[],
-        forecast_calibration={},
-    ))
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.InputManager",
+        lambda *args, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context,
+            thermal_sample=lambda built_context: {},
+            forecast_training_slots=[],
+            forecast_calibration={},
+        ),
+    )
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder",
         fake_import_trip_history,
