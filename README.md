@@ -18,11 +18,6 @@
 
 Local-first Home Assistant integration for planning and safely coordinating household energy decisions across tariffs, solar forecasts, battery state, EV charging, climate comfort, Enphase profiles, HAEO optimization, and optional local AI advice.
 
-> [!IMPORTANT]
-> Energy Planner is an unofficial community project. It is not affiliated with, endorsed by, or supported by Home Assistant, HAEO, Amber, Solcast, Enphase, Daikin, BMW, or any other third-party integration or vendor.
->
-> The integration is designed to fail closed. Active device control starts disabled, dry-run starts enabled, and production control must be explicitly armed before real service calls are allowed.
-
 ## Supported device categories
 
 - Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
@@ -51,10 +46,6 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly
 - Home Assistant diagnostics, system health, repair/preflight evidence, entity translations, and icons for all exposed entities
 - Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and a smoke-tested Home Assistant container
-
-## Screenshots
-
-Screenshots have not been committed yet. The integration currently exposes hub-level devices for System, Energy, Presence, Climate, Enphase, AI, and EV planning, with each device showing only the entities relevant to that planning area.
 
 ## Installation
 
