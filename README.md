@@ -4,6 +4,9 @@
 
 # Energy Planner - Home Assistant Custom Integration
 
+> [!IMPORTANT]
+> Energy Planner is in active development and is not ready for production use. Do not rely on it for real device control, billing decisions, or unattended energy automation yet.
+
 <!-- Badges -->
 [![Release](https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&sort=semver)](https://github.com/barneyonline/ha-energy-planner/releases)
 [![Stars](https://img.shields.io/github/stars/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/stargazers)
@@ -102,16 +105,16 @@ Energy Planner does not authenticate directly with vendor cloud APIs. It reads e
 
 Energy Planner can be useful with different source integrations, but the current implementation is built around these common inputs:
 
-- Amber Electric price sensors for import/export tariffs
-- Solcast or HAFO-style PV forecast sensors
-- Baseline load forecast sensors
-- Bureau of Meteorology or another weather provider
-- HAEO for response-capable optimization through `haeo.optimize`
-- Enphase profile entity/control exposed through an Enphase integration
-- EV Smart Charging or equivalent start/stop controls
-- BMW/vehicle entities or equivalent EV connected/SOC sensors
-- Daikin climate and HVAC power entities
-- Extended OpenAI Conversation or another supported local AI task/conversation provider for optional advice
+- Amber Electric price sensors for import/export tariffs from the Home Assistant core [Amber Electric integration](https://github.com/home-assistant/core/tree/dev/homeassistant/components/amberelectric) or [hass-energy/amber-express](https://github.com/hass-energy/amber-express).
+- Solar production forecast sensors from [BJReplay/ha-solcast-solar](https://github.com/BJReplay/ha-solcast-solar), [hass-energy/hafo](https://github.com/hass-energy/hafo), or another forecast integration that exposes Home Assistant sensor data.
+- Baseline load forecast sensors from [hass-energy/hafo](https://github.com/hass-energy/hafo) or another forecast source that exposes household load forecast data.
+- Weather inputs from [bremor/bureau_of_meteorology](https://github.com/bremor/bureau_of_meteorology) or another Home Assistant weather provider.
+- HAEO optimization through [hass-energy/haeo](https://github.com/hass-energy/haeo), using the response-capable `haeo.optimize` service.
+- Enphase profile monitoring and control through [barneyonline/ha-enphase-energy](https://github.com/barneyonline/ha-enphase-energy) or another integration that exposes the system profile as a selectable entity.
+- EV charge start/stop controls from [jonasbkarlsson/ev_smart_charging](https://github.com/jonasbkarlsson/ev_smart_charging) or equivalent Home Assistant switch/button entities.
+- BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
+- Daikin climate and HVAC power entities from Home Assistant climate/sensor integrations.
+- Optional AI advice from [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation) or another supported local AI task/conversation provider.
 
 ## Safety model
 
