@@ -69,7 +69,9 @@ from custom_components.ha_energy_planner.ownership import EnphaseProfileGuard, O
 from custom_components.ha_energy_planner.planner import DryRunPlanner
 from custom_components.ha_energy_planner.preflight import (
     _audit_report,
+    _bounded_join,
     _entity_report,
+    _production_gate_message,
     _service_report,
     _split_entities,
 )
@@ -178,6 +180,17 @@ def test_remaining_preflight_helpers() -> None:
         {},
         {"plan_id": "plan-1"},
     ]
+    assert _bounded_join(["a", "b", "c", "d", "e", "f"]) == "a, b, c, d, e, 1 more"
+    assert (
+        _production_gate_message(
+            {
+                "ready_to_arm": False,
+                "dry_run_ready_cycles": 3,
+                "device_controls": {"ev": True, "climate": True, "enphase": True},
+            }
+        )
+        == "Production gate is not ready to arm yet."
+    )
 
 
 def test_remaining_thermal_and_input_branches() -> None:

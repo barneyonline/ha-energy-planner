@@ -238,6 +238,31 @@ def test_run_preflight_reports_missing_configured_entities_and_services() -> Non
     assert "input_boolean.missing_stop" in response["entities"]["missing"]
     assert "haeo.missing" in response["services"]["unavailable"]
     assert response["discovery"]["haeo"]["supported"] is False
+    checks = {check["check"]: check for check in response["checks"]}
+    assert "input_boolean.missing_stop" in checks["configured_entities_available"]["message"]
+    assert "haeo.missing" in checks["configured_services_available"]["message"]
+
+
+def test_run_preflight_reports_production_gate_reasons() -> None:
+    coordinator = _coordinator()
+    coordinator.entry.options["ev_control_enabled"] = False
+    coordinator.store.data["production"] = {
+        "armed": False,
+        "dry_run_ready_cycles": 1,
+    }
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    response = asyncio.run(handler(FakeCall({})))
+
+    checks = {check["check"]: check for check in response["checks"]}
+    assert response["ok"] is False
+    assert checks["production_gate_ready"]["ok"] is False
+    assert "1/3 healthy dry-run cycles" in checks["production_gate_ready"]["message"]
+    assert "ev" in checks["production_gate_ready"]["message"]
+    assert checks["production_control_armed"]["ok"] is False
+    assert "has not been armed" in checks["production_control_armed"]["message"]
 
 
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:

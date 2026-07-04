@@ -60,13 +60,21 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             "check": "configured_entities_available",
             "ok": not entity_report["missing"] and not entity_report["unavailable"],
             "blocking": True,
-            "message": "All configured entities are present and available.",
+            "message": _availability_message(
+                "All configured entities are present and available.",
+                missing=entity_report["missing"],
+                unavailable=entity_report["unavailable"],
+            ),
         },
         {
             "check": "configured_services_available",
             "ok": not service_report["missing"] and not service_report["unavailable"],
             "blocking": True,
-            "message": "All configured services are registered.",
+            "message": _availability_message(
+                "All configured services are registered.",
+                missing=service_report["missing"],
+                unavailable=service_report["unavailable"],
+            ),
         },
         {
             "check": "recorder_available",
@@ -80,10 +88,16 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             "check": "production_gate_ready",
             "ok": production["ready_to_arm"],
             "blocking": False,
+            "message": _production_gate_message(production),
+        },
+        {
+            "check": "production_control_armed",
+            "ok": production["armed"],
+            "blocking": False,
             "message": (
-                "Production gate has enough dry-run evidence and all device controls are explicitly enabled."
-                if production["ready_to_arm"]
-                else "Production gate is not ready to arm yet."
+                "Production control is armed."
+                if production["armed"]
+                else "Production control has not been armed. Review preflight, then use Arm production control when ready."
             ),
         },
     ]
@@ -105,6 +119,45 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
         "discovery": discovery,
         "audit": audit,
     }
+
+
+def _availability_message(success_message: str, *, missing: list[str], unavailable: list[str]) -> str:
+    """Return a concise availability check message."""
+    details = []
+    if missing:
+        details.append(f"missing: {_bounded_join(missing)}")
+    if unavailable:
+        details.append(f"unavailable: {_bounded_join(unavailable)}")
+    if not details:
+        return success_message
+    return f"Configured references are not ready; {'; '.join(details)}."
+
+
+def _production_gate_message(production: dict[str, Any]) -> str:
+    """Return a concise production gate readiness message."""
+    if production["ready_to_arm"]:
+        return "Production gate has enough dry-run evidence and all device controls are explicitly enabled."
+
+    details: list[str] = []
+    dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
+    if dry_run_ready_cycles < 3:
+        details.append(f"{dry_run_ready_cycles}/3 healthy dry-run cycles recorded")
+    disabled_controls = [
+        name for name, enabled in dict(production.get("device_controls", {})).items() if not bool(enabled)
+    ]
+    if disabled_controls:
+        details.append(f"device controls disabled: {_bounded_join(disabled_controls)}")
+    if not details:
+        return "Production gate is not ready to arm yet."
+    return f"Production gate is not ready to arm yet; {'; '.join(details)}."
+
+
+def _bounded_join(values: list[str], *, limit: int = 5) -> str:
+    """Return a short comma-separated list."""
+    visible = [str(value) for value in values[:limit]]
+    if len(values) > limit:
+        visible.append(f"{len(values) - limit} more")
+    return ", ".join(visible)
 
 
 def _entity_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str, Any]:
