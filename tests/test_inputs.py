@@ -33,6 +33,8 @@ from custom_components.ha_energy_planner.inputs import (
     _attribute_value,
     _combined_confidence,
     _finite_float_or_none,
+    _percent_float_or_none,
+    _ready_by_time_or_none,
     _series_value,
     _state_confidence,
 )
@@ -173,6 +175,65 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     assert context.ev_target_soc_percent == 80
     assert context.ev_ready_by == "08:00"
     assert context.input_health == InputHealth.HEALTHY
+
+
+def test_input_manager_ev_helper_state_edge_cases() -> None:
+    manager = InputManager(
+        FakeHass(
+            {
+                "sensor.unavailable": FakeState("unavailable"),
+                "sensor.bad_soc": FakeState("bad"),
+                "sensor.high_soc": FakeState("101"),
+                "select.unavailable": FakeState("unavailable"),
+                "select.none": FakeState("None"),
+                "select.bad_time": FakeState("25:99"),
+            }
+        ),
+        {},
+        DEFAULT_OPTIONS,
+    )
+
+    assert manager._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC) == (None, None)
+    manager.entry_data[CONF_EV_SMART_CHARGING_TARGET_SOC] = "sensor.unavailable"
+    assert manager._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC) == (
+        None,
+        "ev_smart_charging_target_soc_entity_unavailable",
+    )
+    manager.entry_data[CONF_EV_SMART_CHARGING_TARGET_SOC] = "sensor.bad_soc"
+    assert manager._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC) == (
+        None,
+        "ev_smart_charging_target_soc_entity_non_numeric",
+    )
+    manager.entry_data[CONF_EV_SMART_CHARGING_TARGET_SOC] = "sensor.high_soc"
+    assert manager._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC) == (
+        None,
+        "ev_smart_charging_target_soc_entity_out_of_range",
+    )
+
+    assert manager._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY) == (None, None)
+    manager.entry_data[CONF_EV_SMART_CHARGING_READY_BY] = "select.unavailable"
+    assert manager._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY) == (
+        None,
+        "ev_smart_charging_ready_by_entity_unavailable",
+    )
+    manager.entry_data[CONF_EV_SMART_CHARGING_READY_BY] = "select.none"
+    assert manager._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY) == (None, None)
+    manager.entry_data[CONF_EV_SMART_CHARGING_READY_BY] = "select.bad_time"
+    assert manager._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY) == (
+        None,
+        "ev_smart_charging_ready_by_entity_invalid_time",
+    )
+
+
+def test_ev_helper_value_parsers_handle_supported_formats() -> None:
+    assert _percent_float_or_none("80%") == 80
+    assert _percent_float_or_none("80,5%") == 80.5
+    assert _ready_by_time_or_none("") is None
+    assert _ready_by_time_or_none("2026-07-05T08:15:00+10:00") == "08:15"
+    assert _ready_by_time_or_none("2026-07-05Tbad") is None
+    assert _ready_by_time_or_none("7:05") == "07:05"
+    assert _ready_by_time_or_none("07:05:30") == "07:05"
+    assert _ready_by_time_or_none("not a time") is None
 
 
 def test_input_manager_adds_trip_history_summary_to_context() -> None:
