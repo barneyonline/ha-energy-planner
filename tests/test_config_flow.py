@@ -41,7 +41,6 @@ from custom_components.ha_energy_planner.config_flow import (
 )
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_AI_AGENT_ID,
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -971,26 +970,6 @@ def test_enphase_profile_entity_step_returns_validation_errors() -> None:
     assert result["errors"][CONF_ENPHASE_PROFILE] == "invalid_entity_domain"
 
 
-def test_ai_subentry_stores_selected_conversation_agent_with_process_service() -> None:
-    entry = SimpleNamespace(subentries={})
-    flow = AISubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-    flow.async_create_entry = Mock(return_value={"type": "create_entry"})
-
-    result = asyncio.run(flow.async_step_user({CONF_AI_AGENT_ID: "conversation.extended_openai_conversation"}))
-
-    assert result == {"type": "create_entry"}
-    flow.async_create_entry.assert_called_once_with(
-        title="AI",
-        data={
-            CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
-            CONF_AI_ADVISOR_SERVICE: "conversation.process",
-        },
-    )
-
-
 def test_ai_subentry_stores_selected_ai_task_entity_with_generate_data_service() -> None:
     entry = SimpleNamespace(subentries={})
     flow = AISubentryFlow()
@@ -1011,18 +990,17 @@ def test_ai_subentry_stores_selected_ai_task_entity_with_generate_data_service()
     )
 
 
-def test_ai_subentry_normalizes_task_and_agent_or_empty_selection() -> None:
+def test_ai_subentry_normalizes_task_and_ignores_legacy_agent_selection() -> None:
     assert _normalize_ai_config(
         {
             CONF_AI_TASK_ENTITY: " ai_task.extended_openai_ai_task ",
-            CONF_AI_AGENT_ID: " conversation.extended_openai_conversation ",
+            "ai_agent_id": " conversation.extended_openai_conversation ",
         }
     ) == {
         CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
-        CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
         CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
     }
-    assert _normalize_ai_config({CONF_AI_TASK_ENTITY: " ", CONF_AI_AGENT_ID: " "}) == {
+    assert _normalize_ai_config({CONF_AI_TASK_ENTITY: " ", "ai_agent_id": " "}) == {
         CONF_AI_ADVISOR_SERVICE: "",
     }
 
@@ -1056,10 +1034,16 @@ def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
                 data={
                     "enphase_arbitrage_profile": "Savings",
                     CONF_ENPHASE_PROFILE_CONTROL_SERVICE: "select.select_option",
-                    "ai_advisor_service": "conversation.process",
+                    "ai_advisor_service": "ai_task.generate_data",
                 },
             ),
-            "advisor": SimpleNamespace(subentry_type="advisor", data={"ai_advisor_service": "conversation.process"}),
+            "advisor": SimpleNamespace(
+                subentry_type="advisor",
+                data={
+                    "ai_advisor_service": "ai_task.generate_data",
+                    CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+                },
+            ),
         },
     )
 
@@ -1081,7 +1065,10 @@ def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
         CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
         CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
     }
-    assert grouped["ai"] == {"ai_advisor_service": "conversation.process"}
+    assert grouped["ai"] == {
+        "ai_advisor_service": "ai_task.generate_data",
+        CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+    }
 
 
 def test_migration_removes_source_group_when_all_fields_moved() -> None:

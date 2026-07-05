@@ -13,7 +13,6 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .ai_advisor import ai_rejection_detail
 from .const import (
-    CONF_AI_AGENT_ID,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_ENPHASE_CONTROL_ENABLED,
@@ -588,7 +587,6 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "status": latest.get("status"),
         "service_called": latest.get("service_called"),
         "ai_task_entity": latest.get(CONF_AI_TASK_ENTITY),
-        "ai_agent_id": latest.get(CONF_AI_AGENT_ID),
         "rejected_reason": latest.get("rejected_reason"),
         "rejected_detail": _bounded_json(rejected_detail),
         "alerts": accepted.get("alerts", []),

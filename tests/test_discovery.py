@@ -69,12 +69,12 @@ def test_discovery_reports_supported_controls() -> None:
             "automation.climate": "on",
             "select.enphase_profile": "AI Optimisation",
         },
-        {("haeo", "optimize"), ("select", "select_option"), ("conversation", "process")},
+        {("haeo", "optimize"), ("select", "select_option"), ("ai_task", "generate_data")},
     )
     report = CapabilityDiscovery(
         hass,
         {
-            CONF_AI_ADVISOR_SERVICE: "conversation.process",
+            CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
             CONF_EV_SMART_CHARGING_START: "switch.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop",
             CONF_DAIKIN_CLIMATE: "climate.daikin",

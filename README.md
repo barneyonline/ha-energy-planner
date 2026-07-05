@@ -48,7 +48,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, and manual override blocking
 - 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
 - Forecast confidence breakdown across required inputs so stale, missing, or invalid data is visible
-- Optional AI advice through supported Home Assistant AI task or conversation entities, rate-limited and treated as advisory only
+- Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly
 - Home Assistant diagnostics, system health, repair/preflight evidence, entity translations, and icons for all exposed entities
@@ -91,7 +91,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.1.36`
+- Current manifest version: `0.1.37`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `hub`
 - IoT class: `local_polling`
@@ -114,7 +114,7 @@ Energy Planner can be useful with different source integrations, but the current
 - EV charge start/stop controls from [jonasbkarlsson/ev_smart_charging](https://github.com/jonasbkarlsson/ev_smart_charging) or equivalent Home Assistant switch/button entities.
 - BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
 - Daikin climate and HVAC power entities from Home Assistant climate/sensor integrations.
-- Optional AI advice from [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation) or another supported local AI task/conversation provider.
+- Optional AI advice from an AI Task provider such as [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation), when it exposes an `ai_task` entity.
 
 ## Safety model
 

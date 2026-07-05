@@ -17,7 +17,6 @@ from homeassistant.util import dt as dt_util
 from .ai_advisor import AIAdviceResult, LocalAIAdvisor
 from .const import (
     AI_ADVICE_MIN_INTERVAL_SECONDS,
-    CONF_AI_AGENT_ID,
     CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
@@ -284,7 +283,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         "rejected_reason": ai_result.rejected_reason,
                         "rejected_detail": ai_result.rejected_detail,
                         "service_called": ai_result.service_called,
-                        CONF_AI_AGENT_ID: ai_result.ai_agent_id,
                         CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
                     }
                 )
@@ -335,7 +333,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "rejected_reason": ai_result.rejected_reason,
                     "rejected_detail": ai_result.rejected_detail,
                     "service_called": ai_result.service_called,
-                    CONF_AI_AGENT_ID: ai_result.ai_agent_id,
                     CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
                 },
             }

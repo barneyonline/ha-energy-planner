@@ -11,7 +11,6 @@ from typing import Any
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_AI_AGENT_ID,
     CONF_AI_TASK_ENTITY,
     CONF_AI_TIMEOUT_SECONDS,
     CONF_ENPHASE_MIN_SAVINGS,
@@ -70,7 +69,6 @@ REJECTION_MESSAGES = {
     "ai_response_unsupported_fields": "The AI response included fields outside the supported advice contract.",
     "ai_response_no_accepted_fields": "The AI response was valid JSON but did not include any supported advice fields.",
     "ai_service_not_configured": "No AI advisor service is configured.",
-    "ai_service_invalid": "The AI advisor service must use domain.service format.",
     "ai_service_unavailable": "The configured AI advisor service is not currently available in Home Assistant.",
     "ai_provider_not_ready": "The configured AI provider entity is not ready yet.",
     "ai_timeout": "The AI advisor service did not respond before the configured timeout.",
@@ -91,7 +89,6 @@ class AIAdviceResult:
     service_called: str | None
     rejected_detail: dict[str, Any] = field(default_factory=dict)
     ai_task_entity: str | None = None
-    ai_agent_id: str | None = None
 
 
 class LocalAIAdvisor:
@@ -110,8 +107,6 @@ class LocalAIAdvisor:
             return _with_provider(_rejected_result("skipped", "ai_skipped_planner_disabled", None), entry_data)
         if not service_name:
             return _with_provider(_rejected_result("skipped", "ai_service_not_configured", None), entry_data)
-        if "." not in service_name:
-            return _with_provider(_rejected_result("rejected", "ai_service_invalid", service_name), entry_data)
         domain, service = service_name.split(".", 1)
         if _provider_entity_missing(self.hass, service_name, entry_data):
             return _with_provider(_rejected_result("skipped", "ai_provider_not_ready", service_name), entry_data)
@@ -316,74 +311,40 @@ def _service_payload(
     plan: EnergyPlan,
 ) -> dict[str, Any]:
     """Return service data for the configured AI provider type."""
-    if service_name == "ai_task.generate_data":
-        prompt = _build_instructions(context, plan, structured=False)
-        payload = {
-            "task_name": "Energy Planner advice",
-            "instructions": prompt,
-            "entity_id": entry_data.get(CONF_AI_TASK_ENTITY),
-        }
-    else:
-        prompt = _build_instructions(context, plan, structured=False)
-        payload = {
-            "text": prompt,
-            "agent_id": entry_data.get(CONF_AI_AGENT_ID),
-        }
+    prompt = _build_instructions(context, plan, structured=False)
+    payload = {
+        "task_name": "Energy Planner advice",
+        "instructions": prompt,
+        "entity_id": entry_data.get(CONF_AI_TASK_ENTITY),
+    }
     return {key: value for key, value in payload.items() if value}
 
 
 def _resolve_ai_service(hass: Any, entry_data: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
-    """Prefer structured AI Task when the instance exposes a single provider."""
+    """Return the supported AI Task service when configured."""
     service_name = str(entry_data.get(CONF_AI_ADVISOR_SERVICE, "") or "").strip()
     configured_task_entity = str(entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip()
-    if service_name == "conversation.process" and not configured_task_entity:
-        task_entity = _single_ai_task_entity(hass)
-        if task_entity:
-            data = dict(entry_data)
-            data[CONF_AI_TASK_ENTITY] = task_entity
-            data[CONF_AI_ADVISOR_SERVICE] = "ai_task.generate_data"
-            return "ai_task.generate_data", data
-    return service_name, entry_data
-
-
-def _single_ai_task_entity(hass: Any) -> str | None:
-    """Return the only configured AI Task entity, if there is exactly one."""
-    states = getattr(hass, "states", None)
-    if states is None:
-        return None
-
-    async_entity_ids = getattr(states, "async_entity_ids", None)
-    if callable(async_entity_ids):
-        entity_ids = list(async_entity_ids("ai_task"))
-    else:
-        async_all = getattr(states, "async_all", None)
-        if not callable(async_all):
-            return None
-        entity_ids = [state.entity_id for state in async_all("ai_task")]
-
-    return entity_ids[0] if len(entity_ids) == 1 else None
+    if configured_task_entity:
+        data = dict(entry_data)
+        data[CONF_AI_TASK_ENTITY] = configured_task_entity
+        data[CONF_AI_ADVISOR_SERVICE] = "ai_task.generate_data"
+        return "ai_task.generate_data", data
+    return "", entry_data
 
 
 def _with_provider(result: AIAdviceResult, entry_data: Mapping[str, Any]) -> AIAdviceResult:
     """Attach resolved provider metadata to a result."""
     result.ai_task_entity = str(entry_data.get(CONF_AI_TASK_ENTITY) or "") or None
-    result.ai_agent_id = str(entry_data.get(CONF_AI_AGENT_ID) or "") or None
     return result
 
 
 def _provider_entity_missing(hass: Any, service_name: str, entry_data: Mapping[str, Any]) -> bool:
     """Return whether the selected provider entity has not been registered yet."""
-    entity_id: str | None = None
-    if service_name == "ai_task.generate_data":
-        entity_id = str(entry_data.get(CONF_AI_TASK_ENTITY) or "") or None
-    elif service_name == "conversation.process":
-        entity_id = str(entry_data.get(CONF_AI_AGENT_ID) or "") or None
-    if not entity_id:
-        return False
+    entity_id = str(entry_data.get(CONF_AI_TASK_ENTITY) or "")
 
     states = getattr(hass, "states", None)
     get_state = getattr(states, "get", None)
-    return callable(get_state) and get_state(entity_id) is None
+    return bool(entity_id) and callable(get_state) and get_state(entity_id) is None
 
 
 def _parse_response(response: Any) -> Any:
@@ -474,7 +435,7 @@ def _loads(value: str) -> Any:
 
 
 def _extract_response_text(response: Mapping[str, Any]) -> str | None:
-    """Extract assistant speech text from Home Assistant conversation wrappers."""
+    """Extract assistant text from common nested response wrappers."""
     speech = response.get("speech")
     if isinstance(speech, Mapping):
         plain = speech.get("plain")

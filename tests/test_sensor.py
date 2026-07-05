@@ -598,8 +598,8 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
                     "created_at": "2026-06-27T00:00:00+00:00",
                     "plan_id": "plan-1",
                     "status": "accepted",
-                    "service_called": "conversation.process",
-                    "ai_agent_id": "conversation.extended_openai_conversation",
+                    "service_called": "ai_task.generate_data",
+                    "ai_task_entity": "ai_task.extended_openai_ai_task",
                     "rejected_reason": None,
                     "accepted": {
                         "alerts": ["PV forecast confidence is low"],
@@ -617,7 +617,7 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
 
     assert description.value_fn(coordinator) == "Accepted"
     assert attrs["enabled"] is True
-    assert attrs["ai_agent_id"] == "conversation.extended_openai_conversation"
+    assert attrs["ai_task_entity"] == "ai_task.extended_openai_ai_task"
     assert attrs["alerts"] == ["PV forecast confidence is low"]
     assert attrs["reasoning_summary"] == "Use extra forecast buffer."
     assert attrs["accepted"]["suggested_forecast_buffer_percent"] == 12
@@ -694,7 +694,7 @@ def test_ai_advice_sensor_builds_rejection_detail_for_legacy_history() -> None:
             "ai_recommendations": [
                 {
                     "status": "rejected",
-                    "service_called": "conversation.process",
+                    "service_called": "ai_task.generate_data",
                     "rejected_reason": "ai_response_not_json",
                     "accepted": {},
                 }

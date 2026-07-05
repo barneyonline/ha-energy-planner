@@ -55,7 +55,7 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
             "amber_import_price_entity": "sensor.import_price",
             "climate_automation_entities": "automation.heat, automation.cool",
             "person_entities": "person.james,person.cath",
-            "ai_advisor_service": "conversation.process",
+            "ai_advisor_service": "ai_task.generate_data",
             "empty_entity": "",
         }
     )
@@ -723,7 +723,6 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
                 rejected_detail={},
                 service_called="ai_task.generate_data",
                 ai_task_entity="ai_task.local",
-                ai_agent_id="conversation.local",
             ),
             True,
         )

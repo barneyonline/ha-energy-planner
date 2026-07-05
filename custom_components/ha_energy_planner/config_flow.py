@@ -17,8 +17,6 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     BooleanSelector,
-    ConversationAgentSelector,
-    ConversationAgentSelectorConfig,
     EntitySelector,
     EntitySelectorConfig,
     NumberSelector,
@@ -34,7 +32,6 @@ from voluptuous import Invalid
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_AI_AGENT_ID,
     CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_AI_TIMEOUT_SECONDS,
@@ -201,7 +198,6 @@ ENPHASE_ENTITY_SCHEMA = vol.Schema(
 AI_DATA_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_AI_TASK_ENTITY): _entity_selector("ai_task"),
-        vol.Optional(CONF_AI_AGENT_ID): ConversationAgentSelector(ConversationAgentSelectorConfig()),
     }
 )
 
@@ -830,24 +826,15 @@ def _dedupe_text_values(values: list[Any]) -> list[str]:
 
 
 def _normalize_ai_config(user_input: dict[str, Any]) -> dict[str, Any]:
-    """Return stored AI config from the selected conversation agent."""
+    """Return stored AI config from the selected AI Task entity."""
     data = dict(user_input)
     task_entity = str(data.get(CONF_AI_TASK_ENTITY, "") or "").strip()
-    agent_id = str(data.get(CONF_AI_AGENT_ID, "") or "").strip()
+    data.pop("ai_agent_id", None)
     if task_entity:
         data[CONF_AI_TASK_ENTITY] = task_entity
-        if agent_id:
-            data[CONF_AI_AGENT_ID] = agent_id
-        else:
-            data.pop(CONF_AI_AGENT_ID, None)
         data[CONF_AI_ADVISOR_SERVICE] = "ai_task.generate_data"
-    elif agent_id:
-        data[CONF_AI_AGENT_ID] = agent_id
-        data.pop(CONF_AI_TASK_ENTITY, None)
-        data[CONF_AI_ADVISOR_SERVICE] = "conversation.process"
     else:
         data.pop(CONF_AI_TASK_ENTITY, None)
-        data.pop(CONF_AI_AGENT_ID, None)
         data[CONF_AI_ADVISOR_SERVICE] = ""
     return data
 

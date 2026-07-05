@@ -1,6 +1,6 @@
 [project]
 name = "ha-energy-planner"
-version = "0.1.36"
+version = "0.1.37"
 requires-python = ">=3.14"
 dependencies = []
 

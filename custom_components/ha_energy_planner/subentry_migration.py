@@ -50,7 +50,7 @@ _LEGACY_TO_TARGET = {
     "ev": SUBENTRY_EV,
 }
 
-_AI_KEYS = {"ai_advisor_service", "ai_agent_id", "ai_task_entity"}
+_AI_KEYS = {"ai_advisor_service", "ai_task_entity"}
 _CLIMATE_KEYS_FROM_ENERGY = {"weather_entity"}
 _PRESENCE_KEYS = {"person_entities"}
 _ENPHASE_REMOVED_KEYS = {"enphase_arbitrage_profile"}

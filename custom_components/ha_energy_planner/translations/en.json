@@ -59,7 +59,7 @@
           "ev_smart_charging_stop_entity": "Switch, button, input_boolean, or input_button used to stop EV Smart Charging.",
           "ev_smart_charging_target_soc_entity": "Optional number, input_number, select, input_select, or battery percentage sensor used for EV target SOC. Sensors are read-only and only validate the current target; use a writable helper if Energy Planner must change the target.",
           "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, input_text, select, or input_select helper used for EV ready-by time.",
-          "ai_advisor_service": "Optional response-capable local AI advisory service.",
+          "ai_advisor_service": "Optional local AI Task advisory service.",
           "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points."
         }
       }
@@ -213,14 +213,12 @@
       "step": {
         "user": {
           "title": "AI",
-          "description": "Configure the optional local AI advisory service. Prefer an AI task provider when one is available; it is designed for background data-generation tasks and is the most reliable option for Energy Planner. Use a conversation agent only as a fallback when your AI integration does not expose an AI task entity.",
+          "description": "Configure the optional local AI Task advisory service. Energy Planner uses AI Task providers for background JSON advice and validates the response before using it.",
           "data": {
-            "ai_task_entity": "AI task provider",
-            "ai_agent_id": "AI conversation agent"
+            "ai_task_entity": "AI task provider"
           },
           "data_description": {
-            "ai_task_entity": "Preferred. Select an AI Task entity for advisory JSON generation. Energy Planner calls ai_task.generate_data and validates the response before using it.",
-            "ai_agent_id": "Fallback. Select a conversation agent only if no AI Task entity is available. Conversation agents are built for chat/voice responses, so Energy Planner has to parse their text output."
+            "ai_task_entity": "Select an AI Task entity for advisory JSON generation. Energy Planner calls ai_task.generate_data and validates the response before using it."
           }
         }
       }
@@ -364,7 +362,7 @@
         "data_description": {
           "planner_enabled": "Turns on planner-owned device control. Leave off until preflight and dry-run behavior are reviewed.",
           "dry_run": "When enabled, the planner records decisions without calling device-control services.",
-          "ai_enabled": "Allows the configured AI conversation agent to provide bounded advice. AI advice cannot directly command devices.",
+          "ai_enabled": "Allows the configured AI Task provider to provide bounded advice. AI advice cannot directly command devices.",
           "ev_control_enabled": "Allows active-mode EV start, stop, and schedule commands after production is armed.",
           "climate_control_enabled": "Allows active-mode climate commands after production is armed.",
           "enphase_control_enabled": "Allows active-mode Enphase profile changes after production is armed.",

@@ -37,7 +37,6 @@ CONF_EV_SMART_CHARGING_STOP = "ev_smart_charging_stop_entity"
 CONF_EV_SMART_CHARGING_TARGET_SOC = "ev_smart_charging_target_soc_entity"
 CONF_EV_SMART_CHARGING_READY_BY = "ev_smart_charging_ready_by_entity"
 CONF_AI_ADVISOR_SERVICE = "ai_advisor_service"
-CONF_AI_AGENT_ID = "ai_agent_id"
 CONF_AI_TASK_ENTITY = "ai_task_entity"
 CONF_WEATHER = "weather_entity"
 

@@ -14,13 +14,11 @@ from custom_components.ha_energy_planner.ai_advisor import (
     _loads,
     _parse_response,
     _preview_summary,
-    _single_ai_task_entity,
     ai_rejection_detail,
     validate_ai_response,
 )
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_AI_AGENT_ID,
     CONF_AI_TASK_ENTITY,
     DEFAULT_OPTIONS,
 )
@@ -88,9 +86,7 @@ class FakeServices:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
 
     def has_service(self, domain: str, service: str) -> bool:
-        return self.available and (
-            (domain == "conversation" and service == "process") or (domain == "ai_task" and service == "generate_data")
-        )
+        return self.available and domain == "ai_task" and service == "generate_data"
 
     async def async_call(
         self,
@@ -138,20 +134,6 @@ class FakeStates:
 
     def get(self, entity_id: str) -> object | None:
         return object() if entity_id in self._entity_ids else None
-
-
-class FakeAllStates:
-    """State machine exposing only async_all."""
-
-    def __init__(self, entity_ids: list[str]) -> None:
-        self._entity_ids = entity_ids
-
-    def async_all(self, domain: str | None = None) -> list[Any]:
-        return [
-            type("State", (), {"entity_id": entity_id})()
-            for entity_id in self._entity_ids
-            if domain is None or entity_id.startswith(f"{domain}.")
-        ]
 
 
 class FakeHass:
@@ -225,13 +207,13 @@ def test_local_ai_advisor_accepts_valid_json_response() -> None:
             }
         )
     }
-    hass = FakeHass(response, entity_ids=["conversation.extended_openai_conversation"])
+    hass = FakeHass(response, entity_ids=["ai_task.extended_openai_ai_task"])
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
@@ -239,44 +221,15 @@ def test_local_ai_advisor_accepts_valid_json_response() -> None:
     assert result.status == "accepted"
     assert result.accepted["suggested_precondition_lead_minutes"] == 30
     assert result.accepted["suggested_takeover_savings_threshold"] == 0.5
-    assert "contract" in hass.services.calls[0][2]["text"]
-    assert "Return exactly one JSON object" in hass.services.calls[0][2]["text"]
-    assert hass.services.calls[0][2]["agent_id"] == "conversation.extended_openai_conversation"
+    assert "contract" in hass.services.calls[0][2]["instructions"]
+    assert "Return exactly one JSON object" in hass.services.calls[0][2]["instructions"]
+    assert hass.services.calls[0][2]["entity_id"] == "ai_task.extended_openai_ai_task"
 
 
-def test_local_ai_advisor_accepts_home_assistant_conversation_response() -> None:
+def test_local_ai_advisor_ignores_legacy_conversation_service() -> None:
     response = {
-        "conversation_id": "conv-1",
-        "response": {
-            "speech": {
-                "plain": {"speech": '```json\n{"reasoning_summary":"Use the current plan.","confidence":0.61}\n```'}
-            }
-        },
-    }
-    hass = FakeHass(response, entity_ids=["conversation.extended_openai_conversation"])
-    result = asyncio.run(
-        LocalAIAdvisor(
-            hass,
-            {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
-            },
-            DEFAULT_OPTIONS,
-        ).async_get_advice(_context(), _plan())
-    )
-
-    assert result.status == "accepted"
-    assert result.accepted["reasoning_summary"] == "Use the current plan."
-    assert result.accepted["confidence"] == 0.61
-
-
-def test_local_ai_advisor_prefers_single_ai_task_entity_over_conversation_agent() -> None:
-    response = {
-        "conversation_id": "conv-1",
         "data": {
             "alerts": "PV forecast confidence is low",
-            "reasoning_summary": "Use the structured AI task provider.",
-            "confidence": 0.8,
         },
     }
     hass = FakeHass(response, entity_ids=["ai_task.extended_openai_ai_task"])
@@ -285,17 +238,14 @@ def test_local_ai_advisor_prefers_single_ai_task_entity_over_conversation_agent(
             hass,
             {
                 CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
 
-    assert result.status == "accepted"
-    assert result.service_called == "ai_task.generate_data"
-    assert result.accepted["alerts"] == ["PV forecast confidence is low"]
-    assert hass.services.calls[0][0:2] == ("ai_task", "generate_data")
-    assert hass.services.calls[0][2]["entity_id"] == "ai_task.extended_openai_ai_task"
+    assert result.status == "skipped"
+    assert result.rejected_reason == "ai_service_not_configured"
+    assert hass.services.calls == []
 
 
 def test_local_ai_advisor_accepts_ai_task_data_response() -> None:
@@ -330,11 +280,14 @@ def test_local_ai_advisor_accepts_ai_task_data_response() -> None:
 
 
 def test_local_ai_advisor_rejects_malformed_output() -> None:
-    hass = FakeHass({"response": "not json"}, entity_ids=["conversation.extended_openai_conversation"])
+    hass = FakeHass({"response": "not json"}, entity_ids=["ai_task.extended_openai_ai_task"])
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
-            {CONF_AI_ADVISOR_SERVICE: "conversation.process"},
+            {
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+            },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
@@ -355,11 +308,14 @@ def test_local_ai_advisor_rejects_forbidden_fields() -> None:
             )
         }
     )
-    hass.states = FakeStates(["conversation.extended_openai_conversation"])
+    hass.states = FakeStates(["ai_task.extended_openai_ai_task"])
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
-            {CONF_AI_ADVISOR_SERVICE: "conversation.process"},
+            {
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+            },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
@@ -387,11 +343,14 @@ def test_local_ai_advisor_rejection_detail_lists_unsupported_fields() -> None:
             )
         }
     )
-    hass.states = FakeStates(["conversation.extended_openai_conversation"])
+    hass.states = FakeStates(["ai_task.extended_openai_ai_task"])
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
-            {CONF_AI_ADVISOR_SERVICE: "conversation.process"},
+            {
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+            },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
@@ -402,11 +361,14 @@ def test_local_ai_advisor_rejection_detail_lists_unsupported_fields() -> None:
 
 
 def test_local_ai_advisor_skips_unavailable_service() -> None:
-    hass = FakeHass({}, available=False, entity_ids=["conversation.extended_openai_conversation"])
+    hass = FakeHass({}, available=False, entity_ids=["ai_task.extended_openai_ai_task"])
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
-            {CONF_AI_ADVISOR_SERVICE: "conversation.process"},
+            {
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+            },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
@@ -421,8 +383,8 @@ def test_local_ai_advisor_skips_provider_entity_not_ready() -> None:
         LocalAIAdvisor(
             hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
@@ -445,8 +407,8 @@ def test_local_ai_advisor_rejects_missing_and_invalid_service() -> None:
 
     assert missing.status == "skipped"
     assert missing.rejected_reason == "ai_service_not_configured"
-    assert invalid.status == "rejected"
-    assert invalid.rejected_reason == "ai_service_invalid"
+    assert invalid.status == "skipped"
+    assert invalid.rejected_reason == "ai_service_not_configured"
 
 
 def test_local_ai_advisor_supports_service_call_without_return_response() -> None:
@@ -459,7 +421,7 @@ def test_local_ai_advisor_supports_service_call_without_return_response() -> Non
                 }
             )
         },
-        entity_ids=["conversation.extended_openai_conversation"],
+        entity_ids=["ai_task.extended_openai_ai_task"],
     )
     hass.services = FakeFallbackServices(hass.services.response)
 
@@ -467,8 +429,8 @@ def test_local_ai_advisor_supports_service_call_without_return_response() -> Non
         LocalAIAdvisor(
             hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
@@ -479,7 +441,7 @@ def test_local_ai_advisor_supports_service_call_without_return_response() -> Non
 
 
 def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: object) -> None:
-    timeout_hass = FakeHass({}, entity_ids=["conversation.extended_openai_conversation"])
+    timeout_hass = FakeHass({}, entity_ids=["ai_task.extended_openai_ai_task"])
     real_timeout = asyncio.timeout
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.ai_advisor.asyncio.timeout",
@@ -490,22 +452,22 @@ def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: objec
         LocalAIAdvisor(
             timeout_hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
 
     monkeypatch.setattr("custom_components.ha_energy_planner.ai_advisor.asyncio.timeout", real_timeout)
-    failing_hass = FakeHass({}, entity_ids=["conversation.extended_openai_conversation"])
+    failing_hass = FakeHass({}, entity_ids=["ai_task.extended_openai_ai_task"])
     failing_hass.services = FakeFailingServices({})
     failed = asyncio.run(
         LocalAIAdvisor(
             failing_hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
@@ -517,14 +479,14 @@ def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: objec
 
 
 def test_local_ai_advisor_rejects_valid_json_with_no_supported_fields() -> None:
-    hass = FakeHass({"response": "{}"}, entity_ids=["conversation.extended_openai_conversation"])
+    hass = FakeHass({"response": "{}"}, entity_ids=["ai_task.extended_openai_ai_task"])
 
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
@@ -537,7 +499,7 @@ def test_local_ai_advisor_rejects_valid_json_with_no_supported_fields() -> None:
 def test_local_ai_advisor_skips_disabled_healthy_plan_without_provider_call() -> None:
     hass = FakeHass(
         {"response": json.dumps({"reasoning_summary": "Energy planner is disabled and OK.", "confidence": 0.7})},
-        entity_ids=["conversation.extended_openai_conversation"],
+        entity_ids=["ai_task.extended_openai_ai_task"],
     )
     plan = _plan()
     plan.mode = PlannerMode.DISABLED
@@ -546,8 +508,8 @@ def test_local_ai_advisor_skips_disabled_healthy_plan_without_provider_call() ->
         LocalAIAdvisor(
             hass,
             {
-                CONF_AI_ADVISOR_SERVICE: "conversation.process",
-                CONF_AI_AGENT_ID: "conversation.extended_openai_conversation",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), plan)
@@ -585,21 +547,13 @@ def test_build_instructions_supports_structured_prompt() -> None:
     assert "not an input health reason, advice reason, or OK outcome" in instructions
 
 
-def test_single_ai_task_entity_supports_async_all_fallback() -> None:
-    hass = type("Hass", (), {"states": FakeAllStates(["ai_task.one"])})()
-
-    assert _single_ai_task_entity(hass) == "ai_task.one"
-    assert _single_ai_task_entity(type("Hass", (), {"states": FakeAllStates(["ai_task.one", "ai_task.two"])})()) is None
-    assert _single_ai_task_entity(type("Hass", (), {"states": object()})()) is None
-    assert _single_ai_task_entity(type("Hass", (), {"states": None})()) is None
-
-
 def test_parse_response_supports_common_nested_shapes() -> None:
     assert _parse_response({"data": '{"confidence":0.4}'}) == {"confidence": 0.4}
     assert _parse_response({"response": {"text": '{"confidence":0.5}'}}) == {"confidence": 0.5}
     assert _parse_response({"confidence": 0.6}) == {"confidence": 0.6}
     assert _parse_response('{"confidence":0.7}') == {"confidence": 0.7}
     assert _parse_response({"speech": {"speech": '{"confidence":0.8}'}}) == {"confidence": 0.8}
+    assert _parse_response({"speech": {"plain": {"speech": '{"confidence":0.85}'}}}) == {"confidence": 0.85}
     assert _parse_response({"message": '{"confidence":0.9}'}) == {"confidence": 0.9}
 
 
