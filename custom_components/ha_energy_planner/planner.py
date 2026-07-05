@@ -112,7 +112,7 @@ class DryRunPlanner:
 
     def _actions(self, context: DecisionContext, mode: PlannerMode) -> list[PlanAction]:
         """Create conservative immediate candidate actions."""
-        if mode != PlannerMode.ACTIVE_HEALTHY or context.input_health != InputHealth.HEALTHY:
+        if mode not in {PlannerMode.ACTIVE_HEALTHY, PlannerMode.DRY_RUN} or context.input_health != InputHealth.HEALTHY:
             return []
         actions: list[PlanAction] = []
         execute_not_before = context.created_at

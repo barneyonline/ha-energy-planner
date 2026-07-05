@@ -292,9 +292,20 @@ def test_plan_validation_reports_config_and_grid_limit_issues() -> None:
 
     assert "battery_soc_below_floor" in violations
     assert "ev_min_above_ev_max" in violations
-    assert "dry_run_plan_must_not_generate_control_actions" in violations
+    assert "disabled_plan_must_not_generate_control_actions" not in violations
     assert "grid_import_limit_exceeded" in violations
     assert "grid_export_limit_exceeded" in violations
+
+
+def test_disabled_plan_validation_rejects_control_actions() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = _context(now)
+    plan = _plan(now, _action(now, ActionAsset.EV, ActionKind.EV_START, {}))
+    plan.mode = PlannerMode.DISABLED
+
+    violations = ConstraintValidator(DEFAULT_OPTIONS).validate_plan(context, plan)
+
+    assert "disabled_plan_must_not_generate_control_actions" in violations
 
 
 def test_action_validation_reports_global_and_time_window_issues() -> None:

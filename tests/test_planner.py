@@ -48,11 +48,16 @@ def _context(health: InputHealth = InputHealth.HEALTHY) -> DecisionContext:
     )
 
 
-def test_dry_run_plan_has_no_actions() -> None:
+def test_dry_run_plan_has_candidate_actions_without_active_control() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    plan = DryRunPlanner(options).create_plan(_context())
+    context = _context()
+    context.occupancy_state = OccupancyState.AWAY
+
+    plan = DryRunPlanner(options).create_plan(context)
+
     assert plan.mode == PlannerMode.DRY_RUN
-    assert plan.actions == []
+    assert plan.actions[0].asset == ActionAsset.DAIKIN
+    assert plan.actions[0].kind == ActionKind.SET_HVAC
     assert plan.status == "current"
     assert plan.confidence == 1.0
 
@@ -72,6 +77,7 @@ def test_estimated_cost_uses_configured_planning_interval() -> None:
         "planning_interval_minutes": 15,
     }
     context = _context()
+    context.current_ev_soc_percent = None
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),
@@ -91,6 +97,7 @@ def test_estimated_cost_uses_configured_planning_interval() -> None:
 def test_estimated_cost_subtracts_export_credit_for_surplus_solar() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
     context = _context()
+    context.current_ev_soc_percent = None
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),

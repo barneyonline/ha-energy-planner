@@ -67,13 +67,11 @@ class ConstraintValidator:
         ev_max = float(self.options[CONF_EV_MAX_SOC_PERCENT])
         if ev_min > ev_max:
             violations.append(_violation("ev_min_above_ev_max", "EV minimum SOC is above maximum SOC.", ActionAsset.EV))
-        if plan.actions and (
-            plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN} or bool(self.options[CONF_DRY_RUN])
-        ):
+        if plan.actions and plan.mode == PlannerMode.DISABLED:
             violations.append(
                 _violation(
-                    "dry_run_plan_must_not_generate_control_actions",
-                    "Disabled or dry-run plans must not emit control actions.",
+                    "disabled_plan_must_not_generate_control_actions",
+                    "Disabled plans must not emit control actions.",
                 )
             )
         violations.extend(self._evaluate_grid_limits(context))
