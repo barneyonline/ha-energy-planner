@@ -674,12 +674,18 @@ def test_options_flow_all_policy_section_steps_show_forms() -> None:
 
 
 def test_options_flow_section_update_preserves_other_options() -> None:
+    updates: list[dict[str, Any]] = []
     flow = OptionsFlow(
         SimpleNamespace(
             options={
                 CONF_EV_MIN_SOC_PERCENT: 55,
                 CONF_PRIORITY_WEIGHTS: "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon",
             }
+        )
+    )
+    flow.hass = SimpleNamespace(
+        config_entries=SimpleNamespace(
+            async_update_entry=lambda entry, **kwargs: updates.append(kwargs),
         )
     )
 
@@ -693,12 +699,34 @@ def test_options_flow_section_update_preserves_other_options() -> None:
         )
     )
 
-    assert result["type"] == "create_entry"
-    assert result["data"][CONF_PLANNING_HORIZON_HOURS] == 36
-    assert result["data"][CONF_EV_MIN_SOC_PERCENT] == 55
-    assert result["data"][CONF_PRIORITY_WEIGHTS] == (
+    assert result["type"] == "menu"
+    assert result["step_id"] == "init"
+    assert updates == [{"options": flow._options}]
+    assert flow._options[CONF_PLANNING_HORIZON_HOURS] == 36
+    assert flow._options[CONF_EV_MIN_SOC_PERCENT] == 55
+    assert flow._options[CONF_PRIORITY_WEIGHTS] == (
         "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon"
     )
+
+
+def test_options_flow_uses_saved_values_after_returning_to_menu() -> None:
+    flow = OptionsFlow(SimpleNamespace(options={CONF_EV_MIN_SOC_PERCENT: 55}))
+
+    asyncio.run(
+        flow.async_step_schedule(
+            {
+                CONF_PLANNING_HORIZON_HOURS: 36,
+                CONF_PLANNING_INTERVAL_MINUTES: 10,
+                CONF_DEFAULT_READY_BY: "08:30",
+            }
+        )
+    )
+
+    result = asyncio.run(flow.async_step_schedule())
+    schema_fields = {str(getattr(key, "schema", key)): key for key in result["data_schema"].schema}
+
+    assert result["type"] == "form"
+    assert getattr(schema_fields[CONF_PLANNING_HORIZON_HOURS], "default")() == 36
 
 
 def test_options_flow_section_validation_returns_form_errors() -> None:

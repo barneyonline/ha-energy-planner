@@ -672,6 +672,7 @@ class OptionsFlow(config_entries.OptionsFlow):
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
+        self._options = dict(config_entry.options)
 
     async def async_step_init(
         self,
@@ -736,17 +737,27 @@ class OptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         """Manage one policy section."""
         errors: dict[str, str] = {}
-        options = {**DEFAULT_OPTIONS, **dict(self._config_entry.options)}
+        options = {**DEFAULT_OPTIONS, **self._options}
         if user_input is not None:
             updated = {**options, **user_input}
             errors = _validate_options(updated)
             if not errors:
-                return self.async_create_entry(title="", data=_normalize_options_input(updated))
+                self._async_save_options(_normalize_options_input(updated))
+                return await self.async_step_init()
         return self.async_show_form(
             step_id=step_id,
             data_schema=_options_section_schema(options, _POLICY_SECTION_FIELDS[step_id]),
             errors=errors,
         )
+
+    def _async_save_options(self, options: dict[str, Any]) -> None:
+        """Persist options without ending the policy menu flow."""
+        self._options = dict(options)
+        hass = getattr(self, "hass", None)
+        config_entries_manager = getattr(hass, "config_entries", None)
+        async_update_entry = getattr(config_entries_manager, "async_update_entry", None)
+        if callable(async_update_entry):
+            async_update_entry(self._config_entry, options=self._options)
 
 
 def _form_suggested_values(data: dict[str, Any]) -> dict[str, Any]:
