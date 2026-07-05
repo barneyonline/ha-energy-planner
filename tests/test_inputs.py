@@ -20,6 +20,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CONNECTED,
+    CONF_EV_SMART_CHARGING_READY_BY,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
     CONF_PERSON_ENTITIES,
     CONF_PV_FORECAST,
     CONF_WEATHER,
@@ -132,6 +135,44 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     assert context.current_outdoor_temperature_c == 13.2
     assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [14.0, 16.0, 16.0, 16.0]
     assert manager.thermal_sample(context)["hvac_power_kw"] == 1.7
+
+
+def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_BATTERY_SOC: "sensor.battery",
+        CONF_EV_SOC: "sensor.ev_soc",
+        CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+        CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+        CONF_EV_SMART_CHARGING_READY_BY: "select.ev_ready_by",
+        CONF_PERSON_ENTITIES: ["person.james"],
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.20"),
+            "sensor.export": FakeState("0.05"),
+            "sensor.pv": FakeState("1.0"),
+            "sensor.load": FakeState("2.0"),
+            "sensor.battery": FakeState("55"),
+            "sensor.ev_soc": FakeState("72"),
+            "binary_sensor.ev_connected": FakeState("on"),
+            "sensor.ev_target": FakeState("80", {"device_class": "battery", "unit_of_measurement": "%"}),
+            "select.ev_ready_by": FakeState("08:00", {"options": ["07:00", "08:00"]}),
+            "person.james": FakeState("home"),
+        }
+    )
+
+    context = InputManager(hass, entry_data, options).build_context()
+
+    assert context.current_ev_soc_percent == 72
+    assert context.ev_connected is True
+    assert context.ev_target_soc_percent == 80
+    assert context.ev_ready_by == "08:00"
+    assert context.input_health == InputHealth.HEALTHY
 
 
 def test_input_manager_adds_trip_history_summary_to_context() -> None:

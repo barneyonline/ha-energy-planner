@@ -479,6 +479,49 @@ def test_active_plan_uses_runtime_ready_by_option_for_ev_schedule() -> None:
     assert plan.actions[0].desired_state["infeasible"] is False
 
 
+def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": True,
+        "ev_min_soc_percent": 40,
+        "ev_max_soc_percent": 90,
+        "ev_fallback_target_soc_percent": 70,
+        "default_ready_by": "07:00",
+        "ev_charge_rate_kw": 7,
+        "ev_soc_per_kwh": 5,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 72
+    context.ev_connected = True
+    context.ev_target_soc_percent = 80
+    context.ev_ready_by = "08:00"
+    context.ev_trip_history_sufficient = True
+    context.ev_trip_max_daily_soc_percent = 5
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [(0, 0.50), (5, 0.10), (10, 0.01), (15, 0.20)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.mode == PlannerMode.DRY_RUN
+    assert plan.actions[0].asset == ActionAsset.EV
+    assert plan.actions[0].desired_state["target_soc_percent"] == 80
+    assert plan.actions[0].desired_state["configured_target_soc_percent"] == 80
+    assert plan.actions[0].desired_state["ready_by"] == "08:00"
+    assert plan.actions[0].desired_state["required_charge_percent"] == 8
+    assert any(entry["state"] == "charging" for entry in plan.device_plans["ev"]["timeline"])
+
+
 def test_active_plan_does_not_schedule_ev_when_disconnected() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 70}
     context = _context()

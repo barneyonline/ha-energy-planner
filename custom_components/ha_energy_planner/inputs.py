@@ -26,6 +26,8 @@ from .const import (
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CONNECTED,
+    CONF_EV_SMART_CHARGING_READY_BY,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_PERSON_ENTITIES,
@@ -132,6 +134,8 @@ class InputManager:
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
         ev_connected, ev_connected_issue = self._optional_bool_state(CONF_EV_CONNECTED)
+        ev_target_soc, ev_target_soc_issue = self._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC)
+        ev_ready_by, ev_ready_by_issue = self._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY)
         enphase_profile, enphase_profile_issue = self._optional_string_state(CONF_ENPHASE_PROFILE)
         hvac_mode, hvac_temperature, hvac_issue = self._optional_climate_state(CONF_DAIKIN_CLIMATE)
         hvac_power, hvac_power_issue = self._optional_numeric_state(CONF_DAIKIN_POWER)
@@ -168,6 +172,8 @@ class InputManager:
                 battery_issue,
                 ev_issue,
                 ev_connected_issue,
+                ev_target_soc_issue,
+                ev_ready_by_issue,
                 enphase_profile_issue,
                 hvac_issue,
                 hvac_power_issue,
@@ -217,6 +223,8 @@ class InputManager:
             current_hvac_power_kw=hvac_power,
             current_outdoor_temperature_c=outdoor_temperature,
             ev_connected=ev_connected,
+            ev_target_soc_percent=ev_target_soc,
+            ev_ready_by=ev_ready_by,
             ev_trip_observed_days=ev_trip_summary.observed_days,
             ev_trip_max_daily_soc_percent=ev_trip_summary.max_daily_soc_percent,
             ev_trip_average_daily_soc_percent=ev_trip_summary.average_daily_soc_percent,
@@ -351,6 +359,34 @@ class InputManager:
         }:
             return False, None
         return None, f"{config_key}_unsupported_state"
+
+    def _optional_soc_state(self, config_key: str) -> tuple[float | None, str | None]:
+        entity_id = self.entry_data.get(config_key)
+        if not entity_id:
+            return None, None
+        state = self._state(entity_id)
+        if not self._valid_state(state):
+            return None, f"{config_key}_unavailable"
+        value = _percent_float_or_none(state.state)
+        if value is None:
+            return None, f"{config_key}_non_numeric"
+        if value < 0 or value > 100:
+            return None, f"{config_key}_out_of_range"
+        return value, None
+
+    def _optional_ready_by_state(self, config_key: str) -> tuple[str | None, str | None]:
+        entity_id = self.entry_data.get(config_key)
+        if not entity_id:
+            return None, None
+        state = self._state(entity_id)
+        if not self._valid_state(state):
+            return None, f"{config_key}_unavailable"
+        ready_by = _ready_by_time_or_none(state.state)
+        if ready_by is None:
+            if str(state.state).strip().lower() in {"", "none", "unknown", "unavailable"}:
+                return None, None
+            return None, f"{config_key}_invalid_time"
+        return ready_by, None
 
     def _optional_string_state(self, config_key: str) -> tuple[str | None, str | None]:
         entity_id = self.entry_data.get(config_key)
@@ -543,6 +579,31 @@ def _finite_float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if isfinite(number) else None
+
+
+def _percent_float_or_none(value: Any) -> float | None:
+    if isinstance(value, str):
+        value = value.strip().removesuffix("%").strip()
+        if "," in value and "." not in value:
+            value = value.replace(",", ".")
+    return _finite_float_or_none(value)
+
+
+def _ready_by_time_or_none(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if "T" in text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None:
+            return f"{parsed.hour:02d}:{parsed.minute:02d}"
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?", text)
+    if match is None:
+        return None
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
 
 
 def _attribute_value(attributes: Mapping[str, Any], *keys: str) -> Any:

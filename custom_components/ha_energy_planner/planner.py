@@ -145,20 +145,27 @@ class DryRunPlanner:
             actions.append(enphase_action)
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         if context.ev_connected is not False and context.current_ev_soc_percent is not None:
-            ready_by = _next_ready_by(context.created_at, str(self.options[CONF_DEFAULT_READY_BY]))
+            ready_by_text = context.ev_ready_by or str(self.options[CONF_DEFAULT_READY_BY])
+            ready_by = _next_ready_by(context.created_at, ready_by_text)
             charge_rate_kw = float(self.options[CONF_EV_CHARGE_RATE_KW])
             soc_per_kwh = float(self.options[CONF_EV_SOC_PER_KWH])
+            target_soc = context.ev_target_soc_percent
+            fallback_target_soc = (
+                float(target_soc)
+                if target_soc is not None
+                else float(self.options[CONF_EV_FALLBACK_TARGET_SOC_PERCENT])
+            )
             target = calculate_ev_target(
                 current_soc_percent=context.current_ev_soc_percent,
                 summary=EVTripSummary(
                     observed_days=context.ev_trip_observed_days,
                     max_daily_soc_percent=context.ev_trip_max_daily_soc_percent,
                     average_daily_soc_percent=context.ev_trip_average_daily_soc_percent,
-                    history_sufficient=context.ev_trip_history_sufficient,
+                    history_sufficient=context.ev_trip_history_sufficient and target_soc is None,
                 ),
                 ev_min_soc_percent=ev_min,
                 ev_max_soc_percent=float(self.options[CONF_EV_MAX_SOC_PERCENT]),
-                fallback_target_soc_percent=float(self.options[CONF_EV_FALLBACK_TARGET_SOC_PERCENT]),
+                fallback_target_soc_percent=fallback_target_soc,
                 available_charge_hours=max((ready_by - context.created_at).total_seconds() / 3600, 0.0),
                 charge_rate_percent_per_hour=charge_rate_kw * soc_per_kwh,
             )
@@ -187,7 +194,8 @@ class DryRunPlanner:
                     kind=ActionKind.EV_SCHEDULE,
                     desired_state={
                         "target_soc_percent": schedule.scheduled_soc_percent,
-                        "ready_by": str(self.options[CONF_DEFAULT_READY_BY]),
+                        "ready_by": ready_by_text,
+                        "configured_target_soc_percent": target_soc,
                         "required_charge_percent": target.required_charge_percent,
                         "max_attainable_soc_percent": target.max_attainable_soc_percent,
                         "trip_history_observed_days": context.ev_trip_observed_days,
