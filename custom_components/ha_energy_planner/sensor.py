@@ -22,7 +22,7 @@ from .const import (
 )
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
-from .models import ActionAsset, EnergyPlan, PlanAction, to_jsonable
+from .models import ActionAsset, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -607,7 +607,7 @@ def _confidence_breakdown_state(coordinator: EnergyPlannerCoordinator) -> str:
 
 
 def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return simple confidence contribution breakdown."""
+    """Return confidence calculation, component status, and improvement guidance."""
     if coordinator.data is None:
         return {}
     issues = list(coordinator.data.input_issues)
@@ -628,12 +628,169 @@ def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
             "status": "degraded" if matching else "healthy",
             "issues": matching[:8],
         }
+    health_score = _confidence_health_score(coordinator.data.health)
+    forecast_confidence = _forecast_source_confidence(coordinator)
+    calculation = {
+        "formula": "overall = min(input_health_score, forecast_source_confidence)",
+        "overall": coordinator.data.confidence,
+        "overall_percent": round(coordinator.data.confidence * 100, 1),
+        "input_health_score": health_score,
+        "input_health_percent": round(health_score * 100, 1),
+        "forecast_source_confidence": forecast_confidence,
+        "forecast_source_percent": None if forecast_confidence is None else round(forecast_confidence * 100, 1),
+        "limiting_factor": _confidence_limiting_factor(coordinator.data.confidence, health_score, forecast_confidence),
+    }
+    sources = _confidence_sources(coordinator)
     return {
         "plan_id": coordinator.data.plan_id,
         "overall_confidence": coordinator.data.confidence,
+        "calculation": calculation,
         "health": str(coordinator.data.health),
         "breakdown": breakdown,
+        "source_confidence": sources,
+        "improvement_actions": _confidence_improvement_actions(
+            coordinator.data.confidence,
+            health_score,
+            forecast_confidence,
+            sources,
+            breakdown,
+        ),
     }
+
+
+def _confidence_health_score(health: InputHealth | str) -> float:
+    """Return confidence score contributed by input health."""
+    if str(health) == InputHealth.HEALTHY:
+        return 1.0
+    if str(health) == InputHealth.DEGRADED:
+        return 0.65
+    return 0.0
+
+
+def _forecast_source_confidence(coordinator: EnergyPlannerCoordinator) -> float | None:
+    """Return the forecast-source confidence used by the current plan when known."""
+    latest = _latest_forecast_snapshot(coordinator)
+    confidence = latest.get("confidence") if isinstance(latest, dict) else None
+    if isinstance(confidence, dict):
+        value = confidence.get("forecast_source_confidence")
+        if isinstance(value, int | float):
+            return round(float(value), 4)
+    if coordinator.data is None:
+        return None
+    health_score = _confidence_health_score(coordinator.data.health)
+    if coordinator.data.confidence < health_score:
+        return coordinator.data.confidence
+    return None
+
+
+def _confidence_sources(coordinator: EnergyPlannerCoordinator) -> list[dict[str, Any]]:
+    """Return bounded source confidence evidence from the latest forecast snapshot."""
+    latest = _latest_forecast_snapshot(coordinator)
+    confidence = latest.get("confidence") if isinstance(latest, dict) else None
+    sources = confidence.get("sources") if isinstance(confidence, dict) else []
+    if not isinstance(sources, list):
+        return []
+    return [
+        {
+            "input": _confidence_source_label(source),
+            "entity_id": source.get("entity_id"),
+            "source": _display_state(source.get("source", "unknown")),
+            "confidence": source.get("confidence"),
+            "confidence_percent": round(float(source.get("confidence", 0.0) or 0.0) * 100, 1),
+            "reason": _confidence_source_reason(source),
+        }
+        for source in sources[:12]
+        if isinstance(source, dict)
+    ]
+
+
+def _latest_forecast_snapshot(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return the most recent forecast snapshot for the current plan where possible."""
+    snapshots = coordinator.store.data.get("forecast_snapshots", [])
+    if not isinstance(snapshots, list):
+        return {}
+    plan_id = None if coordinator.data is None else coordinator.data.plan_id
+    for item in reversed(snapshots):
+        if isinstance(item, dict) and (plan_id is None or item.get("plan_id") == plan_id):
+            return item
+    return {}
+
+
+def _confidence_limiting_factor(overall: float, health_score: float, forecast_confidence: float | None) -> str:
+    """Return the factor currently limiting confidence."""
+    if overall <= 0:
+        return "unsafe_inputs"
+    if forecast_confidence is None:
+        return "input_health" if overall == health_score and overall < 1.0 else "unknown"
+    health_limited = overall == health_score and health_score <= forecast_confidence
+    forecast_limited = overall == forecast_confidence and forecast_confidence <= health_score
+    if health_limited and forecast_limited:
+        return "input_health_and_forecast_sources"
+    if health_limited:
+        return "input_health"
+    if forecast_limited:
+        return "forecast_sources"
+    return "unknown"
+
+
+def _confidence_improvement_actions(
+    overall: float,
+    health_score: float,
+    forecast_confidence: float | None,
+    sources: list[dict[str, Any]],
+    breakdown: dict[str, Any],
+) -> list[str]:
+    """Return prioritized actions to improve plan confidence."""
+    actions: list[str] = []
+    if forecast_confidence is not None and forecast_confidence <= health_score and forecast_confidence < 1.0:
+        limiting_sources = [source for source in sources if source.get("confidence") == forecast_confidence]
+        for source in limiting_sources[:4]:
+            if source.get("source") == "Point Value Repeated":
+                actions.append(
+                    f"Replace {source['input']} ({source.get('entity_id')}) with an entity that exposes forecast data "
+                    "for the planning horizon, or add source confidence metadata."
+                )
+            elif source.get("source") == "Invalid State":
+                actions.append(f"Fix {source['input']} ({source.get('entity_id')}) so it has a numeric usable state.")
+            else:
+                actions.append(
+                    f"Improve {source['input']} ({source.get('entity_id')}) source confidence or data quality."
+                )
+    if overall == health_score and health_score < 1.0:
+        for name, details in breakdown.items():
+            issues = details.get("issues", []) if isinstance(details, dict) else []
+            if issues:
+                actions.append(f"Resolve {name} input issue(s): {', '.join(str(issue) for issue in issues[:3])}.")
+    if not actions and overall < 1.0:
+        actions.append("Use forecast-capable entities with confidence metadata for price, PV, load, and weather inputs.")
+    if not actions:
+        actions.append("Confidence is already at 100%; no action is needed.")
+    return actions[:8]
+
+
+def _confidence_source_label(source: dict[str, Any]) -> str:
+    """Return a readable configured input label."""
+    labels = {
+        "amber_import_price_entity": "Amber import price",
+        "amber_export_price_entity": "Amber export price",
+        "pv_forecast_entity": "PV forecast",
+        "baseline_load_forecast_entity": "Baseline load forecast",
+        "weather_entity": "Weather forecast",
+    }
+    config_key = str(source.get("config_key", "unknown"))
+    return labels.get(config_key, config_key.replace("_", " ").capitalize())
+
+
+def _confidence_source_reason(source: dict[str, Any]) -> str:
+    """Return a readable reason for one confidence source score."""
+    source_kind = source.get("source")
+    if source_kind == "forecast_series":
+        return "Forecast series found; confidence comes from entity metadata when present, otherwise 100%."
+    if source_kind == "point_value_repeated":
+        return "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
+    if source_kind == "invalid_state":
+        return "The entity state could not be converted into usable forecast data."
+    return "Confidence source was not classified."
 
 
 def _production_readiness_state(coordinator: EnergyPlannerCoordinator) -> str:

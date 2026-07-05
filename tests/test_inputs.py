@@ -405,10 +405,43 @@ def test_input_manager_combines_forecast_confidence_metadata() -> None:
         }
     )
 
-    context = InputManager(hass, entry_data, options).build_context()
+    manager = InputManager(hass, entry_data, options)
+    context = manager.build_context()
 
     assert context.input_health == InputHealth.HEALTHY
     assert context.forecast_confidence == 0.62
+    assert manager.forecast_confidence_details == [
+        {
+            "config_key": CONF_AMBER_IMPORT_PRICE,
+            "entity_id": "sensor.import",
+            "source": "forecast_series",
+            "confidence": 0.91,
+        },
+        {
+            "config_key": CONF_AMBER_EXPORT_PRICE,
+            "entity_id": "sensor.export",
+            "source": "forecast_series",
+            "confidence": 0.84,
+        },
+        {
+            "config_key": CONF_PV_FORECAST,
+            "entity_id": "sensor.pv",
+            "source": "forecast_series",
+            "confidence": 0.62,
+        },
+        {
+            "config_key": CONF_BASELINE_LOAD_FORECAST,
+            "entity_id": "sensor.load",
+            "source": "forecast_series",
+            "confidence": 0.77,
+        },
+        {
+            "config_key": CONF_WEATHER,
+            "entity_id": "weather.home",
+            "source": "forecast_series",
+            "confidence": 0.88,
+        },
+    ]
 
 
 def test_input_manager_marks_required_non_finite_numeric_state_unsafe() -> None:

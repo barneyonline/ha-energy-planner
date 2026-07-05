@@ -74,6 +74,7 @@ class InputManager:
         self.trip_history = dict(trip_history or {})
         self.forecast_calibration = dict(forecast_calibration or {})
         self.forecast_training_slots: list[dict[str, Any]] = []
+        self.forecast_confidence_details: list[dict[str, Any]] = []
         self._raw_forecast_series: dict[str, list[float | None]] = {}
         self._forecast_confidence_scores: list[float] = []
         self._state_cache: dict[str, State | None] = {}
@@ -82,6 +83,7 @@ class InputManager:
         """Build the current 24-hour decision context."""
         now = dt_util.utcnow()
         self._forecast_confidence_scores = []
+        self.forecast_confidence_details = []
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
         import_prices, import_issue = self._required_series(
@@ -264,7 +266,12 @@ class InputManager:
             value_kind=value_kind,
         )
         if forecast:
-            self._record_forecast_confidence(_state_confidence(state, default=1.0))
+            self._record_forecast_confidence(
+                _state_confidence(state, default=1.0),
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="forecast_series",
+            )
             padded = list(forecast[:slot_count])
             if len(padded) < slot_count:
                 padded.extend([padded[-1]] * (slot_count - len(padded)))
@@ -276,12 +283,22 @@ class InputManager:
 
         value = _finite_float_or_none(state.state)
         if value is None:
-            self._record_forecast_confidence(0.0)
+            self._record_forecast_confidence(
+                0.0,
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="invalid_state",
+            )
             return [None] * slot_count, f"{config_key}_non_numeric"
         attributes = getattr(state, "attributes", {}) or {}
         unit = str(_attribute_value(attributes, "unit_of_measurement", "unit") or "")
         value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_keys[0], unit=unit)
-        self._record_forecast_confidence(_POINT_SENSOR_CONFIDENCE)
+        self._record_forecast_confidence(
+            _POINT_SENSOR_CONFIDENCE,
+            config_key=config_key,
+            entity_id=str(entity_id),
+            source="point_value_repeated",
+        )
         return [value] * slot_count, None
 
     def _optional_numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
@@ -387,15 +404,30 @@ class InputManager:
             value_kind="temperature",
         )
         if forecast:
-            self._record_forecast_confidence(_state_confidence(state, default=1.0))
+            self._record_forecast_confidence(
+                _state_confidence(state, default=1.0),
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="forecast_series",
+            )
             padded = list(forecast[:slot_count])
             if len(padded) < slot_count:
                 padded.extend([padded[-1]] * (slot_count - len(padded)))
             return current_temperature, padded, None
         if current_temperature is not None:
-            self._record_forecast_confidence(_POINT_SENSOR_CONFIDENCE)
+            self._record_forecast_confidence(
+                _POINT_SENSOR_CONFIDENCE,
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="point_value_repeated",
+            )
             return current_temperature, [current_temperature] * slot_count, None
-        self._record_forecast_confidence(0.0)
+        self._record_forecast_confidence(
+            0.0,
+            config_key=config_key,
+            entity_id=str(entity_id),
+            source="invalid_state",
+        )
         return None, [None] * slot_count, f"{config_key}_non_numeric_temperature"
 
     def _freshness_issues(self, now: datetime) -> list[str]:
@@ -471,8 +503,25 @@ class InputManager:
             return InputHealth.DEGRADED
         return InputHealth.HEALTHY
 
-    def _record_forecast_confidence(self, value: float) -> None:
-        self._forecast_confidence_scores.append(_clamp_confidence(value))
+    def _record_forecast_confidence(
+        self,
+        value: float,
+        *,
+        config_key: str | None = None,
+        entity_id: str | None = None,
+        source: str = "unknown",
+    ) -> None:
+        confidence = _clamp_confidence(value)
+        self._forecast_confidence_scores.append(confidence)
+        if config_key is not None:
+            self.forecast_confidence_details.append(
+                {
+                    "config_key": config_key,
+                    "entity_id": entity_id,
+                    "source": source,
+                    "confidence": confidence,
+                }
+            )
 
 
 def _series_value(series: list[float | None], index: int) -> float | None:

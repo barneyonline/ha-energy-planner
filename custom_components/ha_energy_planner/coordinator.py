@@ -324,6 +324,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         forecast_calibration, "baseline_load_forecast_kw"
                     ),
                 },
+                "confidence": {
+                    "overall": plan.confidence,
+                    "forecast_source_confidence": getattr(context, "forecast_confidence", plan.confidence),
+                    "sources": getattr(manager, "forecast_confidence_details", []),
+                },
                 "input_issues": context.input_issues[:20],
                 "ai": None
                 if ai_result is None

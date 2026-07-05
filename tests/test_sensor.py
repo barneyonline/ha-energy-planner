@@ -124,6 +124,114 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert support.attrs_fn(coordinator)["latest_ai"]["reasoning_summary"] == "Looks OK"
 
 
+def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
+    plan = _plan()
+    plan.confidence = 0.7
+    coordinator = _coordinator(
+        plan,
+        store_data={
+            "forecast_snapshots": [
+                {
+                    "plan_id": "plan-1",
+                    "confidence": {
+                        "overall": 0.7,
+                        "forecast_source_confidence": 0.7,
+                        "sources": [
+                            {
+                                "config_key": "pv_forecast_entity",
+                                "entity_id": "sensor.pv",
+                                "source": "point_value_repeated",
+                                "confidence": 0.7,
+                            },
+                            {
+                                "config_key": "amber_import_price_entity",
+                                "entity_id": "sensor.import",
+                                "source": "forecast_series",
+                                "confidence": 1.0,
+                            },
+                        ],
+                    },
+                }
+            ]
+        },
+    )
+    confidence = next(item for item in SENSORS if item.key == "confidence_breakdown")
+
+    attrs = confidence.attrs_fn(coordinator)
+
+    assert attrs["calculation"] == {
+        "formula": "overall = min(input_health_score, forecast_source_confidence)",
+        "overall": 0.7,
+        "overall_percent": 70.0,
+        "input_health_score": 1.0,
+        "input_health_percent": 100.0,
+        "forecast_source_confidence": 0.7,
+        "forecast_source_percent": 70.0,
+        "limiting_factor": "forecast_sources",
+    }
+    assert attrs["source_confidence"][0]["reason"] == (
+        "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
+    )
+    assert attrs["improvement_actions"] == [
+        "Replace PV forecast (sensor.pv) with an entity that exposes forecast data for the planning horizon, "
+        "or add source confidence metadata."
+    ]
+
+
+def test_confidence_helper_edge_cases_are_readable() -> None:
+    assert sensor_module._confidence_health_score(InputHealth.DEGRADED) == 0.65
+    assert sensor_module._forecast_source_confidence(_coordinator(None)) is None
+
+    plan = _plan()
+    plan.confidence = 0.8
+    assert sensor_module._forecast_source_confidence(_coordinator(plan)) == 0.8
+    assert sensor_module._latest_forecast_snapshot(_coordinator(plan, store_data={"forecast_snapshots": "bad"})) == {}
+    assert (
+        sensor_module._confidence_sources(
+            _coordinator(plan, store_data={"forecast_snapshots": [{"plan_id": "plan-1", "confidence": {"sources": "bad"}}]})
+        )
+        == []
+    )
+    assert sensor_module._confidence_limiting_factor(0.0, 0.0, 0.0) == "unsafe_inputs"
+    assert sensor_module._confidence_limiting_factor(0.65, 0.65, None) == "input_health"
+    assert sensor_module._confidence_limiting_factor(1.0, 1.0, None) == "unknown"
+    assert sensor_module._confidence_limiting_factor(0.65, 0.65, 0.65) == "input_health_and_forecast_sources"
+    assert sensor_module._confidence_limiting_factor(0.65, 0.65, 0.9) == "input_health"
+    assert sensor_module._confidence_limiting_factor(0.8, 0.9, 0.7) == "unknown"
+    assert sensor_module._confidence_source_reason({"source": "invalid_state"}) == (
+        "The entity state could not be converted into usable forecast data."
+    )
+    assert sensor_module._confidence_source_reason({"source": "other"}) == "Confidence source was not classified."
+
+    assert sensor_module._confidence_improvement_actions(
+        0.4,
+        1.0,
+        0.4,
+        [{"input": "Load", "entity_id": "sensor.load", "source": "Invalid State", "confidence": 0.4}],
+        {},
+    ) == ["Fix Load (sensor.load) so it has a numeric usable state."]
+    assert sensor_module._confidence_improvement_actions(
+        0.5,
+        1.0,
+        0.5,
+        [{"input": "PV", "entity_id": "sensor.pv", "source": "Forecast Series", "confidence": 0.5}],
+        {},
+    ) == ["Improve PV (sensor.pv) source confidence or data quality."]
+    assert sensor_module._confidence_improvement_actions(
+        0.65,
+        0.65,
+        1.0,
+        [],
+        {"pv": {"issues": ["pv_forecast_entity_unavailable", "pv_forecast_entity_stale"]}},
+    ) == ["Resolve pv input issue(s): pv_forecast_entity_unavailable, pv_forecast_entity_stale."]
+    assert sensor_module._confidence_improvement_actions(0.8, 1.0, None, [], {}) == [
+        "Use forecast-capable entities with confidence metadata for price, PV, load, and weather inputs."
+    ]
+    assert sensor_module._confidence_improvement_actions(1.0, 1.0, 1.0, [], {}) == [
+        "Confidence is already at 100%; no action is needed."
+    ]
+
+
 def test_operational_summary_sensors_handle_edge_shapes() -> None:
     ready = _coordinator(
         _plan(),
