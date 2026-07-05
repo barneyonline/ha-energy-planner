@@ -157,7 +157,15 @@ def test_remaining_validation_and_small_helpers(monkeypatch: pytest.MonkeyPatch)
 
 def test_remaining_preflight_helpers() -> None:
     hass = SimpleNamespace(
-        states=States({"sensor.a": "unavailable", "sensor.b": "1"}),
+        states=States(
+            {
+                "sensor.a": "unavailable",
+                "sensor.b": "1",
+                "button.ev_start": "unknown",
+                "input_button.ev_stop": "unknown",
+                "button.ev_unavailable": "unavailable",
+            }
+        ),
         services=Services({("ok", "service")}),
         config=SimpleNamespace(components={"recorder"}),
         data={},
@@ -165,12 +173,15 @@ def test_remaining_preflight_helpers() -> None:
     entry_data = {
         "amber_import_price_entity": "sensor.a",
         "pv_forecast_entity": "sensor.missing",
+        "ev_smart_charging_start_entity": "button.ev_start",
+        "ev_smart_charging_stop_entity": "input_button.ev_stop",
+        "ev_unavailable_entity": "button.ev_unavailable",
         "person_entities": ["person.a", "bad"],
         "service_key": "badservice",
         "haeo_optimize_service": "ok.service",
     }
 
-    assert _entity_report(hass, entry_data)["unavailable"] == ["sensor.a"]
+    assert _entity_report(hass, entry_data)["unavailable"] == ["button.ev_unavailable", "sensor.a"]
     assert _service_report(hass, {"haeo_optimize_service": "ok.service", "ai_advisor_service": "badservice"})[
         "missing"
     ] == ["badservice"]

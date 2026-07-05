@@ -243,6 +243,24 @@ def test_run_preflight_reports_missing_configured_entities_and_services() -> Non
     assert "haeo.missing" in checks["configured_services_available"]["message"]
 
 
+def test_run_preflight_accepts_unknown_stateless_ev_buttons() -> None:
+    coordinator = _coordinator()
+    coordinator.entry.data["ev_smart_charging_start_entity"] = "button.ev_start"
+    coordinator.entry.data["ev_smart_charging_stop_entity"] = "button.ev_stop"
+    hass = FakeHass(coordinator)
+    hass.states.values["button.ev_start"] = "unknown"
+    hass.states.values["button.ev_stop"] = "unknown"
+    asyncio.run(async_setup(hass, {}))
+
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    response = asyncio.run(handler(FakeCall({})))
+
+    checks = {check["check"]: check for check in response["checks"]}
+    assert checks["configured_entities_available"]["ok"] is True
+    assert response["entities"]["unavailable"] == []
+    assert response["discovery"]["ev"]["supported"] is True
+
+
 def test_run_preflight_reports_production_gate_reasons() -> None:
     coordinator = _coordinator()
     coordinator.entry.options["ev_control_enabled"] = False

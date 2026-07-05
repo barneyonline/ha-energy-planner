@@ -168,7 +168,7 @@ def _entity_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str,
         state = hass.states.get(entity_id)
         if state is None:
             missing.append(entity_id)
-        elif str(getattr(state, "state", "")).lower() in {"unknown", "unavailable"}:
+        elif _entity_unavailable(entity_id, getattr(state, "state", "")):
             unavailable.append(entity_id)
     return {
         "configured": configured,
@@ -176,6 +176,15 @@ def _entity_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str,
         "unavailable": unavailable,
         "available_count": len(configured) - len(missing) - len(unavailable),
     }
+
+
+def _entity_unavailable(entity_id: str, state_value: Any) -> bool:
+    """Return true when a configured entity cannot be used for preflight."""
+    state = str(state_value or "").lower()
+    domain = entity_id.split(".", 1)[0]
+    if domain in {"button", "input_button"}:
+        return state == "unavailable"
+    return state in {"unknown", "unavailable"}
 
 
 def _service_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str, Any]:
