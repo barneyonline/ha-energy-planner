@@ -175,6 +175,24 @@ def test_latest_forecast_valid_at_reads_solcast_detailed_forecast() -> None:
     ) == datetime(2026, 6, 27, 13, 30, tzinfo=UTC)
 
 
+def test_latest_forecast_valid_at_skips_values_without_timestamps_and_normalizes_naive_time() -> None:
+    state = FakeState(
+        "0",
+        {
+            "forecast": [
+                1.0,
+                {"pv_estimate": 2.0},
+                {"period_start": "2026-06-27T10:00:00", "pv_estimate": 3.0},
+            ]
+        },
+    )
+
+    assert latest_forecast_valid_at_from_state(
+        state,
+        value_keys=("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
+    ) == datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+
+
 def test_forecast_series_converts_solcast_wh_energy_buckets_to_average_kw() -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
