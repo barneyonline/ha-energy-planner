@@ -42,7 +42,7 @@ from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import update_trip_history_from_values
-from .executor import Executor
+from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
@@ -65,7 +65,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.store = store
         self.overrides: list[Override] = _overrides_from_store(store.data, dt_util.utcnow())
         self.ready_by = str(self.options.get(CONF_DEFAULT_READY_BY, "07:00"))
-        self.executor = Executor(store, hass=hass, entry_data=self.entry_data, options=self.options)
+        self.executor = Executor(
+            store,
+            hass=hass,
+            entry_data=self.entry_data,
+            options=self.options,
+            notification_grace_until=dt_util.utcnow() + PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE,
+        )
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None

@@ -340,6 +340,48 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
     ]
 
 
+def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="test",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["input_health_unsafe", "haeo_service_failed:ServiceValidationError"],
+    )
+    store = FakeStore()
+    hass = FakeHass()
+    executor = Executor(store, hass=hass, notification_grace_until=now + timedelta(minutes=5))
+
+    asyncio.run(executor.async_notify_plan_fallback(plan, ["input_health_unsafe"]))
+
+    assert hass.services.calls == [
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_plan_unsafe"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_grid_limit_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+    ]
+
+
 def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() -> None:
     now = datetime.now(UTC)
     plan = EnergyPlan(

@@ -375,6 +375,8 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.store is store
     assert coordinator.ready_by == "06:30"
     assert coordinator.executor.entry_data == {"amber_import_price_entity": "sensor.import"}
+    assert coordinator.executor.notification_grace_until is not None
+    assert coordinator.executor.notification_grace_until > datetime.now(UTC)
     assert coordinator.planner_enabled is False
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1

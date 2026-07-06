@@ -43,6 +43,7 @@ _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _GRID_LIMIT_NOTIFICATION_ID,
     _HAEO_FALLBACK_NOTIFICATION_ID,
 )
+PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
 
 
 class Executor:
@@ -55,12 +56,14 @@ class Executor:
         hass: Any | None = None,
         entry_data: dict[str, Any] | None = None,
         options: dict[str, Any] | None = None,
+        notification_grace_until: datetime | None = None,
     ) -> None:
         """Initialize executor."""
         self.store = store
         self.hass = hass
         self.entry_data = entry_data or {}
         self.options = options or {}
+        self.notification_grace_until = notification_grace_until
 
     async def async_evaluate(self, plan: EnergyPlan, context: DecisionContext | None = None) -> None:
         """Audit why an action was not executed."""
@@ -333,6 +336,9 @@ class Executor:
             code for code in clean_violations if code in {"grid_import_limit_exceeded", "grid_export_limit_exceeded"}
         ]
         haeo_issues = _haeo_fallback_issues(plan.input_issues)
+        if self._in_notification_grace_period():
+            await self._async_dismiss_notifications(_PLAN_FALLBACK_NOTIFICATION_IDS)
+            return
         if plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN}:
             await self._async_dismiss_notifications(_PLAN_FALLBACK_NOTIFICATION_IDS)
             return
@@ -375,6 +381,10 @@ class Executor:
             )
         else:
             await self._async_dismiss_notification(_HAEO_FALLBACK_NOTIFICATION_ID)
+
+    def _in_notification_grace_period(self) -> bool:
+        """Return whether startup warm-up should suppress fallback notifications."""
+        return self.notification_grace_until is not None and dt_util.utcnow() < self.notification_grace_until
 
     async def _async_notify_restore(self, outcome: ActionOutcome) -> None:
         """Create a persistent notification for failsafe/manual restore."""
