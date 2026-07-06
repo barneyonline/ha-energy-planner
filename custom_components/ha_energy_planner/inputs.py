@@ -43,12 +43,16 @@ from .const import (
 )
 from .ev import summarize_stored_trip_history
 from .forecast_calibration import apply_forecast_calibration
-from .forecasts import forecast_series_from_state, normalize_scalar_value
+from .forecasts import forecast_series_from_state, latest_forecast_valid_at_from_state, normalize_scalar_value
 from .models import DecisionContext, DecisionSlot, HAEOStatus, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
     CONF_BASELINE_LOAD_FORECAST: "baseline_load_forecast_kw",
+}
+_FORECAST_VALUE_KEYS_BY_CONFIG = {
+    CONF_PV_FORECAST: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
+    CONF_BASELINE_LOAD_FORECAST: ("baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"),
 }
 _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_DAIKIN_POWER: ("power", "power"),
@@ -106,7 +110,7 @@ class InputManager:
         )
         pv_forecasts, pv_issue = self._required_series(
             CONF_PV_FORECAST,
-            ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
+            _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_PV_FORECAST],
             "power",
             now,
             horizon,
@@ -114,7 +118,7 @@ class InputManager:
         )
         baseline_loads, load_issue = self._required_series(
             CONF_BASELINE_LOAD_FORECAST,
-            ("baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"),
+            _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_BASELINE_LOAD_FORECAST],
             "power",
             now,
             horizon,
@@ -478,7 +482,11 @@ class InputManager:
         for key in (CONF_PV_FORECAST, CONF_BASELINE_LOAD_FORECAST):
             entity_id = self.entry_data.get(key)
             state = self._state(entity_id) if entity_id else None
-            if state and now - state.last_updated > forecast_timeout:
+            if state and now - state.last_updated > forecast_timeout and not _has_current_forecast_data(
+                state,
+                now,
+                _FORECAST_VALUE_KEYS_BY_CONFIG[key],
+            ):
                 issues.append(f"{key}_stale")
         return issues
 
@@ -646,6 +654,11 @@ def _combined_confidence(values: list[float]) -> float:
     if not values:
         return 1.0
     return round(min(values), 4)
+
+
+def _has_current_forecast_data(state: State, now: datetime, value_keys: tuple[str, ...]) -> bool:
+    latest_valid_at = latest_forecast_valid_at_from_state(state, value_keys=value_keys)
+    return latest_valid_at is not None and latest_valid_at >= now
 
 
 def _clamp_confidence(value: float) -> float:

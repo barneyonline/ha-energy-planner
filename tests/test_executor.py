@@ -391,6 +391,36 @@ def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() 
     ]
 
 
+def test_plan_fallback_notification_ignores_successful_haeo_call_reason() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["haeo_service_called"],
+    )
+    store = FakeStore()
+    hass = FakeHass()
+    executor = Executor(store, hass=hass)
+
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+
+    assert hass.services.calls[-1] == (
+        "persistent_notification",
+        "dismiss",
+        {"notification_id": "ha_energy_planner_haeo_fallback"},
+    )
+
+
 def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> None:
     now = datetime.now(UTC)
     plan = EnergyPlan(

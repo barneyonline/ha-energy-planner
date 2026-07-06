@@ -13,6 +13,7 @@ from custom_components.ha_energy_planner.forecasts import (
     _parse_datetime_or_none,
     constant_forecast,
     forecast_series_from_state,
+    latest_forecast_valid_at_from_state,
     normalize_scalar_value,
 )
 
@@ -154,6 +155,24 @@ def test_forecast_series_converts_solcast_energy_buckets_to_average_kw() -> None
     )
 
     assert series == [1.0, 1.0, 2.0, 2.0]
+
+
+def test_latest_forecast_valid_at_reads_solcast_detailed_forecast() -> None:
+    state = FakeState(
+        "3.0",
+        {
+            "unit_of_measurement": "kWh",
+            "detailedForecast": [
+                {"period_start": "2026-06-27T00:00:00+10:00", "pv_estimate": 0.5},
+                {"period_start": "2026-06-27T23:30:00+10:00", "pv_estimate": 0.0},
+            ],
+        },
+    )
+
+    assert latest_forecast_valid_at_from_state(
+        state,
+        value_keys=("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
+    ) == datetime(2026, 6, 27, 13, 30, tzinfo=UTC)
 
 
 def test_forecast_series_converts_solcast_wh_energy_buckets_to_average_kw() -> None:

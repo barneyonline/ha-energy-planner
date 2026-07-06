@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
@@ -94,6 +94,34 @@ def forecast_series_from_state(
         _value_for_slot(issued_at + timedelta(minutes=offset), timestamped)
         for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
+
+
+def latest_forecast_valid_at_from_state(
+    state: Any,
+    *,
+    value_keys: tuple[str, ...],
+) -> datetime | None:
+    """Return the latest timestamp found in a forecast payload."""
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    latest: datetime | None = None
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        flattened = _flatten_item(item)
+        valid_at = None
+        for key in _TIME_KEYS:
+            if key not in flattened:
+                continue
+            valid_at = _parse_datetime_or_none(flattened[key])
+            if valid_at is not None:
+                break
+        if valid_at is None:
+            continue
+        valid_at = _as_aware_utc(valid_at)
+        if latest is None or valid_at > latest:
+            latest = valid_at
+    return latest
 
 
 def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = "", unit: str = "") -> float:
@@ -371,3 +399,9 @@ def _parse_datetime_or_none(value: Any) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)

@@ -705,6 +705,43 @@ def test_input_manager_required_series_and_freshness_edge_cases() -> None:
     assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
 
 
+def test_input_manager_does_not_mark_timestamped_future_forecast_stale() -> None:
+    now = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+    options = {
+        **DEFAULT_OPTIONS,
+        "forecast_freshness_minutes": 60,
+    }
+    old_update = now - timedelta(hours=4)
+    manager = InputManager(
+        FakeHass(
+            {
+                "sensor.pv": FakeState(
+                    "3.0",
+                    {
+                        "unit_of_measurement": "kWh",
+                        "detailedForecast": [
+                            {"period_start": "2026-06-27T00:00:00+00:00", "pv_estimate": 0.5},
+                            {"period_start": "2026-06-27T23:30:00+00:00", "pv_estimate": 0.0},
+                        ],
+                    },
+                    last_updated=old_update,
+                ),
+                "sensor.load": FakeState("2.0", last_updated=old_update),
+            }
+        ),
+        {
+            CONF_PV_FORECAST: "sensor.pv",
+            CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        },
+        options,
+    )
+
+    issues = manager._freshness_issues(now)
+
+    assert "pv_forecast_entity_stale" not in issues
+    assert "baseline_load_forecast_entity_stale" in issues
+
+
 def test_input_manager_state_cache_and_small_helpers() -> None:
     hass = FakeHass({"sensor.value": FakeState("1", {"camelCase": 2})})
     manager = InputManager(hass, {}, DEFAULT_OPTIONS)

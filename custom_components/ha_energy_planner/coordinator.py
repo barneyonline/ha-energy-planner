@@ -228,15 +228,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         projections = await self.hass.async_add_executor_job(planner.project_flexible_loads, context)
         second_pass_result = None
         second_pass_evidence_counts: dict[str, int] = {}
-        if baseline_result.status == HAEOStatus.READY and projections:
+        if baseline_result.status != HAEOStatus.READY:
+            plan.input_issues.append(baseline_result.reason)
+        elif projections:
             second_pass_result = await haeo.async_solve_with_flexible_load(context, projections)
             if second_pass_result.status != HAEOStatus.READY:
                 context.haeo_status = second_pass_result.status
                 plan.input_issues.append(second_pass_result.reason)
             else:
                 second_pass_evidence_counts = apply_haeo_response_to_context(context, second_pass_result.response)
-        else:
-            plan.input_issues.append(baseline_result.reason)
         await self.store.async_add_haeo_run(
             {
                 "created_at": context.created_at,

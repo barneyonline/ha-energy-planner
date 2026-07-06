@@ -595,7 +595,11 @@ def _plan_fallback_message(plan: EnergyPlan, summary: str, reason_codes: list[st
 
 
 def _haeo_fallback_issues(issues: list[str]) -> list[str]:
-    return [code for code in _clean_reason_codes(issues) if code.startswith("haeo_") or "haeo" in code]
+    return [
+        code
+        for code in _clean_reason_codes(issues)
+        if code != "haeo_service_called" and (code.startswith("haeo_") or "haeo" in code)
+    ]
 
 
 def _clean_reason_codes(codes: list[str]) -> list[str]:
