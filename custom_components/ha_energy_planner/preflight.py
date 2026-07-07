@@ -97,7 +97,10 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             "message": (
                 "Production control is armed."
                 if production["armed"]
-                else "Production control has not been armed. Review preflight, then use Arm production control when ready."
+                else (
+                    "Production control has not been armed. Review preflight, then use Arm production control "
+                    "when ready."
+                )
             ),
         },
     ]

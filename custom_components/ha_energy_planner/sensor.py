@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
@@ -22,7 +23,7 @@ from .const import (
 )
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
-from .models import ActionAsset, EnergyPlan, InputHealth, PlanAction, to_jsonable
+from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -42,10 +43,10 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: "None"
         if not coordinator.data or not coordinator.data.next_action
-        else _display_state(coordinator.data.next_action.kind),
+        else _action_label(coordinator.data.next_action),
         attrs_fn=lambda coordinator: {}
         if not coordinator.data or not coordinator.data.next_action
-        else {"action": _compact_action(coordinator.data.next_action)},
+        else _plain_action(coordinator.data.next_action),
     ),
     PlannerSensorDescription(
         key="plan_status",
@@ -89,6 +90,30 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: _confidence_breakdown_state(coordinator),
         attrs_fn=lambda coordinator: _confidence_breakdown_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="decision_audit",
+        translation_key="decision_audit",
+        icon="mdi:clipboard-search-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _decision_audit_state(coordinator.data),
+        attrs_fn=lambda coordinator: _decision_audit_attrs(coordinator.data),
+    ),
+    PlannerSensorDescription(
+        key="rejected_actions",
+        translation_key="rejected_actions",
+        icon="mdi:clipboard-remove-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _rejected_actions_state(coordinator.data),
+        attrs_fn=lambda coordinator: _rejected_actions_attrs(coordinator.data),
+    ),
+    PlannerSensorDescription(
+        key="upcoming_timeline",
+        translation_key="upcoming_timeline",
+        icon="mdi:timeline-clock-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _upcoming_timeline_state(coordinator.data),
+        attrs_fn=lambda coordinator: _upcoming_timeline_attrs(coordinator.data),
     ),
     PlannerSensorDescription(
         key="production_readiness",
@@ -147,6 +172,14 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         attrs_fn=lambda coordinator: _asset_plan_attrs(coordinator.data, ActionAsset.DAIKIN),
     ),
     PlannerSensorDescription(
+        key="climate_decision",
+        translation_key="decision",
+        icon="mdi:thermostat-cog",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _device_decision_state(coordinator.data, ActionAsset.DAIKIN),
+        attrs_fn=lambda coordinator: _device_decision_attrs(coordinator.data, ActionAsset.DAIKIN),
+    ),
+    PlannerSensorDescription(
         key="climate_current_state",
         translation_key="current_state",
         icon="mdi:thermostat",
@@ -179,6 +212,14 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         attrs_fn=lambda coordinator: _asset_plan_attrs(coordinator.data, ActionAsset.ENPHASE),
     ),
     PlannerSensorDescription(
+        key="enphase_decision",
+        translation_key="decision",
+        icon="mdi:home-battery",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _device_decision_state(coordinator.data, ActionAsset.ENPHASE),
+        attrs_fn=lambda coordinator: _device_decision_attrs(coordinator.data, ActionAsset.ENPHASE),
+    ),
+    PlannerSensorDescription(
         key="enphase_current_state",
         translation_key="current_state",
         icon="mdi:home-battery-outline",
@@ -201,6 +242,14 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: _asset_plan_state(coordinator.data, ActionAsset.EV),
         attrs_fn=lambda coordinator: _ev_plan_attrs(coordinator.data, coordinator.store.data),
+    ),
+    PlannerSensorDescription(
+        key="ev_decision",
+        translation_key="decision",
+        icon="mdi:ev-station",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _device_decision_state(coordinator.data, ActionAsset.EV),
+        attrs_fn=lambda coordinator: _device_decision_attrs(coordinator.data, ActionAsset.EV),
     ),
     PlannerSensorDescription(
         key="ev_current_state",
@@ -281,7 +330,129 @@ def _asset_plan_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
     action = _first_asset_action(plan, asset)
     if action is None:
         return "Idle"
-    return _display_state(action.kind)
+    return _action_label(action)
+
+
+def _decision_audit_state(plan: EnergyPlan | None) -> str:
+    """Return concise decision audit state."""
+    if plan is None:
+        return "Unknown"
+    accepted = _accepted_decisions(plan)
+    return f"{len(accepted)} Accepted" if accepted else "No Actions"
+
+
+def _decision_audit_attrs(plan: EnergyPlan | None) -> dict[str, Any]:
+    """Return scored accepted decision evidence."""
+    if plan is None:
+        return {}
+    audit = dict(plan.decision_audit or {})
+    return {
+        "plan_id": plan.plan_id,
+        "summary": audit.get("summary"),
+        "policy_order": audit.get("policy_order", []),
+        "marginal_budget": _bounded_json(audit.get("marginal_budget", {})),
+        "accepted": _bounded_json(audit.get("accepted", [])),
+    }
+
+
+def _rejected_actions_state(plan: EnergyPlan | None) -> str:
+    """Return rejected decision count."""
+    if plan is None:
+        return "Unknown"
+    count = len(plan.rejected_actions or [])
+    return f"{count} Rejected" if count else "None"
+
+
+def _rejected_actions_attrs(plan: EnergyPlan | None) -> dict[str, Any]:
+    """Return rejected decision evidence."""
+    if plan is None:
+        return {}
+    return {
+        "plan_id": plan.plan_id,
+        "rejected": _bounded_json(plan.rejected_actions or []),
+    }
+
+
+def _upcoming_timeline_state(plan: EnergyPlan | None) -> str:
+    """Return upcoming timeline row count."""
+    if plan is None:
+        return "Unknown"
+    count = len(plan.timeline_card or [])
+    return f"{count} Upcoming" if count else "Idle"
+
+
+def _upcoming_timeline_attrs(plan: EnergyPlan | None) -> dict[str, Any]:
+    """Return dashboard-friendly timeline rows."""
+    if plan is None:
+        return {}
+    return {
+        "plan_id": plan.plan_id,
+        "rows": _bounded_json(plan.timeline_card or []),
+    }
+
+
+def _device_decision_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
+    """Return concise per-device decision state."""
+    if plan is None:
+        return "Unknown"
+    accepted = _accepted_decision_for_asset(plan, asset)
+    if accepted is not None:
+        return "Accepted"
+    rejected = _rejected_decision_for_asset(plan, asset)
+    return "Rejected" if rejected is not None else "Not Considered"
+
+
+def _device_decision_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, Any]:
+    """Return why a device decision was accepted or rejected."""
+    if plan is None:
+        return {}
+    accepted = _accepted_decision_for_asset(plan, asset)
+    rejected = _rejected_decision_for_asset(plan, asset)
+    return {
+        "plan_id": plan.plan_id,
+        "device": _asset_name(asset),
+        "accepted": _bounded_json(accepted or {}),
+        "rejected": _bounded_json(rejected or {}),
+        "summary": _device_decision_summary(asset, accepted, rejected),
+    }
+
+
+def _accepted_decisions(plan: EnergyPlan) -> list[dict[str, Any]]:
+    """Return accepted decision rows from the plan audit."""
+    accepted = dict(plan.decision_audit or {}).get("accepted", [])
+    return [dict(item) for item in accepted if isinstance(item, dict)] if isinstance(accepted, list) else []
+
+
+def _accepted_decision_for_asset(plan: EnergyPlan, asset: ActionAsset) -> dict[str, Any] | None:
+    """Return accepted decision for one asset."""
+    name = _asset_name(asset)
+    for item in _accepted_decisions(plan):
+        if item.get("device") == name:
+            return item
+    return None
+
+
+def _rejected_decision_for_asset(plan: EnergyPlan, asset: ActionAsset) -> dict[str, Any] | None:
+    """Return rejected decision for one asset."""
+    name = _asset_name(asset)
+    for item in plan.rejected_actions or []:
+        if isinstance(item, dict) and item.get("device") == name:
+            return dict(item)
+    return None
+
+
+def _device_decision_summary(
+    asset: ActionAsset,
+    accepted: dict[str, Any] | None,
+    rejected: dict[str, Any] | None,
+) -> str:
+    """Return plain-English per-device decision summary."""
+    name = _asset_name(asset)
+    if accepted:
+        return f"{name} action was selected because {accepted.get('reason', 'it had the highest score')}."
+    if rejected:
+        return str(rejected.get("reason") or f"{name} action was considered but not selected.")
+    return f"{name} was not considered in this planning run."
 
 
 def _asset_plan_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, Any]:
@@ -291,10 +462,10 @@ def _asset_plan_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, 
     actions = [action for action in plan.actions if action.asset == asset]
     device_plan = _device_plan_for_asset(plan, asset)
     timeline = device_plan.get("timeline", []) if isinstance(device_plan, dict) else []
-    return {
+    attrs = {
         "plan_id": plan.plan_id,
-        "mode": str(plan.mode),
-        "health": str(plan.health),
+        "mode": _display_state(plan.mode),
+        "health": _display_state(plan.health),
         "horizon_hours": device_plan.get("horizon_hours", plan.horizon_hours)
         if isinstance(device_plan, dict)
         else plan.horizon_hours,
@@ -310,18 +481,127 @@ def _asset_plan_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, 
         "total_estimated_battery_discharge_kwh": device_plan.get("total_estimated_battery_discharge_kwh")
         if isinstance(device_plan, dict)
         else None,
-        "current_state": device_plan.get("current_state") if isinstance(device_plan, dict) else None,
-        "current_state_label": device_plan.get("current_state_label") if isinstance(device_plan, dict) else None,
-        "next_planned_state": device_plan.get("next_planned_state") if isinstance(device_plan, dict) else None,
-        "next_planned_state_label": device_plan.get("next_planned_state_label")
-        if isinstance(device_plan, dict)
-        else None,
+        "summary": _asset_plan_summary(plan, asset, actions, timeline),
         "planned_action_count": len(actions),
-        "planned_actions": [_compact_action(action) for action in actions[:5]],
+        "planned_actions": [_plain_action(action) for action in actions[:5]],
         "timeline_segment_count": len(timeline) if isinstance(timeline, list) else 0,
-        "timeline": timeline if isinstance(timeline, list) else [],
-        "issues": _asset_issues(plan, asset)[:10],
+        "timeline_summary": _timeline_summary(timeline) if isinstance(timeline, list) else [],
+        "issues": [_plain_reason(issue) for issue in _asset_issues(plan, asset)[:10]],
     }
+    return {key: value for key, value in attrs.items() if value is not None}
+
+
+def _asset_plan_summary(
+    plan: EnergyPlan,
+    asset: ActionAsset,
+    actions: list[PlanAction],
+    timeline: Any,
+) -> str:
+    """Return a plain-English summary for an asset planning sensor."""
+    asset_name = _asset_name(asset)
+    if actions:
+        first_action = min(actions, key=lambda action: action.execute_not_before)
+        return (
+            f"{asset_name} has {len(actions)} planned action"
+            f"{'' if len(actions) == 1 else 's'}. Next: {_action_sentence(first_action)}"
+        )
+    if isinstance(timeline, list) and timeline:
+        return f"{asset_name} has no planned changes over the next {plan.horizon_hours:g} hours."
+    return f"{asset_name} has no timeline available for the current plan."
+
+
+def _timeline_summary(timeline: list[Any]) -> list[str]:
+    """Return readable timeline segment summaries."""
+    summaries: list[str] = []
+    for item in timeline[:12]:
+        if not isinstance(item, dict):
+            continue
+        label = _timeline_state_label(item)
+        start = _time_label(item.get("start"))
+        end = _time_label(item.get("end"))
+        reason = _reason_summary(item.get("reason_codes"))
+        period = f"{start}-{end}" if start and end else "Current period"
+        summaries.append(f"{period}: {label}{f' because {reason}' if reason else ''}.")
+    if len(timeline) > 12:
+        summaries.append(f"{len(timeline) - 12} more segment(s) omitted.")
+    return summaries
+
+
+def _plain_action(action: PlanAction) -> dict[str, Any]:
+    """Return action metadata in a user-readable shape."""
+    attrs = {
+        "action": _action_label(action),
+        "decision": _action_sentence(action),
+        "when": _action_window(action),
+        "why": _reason_summary(action.reason_codes),
+        "constraints": [_plain_reason(item) for item in action.hard_constraints[:8]],
+        "desired_state": _plain_state_details(action.desired_state),
+        "estimated_value": action.expected_cost_delta,
+        "confidence": None if action.confidence is None else f"{round(action.confidence * 100, 1)}%",
+        "requires_haeo_plan": bool(action.requires_haeo_plan_id),
+    }
+    return {key: value for key, value in attrs.items() if value not in (None, [], {})}
+
+
+def _plain_state_details(state: dict[str, Any]) -> dict[str, Any]:
+    """Return readable details for a current, planned, or desired state."""
+    details: dict[str, Any] = {}
+    for key, value in state.items():
+        if value is None:
+            continue
+        if key in {"reason_codes", "issues"} and isinstance(value, list):
+            details[_plain_key(key)] = [_plain_reason(item) for item in value]
+        elif key in {"state", "action", "hvac_mode", "arbitrage_direction", "arbitrage_source"}:
+            details[_plain_key(key)] = _display_state(value)
+        elif key in {"start", "end", "execute_not_before", "execute_not_after"}:
+            details[_plain_key(key)] = _time_label(value) or value
+        elif key == "allocated_slots" and isinstance(value, list):
+            details["Charging windows"] = len(value)
+        else:
+            details[_plain_key(key)] = _bounded_json(value)
+    return details
+
+
+def _action_sentence(action: PlanAction) -> str:
+    """Return a one-sentence explanation of a planned action."""
+    desired = action.desired_state
+    if action.kind == ActionKind.SET_PROFILE:
+        return f"Switch Enphase profile to {desired.get('profile', 'the selected profile')}."
+    if action.kind == ActionKind.RESTORE_AI:
+        return f"Restore Enphase to {desired.get('profile', 'the AI profile')}."
+    if action.kind == ActionKind.SET_HVAC:
+        mode = _display_state(desired.get("hvac_mode", "climate"))
+        target = desired.get("target_temperature")
+        if target is not None:
+            return f"Set climate to {mode} at {target} C."
+        return f"Set climate to {mode}."
+    if action.kind == ActionKind.EV_SCHEDULE:
+        target = desired.get("target_soc_percent")
+        ready_by = desired.get("ready_by")
+        target_text = f" to {target}%" if target is not None else ""
+        ready_text = f" by {ready_by}" if ready_by else ""
+        return f"Schedule EV charging{target_text}{ready_text}."
+    return _action_label(action)
+
+
+def _action_label(action: PlanAction) -> str:
+    """Return a short user-facing action label."""
+    labels = {
+        ActionKind.SET_PROFILE: "Switch Enphase profile",
+        ActionKind.RESTORE_AI: "Restore AI profile",
+        ActionKind.SET_HVAC: "Change climate state",
+        ActionKind.EV_START: "Start EV charging",
+        ActionKind.EV_STOP: "Stop EV charging",
+        ActionKind.EV_SCHEDULE: "Schedule EV charging",
+    }
+    return labels.get(action.kind, _display_state(action.kind))
+
+
+def _action_window(action: PlanAction) -> str:
+    """Return a concise action execution window."""
+    start = _time_label(action.execute_not_before)
+    end = _time_label(action.execute_not_after)
+    return f"{start}-{end}" if start and end else "Next planning window"
 
 
 def _asset_current_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
@@ -360,9 +640,10 @@ def _asset_state_attrs(plan: EnergyPlan | None, asset: ActionAsset, kind: str) -
         state = dict(device_plan["next_planned_state"])
     return {
         "plan_id": plan.plan_id,
-        "mode": str(plan.mode),
-        "health": str(plan.health),
-        "state": _bounded_json(state),
+        "mode": _display_state(plan.mode),
+        "health": _display_state(plan.health),
+        "summary": _asset_current_state(plan, asset) if kind == "current" else _asset_next_state(plan, asset),
+        "details": _plain_state_details(state),
         "source": "current_state" if kind == "current" else "next_planned_state",
     }
 
@@ -595,7 +876,6 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "suggested_precondition_lead_minutes": accepted.get("suggested_precondition_lead_minutes"),
         "suggested_forecast_buffer_percent": accepted.get("suggested_forecast_buffer_percent"),
         "suggested_takeover_savings_threshold": accepted.get("suggested_takeover_savings_threshold"),
-        "accepted": _bounded_json(accepted),
     }
 
 
@@ -645,6 +925,7 @@ def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "plan_id": coordinator.data.plan_id,
         "overall_confidence": coordinator.data.confidence,
         "calculation": calculation,
+        "subsystems": _bounded_json(coordinator.data.confidence_breakdown or {}),
         "health": str(coordinator.data.health),
         "breakdown": breakdown,
         "source_confidence": sources,
@@ -762,7 +1043,9 @@ def _confidence_improvement_actions(
             if issues:
                 actions.append(f"Resolve {name} input issue(s): {', '.join(str(issue) for issue in issues[:3])}.")
     if not actions and overall < 1.0:
-        actions.append("Use forecast-capable entities with confidence metadata for price, PV, load, and weather inputs.")
+        actions.append(
+            "Use forecast-capable entities with confidence metadata for price, PV, load, and weather inputs."
+        )
     if not actions:
         actions.append("Confidence is already at 100%; no action is needed.")
     return actions[:8]
@@ -977,22 +1260,104 @@ def _asset_issues(plan: EnergyPlan, asset: ActionAsset) -> list[str]:
     return [issue for issue in plan.input_issues if any(issue.startswith(prefix) for prefix in prefixes)]
 
 
-def _compact_action(action: PlanAction) -> dict[str, Any]:
-    """Return bounded action metadata suitable for entity attributes."""
-    return {
-        "action_id": action.action_id,
-        "plan_id": action.plan_id,
-        "asset": str(action.asset),
-        "kind": str(action.kind),
-        "execute_not_before": action.execute_not_before.isoformat(),
-        "execute_not_after": action.execute_not_after.isoformat(),
-        "desired_state": _bounded_json(action.desired_state),
-        "hard_constraints": action.hard_constraints[:8],
-        "reason_codes": action.reason_codes[:8],
-        "expected_cost_delta": action.expected_cost_delta,
-        "confidence": action.confidence,
-        "requires_haeo_plan_id": action.requires_haeo_plan_id,
+def _asset_name(asset: ActionAsset) -> str:
+    """Return a readable asset name."""
+    names = {
+        ActionAsset.DAIKIN: "Climate",
+        ActionAsset.ENPHASE: "Enphase",
+        ActionAsset.EV: "EV",
     }
+    return names.get(asset, _display_state(asset))
+
+
+def _reason_summary(reasons: Any) -> str:
+    """Return a readable reason summary from one or more reason codes."""
+    if isinstance(reasons, str):
+        reasons = [reasons]
+    if not isinstance(reasons, list):
+        return ""
+    readable = [_plain_reason(reason) for reason in reasons[:3]]
+    return "; ".join(reason for reason in readable if reason)
+
+
+def _plain_reason(value: Any) -> str:
+    """Return a plain-English explanation for an internal reason or issue code."""
+    text = str(value or "").strip()
+    labels = {
+        "away_hvac_policy": "Nobody is home, so climate control can be reduced.",
+        "occupied_comfort_within_bounds": "The home is occupied and temperature is already within the comfort range.",
+        "manual_hvac_override_inactive": "No manual climate override is active.",
+        "hvac_min_cycle": "The climate minimum cycle time is being respected.",
+        "hvac_precondition_before_expensive_period": "Preconditioning before a more expensive electricity period.",
+        "hvac_thermal_shift_before_expensive_period": (
+            "Heating or cooling now because electricity is cheap and the home can coast through a later "
+            "expensive period."
+        ),
+        "enphase_price_spread_above_threshold": "The forecast price spread is above the Enphase savings threshold.",
+        "enphase_haeo_export_value_above_threshold": "HAEO expects export value above the Enphase savings threshold.",
+        "enphase_haeo_battery_arbitrage_value_above_threshold": (
+            "HAEO expects battery arbitrage value above the Enphase savings threshold."
+        ),
+        "enphase_forecast_solar_export_value_above_threshold": (
+            "Forecast solar surplus value is above the Enphase savings threshold."
+        ),
+        "enphase_insufficient_arbitrage_evidence_below_threshold": (
+            "There is not enough forecast battery or solar value to justify Enphase profile ownership."
+        ),
+        "enphase_arbitrage_below_threshold": "The expected Enphase value is below the configured savings threshold.",
+        "ev_soc_below_target": "The EV battery is below the target state of charge.",
+        "least_cost_slots_before_ready_by": "Charging was placed in the cheapest slots before the ready-by time.",
+        "least_cost_solar_aware_slots_before_ready_by": (
+            "Charging was placed in the lowest effective-cost slots, including forecast solar surplus."
+        ),
+        "configured_target": "The configured EV target state of charge is being used.",
+        "history_max_daily_consumption": "Trip history raised the EV target to cover recent driving.",
+        "battery_floor": "The battery reserve limit must be respected.",
+        "enphase_min_savings": "The Enphase savings threshold must be met.",
+        "enphase_profile_hold": "The Enphase profile hold period must be respected.",
+        "ev_min_soc": "The EV minimum state of charge must be respected.",
+        "ready_by": "The EV ready-by time must be respected.",
+        "comfort": "The climate comfort range must be respected.",
+    }
+    if text in labels:
+        return labels[text]
+    return _display_state(text)
+
+
+def _plain_key(value: Any) -> str:
+    """Return a readable attribute key."""
+    labels = {
+        "reason_codes": "Reasons",
+        "hvac_mode": "Climate mode",
+        "target_temperature": "Target temperature C",
+        "current_temperature": "Current temperature C",
+        "current_power_kw": "Current power kW",
+        "outdoor_temperature": "Outdoor temperature C",
+        "occupied_temperature_low": "Comfort low C",
+        "occupied_temperature_high": "Comfort high C",
+        "target_soc_percent": "Target SOC percent",
+        "ready_by": "Ready by",
+        "arbitrage_value": "Estimated value",
+        "arbitrage_source": "Value source",
+        "arbitrage_direction": "Battery strategy",
+        "execute_not_before": "Start",
+        "execute_not_after": "End",
+    }
+    text = str(value)
+    return labels.get(text, _display_state(text))
+
+
+def _time_label(value: Any) -> str | None:
+    """Return a readable local time label for an ISO timestamp or datetime."""
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.strftime("%H:%M")
 
 
 def _display_state(value: Any) -> str:
@@ -1003,7 +1368,7 @@ def _display_state(value: Any) -> str:
     words = []
     for word in text.split():
         upper = word.upper()
-        words.append(upper if upper in {"AI", "EV", "HVAC", "SOC"} else word.capitalize())
+        words.append(upper if upper in {"AI", "EV", "HVAC", "PV", "SOC"} else word.capitalize())
     return " ".join(words)
 
 

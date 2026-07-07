@@ -241,6 +241,10 @@ class EnergyPlan:
     preview: list[dict[str, Any]]
     input_issues: list[str] = field(default_factory=list)
     device_plans: dict[str, Any] = field(default_factory=dict)
+    decision_audit: dict[str, Any] = field(default_factory=dict)
+    rejected_actions: list[dict[str, Any]] = field(default_factory=list)
+    timeline_card: list[dict[str, Any]] = field(default_factory=list)
+    confidence_breakdown: dict[str, Any] = field(default_factory=dict)
 
     @property
     def next_action(self) -> PlanAction | None:

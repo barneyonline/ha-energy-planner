@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from custom_components.ha_energy_planner import executor as executor_module
@@ -60,6 +61,9 @@ class FakeStore:
 
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         self.data["command_rate_limits"] = limits
+
+    async def async_save_control_pause(self, pause: dict[str, Any]) -> None:
+        self.data["control_pause"] = pause
 
     async def async_clear_ownership(self) -> None:
         self.data["ownership"] = {}
@@ -608,6 +612,355 @@ def test_executor_rate_limits_repeated_device_command() -> None:
     assert store.data["outcomes"][0].reason == "device_command_rate_limited"
     assert hass.services.calls == []
     assert hass.states.values["input_boolean.ev_start"] == "off"
+
+
+def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    store = FakeStore()
+    store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "ev",
+            "result": "applied",
+            "post_state": {"input_boolean.ev_start": "on"},
+        }
+    ]
+    executor = Executor(
+        store,
+        hass=FakeHass({"input_boolean.ev_start": "off"}),
+        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+    )
+
+    assert executor._observed_conflict_reason(action, now) == "external_ev_charging_conflict"
+    asyncio.run(
+        executor._async_pause_asset_control(
+            ActionAsset.EV,
+            now,
+            "external_ev_charging_conflict",
+            timedelta(minutes=2),
+        )
+    )
+    assert store.data["control_pause"]["assets"] == ["ev"]
+    assert store.data["control_pause"]["reason"] == "external_ev_charging_conflict"
+
+
+def test_executor_detects_recent_enphase_external_conflict() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="enphase",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.ENPHASE,
+        kind=ActionKind.SET_PROFILE,
+        desired_state={"profile": "Self-Consumption"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=1.0,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    store = FakeStore()
+    store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "enphase",
+            "result": "applied",
+            "post_state": {"profile": "Self-Consumption"},
+        }
+    ]
+    executor = Executor(
+        store,
+        hass=FakeHass({"input_select.enphase_profile": "AI Optimisation"}),
+        entry_data={
+            CONF_ENPHASE_PROFILE: "input_select.enphase_profile",
+            CONF_ENPHASE_PROFILE_CONTROL_SERVICE: "input_select.select_option",
+        },
+    )
+
+    assert executor._observed_conflict_reason(action, now) == "external_enphase_profile_conflict"
+
+
+def test_executor_conflict_helpers_cover_defensive_branches() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now,
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    store_without_pause_method = SimpleNamespace(data={})
+    asyncio.run(
+        Executor(store_without_pause_method)._async_pause_asset_control(
+            ActionAsset.EV,
+            now,
+            "pause_reason",
+            timedelta(minutes=1),
+        )
+    )
+    assert store_without_pause_method.data["control_pause"]["reason"] == "pause_reason"
+
+    assert executor_module._entity_id_from_service_target(None) is None
+    assert executor_module._latest_applied_audit_for_asset("bad", ActionAsset.EV, now) is None
+    assert (
+        executor_module._latest_applied_audit_for_asset(
+            [
+                "bad",
+                {"asset": "climate", "result": "applied", "attempted_at": now.isoformat()},
+                {"asset": "ev", "result": "rejected", "attempted_at": now.isoformat()},
+                {"asset": "ev", "result": "applied", "attempted_at": "not-a-date"},
+                {
+                    "asset": "ev",
+                    "result": "applied",
+                    "attempted_at": (now - timedelta(minutes=10)).isoformat(),
+                },
+            ],
+            ActionAsset.EV,
+            now,
+        )
+        is None
+    )
+
+    no_target = Executor(FakeStore(), hass=FakeHass({"input_boolean.ev_start": "off"}), entry_data={})
+    no_target.store.data["execution_audit"] = [
+        {"attempted_at": now.isoformat(), "asset": "ev", "result": "applied", "post_state": {}}
+    ]
+    assert no_target._observed_conflict_reason(action, now) is None
+    no_state = Executor(
+        FakeStore(),
+        hass=FakeHass({}),
+        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+    )
+    no_state.store.data["execution_audit"] = [
+        {"attempted_at": now.isoformat(), "asset": "ev", "result": "applied", "post_state": {}}
+    ]
+    assert no_state._observed_conflict_reason(action, now) is None
+    no_conflict = Executor(
+        FakeStore(),
+        hass=FakeHass({"input_boolean.ev_start": "on"}),
+        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+    )
+    no_conflict.store.data["execution_audit"] = [
+        {"attempted_at": now.isoformat(), "asset": "ev", "result": "applied", "post_state": {}}
+    ]
+    assert no_conflict._observed_conflict_reason(action, now) is None
+
+
+def test_executor_rejects_and_pauses_on_observed_conflict() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "ev",
+            "result": "applied",
+            "post_state": {"input_boolean.ev_start": "on"},
+        }
+    ]
+    hass = FakeHass({"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"})
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+    )
+
+    asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+    assert store.data["outcomes"][0].result == "rejected"
+    assert store.data["outcomes"][0].reason == "external_ev_charging_conflict"
+    assert store.data["control_pause"]["assets"] == ["ev"]
+
+
+def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
+    now = datetime.now(UTC)
+
+    class FailedEVAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_execute(self, action: Any) -> Any:
+            return SimpleNamespace(applied=False, reason="ev_failed", pre_state={}, post_state={})
+
+    class FailedHVACAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_execute(self, action: Any) -> Any:
+            return SimpleNamespace(
+                applied=False,
+                reason="hvac_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+            )
+
+    class FailedEnphaseAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_execute(self, action: Any) -> Any:
+            return SimpleNamespace(
+                applied=False,
+                reason="enphase_failed",
+                pre_state={},
+                post_state={},
+                saved_profile=None,
+                changed_profile_at=False,
+            )
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedEVAdapter)
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedHVACAdapter)
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FailedEnphaseAdapter)
+
+    class SupportedDiscovery:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def inspect(self) -> SupportedDiscovery:
+            return self
+
+        def for_asset(self, asset: Any) -> Any:
+            return SimpleNamespace(supported=True, issues=[])
+
+    monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
+
+    cases = [
+        (
+            PlanAction(
+                "ev",
+                "plan-1",
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+                ActionAsset.EV,
+                ActionKind.EV_START,
+                {},
+                [],
+                [],
+                None,
+                1.0,
+                None,
+            ),
+            {
+                "ev_smart_charging_start_entity": "input_boolean.ev_start",
+                "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            },
+            {"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"},
+            "ev_failed",
+        ),
+        (
+            PlanAction(
+                "climate",
+                "plan-1",
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+                ActionAsset.DAIKIN,
+                ActionKind.SET_HVAC,
+                {"hvac_mode": "off"},
+                [],
+                [],
+                None,
+                1.0,
+                None,
+            ),
+            {"daikin_climate_entity": "climate.daikin"},
+            {"climate.daikin": "heat"},
+            "hvac_failed",
+        ),
+        (
+            PlanAction(
+                "enphase",
+                "plan-1",
+                now - timedelta(minutes=1),
+                now + timedelta(minutes=1),
+                ActionAsset.ENPHASE,
+                ActionKind.SET_PROFILE,
+                {"profile": "Self-Consumption"},
+                [],
+                [],
+                1.0,
+                1.0,
+                None,
+            ),
+            {
+                "enphase_profile_entity": "input_select.enphase",
+                "enphase_profile_control_service": "input_select.select_option",
+            },
+            {"input_select.enphase": "AI Optimisation"},
+            "enphase_failed",
+        ),
+    ]
+    for action, entry_data, states, reason in cases:
+        store = FakeStore()
+        plan = EnergyPlan(
+            "plan-1",
+            now,
+            24,
+            5,
+            "current",
+            InputHealth.HEALTHY,
+            PlannerMode.ACTIVE_HEALTHY,
+            "test",
+            1.0,
+            None,
+            [action],
+            [],
+        )
+        asyncio.run(Executor(store, hass=FakeHass(states), entry_data=entry_data).async_evaluate(plan, _context(now)))
+        assert store.data["control_pause"]["reason"] == reason
+        assert store.data["outcomes"][0].result == "failed"
 
 
 def test_executor_rejects_active_command_when_production_gate_not_armed() -> None:

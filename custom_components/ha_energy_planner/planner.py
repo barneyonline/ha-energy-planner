@@ -4,11 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import time, timedelta
-from math import isfinite
+from math import ceil, isfinite
 from typing import Any
 
 from .const import (
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+    CONF_BATTERY_USABLE_CAPACITY_KWH,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
@@ -20,10 +24,17 @@ from .const import (
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
+    CONF_MIN_CLIMATE_CONFIDENCE,
+    CONF_MIN_ENPHASE_CONFIDENCE,
+    CONF_MIN_EV_CONFIDENCE,
+    CONF_MIN_LOAD_CONFIDENCE,
+    CONF_MIN_SOLAR_CONFIDENCE,
+    CONF_MIN_TARIFF_CONFIDENCE,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
+    CONF_PRIORITY_WEIGHTS,
 )
 from .ev import EVTripSummary, allocate_least_cost_charging, calculate_ev_target
 from .models import (
@@ -37,9 +48,15 @@ from .models import (
     PlanAction,
     PlannerMode,
 )
-from .thermal_model import thermal_hvac_load_kw, thermal_model_summary
+from .thermal_model import (
+    thermal_active_temperature_rate_c_per_hour,
+    thermal_hvac_load_kw,
+    thermal_model_summary,
+)
 
 HVAC_PRECONDITION_PROJECTED_LOAD_KW = 1.0
+THERMAL_SHIFT_MIN_TARGET_DELTA_C = 0.3
+THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR = 0.5
 
 
 class DryRunPlanner:
@@ -58,6 +75,10 @@ class DryRunPlanner:
         preview = self._preview(context)
         estimated_cost = self._estimate_cost(context)
         device_plans = self._device_plans(context, actions)
+        confidence_breakdown = _confidence_breakdown(context, actions)
+        decision_audit = _decision_audit(context, actions, self.options)
+        rejected_actions = _rejected_actions(context, actions, self.options, self.thermal_model)
+        timeline_card = _timeline_card_rows(device_plans)
 
         summary = "Planner disabled"
         if mode == PlannerMode.DRY_RUN:
@@ -82,6 +103,10 @@ class DryRunPlanner:
             preview=preview,
             input_issues=context.input_issues,
             device_plans=device_plans,
+            decision_audit=decision_audit,
+            rejected_actions=rejected_actions,
+            timeline_card=timeline_card,
+            confidence_breakdown=confidence_breakdown,
         )
 
     def _mode(self, context: DecisionContext) -> PlannerMode:
@@ -140,9 +165,6 @@ class DryRunPlanner:
                 hvac_action = self._hvac_preconditioning_action(context, execute_not_before, execute_not_after)
             if hvac_action is not None:
                 actions.append(hvac_action)
-        enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
-        if enphase_action is not None:
-            actions.append(enphase_action)
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         if context.ev_connected is not False and context.current_ev_soc_percent is not None:
             ready_by_text = context.ev_ready_by or str(self.options[CONF_DEFAULT_READY_BY])
@@ -170,55 +192,63 @@ class DryRunPlanner:
                 charge_rate_percent_per_hour=charge_rate_kw * soc_per_kwh,
             )
             if target.required_charge_percent <= 0:
-                return actions
-            schedule = allocate_least_cost_charging(
-                context.slots,
-                current_soc_percent=context.current_ev_soc_percent,
-                target_soc_percent=target.target_soc_percent,
-                ready_by=ready_by,
-                charge_rate_kw=charge_rate_kw,
-                soc_per_kwh=soc_per_kwh,
-                interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
-            )
-            allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
-            for slot in context.slots:
-                if slot.valid_at in allocation_by_time:
-                    slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
-            actions.append(
-                PlanAction(
-                    action_id=f"{context.plan_id}-ev-minimum-soc",
-                    plan_id=context.plan_id,
-                    execute_not_before=execute_not_before,
-                    execute_not_after=execute_not_after,
-                    asset=ActionAsset.EV,
-                    kind=ActionKind.EV_SCHEDULE,
-                    desired_state={
-                        "target_soc_percent": schedule.scheduled_soc_percent,
-                        "ready_by": ready_by_text,
-                        "configured_target_soc_percent": target_soc,
-                        "required_charge_percent": target.required_charge_percent,
-                        "max_attainable_soc_percent": target.max_attainable_soc_percent,
-                        "trip_history_observed_days": context.ev_trip_observed_days,
-                        "trip_history_sufficient": context.ev_trip_history_sufficient,
-                        "allocated_slots": [
-                            {
-                                "valid_at": allocation.valid_at.isoformat(),
-                                "charge_kw": allocation.charge_kw,
-                                "added_soc_percent": allocation.added_soc_percent,
-                                "import_price": allocation.import_price,
-                            }
-                            for allocation in schedule.allocations
-                        ],
-                        "infeasible": schedule.infeasible,
-                    },
-                    hard_constraints=["ev_min_soc", "ready_by"],
-                    reason_codes=["ev_soc_below_target", target.reason, schedule.reason],
-                    expected_cost_delta=None,
-                    confidence=confidence_from_context(context),
-                    requires_haeo_plan_id=context.plan_id,
+                target = None
+            if target is not None:
+                schedule = allocate_least_cost_charging(
+                    context.slots,
+                    current_soc_percent=context.current_ev_soc_percent,
+                    target_soc_percent=target.target_soc_percent,
+                    ready_by=ready_by,
+                    charge_rate_kw=charge_rate_kw,
+                    soc_per_kwh=soc_per_kwh,
+                    interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
                 )
-            )
-        return actions
+                allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
+                for slot in context.slots:
+                    if slot.valid_at in allocation_by_time:
+                        slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
+                actions.append(
+                    PlanAction(
+                        action_id=f"{context.plan_id}-ev-minimum-soc",
+                        plan_id=context.plan_id,
+                        execute_not_before=execute_not_before,
+                        execute_not_after=execute_not_after,
+                        asset=ActionAsset.EV,
+                        kind=ActionKind.EV_SCHEDULE,
+                        desired_state={
+                            "target_soc_percent": schedule.scheduled_soc_percent,
+                            "ready_by": ready_by_text,
+                            "configured_target_soc_percent": target_soc,
+                            "required_charge_percent": target.required_charge_percent,
+                            "max_attainable_soc_percent": target.max_attainable_soc_percent,
+                            "trip_history_observed_days": context.ev_trip_observed_days,
+                            "trip_history_sufficient": context.ev_trip_history_sufficient,
+                            "allocated_slots": [
+                                {
+                                    "valid_at": allocation.valid_at.isoformat(),
+                                    "charge_kw": allocation.charge_kw,
+                                    "added_soc_percent": allocation.added_soc_percent,
+                                    "import_price": allocation.import_price,
+                                    "effective_price": allocation.effective_price,
+                                    "solar_surplus_used_kw": allocation.solar_surplus_used_kw,
+                                    "grid_import_used_kw": allocation.grid_import_used_kw,
+                                }
+                                for allocation in schedule.allocations
+                            ],
+                            "infeasible": schedule.infeasible,
+                        },
+                        hard_constraints=["ev_min_soc", "ready_by"],
+                        reason_codes=["ev_soc_below_target", target.reason, schedule.reason],
+                        expected_cost_delta=None,
+                        confidence=confidence_from_context(context),
+                        requires_haeo_plan_id=context.plan_id,
+                    )
+                )
+        enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
+        if enphase_action is not None:
+            actions.append(enphase_action)
+        actions = [action for action in actions if _action_meets_confidence_threshold(action, context, self.options)]
+        return sorted(actions, key=lambda action: _action_score(action, context, self.options)["score"], reverse=True)
 
     def _enphase_action(
         self,
@@ -226,7 +256,7 @@ class DryRunPlanner:
         execute_not_before: Any,
         execute_not_after: Any,
     ) -> PlanAction | None:
-        arbitrage = _arbitrage_value(context, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        arbitrage = _arbitrage_value(context, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]), self.options)
         value = arbitrage["value"]
         min_savings = float(self.options[CONF_ENPHASE_MIN_SAVINGS])
         current_profile = context.current_enphase_profile
@@ -245,6 +275,7 @@ class DryRunPlanner:
                     "arbitrage_value": round(value, 4),
                     "arbitrage_source": arbitrage["source"],
                     "arbitrage_direction": arbitrage["direction"],
+                    "arbitrage_details": arbitrage.get("details", {}),
                 },
                 hard_constraints=["battery_floor", "enphase_min_savings", "enphase_profile_hold"],
                 reason_codes=[f"enphase_{arbitrage['source']}_above_threshold"],
@@ -265,6 +296,7 @@ class DryRunPlanner:
                     "arbitrage_value": round(value, 4),
                     "arbitrage_source": arbitrage["source"],
                     "arbitrage_direction": arbitrage["direction"],
+                    "arbitrage_details": arbitrage.get("details", {}),
                 },
                 hard_constraints=["restore_ai_when_takeover_not_justified"],
                 reason_codes=[f"enphase_{arbitrage['source']}_below_threshold"],
@@ -340,25 +372,56 @@ class DryRunPlanner:
         if delta < threshold:
             return None
 
-        target: float | None = None
-        mode: str | None = None
+        reason_code = "hvac_precondition_before_expensive_period"
+        desired_extra: dict[str, Any] = {}
         current_temperature = float(context.current_hvac_temperature_c)
         low = float(context.occupied_temperature_low_c)
         high = float(context.occupied_temperature_high_c)
+        target: float | None = None
+        mode: str | None = None
         if current_temperature < low:
             target = low
             mode = "heat"
         elif current_temperature > high:
             target = high
             mode = "cool"
-        if target is None or mode is None:
-            return None
+        else:
+            shift = _thermal_shift_target(
+                context,
+                future_peak_slot,
+                interval_minutes,
+                self.thermal_model,
+            )
+            if shift is None:
+                return None
+            target = shift["target_temperature"]
+            mode = shift["hvac_mode"]
+            reason_code = "hvac_thermal_shift_before_expensive_period"
+            desired_extra.update(shift)
 
         projected_load_kw = thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW)
         thermal_summary = thermal_model_summary(self.thermal_model)
-        for slot in context.slots[: context.slots.index(future_peak_slot)]:
+        precondition_slots = _precondition_slot_count(
+            current_temperature=current_temperature,
+            target_temperature=float(target),
+            mode=str(mode),
+            interval_minutes=interval_minutes,
+            max_slots=context.slots.index(future_peak_slot),
+            thermal_model=self.thermal_model,
+        )
+        for slot in context.slots[:precondition_slots]:
             slot.projected_hvac_load_kw = max(slot.projected_hvac_load_kw, projected_load_kw)
 
+        desired_extra.update(
+            {
+                "thermal_model_enabled": thermal_summary["enabled"],
+                "thermal_model_sample_count": thermal_summary["active_sample_count"],
+                "active_heat_rate_c_per_hour": thermal_summary["active_heat_rate_c_per_hour"],
+                "active_cool_rate_c_per_hour": thermal_summary["active_cool_rate_c_per_hour"],
+                "passive_indoor_drift_c_per_hour": thermal_summary["passive_indoor_drift_c_per_hour"],
+                "precondition_slot_count": precondition_slots,
+            }
+        )
         return PlanAction(
             action_id=f"{context.plan_id}-hvac-precondition-before-expensive-period",
             plan_id=context.plan_id,
@@ -373,15 +436,14 @@ class DryRunPlanner:
                 "current_import_price": round(float(current_price), 4),
                 "future_peak_import_price": round(float(future_peak_slot.import_price), 4),
                 "projected_hvac_load_kw": projected_load_kw,
-                "thermal_model_enabled": thermal_summary["enabled"],
-                "thermal_model_sample_count": thermal_summary["active_sample_count"],
+                **desired_extra,
             },
             hard_constraints=[
                 "occupied_comfort_within_bounds",
                 "manual_hvac_override_inactive",
                 "hvac_min_cycle",
             ],
-            reason_codes=["hvac_precondition_before_expensive_period"],
+            reason_codes=[reason_code],
             expected_cost_delta=round(delta, 4),
             confidence=confidence_from_context(context),
             requires_haeo_plan_id=None,
@@ -424,6 +486,7 @@ class DryRunPlanner:
         """Return compact 24-hour device timelines for entity attributes."""
         interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         climate_actions = [action for action in actions if action.asset == ActionAsset.DAIKIN]
+        enphase_actions = [action for action in actions if action.asset == ActionAsset.ENPHASE]
         climate_plan = _device_plan(
             context,
             interval_minutes,
@@ -431,14 +494,16 @@ class DryRunPlanner:
             climate_actions,
         )
         climate_plan.update(_climate_plan_summary(context, climate_actions))
+        enphase_plan = _device_plan(
+            context,
+            interval_minutes,
+            _enphase_timeline_entry,
+            enphase_actions,
+        )
+        enphase_plan.update(_enphase_plan_summary(context, enphase_actions))
         return {
             "climate": climate_plan,
-            "enphase": _device_plan(
-                context,
-                interval_minutes,
-                _enphase_timeline_entry,
-                [action for action in actions if action.asset == ActionAsset.ENPHASE],
-            ),
+            "enphase": enphase_plan,
             "ev": _device_plan(
                 context,
                 interval_minutes,
@@ -460,6 +525,469 @@ def confidence_from_health(input_health: InputHealth) -> float:
 def confidence_from_context(context: DecisionContext) -> float:
     """Return confidence scalar capped by health and forecast/source confidence."""
     return round(min(confidence_from_health(context.input_health), context.forecast_confidence), 4)
+
+
+def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
+    """Return confidence by planning subsystem."""
+    base = confidence_from_context(context)
+    issue_text = " ".join(context.input_issues)
+    breakdown = {
+        "overall": base,
+        "tariff": _subsystem_confidence(base, issue_text, ("amber_", "price_")),
+        "solar": _subsystem_confidence(base, issue_text, ("pv_forecast", "solar")),
+        "load": _subsystem_confidence(base, issue_text, ("baseline_load", "load_forecast")),
+        "climate": _subsystem_confidence(base, issue_text, ("daikin_", "climate_", "weather_")),
+        "ev": _subsystem_confidence(base, issue_text, ("ev_",)),
+        "enphase": _subsystem_confidence(base, issue_text, ("enphase_", "battery_soc")),
+    }
+    assets_with_actions = {str(action.asset) for action in actions}
+    return {
+        **breakdown,
+        "action_assets": sorted(assets_with_actions),
+        "limited_by": min(breakdown, key=lambda key: breakdown[key]),
+    }
+
+
+def _subsystem_confidence(base: float, issue_text: str, issue_markers: tuple[str, ...]) -> float:
+    """Return confidence reduced when a subsystem has matching input issues."""
+    if any(marker in issue_text for marker in issue_markers):
+        return round(min(base, 0.4), 4)
+    return base
+
+
+def _action_meets_confidence_threshold(
+    action: PlanAction,
+    context: DecisionContext,
+    options: Mapping[str, Any],
+) -> bool:
+    """Return whether an action clears tariff and device confidence thresholds."""
+    breakdown = _confidence_breakdown(context, [action])
+    checks = [("tariff", CONF_MIN_TARIFF_CONFIDENCE)]
+    if action.asset == ActionAsset.DAIKIN:
+        checks.extend([("climate", CONF_MIN_CLIMATE_CONFIDENCE), ("load", CONF_MIN_LOAD_CONFIDENCE)])
+    elif action.asset == ActionAsset.EV:
+        checks.extend([("ev", CONF_MIN_EV_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
+    elif action.asset == ActionAsset.ENPHASE:
+        checks.extend([("enphase", CONF_MIN_ENPHASE_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
+    for key, option in checks:
+        threshold = float(options.get(option, 0.0) or 0.0) / 100.0
+        if float(breakdown.get(key, 0.0) or 0.0) < threshold:
+            return False
+    return True
+
+
+def _confidence_rejection_reason(
+    asset: ActionAsset,
+    context: DecisionContext,
+    options: Mapping[str, Any],
+) -> str | None:
+    """Return a plain-English confidence rejection reason for an asset."""
+    fake_action = PlanAction(
+        action_id="confidence-check",
+        plan_id=context.plan_id,
+        execute_not_before=context.created_at,
+        execute_not_after=context.created_at,
+        asset=asset,
+        kind=ActionKind.SET_HVAC if asset == ActionAsset.DAIKIN else ActionKind.EV_SCHEDULE,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=confidence_from_context(context),
+        requires_haeo_plan_id=None,
+    )
+    if _action_meets_confidence_threshold(fake_action, context, options):
+        return None
+    breakdown = _confidence_breakdown(context, [])
+    return (
+        "Skipped because tariff or device confidence is below the configured threshold. "
+        f"Current confidence: {round(float(breakdown.get('overall', 0.0)) * 100, 1)}%."
+    )
+
+
+def _decision_audit(
+    context: DecisionContext,
+    actions: list[PlanAction],
+    options: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return scored decision evidence for accepted actions."""
+    scored = [_action_score(action, context, options) for action in actions]
+    return {
+        "summary": _decision_summary(scored),
+        "accepted": scored,
+        "policy_order": _priority_order(options),
+        "marginal_budget": _marginal_budget_summary(context, options),
+    }
+
+
+def _decision_summary(scored: list[dict[str, Any]]) -> str:
+    """Return a compact plain-English decision summary."""
+    if not scored:
+        return "No device changes were selected for this planning run."
+    first = scored[0]
+    return (
+        f"Selected {len(scored)} action(s). Highest priority is {first['device']} "
+        f"because {first['reason']}."
+    )
+
+
+def _action_score(action: PlanAction, context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
+    """Return weighted priority score for one action."""
+    components = _score_components(action, context)
+    weights = _priority_weights(options)
+    weighted = {key: round(components.get(key, 0.0) * weight, 4) for key, weight in weights.items()}
+    score = round(sum(weighted.values()), 4)
+    return {
+        "action_id": action.action_id,
+        "device": _asset_label(action.asset),
+        "action": _display_text(action.kind),
+        "score": score,
+        "components": components,
+        "weighted_components": weighted,
+        "reason": _score_reason(action, components),
+        "estimated_value": action.expected_cost_delta,
+        "confidence": action.confidence,
+    }
+
+
+def _score_components(action: PlanAction, context: DecisionContext) -> dict[str, float]:
+    """Return normalized scoring components for one action."""
+    value = max(float(action.expected_cost_delta or 0.0), 0.0)
+    components = {
+        "cost": min(value / 2.0, 1.0),
+        "comfort": 0.0,
+        "ev_readiness": 0.0,
+        "battery_reserve": 0.0,
+        "solar_self_consumption": 0.0,
+        "carbon": 0.0,
+    }
+    if action.asset == ActionAsset.DAIKIN:
+        components["comfort"] = 1.0 if "away_hvac_policy" not in action.reason_codes else 0.9
+        if action.desired_state.get("thermal_shift"):
+            components["cost"] = max(components["cost"], 0.5)
+            components["solar_self_consumption"] = 0.3
+    if action.asset == ActionAsset.EV:
+        required = float(action.desired_state.get("required_charge_percent") or 0.0)
+        components["ev_readiness"] = min(required / 30.0, 1.0)
+        solar_kw = sum(
+            float(item.get("solar_surplus_used_kw") or 0.0)
+            for item in action.desired_state.get("allocated_slots", [])
+            if isinstance(item, dict)
+        )
+        components["solar_self_consumption"] = min(solar_kw / 10.0, 1.0)
+    if action.asset == ActionAsset.ENPHASE:
+        direction = action.desired_state.get("arbitrage_direction")
+        components["solar_self_consumption"] = 1.0 if direction == "consume" else 0.4
+        components["battery_reserve"] = _battery_reserve_score(context)
+    return components
+
+
+def _battery_reserve_score(context: DecisionContext) -> float:
+    """Return reserve urgency for home battery decisions."""
+    if context.current_battery_soc_percent is None:
+        return 0.0
+    if context.current_battery_soc_percent <= 20:
+        return 1.0
+    if context.current_battery_soc_percent <= 40:
+        return 0.5
+    return 0.1
+
+
+def _score_reason(action: PlanAction, components: dict[str, float]) -> str:
+    """Return the strongest plain-English score reason."""
+    strongest = max(components, key=lambda key: components[key])
+    reason_by_component = {
+        "cost": "it has the strongest cost or tariff benefit",
+        "comfort": "it protects household comfort",
+        "ev_readiness": "the EV needs charge before its ready-by time",
+        "battery_reserve": "the home battery reserve matters for this decision",
+        "solar_self_consumption": "it uses forecast solar that may otherwise be exported",
+        "carbon": "it aligns with the carbon objective",
+    }
+    return reason_by_component.get(strongest, _display_text(action.kind))
+
+
+def _priority_weights(options: Mapping[str, Any]) -> dict[str, float]:
+    """Return descending weights from the configured priority order."""
+    order = _priority_order(options)
+    count = len(order)
+    return {objective: float(count - index) / count for index, objective in enumerate(order)}
+
+
+def _priority_order(options: Mapping[str, Any]) -> list[str]:
+    """Return sanitized planning priority order."""
+    allowed = ["cost", "comfort", "ev_readiness", "battery_reserve", "solar_self_consumption", "carbon"]
+    raw = str(options.get(CONF_PRIORITY_WEIGHTS, "") or "")
+    values = [item.strip() for item in raw.split(",") if item.strip() in allowed]
+    result = []
+    for item in [*values, *allowed]:
+        if item not in result:
+            result.append(item)
+    return result
+
+
+def _marginal_budget_summary(context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
+    """Return shared energy budget used by marginal device decisions."""
+    interval_minutes = int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5) or 5)
+    surplus_kwh = _forecast_surplus_kwh(context, interval_minutes)
+    battery = _battery_model(context, options)
+    return {
+        "forecast_surplus_kwh": surplus_kwh,
+        "battery_charge_headroom_kwh": battery["charge_headroom_kwh"],
+        "battery_discharge_available_kwh": battery["discharge_available_kwh"],
+        "battery_max_charge_kw": battery["max_charge_kw"],
+        "battery_max_discharge_kw": battery["max_discharge_kw"],
+        "battery_round_trip_efficiency": battery["round_trip_efficiency"],
+    }
+
+
+def _rejected_actions(
+    context: DecisionContext,
+    actions: list[PlanAction],
+    options: Mapping[str, Any],
+    thermal_model: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Return plain-English decisions that were considered but not selected."""
+    rejected: list[dict[str, Any]] = []
+    assets = {action.asset for action in actions}
+    if ActionAsset.EV not in assets:
+        rejected.append(_rejected_ev_decision(context, options))
+    if ActionAsset.DAIKIN not in assets:
+        rejected.append(_rejected_climate_decision(context, options, thermal_model))
+    if ActionAsset.ENPHASE not in assets:
+        rejected.append(_rejected_enphase_decision(context, options))
+    return [item for item in rejected if item]
+
+
+def _rejected_ev_decision(context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
+    """Return why EV charging was not selected."""
+    confidence_reason = _confidence_rejection_reason(ActionAsset.EV, context, options)
+    if confidence_reason is not None:
+        reason = confidence_reason
+    elif context.ev_connected is False:
+        reason = "Skipped EV charging because the EV is not connected."
+    elif context.current_ev_soc_percent is None:
+        reason = "Skipped EV charging because the current EV state of charge is not available."
+    else:
+        reason = "Skipped EV charging because the EV is already at or above the planned target."
+    return {"device": "EV", "action": "Charge EV", "reason": reason}
+
+
+def _rejected_climate_decision(
+    context: DecisionContext,
+    options: Mapping[str, Any],
+    thermal_model: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return why climate control was not selected."""
+    confidence_reason = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
+    if confidence_reason is not None:
+        reason = confidence_reason
+    elif context.occupancy_state != OccupancyState.OCCUPIED:
+        reason = "Skipped comfort preconditioning because nobody is currently home."
+    elif not _comfort_valid(context, float(options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT])):
+        reason = "Skipped comfort preconditioning because climate comfort inputs are incomplete."
+    elif not context.slots:
+        reason = "Skipped comfort preconditioning because no tariff forecast slots are available."
+    else:
+        shift = _thermal_shift_target(
+            context,
+            context.slots[min(len(context.slots) - 1, 1)],
+            int(options[CONF_PLANNING_INTERVAL_MINUTES]),
+            thermal_model,
+        )
+        reason = (
+            "Skipped comfort preconditioning because the price difference or comfort coast time "
+            "does not justify running the climate system now."
+            if shift is None
+            else "Skipped comfort preconditioning because another device had higher marginal value."
+        )
+    return {"device": "Climate", "action": "Precondition", "reason": reason}
+
+
+def _rejected_enphase_decision(context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
+    """Return why Enphase profile control was not selected."""
+    confidence_reason = _confidence_rejection_reason(ActionAsset.ENPHASE, context, options)
+    if confidence_reason is not None:
+        return {
+            "device": "Enphase",
+            "action": "Change battery profile",
+            "reason": confidence_reason,
+            "estimated_value": 0.0,
+            "evidence": "confidence_threshold",
+        }
+    arbitrage = _arbitrage_value(context, int(options[CONF_PLANNING_INTERVAL_MINUTES]), options)
+    threshold = float(options[CONF_ENPHASE_MIN_SAVINGS])
+    if arbitrage["value"] < threshold:
+        reason = (
+            "Skipped Enphase profile change because battery or solar value "
+            f"({round(float(arbitrage['value']), 2)}) is below the configured threshold ({threshold})."
+        )
+    else:
+        reason = "Skipped Enphase profile change because the selected profile is already active."
+    return {
+        "device": "Enphase",
+        "action": "Change battery profile",
+        "reason": reason,
+        "estimated_value": round(float(arbitrage["value"]), 4),
+        "evidence": arbitrage["source"],
+    }
+
+
+def _timeline_card_rows(device_plans: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return dashboard-friendly upcoming timeline rows."""
+    rows: list[dict[str, Any]] = []
+    for device_key, plan in device_plans.items():
+        if not isinstance(plan, dict):
+            continue
+        for item in plan.get("timeline", [])[:24]:
+            if not isinstance(item, dict) or item.get("state") in {None, "idle", "unknown"}:
+                continue
+            rows.append(
+                {
+                    "time": _time_range(item),
+                    "device": _display_text(device_key),
+                    "action": _display_text(item.get("state")),
+                    "reason": item.get("reason") or item.get("reason_codes"),
+                    "estimated_kwh": item.get("estimated_energy_kwh"),
+                    "estimated_value": item.get("arbitrage_value") or item.get("effective_price"),
+                }
+            )
+    return rows[:24]
+
+
+def _time_range(item: Mapping[str, Any]) -> str:
+    """Return a compact ISO time range for a timeline row."""
+    start = str(item.get("start", ""))
+    end = str(item.get("end", ""))
+    return f"{start[11:16]}-{end[11:16]}" if len(start) >= 16 and len(end) >= 16 else "Current period"
+
+
+def _thermal_shift_target(
+    context: DecisionContext,
+    future_peak_slot: Any,
+    interval_minutes: int,
+    thermal_model: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return a comfort-bounded thermal-shift target for cheap preheat/precool."""
+    if (
+        context.current_hvac_temperature_c is None
+        or context.occupied_temperature_low_c is None
+        or context.occupied_temperature_high_c is None
+    ):
+        return None
+    current_temperature = float(context.current_hvac_temperature_c)
+    low = float(context.occupied_temperature_low_c)
+    high = float(context.occupied_temperature_high_c)
+    if not low <= current_temperature <= high:
+        return None
+    mode = _thermal_shift_mode(context, current_temperature, low, high)
+    if mode is None:
+        return None
+    target = high if mode == "heat" else low
+    boundary = low if mode == "heat" else high
+    if abs(target - current_temperature) < THERMAL_SHIFT_MIN_TARGET_DELTA_C:
+        return None
+    drift = _effective_passive_drift_c_per_hour(context, mode, thermal_model)
+    time_to_peak_hours = max(
+        (future_peak_slot.valid_at - context.created_at).total_seconds() / 3600,
+        interval_minutes / 60,
+    )
+    coast_hours = _thermal_coast_hours(
+        mode=mode,
+        target_temperature=target,
+        comfort_boundary=boundary,
+        passive_drift_c_per_hour=drift,
+    )
+    if coast_hours is not None and coast_hours < time_to_peak_hours:
+        return None
+    return {
+        "hvac_mode": mode,
+        "target_temperature": round(target, 1),
+        "thermal_shift": True,
+        "comfort_coast_boundary": round(boundary, 1),
+        "time_to_expensive_period_hours": round(time_to_peak_hours, 3),
+        "estimated_coast_hours": None if coast_hours is None else round(coast_hours, 3),
+    }
+
+
+def _thermal_shift_mode(
+    context: DecisionContext,
+    current_temperature: float,
+    low: float,
+    high: float,
+) -> str | None:
+    """Infer whether thermal shifting should preheat or precool."""
+    current_mode = str(context.current_hvac_mode or "").lower()
+    if current_mode in {"heat", "cool"}:
+        return current_mode
+    if context.current_outdoor_temperature_c is not None:
+        if float(context.current_outdoor_temperature_c) < current_temperature - 0.5:
+            return "heat"
+        if float(context.current_outdoor_temperature_c) > current_temperature + 0.5:
+            return "cool"
+    midpoint = (low + high) / 2
+    if current_temperature < midpoint:
+        return "heat"
+    if current_temperature > midpoint:
+        return "cool"
+    return None
+
+
+def _effective_passive_drift_c_per_hour(
+    context: DecisionContext,
+    mode: str,
+    thermal_model: Mapping[str, Any],
+) -> float | None:
+    """Return learned or inferred passive indoor temperature drift."""
+    summary = thermal_model_summary(thermal_model)
+    drift = summary.get("passive_indoor_drift_c_per_hour")
+    if isinstance(drift, int | float) and isfinite(float(drift)):
+        return float(drift)
+    if context.current_outdoor_temperature_c is None or context.current_hvac_temperature_c is None:
+        return None
+    outdoor_delta = float(context.current_outdoor_temperature_c) - float(context.current_hvac_temperature_c)
+    if mode == "heat" and outdoor_delta < -0.5:
+        return -THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
+    if mode == "cool" and outdoor_delta > 0.5:
+        return THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
+    return None
+
+
+def _thermal_coast_hours(
+    *,
+    mode: str,
+    target_temperature: float,
+    comfort_boundary: float,
+    passive_drift_c_per_hour: float | None,
+) -> float | None:
+    """Return estimated hours before a preheated/precooled room reaches comfort boundary."""
+    if passive_drift_c_per_hour is None or passive_drift_c_per_hour == 0:
+        return None
+    if mode == "heat" and passive_drift_c_per_hour < 0:
+        return max((target_temperature - comfort_boundary) / abs(passive_drift_c_per_hour), 0.0)
+    if mode == "cool" and passive_drift_c_per_hour > 0:
+        return max((comfort_boundary - target_temperature) / passive_drift_c_per_hour, 0.0)
+    return None
+
+
+def _precondition_slot_count(
+    *,
+    current_temperature: float,
+    target_temperature: float,
+    mode: str,
+    interval_minutes: int,
+    max_slots: int,
+    thermal_model: Mapping[str, Any],
+) -> int:
+    """Return how many slots should carry projected HVAC load for preconditioning."""
+    if max_slots <= 0:
+        return 0
+    temperature_delta = abs(target_temperature - current_temperature)
+    rate = thermal_active_temperature_rate_c_per_hour(thermal_model, mode)
+    if rate is None or rate <= 0:
+        return max_slots
+    interval_hours = interval_minutes / 60
+    return min(max(1, ceil((temperature_delta / rate) / interval_hours)), max_slots)
 
 
 def _device_plan(
@@ -564,9 +1092,74 @@ def _climate_next_state_label(state: Mapping[str, Any]) -> str:
     return label
 
 
+def _enphase_plan_summary(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
+    """Return current and next planned Enphase state summaries."""
+    current = {
+        "state": context.current_enphase_profile or "unknown",
+        "profile": context.current_enphase_profile,
+        "ai_profile": context.enphase_ai_profile,
+        "self_consumption_profile": context.enphase_self_consumption_profile,
+        "full_backup_profile": context.enphase_full_backup_profile,
+    }
+    next_action = min(actions, key=lambda action: action.execute_not_before) if actions else None
+    if next_action is None:
+        next_planned = {
+            "state": "idle",
+            "profile": context.current_enphase_profile,
+            "reason": "no_planned_enphase_action",
+        }
+    else:
+        next_planned = _enphase_action_state(next_action)
+    return {
+        "current_state": current,
+        "current_state_label": _enphase_current_state_label(current),
+        "next_planned_state": next_planned,
+        "next_planned_state_label": _enphase_next_state_label(next_planned),
+    }
+
+
+def _enphase_action_state(action: PlanAction) -> dict[str, Any]:
+    """Return compact desired state for a planned Enphase action."""
+    result: dict[str, Any] = {
+        "state": str(action.kind),
+        "action": str(action.kind),
+        "execute_not_before": action.execute_not_before.isoformat(),
+        "execute_not_after": action.execute_not_after.isoformat(),
+        "reason_codes": action.reason_codes[:4],
+    }
+    desired = action.desired_state
+    for key in ("profile", "arbitrage_direction", "arbitrage_source", "arbitrage_value"):
+        if desired.get(key) is not None:
+            result[key] = desired.get(key)
+    return result
+
+
+def _enphase_current_state_label(state: Mapping[str, Any]) -> str:
+    """Return concise current Enphase profile text."""
+    return str(state.get("profile") or _display_text(state.get("state")))
+
+
+def _enphase_next_state_label(state: Mapping[str, Any]) -> str:
+    """Return concise planned Enphase state text."""
+    if state.get("state") == "idle":
+        profile = state.get("profile")
+        return f"Idle: {profile}" if profile else "Idle"
+    label = _display_text(state.get("state"))
+    profile = state.get("profile")
+    if profile:
+        label = f"{label}: {profile}"
+    return label
+
+
 def _display_text(value: Any) -> str:
     text = str(value or "unknown").replace("_", " ").strip()
-    return text.title() if text else "Unknown"
+    if not text:
+        return "Unknown"
+    words = []
+    for word in text.split():
+        upper = word.upper()
+        words.append(upper if upper in {"AI", "EV", "HVAC"} else word.title())
+    return " ".join(words)
 
 
 def _append_timeline_entry(timeline: list[dict[str, Any]], entry: dict[str, Any]) -> None:
@@ -737,25 +1330,65 @@ def _next_ready_by(created_at: Any, ready_by: str) -> Any:
     return candidate
 
 
-def _arbitrage_value(context: DecisionContext, interval_minutes: int) -> dict[str, Any]:
-    battery_arbitrage = _haeo_battery_arbitrage(context, interval_minutes)
+def _asset_label(asset: ActionAsset) -> str:
+    """Return a user-facing asset label."""
+    labels = {
+        ActionAsset.DAIKIN: "Climate",
+        ActionAsset.ENPHASE: "Enphase",
+        ActionAsset.EV: "EV",
+    }
+    return labels.get(asset, _display_text(asset))
+
+
+def _arbitrage_value(
+    context: DecisionContext,
+    interval_minutes: int,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    battery_arbitrage = _haeo_battery_arbitrage(context, interval_minutes, options)
     if battery_arbitrage is not None:
         return {
             "value": battery_arbitrage["value"],
             "source": "haeo_battery_arbitrage_value",
             "direction": battery_arbitrage["direction"],
+            "details": battery_arbitrage.get("details", {}),
         }
     haeo_export_value = _haeo_export_value(context, interval_minutes)
     if haeo_export_value is not None:
-        return {"value": haeo_export_value, "source": "haeo_export_value", "direction": "consume"}
-    return {"value": _arbitrage_spread(context), "source": "price_spread", "direction": "consume"}
+        return {
+            "value": haeo_export_value,
+            "source": "haeo_export_value",
+            "direction": "consume",
+            "details": {"source": "haeo_grid_export_forecast_kw"},
+        }
+    forecast_export = _forecast_solar_export_value(context, interval_minutes, options)
+    if forecast_export is not None:
+        return {
+            "value": forecast_export["value"],
+            "source": "forecast_solar_export_value",
+            "direction": "consume",
+            "details": forecast_export,
+        }
+    return {
+        "value": 0.0,
+        "source": "insufficient_arbitrage_evidence",
+        "direction": "consume",
+        "details": _marginal_budget_summary(context, options or {}),
+    }
 
 
-def _haeo_battery_arbitrage(context: DecisionContext, interval_minutes: int) -> dict[str, Any] | None:
+def _haeo_battery_arbitrage(
+    context: DecisionContext,
+    interval_minutes: int,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
     total = 0.0
     has_battery_evidence = False
     first_direction: str | None = None
     interval_hours = interval_minutes / 60
+    battery = _battery_model(context, options or {})
+    remaining_charge_kwh = battery["charge_headroom_kwh"]
+    remaining_discharge_kwh = battery["discharge_available_kwh"]
     for slot in context.slots:
         charge_kw = _positive_or_none(slot.haeo_battery_charge_forecast_kw)
         discharge_kw = _positive_or_none(slot.haeo_battery_discharge_forecast_kw)
@@ -765,8 +1398,14 @@ def _haeo_battery_arbitrage(context: DecisionContext, interval_minutes: int) -> 
             grid_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
             import_price = _float_or_none(slot.import_price)
             if grid_import_kw is not None and import_price is not None:
-                grid_charge_kw = min(charge_kw, grid_import_kw)
-                total -= grid_charge_kw * import_price * interval_hours
+                grid_charge_kw = min(charge_kw, grid_import_kw, battery["max_charge_kw"])
+                charged_kwh = min(
+                    grid_charge_kw * interval_hours * battery["round_trip_efficiency"],
+                    remaining_charge_kwh,
+                )
+                if charged_kwh > 0:
+                    remaining_charge_kwh -= charged_kwh
+                    total -= (charged_kwh / battery["round_trip_efficiency"]) * import_price
         if discharge_kw is not None:
             has_battery_evidence = True
             first_direction = first_direction or "consume"
@@ -777,10 +1416,22 @@ def _haeo_battery_arbitrage(context: DecisionContext, interval_minutes: int) -> 
             if price is None:
                 price = _float_or_none(slot.import_price)
             if price is not None:
-                total += discharge_kw * price * interval_hours
+                discharge_kw = min(discharge_kw, battery["max_discharge_kw"])
+                discharged_kwh = min(discharge_kw * interval_hours, remaining_discharge_kwh)
+                remaining_discharge_kwh -= discharged_kwh
+                total += discharged_kwh * price
     if not has_battery_evidence:
         return None
-    return {"value": round(total, 4), "direction": first_direction or "consume"}
+    return {
+        "value": round(total, 4),
+        "direction": first_direction or "consume",
+        "details": {
+            "battery_charge_headroom_kwh": battery["charge_headroom_kwh"],
+            "battery_discharge_available_kwh": battery["discharge_available_kwh"],
+            "remaining_charge_headroom_kwh": round(remaining_charge_kwh, 4),
+            "remaining_discharge_available_kwh": round(remaining_discharge_kwh, 4),
+        },
+    }
 
 
 def _haeo_battery_arbitrage_value(context: DecisionContext, interval_minutes: int) -> float | None:
@@ -806,6 +1457,100 @@ def _haeo_export_value(context: DecisionContext, interval_minutes: int) -> float
         has_haeo_export = True
         total += export_kw * export_price * interval_hours
     return round(total, 4) if has_haeo_export else None
+
+
+def _forecast_solar_export_value(
+    context: DecisionContext,
+    interval_minutes: int,
+    options: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return estimated value of forecast solar surplus that could be self-consumed."""
+    total = 0.0
+    has_surplus = False
+    interval_hours = interval_minutes / 60
+    battery = _battery_model(context, options or {})
+    remaining_charge_kwh = battery["charge_headroom_kwh"]
+    accepted_surplus_kwh = 0.0
+    forecast_surplus_kwh = 0.0
+    for slot in context.slots:
+        pv_kw = _positive_or_none(slot.pv_forecast_kw)
+        load_kw = _positive_or_none(slot.baseline_load_forecast_kw)
+        export_price = _float_or_none(slot.export_price)
+        if pv_kw is None or load_kw is None or export_price is None:
+            continue
+        flexible_load_kw = max(float(slot.projected_ev_load_kw or 0.0), 0.0) + max(
+            float(slot.projected_hvac_load_kw or 0.0),
+            0.0,
+        )
+        surplus_kw = max(pv_kw - load_kw - flexible_load_kw, 0.0)
+        if surplus_kw <= 0:
+            continue
+        forecast_surplus_kwh += surplus_kw * interval_hours
+        has_surplus = True
+        charge_kw = min(surplus_kw, battery["max_charge_kw"])
+        charge_input_kwh = charge_kw * interval_hours
+        stored_kwh = min(charge_input_kwh * battery["round_trip_efficiency"], remaining_charge_kwh)
+        if stored_kwh <= 0:
+            continue
+        remaining_charge_kwh -= stored_kwh
+        accepted_input_kwh = stored_kwh / battery["round_trip_efficiency"]
+        accepted_surplus_kwh += accepted_input_kwh
+        total += accepted_input_kwh * export_price * battery["round_trip_efficiency"]
+    if not has_surplus:
+        return None
+    return {
+        "value": round(total, 4),
+        "forecast_surplus_kwh": round(forecast_surplus_kwh, 4),
+        "accepted_surplus_kwh": round(accepted_surplus_kwh, 4),
+        "battery_charge_headroom_kwh": battery["charge_headroom_kwh"],
+        "remaining_charge_headroom_kwh": round(remaining_charge_kwh, 4),
+        "battery_max_charge_kw": battery["max_charge_kw"],
+        "battery_round_trip_efficiency": battery["round_trip_efficiency"],
+    }
+
+
+def _forecast_surplus_kwh(context: DecisionContext, interval_minutes: int) -> float:
+    """Return forecast solar surplus after projected flexible loads."""
+    interval_hours = interval_minutes / 60
+    total = 0.0
+    for slot in context.slots:
+        pv_kw = _positive_or_none(slot.pv_forecast_kw)
+        load_kw = _positive_or_none(slot.baseline_load_forecast_kw)
+        if pv_kw is None or load_kw is None:
+            continue
+        flexible_kw = max(float(slot.projected_ev_load_kw or 0.0), 0.0) + max(
+            float(slot.projected_hvac_load_kw or 0.0),
+            0.0,
+        )
+        total += max(pv_kw - load_kw - flexible_kw, 0.0) * interval_hours
+    return round(total, 4)
+
+
+def _battery_model(context: DecisionContext, options: Mapping[str, Any]) -> dict[str, float]:
+    """Return bounded battery physics used by planning estimates."""
+    capacity_kwh = max(_float_or_none(options.get(CONF_BATTERY_USABLE_CAPACITY_KWH)) or 0.0, 0.0)
+    soc = _float_or_none(context.current_battery_soc_percent)
+    reserve_soc = max(_float_or_none(options.get(CONF_BATTERY_MIN_SOC_PERCENT)) or 0.0, 0.0)
+    efficiency_percent = _float_or_none(options.get(CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT))
+    efficiency = min(max((efficiency_percent or 90.0) / 100.0, 0.01), 1.0)
+    max_charge_kw = max(_float_or_none(options.get(CONF_BATTERY_MAX_CHARGE_KW)) or 0.0, 0.0)
+    max_discharge_kw = max(_float_or_none(options.get(CONF_BATTERY_MAX_DISCHARGE_KW)) or 0.0, 0.0)
+    if soc is None or capacity_kwh <= 0:
+        charge_headroom_kwh = capacity_kwh
+        discharge_available_kwh = 0.0
+    else:
+        charge_headroom_kwh = max(capacity_kwh * ((100.0 - soc) / 100.0), 0.0)
+        discharge_available_kwh = max(capacity_kwh * ((soc - reserve_soc) / 100.0), 0.0)
+    return {
+        "capacity_kwh": round(capacity_kwh, 4),
+        "soc_percent": -1.0 if soc is None else round(soc, 4),
+        "reserve_soc_percent": round(reserve_soc, 4),
+        "charge_headroom_kwh": round(charge_headroom_kwh, 4),
+        "discharge_available_kwh": round(discharge_available_kwh, 4),
+        "round_trip_efficiency": round(efficiency, 4),
+        "max_charge_kw": round(max_charge_kw, 4),
+        "max_discharge_kw": round(max_discharge_kw, 4),
+    }
 
 
 def _arbitrage_spread(context: DecisionContext) -> float:

@@ -6,8 +6,11 @@ from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.ev import (
     EVTripRecord,
+    _charge_cost_components,
     _connected_bool,
+    _effective_charge_price,
     _float_or_none,
+    _solar_surplus_kw,
     _state_timestamp,
     allocate_least_cost_charging,
     calculate_ev_target,
@@ -75,6 +78,47 @@ def test_allocate_least_cost_charging_uses_cheapest_slots_before_ready_by() -> N
         now + timedelta(minutes=5),
     ]
     assert [allocation.charge_kw for allocation in schedule.allocations] == [6, 6]
+
+
+def test_allocate_least_cost_charging_prefers_solar_surplus_effective_cost() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    slots = [
+        DecisionSlot(now, 0.10, 0.05, 0.0, 2.0),
+        DecisionSlot(now + timedelta(minutes=5), 0.30, 0.02, 8.0, 2.0),
+        DecisionSlot(now + timedelta(minutes=10), 0.12, 0.05, 0.0, 2.0),
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=45,
+        ready_by=now + timedelta(minutes=15),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+    )
+
+    assert schedule.reason == "least_cost_solar_aware_slots_before_ready_by"
+    assert schedule.allocations[0].valid_at == now + timedelta(minutes=5)
+    assert schedule.allocations[0].import_price == 0.30
+    assert schedule.allocations[0].effective_price == 0.02
+    assert schedule.allocations[0].solar_surplus_used_kw == 6
+    assert schedule.allocations[0].grid_import_used_kw == 0
+
+
+def test_ev_solar_aware_cost_helpers_cover_fallbacks() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    zero_charge_slot = DecisionSlot(now, 0.25, 0.05, 6.0, 2.0)
+    missing_import_slot = DecisionSlot(now, None, 0.05, 6.0, 2.0)
+    missing_forecast_slot = DecisionSlot(now, 0.25, 0.05, None, 2.0)
+    flexible_load_slot = DecisionSlot(now, 0.25, None, 8.0, 2.0, projected_hvac_load_kw=1.5)
+
+    assert _charge_cost_components(zero_charge_slot, 0) == (None, 0.0, 0.0)
+    assert _charge_cost_components(missing_import_slot, 6) == (None, 0.0, 6)
+    assert _effective_charge_price(zero_charge_slot, 0) == 0.25
+    assert _solar_surplus_kw(missing_forecast_slot) == 0.0
+    assert _solar_surplus_kw(flexible_load_slot) == 4.5
+    assert _charge_cost_components(flexible_load_slot, 6) == (0.0625, 4.5, 1.5)
 
 
 def test_allocate_least_cost_charging_marks_infeasible() -> None:

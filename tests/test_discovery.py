@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
@@ -67,6 +68,7 @@ def test_discovery_reports_supported_controls() -> None:
             "switch.ev_stop": "on",
             "climate.daikin": "heat",
             "automation.climate": "on",
+            "ai_task.extended_openai": "ready",
             "select.enphase_profile": "AI Optimisation",
         },
         {("haeo", "optimize"), ("select", "select_option"), ("ai_task", "generate_data")},
@@ -74,7 +76,7 @@ def test_discovery_reports_supported_controls() -> None:
     report = CapabilityDiscovery(
         hass,
         {
-            CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+            CONF_AI_TASK_ENTITY: "ai_task.extended_openai",
             CONF_EV_SMART_CHARGING_START: "switch.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop",
             CONF_DAIKIN_CLIMATE: "climate.daikin",
@@ -147,7 +149,7 @@ def test_discovery_reports_missing_and_invalid_surfaces() -> None:
             CONF_EV_SMART_CHARGING_READY_BY: "input_text.ready_by",
             CONF_DAIKIN_CLIMATE: "climate.missing",
             CONF_ENPHASE_PROFILE: "sensor.profile",
-            CONF_AI_ADVISOR_SERVICE: "badservice",
+            CONF_AI_TASK_ENTITY: "ai_task.missing",
         },
     ).inspect()
 
@@ -159,9 +161,18 @@ def test_discovery_reports_missing_and_invalid_surfaces() -> None:
     assert report.hvac.issues == ["daikin_climate_unavailable"]
     assert "enphase_profile_control_not_configured" in report.enphase.issues
     assert "enphase_ai_profile_not_configured" in report.enphase.issues
-    assert report.ai.issues == ["ai_service_invalid"]
+    assert report.ai.issues == ["ai_service_unavailable", "ai_task_entity_unavailable"]
     assert report.for_asset(ActionAsset.EV) is report.ev
     assert report.as_dict()["ev"]["supported"] is False
+
+
+def test_discovery_requires_ai_task_entity_for_ai_task_service() -> None:
+    hass = FakeHass({}, {("ai_task", "generate_data")})
+
+    report = CapabilityDiscovery(hass, {CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data"}).inspect()
+
+    assert report.ai.supported is False
+    assert report.ai.issues == ["ai_task_entity_not_configured"]
 
 
 def test_discovery_low_level_service_and_profile_helpers() -> None:

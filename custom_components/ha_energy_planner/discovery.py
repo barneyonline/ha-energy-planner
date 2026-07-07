@@ -9,6 +9,7 @@ from homeassistant.core import HomeAssistant
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
@@ -158,10 +159,25 @@ class CapabilityDiscovery:
         )
 
     def _inspect_ai(self) -> CapabilityEvidence:
+        task_entity = str(self.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip()
+        if task_entity:
+            service_evidence = _service_evidence(self.hass, "ai_task.generate_data", "ai_service")
+            issues = list(service_evidence.issues)
+            if _state_missing(self.hass, task_entity):
+                issues.append("ai_task_entity_unavailable")
+            return CapabilityEvidence(
+                not issues,
+                issues,
+                {
+                    **service_evidence.details,
+                    "ai_task_entity": task_entity,
+                },
+            )
+
         service = self.entry_data.get(CONF_AI_ADVISOR_SERVICE)
-        if not service:
-            return CapabilityEvidence(False, ["ai_service_not_configured"], {})
-        return _service_evidence(self.hass, service, "ai_service")
+        if service == "ai_task.generate_data":
+            return CapabilityEvidence(False, ["ai_task_entity_not_configured"], {"service": service})
+        return CapabilityEvidence(False, ["ai_service_not_configured"], {})
 
 
 def _service_evidence(hass: HomeAssistant, service_name: str | None, label: str) -> CapabilityEvidence:

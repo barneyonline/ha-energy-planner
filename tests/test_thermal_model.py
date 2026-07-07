@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.thermal_model import (
+    thermal_active_temperature_rate_c_per_hour,
     thermal_hvac_load_kw,
     thermal_model_summary,
     update_thermal_model,
@@ -33,7 +34,36 @@ def test_thermal_model_enables_after_enough_active_power_samples() -> None:
 
     assert summary["enabled"] is True
     assert summary["active_sample_count"] == 12
+    assert summary["active_heat_rate_c_per_hour"] == 1.2
+    assert summary["active_heat_rate_sample_count"] == 12
     assert thermal_hvac_load_kw(model, 1.0) == 1.8
+
+
+def test_thermal_model_tracks_active_cooling_rate() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    model: dict[str, object] = {}
+
+    for index in range(12):
+        model, changed = update_thermal_model(
+            model,
+            {
+                "sampled_at": (now + timedelta(minutes=5 * index)).isoformat(),
+                "indoor_temperature_c": 25.0,
+                "hvac_power_kw": 1.6,
+            },
+            {
+                "sampled_at": (now + timedelta(minutes=5 * (index + 1))).isoformat(),
+                "indoor_temperature_c": 24.8,
+                "hvac_power_kw": 1.6,
+            },
+        )
+        assert changed is True
+
+    summary = thermal_model_summary(model)
+
+    assert summary["enabled"] is True
+    assert summary["active_cool_rate_c_per_hour"] == 2.4
+    assert summary["active_cool_rate_sample_count"] == 12
 
 
 def test_thermal_model_tracks_passive_temperature_drift_without_hvac_power() -> None:
@@ -146,3 +176,11 @@ def test_thermal_model_ignores_malformed_persisted_numbers() -> None:
     assert summary["passive_sample_count"] == 0
     assert summary["passive_indoor_drift_c_per_hour"] is None
     assert thermal_hvac_load_kw(model, 1.0) == 1.0
+    assert (
+        thermal_active_temperature_rate_c_per_hour(
+            {"enabled": True, "active_heat_rate_c_per_hour": {"sample_count": 3, "average": "nan"}},
+            "heat",
+            0.75,
+        )
+        == 0.75
+    )

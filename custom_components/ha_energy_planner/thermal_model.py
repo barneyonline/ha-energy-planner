@@ -47,6 +47,11 @@ def update_thermal_model(
 
     if previous_power is not None and previous_power >= ACTIVE_POWER_THRESHOLD_KW:
         _add_average(updated, "active_hvac_load_kw", _clamp(previous_power, MIN_HVAC_LOAD_KW, MAX_HVAC_LOAD_KW))
+        active_rate = (current_temp - previous_temp) / hours
+        if active_rate > 0:
+            _add_average(updated, "active_heat_rate_c_per_hour", _clamp(active_rate, 0.05, 10.0))
+        elif active_rate < 0:
+            _add_average(updated, "active_cool_rate_c_per_hour", _clamp(abs(active_rate), 0.05, 10.0))
     else:
         drift_per_hour = (current_temp - previous_temp) / hours
         _add_average(updated, "passive_indoor_drift_c_per_hour", _clamp(drift_per_hour, -5.0, 5.0))
@@ -67,14 +72,38 @@ def thermal_hvac_load_kw(model: Mapping[str, Any] | None, fallback_kw: float) ->
     return round(_clamp(value, MIN_HVAC_LOAD_KW, MAX_HVAC_LOAD_KW), 4)
 
 
+def thermal_active_temperature_rate_c_per_hour(
+    model: Mapping[str, Any] | None,
+    mode: str,
+    fallback_c_per_hour: float | None = None,
+) -> float | None:
+    """Return learned active heating/cooling rate when the model is mature enough."""
+    key = "active_heat_rate_c_per_hour" if mode == "heat" else "active_cool_rate_c_per_hour"
+    bucket = dict((model or {}).get(key, {}))
+    if not (model or {}).get("enabled"):
+        return fallback_c_per_hour
+    if _int_or_zero(bucket.get("sample_count")) < 3:
+        return fallback_c_per_hour
+    value = _float_or_none(bucket.get("average"))
+    if value is None:
+        return fallback_c_per_hour
+    return round(_clamp(value, 0.05, 10.0), 4)
+
+
 def thermal_model_summary(model: Mapping[str, Any] | None) -> dict[str, Any]:
     """Return compact model metadata for diagnostics."""
     active = dict((model or {}).get("active_hvac_load_kw", {}))
+    heat_rate = dict((model or {}).get("active_heat_rate_c_per_hour", {}))
+    cool_rate = dict((model or {}).get("active_cool_rate_c_per_hour", {}))
     drift = dict((model or {}).get("passive_indoor_drift_c_per_hour", {}))
     return {
         "enabled": bool((model or {}).get("enabled", False)),
         "active_sample_count": _int_or_zero(active.get("sample_count")),
         "active_hvac_load_kw": _float_or_none(active.get("average")),
+        "active_heat_rate_c_per_hour": _float_or_none(heat_rate.get("average")),
+        "active_heat_rate_sample_count": _int_or_zero(heat_rate.get("sample_count")),
+        "active_cool_rate_c_per_hour": _float_or_none(cool_rate.get("average")),
+        "active_cool_rate_sample_count": _int_or_zero(cool_rate.get("sample_count")),
         "passive_sample_count": _int_or_zero(drift.get("sample_count")),
         "passive_indoor_drift_c_per_hour": _float_or_none(drift.get("average")),
     }

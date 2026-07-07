@@ -15,8 +15,8 @@ from custom_components.ha_energy_planner.entity import (
     EnergyPlannerEntity,
     async_add_planner_entities,
     planner_config_subentry_id,
-    planner_device_key_for_entity,
     planner_device_configured,
+    planner_device_key_for_entity,
 )
 
 

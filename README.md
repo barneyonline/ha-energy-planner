@@ -42,12 +42,15 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Guided setup with no required inputs on initial install; add Energy, Climate, Presence, Enphase, AI, and EV inputs separately from the integration page
 - Device structure aligned with Home Assistant hub-style integrations: each planning area appears as its own device with relevant sub-entities
 - Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
+- Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
+- Battery-aware decisions using configured usable capacity, reserve floor, round-trip efficiency, maximum charge power, and maximum discharge power
 - HAEO service support for optimization, with bounded fallback planning when HAEO is unavailable or returns an unhealthy result
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
-- EV planning with connected state, SOC, start/stop entities, daily trip-history replay, and estimated charging kWh
-- Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, and manual override blocking
+- EV planning with connected state, SOC, start/stop entities, daily trip-history replay, estimated charging kWh, and solar-aware effective-cost scheduling
+- Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
 - 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
-- Forecast confidence breakdown across required inputs so stale, missing, or invalid data is visible
+- Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
+- Decision audit, rejected action, upcoming timeline, and per-device decision sensors explaining what was selected and why alternatives were skipped
 - Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly
@@ -91,7 +94,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.1.44`
+- Current manifest version: `0.2.0`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `hub`
 - IoT class: `local_polling`
@@ -125,6 +128,7 @@ Energy Planner is built around conservative production controls:
 - Active control requires mapped inputs, healthy preflight status, production arming, and dry-run review.
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
+- Device control is paused temporarily when a command fails or a recent planner-owned EV/Enphase state appears to have been changed externally.
 - AI advice is optional, rate-limited, redacted, and advisory only.
 - Preflight and restore-safe-state support are available through both services and button entities.
 
@@ -157,13 +161,15 @@ Energy Planner registers these Home Assistant services:
 1. Install Energy Planner and add it from **Devices & services**.
 2. Add planning areas from the integration page.
 3. Map the required source entities and services for the planning areas you want to use.
-4. Leave active control disabled and dry-run enabled.
-5. Press the **Run preflight** button or run `ha_energy_planner.run_preflight`.
-6. Fix missing, unavailable, stale, or invalid inputs.
-7. Run several dry-run cycles and review plan, confidence, cost, timeline, next-state, AI advice, and execution audit entities.
-8. Export a support bundle with `ha_energy_planner.export_support_bundle`.
-9. Arm production control only after the dry-run plan matches your expectations.
-10. Keep dry-run enabled for the first production-readiness review, then disable dry-run only when you are ready for real service calls.
+4. Review the **EV, battery, and grid** policy settings, especially usable battery capacity, efficiency, and max charge/discharge power.
+5. Review the **Data health** confidence thresholds for tariff, solar, load, climate, EV, and Enphase decisions.
+6. Leave active control disabled and dry-run enabled.
+7. Press the **Run preflight** button or run `ha_energy_planner.run_preflight`.
+8. Fix missing, unavailable, stale, invalid, or low-confidence inputs.
+9. Run several dry-run cycles and review plan, confidence, decision audit, rejected actions, upcoming timeline, next-state, AI advice, and execution audit entities.
+10. Export a support bundle with `ha_energy_planner.export_support_bundle`.
+11. Arm production control only after the dry-run plan matches your expectations.
+12. Keep dry-run enabled for the first production-readiness review, then disable dry-run only when you are ready for real service calls.
 
 ## Rollback and manual recovery
 
@@ -253,6 +259,7 @@ scripts/export-real-validation-bundle.sh --validate-only
 
 ## Documentation
 
+- Release notes: [CHANGELOG.md](CHANGELOG.md)
 - Requirement evidence: [docs/requirements-audit.md](docs/requirements-audit.md)
 - Quality evidence: [quality_scale.yaml](quality_scale.yaml)
 - Issue tracker: [GitHub Issues](https://github.com/barneyonline/ha-energy-planner/issues)

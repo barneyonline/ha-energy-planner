@@ -292,6 +292,10 @@
         "description": "Set battery reserve, EV charging assumptions, and grid power limits.",
         "data": {
           "battery_min_soc_percent": "Minimum battery SOC",
+          "battery_usable_capacity_kwh": "Usable battery capacity (kWh)",
+          "battery_round_trip_efficiency_percent": "Battery round-trip efficiency (%)",
+          "battery_max_charge_kw": "Battery maximum charge power (kW)",
+          "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
           "ev_min_soc_percent": "Minimum EV SOC",
           "ev_max_soc_percent": "Maximum EV SOC",
           "ev_fallback_target_soc_percent": "Fallback EV target SOC",
@@ -302,6 +306,10 @@
         },
         "data_description": {
           "battery_min_soc_percent": "Minimum home battery state of charge the planner tries to preserve.",
+          "battery_usable_capacity_kwh": "Usable home battery capacity available for planning decisions.",
+          "battery_round_trip_efficiency_percent": "Estimated battery round-trip efficiency used when valuing stored solar or tariff arbitrage.",
+          "battery_max_charge_kw": "Maximum battery charge power used when estimating whether surplus solar can be absorbed.",
+          "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
           "ev_min_soc_percent": "Lowest EV state of charge the planner treats as acceptable before charging is prioritised.",
           "ev_max_soc_percent": "Upper EV state of charge limit used when planning smart charging.",
           "ev_fallback_target_soc_percent": "EV target used when trip history or a ready-by target is unavailable.",
@@ -379,12 +387,24 @@
         "data": {
           "price_freshness_minutes": "Price freshness window",
           "forecast_freshness_minutes": "Forecast freshness window",
-          "material_change_threshold_percent": "Material change threshold"
+          "material_change_threshold_percent": "Material change threshold",
+          "minimum_tariff_confidence": "Minimum tariff confidence",
+          "minimum_solar_confidence": "Minimum solar confidence",
+          "minimum_load_confidence": "Minimum load confidence",
+          "minimum_climate_confidence": "Minimum climate confidence",
+          "minimum_ev_confidence": "Minimum EV confidence",
+          "minimum_enphase_confidence": "Minimum Enphase confidence"
         },
         "data_description": {
           "price_freshness_minutes": "Maximum age for price inputs before they are treated as stale.",
           "forecast_freshness_minutes": "Maximum age for forecast inputs before they are treated as stale.",
-          "material_change_threshold_percent": "Minimum plan-change percentage before a new plan is considered materially different."
+          "material_change_threshold_percent": "Minimum plan-change percentage before a new plan is considered materially different.",
+          "minimum_tariff_confidence": "Lowest tariff confidence allowed before tariff-driven decisions should be treated as degraded.",
+          "minimum_solar_confidence": "Lowest solar forecast confidence allowed before solar-driven decisions should be treated as degraded.",
+          "minimum_load_confidence": "Lowest load forecast confidence allowed before load-driven decisions should be treated as degraded.",
+          "minimum_climate_confidence": "Lowest climate confidence allowed before climate decisions should be treated as degraded.",
+          "minimum_ev_confidence": "Lowest EV confidence allowed before EV charging decisions should be treated as degraded.",
+          "minimum_enphase_confidence": "Lowest Enphase confidence allowed before battery profile decisions should be treated as degraded."
         }
       },
       "priorities": {
@@ -434,6 +454,15 @@
       "confidence_breakdown": {
         "name": "Confidence breakdown"
       },
+      "decision_audit": {
+        "name": "Decision audit"
+      },
+      "rejected_actions": {
+        "name": "Rejected actions"
+      },
+      "upcoming_timeline": {
+        "name": "Upcoming timeline"
+      },
       "production_readiness": {
         "name": "Production readiness"
       },
@@ -450,10 +479,13 @@
         "name": "Support bundle summary"
       },
       "ai_advice": {
-        "name": "AI advice"
+        "name": "Advice"
       },
       "climate_plan": {
-        "name": "Climate plan"
+        "name": "Plan"
+      },
+      "decision": {
+        "name": "Decision"
       },
       "current_state": {
         "name": "Current state"
@@ -465,10 +497,10 @@
         "name": "State"
       },
       "enphase_plan": {
-        "name": "Enphase plan"
+        "name": "Plan"
       },
       "ev_charging_plan": {
-        "name": "EV charging plan"
+        "name": "Charging plan"
       },
       "current_charge_state": {
         "name": "Current charge state"
@@ -479,7 +511,7 @@
     },
     "binary_sensor": {
       "data_healthy": {
-        "name": "Data health"
+        "name": "Data problem"
       },
       "takeover_active": {
         "name": "Takeover active"

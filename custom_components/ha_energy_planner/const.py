@@ -49,6 +49,10 @@ CONF_PLANNING_HORIZON_HOURS = "planning_horizon_hours"
 CONF_PLANNING_INTERVAL_MINUTES = "planning_interval_minutes"
 CONF_DEFAULT_READY_BY = "default_ready_by"
 CONF_BATTERY_MIN_SOC_PERCENT = "battery_min_soc_percent"
+CONF_BATTERY_USABLE_CAPACITY_KWH = "battery_usable_capacity_kwh"
+CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT = "battery_round_trip_efficiency_percent"
+CONF_BATTERY_MAX_CHARGE_KW = "battery_max_charge_kw"
+CONF_BATTERY_MAX_DISCHARGE_KW = "battery_max_discharge_kw"
 CONF_EV_MIN_SOC_PERCENT = "ev_min_soc_percent"
 CONF_EV_MAX_SOC_PERCENT = "ev_max_soc_percent"
 CONF_EV_FALLBACK_TARGET_SOC_PERCENT = "ev_fallback_target_soc_percent"
@@ -79,12 +83,22 @@ CONF_MAX_DAILY_EV_ACTIONS = "max_daily_ev_actions"
 CONF_MAX_DAILY_CLIMATE_ACTIONS = "max_daily_climate_actions"
 CONF_MAX_DAILY_ENPHASE_ACTIONS = "max_daily_enphase_actions"
 CONF_PRIORITY_WEIGHTS = "priority_weights"
+CONF_MIN_TARIFF_CONFIDENCE = "minimum_tariff_confidence"
+CONF_MIN_SOLAR_CONFIDENCE = "minimum_solar_confidence"
+CONF_MIN_LOAD_CONFIDENCE = "minimum_load_confidence"
+CONF_MIN_CLIMATE_CONFIDENCE = "minimum_climate_confidence"
+CONF_MIN_EV_CONFIDENCE = "minimum_ev_confidence"
+CONF_MIN_ENPHASE_CONFIDENCE = "minimum_enphase_confidence"
 
 DEFAULT_OPTIONS = {
     CONF_PLANNING_HORIZON_HOURS: 24,
     CONF_PLANNING_INTERVAL_MINUTES: 5,
     CONF_DEFAULT_READY_BY: "07:00",
     CONF_BATTERY_MIN_SOC_PERCENT: 10.0,
+    CONF_BATTERY_USABLE_CAPACITY_KWH: 10.0,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: 90.0,
+    CONF_BATTERY_MAX_CHARGE_KW: 5.0,
+    CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
     CONF_EV_MIN_SOC_PERCENT: 40.0,
     CONF_EV_MAX_SOC_PERCENT: 90.0,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 80.0,
@@ -115,6 +129,12 @@ DEFAULT_OPTIONS = {
     CONF_MAX_DAILY_CLIMATE_ACTIONS: 8,
     CONF_MAX_DAILY_ENPHASE_ACTIONS: 6,
     CONF_PRIORITY_WEIGHTS: "cost,comfort,ev_readiness,battery_reserve,solar_self_consumption,carbon",
+    CONF_MIN_TARIFF_CONFIDENCE: 50.0,
+    CONF_MIN_SOLAR_CONFIDENCE: 50.0,
+    CONF_MIN_LOAD_CONFIDENCE: 50.0,
+    CONF_MIN_CLIMATE_CONFIDENCE: 50.0,
+    CONF_MIN_EV_CONFIDENCE: 50.0,
+    CONF_MIN_ENPHASE_CONFIDENCE: 50.0,
 }
 
 DEBOUNCE_SECONDS = 20

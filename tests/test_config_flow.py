@@ -61,11 +61,11 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
-    CONF_EV_SOC,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_PERSON_ENTITIES,
     CONF_PLANNING_HORIZON_HOURS,
@@ -726,7 +726,7 @@ def test_options_flow_uses_saved_values_after_returning_to_menu() -> None:
     schema_fields = {str(getattr(key, "schema", key)): key for key in result["data_schema"].schema}
 
     assert result["type"] == "form"
-    assert getattr(schema_fields[CONF_PLANNING_HORIZON_HOURS], "default")() == 36
+    assert schema_fields[CONF_PLANNING_HORIZON_HOURS].default() == 36
 
 
 def test_options_flow_section_validation_returns_form_errors() -> None:
