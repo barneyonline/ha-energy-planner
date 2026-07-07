@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from custom_components.ha_energy_planner import planner as planner_module
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -13,6 +14,7 @@ from custom_components.ha_energy_planner.models import (
     HAEOStatus,
     InputHealth,
     OccupancyState,
+    PlanAction,
     PlannerMode,
 )
 from custom_components.ha_energy_planner.planner import (
@@ -60,6 +62,8 @@ def test_dry_run_plan_has_candidate_actions_without_active_control() -> None:
     assert plan.actions[0].kind == ActionKind.SET_HVAC
     assert plan.status == "current"
     assert plan.confidence == 1.0
+    assert plan.decision_audit["accepted"][0]["device"] == "Climate"
+    assert plan.rejected_actions
 
 
 def test_plan_preview_includes_weather_forecast_temperature() -> None:
@@ -272,6 +276,53 @@ def test_ev_target_at_or_below_current_soc_does_not_create_charge_action() -> No
     assert [action for action in plan.actions if action.asset == ActionAsset.EV] == []
 
 
+def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_min_soc_percent": 45,
+        "default_ready_by": "00:15",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+        "ev_fallback_target_soc_percent": 45,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 40
+    context.current_hvac_temperature_c = None
+    context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=import_price,
+            export_price=export_price,
+            pv_forecast_kw=pv,
+            baseline_load_forecast_kw=load,
+        )
+        for offset, import_price, export_price, pv, load in [
+            (0, 0.10, 0.05, 0.0, 2.0),
+            (5, 0.30, 0.02, 8.0, 2.0),
+            (10, 0.12, 0.05, 0.0, 2.0),
+        ]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    allocation = plan.actions[0].desired_state["allocated_slots"][0]
+    assert plan.actions[0].reason_codes == [
+        "ev_soc_below_target",
+        "fallback_until_history_sufficient",
+        "least_cost_solar_aware_slots_before_ready_by",
+    ]
+    assert allocation["valid_at"] == "2026-06-27T00:05:00+00:00"
+    assert allocation["import_price"] == 0.3
+    assert allocation["effective_price"] == 0.02
+    assert allocation["solar_surplus_used_kw"] == 6
+    assert allocation["grid_import_used_kw"] == 0
+    assert [slot.projected_ev_load_kw for slot in context.slots] == [0.0, 6, 0.0]
+
+
 def test_hvac_suppression_and_preconditioning_guard_branches_return_no_action() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -326,8 +377,56 @@ def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None
     assert _next_ready_by(now, "bad") == datetime(2026, 6, 28, 7, 0, tzinfo=UTC)
     assert _haeo_battery_arbitrage_value(context, 5) is None
     assert _arbitrage_spread(context) == 0.0
+    assert planner_module._forecast_solar_export_value(context, 5) is None
+    context.slots = [DecisionSlot(now, 0.25, 0.50, None, None)]
+    assert _arbitrage_spread(context) == 0.25
     context.input_health = InputHealth.DEGRADED
     assert DryRunPlanner(DEFAULT_OPTIONS)._confidence(context) == 0.65
+    assert planner_module._display_text("   ") == "Unknown"
+
+
+def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> None:
+    context = _context()
+    context.input_issues = ["pv_forecast_entity_unavailable", "ev_soc_entity_unavailable"]
+    assert planner_module._subsystem_confidence(1.0, "pv_forecast_entity_unavailable", ("pv_forecast",)) == 0.4
+    assert planner_module._battery_reserve_score(context) == 0.1
+    context.current_battery_soc_percent = 35
+    assert planner_module._battery_reserve_score(context) == 0.5
+    context.current_battery_soc_percent = 15
+    assert planner_module._battery_reserve_score(context) == 1.0
+    context.current_battery_soc_percent = None
+    assert planner_module._battery_reserve_score(context) == 0.0
+
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    context.slots = []
+    rejected = planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS, {})
+    assert rejected["reason"] == "Skipped comfort preconditioning because no tariff forecast slots are available."
+    assert planner_module._timeline_card_rows({"bad": "value"}) == []
+
+    context.slots = [DecisionSlot(context.created_at, 0.2, 0.05, None, 1.0)]
+    assert planner_module._forecast_surplus_kwh(context, 5) == 0.0
+
+    action = PlanAction(
+        action_id="ev",
+        plan_id=context.plan_id,
+        execute_not_before=context.created_at,
+        execute_not_after=context.created_at,
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    assert not planner_module._action_meets_confidence_threshold(
+        action,
+        context,
+        {**DEFAULT_OPTIONS, "minimum_ev_confidence": 90.0},
+    )
 
 
 def test_device_plans_include_climate_timeline() -> None:
@@ -572,12 +671,13 @@ def test_active_plan_uses_trip_history_for_ev_target() -> None:
     assert "history_max_daily_consumption" in plan.actions[0].reason_codes
 
 
-def test_active_plan_sets_enphase_arbitrage_profile_when_spread_exceeds_threshold() -> None:
+def test_active_plan_sets_enphase_arbitrage_profile_when_forecast_solar_export_value_exceeds_threshold() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
         "enphase_minimum_savings": 0.25,
+        "planning_interval_minutes": 30,
     }
     context = _context()
     context.current_enphase_profile = "AI Optimisation"
@@ -590,10 +690,13 @@ def test_active_plan_sets_enphase_arbitrage_profile_when_spread_exceeds_threshol
             valid_at=context.created_at + timedelta(minutes=offset),
             import_price=import_price,
             export_price=export_price,
-            pv_forecast_kw=1.0,
+            pv_forecast_kw=pv_forecast_kw,
             baseline_load_forecast_kw=2.0,
         )
-        for offset, import_price, export_price in [(0, 0.05, 0.08), (5, 0.15, 0.42)]
+        for offset, import_price, export_price, pv_forecast_kw in [
+            (0, 0.05, 0.20, 4.0),
+            (30, 0.15, 0.20, 3.0),
+        ]
     ]
 
     plan = DryRunPlanner(options).create_plan(context)
@@ -601,10 +704,32 @@ def test_active_plan_sets_enphase_arbitrage_profile_when_spread_exceeds_threshol
     assert plan.actions[0].asset == ActionAsset.ENPHASE
     assert plan.actions[0].kind == ActionKind.SET_PROFILE
     assert plan.actions[0].desired_state["profile"] == "Self-Consumption"
-    assert plan.actions[0].desired_state["arbitrage_source"] == "price_spread"
+    assert plan.actions[0].desired_state["arbitrage_source"] == "forecast_solar_export_value"
     assert plan.actions[0].desired_state["arbitrage_direction"] == "consume"
-    assert plan.actions[0].expected_cost_delta == 0.37
+    assert plan.actions[0].expected_cost_delta == 0.27
+    assert plan.actions[0].desired_state["arbitrage_details"]["accepted_surplus_kwh"] == 1.5
+    assert plan.actions[0].desired_state["arbitrage_details"]["battery_round_trip_efficiency"] == 0.9
     assert plan.actions[0].requires_haeo_plan_id == context.plan_id
+    assert plan.device_plans["enphase"]["current_state"] == {
+        "state": "AI Optimisation",
+        "profile": "AI Optimisation",
+        "ai_profile": "AI Optimisation",
+        "self_consumption_profile": "Self-Consumption",
+        "full_backup_profile": "Full Backup",
+    }
+    assert plan.device_plans["enphase"]["current_state_label"] == "AI Optimisation"
+    assert plan.device_plans["enphase"]["next_planned_state"] == {
+        "state": "set_profile",
+        "action": "set_profile",
+        "execute_not_before": plan.actions[0].execute_not_before.isoformat(),
+        "execute_not_after": plan.actions[0].execute_not_after.isoformat(),
+        "reason_codes": ["enphase_forecast_solar_export_value_above_threshold"],
+        "profile": "Self-Consumption",
+        "arbitrage_direction": "consume",
+        "arbitrage_source": "forecast_solar_export_value",
+        "arbitrage_value": 0.27,
+    }
+    assert plan.device_plans["enphase"]["next_planned_state_label"] == "Set Profile: Self-Consumption"
 
 
 def test_active_plan_restores_enphase_ai_when_arbitrage_spread_below_threshold() -> None:
@@ -635,7 +760,11 @@ def test_active_plan_restores_enphase_ai_when_arbitrage_spread_below_threshold()
     assert plan.actions[0].asset == ActionAsset.ENPHASE
     assert plan.actions[0].kind == ActionKind.RESTORE_AI
     assert plan.actions[0].desired_state["profile"] == "AI Optimisation"
+    assert plan.actions[0].desired_state["arbitrage_source"] == "insufficient_arbitrage_evidence"
+    assert plan.actions[0].reason_codes == ["enphase_insufficient_arbitrage_evidence_below_threshold"]
     assert plan.actions[0].requires_haeo_plan_id is None
+    assert plan.device_plans["enphase"]["current_state_label"] == "Self-Consumption"
+    assert plan.device_plans["enphase"]["next_planned_state_label"] == "Restore AI: AI Optimisation"
 
 
 def test_active_plan_suppresses_hvac_automation_during_expensive_period_when_comfort_valid() -> None:
@@ -763,6 +892,169 @@ def test_active_plan_uses_thermal_model_for_hvac_precondition_projection() -> No
     assert [slot.projected_hvac_load_kw for slot in context.slots] == [1.8, 1.8, 1.8, 0.0]
     assert plan.device_plans["climate"]["total_estimated_energy_kwh"] == 0.45
     assert plan.device_plans["climate"]["timeline"][0]["estimated_energy_kwh"] == 0.15
+
+
+def test_active_plan_thermal_shifts_heat_during_low_tariff_period() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+    }
+    thermal_model = {
+        "enabled": True,
+        "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 4, "average": 2.0},
+        "passive_indoor_drift_c_per_hour": {"sample_count": 4, "average": -0.5},
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 21.0
+    context.current_outdoor_temperature_c = 5.0
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5.0,
+        )
+        for offset, price in [(0, 0.10), (5, 0.12), (10, 0.15), (15, 0.45)]
+    ]
+
+    plan = DryRunPlanner(options, thermal_model=thermal_model).create_plan(context)
+
+    assert plan.actions[0].asset == ActionAsset.DAIKIN
+    assert plan.actions[0].desired_state["hvac_mode"] == "heat"
+    assert plan.actions[0].desired_state["target_temperature"] == 23.0
+    assert plan.actions[0].desired_state["thermal_shift"] is True
+    assert plan.actions[0].desired_state["comfort_coast_boundary"] == 19.0
+    assert plan.actions[0].desired_state["estimated_coast_hours"] == 8.0
+    assert plan.actions[0].desired_state["active_heat_rate_c_per_hour"] == 2.0
+    assert plan.actions[0].desired_state["precondition_slot_count"] == 3
+    assert "hvac_thermal_shift_before_expensive_period" in plan.actions[0].reason_codes
+    assert [slot.projected_hvac_load_kw for slot in context.slots] == [2.0, 2.0, 2.0, 0.0]
+    assert plan.device_plans["climate"]["next_planned_state_label"] == "Set HVAC: Heat to 23.0 C"
+
+
+def test_active_plan_skips_thermal_shift_when_coast_time_is_too_short() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_precondition_lead_minutes": 120,
+        "hvac_precondition_min_price_delta": 0.20,
+    }
+    thermal_model = {
+        "enabled": True,
+        "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 4, "average": 2.0},
+        "passive_indoor_drift_c_per_hour": {"sample_count": 4, "average": -5.0},
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 21.0
+    context.current_outdoor_temperature_c = 5.0
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5.0,
+        )
+        for offset, price in [(0, 0.10), (30, 0.12), (60, 0.45)]
+    ]
+
+    plan = DryRunPlanner(options, thermal_model=thermal_model).create_plan(context)
+
+    assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
+
+
+def test_thermal_shift_helpers_cover_defensive_branches() -> None:
+    context = _context()
+    context.current_hvac_mode = None
+    context.current_hvac_temperature_c = None
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    peak = DecisionSlot(
+        valid_at=context.created_at + timedelta(minutes=30),
+        import_price=0.50,
+        export_price=0.05,
+        pv_forecast_kw=1.0,
+        baseline_load_forecast_kw=2.0,
+    )
+
+    assert planner_module._thermal_shift_target(context, peak, 5, {}) is None
+
+    context.current_hvac_temperature_c = 18
+    assert planner_module._thermal_shift_target(context, peak, 5, {}) is None
+
+    context.current_hvac_temperature_c = 22.8
+    context.current_hvac_mode = "heat"
+    assert planner_module._thermal_shift_target(context, peak, 5, {}) is None
+
+    context.current_hvac_mode = None
+    context.current_hvac_temperature_c = 21
+    context.current_outdoor_temperature_c = 5
+    assert planner_module._thermal_shift_mode(context, 21, 19, 23) == "heat"
+    context.current_outdoor_temperature_c = 30
+    assert planner_module._thermal_shift_mode(context, 21, 19, 23) == "cool"
+    context.current_outdoor_temperature_c = None
+    assert planner_module._thermal_shift_mode(context, 20, 19, 23) == "heat"
+    assert planner_module._thermal_shift_mode(context, 22, 19, 23) == "cool"
+
+    assert planner_module._effective_passive_drift_c_per_hour(context, "heat", {}) is None
+    context.current_outdoor_temperature_c = 5
+    assert planner_module._effective_passive_drift_c_per_hour(context, "heat", {}) == -0.5
+    context.current_outdoor_temperature_c = 30
+    assert planner_module._effective_passive_drift_c_per_hour(context, "cool", {}) == 0.5
+    context.current_outdoor_temperature_c = 21
+    assert planner_module._effective_passive_drift_c_per_hour(context, "cool", {}) is None
+
+    assert (
+        planner_module._effective_passive_drift_c_per_hour(
+            context,
+            "heat",
+            {"passive_indoor_drift_c_per_hour": {"average": -0.25}},
+        )
+        == -0.25
+    )
+    assert planner_module._thermal_coast_hours(
+        mode="heat",
+        target_temperature=23,
+        comfort_boundary=19,
+        passive_drift_c_per_hour=None,
+    ) is None
+    assert planner_module._thermal_coast_hours(
+        mode="cool",
+        target_temperature=19,
+        comfort_boundary=23,
+        passive_drift_c_per_hour=0.5,
+    ) == 8
+    assert planner_module._thermal_coast_hours(
+        mode="heat",
+        target_temperature=23,
+        comfort_boundary=19,
+        passive_drift_c_per_hour=0.5,
+    ) is None
+    assert planner_module._precondition_slot_count(
+        current_temperature=21,
+        target_temperature=23,
+        mode="heat",
+        interval_minutes=5,
+        max_slots=0,
+        thermal_model={},
+    ) == 0
 
 
 def test_active_plan_uses_replayed_cold_thermal_samples_for_heat_preconditioning() -> None:
@@ -1005,8 +1297,8 @@ def test_enphase_arbitrage_ignores_non_finite_direct_haeo_evidence() -> None:
         DecisionSlot(
             valid_at=context.created_at,
             import_price=0.05,
-            export_price=0.08,
-            pv_forecast_kw=1.0,
+            export_price=0.20,
+            pv_forecast_kw=4.0,
             baseline_load_forecast_kw=2.0,
             haeo_grid_import_forecast_kw=float("nan"),
             haeo_battery_charge_forecast_kw=float("nan"),
@@ -1014,8 +1306,8 @@ def test_enphase_arbitrage_ignores_non_finite_direct_haeo_evidence() -> None:
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=30),
             import_price=0.15,
-            export_price=0.42,
-            pv_forecast_kw=1.0,
+            export_price=0.20,
+            pv_forecast_kw=3.0,
             baseline_load_forecast_kw=2.0,
             haeo_grid_export_forecast_kw=float("inf"),
             haeo_battery_discharge_forecast_kw=float("-inf"),
@@ -1026,9 +1318,9 @@ def test_enphase_arbitrage_ignores_non_finite_direct_haeo_evidence() -> None:
 
     assert plan.actions[0].asset == ActionAsset.ENPHASE
     assert plan.actions[0].desired_state["profile"] == "Self-Consumption"
-    assert plan.actions[0].desired_state["arbitrage_source"] == "price_spread"
+    assert plan.actions[0].desired_state["arbitrage_source"] == "forecast_solar_export_value"
     assert plan.actions[0].desired_state["arbitrage_direction"] == "consume"
-    assert plan.actions[0].expected_cost_delta == 0.37
+    assert plan.actions[0].expected_cost_delta == 0.27
 
 
 def test_enphase_restore_not_suppressed_by_non_finite_direct_haeo_evidence() -> None:
@@ -1061,5 +1353,6 @@ def test_enphase_restore_not_suppressed_by_non_finite_direct_haeo_evidence() -> 
 
     assert plan.actions[0].asset == ActionAsset.ENPHASE
     assert plan.actions[0].kind == ActionKind.RESTORE_AI
-    assert plan.actions[0].desired_state["arbitrage_source"] == "price_spread"
+    assert plan.actions[0].desired_state["arbitrage_source"] == "insufficient_arbitrage_evidence"
+    assert plan.actions[0].reason_codes == ["enphase_insufficient_arbitrage_evidence_below_threshold"]
     assert plan.actions[0].expected_cost_delta == 0.0

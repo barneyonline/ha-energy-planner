@@ -322,7 +322,6 @@ def _service_payload(
 
 def _resolve_ai_service(hass: Any, entry_data: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:
     """Return the supported AI Task service when configured."""
-    service_name = str(entry_data.get(CONF_AI_ADVISOR_SERVICE, "") or "").strip()
     configured_task_entity = str(entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip()
     if configured_task_entity:
         data = dict(entry_data)

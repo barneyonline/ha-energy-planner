@@ -29,6 +29,9 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "estimated_daily_cost": None,
         "forecast_confidence": None,
         "confidence_breakdown": "Unknown",
+        "decision_audit": "Unknown",
+        "rejected_actions": "Unknown",
+        "upcoming_timeline": "Unknown",
         "production_readiness": "Not Ready",
         "control_block_reason": "Production Gate Not Armed",
         "execution_audit": "No Activity",
@@ -36,13 +39,16 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "support_bundle_summary": "No Plan",
         "ai_advice": "Disabled",
         "climate_plan": "Unknown",
+        "climate_decision": "Unknown",
         "climate_current_state": "Unknown",
         "climate_next_state": "Unknown",
         "presence_state": "Unknown",
         "enphase_plan": "Unknown",
+        "enphase_decision": "Unknown",
         "enphase_current_state": "Unknown",
         "enphase_next_state": "Unknown",
         "ev_charging_plan": "Unknown",
+        "ev_decision": "Unknown",
         "ev_current_state": "Unknown",
         "ev_next_state": "Unknown",
         "ev_current_charge_state": "Unknown",
@@ -124,6 +130,67 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert support.attrs_fn(coordinator)["latest_ai"]["reasoning_summary"] == "Looks OK"
 
 
+def test_decision_audit_sensors_expose_accepted_rejected_and_timeline_rows() -> None:
+    plan = _plan()
+    plan.decision_audit = {
+        "summary": "Selected 1 action.",
+        "policy_order": ["cost", "comfort"],
+        "marginal_budget": {"forecast_surplus_kwh": 2.5},
+        "accepted": [
+            {
+                "action_id": "ev-1",
+                "device": "EV",
+                "action": "EV Schedule",
+                "score": 0.8,
+                "reason": "the EV needs charge before its ready-by time",
+            }
+        ],
+    }
+    plan.rejected_actions = [
+        {
+            "device": "Enphase",
+            "action": "Change battery profile",
+            "reason": "Skipped Enphase profile change because EV charging had higher marginal value.",
+        }
+    ]
+    plan.timeline_card = [
+        {
+            "time": "12:00-12:30",
+            "device": "EV",
+            "action": "Charging",
+            "reason": "Solar surplus",
+            "estimated_kwh": 3.5,
+            "estimated_value": 0.2,
+        }
+    ]
+    coordinator = _coordinator(plan)
+
+    assert next(item for item in SENSORS if item.key == "decision_audit").value_fn(coordinator) == "1 Accepted"
+    assert next(item for item in SENSORS if item.key == "rejected_actions").value_fn(coordinator) == "1 Rejected"
+    assert next(item for item in SENSORS if item.key == "upcoming_timeline").value_fn(coordinator) == "1 Upcoming"
+    assert next(item for item in SENSORS if item.key == "ev_decision").value_fn(coordinator) == "Accepted"
+    assert next(item for item in SENSORS if item.key == "enphase_decision").value_fn(coordinator) == "Rejected"
+    ev_attrs = next(item for item in SENSORS if item.key == "ev_decision").attrs_fn(coordinator)
+    timeline_attrs = next(item for item in SENSORS if item.key == "upcoming_timeline").attrs_fn(coordinator)
+    assert ev_attrs["summary"] == "EV action was selected because the EV needs charge before its ready-by time."
+    assert timeline_attrs["rows"][0]["estimated_kwh"] == 3.5
+
+    empty_plan = _plan()
+    empty_coordinator = _coordinator(empty_plan)
+    assert next(item for item in SENSORS if item.key == "decision_audit").attrs_fn(empty_coordinator)["accepted"] == []
+    assert (
+        next(item for item in SENSORS if item.key == "rejected_actions").attrs_fn(empty_coordinator)["rejected"] == []
+    )
+    assert (
+        sensor_module._device_decision_summary(ActionAsset.DAIKIN, None, {"device": "Climate"})
+        == "Climate action was considered but not selected."
+    )
+    assert (
+        sensor_module._device_decision_summary(ActionAsset.DAIKIN, None, None)
+        == "Climate was not considered in this planning run."
+    )
+
+
 def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
     plan = _plan()
     plan.confidence = 0.7
@@ -188,7 +255,10 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
     assert sensor_module._latest_forecast_snapshot(_coordinator(plan, store_data={"forecast_snapshots": "bad"})) == {}
     assert (
         sensor_module._confidence_sources(
-            _coordinator(plan, store_data={"forecast_snapshots": [{"plan_id": "plan-1", "confidence": {"sources": "bad"}}]})
+            _coordinator(
+                plan,
+                store_data={"forecast_snapshots": [{"plan_id": "plan-1", "confidence": {"sources": "bad"}}]},
+            )
         )
         == []
     )
@@ -307,7 +377,7 @@ def test_plan_status_attributes_are_json_friendly_and_bounded() -> None:
     assert len(attrs["preview"]) == 12
 
 
-def test_next_action_sensor_exposes_compact_json_action() -> None:
+def test_next_action_sensor_exposes_plain_english_action() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     action = PlanAction(
         action_id="ev-1",
@@ -329,22 +399,17 @@ def test_next_action_sensor_exposes_compact_json_action() -> None:
 
     attrs = description.attrs_fn(coordinator)
 
-    assert description.value_fn(coordinator) == "EV Schedule"
+    assert description.value_fn(coordinator) == "Schedule EV charging"
     assert attrs == {
-        "action": {
-            "action_id": "ev-1",
-            "plan_id": "plan-1",
-            "execute_not_before": "2026-06-27T00:00:00+00:00",
-            "execute_not_after": "2026-06-27T00:05:00+00:00",
-            "asset": "ev",
-            "kind": "ev_schedule",
-            "desired_state": {"target_soc_percent": 80},
-            "hard_constraints": ["ev_bounds"],
-            "reason_codes": ["least_cost_slots_before_ready_by"],
-            "expected_cost_delta": -0.25,
-            "confidence": 0.8,
-            "requires_haeo_plan_id": None,
-        }
+        "action": "Schedule EV charging",
+        "decision": "Schedule EV charging to 80%.",
+        "when": "00:00-00:05",
+        "why": "Charging was placed in the cheapest slots before the ready-by time.",
+        "constraints": ["EV Bounds"],
+        "desired_state": {"Target SOC percent": 80},
+        "estimated_value": -0.25,
+        "confidence": "80.0%",
+        "requires_haeo_plan": False,
     }
 
 
@@ -384,12 +449,15 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
     climate = next(item for item in SENSORS if item.key == "climate_plan")
     ev = next(item for item in SENSORS if item.key == "ev_charging_plan")
 
-    assert climate.value_fn(coordinator) == "Set HVAC"
-    assert climate.attrs_fn(coordinator)["planned_actions"][0]["desired_state"]["target_temperature"] == 22
-    assert ev.value_fn(coordinator) == "EV Schedule"
+    assert climate.value_fn(coordinator) == "Change climate state"
+    climate_attrs = climate.attrs_fn(coordinator)
+    assert climate_attrs["planned_actions"][0]["decision"] == "Set climate to Cool at 22 C."
+    assert climate_attrs["planned_actions"][0]["why"] == "Preconditioning before a more expensive electricity period."
+    assert climate_attrs["planned_actions"][0]["desired_state"]["Target temperature C"] == 22
+    assert ev.value_fn(coordinator) == "Schedule EV charging"
     ev_attrs = ev.attrs_fn(coordinator)
     assert ev_attrs["trip_history_record_count"] == 2
-    assert ev_attrs["planned_actions"][0]["desired_state"]["allocated_slots"][-1] == {"truncated_count": 8}
+    assert ev_attrs["planned_actions"][0]["desired_state"]["Charging windows"] == 20
 
 
 def test_asset_plan_sensors_filter_issues_to_device() -> None:
@@ -413,22 +481,22 @@ def test_asset_plan_sensors_filter_issues_to_device() -> None:
     enphase = next(item for item in SENSORS if item.key == "enphase_plan")
 
     assert ev.attrs_fn(coordinator)["issues"] == [
-        "amber_import_price_entity_unavailable",
-        "ev_soc_entity_unavailable",
-        "ev_connected_entity_unavailable",
+        "Amber Import Price Entity Unavailable",
+        "EV SOC Entity Unavailable",
+        "EV Connected Entity Unavailable",
     ]
     assert climate.attrs_fn(coordinator)["issues"] == [
-        "amber_import_price_entity_unavailable",
-        "daikin_climate_entity_unavailable",
-        "daikin_power_entity_unavailable",
+        "Amber Import Price Entity Unavailable",
+        "Daikin Climate Entity Unavailable",
+        "Daikin Power Entity Unavailable",
     ]
     assert enphase.attrs_fn(coordinator)["issues"] == [
-        "amber_import_price_entity_unavailable",
-        "amber_export_price_entity_unavailable",
-        "pv_forecast_entity_unavailable",
-        "baseline_load_forecast_entity_unavailable",
-        "battery_soc_entity_unavailable",
-        "enphase_profile_entity_unavailable",
+        "Amber Import Price Entity Unavailable",
+        "Amber Export Price Entity Unavailable",
+        "PV Forecast Entity Unavailable",
+        "Baseline Load Forecast Entity Unavailable",
+        "Battery SOC Entity Unavailable",
+        "Enphase Profile Entity Unavailable",
     ]
 
 
@@ -470,19 +538,12 @@ def test_asset_plan_sensors_expose_device_timeline() -> None:
     assert attrs["horizon_hours"] == 24
     assert attrs["interval_minutes"] == 5
     assert attrs["total_estimated_energy_kwh"] == 1.2
-    assert attrs["current_state_label"] == "Heat (21.5 C)"
-    assert attrs["current_state"]["hvac_mode"] == "heat"
-    assert attrs["next_planned_state_label"] == "Preconditioning: Heat to 22 C"
-    assert attrs["next_planned_state"]["target_temperature"] == 22
+    assert "current_state_label" not in attrs
+    assert "current_state" not in attrs
+    assert "next_planned_state_label" not in attrs
+    assert "next_planned_state" not in attrs
     assert attrs["timeline_segment_count"] == 1
-    assert attrs["timeline"] == [
-        {
-            "start": "2026-06-27T00:00:00+00:00",
-            "end": "2026-06-27T00:30:00+00:00",
-            "state": "preconditioning",
-            "target_temperature": 22,
-        }
-    ]
+    assert attrs["timeline_summary"] == ["00:00-00:30: Preconditioning."]
 
 
 def test_asset_state_sensors_expose_current_and_next_labels() -> None:
@@ -584,8 +645,8 @@ def test_asset_state_attributes_prefer_explicit_current_and_next_state() -> None
     current = next(item for item in SENSORS if item.key == "climate_current_state")
     next_state = next(item for item in SENSORS if item.key == "climate_next_state")
 
-    assert current.attrs_fn(coordinator)["state"] == {"state": "cool", "hvac_mode": "cool"}
-    assert next_state.attrs_fn(coordinator)["state"]["target_temperature"] == 23
+    assert current.attrs_fn(coordinator)["details"] == {"State": "Cool", "Climate mode": "Cool"}
+    assert next_state.attrs_fn(coordinator)["details"]["Target temperature C"] == 23
 
 
 def test_ev_charge_state_sensors_expose_live_and_planned_charge_state() -> None:
@@ -728,7 +789,7 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
     assert attrs["ai_task_entity"] == "ai_task.extended_openai_ai_task"
     assert attrs["alerts"] == ["PV forecast confidence is low"]
     assert attrs["reasoning_summary"] == "Use extra forecast buffer."
-    assert attrs["accepted"]["suggested_forecast_buffer_percent"] == 12
+    assert attrs["suggested_forecast_buffer_percent"] == 12
 
 
 def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads() -> None:
@@ -756,7 +817,6 @@ def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads
     assert description.value_fn(coordinator) == "Unknown"
     assert attrs["alerts"] == []
     assert attrs["rejected_detail"] == {}
-    assert attrs["accepted"] == {}
 
 
 def test_ai_advice_sensor_exposes_rejection_detail() -> None:
@@ -820,6 +880,64 @@ def test_ai_advice_sensor_builds_rejection_detail_for_legacy_history() -> None:
 
 
 def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    profile_action = PlanAction(
+        action_id="enphase-1",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.ENPHASE,
+        kind=ActionKind.SET_PROFILE,
+        desired_state={"profile": "Self-Consumption"},
+        hard_constraints=[],
+        reason_codes=["enphase_price_spread_above_threshold"],
+        expected_cost_delta=0.3,
+        confidence=0.7,
+        requires_haeo_plan_id="plan-1",
+    )
+    restore_action = PlanAction(
+        action_id="enphase-restore",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.ENPHASE,
+        kind=ActionKind.RESTORE_AI,
+        desired_state={"profile": "AI Optimisation"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    climate_action = PlanAction(
+        action_id="climate-1",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={"hvac_mode": "off"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    start_action = PlanAction(
+        action_id="ev-start",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+
     assert sensor_module._asset_plan_state(_plan(), ActionAsset.EV) == "Idle"
     assert sensor_module._asset_timeline_state({"timeline": []}, "current") == {"state": "unknown"}
     assert sensor_module._asset_timeline_state({"timeline": ["bad", {"state": "charging"}]}, "current") == {
@@ -838,6 +956,35 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         sensor_module._timeline_state_label({"state": "preconditioning", "hvac_mode": "heat"})
         == "Preconditioning: Heat"
     )
+    assert sensor_module._timeline_summary(["bad"] + [{"state": "idle"} for _ in range(13)])[-1] == (
+        "2 more segment(s) omitted."
+    )
+    assert sensor_module._plain_action(profile_action)["decision"] == "Switch Enphase profile to Self-Consumption."
+    assert sensor_module._plain_action(profile_action)["requires_haeo_plan"] is True
+    assert sensor_module._action_sentence(restore_action) == "Restore Enphase to AI Optimisation."
+    assert sensor_module._action_sentence(climate_action) == "Set climate to Off."
+    assert sensor_module._action_sentence(start_action) == "Start EV charging"
+    assert sensor_module._plain_state_details(
+        {
+            "state": "set_hvac",
+            "reason_codes": ["hvac_thermal_shift_before_expensive_period"],
+            "execute_not_before": now.isoformat(),
+            "bad_time": "not-a-time",
+            "ignored": None,
+        }
+    ) == {
+        "State": "Set HVAC",
+        "Reasons": [
+            "Heating or cooling now because electricity is cheap and the home can coast through a later "
+            "expensive period."
+        ],
+        "Start": "00:00",
+        "Bad Time": "not-a-time",
+    }
+    assert sensor_module._reason_summary("away_hvac_policy") == "Nobody is home, so climate control can be reduced."
+    assert sensor_module._reason_summary(123) == ""
+    assert sensor_module._time_label(None) is None
+    assert sensor_module._time_label("not-a-time") == "not-a-time"
     assert sensor_module._charge_state_label_from_raw("unknown") is None
     assert (
         sensor_module._charge_timeline_state_label({"state": "charging", "target_soc_percent": 80}) == "Charging to 80%"
@@ -848,6 +995,7 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
     assert sensor_module._bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {
         "a": {"b": {"c": {"d": "<truncated>"}}}
     }
+    assert sensor_module._bounded_json(list(range(13)))[-1] == {"truncated_count": 1}
 
 
 def test_sensor_configured_state_and_presence_helpers_cover_fallbacks() -> None:
@@ -886,7 +1034,7 @@ def test_sensor_asset_attrs_handle_missing_actions_and_non_dict_device_plan() ->
 
     assert attrs["planned_action_count"] == 0
     assert attrs["timeline_segment_count"] == 0
-    assert attrs["issues"] == ["ev_soc_entity_unavailable"]
+    assert attrs["issues"] == ["EV SOC Entity Unavailable"]
     assert sensor_module._first_asset_action(plan, ActionAsset.EV) is None
 
 

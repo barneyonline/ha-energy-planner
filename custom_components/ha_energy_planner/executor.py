@@ -44,6 +44,8 @@ _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _HAEO_FALLBACK_NOTIFICATION_ID,
 )
 PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
+ACTION_BACKOFF_DURATION = timedelta(minutes=10)
+CONFLICT_DETECTION_WINDOW = timedelta(minutes=2)
 
 
 class Executor:
@@ -112,6 +114,21 @@ class Executor:
                 )
                 return
         reason = self._rejection_reason(plan)
+        conflict_reason = self._observed_conflict_reason(action, now)
+        if reason is None and conflict_reason is not None:
+            await self._async_pause_asset_control(action.asset, now, conflict_reason, CONFLICT_DETECTION_WINDOW)
+            await self.store.async_add_outcome(
+                self._action_outcome(
+                    action,
+                    now,
+                    result=OutcomeResult.REJECTED,
+                    reason=conflict_reason,
+                    pre_state={},
+                    post_state={},
+                    plan_id=plan.plan_id,
+                )
+            )
+            return
         control_reason = self._control_rejection_reason(action, now)
         if reason is None and control_reason is not None:
             await self.store.async_add_outcome(
@@ -143,6 +160,8 @@ class Executor:
         if reason is None and action.asset == ActionAsset.EV and self.hass is not None:
             result = await EVSmartChargingAdapter(self.hass, self.entry_data).async_execute(action)
             await self._async_record_command_attempt(action, now)
+            if not result.applied:
+                await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
             if result.applied:
                 ownership = dict(self.store.data.get("ownership", {}))
                 if "ev_smart_charging_state" not in ownership:
@@ -163,6 +182,8 @@ class Executor:
         if reason is None and action.asset == ActionAsset.DAIKIN and self.hass is not None:
             result = await DaikinHVACAdapter(self.hass, self.entry_data).async_execute(action)
             await self._async_record_command_attempt(action, now)
+            if not result.applied:
+                await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
             if result.applied and result.reason != "already_in_desired_hvac_state":
                 ownership_data = dict(self.store.data.get("ownership", {}))
                 ownership_data["climate_automations"] = result.saved_automation_states
@@ -184,6 +205,8 @@ class Executor:
         if reason is None and action.asset == ActionAsset.ENPHASE and self.hass is not None:
             result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_execute(action)
             await self._async_record_command_attempt(action, now)
+            if not result.applied:
+                await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
             if result.applied:
                 ownership_data = dict(self.store.data.get("ownership", {}))
                 if action.kind == ActionKind.RESTORE_AI:
@@ -328,6 +351,55 @@ class Executor:
         limits = dict(self.store.data.get("command_rate_limits", {}))
         limits[_command_rate_limit_key(action)] = attempted_at
         await self.store.async_save_command_rate_limits(limits)
+
+    async def _async_pause_asset_control(
+        self,
+        asset: ActionAsset,
+        now: datetime,
+        reason: str,
+        duration: timedelta,
+    ) -> None:
+        """Pause one asset after failed or conflicting active control."""
+        pause = {
+            "active": True,
+            "assets": [str(asset)],
+            "until": now + duration,
+            "reason": reason,
+        }
+        save_pause = getattr(self.store, "async_save_control_pause", None)
+        if callable(save_pause):
+            await save_pause(pause)
+        else:
+            self.store.data["control_pause"] = pause
+
+    def _observed_conflict_reason(self, action: Any, now: datetime) -> str | None:
+        """Return a conflict reason when another automation appears to have changed planner-owned state."""
+        if self.hass is None:
+            return None
+        recent = _latest_applied_audit_for_asset(self.store.data.get("execution_audit"), action.asset, now)
+        if recent is None:
+            return None
+        target = _service_target_for_action(action, self.entry_data)
+        entity_id = _entity_id_from_service_target(target)
+        if not entity_id:
+            return None
+        state = self.hass.states.get(entity_id)
+        if state is None:
+            return None
+        observed = str(getattr(state, "state", "") or "")
+        post_state = dict(recent.get("post_state", {}))
+        if action.asset == ActionAsset.ENPHASE:
+            expected = (
+                post_state.get("current_profile")
+                or post_state.get("profile")
+                or action.desired_state.get("profile")
+            )
+            if expected and observed != str(expected):
+                return "external_enphase_profile_conflict"
+        if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_START, ActionKind.EV_SCHEDULE}:
+            if observed.lower() in {"off", "false", "0", "idle", "not_charging"}:
+                return "external_ev_charging_conflict"
+        return None
 
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         """Create persistent notifications for major plan fallback classes."""
@@ -510,6 +582,33 @@ def _service_target_for_action(action: Any, entry_data: dict[str, Any]) -> str |
         if service and entity:
             return f"{service}:{entity}"
         return service or entity
+    return None
+
+
+def _entity_id_from_service_target(target: str | None) -> str | None:
+    """Return an entity ID from a service target string."""
+    if not target:
+        return None
+    text = str(target)
+    if ":" in text:
+        text = text.split(":", 1)[1]
+    return text if "." in text else None
+
+
+def _latest_applied_audit_for_asset(audit: Any, asset: ActionAsset, now: datetime) -> dict[str, Any] | None:
+    """Return the latest recent applied audit row for an asset."""
+    if not isinstance(audit, list):
+        return None
+    cutoff = now - CONFLICT_DETECTION_WINDOW
+    for item in reversed(audit):
+        if not isinstance(item, dict) or item.get("asset") != str(asset):
+            continue
+        if item.get("result") != str(OutcomeResult.APPLIED):
+            continue
+        attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
+        if attempted_at is None or attempted_at < cutoff:
+            continue
+        return item
     return None
 
 

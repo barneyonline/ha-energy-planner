@@ -278,8 +278,8 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
         DEVICE_PRESENCE,
         DEVICE_SYSTEM,
         OPTIONAL_DEVICE_KEYS,
-        planner_device_identifier,
         planner_device_configured,
+        planner_device_identifier,
         planner_device_key_for_entity,
     )
 
