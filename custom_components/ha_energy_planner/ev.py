@@ -54,6 +54,9 @@ class EVChargeAllocation:
     charge_kw: float
     added_soc_percent: float
     import_price: float
+    effective_price: float | None = None
+    solar_surplus_used_kw: float = 0.0
+    grid_import_used_kw: float = 0.0
 
 
 @dataclass(slots=True)
@@ -281,7 +284,11 @@ def allocate_least_cost_charging(
     soc_per_kwh: float,
     interval_minutes: int,
 ) -> EVChargeSchedule:
-    """Allocate EV charging to cheapest feasible slots before ready-by."""
+    """Allocate EV charging to cheapest feasible slots before ready-by.
+
+    Slot ranking is solar-aware: surplus PV is valued at the foregone feed-in
+    price, and any remaining charge power is valued at the grid import price.
+    """
     required = max(target_soc_percent - current_soc_percent, 0.0)
     if required == 0:
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, 0.0, False, "already_at_target")
@@ -291,7 +298,14 @@ def allocate_least_cost_charging(
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, required, True, "ev_charge_rate_invalid")
 
     feasible_slots = [slot for slot in slots if slot.valid_at < ready_by and slot.import_price is not None]
-    ordered = sorted(feasible_slots, key=lambda slot: (slot.import_price, slot.valid_at))
+    ordered = sorted(
+        feasible_slots,
+        key=lambda slot: (
+            _effective_charge_price(slot, charge_rate_kw),
+            float(slot.import_price),
+            slot.valid_at,
+        ),
+    )
     remaining = required
     allocations: list[EVChargeAllocation] = []
     for slot in ordered:
@@ -300,26 +314,71 @@ def allocate_least_cost_charging(
         added_soc = min(soc_per_slot, remaining)
         charge_fraction = added_soc / soc_per_slot
         charge_kw = round(charge_rate_kw * charge_fraction, 6)
+        effective_price, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
         allocations.append(
             EVChargeAllocation(
                 valid_at=slot.valid_at,
                 charge_kw=charge_kw,
                 added_soc_percent=round(added_soc, 6),
                 import_price=float(slot.import_price),
+                effective_price=effective_price,
+                solar_surplus_used_kw=solar_kw,
+                grid_import_used_kw=grid_kw,
             )
         )
         remaining -= added_soc
 
     scheduled = target_soc_percent - max(remaining, 0.0)
     infeasible = remaining > 0.000001
+    used_solar_surplus = any(allocation.solar_surplus_used_kw > 0 for allocation in allocations)
     return EVChargeSchedule(
         allocations=allocations,
         target_soc_percent=round(target_soc_percent, 3),
         scheduled_soc_percent=round(scheduled, 3),
         required_charge_percent=round(required, 3),
         infeasible=infeasible,
-        reason="infeasible_before_ready_by" if infeasible else "least_cost_slots_before_ready_by",
+        reason="infeasible_before_ready_by"
+        if infeasible
+        else "least_cost_solar_aware_slots_before_ready_by"
+        if used_solar_surplus
+        else "least_cost_slots_before_ready_by",
     )
+
+
+def _effective_charge_price(slot: Any, charge_kw: float) -> float:
+    """Return the effective unit price for EV charging in one slot."""
+    effective_price, _solar_kw, _grid_kw = _charge_cost_components(slot, charge_kw)
+    if effective_price is not None:
+        return effective_price
+    return float(slot.import_price)
+
+
+def _charge_cost_components(slot: Any, charge_kw: float) -> tuple[float | None, float, float]:
+    """Return effective price plus solar/grid split for one charging slot."""
+    if charge_kw <= 0:
+        return None, 0.0, 0.0
+    import_price = _float_or_none(getattr(slot, "import_price", None))
+    if import_price is None:
+        return None, 0.0, round(charge_kw, 6)
+    surplus_kw = _solar_surplus_kw(slot)
+    solar_kw = min(charge_kw, surplus_kw)
+    grid_kw = max(charge_kw - solar_kw, 0.0)
+    export_price = _float_or_none(getattr(slot, "export_price", None)) or 0.0
+    effective_price = ((solar_kw * export_price) + (grid_kw * import_price)) / charge_kw
+    return round(effective_price, 6), round(solar_kw, 6), round(grid_kw, 6)
+
+
+def _solar_surplus_kw(slot: Any) -> float:
+    """Return forecast PV surplus available for flexible EV charging."""
+    pv_kw = _float_or_none(getattr(slot, "pv_forecast_kw", None))
+    load_kw = _float_or_none(getattr(slot, "baseline_load_forecast_kw", None))
+    if pv_kw is None or load_kw is None:
+        return 0.0
+    existing_flexible_load_kw = (
+        (_float_or_none(getattr(slot, "projected_hvac_load_kw", None)) or 0.0)
+        + (_float_or_none(getattr(slot, "projected_ev_load_kw", None)) or 0.0)
+    )
+    return round(max(pv_kw - load_kw - existing_flexible_load_kw, 0.0), 6)
 
 
 def _clamp(value: float, low: float, high: float) -> float:

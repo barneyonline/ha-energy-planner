@@ -38,8 +38,12 @@ from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BASELINE_LOAD_FORECAST,
+    CONF_BATTERY_MAX_CHARGE_KW,
+    CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
+    CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC,
+    CONF_BATTERY_USABLE_CAPACITY_KWH,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -85,6 +89,12 @@ from .const import (
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
+    CONF_MIN_CLIMATE_CONFIDENCE,
+    CONF_MIN_ENPHASE_CONFIDENCE,
+    CONF_MIN_EV_CONFIDENCE,
+    CONF_MIN_LOAD_CONFIDENCE,
+    CONF_MIN_SOLAR_CONFIDENCE,
+    CONF_MIN_TARIFF_CONFIDENCE,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -285,6 +295,10 @@ _POLICY_SECTION_FIELDS = {
     ),
     POLICY_STEP_EV_BATTERY_GRID: (
         CONF_BATTERY_MIN_SOC_PERCENT,
+        CONF_BATTERY_USABLE_CAPACITY_KWH,
+        CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+        CONF_BATTERY_MAX_CHARGE_KW,
+        CONF_BATTERY_MAX_DISCHARGE_KW,
         CONF_EV_MIN_SOC_PERCENT,
         CONF_EV_MAX_SOC_PERCENT,
         CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
@@ -322,6 +336,12 @@ _POLICY_SECTION_FIELDS = {
         CONF_PRICE_FRESHNESS_MINUTES,
         CONF_FORECAST_FRESHNESS_MINUTES,
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
+        CONF_MIN_TARIFF_CONFIDENCE,
+        CONF_MIN_SOLAR_CONFIDENCE,
+        CONF_MIN_LOAD_CONFIDENCE,
+        CONF_MIN_CLIMATE_CONFIDENCE,
+        CONF_MIN_EV_CONFIDENCE,
+        CONF_MIN_ENPHASE_CONFIDENCE,
     ),
     POLICY_STEP_PRIORITIES: _PRIORITY_FORM_FIELDS,
 }
@@ -372,6 +392,18 @@ def _option_selector(field: str) -> Any:
         CONF_DEFAULT_READY_BY: TextSelector(TextSelectorConfig()),
         CONF_BATTERY_MIN_SOC_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_BATTERY_USABLE_CAPACITY_KWH: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=0.1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: NumberSelector(
+            NumberSelectorConfig(min=1, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_BATTERY_MAX_CHARGE_KW: NumberSelector(
+            NumberSelectorConfig(min=0, max=50, step=0.1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_BATTERY_MAX_DISCHARGE_KW: NumberSelector(
+            NumberSelectorConfig(min=0, max=50, step=0.1, mode=NumberSelectorMode.BOX)
         ),
         CONF_EV_MIN_SOC_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
@@ -431,6 +463,24 @@ def _option_selector(field: str) -> Any:
             NumberSelectorConfig(min=1, max=1440, step=5, mode=NumberSelectorMode.BOX)
         ),
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_TARIFF_CONFIDENCE: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_SOLAR_CONFIDENCE: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_LOAD_CONFIDENCE: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_CLIMATE_CONFIDENCE: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_EV_CONFIDENCE: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_MIN_ENPHASE_CONFIDENCE: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_ENPHASE_MIN_SAVINGS: NumberSelector(

@@ -153,6 +153,61 @@ def test_ev_schedule_sets_helpers_then_starts() -> None:
     ]
 
 
+def test_set_ready_by_updates_helper_without_starting_charging() -> None:
+    hass = FakeHass({"input_datetime.ev_ready_by": "06:00:00", "switch.ev_start": "off"})
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ev_ready_by",
+            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+        },
+    )
+
+    result = asyncio.run(adapter.async_set_ready_by("23:45"))
+
+    assert result.applied is True
+    assert result.reason == "ev_ready_by_helper_updated"
+    assert result.pre_state[CONF_EV_SMART_CHARGING_READY_BY] == "06:00:00"
+    assert result.post_state[CONF_EV_SMART_CHARGING_READY_BY] == "23:45"
+    assert hass.states.values["switch.ev_start"] == "off"
+    assert hass.services.calls == [
+        ("input_datetime", "set_datetime", {"entity_id": "input_datetime.ev_ready_by", "time": "23:45"})
+    ]
+
+
+def test_set_ready_by_reports_missing_helper() -> None:
+    adapter = EVSmartChargingAdapter(FakeHass({}), {})
+
+    result = asyncio.run(adapter.async_set_ready_by("23:45"))
+
+    assert result.applied is False
+    assert result.reason == "ev_ready_by_helper_not_configured"
+
+
+def test_set_ready_by_reports_unsupported_helper_domain() -> None:
+    adapter = EVSmartChargingAdapter(
+        FakeHass({"sensor.ready_by": "06:00"}),
+        {CONF_EV_SMART_CHARGING_READY_BY: "sensor.ready_by"},
+    )
+
+    result = asyncio.run(adapter.async_set_ready_by("23:45"))
+
+    assert result.applied is False
+    assert result.reason == "ev_ready_by_helper_unsupported"
+
+
+def test_set_ready_by_reports_helper_service_failure() -> None:
+    adapter = EVSmartChargingAdapter(
+        FailingHass({"input_datetime.ready_by": "06:00:00"}),
+        {CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ready_by"},
+    )
+
+    result = asyncio.run(adapter.async_set_ready_by("23:45"))
+
+    assert result.applied is False
+    assert result.reason == "ev_ready_by_helper_unsupported"
+
+
 def test_ev_schedule_skips_helper_writes_when_values_already_match() -> None:
     hass = FakeHass(
         {

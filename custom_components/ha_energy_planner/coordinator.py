@@ -26,6 +26,7 @@ from .const import (
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_EV_CONNECTED,
+    CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -42,6 +43,7 @@ from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import update_trip_history_from_values
+from .ev_adapter import EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
@@ -361,6 +363,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Set runtime ready-by override."""
         self.ready_by = ready_by
+        entry_data = self.entry_data
+        if entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
+            await EVSmartChargingAdapter(self.hass, entry_data).async_set_ready_by(ready_by)
         self._mark_replan_requested()
         await self.async_request_refresh()
 

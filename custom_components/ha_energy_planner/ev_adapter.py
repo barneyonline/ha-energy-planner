@@ -74,6 +74,20 @@ class EVSmartChargingAdapter:
         result = await self._async_stop()
         return EVCommandResult(result.applied, result.reason, pre_state, self._snapshot())
 
+    async def async_set_ready_by(self, ready_by: str) -> EVCommandResult:
+        """Set the configured EV ready-by helper without starting or stopping charging."""
+        pre_state = self._snapshot()
+        ready_by_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
+        if not ready_by_entity:
+            return EVCommandResult(False, "ev_ready_by_helper_not_configured", pre_state, self._snapshot())
+        if not self._entity_value_matches(ready_by_entity, ready_by) and not self._can_set_entity_value(
+            ready_by_entity
+        ):
+            return EVCommandResult(False, "ev_ready_by_helper_unsupported", pre_state, self._snapshot())
+        if not await self._async_set_entity_value(ready_by_entity, ready_by):
+            return EVCommandResult(False, "ev_ready_by_helper_unsupported", pre_state, self._snapshot())
+        return EVCommandResult(True, "ev_ready_by_helper_updated", pre_state, self._snapshot())
+
     async def _async_start(self, action: PlanAction) -> EVCommandResult:
         connected = self._state(self.entry_data.get(CONF_EV_CONNECTED))
         if connected is not None and not _truthy_state(connected):
@@ -101,12 +115,16 @@ class EVSmartChargingAdapter:
         if target_soc is not None:
             if not target_entity:
                 return EVCommandResult(False, "ev_target_soc_helper_not_configured", self._snapshot(), self._snapshot())
-            if not self._entity_value_matches(target_entity, target_soc) and not self._can_set_entity_value(target_entity):
+            if not self._entity_value_matches(target_entity, target_soc) and not self._can_set_entity_value(
+                target_entity
+            ):
                 return EVCommandResult(False, "ev_target_soc_helper_unsupported", self._snapshot(), self._snapshot())
         if ready_by is not None:
             if not ready_by_entity:
                 return EVCommandResult(False, "ev_ready_by_helper_not_configured", self._snapshot(), self._snapshot())
-            if not self._entity_value_matches(ready_by_entity, ready_by) and not self._can_set_entity_value(ready_by_entity):
+            if not self._entity_value_matches(ready_by_entity, ready_by) and not self._can_set_entity_value(
+                ready_by_entity
+            ):
                 return EVCommandResult(False, "ev_ready_by_helper_unsupported", self._snapshot(), self._snapshot())
         if target_soc is not None and not await self._async_set_entity_value(target_entity, target_soc):
             return EVCommandResult(False, "ev_target_soc_helper_unsupported", self._snapshot(), self._snapshot())

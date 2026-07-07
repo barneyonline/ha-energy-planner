@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -15,6 +16,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_EV_CONNECTED,
+    CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
@@ -1149,6 +1151,29 @@ def test_request_replan_and_ready_by_mark_generation_and_refresh() -> None:
     assert coordinator.ready_by == "09:15"
     assert coordinator.refresh_requested == 2
     assert coordinator._refresh_generation == 2
+
+
+def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
+    calls: list[tuple[object, dict[str, object], str]] = []
+
+    class FakeEVAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, object]) -> None:
+            self.hass = hass
+            self.entry_data = entry_data
+
+        async def async_set_ready_by(self, ready_by: str) -> None:
+            calls.append((self.hass, self.entry_data, ready_by))
+
+    monkeypatch.setattr(coordinator_module, "EVSmartChargingAdapter", FakeEVAdapter)
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ev_ready_by"}
+    )
+
+    asyncio.run(coordinator.async_set_ready_by("23:45"))
+
+    assert coordinator.ready_by == "23:45"
+    assert coordinator.refresh_requested == 1
+    assert calls == [(coordinator.hass, coordinator.entry_data, "23:45")]
 
 
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
