@@ -37,6 +37,5 @@
 ### Validation
 
 - `ruff check custom_components/ha_energy_planner tests`
-- Dockerized pytest and coverage: `486 passed`, `100%` coverage
+- Dockerized pytest and coverage: `492 passed`, `100%` coverage
 - Translation JSON validation
-
