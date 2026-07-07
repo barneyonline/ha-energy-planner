@@ -582,7 +582,7 @@ automation:
       - delay: "00:00:03"
       - action: switch.turn_off
         data:
-          entity_id: switch.climate_climate_control_enabled
+          entity_id: switch.climate_control_enabled
       - delay: "00:00:02"
       - action: input_number.set_value
         data:
@@ -671,7 +671,7 @@ automation:
       - delay: "00:00:02"
       - action: switch.turn_on
         data:
-          entity_id: switch.ai_ai_enabled
+          entity_id: switch.ai_enabled
       - delay: "00:00:02"
       - action: button.press
         data:
@@ -700,7 +700,7 @@ automation:
       - action: input_text.set_value
         data:
           entity_id: input_text.planner_ai_enabled_seen
-          value: "{{ states('switch.ai_ai_enabled') }}"
+          value: "{{ states('switch.ai_enabled') }}"
       - action: input_text.set_value
         data:
           entity_id: input_text.planner_replan_button_seen
@@ -960,7 +960,7 @@ expected_entities = {
     "binary_sensor.system_takeover_active",
     "switch.system_enabled",
     "switch.system_dry_run",
-    "switch.ai_ai_enabled",
+    "switch.ai_enabled",
     "button.system_replan",
     "button.system_restore_safe_state",
 }
