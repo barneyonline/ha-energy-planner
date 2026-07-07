@@ -525,16 +525,16 @@
         "name": "Dry run"
       },
       "ai_enabled": {
-        "name": "AI enabled"
+        "name": "Enabled"
       },
       "ev_control_enabled": {
-        "name": "EV control enabled"
+        "name": "Control enabled"
       },
       "climate_control_enabled": {
-        "name": "Climate control enabled"
+        "name": "Control enabled"
       },
       "enphase_control_enabled": {
-        "name": "Enphase control enabled"
+        "name": "Control enabled"
       }
     },
     "button": {

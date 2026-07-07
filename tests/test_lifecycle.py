@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from custom_components.ha_energy_planner import (
+    _async_migrate_duplicate_entity_ids,
     _async_remove_legacy_device,
     _async_sync_planner_devices,
     _async_update_listener,
@@ -228,6 +229,41 @@ def test_remove_legacy_device_clears_planner_entity_device_ids(monkeypatch: pyte
 
     assert updated == [("sensor.ha_energy_planner_plan_status", {"device_id": None})]
     assert removed == ["device_1"]
+
+
+def test_migrate_duplicate_entity_ids_renames_only_available_planner_entities() -> None:
+    updated: list[tuple[str, dict[str, Any]]] = []
+
+    class FakeEntityRegistry:
+        entities = {
+            "sensor.ai_ai_advice": type(
+                "Entity",
+                (),
+                {"platform": "ha_energy_planner", "entity_id": "sensor.ai_ai_advice"},
+            )(),
+            "switch.ai_ai_enabled": type(
+                "Entity",
+                (),
+                {"platform": "ha_energy_planner", "entity_id": "switch.ai_ai_enabled"},
+            )(),
+            "switch.ai_enabled": type(
+                "Entity",
+                (),
+                {"platform": "ha_energy_planner", "entity_id": "switch.ai_enabled"},
+            )(),
+            "sensor.ev_ev_charging_plan": type(
+                "Entity",
+                (),
+                {"platform": "other", "entity_id": "sensor.ev_ev_charging_plan"},
+            )(),
+        }
+
+        def async_update_entity(self, entity_id: str, **kwargs: Any) -> None:
+            updated.append((entity_id, kwargs))
+
+    _async_migrate_duplicate_entity_ids(FakeEntityRegistry())
+
+    assert updated == [("sensor.ai_ai_advice", {"new_entity_id": "sensor.ai_advice"})]
 
 
 def test_sync_planner_devices_creates_group_devices_and_relinks_entities(monkeypatch: pytest.MonkeyPatch) -> None:

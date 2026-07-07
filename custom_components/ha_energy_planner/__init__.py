@@ -33,6 +33,16 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
+_DUPLICATE_ENTITY_ID_MIGRATIONS = {
+    "sensor.ai_ai_advice": "sensor.ai_advice",
+    "switch.ai_ai_enabled": "switch.ai_enabled",
+    "sensor.climate_climate_plan": "sensor.climate_plan",
+    "switch.climate_climate_control_enabled": "switch.climate_control_enabled",
+    "sensor.enphase_enphase_plan": "sensor.enphase_plan",
+    "switch.enphase_enphase_control_enabled": "switch.enphase_control_enabled",
+    "sensor.ev_ev_charging_plan": "sensor.ev_charging_plan",
+    "switch.ev_ev_control_enabled": "switch.ev_control_enabled",
+}
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -285,6 +295,7 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
 
     ent_reg = er.async_get(hass)
     dev_reg = dr.async_get(hass)
+    _async_migrate_duplicate_entity_ids(ent_reg)
     subentries_by_type = {subentry.subentry_type: subentry for subentry in getattr(entry, "subentries", {}).values()}
     device_subentry_ids = {
         DEVICE_SYSTEM: getattr(subentries_by_type.get(DEVICE_SYSTEM), "subentry_id", None),
@@ -341,6 +352,17 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
     old_device = dev_reg.async_get_device(identifiers={(DOMAIN, f"{entry.entry_id}_controls")})
     if old_device is not None:
         dev_reg.async_remove_device(old_device.id)
+
+
+def _async_migrate_duplicate_entity_ids(ent_reg: Any) -> None:
+    """Rename entity IDs generated from duplicated device/entity labels."""
+    for old_entity_id, new_entity_id in _DUPLICATE_ENTITY_ID_MIGRATIONS.items():
+        entity = ent_reg.entities.get(old_entity_id)
+        if entity is None or getattr(entity, "platform", None) != DOMAIN:
+            continue
+        if ent_reg.entities.get(new_entity_id) is not None:
+            continue
+        ent_reg.async_update_entity(old_entity_id, new_entity_id=new_entity_id)
 
 
 def _planner_entity_key(entry_id: str, entity: Any) -> str:
