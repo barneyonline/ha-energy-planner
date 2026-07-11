@@ -467,9 +467,27 @@ class DryRunPlanner:
         has_data = False
         interval_hours = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES])).total_seconds() / 3600
         for slot in context.slots:
+            haeo_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
+            haeo_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
+            if haeo_import_kw is not None and haeo_export_kw is not None:
+                if slot.import_price is not None:
+                    total += haeo_import_kw * interval_hours * slot.import_price
+                    has_data = True
+                if slot.export_price is not None:
+                    total -= haeo_export_kw * interval_hours * slot.export_price
+                    has_data = True
+                continue
             if slot.import_price is None or slot.baseline_load_forecast_kw is None:
                 continue
-            load_kw = slot.baseline_load_forecast_kw + slot.projected_ev_load_kw + slot.projected_hvac_load_kw
+            battery_charge_kw = _positive_or_none(slot.haeo_battery_charge_forecast_kw) or 0.0
+            battery_discharge_kw = _positive_or_none(slot.haeo_battery_discharge_forecast_kw) or 0.0
+            load_kw = (
+                slot.baseline_load_forecast_kw
+                + slot.projected_ev_load_kw
+                + slot.projected_hvac_load_kw
+                + battery_charge_kw
+                - battery_discharge_kw
+            )
             net_kw = load_kw - (slot.pv_forecast_kw or 0.0)
             if net_kw >= 0:
                 total += net_kw * interval_hours * slot.import_price

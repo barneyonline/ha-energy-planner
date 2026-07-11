@@ -55,7 +55,7 @@ def forecast_series_from_state(
     interval_minutes: int,
     value_keys: tuple[str, ...],
     value_kind: str,
-) -> list[float] | None:
+) -> list[float | None] | None:
     """Return a slot-aligned numeric forecast series from common HA attributes.
 
     Supports two common integration shapes:
@@ -76,24 +76,75 @@ def forecast_series_from_state(
     if value_kind == "power":
         raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
 
-    parsed = [
+    parsed_items = [
         _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit) for item in raw_items
     ]
-    parsed = [item for item in parsed if item is not None]
+    parsed = [item for item in parsed_items if item is not None]
     if not parsed:
         return None
 
     if all(valid_at is None for valid_at, _value in parsed):
-        return [value for _valid_at, value in parsed[:slot_count]]
+        # Ordered payloads have no temporal metadata. Treat each source position as
+        # exactly one planner interval and retain invalid positions as gaps. This is
+        # deliberately conservative: inventing a longer cadence would silently
+        # extend a short forecast across the rest of the planning horizon.
+        source_interval = _explicit_interval_minutes(attributes) or float(interval_minutes)
+        return _align_ordered_values(parsed_items, slot_count, interval_minutes, source_interval)
 
     timestamped = sorted(
-        [(valid_at, value) for valid_at, value in parsed if valid_at is not None],
+        [(_as_aware_utc(valid_at), value) for valid_at, value in parsed if valid_at is not None],
         key=lambda item: item[0],
     )
+    explicit_interval = _explicit_interval_minutes(attributes)
+    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+    cadence = _conservative_cadence(
+        timestamped,
+        explicit_cadence or timedelta(minutes=interval_minutes),
+        maximum=explicit_cadence,
+    )
+    issued_at = _as_aware_utc(issued_at)
     return [
-        _value_for_slot(issued_at + timedelta(minutes=offset), timestamped)
+        _value_for_slot(issued_at + timedelta(minutes=offset), timestamped, final_cadence=cadence)
         for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
+
+
+def forecast_coverage_ratio(series: list[float | None] | None) -> float:
+    """Return the fraction of requested forecast slots that contain values."""
+    if not series:
+        return 0.0
+    return sum(value is not None for value in series) / len(series)
+
+
+def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
+    """Return a valid explicitly declared forecast cadence in minutes."""
+    for key in ("forecast_interval_minutes", "interval_minutes", "resolution_minutes"):
+        try:
+            value = float(attributes.get(key))
+        except (TypeError, ValueError):
+            continue
+        if isfinite(value) and value > 0:
+            return value
+    return None
+
+
+def _align_ordered_values(
+    parsed_items: list[tuple[datetime | None, float] | None],
+    slot_count: int,
+    planner_interval_minutes: int,
+    source_interval_minutes: float,
+) -> list[float | None]:
+    """Align ordered buckets without extending beyond their declared coverage."""
+    series: list[float | None] = []
+    for index in range(slot_count):
+        elapsed = index * planner_interval_minutes
+        source_index = int(elapsed // source_interval_minutes)
+        if source_index >= len(parsed_items):
+            series.append(None)
+            continue
+        item = parsed_items[source_index]
+        series.append(item[1] if item is not None else None)
+    return series
 
 
 def latest_forecast_valid_at_from_state(
@@ -381,13 +432,41 @@ _ENERGY_UNITS = {
 }
 
 
-def _value_for_slot(slot_time: datetime, timestamped: list[tuple[datetime, float]]) -> float:
-    selected = timestamped[0][1]
+def _value_for_slot(
+    slot_time: datetime,
+    timestamped: list[tuple[datetime, float]],
+    *,
+    final_cadence: timedelta,
+) -> float | None:
+    """Return the bucket value only while the source forecast has coverage."""
+    if slot_time < timestamped[0][0]:
+        return None
+    selected: float | None = None
+    selected_at: datetime | None = None
     for valid_at, value in timestamped:
         if valid_at > slot_time:
             break
         selected = value
+        selected_at = valid_at
+    if selected_at is None or slot_time >= selected_at + final_cadence:
+        return None
     return selected
+
+
+def _conservative_cadence(
+    timestamped: list[tuple[datetime, float]],
+    default: timedelta,
+    *,
+    maximum: timedelta | None = None,
+) -> timedelta:
+    """Infer bucket duration without extending beyond a declared or observed cadence."""
+    gaps = [
+        right[0] - left[0]
+        for left, right in zip(timestamped, timestamped[1:], strict=False)
+        if right[0] > left[0]
+    ]
+    cadence = min(gaps) if gaps else default
+    return min(cadence, maximum) if maximum is not None else cadence
 
 
 def _parse_datetime_or_none(value: Any) -> datetime | None:

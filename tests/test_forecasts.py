@@ -12,6 +12,7 @@ from custom_components.ha_energy_planner.forecasts import (
     _items_from_value,
     _parse_datetime_or_none,
     constant_forecast,
+    forecast_coverage_ratio,
     forecast_series_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
@@ -47,7 +48,7 @@ def test_forecast_series_parses_timestamp_keyed_watts_map() -> None:
         value_kind="power",
     )
 
-    assert series == [0.5, 1.5, 1.5, 1.5]
+    assert series == [0.5, 1.5, None, None]
 
 
 def test_forecast_series_parses_nested_prediction_items() -> None:
@@ -104,7 +105,7 @@ def test_forecast_series_uses_state_unit_for_timestamp_maps() -> None:
         value_kind="power",
     )
 
-    assert series == [1.0, 2.0, 2.0, 2.0]
+    assert series == [1.0, 2.0, None, None]
 
 
 def test_forecast_series_converts_megawatt_power_units_to_kw() -> None:
@@ -129,7 +130,7 @@ def test_forecast_series_converts_megawatt_power_units_to_kw() -> None:
         value_kind="power",
     )
 
-    assert series == [1.0, 2.0, 2.0, 2.0]
+    assert series == [1.0, 2.0, None, None]
 
 
 def test_forecast_series_converts_solcast_energy_buckets_to_average_kw() -> None:
@@ -240,7 +241,7 @@ def test_forecast_series_converts_cent_price_units_to_dollars() -> None:
         value_kind="price",
     )
 
-    assert series == [0.12, 0.34, 0.34, 0.34]
+    assert series == [0.12, 0.34, None, None]
 
 
 def test_forecast_series_parses_camel_case_live_export_keys() -> None:
@@ -308,7 +309,9 @@ def test_forecast_series_rejects_non_finite_values() -> None:
         value_kind="price",
     )
 
-    assert series == [1.0, 2.0]
+    assert series == [1.0, None, None, None]
+    assert forecast_coverage_ratio(series) == 0.25
+    assert forecast_coverage_ratio(None) == 0.0
 
 
 def test_constant_forecast_builds_interval_points() -> None:
@@ -375,7 +378,84 @@ def test_forecast_series_treats_bad_times_as_ordered_values() -> None:
         interval_minutes=15,
         value_keys=("value",),
         value_kind="price",
-    ) == [1.0]
+    ) == [1.0, None, None, None]
+
+
+def test_ordered_forecast_honors_explicit_minute_cadence_without_extending_coverage() -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": 30},
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=2,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 1.0, 2.0, 2.0, None, None, None, None]
+
+
+def test_timestamped_forecast_does_not_fill_irregular_internal_gaps() -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {
+            "forecast": [
+                {"valid_at": "2026-06-27T00:00:00+00:00", "value": 1.0},
+                {"valid_at": "2026-06-27T00:30:00+00:00", "value": 2.0},
+                {"valid_at": "2026-06-27T02:00:00+00:00", "value": 3.0},
+            ]
+        },
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=3,
+        interval_minutes=30,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 2.0, None, None, 3.0, None]
+
+
+def test_timestamped_forecast_honors_explicit_cadence_for_single_point() -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {
+            "forecast_interval_minutes": 60,
+            "forecast": [{"valid_at": "2026-06-27T00:00:00+00:00", "value": 1.0}],
+        },
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=2,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 1.0, 1.0, 1.0, None, None, None, None]
+
+
+def test_timestamped_forecast_preserves_missing_slots_before_first_point() -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {"forecast": [{"valid_at": "2026-06-27T00:30:00+00:00", "value": 1.0}]},
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [None, None, 1.0, None]
 
 
 def test_forecast_helpers_cover_nested_and_rejected_shapes() -> None:
