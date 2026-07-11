@@ -38,6 +38,7 @@ from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BASELINE_LOAD_FORECAST,
+    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
@@ -103,6 +104,7 @@ from .const import (
     CONF_PRICE_FRESHNESS_MINUTES,
     CONF_PRIORITY_WEIGHTS,
     CONF_PV_FORECAST,
+    CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_ENPHASE_AI_PROFILE,
     DEFAULT_ENPHASE_FULL_BACKUP_PROFILE,
@@ -183,6 +185,8 @@ ENERGY_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
         vol.Required(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
         vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Optional(CONF_PV_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Optional(CONF_BASELINE_LOAD_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Required(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
     }
 )
@@ -930,6 +934,12 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
 def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[str, str]:
     """Validate configured entities without calling device services."""
     errors: dict[str, str] = {}
+    for observed_key, forecast_key in (
+        (CONF_PV_OBSERVED, CONF_PV_FORECAST),
+        (CONF_BASELINE_LOAD_OBSERVED, CONF_BASELINE_LOAD_FORECAST),
+    ):
+        if user_input.get(observed_key) and user_input.get(observed_key) == user_input.get(forecast_key):
+            errors[observed_key] = "observation_must_differ_from_forecast"
     for key in (CONF_HAEO_OPTIMIZE_SERVICE, CONF_AI_ADVISOR_SERVICE):
         value = user_input.get(key)
         if not value:
@@ -957,6 +967,8 @@ _ENTITY_DOMAIN_RULES = {
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},
     CONF_BASELINE_LOAD_FORECAST: {"sensor"},
+    CONF_PV_OBSERVED: {"sensor"},
+    CONF_BASELINE_LOAD_OBSERVED: {"sensor"},
     CONF_BATTERY_SOC: {"sensor"},
     CONF_ENPHASE_PROFILE: {"select", "input_select"},
     CONF_DAIKIN_CLIMATE: {"climate"},
@@ -1105,6 +1117,8 @@ _ENTITY_UNIT_RULES = {
     CONF_AMBER_EXPORT_PRICE: _PRICE_UNITS,
     CONF_PV_FORECAST: _POWER_UNITS | _ENERGY_UNITS,
     CONF_BASELINE_LOAD_FORECAST: _POWER_UNITS,
+    CONF_PV_OBSERVED: _POWER_UNITS,
+    CONF_BASELINE_LOAD_OBSERVED: _POWER_UNITS,
     CONF_BATTERY_SOC: _PERCENT_UNITS,
     CONF_DAIKIN_POWER: _POWER_UNITS,
     CONF_EV_SOC: _PERCENT_UNITS,

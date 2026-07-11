@@ -51,7 +51,9 @@ def test_real_history_profile_reports_missing_fixture_names() -> None:
 
     assert validator._profile_missing_names("ha-energy-planner-history-v1-real", _fixtures()) == [
         "real_daikin_thermal_history",
+        "real_load_forecast_accuracy",
         "real_mini_trip_history",
+        "real_pv_forecast_accuracy",
     ]
 
 
@@ -73,6 +75,16 @@ def test_real_history_profile_accepts_required_source_entities() -> None:
                 "indoor_temperature": "climate.daikin",
                 "hvac_power": "sensor.daikin_power",
             },
+        },
+        {
+            "kind": "forecast_accuracy",
+            "name": "real_pv_forecast_accuracy",
+            "source_entity_ids": {"forecast": "sensor.pv_forecast", "actual": "sensor.pv_power"},
+        },
+        {
+            "kind": "forecast_accuracy",
+            "name": "real_load_forecast_accuracy",
+            "source_entity_ids": {"forecast": "sensor.load_forecast", "actual": "sensor.load_power"},
         },
     ]
 
@@ -203,3 +215,101 @@ def test_thermal_history_export_keeps_requested_temperature_attribute(monkeypatc
     assert fixture["indoor_temperature_attribute"] == "current_temperature"
     assert fixture["states"]["indoor_temperature"][0]["attributes"]["current_temperature"] == 20.1
     assert "access_token" not in fixture["states"]["indoor_temperature"][0]["attributes"]
+
+
+def test_forecast_accuracy_export_keeps_only_forecast_and_unit_attributes(monkeypatch: Any) -> None:
+    exporter = _load_exporter()
+
+    def fake_request_json(*args: Any, **kwargs: Any) -> list[list[dict[str, Any]]]:
+        common = {"last_changed": "2026-06-27T00:00:00+00:00", "last_updated": "2026-06-27T00:00:00+00:00"}
+        return [
+            [
+                {
+                    **common,
+                    "entity_id": "sensor.pv_forecast",
+                    "state": "1.0",
+                    "attributes": {"detailedForecast": [1.0, 2.0], "unit_of_measurement": "kW", "token": "bad"},
+                }
+            ],
+            [
+                {
+                    **common,
+                    "entity_id": "sensor.pv_power",
+                    "state": "0.8",
+                    "attributes": {"unit_of_measurement": "kW", "latitude": -37.0},
+                }
+            ],
+        ]
+
+    monkeypatch.setattr(exporter, "_request_json", fake_request_json)
+    fixture = exporter._forecast_accuracy_fixture(
+        Namespace(
+            ha_url="http://ha.local:8123",
+            token="token",
+            name="real_pv_forecast_accuracy",
+            forecast_entity="sensor.pv_forecast",
+            actual_entity="sensor.pv_power",
+            forecast_attribute=["detailedForecast"],
+            value_keys="pv_estimate,value",
+            value_kind="power",
+            interval_minutes=30,
+            horizon_hours=24,
+            match_tolerance_minutes=15,
+            min_origins=4,
+            min_samples_per_bucket=4,
+            max_baseline_mae_ratio=1.0,
+            max_mae=None,
+            redact_key=[],
+        ),
+        exporter._parse_datetime("2026-06-27T00:00:00+00:00"),
+        exporter._parse_datetime("2026-06-28T00:00:00+00:00"),
+    )
+
+    assert fixture["source_entity_ids"] == {"forecast": "sensor.pv_forecast", "actual": "sensor.pv_power"}
+    assert fixture["states"]["forecast"][0]["attributes"] == {
+        "detailedForecast": [1.0, 2.0],
+        "unit_of_measurement": "kW",
+    }
+    assert fixture["states"]["actual"][0]["attributes"] == {"unit_of_measurement": "kW"}
+
+
+def test_forecast_accuracy_history_is_matched_to_valid_time_without_lookahead() -> None:
+    validator = _load_validator()
+    fixture = {
+        "kind": "forecast_accuracy",
+        "interval_minutes": 60,
+        "horizon_hours": 2,
+        "match_tolerance_minutes": 1,
+        "value_keys": ["value"],
+        "value_kind": "power",
+        "states": {
+            "forecast": [
+                {
+                    "state": "0",
+                    "last_changed": "2026-06-27T00:00:00+00:00",
+                    "last_updated": "2026-06-27T00:00:00+00:00",
+                    "attributes": {"forecast": [1.0, 2.0], "unit_of_measurement": "kW"},
+                }
+            ],
+            "actual": [
+                {
+                    "state": "1.2",
+                    "last_changed": "2026-06-27T00:00:00+00:00",
+                    "last_updated": "2026-06-27T00:00:00+00:00",
+                    "attributes": {"unit_of_measurement": "kW"},
+                },
+                {
+                    "state": "2.1",
+                    "last_changed": "2026-06-27T01:00:00+00:00",
+                    "last_updated": "2026-06-27T01:00:00+00:00",
+                    "attributes": {"unit_of_measurement": "kW"},
+                },
+            ],
+        },
+    }
+
+    samples = validator._forecast_accuracy_samples(fixture)
+
+    assert [sample["actual"] for sample in samples] == [1.2, 2.1]
+    assert [sample["baseline"] for sample in samples] == [1.2, 1.2]
+    assert [sample["lead_hours"] for sample in samples] == [0.0, 1.0]

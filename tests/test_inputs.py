@@ -10,6 +10,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BASELINE_LOAD_FORECAST,
+    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
@@ -25,6 +26,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SOC,
     CONF_PERSON_ENTITIES,
     CONF_PV_FORECAST,
+    CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
 )
@@ -33,6 +35,7 @@ from custom_components.ha_energy_planner.inputs import (
     _attribute_value,
     _combined_confidence,
     _finite_float_or_none,
+    _forecast_source_issued_at,
     _percent_float_or_none,
     _ready_by_time_or_none,
     _series_value,
@@ -122,10 +125,12 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     manager = InputManager(hass, entry_data, options)
     context = manager.build_context()
 
-    assert context.input_health == InputHealth.HEALTHY
     assert [slot.import_price for slot in context.slots] == [0.10, 0.20, 0.30, 0.40]
     assert [slot.export_price for slot in context.slots] == [0.01, 0.02, 0.03, 0.04]
-    assert [slot.pv_forecast_kw for slot in context.slots] == [0.5, 1.0, 1.0, 1.0]
+    assert [slot.pv_forecast_kw for slot in context.slots] == [0.5, 1.0, None, None]
+    assert context.input_health == InputHealth.UNSAFE
+    assert "pv_forecast_entity_incomplete_horizon" in context.input_issues
+    assert context.forecast_confidence == 0.5
     assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.2, 1.2, 1.2, 1.2]
     assert context.current_enphase_profile == "AI Optimisation"
     assert context.enphase_ai_profile == "AI Optimisation"
@@ -135,7 +140,7 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     assert context.current_hvac_temperature_c == 21.5
     assert context.current_hvac_power_kw == 1.7
     assert context.current_outdoor_temperature_c == 13.2
-    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [14.0, 16.0, 16.0, 16.0]
+    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [14.0, 16.0, None, None]
     assert manager.thermal_sample(context)["hvac_power_kw"] == 1.7
 
 
@@ -320,6 +325,8 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
         CONF_AMBER_EXPORT_PRICE: "sensor.export",
         CONF_PV_FORECAST: "sensor.pv",
         CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_PV_OBSERVED: "sensor.pv_observed",
+        CONF_BASELINE_LOAD_OBSERVED: "sensor.load_observed",
         CONF_BATTERY_SOC: "sensor.battery",
         CONF_DAIKIN_POWER: "sensor.daikin_power",
         CONF_PERSON_ENTITIES: "person.james",
@@ -330,6 +337,8 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
             "sensor.export": FakeState("0.05"),
             "sensor.pv": FakeState("0.002", {"unitOfMeasurement": "MW"}),
             "sensor.load": FakeState("1500", {"unitOfMeasurement": "W"}),
+            "sensor.pv_observed": FakeState("0.002", {"unitOfMeasurement": "MW"}),
+            "sensor.load_observed": FakeState("1500", {"unitOfMeasurement": "W"}),
             "sensor.battery": FakeState("55"),
             "sensor.daikin_power": FakeState("1700", {"unitOfMeasurement": "W"}),
             "person.james": FakeState("home"),
@@ -341,10 +350,9 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
 
     assert context.current_hvac_power_kw == 1.7
     assert manager.thermal_sample(context)["hvac_power_kw"] == 1.7
-    assert manager.current_forecast_observations() == {
-        "pv_forecast_kw": 2.0,
-        "baseline_load_forecast_kw": 1.5,
-    }
+    observations = manager.current_forecast_observations()
+    assert observations["pv_forecast_kw"]["value"] == 2.0  # type: ignore[index]
+    assert observations["baseline_load_forecast_kw"]["value"] == 1.5  # type: ignore[index]
 
 
 def test_input_manager_accepts_mini_like_ev_connected_state() -> None:
@@ -409,7 +417,8 @@ def test_input_manager_converts_weather_current_temperature_from_fahrenheit() ->
     context = InputManager(hass, entry_data, options).build_context()
 
     assert context.current_outdoor_temperature_c == 20.0
-    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, 25.0, 25.0, 25.0]
+    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, None, None, None]
+    assert context.input_health == InputHealth.DEGRADED
 
 
 def test_input_manager_parses_camel_case_current_weather_temperature() -> None:
@@ -445,7 +454,8 @@ def test_input_manager_parses_camel_case_current_weather_temperature() -> None:
     context = InputManager(hass, entry_data, options).build_context()
 
     assert context.current_outdoor_temperature_c == 20.0
-    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, 25.0, 25.0, 25.0]
+    assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, None, None, None]
+    assert context.input_health == InputHealth.DEGRADED
 
 
 def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() -> None:
@@ -469,16 +479,123 @@ def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() 
         }
     )
     calibration = {
-        "pv_forecast_kw": {"enabled": True, "factor": 1.2, "sample_count": 12},
-        "baseline_load_forecast_kw": {"enabled": True, "factor": 0.8, "sample_count": 12},
+        "pv_forecast_kw": {
+            "model_version": 3,
+            "buckets": {"0": {"enabled": True, "factor": 1.2}, "1": {"enabled": True, "factor": 1.2}},
+        },
+        "baseline_load_forecast_kw": {
+            "model_version": 3,
+            "buckets": {"0": {"enabled": True, "factor": 0.8}, "1": {"enabled": True, "factor": 0.8}},
+        },
     }
     manager = InputManager(hass, entry_data, options, forecast_calibration=calibration)
 
     context = manager.build_context()
 
-    assert [slot.pv_forecast_kw for slot in context.slots] == [1.2, 2.4, 2.4, 2.4]
-    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.6, 2.4, 2.4, 2.4]
-    assert [slot["pv_forecast_kw"] for slot in manager.forecast_training_slots] == [1.0, 2.0, 2.0, 2.0]
+    assert [slot.pv_forecast_kw for slot in context.slots] == [1.2, 2.4, None, None]
+    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.6, 2.4, None, None]
+    assert context.input_health == InputHealth.UNSAFE
+    assert all(slot["pv_forecast_kw_issued_at"] <= slot["valid_at"] for slot in manager.forecast_training_slots)
+    assert all(
+        slot["baseline_load_forecast_kw_issued_at"] <= slot["valid_at"]
+        for slot in manager.forecast_training_slots
+    )
+
+
+def test_forecast_observations_use_dedicated_measured_entities_with_timestamps() -> None:
+    observed_at = datetime(2026, 6, 27, 1, 2, 3, tzinfo=UTC)
+    entry_data = {
+        CONF_PV_FORECAST: "sensor.pv_forecast",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load_forecast",
+        CONF_PV_OBSERVED: "sensor.pv_power",
+        CONF_BASELINE_LOAD_OBSERVED: "sensor.house_power",
+    }
+    hass = FakeHass(
+        {
+            "sensor.pv_forecast": FakeState("99", last_updated=observed_at),
+            "sensor.load_forecast": FakeState("88", last_updated=observed_at),
+            "sensor.pv_power": FakeState("1200", {"unit_of_measurement": "W"}, observed_at),
+            "sensor.house_power": FakeState("2.5", {"unit_of_measurement": "kW"}, observed_at),
+        }
+    )
+
+    observations = InputManager(hass, entry_data, DEFAULT_OPTIONS).current_forecast_observations()
+
+    assert observations == {
+        "pv_forecast_kw": {"value": 1.2, "observed_at": observed_at},
+        "baseline_load_forecast_kw": {"value": 2.5, "observed_at": observed_at},
+    }
+
+
+def test_forecast_observations_do_not_fall_back_to_forecast_entities() -> None:
+    hass = FakeHass(
+        {
+            "sensor.pv_forecast": FakeState("99"),
+            "sensor.load_forecast": FakeState("88"),
+        }
+    )
+    entry_data = {
+        CONF_PV_FORECAST: "sensor.pv_forecast",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load_forecast",
+    }
+
+    assert InputManager(hass, entry_data, DEFAULT_OPTIONS).current_forecast_observations() == {
+        "pv_forecast_kw": None,
+        "baseline_load_forecast_kw": None,
+    }
+
+
+def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch: Any) -> None:
+    first_now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    second_now = first_now + timedelta(minutes=5)
+    pv_issued = first_now - timedelta(hours=2)
+    load_issued = first_now - timedelta(hours=3)
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 5}
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_BATTERY_SOC: "sensor.battery",
+    }
+    values = [1.0] * 12
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.2", {"forecast": [0.2] * 12}, first_now),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 12}, first_now),
+            "sensor.pv": FakeState("1", {"forecast": values}, pv_issued),
+            "sensor.load": FakeState(
+                "1",
+                {"forecast": values, "forecastGeneratedAt": load_issued.isoformat()},
+                first_now,
+            ),
+            "sensor.battery": FakeState("50", last_updated=first_now),
+        }
+    )
+    monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: first_now)
+    first = InputManager(hass, entry_data, options)
+    first.build_context()
+    monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: second_now)
+    second = InputManager(hass, entry_data, options)
+    second.build_context()
+
+    first_common = first.forecast_training_slots[1]
+    second_common = second.forecast_training_slots[0]
+    assert first_common["valid_at"] == second_common["valid_at"]
+    assert first_common["pv_forecast_kw_issued_at"] == second_common["pv_forecast_kw_issued_at"] == pv_issued
+    assert (
+        first_common["baseline_load_forecast_kw_issued_at"]
+        == second_common["baseline_load_forecast_kw_issued_at"]
+        == load_issued
+    )
+
+
+def test_forecast_source_issue_time_accepts_datetime_and_naive_fallback() -> None:
+    fallback = datetime(2026, 6, 27, 12, 0)
+    issued = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
+
+    assert _forecast_source_issued_at(FakeState("1", {"issued_at": issued}), fallback) == issued
+    assert _forecast_source_issued_at(FakeState("1", last_updated=fallback), fallback) == fallback.replace(tzinfo=UTC)
 
 
 def test_input_manager_combines_forecast_confidence_metadata() -> None:
@@ -510,8 +627,8 @@ def test_input_manager_combines_forecast_confidence_metadata() -> None:
     manager = InputManager(hass, entry_data, options)
     context = manager.build_context()
 
-    assert context.input_health == InputHealth.HEALTHY
-    assert context.forecast_confidence == 0.62
+    assert context.input_health == InputHealth.DEGRADED
+    assert context.forecast_confidence == 0.44
     assert manager.forecast_confidence_details == [
         {
             "config_key": CONF_AMBER_IMPORT_PRICE,
@@ -540,8 +657,8 @@ def test_input_manager_combines_forecast_confidence_metadata() -> None:
         {
             "config_key": CONF_WEATHER,
             "entity_id": "weather.home",
-            "source": "forecast_series",
-            "confidence": 0.88,
+            "source": "forecast_series_partial",
+            "confidence": 0.44,
         },
     ]
 

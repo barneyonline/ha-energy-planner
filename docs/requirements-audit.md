@@ -95,13 +95,20 @@ Status as of 2026-06-28.
   the real HAEO response fixture to include parsed grid import/export and
   battery charge/discharge evidence before Enphase value-evidence validation is
   accepted.
-- Executable real-history fixtures cover Recorder-style MINI trip replay and
-  Daikin thermal-model replay through `scripts/validate-real-history-fixture.py`.
+- Executable real-history fixtures cover Recorder-style MINI trip replay,
+  Daikin thermal-model replay, and rolling-origin PV/load forecast accuracy
+  through `scripts/validate-real-history-fixture.py`. Forecast evidence is
+  matched by issue/valid time, reports MAE and RMSE for near/day/long lead-time
+  buckets, and must outperform a no-lookahead persistence baseline.
   `scripts/export-real-history-fixtures.sh` wraps sanitized Home Assistant
-  history export for the required `real_mini_trip_history` and
-  `real_daikin_thermal_history` fixtures, and the
+  history export for the required `real_mini_trip_history`,
+  `real_daikin_thermal_history`, `real_pv_forecast_accuracy`, and
+  `real_load_forecast_accuracy` fixtures, and the
   `ha-energy-planner-history-v1-real` profile verifies exported source entity
   metadata before real-history completion is claimed.
+- Forecast parsing retains uncovered horizon slots as missing values. Input
+  confidence is multiplied by temporal coverage, and incomplete required
+  forecast horizons fail closed rather than extrapolating the final bucket.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
   enforces all real validation profiles in one command so full real-system
   evidence cannot accidentally skip live-schema, HAEO value, or Recorder
@@ -121,8 +128,8 @@ Status as of 2026-06-28.
   forecast attributes using canonical live-style key variants and W-to-kW
   normalization, Amber cent/kWh forecast attributes reflected in compact plan
   previews, weather camelCase forecast attributes reflected in compact plan previews,
-  forecast calibration state updated from a due snapshot and current HA entity
-  states, HVAC thermal-model state updated from Home Assistant climate and
+  forecast calibration state updated from time-aligned, dedicated observed-power
+  entities, HVAC thermal-model state updated from Home Assistant climate and
   power entity samples, Recorder import metadata, and a compact EV trip
   imported from Home Assistant Recorder state history. It also verifies
   bounded forecast-snapshot action metadata for the active EV schedule with
@@ -167,12 +174,15 @@ Status as of 2026-06-28.
   integration-specific Amber, PV/HAFO, weather, and HAEO schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
 - Compact PV and baseline-load forecast calibration is implemented. It records
-  due forecast-versus-observed samples from bounded forecast snapshots, stores
-  only aggregate error/factor statistics, and applies bounded factors only
-  after enough samples show the calibrated running error is better than the raw
-  forecast. Non-finite persisted factors and sample values are ignored. Docker
-  smoke coverage validates calibration sampling from a due forecast snapshot and
-  current Home Assistant PV/load entity states.
+  due forecasts only when a separately configured measured-power observation is
+  timestamp-aligned, deduplicates forecast targets and lead-time buckets, and
+  retains a bounded sample window with diverse forecast horizons. Independent
+  robust bounded factors are trained per 30-minute lead-time bucket and enabled
+  only when that bucket improves a later holdout set spanning enough distinct
+  observations and time; near-term evidence cannot alter day-ahead slots.
+  Forecast entities are never used as
+  actuals, overdue slots are not paired to a current reading, and non-finite
+  persisted factors and sample values are ignored.
 - EV next-day demand uses configured fallback until enough local trip history is
   recorded. Future disconnected trips are compactly stored from EV connection
   and SOC state transitions, and older trips are opportunistically imported

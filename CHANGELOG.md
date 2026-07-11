@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 - 2026-07-12
+
+### Added
+
+- Optional measured PV and household-load power inputs for time-aligned forecast calibration.
+- Independent 30-minute lead-time calibration models with robust median fitting and later holdout validation.
+- Rolling-origin PV/load forecast accuracy validation with MAE and RMSE by near, day, and long horizon.
+- Persistence-baseline gates for exported real forecast evidence.
+
+### Changed
+
+- Successful flexible-load HAEO results now regenerate the final plan instead of only updating stored evidence.
+- Forecast confidence now accounts for actual horizon coverage.
+- Required forecasts with missing or internally gapped coverage fail closed instead of repeating the last value.
+- Estimated daily cost now uses HAEO grid flows where complete and battery charge/discharge evidence otherwise.
+- Forecast attribute changes, including canonical camelCase variants, trigger replanning without reacting to unrelated metadata churn.
+
+### Fixed
+
+- Prevented forecast calibration from treating forecast entity states as measured ground truth.
+- Prevented overdue forecasts from being paired with one current observation after downtime.
+- Prevented correlated refresh snapshots and near-term bias from leaking calibration into unvalidated day-ahead slots.
+- Prevented partial HAEO grid-flow evidence from suppressing fallback cost calculation.
+- Prevented timestamp gaps inside a forecast from being silently forward-filled.
+
+### Upgrade Notes
+
+- To enable forecast calibration, configure separate **Observed PV power** and **Observed baseline load power** sensors in the Energy subentry. Do not select the forecast sensors themselves.
+- Existing pre-0.3 calibration state is ignored until the new timestamped per-lead model has enough holdout-validated evidence.
+- Required forecast sources should cover the complete planning horizon; incomplete horizons now mark planning inputs unsafe.
+
+### Validation
+
+- Dockerized pytest: `519 passed`
+- Coverage: `100%` across `6,188` statements
+- Replay, live-schema, rolling forecast-accuracy, Home Assistant `check_config`, quality-scale, and Docker smoke validation
+
 ## 0.2.1 - 2026-07-07
 
 ### Fixed

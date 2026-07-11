@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +18,11 @@ from custom_components.ha_energy_planner.ev import (  # noqa: E402
     import_trip_history_from_state_sequences,
     summarize_stored_trip_history,
 )
+from custom_components.ha_energy_planner.forecast_accuracy import (  # noqa: E402
+    accuracy_threshold_errors,
+    summarize_forecast_accuracy,
+)
+from custom_components.ha_energy_planner.forecasts import forecast_series_from_state, normalize_scalar_value  # noqa: E402
 from custom_components.ha_energy_planner.thermal_model import (  # noqa: E402
     thermal_model_summary,
     update_thermal_model,
@@ -26,10 +31,14 @@ from custom_components.ha_energy_planner.thermal_model import (  # noqa: E402
 REAL_HISTORY_PROFILE_REQUIREMENTS = {
     "real_mini_trip_history": {"kind": "ev_trip_history"},
     "real_daikin_thermal_history": {"kind": "thermal_history"},
+    "real_pv_forecast_accuracy": {"kind": "forecast_accuracy"},
+    "real_load_forecast_accuracy": {"kind": "forecast_accuracy"},
 }
 REAL_HISTORY_PROFILE_ENTITY_KEYS = {
     "real_mini_trip_history": ("ev_connected", "ev_soc"),
     "real_daikin_thermal_history": ("indoor_temperature", "hvac_power"),
+    "real_pv_forecast_accuracy": ("forecast", "actual"),
+    "real_load_forecast_accuracy": ("forecast", "actual"),
 }
 
 
@@ -46,7 +55,7 @@ class FixtureState:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate ev_trip_history and thermal_history fixtures exported from Home Assistant Recorder history."
+            "Validate trip, thermal, and rolling-origin forecast-accuracy fixtures exported from Recorder history."
         )
     )
     parser.add_argument(
@@ -85,6 +94,8 @@ def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         return _validate_ev_trip_history_fixture(fixture)
     if kind == "thermal_history":
         return _validate_thermal_history_fixture(fixture)
+    if kind == "forecast_accuracy":
+        return _validate_forecast_accuracy_fixture(fixture)
     raise ValueError(f"Unsupported fixture kind: {kind!r}")
 
 
@@ -179,6 +190,97 @@ def _validate_thermal_history_fixture(fixture: dict[str, Any]) -> dict[str, Any]
         "sample_count": len(samples),
         **summary,
     }
+
+
+def _validate_forecast_accuracy_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
+    samples = list(fixture.get("samples", [])) or _forecast_accuracy_samples(fixture)
+    buckets = list(
+        fixture.get(
+            "horizon_buckets",
+            [
+                {"name": "near", "min_hours": 0, "max_hours": 4},
+                {"name": "day", "min_hours": 4, "max_hours": 12},
+                {"name": "long", "min_hours": 12, "max_hours": 24.01},
+            ],
+        )
+    )
+    summary = summarize_forecast_accuracy(samples, buckets)
+    requirements = dict(fixture.get("requirements", {}))
+    errors = accuracy_threshold_errors(summary, requirements)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return {"kind": "forecast_accuracy", "name": fixture.get("name"), **summary}
+
+
+def _forecast_accuracy_samples(fixture: dict[str, Any]) -> list[dict[str, Any]]:
+    """Match historical forecast origins to observations at each exact valid time."""
+    histories = dict(fixture.get("states", {}))
+    forecast_states = [_state_from_item(item) for item in histories.get("forecast", [])]
+    actual_states = [_state_from_item(item) for item in histories.get("actual", [])]
+    interval = int(fixture.get("interval_minutes", 30))
+    horizon = int(fixture.get("horizon_hours", 24))
+    tolerance_seconds = int(fixture.get("match_tolerance_minutes", interval // 2)) * 60
+    value_kind = str(fixture.get("value_kind", "power"))
+    value_keys = tuple(fixture.get("value_keys", ("value",)))
+    samples: list[dict[str, Any]] = []
+    for state in forecast_states:
+        issued_at = state.last_updated
+        baseline_state = _actual_at_or_before(actual_states, issued_at)
+        if baseline_state is None:
+            continue
+        baseline = _normalized_state_value(baseline_state, value_kind)
+        if baseline is None:
+            continue
+        series = forecast_series_from_state(
+            state,
+            issued_at=issued_at,
+            horizon_hours=horizon,
+            interval_minutes=interval,
+            value_keys=value_keys,
+            value_kind=value_kind,
+        )
+        if series is None:
+            continue
+        for index, forecast in enumerate(series):
+            if forecast is None:
+                continue
+            valid_at = issued_at + timedelta(minutes=index * interval)
+            actual_state = _nearest_actual(actual_states, valid_at, tolerance_seconds)
+            actual = _normalized_state_value(actual_state, value_kind) if actual_state else None
+            if actual is None:
+                continue
+            samples.append(
+                {
+                    "issued_at": issued_at.isoformat(),
+                    "valid_at": valid_at.isoformat(),
+                    "lead_hours": index * interval / 60,
+                    "forecast": forecast,
+                    "actual": actual,
+                    "baseline": baseline,
+                }
+            )
+    return samples
+
+
+def _actual_at_or_before(states: list[FixtureState], target: datetime) -> FixtureState | None:
+    matches = [state for state in states if state.last_updated <= target]
+    return max(matches, key=lambda state: state.last_updated) if matches else None
+
+
+def _nearest_actual(states: list[FixtureState], target: datetime, tolerance_seconds: int) -> FixtureState | None:
+    if not states:
+        return None
+    nearest = min(states, key=lambda state: abs((state.last_updated - target).total_seconds()))
+    return nearest if abs((nearest.last_updated - target).total_seconds()) <= tolerance_seconds else None
+
+
+def _normalized_state_value(state: FixtureState, value_kind: str) -> float | None:
+    try:
+        value = float(state.state)
+    except (TypeError, ValueError):
+        return None
+    unit = str(state.attributes.get("unit_of_measurement", state.attributes.get("unit", "")))
+    return normalize_scalar_value(value, value_kind=value_kind, unit=unit)
 
 
 def _states_for_key(fixture: dict[str, Any], key: str) -> list[FixtureState]:

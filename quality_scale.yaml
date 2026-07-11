@@ -279,15 +279,17 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, replay fixtures, live-schema fixtures, real-history fixtures, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin forecast MAE/RMSE and baseline gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
         - tests/test_executor.py
         - tests/test_services.py
         - tests/test_real_history_fixtures.py
+        - tests/test_forecast_accuracy.py
       code:
         - scripts/docker-validate.sh
+        - scripts/validate-real-history-fixture.py
   devices:
     status: done
     references:
