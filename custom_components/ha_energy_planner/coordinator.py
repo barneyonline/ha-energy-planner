@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from math import isfinite
@@ -56,6 +57,41 @@ from .thermal_model import thermal_model_summary, update_thermal_model
 from .type_defs import EnergyPlannerConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+_MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
+    {
+        "forecast",
+        "forecasts",
+        "data",
+        "values",
+        "detailed_forecast",
+        "predictions",
+        "pv_forecast_kw",
+        "pv_estimate",
+        "estimate",
+        "baseline_load_forecast_kw",
+        "load_kw",
+        "load",
+        "power",
+        "watts",
+        "value",
+        "outdoor_temperature_forecast_c",
+        "temperature",
+        "native_temperature",
+        "current_temperature",
+        "temp",
+        "confidence",
+        "confidence_percent",
+        "forecast_confidence",
+        "forecast_confidence_percent",
+        "unit_of_measurement",
+        "unit",
+        "temperature_unit",
+        "forecast_interval_minutes",
+        "interval_minutes",
+        "resolution_minutes",
+    }
+)
 
 
 class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
@@ -233,7 +269,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         baseline_evidence_counts = apply_haeo_response_to_context(context, baseline_result.response)
         planner = DryRunPlanner(options, thermal_model=thermal_model)
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)
-        projections = await self.hass.async_add_executor_job(planner.project_flexible_loads, context)
+        projections = planner.project_flexible_loads(context)
         second_pass_result = None
         second_pass_evidence_counts: dict[str, int] = {}
         if baseline_result.status != HAEOStatus.READY:
@@ -245,6 +281,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 plan.input_issues.append(second_pass_result.reason)
             else:
                 second_pass_evidence_counts = apply_haeo_response_to_context(context, second_pass_result.response)
+                _reset_flexible_load_projections(context)
+                plan = await self.hass.async_add_executor_job(planner.create_plan, context)
         await self.store.async_add_haeo_run(
             {
                 "created_at": context.created_at,
@@ -715,6 +753,8 @@ def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:
         return True
     old_value = getattr(old_state, "state", None)
     new_value = getattr(new_state, "state", None)
+    if _material_attributes_changed(old_state, new_state):
+        return True
     if old_value == new_value:
         return False
     try:
@@ -729,6 +769,31 @@ def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:
         return delta > 0
     threshold_percent = float(options.get(CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT, 0.0))
     return (delta / abs(old_number)) * 100 >= threshold_percent
+
+
+def _material_attributes_changed(old_state: Any, new_state: Any) -> bool:
+    """Return whether an input attribute consumed by planning changed."""
+    old_attributes = _canonical_attributes(getattr(old_state, "attributes", {}) or {})
+    new_attributes = _canonical_attributes(getattr(new_state, "attributes", {}) or {})
+    return any(old_attributes.get(key) != new_attributes.get(key) for key in _MATERIAL_STATE_ATTRIBUTE_KEYS)
+
+
+def _canonical_attributes(attributes: Any) -> dict[str, Any]:
+    """Return attributes with the same camelCase aliases accepted by forecast parsing."""
+    canonical = dict(attributes)
+    for key, value in attributes.items():
+        raw = str(key)
+        separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", raw)
+        separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
+        canonical.setdefault(separated.strip("_").lower(), value)
+    return canonical
+
+
+def _reset_flexible_load_projections(context: Any) -> None:
+    """Clear planner-derived loads before regenerating a plan."""
+    for slot in context.slots:
+        slot.projected_ev_load_kw = 0.0
+        slot.projected_hvac_load_kw = 0.0
 
 
 def _is_ev_history_state_change(entry_data: dict[str, Any], event: Any) -> bool:

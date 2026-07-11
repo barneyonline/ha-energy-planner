@@ -75,6 +75,7 @@ class FakeState:
     """Minimal HA state."""
 
     state: str
+    attributes: dict[str, object] = field(default_factory=dict)
 
 
 class FakeStates:
@@ -215,11 +216,19 @@ class FakeEntry:
 class FakeEvent:
     """Minimal state changed event."""
 
-    def __init__(self, entity_id: str, old: str, new: str) -> None:
+    def __init__(
+        self,
+        entity_id: str,
+        old: str,
+        new: str,
+        *,
+        old_attributes: dict[str, object] | None = None,
+        new_attributes: dict[str, object] | None = None,
+    ) -> None:
         self.data = {
             "entity_id": entity_id,
-            "old_state": FakeState(old),
-            "new_state": FakeState(new),
+            "old_state": FakeState(old, old_attributes or {}),
+            "new_state": FakeState(new, new_attributes or {}),
         }
 
 
@@ -277,6 +286,71 @@ def test_material_state_change_treats_non_finite_numbers_as_material() -> None:
 
     assert _is_material_state_change(FakeEvent("sensor.price", "1.0", "nan"), options)
     assert _is_material_state_change(FakeEvent("sensor.price", "inf", "1.0"), options)
+
+
+def test_material_state_change_detects_only_planner_input_attribute_updates() -> None:
+    options = {"material_change_threshold_percent": 5}
+    old_forecast = [{"valid_at": "2026-06-27T10:00:00+00:00", "value": 1.0}]
+    new_forecast = [{"valid_at": "2026-06-27T10:00:00+00:00", "value": 2.0}]
+
+    assert _is_material_state_change(
+        FakeEvent(
+            "sensor.pv_forecast",
+            "1.0",
+            "1.0",
+            old_attributes={"forecast": old_forecast, "friendly_name": "PV old"},
+            new_attributes={"forecast": new_forecast, "friendly_name": "PV new"},
+        ),
+        options,
+    )
+    assert not _is_material_state_change(
+        FakeEvent(
+            "sensor.pv_forecast",
+            "1.0",
+            "1.0",
+            old_attributes={"forecast": old_forecast, "friendly_name": "PV old"},
+            new_attributes={"forecast": old_forecast, "friendly_name": "PV new"},
+        ),
+        options,
+    )
+
+
+def test_material_attribute_change_overrides_subthreshold_numeric_state_change() -> None:
+    assert _is_material_state_change(
+        FakeEvent(
+            "weather.home",
+            "20.0",
+            "20.1",
+            old_attributes={"temperature": 20.0},
+            new_attributes={"temperature": 21.0},
+        ),
+        {"material_change_threshold_percent": 5},
+    )
+
+
+def test_material_state_change_canonicalizes_camel_case_forecast_attributes() -> None:
+    changes = (
+        ("pvEstimate", [1.0, 2.0], [2.0, 3.0]),
+        ("baselineLoadForecastKw", [0.5, 0.6], [0.7, 0.8]),
+        ("forecastConfidence", 0.8, 0.9),
+        ("unitOfMeasurement", "W", "kW"),
+        ("forecastIntervalMinutes", 30, 60),
+        ("intervalMinutes", 30, 15),
+        ("resolutionMinutes", 30, 15),
+        ("detailedForecast", [{"value": 1.0}], [{"value": 2.0}]),
+    )
+
+    for key, old_value, new_value in changes:
+        assert _is_material_state_change(
+            FakeEvent(
+                "sensor.forecast",
+                "unchanged",
+                "unchanged",
+                old_attributes={key: old_value},
+                new_attributes={key: new_value},
+            ),
+            {"material_change_threshold_percent": 5},
+        ), key
 
 
 def test_overrides_restored_only_when_active() -> None:
@@ -678,14 +752,21 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
             )
 
     class FakePlanner:
+        initial_projected_loads: list[tuple[float, float]] = []
+
         def __init__(self, options: dict[str, object], thermal_model: dict[str, object]) -> None:
             assert thermal_model == {"last_sample": {"sampled_at": now}, "enabled": True}
 
         def create_plan(self, built_context: object) -> EnergyPlan:
             assert built_context is context
+            slot = context.slots[0]
+            self.initial_projected_loads.append((slot.projected_ev_load_kw, slot.projected_hvac_load_kw))
+            slot.projected_ev_load_kw = 7.0
+            slot.projected_hvac_load_kw = 1.0
             plan = _plan("plan-refresh")
             plan.created_at = now
             plan.preview = [{"slot": 1}]
+            plan.summary = str(getattr(context, "last_haeo_response", None))
             return plan
 
         def project_flexible_loads(self, built_context: object) -> list[str]:
@@ -745,9 +826,14 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
         "custom_components.ha_energy_planner.coordinator.update_thermal_model",
         lambda model, previous, sample: ({"last_sample": sample, "enabled": True}, True),
     )
+    def fake_apply_haeo_response(built_context: object, response: object) -> dict[str, int]:
+        assert built_context is context
+        context.last_haeo_response = response
+        return {"evidence": len(response or {})}
+
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.apply_haeo_response_to_context",
-        lambda built_context, response: {"evidence": len(response or {})},
+        fake_apply_haeo_response,
     )
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", FakeHAEOAdapter)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", FakePlanner)
@@ -766,6 +852,9 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     result = asyncio.run(coordinator._async_update_data_locked())
 
     assert result.plan_id == "plan-refresh"
+    assert result.summary == "{'flexible': True}"
+    assert FakePlanner.initial_projected_loads == [(0.0, 0.0), (0.0, 0.0)]
+    assert (context.slots[0].projected_ev_load_kw, context.slots[0].projected_hvac_load_kw) == (7.0, 1.0)
     assert result.status == "unsafe"
     assert result.mode == PlannerMode.ACTIVE_DEGRADED
     assert result.input_issues == ["input_health_unsafe"]

@@ -28,7 +28,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Supported device categories
 
 - Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
-- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, weather, and battery state of charge
+- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
 - EV charging plan, current/next charging state, ready-by planning, charge energy estimates, and start/stop controls
 - Climate plan, current/next climate state, comfort targets, HVAC power modeling, manual override handling, and presence-aware control
 - Presence as a separate device, including multi-person occupancy inputs
@@ -40,6 +40,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Key features
 
 - Guided setup with no required inputs on initial install; add Energy, Climate, Presence, Enphase, AI, and EV inputs separately from the integration page
+- Forecast calibration is opt-in through separate observed PV and household-load power sensors; forecast entities are never treated as ground truth
 - Device structure aligned with Home Assistant hub-style integrations: each planning area appears as its own device with relevant sub-entities
 - Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
 - Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
@@ -50,6 +51,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
 - 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
+- Coverage-aware forecast confidence: short payloads retain missing slots and make required planning inputs unsafe instead of repeating the final value across the horizon
 - Decision audit, rejected action, upcoming timeline, and per-device decision sensors explaining what was selected and why alternatives were skipped
 - Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
@@ -94,7 +96,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.2.1`
+- Current manifest version: `0.3.0`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `hub`
 - IoT class: `local_polling`
@@ -199,6 +201,7 @@ This runs:
 - Replay fixtures
 - Live-schema fixture validation
 - Real-history fixture validation
+- Rolling-origin PV/load forecast accuracy gates with MAE/RMSE by lead-time bucket and persistence-baseline comparison
 - Home Assistant `check_config`
 - Docker smoke test against a real Home Assistant container, unless `HEP_SKIP_HA_SMOKE=1` is set
 
@@ -235,6 +238,9 @@ HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
 HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
 HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
 HEP_BASELINE_LOAD_ENTITY=sensor.baseline_load_forecast \
+HEP_PV_ACTUAL_ENTITY=sensor.pv_power \
+HEP_LOAD_FORECAST_ENTITY=sensor.baseline_load_forecast \
+HEP_LOAD_ACTUAL_ENTITY=sensor.household_load_power \
 HEP_WEATHER_ENTITY=weather.home \
 HEP_HAEO_SERVICE=haeo.optimize \
 HEP_EV_CONNECTED_ENTITY=binary_sensor.ev_connected \
@@ -245,7 +251,7 @@ HEP_DAIKIN_POWER_ENTITY=sensor.daikin_power \
 scripts/export-real-validation-bundle.sh
 ```
 
-Good output means the real live-schema, HAEO value-evidence, and real-history profiles pass:
+Good output means the real live-schema, HAEO value-evidence, and real-history profiles pass. The history profile includes rolling, time-aligned PV and load accuracy evidence; each configured horizon bucket must meet its MAE limit and beat a persistence baseline:
 
 - `ha-energy-planner-v1-real`
 - `ha-energy-planner-haeo-value-v1-real`
