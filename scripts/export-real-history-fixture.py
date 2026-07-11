@@ -36,7 +36,7 @@ SENSITIVE_KEY_PARTS = (
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Export sanitized Home Assistant Recorder history for EV trip and Daikin HVAC thermal replay validation."
+            "Export sanitized Recorder history for EV, thermal, and forecast-accuracy validation."
         )
     )
     parser.add_argument("--ha-url", default=os.environ.get("HOME_ASSISTANT_URL"))
@@ -79,6 +79,24 @@ def main() -> int:
     thermal.add_argument("--expected-min-passive-samples", type=int, default=0)
     thermal.add_argument("--hvac-mode", default=None)
 
+    accuracy = subparsers.add_parser(
+        "forecast-accuracy",
+        help="Export rolling forecast origins and observed values for time-aligned accuracy validation.",
+    )
+    accuracy.add_argument("--name", required=True)
+    accuracy.add_argument("--forecast-entity", required=True)
+    accuracy.add_argument("--actual-entity", required=True)
+    accuracy.add_argument("--forecast-attribute", action="append", default=[])
+    accuracy.add_argument("--value-keys", default="value,power,watts")
+    accuracy.add_argument("--value-kind", choices=("power", "price", "temperature"), default="power")
+    accuracy.add_argument("--interval-minutes", type=int, default=30)
+    accuracy.add_argument("--horizon-hours", type=int, default=24)
+    accuracy.add_argument("--match-tolerance-minutes", type=int, default=15)
+    accuracy.add_argument("--min-origins", type=int, default=4)
+    accuracy.add_argument("--min-samples-per-bucket", type=int, default=4)
+    accuracy.add_argument("--max-baseline-mae-ratio", type=float, default=1.0)
+    accuracy.add_argument("--max-mae", type=float, default=None)
+
     args = parser.parse_args()
     if not args.ha_url:
         parser.error("--ha-url or HOME_ASSISTANT_URL is required")
@@ -105,6 +123,8 @@ def _build_fixture(args: argparse.Namespace) -> dict[str, Any]:
         return _ev_trip_history_fixture(args, start, end)
     if args.kind == "thermal-history":
         return _thermal_history_fixture(args, start, end)
+    if args.kind == "forecast-accuracy":
+        return _forecast_accuracy_fixture(args, start, end)
     raise ValueError(f"Unsupported fixture kind: {args.kind!r}")
 
 
@@ -156,6 +176,58 @@ def _thermal_history_fixture(args: argparse.Namespace, start: datetime, end: dat
         "source_entity_ids": entity_map,
         "expected_min_active_samples": args.expected_min_active_samples,
         "expected_min_passive_samples": args.expected_min_passive_samples,
+        "states": histories,
+    }
+
+
+def _forecast_accuracy_fixture(args: argparse.Namespace, start: datetime, end: datetime) -> dict[str, Any]:
+    entity_map = {"forecast": args.forecast_entity, "actual": args.actual_entity}
+    forecast_attributes = tuple(
+        dict.fromkeys(
+            [
+                *(args.forecast_attribute or ("forecast",)),
+                "unit_of_measurement",
+                "unit",
+                "temperature_unit",
+            ]
+        )
+    )
+    histories = _history_by_key(
+        args,
+        start,
+        end,
+        entity_map,
+        {
+            "forecast": forecast_attributes,
+            "actual": ("unit_of_measurement", "unit", "temperature_unit"),
+        },
+    )
+    requirements: dict[str, Any] = {
+        "min_origins": args.min_origins,
+        "min_samples_per_bucket": args.min_samples_per_bucket,
+        "max_baseline_mae_ratio": args.max_baseline_mae_ratio,
+        "required_buckets": ["near", "day", "long"],
+    }
+    if args.max_mae is not None:
+        requirements["max_mae"] = args.max_mae
+    return {
+        "kind": "forecast_accuracy",
+        "name": args.name,
+        "exported_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "source_entity_ids": entity_map,
+        "value_keys": [value.strip() for value in args.value_keys.split(",") if value.strip()],
+        "value_kind": args.value_kind,
+        "interval_minutes": args.interval_minutes,
+        "horizon_hours": args.horizon_hours,
+        "match_tolerance_minutes": args.match_tolerance_minutes,
+        "horizon_buckets": [
+            {"name": "near", "min_hours": 0, "max_hours": 4},
+            {"name": "day", "min_hours": 4, "max_hours": 12},
+            {"name": "long", "min_hours": 12, "max_hours": 24.01},
+        ],
+        "requirements": requirements,
         "states": histories,
     }
 

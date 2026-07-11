@@ -9,6 +9,8 @@
           "amber_export_price_entity": "Amber export price sensor",
           "pv_forecast_entity": "PV forecast sensor",
           "baseline_load_forecast_entity": "Baseline load forecast sensor",
+          "pv_observed_entity": "Observed PV power sensor",
+          "baseline_load_observed_entity": "Observed baseline load power sensor",
           "battery_soc_entity": "Battery SOC sensor",
           "enphase_profile_entity": "Enphase Profile",
           "enphase_ai_profile": "Enphase Restore Profile",
@@ -38,6 +40,8 @@
           "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
           "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use. Select a power or energy forecast sensor using W, kW, MW, Wh, kWh, or MWh; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
           "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data in W, kW, or MW.",
+          "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
+          "baseline_load_observed_entity": "Optional actual household load power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
           "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value.",
           "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
           "enphase_ai_profile": "Profile name to restore when planner ownership ends, normally AI Optimisation.",
@@ -69,6 +73,7 @@
       "invalid_entity_id": "Entity ID is invalid.",
       "invalid_entity_domain": "Entity domain is not supported for this field.",
       "invalid_unit": "Entity unit is not compatible with this field.",
+      "observation_must_differ_from_forecast": "Select a measured power sensor, not the forecast sensor.",
       "invalid_service_name": "Service name must use domain.service format.",
       "service_not_found": "Service was not found in Home Assistant."
     },
@@ -94,6 +99,8 @@
             "amber_export_price_entity": "Amber export price sensor",
             "pv_forecast_entity": "PV forecast sensor",
             "baseline_load_forecast_entity": "Baseline load forecast sensor",
+            "pv_observed_entity": "Observed PV power sensor",
+            "baseline_load_observed_entity": "Observed baseline load power sensor",
             "battery_soc_entity": "Battery SOC sensor"
           },
           "data_description": {
@@ -101,6 +108,8 @@
             "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
             "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use. Select a power or energy forecast sensor using W, kW, MW, Wh, kWh, or MWh; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
             "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data in W, kW, or MW.",
+            "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
+            "baseline_load_observed_entity": "Optional actual household load power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
             "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value."
           }
         }

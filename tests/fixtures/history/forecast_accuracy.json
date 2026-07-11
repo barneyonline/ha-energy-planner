@@ -1,0 +1,27 @@
+{
+  "kind": "forecast_accuracy",
+  "name": "synthetic_forecast_accuracy",
+  "horizon_buckets": [
+    {"name": "near", "min_hours": 0, "max_hours": 4},
+    {"name": "day", "min_hours": 4, "max_hours": 12},
+    {"name": "long", "min_hours": 12, "max_hours": 24.01}
+  ],
+  "requirements": {
+    "min_origins": 3,
+    "min_samples_per_bucket": 3,
+    "max_baseline_mae_ratio": 0.75,
+    "max_mae": 0.3,
+    "required_buckets": ["near", "day", "long"]
+  },
+  "samples": [
+    {"issued_at": "2026-06-01T00:00:00+00:00", "valid_at": "2026-06-01T01:00:00+00:00", "lead_hours": 1, "forecast": 1.4, "actual": 1.5, "baseline": 0.7},
+    {"issued_at": "2026-06-01T00:00:00+00:00", "valid_at": "2026-06-01T06:00:00+00:00", "lead_hours": 6, "forecast": 3.2, "actual": 3.0, "baseline": 0.7},
+    {"issued_at": "2026-06-01T00:00:00+00:00", "valid_at": "2026-06-01T18:00:00+00:00", "lead_hours": 18, "forecast": 0.8, "actual": 0.7, "baseline": 0.2},
+    {"issued_at": "2026-06-02T00:00:00+00:00", "valid_at": "2026-06-02T01:00:00+00:00", "lead_hours": 1, "forecast": 1.7, "actual": 1.6, "baseline": 0.6},
+    {"issued_at": "2026-06-02T00:00:00+00:00", "valid_at": "2026-06-02T06:00:00+00:00", "lead_hours": 6, "forecast": 3.6, "actual": 3.4, "baseline": 0.6},
+    {"issued_at": "2026-06-02T00:00:00+00:00", "valid_at": "2026-06-02T18:00:00+00:00", "lead_hours": 18, "forecast": 0.5, "actual": 0.6, "baseline": 0.1},
+    {"issued_at": "2026-06-03T00:00:00+00:00", "valid_at": "2026-06-03T01:00:00+00:00", "lead_hours": 1, "forecast": 1.1, "actual": 1.2, "baseline": 0.5},
+    {"issued_at": "2026-06-03T00:00:00+00:00", "valid_at": "2026-06-03T06:00:00+00:00", "lead_hours": 6, "forecast": 2.8, "actual": 2.7, "baseline": 0.5},
+    {"issued_at": "2026-06-03T00:00:00+00:00", "valid_at": "2026-06-03T18:00:00+00:00", "lead_hours": 18, "forecast": 0.4, "actual": 0.5, "baseline": 0.0}
+  ]
+}

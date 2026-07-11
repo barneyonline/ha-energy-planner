@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 from uuid import uuid4
@@ -16,6 +16,7 @@ from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BASELINE_LOAD_FORECAST,
+    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
@@ -35,6 +36,7 @@ from .const import (
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRICE_FRESHNESS_MINUTES,
     CONF_PV_FORECAST,
+    CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_ENPHASE_AI_PROFILE,
     DEFAULT_ENPHASE_FULL_BACKUP_PROFILE,
@@ -43,12 +45,21 @@ from .const import (
 )
 from .ev import summarize_stored_trip_history
 from .forecast_calibration import apply_forecast_calibration
-from .forecasts import forecast_series_from_state, latest_forecast_valid_at_from_state, normalize_scalar_value
+from .forecasts import (
+    forecast_coverage_ratio,
+    forecast_series_from_state,
+    latest_forecast_valid_at_from_state,
+    normalize_scalar_value,
+)
 from .models import DecisionContext, DecisionSlot, HAEOStatus, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
     CONF_BASELINE_LOAD_FORECAST: "baseline_load_forecast_kw",
+}
+_OBSERVATION_FIELDS_BY_CONFIG = {
+    CONF_PV_OBSERVED: "pv_forecast_kw",
+    CONF_BASELINE_LOAD_OBSERVED: "baseline_load_forecast_kw",
 }
 _FORECAST_VALUE_KEYS_BY_CONFIG = {
     CONF_PV_FORECAST: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
@@ -58,6 +69,8 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_DAIKIN_POWER: ("power", "power"),
     CONF_PV_FORECAST: ("power", "power"),
     CONF_BASELINE_LOAD_FORECAST: ("power", "power"),
+    CONF_PV_OBSERVED: ("power", "power"),
+    CONF_BASELINE_LOAD_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
 
@@ -82,6 +95,7 @@ class InputManager:
         self.forecast_training_slots: list[dict[str, Any]] = []
         self.forecast_confidence_details: list[dict[str, Any]] = []
         self._raw_forecast_series: dict[str, list[float | None]] = {}
+        self._forecast_source_issued_at: dict[str, datetime] = {}
         self._forecast_confidence_scores: list[float] = []
         self._state_cache: dict[str, State | None] = {}
 
@@ -127,7 +141,11 @@ class InputManager:
         self.forecast_training_slots = [
             {
                 "valid_at": now + timedelta(minutes=offset),
+                "pv_forecast_kw_issued_at": self._forecast_source_issued_at.get("pv_forecast_kw"),
                 "pv_forecast_kw": _series_value(self._raw_forecast_series.get("pv_forecast_kw", pv_forecasts), index),
+                "baseline_load_forecast_kw_issued_at": self._forecast_source_issued_at.get(
+                    "baseline_load_forecast_kw"
+                ),
                 "baseline_load_forecast_kw": _series_value(
                     self._raw_forecast_series.get("baseline_load_forecast_kw", baseline_loads),
                     index,
@@ -268,6 +286,10 @@ class InputManager:
         state = self._state(entity_id)
         if not self._valid_state(state):
             return [None] * slot_count, f"{config_key}_unavailable"
+        calibration_field = _CALIBRATION_FIELDS_BY_CONFIG.get(config_key)
+        source_issued_at = _forecast_source_issued_at(state, now)
+        if calibration_field:
+            self._forecast_source_issued_at[calibration_field] = source_issued_at
 
         forecast = forecast_series_from_state(
             state,
@@ -278,20 +300,27 @@ class InputManager:
             value_kind=value_kind,
         )
         if forecast:
+            coverage = forecast_coverage_ratio(forecast)
             self._record_forecast_confidence(
-                _state_confidence(state, default=1.0),
+                _state_confidence(state, default=1.0) * coverage,
                 config_key=config_key,
                 entity_id=str(entity_id),
-                source="forecast_series",
+                source="forecast_series" if coverage == 1.0 else "forecast_series_partial",
             )
             padded = list(forecast[:slot_count])
-            if len(padded) < slot_count:
-                padded.extend([padded[-1]] * (slot_count - len(padded)))
-            calibration_field = _CALIBRATION_FIELDS_BY_CONFIG.get(config_key)
             if calibration_field:
                 self._raw_forecast_series[calibration_field] = list(padded)
-                padded = apply_forecast_calibration(padded, self.forecast_calibration, calibration_field)
-            return padded, None
+                lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
+                if lead_offset_minutes >= 0:
+                    padded = apply_forecast_calibration(
+                        padded,
+                        self.forecast_calibration,
+                        calibration_field,
+                        interval_minutes=interval,
+                        lead_offset_minutes=lead_offset_minutes,
+                    )
+            issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
+            return padded, issue
 
         value = _finite_float_or_none(state.state)
         if value is None:
@@ -444,16 +473,16 @@ class InputManager:
             value_kind="temperature",
         )
         if forecast:
+            coverage = forecast_coverage_ratio(forecast)
             self._record_forecast_confidence(
-                _state_confidence(state, default=1.0),
+                _state_confidence(state, default=1.0) * coverage,
                 config_key=config_key,
                 entity_id=str(entity_id),
-                source="forecast_series",
+                source="forecast_series" if coverage == 1.0 else "forecast_series_partial",
             )
             padded = list(forecast[:slot_count])
-            if len(padded) < slot_count:
-                padded.extend([padded[-1]] * (slot_count - len(padded)))
-            return current_temperature, padded, None
+            issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
+            return current_temperature, padded, issue
         if current_temperature is not None:
             self._record_forecast_confidence(
                 _POINT_SENSOR_CONFIDENCE,
@@ -490,12 +519,19 @@ class InputManager:
                 issues.append(f"{key}_stale")
         return issues
 
-    def current_forecast_observations(self) -> dict[str, float | None]:
-        """Return current point values for compact forecast calibration."""
-        observations: dict[str, float | None] = {}
-        for config_key, field in _CALIBRATION_FIELDS_BY_CONFIG.items():
+    def current_forecast_observations(self) -> dict[str, dict[str, Any] | None]:
+        """Return timestamped observed power from dedicated ground-truth entities."""
+        observations: dict[str, dict[str, Any] | None] = {}
+        for config_key, field in _OBSERVATION_FIELDS_BY_CONFIG.items():
             value, _issue = self._optional_numeric_state(config_key)
-            observations[field] = value
+            entity_id = self.entry_data.get(config_key)
+            state = self._state(entity_id) if entity_id else None
+            observed_at = getattr(state, "last_updated", None)
+            observations[field] = (
+                {"value": value, "observed_at": observed_at}
+                if value is not None and isinstance(observed_at, datetime)
+                else None
+            )
         return observations
 
     def thermal_sample(self, context: DecisionContext) -> dict[str, Any]:
@@ -627,6 +663,29 @@ def _attribute_value(attributes: Mapping[str, Any], *keys: str) -> Any:
         if canonical_key in canonical:
             return canonical[canonical_key]
     return None
+
+
+def _forecast_source_issued_at(state: State, fallback: datetime) -> datetime:
+    """Return stable per-source issue time, preferring payload metadata."""
+    attributes = getattr(state, "attributes", {}) or {}
+    raw = _attribute_value(
+        attributes,
+        "forecast_issued_at",
+        "issued_at",
+        "generated_at",
+        "generated_time",
+        "forecast_generated_at",
+    )
+    parsed: datetime | None = None
+    if isinstance(raw, datetime):
+        parsed = raw
+    elif isinstance(raw, str):
+        parsed = dt_util.parse_datetime(raw)
+    state_updated = getattr(state, "last_updated", None)
+    value = parsed or (state_updated if isinstance(state_updated, datetime) else fallback)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return dt_util.as_utc(value)
 
 
 def _canonical_key(value: Any) -> str:

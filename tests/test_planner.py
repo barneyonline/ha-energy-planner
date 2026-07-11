@@ -150,6 +150,85 @@ def test_estimated_cost_includes_projected_flexible_load() -> None:
     assert plan.estimated_daily_cost == 0.25
 
 
+def test_estimated_cost_prefers_haeo_grid_flow_forecasts() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at,
+            import_price=0.30,
+            export_price=0.10,
+            pv_forecast_kw=8.0,
+            baseline_load_forecast_kw=1.0,
+            haeo_grid_import_forecast_kw=2.0,
+            haeo_grid_export_forecast_kw=0.0,
+        ),
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=5),
+            import_price=0.30,
+            export_price=0.10,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=8.0,
+            haeo_grid_import_forecast_kw=0.0,
+            haeo_grid_export_forecast_kw=3.0,
+        ),
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.estimated_daily_cost == 0.025
+
+
+def test_estimated_cost_accounts_for_haeo_battery_power_without_grid_flow() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at,
+            import_price=0.24,
+            export_price=0.06,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=1.0,
+            haeo_battery_charge_forecast_kw=2.0,
+        ),
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=5),
+            import_price=0.24,
+            export_price=0.06,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=2.0,
+            haeo_battery_discharge_forecast_kw=2.0,
+        ),
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.estimated_daily_cost == 0.04
+
+
+def test_estimated_cost_falls_back_when_haeo_grid_flow_is_partial() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at,
+            import_price=0.24,
+            export_price=0.06,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=2.0,
+            haeo_grid_import_forecast_kw=None,
+            haeo_grid_export_forecast_kw=0.0,
+        )
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.estimated_daily_cost == 0.04
+
+
 def test_unsafe_context_suppresses_plan() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     plan = DryRunPlanner(options).create_plan(_context(InputHealth.UNSAFE))

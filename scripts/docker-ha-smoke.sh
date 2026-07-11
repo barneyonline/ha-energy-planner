@@ -67,6 +67,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def seed_due_forecast_snapshot(call: ServiceCall) -> None:
         """Seed one due forecast snapshot for smoke calibration validation."""
+        valid_at = dt_util.utcnow()
+        issued_at = valid_at - timedelta(minutes=5)
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = getattr(entry, "runtime_data", None)
             store = getattr(coordinator, "store", None)
@@ -74,12 +76,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 continue
             await store.async_add_forecast_snapshot(
                 {
-                    "created_at": "1970-01-01T00:00:00+00:00",
+                    "created_at": valid_at.isoformat(),
                     "plan_id": "docker_smoke_calibration",
                     "forecast_training_slots": [
                         {
-                            "valid_at": "1970-01-01T00:00:00+00:00",
+                            "valid_at": valid_at.isoformat(),
+                            "pv_forecast_kw_issued_at": issued_at.isoformat(),
                             "pv_forecast_kw": 1.0,
+                            "baseline_load_forecast_kw_issued_at": issued_at.isoformat(),
                             "baseline_load_forecast_kw": 1.0,
                         }
                     ],
@@ -391,32 +395,32 @@ template:
         attributes:
           unitOfMeasurement: "c/kWh"
           confidence: "{{ 0.94 }}"
-          detailedForecast: "{{ [{'perKwh': ((states('input_number.import_price') | float) * 100) | round(3)}, {'perKwh': 31}, {'perKwh': 32}, {'perKwh': 33}, {'perKwh': 34}, {'perKwh': 35}, {'perKwh': 36}, {'perKwh': 37}, {'perKwh': 38}, {'perKwh': 39}, {'perKwh': 40}, {'perKwh': 41}] }}"
+          detailedForecast: "{{ ([{'perKwh': ((states('input_number.import_price') | float) * 100) | round(3)}, {'perKwh': 31}, {'perKwh': 32}, {'perKwh': 33}, {'perKwh': 34}, {'perKwh': 35}, {'perKwh': 36}, {'perKwh': 37}, {'perKwh': 38}, {'perKwh': 39}, {'perKwh': 40}, {'perKwh': 41}] * 24) }}"
       - name: Smoke export price forecast
         state: "{{ states('input_number.export_price') }}"
         attributes:
           unitOfMeasurement: "c/kWh"
           confidence: "{{ 0.93 }}"
-          detailedForecast: "{{ [{'perKwh': ((states('input_number.export_price') | float) * 100) | round(3)}, {'perKwh': 9}, {'perKwh': 10}, {'perKwh': 11}, {'perKwh': 12}, {'perKwh': 13}, {'perKwh': 14}, {'perKwh': 15}, {'perKwh': 16}, {'perKwh': 17}, {'perKwh': 18}, {'perKwh': 19}] }}"
+          detailedForecast: "{{ ([{'perKwh': ((states('input_number.export_price') | float) * 100) | round(3)}, {'perKwh': 9}, {'perKwh': 10}, {'perKwh': 11}, {'perKwh': 12}, {'perKwh': 13}, {'perKwh': 14}, {'perKwh': 15}, {'perKwh': 16}, {'perKwh': 17}, {'perKwh': 18}, {'perKwh': 19}] * 24) }}"
       - name: Smoke PV forecast series
         state: "{{ states('input_number.pv_forecast') }}"
         attributes:
           unitOfMeasurement: "W"
           confidence: "{{ 0.92 }}"
-          detailedForecast: "{{ [{'prediction': {'watts': 2500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 5000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 2500}}, {'prediction': {'watts': 2000}}] }}"
+          detailedForecast: "{{ ([{'prediction': {'watts': 2500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 5000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 2500}}, {'prediction': {'watts': 2000}}] * 24) }}"
       - name: Smoke baseline load forecast series
         state: "{{ states('input_number.baseline_load') }}"
         attributes:
           unitOfMeasurement: "W"
           confidence: "{{ 0.91 }}"
-          detailedForecast: "{{ [{'watts': 1200}, {'watts': 1400}, {'watts': 1600}, {'watts': 1800}, {'watts': 2000}, {'watts': 2200}, {'watts': 2000}, {'watts': 1800}, {'watts': 1600}, {'watts': 1400}, {'watts': 1200}, {'watts': 1000}] }}"
+          detailedForecast: "{{ ([{'watts': 1200}, {'watts': 1400}, {'watts': 1600}, {'watts': 1800}, {'watts': 2000}, {'watts': 2200}, {'watts': 2000}, {'watts': 1800}, {'watts': 1600}, {'watts': 1400}, {'watts': 1200}, {'watts': 1000}] * 24) }}"
       - name: Smoke weather forecast
         state: "sunny"
         attributes:
           nativeTemperature: "{{ 21 }}"
           temperatureUnit: "C"
           confidence: "{{ 0.90 }}"
-          detailedForecast: "{{ [{'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}, {'nativeTemperature': 23.0}, {'nativeTemperature': 24.0}] }}"
+          detailedForecast: "{{ ([{'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}, {'nativeTemperature': 23.0}, {'nativeTemperature': 24.0}] * 48) }}"
 
 automation:
   - alias: Fake climate conflict
@@ -800,6 +804,8 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "amber_export_price_entity": "sensor.smoke_export_price_forecast",
               "pv_forecast_entity": "sensor.smoke_pv_forecast_series",
               "baseline_load_forecast_entity": "sensor.smoke_baseline_load_forecast_series",
+              "pv_observed_entity": "input_number.pv_forecast",
+              "baseline_load_observed_entity": "input_number.baseline_load",
               "battery_soc_entity": "input_number.battery_soc"
             },
             "subentry_id": "haep_energy",
@@ -1154,12 +1160,12 @@ if not any(
 if "forecast_calibration" not in store_data:
     raise SystemExit("Planner Store did not initialize forecast calibration state")
 forecast_calibration = store_data.get("forecast_calibration", {})
-seen_sample_ids = forecast_calibration.get("_seen_sample_ids", [])
-if not any("docker_smoke_calibration" in str(sample_id) for sample_id in seen_sample_ids):
-    raise SystemExit(f"Forecast calibration did not consume the smoke due snapshot: {seen_sample_ids}")
 for field in ("pv_forecast_kw", "baseline_load_forecast_kw"):
-    if forecast_calibration.get(field, {}).get("sample_count", 0) < 1:
+    calibration = forecast_calibration.get(field, {})
+    if calibration.get("model_version") != 3 or calibration.get("sample_count", 0) < 1:
         raise SystemExit(f"Forecast calibration did not store samples for {field}: {forecast_calibration}")
+    if not any(sample.get("forecast") == 1.0 and sample.get("actual") == 2.0 for sample in calibration.get("samples", [])):
+        raise SystemExit(f"Forecast calibration did not consume the aligned smoke sample for {field}: {calibration}")
 if "thermal_model" not in store_data:
     raise SystemExit("Planner Store did not initialize thermal model state")
 thermal_model = store_data.get("thermal_model", {})
