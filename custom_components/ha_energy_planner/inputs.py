@@ -37,6 +37,7 @@ from .const import (
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRICE_FRESHNESS_MINUTES,
     CONF_PV_FORECAST,
+    CONF_PV_FORECAST_SECONDARY,
     CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_ENPHASE_AI_PROFILE,
@@ -47,6 +48,7 @@ from .const import (
 from .ev import summarize_stored_trip_history
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
+    forecast_coverage_details,
     forecast_coverage_ratio,
     forecast_series_from_state,
     latest_forecast_valid_at_from_state,
@@ -64,6 +66,7 @@ _OBSERVATION_FIELDS_BY_CONFIG = {
 }
 _FORECAST_VALUE_KEYS_BY_CONFIG = {
     CONF_PV_FORECAST: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
+    CONF_PV_FORECAST_SECONDARY: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
     CONF_BASELINE_LOAD_FORECAST: ("baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"),
     CONF_CARBON_INTENSITY_FORECAST: (
         "carbon_intensity_g_per_kwh",
@@ -80,6 +83,8 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_BASELINE_LOAD_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
+_LEADING_LOAD_FILL_CONFIDENCE_FACTOR = 0.75
+_MAX_LEADING_LOAD_FILL_MINUTES = 60
 
 
 class InputManager:
@@ -101,6 +106,7 @@ class InputManager:
         self.forecast_calibration = dict(forecast_calibration or {})
         self.forecast_training_slots: list[dict[str, Any]] = []
         self.forecast_confidence_details: list[dict[str, Any]] = []
+        self.forecast_coverage_details: list[dict[str, Any]] = []
         self._raw_forecast_series: dict[str, list[float | None]] = {}
         self._conservative_forecast_series: dict[str, list[float | None]] = {}
         self._forecast_source_issued_at: dict[str, datetime] = {}
@@ -112,6 +118,7 @@ class InputManager:
         now = dt_util.utcnow()
         self._forecast_confidence_scores = []
         self.forecast_confidence_details = []
+        self.forecast_coverage_details = []
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
         import_prices, import_issue = self._required_series(
@@ -137,6 +144,7 @@ class InputManager:
             now,
             horizon,
             interval,
+            secondary_config_key=CONF_PV_FORECAST_SECONDARY,
         )
         baseline_loads, load_issue = self._required_series(
             CONF_BASELINE_LOAD_FORECAST,
@@ -305,6 +313,8 @@ class InputManager:
         now: datetime,
         horizon: int,
         interval: int,
+        *,
+        secondary_config_key: str | None = None,
     ) -> tuple[list[float | None], str | None]:
         entity_id = self.entry_data.get(config_key)
         slot_count = int((horizon * 60) / interval)
@@ -314,29 +324,98 @@ class InputManager:
         if not self._valid_state(state):
             return [None] * slot_count, f"{config_key}_unavailable"
         calibration_field = _CALIBRATION_FIELDS_BY_CONFIG.get(config_key)
-        source_issued_at = _forecast_source_issued_at(state, now)
+        source_states = [(config_key, str(entity_id), state)]
+        secondary_entity_id = self.entry_data.get(secondary_config_key) if secondary_config_key else None
+        secondary_state = self._state(secondary_entity_id) if secondary_entity_id else None
+        if secondary_config_key and secondary_entity_id:
+            secondary_status = _forecast_source_status(
+                secondary_state,
+                now=now,
+                freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
+                value_keys=value_keys,
+            )
+            if secondary_status == "usable":
+                assert secondary_state is not None
+                source_states.append((secondary_config_key, str(secondary_entity_id), secondary_state))
+            else:
+                self.forecast_coverage_details.append(
+                    {
+                        "config_key": secondary_config_key,
+                        "entity_id": str(secondary_entity_id),
+                        "classification": secondary_status,
+                        "first_timestamp": None,
+                        "last_timestamp": None,
+                        "covered_hours": 0.0,
+                        "continuous_hours": 0.0,
+                        "leading_missing_slots": slot_count,
+                        "trailing_missing_slots": slot_count,
+                        "internal_missing_slots": 0,
+                    }
+                )
+        source_issued_at = min(_forecast_source_issued_at(item[2], now) for item in source_states)
         if calibration_field:
             self._forecast_source_issued_at[calibration_field] = source_issued_at
 
-        forecast = forecast_series_from_state(
-            state,
-            issued_at=now,
-            horizon_hours=horizon,
-            interval_minutes=interval,
-            value_keys=value_keys,
-            value_kind=value_kind,
-        )
+        source_forecasts = [
+            forecast_series_from_state(
+                source_state,
+                issued_at=now,
+                horizon_hours=horizon,
+                interval_minutes=interval,
+                value_keys=value_keys,
+                value_kind=value_kind,
+            )
+            for _source_key, _source_entity, source_state in source_states
+        ]
+        forecasts = [item for item in source_forecasts if item]
+        forecast = _stitch_forecast_series(forecasts, slot_count) if forecasts else None
         if forecast:
+            raw_forecast = list(forecast)
+            leading_fill_slots = 0
+            if config_key == CONF_BASELINE_LOAD_FORECAST:
+                current_value = _finite_float_or_none(state.state)
+                if current_value is not None:
+                    attributes = getattr(state, "attributes", {}) or {}
+                    unit = str(_attribute_value(attributes, "unit_of_measurement", "unit") or "")
+                    current_value = normalize_scalar_value(
+                        current_value,
+                        value_kind=value_kind,
+                        value_key=value_keys[0],
+                        unit=unit,
+                    )
+                    leading_fill_slots = _fill_bounded_leading_gap(
+                        forecast,
+                        current_value,
+                        max_slots=max(int(_MAX_LEADING_LOAD_FILL_MINUTES / interval), 1),
+                    )
             coverage = forecast_coverage_ratio(forecast)
+            coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval)
+            confidence_factor = _LEADING_LOAD_FILL_CONFIDENCE_FACTOR if leading_fill_slots else 1.0
             self._record_forecast_confidence(
-                _state_confidence(state, default=1.0) * coverage,
+                min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
+                * coverage
+                * confidence_factor,
                 config_key=config_key,
-                entity_id=str(entity_id),
-                source="forecast_series" if coverage == 1.0 else "forecast_series_partial",
+                entity_id=",".join(item[1] for item in source_states),
+                source=(
+                    "forecast_series_leading_fill"
+                    if leading_fill_slots
+                    else "forecast_series_stitched"
+                    if len(forecasts) > 1
+                    else "forecast_series"
+                    if coverage == 1.0
+                    else "forecast_series_partial"
+                ),
+                details={
+                    **coverage_details,
+                    "source_count": len(forecasts),
+                    "leading_gap_filled_slots": leading_fill_slots,
+                    "leading_gap_filled_hours": round(leading_fill_slots * interval / 60, 4),
+                },
             )
             padded = list(forecast[:slot_count])
             if calibration_field:
-                self._raw_forecast_series[calibration_field] = list(padded)
+                self._raw_forecast_series[calibration_field] = list(raw_forecast[:slot_count])
                 lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
                 if lead_offset_minutes >= 0:
                     uncertainty_mode = "lower" if calibration_field == "pv_forecast_kw" else "upper"
@@ -355,7 +434,14 @@ class InputManager:
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
                     )
-            issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
+            classification = str(coverage_details["classification"])
+            issue = (
+                None
+                if classification == "healthy"
+                else f"{config_key}_forecast_coverage_degraded"
+                if classification == "degraded"
+                else f"{config_key}_incomplete_horizon"
+            )
             return padded, issue
 
         value = _finite_float_or_none(state.state)
@@ -558,13 +644,21 @@ class InputManager:
             state = self._state(entity_id) if entity_id else None
             if state and now - state.last_updated > price_timeout:
                 issues.append(f"{key}_stale")
-        for key in (CONF_PV_FORECAST, CONF_BASELINE_LOAD_FORECAST, CONF_CARBON_INTENSITY_FORECAST):
+        for key in (
+            CONF_PV_FORECAST,
+            CONF_BASELINE_LOAD_FORECAST,
+            CONF_CARBON_INTENSITY_FORECAST,
+        ):
             entity_id = self.entry_data.get(key)
             state = self._state(entity_id) if entity_id else None
-            if state and now - state.last_updated > forecast_timeout and not _has_current_forecast_data(
-                state,
-                now,
-                _FORECAST_VALUE_KEYS_BY_CONFIG[key],
+            if (
+                state
+                and now - state.last_updated > forecast_timeout
+                and not _has_current_forecast_data(
+                    state,
+                    now,
+                    _FORECAST_VALUE_KEYS_BY_CONFIG[key],
+                )
             ):
                 issues.append(f"{key}_stale")
         return issues
@@ -627,7 +721,8 @@ class InputManager:
     @staticmethod
     def _health_from_issues(issues: list[str]) -> InputHealth:
         required_fragments = ("import_price", "export_price", "pv_forecast", "baseline_load", "battery_soc")
-        if any(any(fragment in issue for fragment in required_fragments) for issue in issues):
+        required_issues = [issue for issue in issues if any(fragment in issue for fragment in required_fragments)]
+        if any(not issue.endswith("_forecast_coverage_degraded") for issue in required_issues):
             return InputHealth.UNSAFE
         if issues:
             return InputHealth.DEGRADED
@@ -640,6 +735,7 @@ class InputManager:
         config_key: str | None = None,
         entity_id: str | None = None,
         source: str = "unknown",
+        details: Mapping[str, Any] | None = None,
     ) -> None:
         confidence = _clamp_confidence(value)
         self._forecast_confidence_scores.append(confidence)
@@ -652,6 +748,14 @@ class InputManager:
                     "confidence": confidence,
                 }
             )
+            if details is not None:
+                self.forecast_coverage_details.append(
+                    {
+                        "config_key": config_key,
+                        "entity_id": entity_id,
+                        **dict(details),
+                    }
+                )
 
 
 def _series_value(series: list[float | None], index: int) -> float | None:
@@ -660,6 +764,37 @@ def _series_value(series: list[float | None], index: int) -> float | None:
     if index < len(series):
         return series[index]
     return series[-1]
+
+
+def _stitch_forecast_series(
+    forecasts: list[list[float | None]],
+    slot_count: int,
+) -> list[float | None]:
+    """Merge aligned forecast sources, retaining primary-source precedence."""
+    stitched: list[float | None] = []
+    for index in range(slot_count):
+        stitched.append(
+            next(
+                (forecast[index] for forecast in forecasts if index < len(forecast) and forecast[index] is not None),
+                None,
+            )
+        )
+    return stitched
+
+
+def _fill_bounded_leading_gap(
+    forecast: list[float | None],
+    current_value: float,
+    *,
+    max_slots: int,
+) -> int:
+    """Fill a short leading load gap without masking internal or long gaps."""
+    first_present = next((index for index, value in enumerate(forecast) if value is not None), None)
+    if first_present is None or first_present == 0 or first_present > max_slots:
+        return 0
+    for index in range(first_present):
+        forecast[index] = current_value
+    return first_present
 
 
 def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> list[int]:
@@ -784,6 +919,25 @@ def _combined_confidence(values: list[float]) -> float:
 def _has_current_forecast_data(state: State, now: datetime, value_keys: tuple[str, ...]) -> bool:
     latest_valid_at = latest_forecast_valid_at_from_state(state, value_keys=value_keys)
     return latest_valid_at is not None and latest_valid_at >= now
+
+
+def _forecast_source_status(
+    state: State | None,
+    *,
+    now: datetime,
+    freshness_minutes: int,
+    value_keys: tuple[str, ...],
+) -> str:
+    """Classify an optional forecast source without affecting usable siblings."""
+    if state is None or state.state in STATE_UNKNOWN_VALUES:
+        return "unavailable"
+    if now - state.last_updated > timedelta(minutes=freshness_minutes) and not _has_current_forecast_data(
+        state,
+        now,
+        value_keys,
+    ):
+        return "stale"
+    return "usable"
 
 
 def _clamp_confidence(value: float) -> float:

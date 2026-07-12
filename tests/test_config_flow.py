@@ -74,6 +74,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRIORITY_WEIGHTS,
     CONF_PV_FORECAST,
+    CONF_PV_FORECAST_SECONDARY,
     CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
@@ -255,6 +256,7 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     import_filter = schema_fields[CONF_AMBER_IMPORT_PRICE].serialize()["selector"]["entity"]["filter"][0]
     export_filter = schema_fields[CONF_AMBER_EXPORT_PRICE].serialize()["selector"]["entity"]["filter"][0]
     pv_filter = schema_fields[CONF_PV_FORECAST].serialize()["selector"]["entity"]["filter"][0]
+    second_pv_filter = schema_fields[CONF_PV_FORECAST_SECONDARY].serialize()["selector"]["entity"]["filter"][0]
     baseline_filter = schema_fields[CONF_BASELINE_LOAD_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     carbon_filter = schema_fields[CONF_CARBON_INTENSITY_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     pv_observed_filter = schema_fields[CONF_PV_OBSERVED].serialize()["selector"]["entity"]["filter"][0]
@@ -265,12 +267,20 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     assert "AUD/kWh" in import_filter["unit_of_measurement"]
     assert "c/kWh" in export_filter["unit_of_measurement"]
     assert {"W", "kW", "kWh"} <= set(pv_filter["unit_of_measurement"])
+    assert second_pv_filter == pv_filter
     assert "kW" in baseline_filter["unit_of_measurement"]
     assert "kWh" not in baseline_filter["unit_of_measurement"]
     assert {"gCO2/kWh", "kgCO₂/kWh"} <= set(carbon_filter["unit_of_measurement"])
     assert pv_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
     assert load_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
     assert battery_filter["unit_of_measurement"] == ["%", "percent", "percentage"]
+
+
+def test_recommended_default_planning_horizon_is_twelve_hours() -> None:
+    schema_fields = {getattr(key, "schema", key): key for key in _options_schema({}).schema}
+
+    assert DEFAULT_OPTIONS[CONF_PLANNING_HORIZON_HOURS] == 12
+    assert schema_fields[CONF_PLANNING_HORIZON_HOURS].default() == 12
 
 
 def test_observed_power_sensor_must_not_be_the_forecast_sensor() -> None:
@@ -282,6 +292,33 @@ def test_observed_power_sensor_must_not_be_the_forecast_sensor() -> None:
     )
 
     assert errors[CONF_PV_OBSERVED] == "observation_must_differ_from_forecast"
+
+
+def test_secondary_pv_forecast_must_be_distinct() -> None:
+    hass = FakeHass(
+        {"sensor.pv", "sensor.observed"},
+        set(),
+        {
+            "sensor.pv": {"unit_of_measurement": "kW"},
+            "sensor.observed": {"unit_of_measurement": "kW"},
+        },
+    )
+
+    duplicate = _validate_config(
+        hass,
+        {CONF_PV_FORECAST: "sensor.pv", CONF_PV_FORECAST_SECONDARY: "sensor.pv"},
+    )
+    observed = _validate_config(
+        hass,
+        {
+            CONF_PV_FORECAST: "sensor.pv",
+            CONF_PV_FORECAST_SECONDARY: "sensor.observed",
+            CONF_PV_OBSERVED: "sensor.observed",
+        },
+    )
+
+    assert duplicate[CONF_PV_FORECAST_SECONDARY] == "forecast_sources_must_differ"
+    assert observed[CONF_PV_OBSERVED] == "observation_must_differ_from_forecast"
 
 
 def test_related_power_and_soc_fields_filter_sensor_selectors_by_expected_units() -> None:
