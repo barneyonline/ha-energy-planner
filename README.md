@@ -135,6 +135,7 @@ Energy Planner is built around conservative production controls:
 - The **Planner enabled** switch starts off.
 - The **Dry run** switch starts on.
 - Active control requires mapped inputs for each enabled control area, healthy modular preflight status, production arming, and dry-run review. Unconfigured or disabled device areas do not block a partial installation.
+- Preflight reports historical `dry_run_evidence_complete` separately from `safe_to_activate_now`. Dry-run evidence is bound to the current control-area/entity/policy fingerprint but intentionally survives switching from dry-run to active mode, changing advisory-only AI settings, and changing the per-run EV ready-by time. Current activation additionally requires a recent successfully refreshed healthy plan, non-zero confidence, at least eight usable priced hours (or the whole configured horizon when shorter), and no active control pause. Execution independently rechecks the evidence fingerprint, bounded evidence count, and strict armed state and fails closed after a contract change or corrupt/missing production state.
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
 - Device control is paused temporarily when a command fails or a recent planner-owned EV/Enphase state appears to have been changed externally.
@@ -147,7 +148,7 @@ Run preflight before enabling active control from the integration **Run prefligh
 service: ha_energy_planner.run_preflight
 ```
 
-Only proceed when the response shows the integration is ready, required entities and services are available, and production control has been intentionally armed.
+Only proceed when `safe_to_activate_now` is true, required entities and services are available, and production control has been intentionally armed. Historical dry-run evidence alone is not a statement that current forecasts are safe.
 
 ## Services
 

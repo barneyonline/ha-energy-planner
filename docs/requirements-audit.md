@@ -226,10 +226,15 @@ Status as of 2026-06-28.
   minimum-cycle/rest validation are implemented. Suppression only disables
   mapped climate automations while occupied comfort is still valid. A compact
   HVAC thermal model records current indoor temperature, optional Daikin power,
-  and optional weather temperature samples, tolerates timezone-naive older
-  sample timestamps and comma-decimal sample strings, ignores non-finite sample
-  or persisted model values, then uses mature active-power history to project HVAC
-  flexible-load demand. Planner tests cover replayed cold/heating and
+  and optional weather temperature samples. Version 2 requires samples at least
+  five minutes apart, ignores sensor deltas below effective precision, excludes
+  HVAC start/stop/mode transitions, requires explicit stable heat/cool mode and
+  power evidence for active learning plus explicit off/idle evidence for passive
+  learning, rejects implausible rates instead of
+  clamping them, and derives medians from bounded rolling windows. Legacy
+  unbounded statistics are reset before a new anchor is accepted. It also
+  tolerates timezone-naive timestamps and comma-decimal strings and ignores
+  non-finite values. Planner tests cover replayed cold/heating and
   warm/cooling thermal samples feeding preconditioning projections. Docker
   smoke coverage validates one active HVAC power sample from Home Assistant
   climate/power entities plus occupied preconditioning, expensive-period
@@ -264,7 +269,8 @@ Status as of 2026-06-28.
   cannot return planner evidence and unsupported second passes, and uses a
   bounded 30-second equivalent-input cache. Service-call status is distinct
   from forecast-evidence status; READY requires continuous import and export
-  evidence across at least 80% of the requested solve slots. Solve and coordinator refresh duration,
+  evidence across at least 80% of the requested solve slots. Solve and
+  coordinator refresh duration,
   trigger, coalesced/skipped counters, refreshes/hour, phase timing, cache,
   evidence, and capability metadata are available to diagnostics consumers.
 - Dry-run actions are recorded as intentionally skipped with the stable
@@ -281,10 +287,29 @@ Status as of 2026-06-28.
 - Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
   retention with defensive hard caps, preserving day-ahead training evidence
   across manual refresh bursts without unbounded storage growth.
+- Forecast calibration explicitly drops legacy models and rebuilds current
+  model fields from bounded timestamped evidence when persisted raw or unique
+  counters are inconsistent or implausibly large. Bounded processed-observation
+  observation-plus-lead identities prevent duplicate training without dropping
+  older observations or newly available lead buckets that arrive out of order.
 - Preflight discovery blocks only configured and enabled control areas. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
   production readiness without an enabled controllable area.
+- Preflight distinguishes historical dry-run evidence from current activation
+  safety. `safe_to_activate_now` additionally requires a current healthy,
+  non-zero-confidence plan, a recent successful coordinator refresh, at least
+  eight usable priced hours (or the full configured horizon when shorter), and
+  no active control pause. Historical evidence is invalidated when the required
+  control areas, mapped entities/services, or decision/control policies change,
+  while runtime planner/dry-run mode, per-run EV ready-by changes, and advisory
+  AI settings are excluded so an intentional dry-run-to-active transition
+  retains valid evidence. The executor and readiness sensor independently fail
+  closed on a mismatch, missing state, non-boolean armed value, or malformed or
+  unreasonable evidence counter. Pause
+  parsing is shared and timezone-aware; malformed active and legacy pause states
+  remain paused rather than failing open.
+  `active_control_ready` still requires the independent production arm.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
   results are discarded before they can overwrite the active plan or execute
   device actions when a newer replan request has arrived.
@@ -313,6 +338,10 @@ Status as of 2026-06-28.
   token, coordinate, address, raw prompt, raw model response, location-history
   field redaction, entity mapping, latest HAEO status, plan metadata, and
   bounded recent outcomes.
+- Diagnostics and system health expose rolling refresh metrics when supplied by
+  the coordinator, including refreshes per hour, last trigger,
+  skipped/coalesced counts, phase durations, and the usable optimization
+  horizon, while remaining compatible with older coordinators.
 - Estimated-cost telemetry reports the usable priced horizon and uses Home
   Assistant's configured currency with the monetary sensor device class.
 - Home Assistant validation is covered by Docker smoke coverage, Home Assistant
