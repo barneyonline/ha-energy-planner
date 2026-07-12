@@ -1,16 +1,44 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-07-12
 
 ### Added
 
 - Optional second PV forecast input with timestamp-safe Today/Tomorrow stitching.
 - Per-input forecast coverage diagnostics and bounded conservative baseline-load leading-gap fill.
+- Refresh-trigger, phase-timing, retention, HAEO-evidence, and usable-horizon diagnostics.
+- Versioned thermal learning, production evidence contracts, fresh-plan activation checks, and shared fail-closed pause parsing.
 
 ### Changed
 
 - The recommended default planning horizon is now 12 hours. Continuous forecast coverage is healthy at 12 hours, degraded from 8 to under 12 hours, and unsafe below 8 hours.
 - Required point-only inputs no longer masquerade as full forecasts; secondary PV stitching requires timezone-aware timestamps and does not calibrate slots without primary-source provenance.
+- Replanning uses an explicit decision-input allowlist, one-minute non-manual floor, coalescing, and stable input fingerprints.
+- AI advice runs after plan commit as a cancellable single-flight task and is published only for the current safe plan.
+- Thermal learning uses explicit HVAC mode/power evidence, minimum sample spacing, plausible-rate gates, and bounded robust medians.
+- Forecast calibration and retained planner evidence use bounded, migration-safe, time-aware storage.
+
+### Fixed
+
+- Dry-run actions are recorded as skipped instead of rejected, while repeated dry-run evidence is coalesced without hiding real command attempts.
+- HAEO is ready only when response-capable services return continuous import and export evidence across enough solve slots.
+- Planner-owned device feedback is suppressed only when a successful command matches the observed state.
+- Stale AI results, stale plans, active pauses, changed control contracts, and missing or malformed production state now fail closed.
+- Corrupt thermal, calibration, retention, pause, boolean, and evidence-counter state is reset, filtered, or blocked safely.
+
+### Upgrade Notes
+
+- Existing configured planning horizons are preserved; review horizons above 12 hours against the actual Amber coverage available at your site.
+- Configure the optional secondary PV entity only when it exposes timezone-aware timestamps. Solcast tomorrow data can then extend the today forecast safely.
+- Production evidence is tied to the mapped control surfaces and decision policy. Relevant configuration changes require new healthy dry-run evidence before active commands resume.
+- Legacy thermal and forecast-calibration statistics are migrated or reset before they can influence planning.
+- AI provider integrations may log prompts independently; review provider logging settings before enabling advisory features.
+
+### Validation
+
+- Dockerized pytest: `647 passed`
+- Coverage: `100%` across `7,314` statements
+- Replay, live-schema, real-history, quality-scale, Home Assistant `check_config`, and Docker smoke validation
 
 ## 0.4.0 - 2026-07-12
 
