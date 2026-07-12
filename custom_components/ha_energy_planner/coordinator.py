@@ -164,8 +164,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             "fingerprint_skipped": 0,
         }
         self._refresh_completed_times: list[float] = []
+        self._refresh_trigger_counts: dict[str, int] = {}
         self._last_phase_durations: dict[str, float] = {}
         self._haeo_adapter: HAEOAdapter | None = None
+        self._ai_advice_task: asyncio.Task[None] | None = None
+        self._ai_advice_fingerprint: str | None = None
         self.last_refresh_metadata: dict[str, Any] = {}
         super().__init__(
             hass,
@@ -210,7 +213,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         return {
             **dict(getattr(self, "_refresh_counters", {})),
             "refreshes_last_hour": len(completed),
-            "last_trigger": getattr(self, "_pending_refresh_trigger", None),
+            "trigger_counts": dict(getattr(self, "_refresh_trigger_counts", {})),
+            "last_trigger": getattr(self, "last_refresh_metadata", {}).get(
+                "trigger", getattr(self, "_pending_refresh_trigger", None)
+            ),
             "last_duration_ms": getattr(self, "last_refresh_metadata", {}).get("duration_ms"),
             "phase_durations_ms": dict(getattr(self, "_last_phase_durations", {})),
         }
@@ -245,6 +251,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if self._boundary_cancel is not None:
             self._boundary_cancel()
             self._boundary_cancel = None
+        ai_task = getattr(self, "_ai_advice_task", None)
+        if ai_task is not None and not ai_task.done():
+            ai_task.cancel()
+        self._ai_advice_task = None
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
 
@@ -297,13 +307,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Refresh planner data."""
         started = perf_counter()
         succeeded = False
+        trigger = getattr(self, "_pending_refresh_trigger", "unknown")
+        trigger_counts = getattr(self, "_refresh_trigger_counts", {})
+        trigger_counts[trigger] = int(trigger_counts.get(trigger, 0)) + 1
+        self._refresh_trigger_counts = trigger_counts
         try:
             async with self._planner_lock:
                 async with self.store.async_delay_save():
                     result = await self._async_update_data_locked()
                     succeeded = True
+                    self._increment_refresh_counter("succeeded")
                     return result
         finally:
+            if not succeeded:
+                self._increment_refresh_counter("failed")
             self._increment_refresh_counter("completed")
             completed_times = getattr(self, "_refresh_completed_times", [])
             completed_times.append(monotonic())
@@ -312,7 +329,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "duration_ms": round((perf_counter() - started) * 1000, 3),
                 "succeeded": succeeded,
                 "completed_at": dt_util.utcnow(),
-                "trigger": getattr(self, "_pending_refresh_trigger", "unknown"),
+                "trigger": trigger,
                 "counters": dict(getattr(self, "_refresh_counters", {})),
                 "phases": dict(getattr(self, "_last_phase_durations", {})),
             }
@@ -445,24 +462,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if plan.mode == PlannerMode.ACTIVE_HEALTHY:
                 plan.mode = PlannerMode.ACTIVE_DEGRADED
         await self.executor.async_notify_plan_fallback(plan, violations)
-        ai_result = None
-        if bool(options.get(CONF_AI_ENABLED, False)):
-            ai_result, should_store_ai_result = await self._async_get_throttled_ai_advice(
-                context, plan, entry_data, options
-            )
-            if should_store_ai_result:
-                await self.store.async_add_ai_recommendation(
-                    {
-                        "created_at": context.created_at,
-                        "plan_id": context.plan_id,
-                        "status": ai_result.status,
-                        "accepted": ai_result.accepted,
-                        "rejected_reason": ai_result.rejected_reason,
-                        "rejected_detail": ai_result.rejected_detail,
-                        "service_called": ai_result.service_called,
-                        CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                    }
-                )
         await self.store.async_add_forecast_snapshot(
             {
                 "created_at": context.created_at,
@@ -496,22 +495,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "sources": getattr(manager, "forecast_confidence_details", []),
                 },
                 "input_issues": context.input_issues[:20],
-                "ai": None
-                if ai_result is None
-                else {
-                    "status": ai_result.status,
-                    "accepted_fields": sorted(ai_result.accepted),
-                    "rejected_reason": ai_result.rejected_reason,
-                    "rejected_detail": ai_result.rejected_detail,
-                    "service_called": ai_result.service_called,
-                    CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                },
+                # Advice is intentionally generated after the plan commit so a
+                # slow local provider cannot hold the coordinator refresh lock.
+                "ai": None,
             }
         )
         await self._async_update_production_evidence(plan, violations)
         if plan.mode == PlannerMode.DRY_RUN:
             await self._async_record_dry_run_comparison(plan)
         result = await self._async_commit_plan_if_current(started_generation, plan, context, options)
+        self._increment_refresh_counter("computed")
         self._last_phase_durations = {
             "inputs_ms": preparation_ms,
             "haeo_ms": round(haeo_ms, 3),
@@ -520,6 +513,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         }
         if started_generation == self._refresh_generation:
             self._last_decision_fingerprint = decision_fingerprint
+            self._schedule_ai_advice(context, plan, entry_data, options)
         return result
 
     def _get_haeo_adapter(self, entry_data: dict[str, Any]) -> HAEOAdapter:
@@ -749,7 +743,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options: dict[str, Any],
     ) -> tuple[AIAdviceResult, bool]:
         """Return AI advice only for safe, materially changed plans."""
-        if plan.health == InputHealth.UNSAFE or plan.confidence <= 0:
+        if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
             return (
                 AIAdviceResult(
                     status="skipped",
@@ -808,6 +802,71 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # widening the public AI result contract.
         result.rejected_detail.setdefault("plan_fingerprint", plan_fingerprint)
         return result, True
+
+    @callback
+    def _schedule_ai_advice(
+        self,
+        context: Any,
+        plan: EnergyPlan,
+        entry_data: dict[str, Any],
+        options: dict[str, Any],
+    ) -> None:
+        """Schedule advisory work after plan commit with one in-flight call."""
+        if (
+            not bool(options.get(CONF_AI_ENABLED, False))
+            or plan.health == InputHealth.UNSAFE
+            or plan.status == "unsafe"
+            or plan.confidence <= 0
+        ):
+            return
+        fingerprint = _material_plan_fingerprint(plan)
+        if _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == fingerprint:
+            return
+        current = getattr(self, "_ai_advice_task", None)
+        if current is not None and not current.done():
+            if getattr(self, "_ai_advice_fingerprint", None) == fingerprint:
+                return
+            current.cancel()
+        self._ai_advice_fingerprint = fingerprint
+        self._ai_advice_task = self.hass.async_create_task(
+            self._async_run_ai_advice(context, plan, entry_data, options, fingerprint)
+        )
+
+    async def _async_run_ai_advice(
+        self,
+        context: Any,
+        plan: EnergyPlan,
+        entry_data: dict[str, Any],
+        options: dict[str, Any],
+        fingerprint: str,
+    ) -> None:
+        """Persist one bounded background advisory result and notify entities."""
+        started = perf_counter()
+        try:
+            ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
+            if not should_store or self._ai_advice_fingerprint != fingerprint:
+                return
+            await self.store.async_add_ai_recommendation(
+                {
+                    "created_at": context.created_at,
+                    "plan_id": plan.plan_id,
+                    "status": ai_result.status,
+                    "accepted": ai_result.accepted,
+                    "rejected_reason": ai_result.rejected_reason,
+                    "rejected_detail": ai_result.rejected_detail,
+                    "service_called": ai_result.service_called,
+                    CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
+                }
+            )
+            self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
+            self.async_update_listeners()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - advice must never fail the planner task.
+            _LOGGER.exception("Background AI advice failed")
+        finally:
+            if getattr(self, "_ai_advice_task", None) is asyncio.current_task():
+                self._ai_advice_task = None
 
     def _non_manual_refresh_delay(self) -> float:
         """Return delay needed to enforce the safe non-manual refresh cadence."""
@@ -885,10 +944,23 @@ def _material_plan_fingerprint(plan: EnergyPlan) -> str:
             for action in plan.actions
         ],
         "estimated_daily_cost": plan.estimated_daily_cost,
-        "preview": to_jsonable(plan.preview[:24]),
+        "preview": _material_preview(plan.preview[:24]),
     }
     encoded = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _material_preview(value: Any) -> Any:
+    """Remove refresh-relative timestamps while retaining decision values."""
+    if isinstance(value, dict):
+        return {
+            str(key): _material_preview(item)
+            for key, item in value.items()
+            if str(key) not in {"valid_at", "created_at", "execute_not_before", "execute_not_after"}
+        }
+    if isinstance(value, list):
+        return [_material_preview(item) for item in value]
+    return to_jsonable(value)
 
 
 def _latest_ai_plan_fingerprint(recommendations: Any) -> str | None:

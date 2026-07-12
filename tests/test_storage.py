@@ -19,6 +19,7 @@ from custom_components.ha_energy_planner.storage import (
     PlannerStore,
     _audit_entry,
     _dry_run_signature,
+    _record_timestamp,
     _same_audit_outcome,
     _same_dry_run_comparison,
 )
@@ -265,8 +266,8 @@ def test_forecast_snapshot_retention_covers_day_ahead_training_at_five_minutes(
 
     asyncio.run(store.async_add_forecast_snapshot({"index": 384}))
 
-    assert len(store.data["forecast_snapshots"]) == 384
-    assert store.data["forecast_snapshots"][0] == {"index": 1}
+    assert len(store.data["forecast_snapshots"]) == 385
+    assert store.data["forecast_snapshots"][0] == {"index": 0}
     assert store.data["forecast_snapshots"][-1] == {"index": 384}
 
 
@@ -327,6 +328,53 @@ def test_store_coalesces_materially_identical_dry_run_outcomes(monkeypatch: obje
     assert len(store.data["execution_audit"]) == 1
     assert store.data["execution_audit"][0]["occurrence_count"] == 2
     assert store.data["execution_audit"][0]["last_attempted_at"] == second_at.isoformat()
+    assert len(store.data["outcomes"]) == 1
+    assert store.data["outcomes"][0]["occurrence_count"] == 2
+    assert store.data["outcomes"][0]["last_attempted_at"] == second_at.isoformat()
+
+
+def test_store_does_not_coalesce_applied_outcomes(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    outcome = ActionOutcome("action", now, OutcomeResult.APPLIED, "ok", {}, {}, "plan", asset="ev", kind="ev_start")
+
+    asyncio.run(store.async_add_outcome(outcome))
+    asyncio.run(store.async_add_outcome(outcome))
+
+    assert len(store.data["execution_audit"]) == 2
+    assert len(store.data["outcomes"]) == 2
+
+
+def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    now = datetime(2026, 6, 30, tzinfo=UTC)
+    store.data["forecast_snapshots"] = [
+        {"created_at": (now - timedelta(hours=49)).isoformat(), "plan_id": "expired"},
+        *[{"created_at": (now - timedelta(hours=24)).isoformat(), "plan_id": f"burst-{index}"} for index in range(500)],
+    ]
+
+    asyncio.run(store.async_add_forecast_snapshot({"created_at": now, "plan_id": "latest"}))
+    store.data["haeo_runs"] = [
+        {"created_at": (now - timedelta(hours=49)).isoformat(), "plan_id": "expired"},
+        {"created_at": (now - timedelta(hours=1)).isoformat(), "plan_id": "recent"},
+    ]
+    asyncio.run(store.async_add_haeo_run({"created_at": now, "plan_id": "latest"}))
+    store.data["dry_run_comparisons"] = [
+        {"created_at": (now - timedelta(days=8)).isoformat(), "planned_action_count": 1},
+        {"created_at": (now - timedelta(days=1)).isoformat(), "planned_action_count": 2},
+    ]
+    asyncio.run(
+        store.async_add_dry_run_comparison(
+            {"created_at": now, "planned_action_count": 3, "next_action": None}
+        )
+    )
+
+    assert len(store.data["forecast_snapshots"]) == 501
+    assert all(item["plan_id"] != "expired" for item in store.data["forecast_snapshots"])
+    assert [item["plan_id"] for item in store.data["haeo_runs"]] == ["recent", "latest"]
+    assert [item["planned_action_count"] for item in store.data["dry_run_comparisons"]] == [2, 3]
 
 
 def test_store_coalesces_dry_run_comparisons_ignoring_generated_metadata(monkeypatch: object) -> None:
@@ -396,3 +444,6 @@ def test_audit_dedup_helpers_handle_malformed_and_sparse_records() -> None:
         desired_state={"target_soc_percent": 80},
     )
     assert _audit_entry(outcome)["desired_state"] == {"target_soc_percent": 80}
+    naive = datetime(2026, 6, 27)
+    assert _record_timestamp({"created_at": naive}) == naive.replace(tzinfo=UTC)
+    assert _record_timestamp({"created_at": "bad"}) is None

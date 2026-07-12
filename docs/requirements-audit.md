@@ -259,7 +259,12 @@ Status as of 2026-06-28.
   and materially identical audit/comparison records are coalesced with first/
   last occurrence evidence. AI advice is skipped for unsafe or zero-confidence
   plans and reused only while a bounded action, forecast preview, issue, and
-  cost signature remains unchanged.
+  cost signature remains unchanged. Provider work runs as a cancellable
+  single-flight task after plan commit, so advisory latency cannot hold the
+  coordinator refresh lock; accepted results persist and notify entities.
+- Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
+  retention with defensive hard caps, preserving day-ahead training evidence
+  across manual refresh bursts without unbounded storage growth.
 - Preflight discovery blocks only configured and enabled control areas. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
