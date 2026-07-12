@@ -193,6 +193,7 @@ class ActionOutcome:
     asset: str | None = None
     kind: str | None = None
     service_target: str | None = None
+    desired_state: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

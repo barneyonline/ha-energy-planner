@@ -74,7 +74,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   appropriate-polling:
     status: done
-    comment: The coordinator schedules wall-clock planning interval refreshes and material-change replans instead of fixed blind polling.
+    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, and skips unchanged input fingerprints instead of fixed blind polling.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -262,7 +262,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   parallel-updates:
     status: done
-    comment: Coordinator refreshes are serialized by lock, and device execution is rate-limited per asset/action kind.
+    comment: Coordinator refreshes are serialized and coalesced with trigger/phase telemetry, while device execution is rate-limited per asset/action kind.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py

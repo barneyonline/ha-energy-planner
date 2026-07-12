@@ -207,22 +207,27 @@ class HAEOAdapter:
                 service_called=self.optimize_service,
             )
             return self._finish(result, started, fingerprint, cache_hit=False)
-
+        if not self.capabilities.supports_response:
+            # A fire-and-forget optimize service cannot provide evidence to the
+            # planner. Calling it on every refresh adds load while leaving the
+            # plan unchanged, so report the capability gap without invoking it.
+            result = HAEOSolveResult(
+                phase,
+                HAEOStatus.STALE,
+                "haeo_response_unsupported",
+                context.plan_id,
+                service_called=None,
+            )
+            return self._finish(result, started, fingerprint, cache_hit=False)
         cached = self._cached_result(fingerprint, context.plan_id)
         if cached is not None:
             return self._finish(cached, started, fingerprint, cache_hit=True)
 
         service_data = _service_data(context, phase, projections)
-        real_haeo_entry_id = self.capabilities.selected_entry_id
-        if real_haeo_entry_id:
-            service_data = {"config_entry": real_haeo_entry_id}
         try:
-            if not self.capabilities.supports_response:
-                response = await self.hass.services.async_call(domain, service, service_data, blocking=True)
-            else:
-                response = await self.hass.services.async_call(
-                    domain, service, service_data, blocking=True, return_response=True
-                )
+            response = await self.hass.services.async_call(
+                domain, service, service_data, blocking=True, return_response=True
+            )
         except Exception as err:  # noqa: BLE001 - adapter must fail closed and report redacted reason.
             result = _service_failed_result(phase, context, self.optimize_service, err)
             return self._finish(result, started, fingerprint, cache_hit=False)

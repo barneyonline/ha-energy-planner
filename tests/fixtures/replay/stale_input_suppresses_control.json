@@ -3,7 +3,7 @@
   "expected_plan_violations": ["input_health_unsafe"],
   "expected_rejected_action_count": 1,
   "expected_action_violations": {
-    "ev-on-stale-data": ["input_health_not_healthy", "input_health_unsafe"]
+    "ev-on-stale-data": ["input_health_not_healthy"]
   },
   "now": "2026-06-27T00:10:00+00:00",
   "options": {

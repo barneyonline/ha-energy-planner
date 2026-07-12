@@ -24,10 +24,13 @@ from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
     _bool_state_value,
     _configured_entity_ids,
+    _decision_input_fingerprint,
     _float_state_value,
     _is_manual_hvac_change,
     _is_material_state_change,
+    _latest_ai_plan_fingerprint,
     _latest_ai_service_call_at,
+    _material_plan_fingerprint,
     _overrides_from_store,
     _parse_datetime_or_none,
     _seconds_until_next_interval_boundary,
@@ -58,12 +61,13 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
             "climate_automation_entities": "automation.heat, automation.cool",
             "person_entities": "person.james,person.cath",
             "ai_advisor_service": "ai_task.generate_data",
+            "ai_task_entity": "ai_task.local",
+            "daikin_power_entity": "sensor.daikin_power",
+            "ev_smart_charging_entity": "switch.ev_control",
             "empty_entity": "",
         }
     )
     assert entity_ids == [
-        "automation.cool",
-        "automation.heat",
         "person.cath",
         "person.james",
         "sensor.import_price",
@@ -685,6 +689,111 @@ def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
     assert result.status == "accepted"
 
 
+def test_ai_advice_skips_unsafe_or_zero_confidence_plan() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.store = FakeStore({"ai_recommendations": []})
+    plan = _plan("unsafe")
+    plan.health = InputHealth.UNSAFE
+    plan.confidence = 0
+
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+
+    assert should_store is False
+    assert result.rejected_reason == "ai_skipped_unsafe_plan"
+
+
+def test_material_ai_fingerprint_changes_with_forecast_preview_and_cost() -> None:
+    first = _plan("generated-1")
+    first.preview = [{"import_price": 0.1, "pv_forecast_kw": 1.0}]
+    first.estimated_daily_cost = 2.5
+    second = _plan("generated-2")
+    second.preview = [{"import_price": 0.2, "pv_forecast_kw": 1.0}]
+    second.estimated_daily_cost = 2.5
+
+    assert _material_plan_fingerprint(first) != _material_plan_fingerprint(second)
+
+
+def test_ai_advice_reuses_unchanged_material_plan() -> None:
+    plan = _plan("new-generated-id")
+    fingerprint = _material_plan_fingerprint(plan)
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.store = FakeStore(
+        {"ai_recommendations": [{"status": "accepted", "rejected_detail": {"plan_fingerprint": fingerprint}}]}
+    )
+
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+
+    assert should_store is False
+    assert result.rejected_reason == "ai_plan_unchanged"
+
+
+def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
+    assert _latest_ai_plan_fingerprint("bad") is None
+    assert _latest_ai_plan_fingerprint([{"ignored": True}, "bad"]) is None
+    assert (
+        _latest_ai_plan_fingerprint(["bad", {"status": "accepted", "plan_fingerprint": "top-level"}])
+        == "top-level"
+    )
+    assert (
+        _latest_ai_plan_fingerprint(
+            [{"status": "accepted", "rejected_detail": {"plan_fingerprint": "nested"}}]
+        )
+        == "nested"
+    )
+    hass = FakeHass({"sensor.price": "0.25"})
+    present = _decision_input_fingerprint(
+        hass,
+        {"amber_import_price_entity": "sensor.price"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 5},
+        [],
+        now=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    missing = _decision_input_fingerprint(
+        FakeHass(),
+        {"amber_import_price_entity": "sensor.price"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 5},
+        [],
+        now=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    assert present != missing
+
+
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline() -> None:
+    coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
+    coordinator.data = _plan("existing")
+    coordinator._last_decision_fingerprint = _decision_input_fingerprint(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.planner_options,
+        coordinator.overrides,
+        now=coordinator.data.created_at,
+    )
+    # Keep the interval bucket stable for this focused short-circuit test.
+    original = coordinator_module.dt_util.utcnow
+    coordinator_module.dt_util.utcnow = lambda: coordinator.data.created_at
+    try:
+        result = asyncio.run(coordinator._async_update_data_locked())
+    finally:
+        coordinator_module.dt_util.utcnow = original
+
+    assert result is coordinator.data
+    assert coordinator._refresh_counters["fingerprint_skipped"] == 1
+
+
+def test_explicit_replan_marks_next_refresh_as_forced() -> None:
+    coordinator = _coordinator_for_runtime_services()
+
+    asyncio.run(coordinator.async_request_replan())
+
+    assert coordinator._force_next_refresh is True
+    assert coordinator.refresh_requested == 1
+    assert coordinator._pending_refresh_trigger == "manual_replan"
+
+
 def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
 
@@ -883,6 +992,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
         "custom_components.ha_energy_planner.coordinator.update_thermal_model",
         lambda model, previous, sample: ({"last_sample": sample, "enabled": True}, True),
     )
+
     def fake_apply_haeo_response(built_context: object, response: object) -> dict[str, int]:
         assert built_context is context
         context.last_haeo_response = response
@@ -944,10 +1054,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
 
     assert adapter.second_pass_calls == 1
     assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == "skipped"
-    assert (
-        coordinator.store.haeo_runs[0]["second_pass"]["reason"]
-        == "haeo_flexible_projection_unsupported"
-    )
+    assert coordinator.store.haeo_runs[0]["second_pass"]["reason"] == "haeo_flexible_projection_unsupported"
     assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 0.0
 
 
@@ -1523,6 +1630,9 @@ def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: 
     coordinator._schedule_next_boundary_refresh()
     boundary_callback = scheduled[-1][1]
     boundary_callback(None)
+    # Boundary scheduling bypasses the 20-second state debounce but still uses
+    # the coalescing/minimum-interval callback.
+    scheduled[-2][1](None)
 
     assert coordinator._refresh_generation == 2
     assert len(coordinator.hass.created_tasks) == 2

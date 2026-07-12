@@ -230,10 +230,14 @@ Status as of 2026-06-28.
   charge/discharge, and battery SOC forecast evidence where available. Direct
   replay or persisted non-finite HAEO evidence is ignored before Enphase value
   calculations so it cannot suppress restore or publish NaN plan values.
-- Material-change events are debounced and finite numeric state changes below
-  the configured material-change threshold are suppressed, while transitions
-  into or out of non-finite numeric states force a replan so input health can
-  fail closed.
+- Only an explicit allowlist of decision inputs can request replanning. AI
+  result, integration-owned control, climate automation, and high-frequency
+  observed power entities cannot create feedback loops; observation-only
+  values are sampled on planning boundaries. Material changes are debounced,
+  constrained by a one-minute non-manual refresh floor, and coalesced. A stable
+  decision-input fingerprint skips HAEO, planning, execution, snapshots, and
+  persistence when no material input changed, while explicit manual replans
+  always force a fresh computation.
 - Coordinator startup schedules recurring wall-clock planning-interval boundary
   refreshes, without also registering a fixed `DataUpdateCoordinator` poll, in
   addition to material-change replans. Planner cost previews use the configured
@@ -243,10 +247,19 @@ Status as of 2026-06-28.
   local times. HVAC suppression and precondition projection windows compare
   timestamps, so their duration is independent of planning interval.
 - HAEO integration detects response and flexible-projection capabilities,
-  deterministically selects a unique native config entry, skips unsupported
-  second passes, and uses a bounded 30-second equivalent-input cache. Solve and
-  coordinator refresh duration, cache, evidence, and capability metadata are
-  available in diagnostics, plan-status attributes, and system health.
+  deterministically selects a unique native config entry, skips services that
+  cannot return planner evidence and unsupported second passes, and uses a
+  bounded 30-second equivalent-input cache. Service-call status is distinct
+  from forecast-evidence status. Solve and coordinator refresh duration,
+  trigger, coalesced/skipped counters, refreshes/hour, phase timing, cache,
+  evidence, and capability metadata are available to diagnostics consumers.
+- Dry-run actions are recorded as intentionally skipped with the stable
+  `dry_run` reason. Plan-wide violations remain on plan health instead of being
+  copied to unrelated action rejections, including neutral Enphase restores,
+  and materially identical audit/comparison records are coalesced with first/
+  last occurrence evidence. AI advice is skipped for unsafe or zero-confidence
+  plans and reused only while a bounded action, forecast preview, issue, and
+  cost signature remains unchanged.
 - Preflight discovery blocks only configured and enabled control areas. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active

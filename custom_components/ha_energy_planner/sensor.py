@@ -387,6 +387,7 @@ def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
             "issues": coordinator.data.input_issues[:20],
             "preview": coordinator.data.preview[:12],
             "refresh": getattr(coordinator, "last_refresh_metadata", None),
+            "refresh_metrics": getattr(coordinator, "refresh_metrics", None),
             "haeo": latest_haeo,
         }
     )
