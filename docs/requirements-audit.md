@@ -66,8 +66,10 @@ Status as of 2026-06-28.
 - Persistent notifications are emitted for restore-safe-state, infeasible EV
   ready-by schedules, unsafe required inputs, grid-limit fallback, and HAEO
   fallback classes, using stable notification IDs and compact redacted reason
-  codes. User-provided service reason fields are validated as compact reason
-  codes before they can be persisted or shown in notifications.
+  codes. The three recurring plan-fallback notification classes can be disabled
+  as a group; doing so dismisses their stable IDs without changing plan health
+  or fail-closed execution. User-provided service reason fields are validated as
+  compact reason codes before they can be persisted or shown in notifications.
 - Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
 - Local AI advice is disabled by default, minimized, JSON-only, whitelisted,

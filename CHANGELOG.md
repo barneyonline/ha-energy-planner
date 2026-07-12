@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 - 2026-07-12
+
+### Added
+
+- An **AI and safety** option to disable and dismiss recurring unsafe-input, grid-limit, and HAEO fallback notifications without weakening fail-closed behavior.
+
 ## 0.5.0 - 2026-07-12
 
 ### Added

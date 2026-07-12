@@ -74,6 +74,7 @@ CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES = "enphase_profile_min_hold_minutes"
 CONF_PLANNER_ENABLED = "planner_enabled"
 CONF_DRY_RUN = "dry_run"
 CONF_AI_ENABLED = "ai_enabled"
+CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED = "plan_fallback_notifications_enabled"
 CONF_EV_CONTROL_ENABLED = "ev_control_enabled"
 CONF_CLIMATE_CONTROL_ENABLED = "climate_control_enabled"
 CONF_ENPHASE_CONTROL_ENABLED = "enphase_control_enabled"
@@ -120,6 +121,7 @@ DEFAULT_OPTIONS = {
     CONF_PLANNER_ENABLED: False,
     CONF_DRY_RUN: True,
     CONF_AI_ENABLED: False,
+    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: True,
     CONF_EV_CONTROL_ENABLED: False,
     CONF_CLIMATE_CONTROL_ENABLED: False,
     CONF_ENPHASE_CONTROL_ENABLED: False,

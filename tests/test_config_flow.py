@@ -70,6 +70,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_PERSON_ENTITIES,
+    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRIORITY_WEIGHTS,
@@ -1321,6 +1322,7 @@ def test_validate_options_accepts_default_policy_values() -> None:
 def test_default_options_require_intentional_active_mode_enablement() -> None:
     assert DEFAULT_OPTIONS["planner_enabled"] is False
     assert DEFAULT_OPTIONS["dry_run"] is True
+    assert DEFAULT_OPTIONS[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is True
 
 
 def test_validate_options_rejects_ev_fallback_outside_soc_bounds() -> None:

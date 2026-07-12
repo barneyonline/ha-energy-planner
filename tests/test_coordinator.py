@@ -18,6 +18,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
+    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
 from custom_components.ha_energy_planner.coordinator import (
@@ -209,6 +210,7 @@ class FakeExecutor:
 
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         self.fallback = (plan, violations)
+        self.fallback_options = dict(self.options)
 
 
 @dataclass(slots=True)
@@ -1593,7 +1595,13 @@ def test_update_data_locked_does_not_record_successful_haeo_baseline_as_issue(mo
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry({"haeo_optimize_service": "haeo.optimize"}, {"ai_enabled": False})
+    coordinator.entry = FakeEntry(
+        {"haeo_optimize_service": "haeo.optimize"},
+        {
+            "ai_enabled": False,
+            CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: False,
+        },
+    )
     coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
     coordinator.executor = FakeExecutor()
     coordinator.overrides = []
@@ -1606,6 +1614,7 @@ def test_update_data_locked_does_not_record_successful_haeo_baseline_as_issue(mo
     assert coordinator.store.haeo_runs[0]["flexible_projection_count"] == 0
     assert coordinator.store.haeo_runs[0]["second_pass"] is None
     assert coordinator.executor.fallback == (result, [])
+    assert coordinator.executor.fallback_options[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is False
 
 
 def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> None:
