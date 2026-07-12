@@ -74,7 +74,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   appropriate-polling:
     status: done
-    comment: The coordinator schedules wall-clock planning interval refreshes and material-change replans instead of fixed blind polling.
+    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, and skips unchanged input fingerprints instead of fixed blind polling.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -262,7 +262,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   parallel-updates:
     status: done
-    comment: Coordinator refreshes are serialized by lock, and device execution is rate-limited per asset/action kind.
+    comment: Coordinator refreshes are serialized and coalesced with trigger/phase telemetry, while device execution is rate-limited per asset/action kind.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -279,7 +279,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin forecast MAE/RMSE and baseline gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, forecast coverage/stitching/gap fixtures, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin forecast MAE/RMSE and baseline gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
@@ -287,6 +287,8 @@ rules:
         - tests/test_services.py
         - tests/test_real_history_fixtures.py
         - tests/test_forecast_accuracy.py
+        - tests/test_forecasts.py
+        - tests/test_inputs.py
       code:
         - scripts/docker-validate.sh
         - scripts/validate-real-history-fixture.py

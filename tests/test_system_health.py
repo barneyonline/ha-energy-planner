@@ -81,6 +81,13 @@ def test_system_health_reports_loaded_planner_state() -> None:
         "coalesced_refresh_count": 4,
         "refresh_phase_durations_ms": {"inputs": 4.5},
         "usable_optimization_horizon_hours": 12.0,
+        "refresh_metrics": {
+            "refreshes_last_hour": 12,
+            "last_trigger": "boundary",
+            "fingerprint_skipped": 3,
+            "coalesced": 4,
+            "phase_durations_ms": {"inputs": 4.5},
+        },
         "latest_haeo_duration_ms": 12.5,
         "latest_haeo_cache_hit": True,
         "latest_ai_status": "accepted",
