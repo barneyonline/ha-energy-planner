@@ -49,8 +49,18 @@ class FakeServices:
         return_response: bool = False,
     ) -> dict[str, Any] | None:
         self.calls.append((domain, service, data))
+        created_at = datetime.fromisoformat(data["created_at"])
         return (
-            {"slots": [{"valid_at": data["created_at"], "grid_import_kw": 1.0}]}
+            {
+                "slots": [
+                    {
+                        "valid_at": (created_at + timedelta(minutes=5 * index)).isoformat(),
+                        "grid_import_kw": 1.0,
+                        "grid_export_kw": 0.0,
+                    }
+                    for index in range(int(data["horizon_slot_count"]))
+                ]
+            }
             if return_response
             else {}
         )
@@ -547,13 +557,32 @@ def test_response_capable_haeo_rejects_empty_or_unusable_evidence() -> None:
         async def async_call(self, *args: object, **kwargs: object) -> object:
             return self.response
 
-    for response in (None, {}, {"slots": []}, {"slots": [{"valid_at": "bad", "grid_import_kw": "nan"}]}):
+    for response in (
+        None,
+        {},
+        {"slots": []},
+        {"slots": [{"valid_at": "bad", "grid_import_kw": "nan"}]},
+        {
+            "slots": [
+                {
+                    "valid_at": "2026-06-27T00:00:00+00:00",
+                    "grid_import_kw": 1.0,
+                    "grid_export_kw": 0.0,
+                }
+            ]
+        },
+    ):
         hass = FakeHass()
         hass.services = EmptyServices(response)
         result = asyncio.run(HAEOAdapter(hass, "haeo.optimize").async_solve_baseline(_context()))
 
         assert result.status == HAEOStatus.STALE
         assert result.reason == "haeo_response_without_usable_evidence"
+
+    empty_context = _context()
+    empty_context.slots = []
+    result = asyncio.run(HAEOAdapter(FakeHass(), "haeo.optimize").async_solve_baseline(empty_context))
+    assert result.status == HAEOStatus.STALE
 
 
 def test_first_haeo_entry_id_handles_missing_or_unexpected_managers() -> None:

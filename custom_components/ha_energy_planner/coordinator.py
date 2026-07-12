@@ -873,18 +873,26 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 or self._ai_current_plan_fingerprint != fingerprint
             ):
                 return
-            await self.store.async_add_ai_recommendation(
-                {
-                    "created_at": context.created_at,
-                    "plan_id": plan.plan_id,
-                    "status": ai_result.status,
-                    "accepted": ai_result.accepted,
-                    "rejected_reason": ai_result.rejected_reason,
-                    "rejected_detail": ai_result.rejected_detail,
-                    "service_called": ai_result.service_called,
-                    CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                }
-            )
+            async with self._planner_lock:
+                if (
+                    not self._ai_current_plan_safe
+                    or self._ai_current_plan_fingerprint != fingerprint
+                ):
+                    return
+                await self.store.async_add_ai_recommendation(
+                    {
+                        "created_at": context.created_at,
+                        "plan_id": plan.plan_id,
+                        "plan_fingerprint": fingerprint,
+                        "plan_health": str(plan.health),
+                        "status": ai_result.status,
+                        "accepted": ai_result.accepted,
+                        "rejected_reason": ai_result.rejected_reason,
+                        "rejected_detail": ai_result.rejected_detail,
+                        "service_called": ai_result.service_called,
+                        CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
+                    }
+                )
             self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
             self.async_update_listeners()
         except asyncio.CancelledError:
@@ -1164,10 +1172,6 @@ def _is_manual_hvac_change(
         guard_state = hass.states.get(guard_entity)
         if guard_state is not None and str(guard_state.state).lower() in {"on", "true", "1"}:
             return False
-    ownership = dict(store_data.get("ownership", {}))
-    grace_until = _parse_datetime_or_none(ownership.get("planner_hvac_action_expires_at"))
-    if grace_until is not None and now < grace_until:
-        return False
     return True
 
 
@@ -1188,18 +1192,34 @@ def _is_planner_owned_control_feedback(
     )
     if asset is None:
         return False
-    if asset == "daikin":
-        grace_until = _parse_datetime_or_none(
-            dict(store_data.get("ownership", {})).get("planner_hvac_action_expires_at")
-        )
-        if grace_until is not None and now < grace_until:
-            return True
-    for key, value in dict(store_data.get("command_rate_limits", {})).items():
-        if not str(key).startswith(f"{asset}:"):
+    new_state = event.data.get("new_state")
+    if new_state is None:
+        return False
+    for outcome in reversed(list(store_data.get("execution_audit", []))):
+        if not isinstance(outcome, dict) or outcome.get("result") != "applied" or outcome.get("asset") != asset:
             continue
-        attempted_at = _parse_datetime_or_none(value)
-        if attempted_at is not None and attempted_at <= now < attempted_at + timedelta(minutes=2):
-            return True
+        attempted_at = _parse_datetime_or_none(outcome.get("attempted_at"))
+        if attempted_at is None or not attempted_at <= now < attempted_at + timedelta(minutes=2):
+            continue
+        desired = outcome.get("desired_state")
+        if not isinstance(desired, dict):
+            continue
+        observed = str(getattr(new_state, "state", ""))
+        if asset == "enphase":
+            return bool(desired.get("profile")) and observed == str(desired["profile"])
+        desired_mode = desired.get("hvac_mode")
+        if desired_mode is not None and observed != str(desired_mode):
+            return False
+        desired_temperature = desired.get("target_temperature")
+        if desired_temperature is not None:
+            attributes = getattr(new_state, "attributes", {}) or {}
+            observed_temperature = attributes.get("temperature")
+            try:
+                if float(observed_temperature) != float(desired_temperature):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return desired_mode is not None or desired_temperature is not None
     return False
 
 
