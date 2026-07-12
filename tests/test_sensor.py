@@ -120,6 +120,7 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert confidence.attrs_fn(coordinator)["breakdown"]["pv"]["status"] == "degraded"
     assert production.value_fn(coordinator) == "Armed"
     assert production.attrs_fn(coordinator)["ready_to_arm"] is True
+    assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is True
     assert block.value_fn(coordinator) == "Planner Paused"
     assert block.attrs_fn(coordinator)["reasons"] == [
         "planner_paused",
@@ -331,7 +332,7 @@ def test_operational_summary_sensors_handle_edge_shapes() -> None:
     comparison = next(item for item in SENSORS if item.key == "dry_run_comparison")
     support = next(item for item in SENSORS if item.key == "support_bundle_summary")
 
-    assert production.value_fn(ready) == "Ready To Arm"
+    assert production.value_fn(ready) == "Evidence Complete"
     assert audit.value_fn(ready) == "Unknown"
     assert audit.attrs_fn(_coordinator(_plan(), store_data={"execution_audit": "bad"})) == {
         "outcome_count": 0,
@@ -357,7 +358,7 @@ def test_production_readiness_supports_ev_only_installation() -> None:
     )
     production = next(item for item in SENSORS if item.key == "production_readiness")
 
-    assert production.value_fn(coordinator) == "Ready To Arm"
+    assert production.value_fn(coordinator) == "Evidence Complete"
     assert production.attrs_fn(coordinator)["required_control_areas"] == ["ev"]
 
 

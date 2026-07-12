@@ -362,8 +362,8 @@ def test_forecast_calibration_rejects_malformed_evidence() -> None:
         now=now,
     )
 
-    assert changed is False
-    assert model == {"pv_forecast_kw": "bad-shape"}
+    assert changed is True
+    assert model == {}
     assert _bounded_factor(float("nan")) == 1.0
     assert _finite_float_or_none("bad") is None
     assert _parse_datetime_or_none(datetime(2026, 6, 27, tzinfo=UTC)) == datetime(2026, 6, 27, tzinfo=UTC)
@@ -399,3 +399,58 @@ def test_calibration_storage_and_observation_helpers_reject_bad_shapes() -> None
     ) == [(now, 1.5)]
     assert _nearest_observation([], now) is None
     assert _as_utc(datetime(2026, 6, 27, 12, 0)) == now
+
+
+def test_forecast_calibration_resets_legacy_and_million_scale_counters() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    legacy, legacy_changed = update_forecast_calibration(
+        {"pv_forecast_kw": {"sample_count": 1_234_567, "factor": 1.3, "enabled": True}},
+        [],
+        {},
+        now=now,
+    )
+    contaminated, contaminated_changed = update_forecast_calibration(
+        {
+            "baseline_load_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 2_000_000,
+                "raw_sample_count": 2_000_000,
+                "samples": [],
+                "enabled": True,
+                "factor": 1.3,
+            }
+        },
+        [],
+        {},
+        now=now,
+    )
+
+    assert legacy_changed is True
+    assert legacy == {}
+    assert contaminated_changed is True
+    assert contaminated == {}
+
+
+def test_forecast_calibration_only_processes_new_mature_observations() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    snapshots = [
+        {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=1),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+    ]
+    actuals = {"pv_forecast_kw": {valid_at.isoformat(): 1.2}}
+
+    model, changed = update_forecast_calibration({}, snapshots, actuals, now=now)
+    unchanged, changed_again = update_forecast_calibration(model, snapshots, actuals, now=now)
+
+    assert changed is True
+    assert changed_again is False
+    assert unchanged == model
+    assert model["pv_forecast_kw"]["last_processed_observation_at"] == valid_at.isoformat()

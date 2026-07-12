@@ -31,6 +31,8 @@ class FakeCoordinator:
 
     data: EnergyPlan
     store: FakeStore
+    last_refresh_metadata: dict[str, Any] | None = None
+    refresh_metrics: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -168,6 +170,13 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
                     "ai_recommendations": [{}],
                 }
             ),
+            last_refresh_metadata={"duration_ms": 25.0},
+            refresh_metrics={
+                "refreshes_per_hour": 12.0,
+                "trigger_counts": {"boundary": 10, "state": 2},
+                "skipped_count": 3,
+                "coalesced_count": 4,
+            },
         ),
     )
 
@@ -187,6 +196,13 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
     assert diagnostics["plan"]["action_count"] == 1
     assert diagnostics["plan"]["next_action"]["action_id"] == "action-1"
     assert diagnostics["haeo"]["plan_id"] == "plan-1"
+    assert diagnostics["refresh_performance"] == {
+        "refreshes_per_hour": 12.0,
+        "trigger_counts": {"boundary": 10, "state": 2},
+        "skipped_count": 3,
+        "coalesced_count": 4,
+        "latest": {"duration_ms": 25.0},
+    }
     assert diagnostics["store"]["active_plan_present"] is True
     assert diagnostics["store"]["haeo_run_count"] == 2
     assert diagnostics["store"]["forecast_snapshot_count"] == 2

@@ -21,6 +21,7 @@ MAX_FACTOR = 1.30
 MIN_UNCERTAINTY_FACTOR = 0.50
 MAX_UNCERTAINTY_FACTOR = 1.50
 MIN_HOLDOUT_IMPROVEMENT = 0.02
+MAX_REASONABLE_LEGACY_COUNT = MAX_STORED_SAMPLES * 4
 
 
 def apply_forecast_calibration(
@@ -85,26 +86,28 @@ def update_forecast_calibration(
     every overdue forecast slot.  Callers may provide one ``{value, observed_at}``
     mapping, a list of those mappings, or a Recorder-style timestamp/value map.
     """
-    updated = {
-        key: dict(value) if isinstance(value, Mapping) else value
-        for key, value in dict(model or {}).items()
-    }
+    updated, changed = _migrate_calibration_model(model)
     observations = {
         field: _observations_for_field(actuals.get(field), now)
         for field in FORECAST_CALIBRATION_FIELDS
     }
     if not any(observations.values()):
-        return updated, False
+        return updated, changed
 
-    changed = False
     for field in FORECAST_CALIBRATION_FIELDS:
         field_observations = observations[field]
         if not field_observations:
             continue
         calibration = dict(updated.get(field, {})) if isinstance(updated.get(field), Mapping) else {}
+        last_processed = _parse_datetime_or_none(calibration.get("last_processed_observation_at"))
+        if last_processed is not None:
+            field_observations = [item for item in field_observations if item[0] > last_processed]
+        if not field_observations:
+            continue
         samples = _stored_samples(calibration.get("samples", []), field)
         seen = {str(sample["sample_id"]) for sample in samples}
         field_changed = False
+        processed_observation_times: list[datetime] = []
 
         for snapshot in snapshots:
             slots = snapshot.get("forecast_training_slots", [])
@@ -134,12 +137,53 @@ def update_forecast_calibration(
                     }
                 )
                 seen.add(sample_id)
+                processed_observation_times.append(observation[0])
                 changed = True
                 field_changed = True
 
         if field_changed:
-            updated[field] = _rebuild_model(_trim_samples(samples))
+            rebuilt = _rebuild_model(_trim_samples(samples))
+            rebuilt["last_processed_observation_at"] = max(processed_observation_times).isoformat()
+            updated[field] = rebuilt
 
+    return updated, changed
+
+
+def _migrate_calibration_model(
+    model: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Discard legacy/unbounded counters and rebuild current fields from evidence."""
+    updated = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in dict(model or {}).items()
+    }
+    changed = False
+    for field in FORECAST_CALIBRATION_FIELDS:
+        value = updated.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, Mapping) or value.get("model_version") != 3:
+            updated.pop(field, None)
+            changed = True
+            continue
+        calibration = dict(value)
+        samples = _trim_samples(_stored_samples(calibration.get("samples", []), field))
+        raw_count = _non_negative_int(calibration.get("raw_sample_count"))
+        sample_count = _non_negative_int(calibration.get("sample_count"))
+        if (
+            raw_count > MAX_REASONABLE_LEGACY_COUNT
+            or sample_count > MAX_REASONABLE_LEGACY_COUNT
+            or raw_count != len(samples)
+        ):
+            rebuilt = _rebuild_model(samples)
+            last_processed = _parse_datetime_or_none(calibration.get("last_processed_observation_at"))
+            if last_processed is not None:
+                rebuilt["last_processed_observation_at"] = last_processed.isoformat()
+            if samples:
+                updated[field] = rebuilt
+            else:
+                updated.pop(field, None)
+            changed = True
     return updated, changed
 
 
@@ -343,6 +387,14 @@ def _finite_float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if isfinite(number) else None
+
+
+def _non_negative_int(value: Any) -> int:
+    """Return a defensive non-negative persisted counter."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _parse_datetime_or_none(value: Any) -> datetime | None:
