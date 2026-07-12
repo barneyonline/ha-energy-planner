@@ -132,7 +132,7 @@ Energy Planner is built around conservative production controls:
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
 - Device control is paused temporarily when a command fails or a recent planner-owned EV/Enphase state appears to have been changed externally.
-- AI advice is optional, rate-limited, redacted, and advisory only.
+- AI advice is optional, rate-limited, minimized, and advisory only. Provider integrations receive a bounded prompt and may log that prompt independently; review the provider's logging configuration and set its logger to warning or stricter when privacy matters.
 - Preflight and restore-safe-state support are available through both services and button entities.
 
 Run preflight before enabling active control from the integration **Run preflight** button or service:

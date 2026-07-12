@@ -169,7 +169,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._haeo_adapter: HAEOAdapter | None = None
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._ai_advice_fingerprint: str | None = None
+        self._ai_current_plan_fingerprint: str | None = None
+        self._ai_current_plan_safe = False
         self.last_refresh_metadata: dict[str, Any] = {}
+        if bool(self.options.get(CONF_AI_ENABLED, False)):
+            _LOGGER.warning(
+                "AI advice is enabled; the selected provider may log bounded prompts independently. "
+                "Review the provider logger configuration"
+            )
         super().__init__(
             hass,
             logger=_LOGGER,
@@ -232,7 +239,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def _handle_state_change(event: Any) -> None:
             entry_data = self.entry_data
-            if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, dt_util.utcnow()):
+            now = dt_util.utcnow()
+            if _is_planner_owned_control_feedback(entry_data, self.store.data, event, now):
+                return
+            if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
                 return
             if _is_ev_history_state_change(entry_data, event):
@@ -536,9 +546,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_request_replan(self) -> None:
         """Request immediate refresh."""
-        self._pending_refresh_trigger = "manual_replan"
-        self._increment_refresh_counter("requested")
-        self._mark_replan_requested(force=True)
+        self._mark_forced_refresh("manual_replan")
         await self.async_request_refresh()
 
     async def async_set_ready_by(self, ready_by: str) -> None:
@@ -547,7 +555,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         entry_data = self.entry_data
         if entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
             await EVSmartChargingAdapter(self.hass, entry_data).async_set_ready_by(ready_by)
-        self._mark_replan_requested(force=True)
+        self._mark_forced_refresh("ready_by_changed")
         await self.async_request_refresh()
 
     async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
@@ -574,7 +582,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 {"entity_id": manual_override_entity},
                 blocking=True,
             )
-        self._mark_replan_requested(force=True)
+        self._mark_forced_refresh("manual_hvac_override")
         await self.async_request_refresh()
 
     async def _async_handle_manual_hvac_change(self, reason: str) -> None:
@@ -602,7 +610,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Restore safe state and refresh."""
         await self.executor.async_restore_safe_state(reason)
         if refresh:
-            self._mark_replan_requested(force=True)
+            self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
 
     async def async_arm_production_control(self, reason: str = "user_acknowledged") -> None:
@@ -643,7 +651,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             "reason": reason,
         }
         await self._async_save_control_pause(pause)
-        self._mark_replan_requested(force=True)
+        self._mark_forced_refresh("control_paused")
         await self.async_request_refresh()
 
     async def async_resume_control(self, reason: str = "user_requested") -> None:
@@ -655,7 +663,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "reason": reason,
             }
         )
-        self._mark_replan_requested(force=True)
+        self._mark_forced_refresh("control_resumed")
         await self.async_request_refresh()
 
     async def _async_update_production_evidence(self, plan: EnergyPlan, violations: list[str]) -> None:
@@ -710,6 +718,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._refresh_generation += 1
         if force:
             self._force_next_refresh = True
+
+    @callback
+    def _mark_forced_refresh(self, trigger: str) -> None:
+        """Attribute and mark an immediate service-driven refresh."""
+        self._pending_refresh_trigger = trigger
+        self._increment_refresh_counter("requested")
+        self._mark_replan_requested(force=True)
 
     async def _async_commit_plan_if_current(
         self,
@@ -818,8 +833,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             or plan.status == "unsafe"
             or plan.confidence <= 0
         ):
+            self._ai_current_plan_safe = False
+            self._ai_current_plan_fingerprint = None
+            current = getattr(self, "_ai_advice_task", None)
+            if current is not None and not current.done():
+                current.cancel()
             return
         fingerprint = _material_plan_fingerprint(plan)
+        self._ai_current_plan_safe = True
+        self._ai_current_plan_fingerprint = fingerprint
         if _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == fingerprint:
             return
         current = getattr(self, "_ai_advice_task", None)
@@ -844,7 +866,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         started = perf_counter()
         try:
             ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
-            if not should_store or self._ai_advice_fingerprint != fingerprint:
+            if (
+                not should_store
+                or self._ai_advice_fingerprint != fingerprint
+                or not self._ai_current_plan_safe
+                or self._ai_current_plan_fingerprint != fingerprint
+            ):
                 return
             await self.store.async_add_ai_recommendation(
                 {
@@ -1142,6 +1169,38 @@ def _is_manual_hvac_change(
     if grace_until is not None and now < grace_until:
         return False
     return True
+
+
+def _is_planner_owned_control_feedback(
+    entry_data: dict[str, Any],
+    store_data: dict[str, Any],
+    event: Any,
+    now: datetime,
+) -> bool:
+    """Return whether a control-state event follows a recent planner command."""
+    entity_id = event.data.get("entity_id")
+    asset = (
+        "daikin"
+        if entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
+        else "enphase"
+        if entity_id == entry_data.get(CONF_ENPHASE_PROFILE)
+        else None
+    )
+    if asset is None:
+        return False
+    if asset == "daikin":
+        grace_until = _parse_datetime_or_none(
+            dict(store_data.get("ownership", {})).get("planner_hvac_action_expires_at")
+        )
+        if grace_until is not None and now < grace_until:
+            return True
+    for key, value in dict(store_data.get("command_rate_limits", {})).items():
+        if not str(key).startswith(f"{asset}:"):
+            continue
+        attempted_at = _parse_datetime_or_none(value)
+        if attempted_at is not None and attempted_at <= now < attempted_at + timedelta(minutes=2):
+            return True
+    return False
 
 
 def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:

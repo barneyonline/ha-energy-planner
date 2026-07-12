@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from hashlib import sha256
@@ -231,13 +232,25 @@ class HAEOAdapter:
         except Exception as err:  # noqa: BLE001 - adapter must fail closed and report redacted reason.
             result = _service_failed_result(phase, context, self.optimize_service, err)
             return self._finish(result, started, fingerprint, cache_hit=False)
+        response_data = response if isinstance(response, dict) else None
+        evidence_counts = apply_haeo_response_to_context(deepcopy(context), response_data)
+        if not evidence_counts:
+            result = HAEOSolveResult(
+                phase,
+                HAEOStatus.STALE,
+                "haeo_response_without_usable_evidence",
+                context.plan_id,
+                service_called=self.optimize_service,
+                response=response_data,
+            )
+            return self._finish(result, started, fingerprint, cache_hit=False)
         result = HAEOSolveResult(
             phase,
             HAEOStatus.READY,
             "haeo_service_called",
             context.plan_id,
             service_called=self.optimize_service,
-            response=response if isinstance(response, dict) else None,
+            response=response_data,
         )
         self._store_cached_result(fingerprint, result)
         return self._finish(result, started, fingerprint, cache_hit=False)

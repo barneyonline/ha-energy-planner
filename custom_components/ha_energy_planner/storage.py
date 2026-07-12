@@ -324,8 +324,9 @@ def _bounded_mapping(value: object) -> dict[str, Any]:
     return {str(key): item for key, item in list(value.items())[:12]}
 
 
-def _retain_by_time(records: list[dict[str, Any]], *, hours: int, hard_cap: int) -> list[dict[str, Any]]:
+def _retain_by_time(records: list[Any], *, hours: int, hard_cap: int) -> list[dict[str, Any]]:
     """Retain timestamped records for a duration with a defensive hard cap."""
+    records = [item for item in records if isinstance(item, dict)]
     timestamps = [_record_timestamp(item) for item in records]
     valid = [item for item in timestamps if item is not None]
     if not valid:
@@ -337,8 +338,10 @@ def _retain_by_time(records: list[dict[str, Any]], *, hours: int, hard_cap: int)
     return retained[-hard_cap:]
 
 
-def _record_timestamp(record: dict[str, Any]) -> datetime | None:
+def _record_timestamp(record: Any) -> datetime | None:
     """Return a normalized record timestamp from supported audit fields."""
+    if not isinstance(record, dict):
+        return None
     value = record.get("created_at", record.get("attempted_at"))
     if isinstance(value, datetime):
         parsed = value
