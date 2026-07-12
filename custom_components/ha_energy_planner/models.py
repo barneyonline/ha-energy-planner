@@ -120,6 +120,9 @@ class DecisionSlot:
     haeo_grid_export_forecast_kw: float | None = None
     haeo_battery_charge_forecast_kw: float | None = None
     haeo_battery_discharge_forecast_kw: float | None = None
+    pv_forecast_lower_kw: float | None = None
+    baseline_load_forecast_upper_kw: float | None = None
+    carbon_intensity_g_per_kwh: float | None = None
 
 
 @dataclass(slots=True)
@@ -155,6 +158,7 @@ class DecisionContext:
     active_overrides: list[Override] = field(default_factory=list)
     input_issues: list[str] = field(default_factory=list)
     forecast_confidence: float = 1.0
+    local_timezone: str = "UTC"
 
 
 @dataclass(slots=True)
@@ -245,6 +249,7 @@ class EnergyPlan:
     rejected_actions: list[dict[str, Any]] = field(default_factory=list)
     timeline_card: list[dict[str, Any]] = field(default_factory=list)
     confidence_breakdown: dict[str, Any] = field(default_factory=dict)
+    estimated_cost_horizon_hours: float | None = None
 
     @property
     def next_action(self) -> PlanAction | None:

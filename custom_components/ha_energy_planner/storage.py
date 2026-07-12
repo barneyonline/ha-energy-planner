@@ -72,7 +72,9 @@ class PlannerStore:
         """Persist a compact forecast snapshot for replay."""
         snapshots = list(self.data.get("forecast_snapshots", []))
         snapshots.append(to_jsonable(snapshot))
-        self.data["forecast_snapshots"] = snapshots[-96:]
+        # At a five-minute refresh cadence, 384 entries retain 32 hours so
+        # day-ahead training targets survive until their observations mature.
+        self.data["forecast_snapshots"] = snapshots[-384:]
         await self._async_save()
 
     async def async_add_dry_run_comparison(self, comparison: dict[str, Any]) -> None:

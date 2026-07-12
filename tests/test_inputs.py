@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 from custom_components.ha_energy_planner.const import (
@@ -12,6 +13,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
+    CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
@@ -36,6 +38,7 @@ from custom_components.ha_energy_planner.inputs import (
     _combined_confidence,
     _finite_float_or_none,
     _forecast_source_issued_at,
+    _forecast_training_indices,
     _percent_float_or_none,
     _ready_by_time_or_none,
     _series_value,
@@ -66,8 +69,9 @@ class FakeStates:
 class FakeHass:
     """Minimal HA object."""
 
-    def __init__(self, values: dict[str, FakeState]) -> None:
+    def __init__(self, values: dict[str, FakeState], time_zone: str = "UTC") -> None:
         self.states = FakeStates(values)
+        self.config = SimpleNamespace(time_zone=time_zone)
 
 
 def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
@@ -119,7 +123,8 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
             ),
             "person.james": FakeState("home"),
             "person.cath": FakeState("not_home"),
-        }
+        },
+        time_zone="Australia/Melbourne",
     )
 
     manager = InputManager(hass, entry_data, options)
@@ -140,6 +145,7 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     assert context.current_hvac_temperature_c == 21.5
     assert context.current_hvac_power_kw == 1.7
     assert context.current_outdoor_temperature_c == 13.2
+    assert context.local_timezone == "Australia/Melbourne"
     assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [14.0, 16.0, None, None]
     assert manager.thermal_sample(context)["hvac_power_kw"] == 1.7
 
@@ -481,11 +487,17 @@ def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() 
     calibration = {
         "pv_forecast_kw": {
             "model_version": 3,
-            "buckets": {"0": {"enabled": True, "factor": 1.2}, "1": {"enabled": True, "factor": 1.2}},
+            "buckets": {
+                "0": {"enabled": True, "factor": 1.2, "lower_factor": 0.7},
+                "1": {"enabled": True, "factor": 1.2, "lower_factor": 0.8},
+            },
         },
         "baseline_load_forecast_kw": {
             "model_version": 3,
-            "buckets": {"0": {"enabled": True, "factor": 0.8}, "1": {"enabled": True, "factor": 0.8}},
+            "buckets": {
+                "0": {"enabled": True, "factor": 0.8, "upper_factor": 1.3},
+                "1": {"enabled": True, "factor": 0.8, "upper_factor": 1.2},
+            },
         },
     }
     manager = InputManager(hass, entry_data, options, forecast_calibration=calibration)
@@ -494,6 +506,8 @@ def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() 
 
     assert [slot.pv_forecast_kw for slot in context.slots] == [1.2, 2.4, None, None]
     assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.6, 2.4, None, None]
+    assert [slot.pv_forecast_lower_kw for slot in context.slots] == [0.7, 1.4, None, None]
+    assert [slot.baseline_load_forecast_upper_kw for slot in context.slots] == [2.6, 3.9, None, None]
     assert context.input_health == InputHealth.UNSAFE
     assert all(slot["pv_forecast_kw_issued_at"] <= slot["valid_at"] for slot in manager.forecast_training_slots)
     assert all(
@@ -579,8 +593,9 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
     second = InputManager(hass, entry_data, options)
     second.build_context()
 
-    first_common = first.forecast_training_slots[1]
-    second_common = second.forecast_training_slots[0]
+    second_by_time = {slot["valid_at"]: slot for slot in second.forecast_training_slots}
+    first_common = next(slot for slot in first.forecast_training_slots if slot["valid_at"] in second_by_time)
+    second_common = second_by_time[first_common["valid_at"]]
     assert first_common["valid_at"] == second_common["valid_at"]
     assert first_common["pv_forecast_kw_issued_at"] == second_common["pv_forecast_kw_issued_at"] == pv_issued
     assert (
@@ -588,6 +603,51 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
         == second_common["baseline_load_forecast_kw_issued_at"]
         == load_issued
     )
+
+
+def test_forecast_training_indices_span_full_horizon_sparsely() -> None:
+    indices = _forecast_training_indices(24, 5)
+
+    assert len(indices) <= 20
+    assert indices[0] == 0
+    assert indices[-1] == 287
+    assert 144 in indices
+
+
+def test_forecast_training_indices_handles_empty_horizon() -> None:
+    assert _forecast_training_indices(0, 5) == []
+
+
+def test_input_manager_normalizes_optional_carbon_forecast_without_making_it_required() -> None:
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon",
+        CONF_BATTERY_SOC: "sensor.battery",
+        CONF_PERSON_ENTITIES: "person.james",
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.20"),
+            "sensor.export": FakeState("0.05"),
+            "sensor.pv": FakeState("1.0"),
+            "sensor.load": FakeState("2.0"),
+            "sensor.carbon": FakeState(
+                "0.5",
+                {"unit_of_measurement": "kgCO₂/kWh", "forecast": [0.5, 0.3, 0.2, 0.4]},
+            ),
+            "sensor.battery": FakeState("55"),
+            "person.james": FakeState("home"),
+        }
+    )
+
+    context = InputManager(hass, entry_data, options).build_context()
+
+    assert [slot.carbon_intensity_g_per_kwh for slot in context.slots] == [500, 300, 200, 400]
+    assert not any("carbon_intensity" in issue for issue in context.input_issues)
 
 
 def test_forecast_source_issue_time_accepts_datetime_and_naive_fallback() -> None:

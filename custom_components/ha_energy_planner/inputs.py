@@ -18,6 +18,7 @@ from .const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
+    CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
@@ -64,6 +65,12 @@ _OBSERVATION_FIELDS_BY_CONFIG = {
 _FORECAST_VALUE_KEYS_BY_CONFIG = {
     CONF_PV_FORECAST: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
     CONF_BASELINE_LOAD_FORECAST: ("baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"),
+    CONF_CARBON_INTENSITY_FORECAST: (
+        "carbon_intensity_g_per_kwh",
+        "carbon_intensity",
+        "forecast",
+        "value",
+    ),
 }
 _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_DAIKIN_POWER: ("power", "power"),
@@ -95,6 +102,7 @@ class InputManager:
         self.forecast_training_slots: list[dict[str, Any]] = []
         self.forecast_confidence_details: list[dict[str, Any]] = []
         self._raw_forecast_series: dict[str, list[float | None]] = {}
+        self._conservative_forecast_series: dict[str, list[float | None]] = {}
         self._forecast_source_issued_at: dict[str, datetime] = {}
         self._forecast_confidence_scores: list[float] = []
         self._state_cache: dict[str, State | None] = {}
@@ -138,6 +146,15 @@ class InputManager:
             horizon,
             interval,
         )
+        carbon_intensities, carbon_issue = self._optional_series(
+            CONF_CARBON_INTENSITY_FORECAST,
+            _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_CARBON_INTENSITY_FORECAST],
+            "carbon_intensity",
+            now,
+            horizon,
+            interval,
+        )
+        training_indices = _forecast_training_indices(horizon, interval)
         self.forecast_training_slots = [
             {
                 "valid_at": now + timedelta(minutes=offset),
@@ -151,7 +168,8 @@ class InputManager:
                     index,
                 ),
             }
-            for index, offset in enumerate(range(0, min(horizon * 60, 12 * interval), interval))
+            for index in training_indices
+            for offset in (index * interval,)
         ]
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
@@ -179,6 +197,13 @@ class InputManager:
                     export_price=_series_value(export_prices, index),
                     pv_forecast_kw=_series_value(pv_forecasts, index),
                     baseline_load_forecast_kw=_series_value(baseline_loads, index),
+                    pv_forecast_lower_kw=_series_value(
+                        self._conservative_forecast_series.get("pv_forecast_kw", pv_forecasts), index
+                    ),
+                    baseline_load_forecast_upper_kw=_series_value(
+                        self._conservative_forecast_series.get("baseline_load_forecast_kw", baseline_loads), index
+                    ),
+                    carbon_intensity_g_per_kwh=_series_value(carbon_intensities, index),
                     outdoor_temperature_forecast_c=_series_value(weather_forecasts, index),
                     occupied=None,
                 )
@@ -191,6 +216,7 @@ class InputManager:
                 export_issue,
                 pv_issue,
                 load_issue,
+                carbon_issue,
                 battery_issue,
                 ev_issue,
                 ev_connected_issue,
@@ -256,6 +282,7 @@ class InputManager:
             active_overrides=overrides or [],
             input_issues=issues,
             forecast_confidence=forecast_confidence,
+            local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
         )
 
     def _numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
@@ -312,6 +339,15 @@ class InputManager:
                 self._raw_forecast_series[calibration_field] = list(padded)
                 lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
                 if lead_offset_minutes >= 0:
+                    uncertainty_mode = "lower" if calibration_field == "pv_forecast_kw" else "upper"
+                    self._conservative_forecast_series[calibration_field] = apply_forecast_calibration(
+                        padded,
+                        self.forecast_calibration,
+                        calibration_field,
+                        interval_minutes=interval,
+                        lead_offset_minutes=lead_offset_minutes,
+                        uncertainty_mode=uncertainty_mode,
+                    )
                     padded = apply_forecast_calibration(
                         padded,
                         self.forecast_calibration,
@@ -341,6 +377,20 @@ class InputManager:
             source="point_value_repeated",
         )
         return [value] * slot_count, None
+
+    def _optional_series(
+        self,
+        config_key: str,
+        value_keys: tuple[str, ...],
+        value_kind: str,
+        now: datetime,
+        horizon: int,
+        interval: int,
+    ) -> tuple[list[float | None], str | None]:
+        """Return an optional forecast series without penalizing absent configuration."""
+        if not self.entry_data.get(config_key):
+            return [None] * int((horizon * 60) / interval), None
+        return self._required_series(config_key, value_keys, value_kind, now, horizon, interval)
 
     def _optional_numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
         entity_id = self.entry_data.get(config_key)
@@ -508,7 +558,7 @@ class InputManager:
             state = self._state(entity_id) if entity_id else None
             if state and now - state.last_updated > price_timeout:
                 issues.append(f"{key}_stale")
-        for key in (CONF_PV_FORECAST, CONF_BASELINE_LOAD_FORECAST):
+        for key in (CONF_PV_FORECAST, CONF_BASELINE_LOAD_FORECAST, CONF_CARBON_INTENSITY_FORECAST):
             entity_id = self.entry_data.get(key)
             state = self._state(entity_id) if entity_id else None
             if state and now - state.last_updated > forecast_timeout and not _has_current_forecast_data(
@@ -610,6 +660,22 @@ def _series_value(series: list[float | None], index: int) -> float | None:
     if index < len(series):
         return series[index]
     return series[-1]
+
+
+def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> list[int]:
+    """Sample forecast leads across the full horizon without growing snapshots."""
+    slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
+    if slot_count == 0:
+        return []
+    target_minutes = (0, 30, 60, 120, 240, 480, 720, 1080, horizon_hours * 60 - interval_minutes)
+    return sorted(
+        set(range(min(12, slot_count)))
+        | {
+            min(max(round(minutes / interval_minutes), 0), slot_count - 1)
+            for minutes in target_minutes
+            if minutes >= 0
+        }
+    )
 
 
 def _profile_name(data: Mapping[str, Any], key: str, default: str) -> str | None:

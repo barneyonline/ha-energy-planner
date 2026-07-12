@@ -42,6 +42,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import json
+import voluptuous as vol
 
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
@@ -198,6 +199,10 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         DOMAIN,
         "optimize",
         optimize,
+        schema=vol.Schema(
+            {vol.Optional("flexible_load_projection", default=[]): list},
+            extra=vol.ALLOW_EXTRA,
+        ),
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
@@ -960,7 +965,7 @@ entities = {
 expected_entities = {
     "sensor.system_next_action",
     "sensor.system_plan_status",
-    "sensor.energy_estimated_daily_cost",
+    "sensor.energy_estimated_plan_cost",
     "sensor.energy_forecast_confidence",
     "binary_sensor.system_data_problem",
     "binary_sensor.system_takeover_active",

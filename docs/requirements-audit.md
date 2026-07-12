@@ -183,6 +183,15 @@ Status as of 2026-06-28.
   Forecast entities are never used as
   actuals, overdue slots are not paired to a current reading, and non-finite
   persisted factors and sample values are ignored.
+- Runtime calibration snapshots retain dense near-term targets plus bounded,
+  stratified targets through the complete planning horizon. Enabled lead-time
+  models expose p10/p90-style bounded factors; conservative flexibility and
+  battery calculations use lower PV and upper load while financial estimates
+  retain the holdout-validated expected factor.
+- Optional grid carbon-intensity series are normalized to gCO2/kWh. Carbon has
+  a non-zero action score when the forecast varies, and EV allocation blends
+  normalized effective cost with grid emissions according to configured
+  priority order while accounting for conservative solar displacement.
 - EV next-day demand uses configured fallback until enough local trip history is
   recorded. Future disconnected trips are compactly stored from EV connection
   and SOC state transitions, and older trips are opportunistically imported
@@ -229,6 +238,19 @@ Status as of 2026-06-28.
   refreshes, without also registering a fixed `DataUpdateCoordinator` poll, in
   addition to material-change replans. Planner cost previews use the configured
   planning interval rather than assuming a fixed slot duration.
+- EV ready-by wall times are resolved in Home Assistant's configured timezone,
+  normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
+  local times. HVAC suppression and precondition projection windows compare
+  timestamps, so their duration is independent of planning interval.
+- HAEO integration detects response and flexible-projection capabilities,
+  deterministically selects a unique native config entry, skips unsupported
+  second passes, and uses a bounded 30-second equivalent-input cache. Solve and
+  coordinator refresh duration, cache, evidence, and capability metadata are
+  available in diagnostics, plan-status attributes, and system health.
+- Preflight discovery blocks only configured and enabled control areas. Partial
+  EV, Climate, Enphase, or explicit HAEO installations can arm independently;
+  dry-run-only installations keep discovery advisory and cannot claim active
+  production readiness without an enabled controllable area.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
   results are discarded before they can overwrite the active plan or execute
   device actions when a newer replan request has arrived.
@@ -257,6 +279,8 @@ Status as of 2026-06-28.
   token, coordinate, address, raw prompt, raw model response, location-history
   field redaction, entity mapping, latest HAEO status, plan metadata, and
   bounded recent outcomes.
+- Estimated-cost telemetry reports the usable priced horizon and uses Home
+  Assistant's configured currency with the monetary sensor device class.
 - Home Assistant validation is covered by Docker smoke coverage, Home Assistant
   `check_config`, unit tests, replay fixtures, live-schema fixtures, and
   real-history replay fixtures. The optional
