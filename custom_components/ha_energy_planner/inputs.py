@@ -51,6 +51,7 @@ from .forecasts import (
     forecast_coverage_details,
     forecast_coverage_ratio,
     forecast_series_from_state,
+    forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
 )
@@ -85,6 +86,12 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
 _POINT_SENSOR_CONFIDENCE = 0.7
 _LEADING_LOAD_FILL_CONFIDENCE_FACTOR = 0.75
 _MAX_LEADING_LOAD_FILL_MINUTES = 60
+_REQUIRED_FORECAST_CONFIGS = {
+    CONF_AMBER_IMPORT_PRICE,
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_PV_FORECAST,
+    CONF_BASELINE_LOAD_FORECAST,
+}
 
 
 class InputManager:
@@ -333,6 +340,7 @@ class InputManager:
                 now=now,
                 freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
                 value_keys=value_keys,
+                require_timestamped=True,
             )
             if secondary_status == "usable":
                 assert secondary_state is not None
@@ -352,7 +360,7 @@ class InputManager:
                         "internal_missing_slots": 0,
                     }
                 )
-        source_issued_at = min(_forecast_source_issued_at(item[2], now) for item in source_states)
+        source_issued_at = _forecast_source_issued_at(state, now)
         if calibration_field:
             self._forecast_source_issued_at[calibration_field] = source_issued_at
 
@@ -370,7 +378,8 @@ class InputManager:
         forecasts = [item for item in source_forecasts if item]
         forecast = _stitch_forecast_series(forecasts, slot_count) if forecasts else None
         if forecast:
-            raw_forecast = list(forecast)
+            primary_forecast = source_forecasts[0]
+            raw_forecast = list(primary_forecast or [None] * slot_count)
             leading_fill_slots = 0
             if config_key == CONF_BASELINE_LOAD_FORECAST:
                 current_value = _finite_float_or_none(state.state)
@@ -419,7 +428,7 @@ class InputManager:
                 lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
                 if lead_offset_minutes >= 0:
                     uncertainty_mode = "lower" if calibration_field == "pv_forecast_kw" else "upper"
-                    self._conservative_forecast_series[calibration_field] = apply_forecast_calibration(
+                    conservative = apply_forecast_calibration(
                         padded,
                         self.forecast_calibration,
                         calibration_field,
@@ -427,13 +436,19 @@ class InputManager:
                         lead_offset_minutes=lead_offset_minutes,
                         uncertainty_mode=uncertainty_mode,
                     )
-                    padded = apply_forecast_calibration(
+                    expected = apply_forecast_calibration(
                         padded,
                         self.forecast_calibration,
                         calibration_field,
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
                     )
+                    self._conservative_forecast_series[calibration_field] = _retain_uncalibrated_secondary_slots(
+                        padded,
+                        conservative,
+                        raw_forecast,
+                    )
+                    padded = _retain_uncalibrated_secondary_slots(padded, expected, raw_forecast)
             classification = str(coverage_details["classification"])
             issue = (
                 None
@@ -456,6 +471,17 @@ class InputManager:
         attributes = getattr(state, "attributes", {}) or {}
         unit = str(_attribute_value(attributes, "unit_of_measurement", "unit") or "")
         value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_keys[0], unit=unit)
+        if config_key in _REQUIRED_FORECAST_CONFIGS:
+            point_series = [value, *([None] * max(slot_count - 1, 0))]
+            coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval)
+            self._record_forecast_confidence(
+                _POINT_SENSOR_CONFIDENCE * forecast_coverage_ratio(point_series),
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="point_value_only",
+                details={**coverage_details, "source_count": 0, "point_value_only": True},
+            )
+            return point_series, f"{config_key}_incomplete_horizon"
         self._record_forecast_confidence(
             _POINT_SENSOR_CONFIDENCE,
             config_key=config_key,
@@ -797,6 +823,20 @@ def _fill_bounded_leading_gap(
     return first_present
 
 
+def _retain_uncalibrated_secondary_slots(
+    original: list[float | None],
+    calibrated: list[float | None],
+    primary: list[float | None],
+) -> list[float | None]:
+    """Apply calibration only where the primary source supplied the slot."""
+    return [
+        calibrated[index]
+        if index < len(primary) and primary[index] is not None
+        else value
+        for index, value in enumerate(original)
+    ]
+
+
 def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> list[int]:
     """Sample forecast leads across the full horizon without growing snapshots."""
     slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
@@ -927,6 +967,7 @@ def _forecast_source_status(
     now: datetime,
     freshness_minutes: int,
     value_keys: tuple[str, ...],
+    require_timestamped: bool = False,
 ) -> str:
     """Classify an optional forecast source without affecting usable siblings."""
     if state is None or state.state in STATE_UNKNOWN_VALUES:
@@ -937,6 +978,10 @@ def _forecast_source_status(
         value_keys,
     ):
         return "stale"
+    if require_timestamped:
+        timestamp_status = forecast_timestamp_status_from_state(state, value_keys=value_keys)
+        if timestamp_status != "aware_timestamps":
+            return timestamp_status
     return "usable"
 
 

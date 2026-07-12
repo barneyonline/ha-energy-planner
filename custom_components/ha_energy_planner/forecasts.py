@@ -246,6 +246,37 @@ def latest_forecast_valid_at_from_state(
     return latest
 
 
+def forecast_timestamp_status_from_state(
+    state: Any,
+    *,
+    value_keys: tuple[str, ...],
+) -> str:
+    """Return whether forecast timestamps are present and timezone-aware.
+
+    A secondary series cannot be placed safely without absolute timestamps.
+    Naive timestamps are rejected rather than assuming UTC or the Home
+    Assistant timezone, which could shift values across midnight or DST.
+    """
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    found = False
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        flattened = _flatten_item(item)
+        for key in _TIME_KEYS:
+            if key not in flattened:
+                continue
+            valid_at = _parse_datetime_or_none(flattened[key])
+            if valid_at is None:
+                continue
+            found = True
+            if valid_at.tzinfo is None or valid_at.utcoffset() is None:
+                return "naive_timestamps"
+            break
+    return "aware_timestamps" if found else "untimestamped"
+
+
 def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = "", unit: str = "") -> float:
     """Normalize a scalar forecast/input value into planner units."""
     if value_kind == "temperature":

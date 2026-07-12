@@ -114,7 +114,11 @@ Status as of 2026-06-28.
   shorter configured horizons. Degraded inputs remain action-ineligible under
   the planner's existing healthy-input action gate.
 - A second optional PV entity supports timestamp-safe Solcast Today/Tomorrow
-  stitching across midnight and daylight-saving changes. Short baseline-load
+  stitching across midnight and daylight-saving changes. Secondary series must
+  expose timezone-aware timestamps; untimestamped and naive timestamps are
+  diagnosed and rejected, and secondary slots are excluded from calibration
+  until per-slot issue-time provenance is retained. Required Amber, PV, and
+  load point values cannot satisfy forecast coverage. Short baseline-load
   leading gaps are filled from the current numeric state for at most one hour,
   with explicit diagnostic evidence and reduced confidence; long or internal
   gaps remain missing and fail closed.
