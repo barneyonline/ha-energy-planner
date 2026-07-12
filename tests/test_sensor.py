@@ -383,6 +383,41 @@ def test_production_readiness_blocks_armed_mismatched_contract() -> None:
     assert "production_evidence_contract_changed" in block.attrs_fn(coordinator)["reasons"]
 
 
+def test_production_sensors_fail_closed_for_missing_and_malformed_state() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={"ev_control_enabled": True},
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+    )
+    production = next(item for item in SENSORS if item.key == "production_readiness")
+    block = next(item for item in SENSORS if item.key == "control_block_reason")
+
+    for value in (
+        None,
+        "corrupt",
+        {"armed": "true", "dry_run_ready_cycles": "3"},
+        {"armed": 1, "dry_run_ready_cycles": 10_001},
+    ):
+        if value is None:
+            coordinator.store.data.pop("production", None)
+        else:
+            coordinator.store.data["production"] = value
+        assert production.value_fn(coordinator) == "Not Ready"
+        assert production.attrs_fn(coordinator)["dry_run_ready_cycles"] == 0
+        assert block.attrs_fn(coordinator)["armed"] is False
+        assert block.attrs_fn(coordinator)["reason"] == "production_gate_not_armed"
+
+    coordinator.store.data["production"] = {
+        "armed": True,
+        "dry_run_ready_cycles": "3",
+        "dry_run_evidence_fingerprint": sensor_module.production_evidence_fingerprint(
+            coordinator.entry_data, coordinator.options
+        ),
+    }
+    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert block.attrs_fn(coordinator)["reason"] == "production_dry_run_evidence_incomplete"
+
+
 def test_sensor_platform_setup_groups_planner_sensors(monkeypatch: object) -> None:
     coordinator = _coordinator(_plan())
     entry = SimpleNamespace(runtime_data=coordinator)

@@ -482,6 +482,56 @@ def test_run_preflight_rejects_active_pause_and_changed_control_contract() -> No
     assert checks["production_gate_ready"]["deprecated_alias_for"] == "dry_run_evidence_complete"
 
 
+def test_run_preflight_fails_closed_for_missing_and_malformed_production_state() -> None:
+    coordinator = _coordinator()
+    coordinator.store.data.pop("production")
+    missing = _run_preflight(coordinator)
+    coordinator.store.data["production"] = {
+        "armed": "true",
+        "dry_run_ready_cycles": "3",
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+            coordinator.entry.data, coordinator.options
+        ),
+    }
+    malformed = _run_preflight(coordinator)
+    coordinator.store.data["production"] = "corrupt"
+    corrupt = _run_preflight(coordinator)
+
+    for report in (missing, malformed, corrupt):
+        assert report["active_control_ready"] is False
+        assert report["production"]["armed"] is False
+        assert report["production"]["dry_run_ready_cycles"] == 0
+        assert report["production"]["dry_run_evidence_complete"] is False
+
+
+def test_run_preflight_rejects_truthy_string_safety_options() -> None:
+    coordinator = _coordinator()
+    coordinator.entry.options.update(
+        {
+            "planner_enabled": "true",
+            "dry_run": "false",
+            "ev_control_enabled": "true",
+            "climate_control_enabled": "true",
+            "enphase_control_enabled": "true",
+        }
+    )
+
+    report = _run_preflight(coordinator)
+
+    assert report["mode"] == {
+        "planner_enabled": False,
+        "dry_run": True,
+        "safe_first_run_mode": True,
+        "active_mode_requested": False,
+    }
+    assert report["control_areas"]["required"] == []
+    assert report["production"]["device_controls"] == {
+        "ev": False,
+        "climate": False,
+        "enphase": False,
+    }
+
+
 def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
     entry_data = {
         "ev_smart_charging_start_entity": "button.ev_start",
@@ -494,6 +544,7 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
         "dry_run": True,
         "ai_enabled": False,
         "ai_timeout_seconds": 10,
+        "default_ready_by": "07:00",
         "command_rate_limit_seconds": 60,
     }
     original = production_evidence_fingerprint(entry_data, options)
@@ -505,6 +556,7 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
             "dry_run": False,
             "ai_enabled": True,
             "ai_timeout_seconds": 30,
+            "default_ready_by": "23:45",
         },
     )
     changed_policy = production_evidence_fingerprint(

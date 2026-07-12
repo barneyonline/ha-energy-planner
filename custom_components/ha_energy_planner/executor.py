@@ -34,7 +34,12 @@ from .models import (
 )
 from .ownership import OwnershipState
 from .preflight import production_evidence_fingerprint
-from .safety import control_pause_reason
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 from .storage import PlannerStore
 
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
@@ -334,17 +339,16 @@ class Executor:
         pause_reason = _pause_rejection_reason(self.store.data.get("control_pause"), action, now)
         if pause_reason is not None:
             return pause_reason
-        production_value = self.store.data.get("production")
-        if production_value is None:
-            return None
-        production = dict(production_value)
-        if not production.get("armed"):
+        production = parse_production_state(self.store.data.get("production"))
+        if not production.armed:
             return "production_gate_not_armed"
-        if production.get("dry_run_evidence_fingerprint") != production_evidence_fingerprint(
+        if production.dry_run_evidence_fingerprint != production_evidence_fingerprint(
             self.entry_data,
             self.options,
         ):
             return "production_evidence_contract_changed"
+        if production.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
+            return "production_dry_run_evidence_incomplete"
         device_reason = _device_control_disabled_reason(action.asset, self.options)
         if device_reason is not None:
             return device_reason
@@ -632,7 +636,7 @@ def _device_control_disabled_reason(asset: ActionAsset, options: dict[str, Any])
         ActionAsset.ENPHASE: (CONF_ENPHASE_CONTROL_ENABLED, "enphase_control_disabled"),
     }
     option_key, reason = option_by_asset[asset]
-    return None if bool(options.get(option_key, False)) else reason
+    return None if strict_bool(options.get(option_key), default=False) else reason
 
 
 def _daily_action_cap_reason(asset: ActionAsset, options: dict[str, Any], audit: Any, now: datetime) -> str | None:

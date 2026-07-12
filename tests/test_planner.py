@@ -120,7 +120,10 @@ def test_carbon_objective_scores_low_carbon_ev_schedule_and_changes_weight_by_pr
     )
 
     components = planner_module._score_components(action, context)
-    carbon_first = {**DEFAULT_OPTIONS, "priority_weights": "carbon,cost,comfort,ev_readiness,battery_reserve,solar_self_consumption"}
+    carbon_first = {
+        **DEFAULT_OPTIONS,
+        "priority_weights": "carbon,cost,comfort,ev_readiness,battery_reserve,solar_self_consumption",
+    }
 
     assert components["carbon"] == 1.0
     assert planner_module._carbon_schedule_weight(carbon_first) > planner_module._carbon_schedule_weight(
@@ -335,6 +338,20 @@ def test_disabled_planner_suppresses_actions_and_marks_disabled() -> None:
 
     assert plan.mode == PlannerMode.DISABLED
     assert plan.actions == []
+
+
+def test_planner_mode_rejects_truthy_string_safety_options() -> None:
+    context = _context()
+
+    disabled = DryRunPlanner(
+        {**DEFAULT_OPTIONS, "planner_enabled": "true", "dry_run": False}
+    ).create_plan(context)
+    dry_run = DryRunPlanner(
+        {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": "false"}
+    ).create_plan(context)
+
+    assert disabled.mode == PlannerMode.DISABLED
+    assert dry_run.mode == PlannerMode.DRY_RUN
 
 
 def test_plan_confidence_is_capped_by_forecast_confidence() -> None:

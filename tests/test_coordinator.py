@@ -47,6 +47,7 @@ from custom_components.ha_energy_planner.models import (
     PlanAction,
     PlannerMode,
 )
+from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
 
 def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
@@ -475,6 +476,11 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.planner_enabled is False
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1
+
+    coordinator.entry.options["planner_enabled"] = "true"
+    coordinator.entry.options["dry_run"] = "false"
+    assert coordinator.planner_enabled is False
+    assert coordinator.dry_run is True
 
 
 def test_coordinator_builds_configured_haeo_adapter_and_capability_metadata() -> None:
@@ -1501,6 +1507,38 @@ def test_production_evidence_resets_when_control_contract_changes() -> None:
 
     assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 1
     assert coordinator.store.data["production"]["dry_run_evidence_fingerprint"] != first_fingerprint
+
+
+def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:
+    dry_run = _plan("dry-run")
+    dry_run.mode = PlannerMode.DRY_RUN
+
+    for corrupt in ("3", True, 3.0, -1, 10_001):
+        coordinator = _coordinator_for_runtime_services(
+            store_data={"production": {"dry_run_ready_cycles": corrupt}}
+        )
+        asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+        assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 1
+
+    coordinator = _coordinator_for_runtime_services()
+    for _index in range(5):
+        asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 3
+
+
+def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_DEFAULT_READY_BY: "07:00", "ev_control_enabled": True},
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+    )
+    dry_run = _plan("dry-run")
+    dry_run.mode = PlannerMode.DRY_RUN
+
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    fingerprint = coordinator.store.data["production"]["dry_run_evidence_fingerprint"]
+    coordinator.ready_by = "23:45"
+
+    assert production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options) == fingerprint
 
 
 def test_shutdown_cancels_pending_callbacks_and_listeners() -> None:

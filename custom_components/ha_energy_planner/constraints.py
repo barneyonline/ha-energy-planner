@@ -33,6 +33,7 @@ from .models import (
     PlannerMode,
 )
 from .ownership import EnphaseProfileGuard, OwnershipState
+from .safety import strict_bool
 
 
 class ConstraintValidator:
@@ -131,9 +132,9 @@ class ConstraintValidator:
         """Validate a single action immediately before execution."""
         ownership = ownership or OwnershipState()
         violations: list[ConstraintViolation] = []
-        if not bool(self.options[CONF_PLANNER_ENABLED]):
+        if not strict_bool(self.options.get(CONF_PLANNER_ENABLED), default=False):
             violations.append(_action_violation(action, "planner_disabled", "Planner execution is disabled."))
-        if bool(self.options[CONF_DRY_RUN]):
+        if strict_bool(self.options.get(CONF_DRY_RUN), default=True):
             violations.append(_action_violation(action, "dry_run_enabled", "Dry run is enabled."))
         if context.input_health != InputHealth.HEALTHY:
             violations.append(_action_violation(action, "input_health_not_healthy", "Inputs are not healthy."))

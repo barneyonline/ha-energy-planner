@@ -15,6 +15,7 @@ from .const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DAIKIN_CLIMATE,
+    CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
@@ -28,7 +29,12 @@ from .const import (
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
-from .safety import control_pause_reason
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 
 _SERVICE_KEYS = (
     CONF_HAEO_OPTIMIZE_SERVICE,
@@ -36,6 +42,7 @@ _SERVICE_KEYS = (
 )
 _EVIDENCE_OPTION_EXCLUSIONS = {
     CONF_AI_ADVISOR_SERVICE,
+    CONF_DEFAULT_READY_BY,
     "ai_enabled",
     "ai_timeout_seconds",
     CONF_DRY_RUN,
@@ -202,13 +209,15 @@ def _availability_message(success_message: str, *, missing: list[str], unavailab
 
 def _production_gate_message(production: dict[str, Any]) -> str:
     """Return a concise production gate readiness message."""
-    if production.get("dry_run_evidence_complete", production.get("ready_to_arm", False)):
+    if production.get("dry_run_evidence_complete", production.get("ready_to_arm", False)) is True:
         return "Production gate has enough dry-run evidence and the configured control areas are explicitly enabled."
 
     details: list[str] = []
-    dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
-    if dry_run_ready_cycles < 3:
-        details.append(f"{dry_run_ready_cycles}/3 healthy dry-run cycles recorded")
+    dry_run_ready_cycles = parse_production_state(production).dry_run_ready_cycles
+    if dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
+        details.append(
+            f"{dry_run_ready_cycles}/{DRY_RUN_READY_CYCLES_REQUIRED} healthy dry-run cycles recorded"
+        )
     required_areas = list(production.get("required_control_areas", []))
     if "required_control_areas" in production and not required_areas:
         details.append("no configured control areas are enabled")
@@ -387,8 +396,8 @@ def _recorder_report(hass: HomeAssistant) -> dict[str, Any]:
 
 
 def _safety_report(options: dict[str, Any]) -> dict[str, Any]:
-    planner_enabled = bool(options.get(CONF_PLANNER_ENABLED, False))
-    dry_run = bool(options.get(CONF_DRY_RUN, True))
+    planner_enabled = strict_bool(options.get(CONF_PLANNER_ENABLED), default=False)
+    dry_run = strict_bool(options.get(CONF_DRY_RUN), default=True)
     return {
         "planner_enabled": planner_enabled,
         "dry_run": dry_run,
@@ -405,35 +414,36 @@ def _production_report(
     expected_evidence_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Return production readiness state."""
-    production = dict(store_data.get("production", {}))
+    production_state = parse_production_state(store_data.get("production"))
+    production = production_state.raw
     pause = store_data.get("control_pause", {})
     device_controls = {
-        "ev": bool(options.get(CONF_EV_CONTROL_ENABLED, False)),
-        "climate": bool(options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
-        "enphase": bool(options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
+        "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
+        "climate": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
+        "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
     }
     required_control_areas = list(control_areas.get("required", []))
-    dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
+    dry_run_ready_cycles = production_state.dry_run_ready_cycles
     required_areas_configured = all(
         bool(control_areas.get("details", {}).get(area, {}).get("configured"))
         for area in required_control_areas
     )
     dry_run_evidence_complete = (
-        dry_run_ready_cycles >= 3
+        dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
         and bool(required_control_areas)
         and required_areas_configured
         and bool(expected_evidence_fingerprint)
-        and production.get("dry_run_evidence_fingerprint") == expected_evidence_fingerprint
+        and production_state.dry_run_evidence_fingerprint == expected_evidence_fingerprint
     )
     return {
-        "armed": bool(production.get("armed", False)),
+        "armed": production_state.armed,
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
         "dry_run_evidence_fingerprint_matches": bool(
             expected_evidence_fingerprint
-            and production.get("dry_run_evidence_fingerprint") == expected_evidence_fingerprint
+            and production_state.dry_run_evidence_fingerprint == expected_evidence_fingerprint
         ),
         "dry_run_evidence_complete": dry_run_evidence_complete,
         # Retained for one release for consumers of the old response schema.
@@ -491,10 +501,10 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
         "enphase": bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
     }
     enabled = {
-        "haeo": bool(options.get(CONF_PLANNER_ENABLED, False)),
-        "ev": bool(options.get(CONF_EV_CONTROL_ENABLED, False)),
-        "hvac": bool(options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
-        "enphase": bool(options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
+        "haeo": strict_bool(options.get(CONF_PLANNER_ENABLED), default=False),
+        "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
+        "hvac": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
+        "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
     }
     required = [
         area
