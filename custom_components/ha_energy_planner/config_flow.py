@@ -105,6 +105,7 @@ from .const import (
     CONF_PRICE_FRESHNESS_MINUTES,
     CONF_PRIORITY_WEIGHTS,
     CONF_PV_FORECAST,
+    CONF_PV_FORECAST_SECONDARY,
     CONF_PV_OBSERVED,
     CONF_WEATHER,
     DEFAULT_ENPHASE_AI_PROFILE,
@@ -191,6 +192,9 @@ ENERGY_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_AMBER_IMPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
         vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
         vol.Required(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
+        vol.Optional(CONF_PV_FORECAST_SECONDARY): _entity_selector(
+            entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)
+        ),
         vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_CARBON_INTENSITY_FORECAST): _entity_selector(
             entity_filter=_sensor_filter(_CARBON_INTENSITY_SENSOR_UNITS)
@@ -950,6 +954,14 @@ def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[st
     ):
         if user_input.get(observed_key) and user_input.get(observed_key) == user_input.get(forecast_key):
             errors[observed_key] = "observation_must_differ_from_forecast"
+    if user_input.get(CONF_PV_FORECAST_SECONDARY) and user_input.get(CONF_PV_FORECAST_SECONDARY) == user_input.get(
+        CONF_PV_FORECAST
+    ):
+        errors[CONF_PV_FORECAST_SECONDARY] = "forecast_sources_must_differ"
+    if user_input.get(CONF_PV_OBSERVED) and user_input.get(CONF_PV_OBSERVED) == user_input.get(
+        CONF_PV_FORECAST_SECONDARY
+    ):
+        errors[CONF_PV_OBSERVED] = "observation_must_differ_from_forecast"
     for key in (CONF_HAEO_OPTIMIZE_SERVICE, CONF_AI_ADVISOR_SERVICE):
         value = user_input.get(key)
         if not value:
@@ -976,6 +988,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_AMBER_IMPORT_PRICE: {"sensor"},
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},
+    CONF_PV_FORECAST_SECONDARY: {"sensor"},
     CONF_BASELINE_LOAD_FORECAST: {"sensor"},
     CONF_CARBON_INTENSITY_FORECAST: {"sensor"},
     CONF_PV_OBSERVED: {"sensor"},
@@ -1128,6 +1141,7 @@ _ENTITY_UNIT_RULES = {
     CONF_AMBER_IMPORT_PRICE: _PRICE_UNITS,
     CONF_AMBER_EXPORT_PRICE: _PRICE_UNITS,
     CONF_PV_FORECAST: _POWER_UNITS | _ENERGY_UNITS,
+    CONF_PV_FORECAST_SECONDARY: _POWER_UNITS | _ENERGY_UNITS,
     CONF_BASELINE_LOAD_FORECAST: _POWER_UNITS,
     CONF_CARBON_INTENSITY_FORECAST: _CARBON_INTENSITY_UNITS,
     CONF_PV_OBSERVED: _POWER_UNITS,

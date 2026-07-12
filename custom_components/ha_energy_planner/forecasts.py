@@ -19,6 +19,8 @@ _FORECAST_CONTAINER_KEYS = (
     "predictions",
 )
 _TIME_KEYS = ("valid_at", "datetime", "start_time", "period_start", "from", "time", "date", "nem_time")
+FORECAST_HEALTHY_HOURS = 12.0
+FORECAST_DEGRADED_HOURS = 8.0
 
 
 def constant_forecast(
@@ -116,6 +118,75 @@ def forecast_coverage_ratio(series: list[float | None] | None) -> float:
     return sum(value is not None for value in series) / len(series)
 
 
+def forecast_coverage_details(
+    series: list[float | None] | None,
+    *,
+    starts_at: datetime,
+    interval_minutes: int,
+) -> dict[str, Any]:
+    """Return bounded temporal coverage evidence for one aligned forecast.
+
+    Classification uses continuous coverage from the first planner slot. This
+    deliberately treats leading or internal gaps as a safety boundary rather
+    than allowing later values to make an immediately unusable forecast look
+    healthy. Thresholds are capped by a shorter configured horizon so existing
+    installations that intentionally plan for less than eight hours continue to
+    require complete coverage of that horizon.
+    """
+    values = list(series or [])
+    slot_count = len(values)
+    present = [index for index, value in enumerate(values) if value is not None]
+    first_index = present[0] if present else None
+    last_index = present[-1] if present else None
+    leading_missing_slots = first_index if first_index is not None else slot_count
+    trailing_missing_slots = slot_count - last_index - 1 if last_index is not None else slot_count
+    continuous_slots = 0
+    for value in values:
+        if value is None:
+            break
+        continuous_slots += 1
+    longest_continuous_slots = 0
+    current_run = 0
+    for value in values:
+        if value is None:
+            current_run = 0
+            continue
+        current_run += 1
+        longest_continuous_slots = max(longest_continuous_slots, current_run)
+
+    interval_hours = interval_minutes / 60
+    requested_hours = slot_count * interval_hours
+    continuous_hours = continuous_slots * interval_hours
+    healthy_threshold = min(FORECAST_HEALTHY_HOURS, requested_hours)
+    degraded_threshold = min(FORECAST_DEGRADED_HOURS, requested_hours)
+    if slot_count and continuous_hours >= healthy_threshold:
+        classification = "healthy"
+    elif slot_count and continuous_hours >= degraded_threshold:
+        classification = "degraded"
+    else:
+        classification = "unsafe"
+
+    starts_at = _as_aware_utc(starts_at)
+    return {
+        "classification": classification,
+        "first_timestamp": None
+        if first_index is None
+        else (starts_at + timedelta(minutes=first_index * interval_minutes)).isoformat(),
+        "last_timestamp": None
+        if last_index is None
+        else (starts_at + timedelta(minutes=last_index * interval_minutes)).isoformat(),
+        "covered_hours": round(len(present) * interval_hours, 4),
+        "continuous_hours": round(continuous_hours, 4),
+        "longest_continuous_hours": round(longest_continuous_slots * interval_hours, 4),
+        "leading_missing_slots": leading_missing_slots,
+        "trailing_missing_slots": trailing_missing_slots,
+        "internal_missing_slots": max(slot_count - len(present) - leading_missing_slots - trailing_missing_slots, 0),
+        "requested_hours": round(requested_hours, 4),
+        "healthy_threshold_hours": round(healthy_threshold, 4),
+        "degraded_threshold_hours": round(degraded_threshold, 4),
+    }
+
+
 def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
     """Return a valid explicitly declared forecast cadence in minutes."""
     for key in ("forecast_interval_minutes", "interval_minutes", "resolution_minutes"):
@@ -173,6 +244,37 @@ def latest_forecast_valid_at_from_state(
         if latest is None or valid_at > latest:
             latest = valid_at
     return latest
+
+
+def forecast_timestamp_status_from_state(
+    state: Any,
+    *,
+    value_keys: tuple[str, ...],
+) -> str:
+    """Return whether forecast timestamps are present and timezone-aware.
+
+    A secondary series cannot be placed safely without absolute timestamps.
+    Naive timestamps are rejected rather than assuming UTC or the Home
+    Assistant timezone, which could shift values across midnight or DST.
+    """
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    found = False
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        flattened = _flatten_item(item)
+        for key in _TIME_KEYS:
+            if key not in flattened:
+                continue
+            valid_at = _parse_datetime_or_none(flattened[key])
+            if valid_at is None:
+                continue
+            found = True
+            if valid_at.tzinfo is None or valid_at.utcoffset() is None:
+                return "naive_timestamps"
+            break
+    return "aware_timestamps" if found else "untimestamped"
 
 
 def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = "", unit: str = "") -> float:

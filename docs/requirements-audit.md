@@ -106,9 +106,22 @@ Status as of 2026-06-28.
   `real_load_forecast_accuracy` fixtures, and the
   `ha-energy-planner-history-v1-real` profile verifies exported source entity
   metadata before real-history completion is claimed.
-- Forecast parsing retains uncovered horizon slots as missing values. Input
-  confidence is multiplied by temporal coverage, and incomplete required
-  forecast horizons fail closed rather than extrapolating the final bucket.
+- Forecast parsing retains uncovered horizon slots as missing values and never
+  extrapolates the final bucket. Per-input evidence reports first/last
+  timestamps, total and continuous coverage, and leading/internal/trailing
+  gaps. Continuous coverage is healthy at 12 hours, degraded from 8 to under
+  12 hours, and unsafe below 8 hours; thresholds are capped by deliberately
+  shorter configured horizons. Degraded inputs remain action-ineligible under
+  the planner's existing healthy-input action gate.
+- A second optional PV entity supports timestamp-safe Solcast Today/Tomorrow
+  stitching across midnight and daylight-saving changes. Secondary series must
+  expose timezone-aware timestamps; untimestamped and naive timestamps are
+  diagnosed and rejected, and secondary slots are excluded from calibration
+  until per-slot issue-time provenance is retained. Required Amber, PV, and
+  load point values cannot satisfy forecast coverage. Short baseline-load
+  leading gaps are filled from the current numeric state for at most one hour,
+  with explicit diagnostic evidence and reduced confidence; long or internal
+  gaps remain missing and fail closed.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
   enforces all real validation profiles in one command so full real-system
   evidence cannot accidentally skip live-schema, HAEO value, or Recorder

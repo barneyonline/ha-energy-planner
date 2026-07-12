@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Optional second PV forecast input with timestamp-safe Today/Tomorrow stitching.
+- Per-input forecast coverage diagnostics and bounded conservative baseline-load leading-gap fill.
+
+### Changed
+
+- The recommended default planning horizon is now 12 hours. Continuous forecast coverage is healthy at 12 hours, degraded from 8 to under 12 hours, and unsafe below 8 hours.
+- Required point-only inputs no longer masquerade as full forecasts; secondary PV stitching requires timezone-aware timestamps and does not calibrate slots without primary-source provenance.
+
 ## 0.4.0 - 2026-07-12
 
 ### Added
