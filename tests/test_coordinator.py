@@ -24,10 +24,14 @@ from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
     _bool_state_value,
     _configured_entity_ids,
+    _decision_input_fingerprint,
     _float_state_value,
     _is_manual_hvac_change,
     _is_material_state_change,
+    _is_planner_owned_control_feedback,
+    _latest_ai_plan_fingerprint,
     _latest_ai_service_call_at,
+    _material_plan_fingerprint,
     _overrides_from_store,
     _parse_datetime_or_none,
     _seconds_until_next_interval_boundary,
@@ -58,12 +62,13 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
             "climate_automation_entities": "automation.heat, automation.cool",
             "person_entities": "person.james,person.cath",
             "ai_advisor_service": "ai_task.generate_data",
+            "ai_task_entity": "ai_task.local",
+            "daikin_power_entity": "sensor.daikin_power",
+            "ev_smart_charging_entity": "switch.ev_control",
             "empty_entity": "",
         }
     )
     assert entity_ids == [
-        "automation.cool",
-        "automation.heat",
         "person.cath",
         "person.james",
         "sensor.import_price",
@@ -220,8 +225,10 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     expected = _plan("refresh-duration")
 
     async def update_locked() -> EnergyPlan:
+        coordinator._pending_refresh_trigger = "newer_request"
         return expected
 
+    coordinator._pending_refresh_trigger = "state_change"
     coordinator._async_update_data_locked = update_locked
 
     result = asyncio.run(coordinator._async_update_data())
@@ -230,6 +237,27 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     assert coordinator.last_refresh_metadata["succeeded"] is True
     assert coordinator.last_refresh_metadata["duration_ms"] >= 0
     assert coordinator.last_refresh_metadata["completed_at"].tzinfo is not None
+    assert coordinator.last_refresh_metadata["trigger"] == "state_change"
+    assert coordinator.refresh_metrics["trigger_counts"] == {"state_change": 1}
+    assert coordinator.refresh_metrics["succeeded"] == 1
+
+
+def test_coordinator_records_failed_refresh() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.store = FakeStore()
+
+    async def update_locked() -> EnergyPlan:
+        raise RuntimeError("failed refresh")
+
+    coordinator._async_update_data_locked = update_locked
+    try:
+        asyncio.run(coordinator._async_update_data())
+    except RuntimeError:
+        pass
+
+    assert coordinator.refresh_metrics["failed"] == 1
+    assert coordinator.last_refresh_metadata["succeeded"] is False
 
 
 class FakeEvent:
@@ -276,9 +304,9 @@ def test_manual_hvac_change_ignored_when_scheduler_guard_on() -> None:
     )
 
 
-def test_manual_hvac_change_ignored_during_planner_grace() -> None:
+def test_manual_hvac_change_preserved_during_planner_grace_when_not_expected() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-    assert not _is_manual_hvac_change(
+    assert _is_manual_hvac_change(
         FakeHass(),
         {CONF_DAIKIN_CLIMATE: "climate.daikin"},
         {"ownership": {"planner_hvac_action_expires_at": (now + timedelta(minutes=1)).isoformat()}},
@@ -439,7 +467,9 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
     assert coordinator._unsub_listeners == []
 
 
-def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(monkeypatch: object) -> None:
+def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(
+    monkeypatch: object, caplog: object
+) -> None:
     def fake_data_update_init(
         self: object, hass: object, *, logger: object, name: str, update_interval: object
     ) -> None:
@@ -462,7 +492,10 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
             ]
         }
     )
-    entry = FakeEntry({"amber_import_price_entity": "sensor.import"}, {CONF_DEFAULT_READY_BY: "06:30"})
+    entry = FakeEntry(
+        {"amber_import_price_entity": "sensor.import"},
+        {CONF_DEFAULT_READY_BY: "06:30", "ai_enabled": True},
+    )
 
     coordinator = EnergyPlannerCoordinator(FakeHass(), entry, store)
 
@@ -475,6 +508,7 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.planner_enabled is False
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1
+    assert "provider may log bounded prompts" in caplog.text
 
 
 def test_coordinator_builds_configured_haeo_adapter_and_capability_metadata() -> None:
@@ -539,7 +573,19 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
         },
         {CONF_PLANNING_INTERVAL_MINUTES: 5},
     )
-    coordinator.store = FakeStore({"ownership": {}})
+    coordinator.store = FakeStore(
+        {
+            "ownership": {},
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": datetime.now(UTC),
+                    "desired_state": {"hvac_mode": "heat"},
+                }
+            ],
+        }
+    )
     coordinator._boundary_cancel = None
     coordinator._debounce_cancel = None
     coordinator._unsub_listeners = []
@@ -547,6 +593,9 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
 
     coordinator.async_start_listeners()
     callback = callbacks[0]
+    callback(FakeEvent("climate.daikin", "off", "heat"))
+    assert coordinator.hass.created_tasks == []
+    coordinator.store.data["execution_audit"] = []
     callback(FakeEvent("climate.daikin", "off", "heat"))
     callback(FakeEvent("sensor.ev_soc", "50", "51"))
     callback(FakeEvent("sensor.price", "100", "110"))
@@ -683,6 +732,472 @@ def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
     assert calls == 1
     assert should_store is True
     assert result.status == "accepted"
+
+
+def test_ai_advice_skips_unsafe_or_zero_confidence_plan() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.store = FakeStore({"ai_recommendations": []})
+    plan = _plan("unsafe")
+    plan.health = InputHealth.UNSAFE
+    plan.confidence = 0
+
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+
+    assert should_store is False
+    assert result.rejected_reason == "ai_skipped_unsafe_plan"
+
+    plan.health = InputHealth.HEALTHY
+    plan.status = "unsafe"
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+    assert should_store is False
+    assert result.rejected_reason == "ai_skipped_unsafe_plan"
+
+
+def test_background_ai_is_non_blocking_single_flight_and_persists() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        updates: list[str] = []
+        calls = 0
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator.async_update_listeners = lambda: updates.append("updated")
+        plan = _plan("background-ai")
+        context = SimpleNamespace(created_at=plan.created_at)
+
+        async def delayed_advice(
+            built_context: object,
+            built_plan: EnergyPlan,
+            entry_data: dict[str, object],
+            options: dict[str, object],
+        ) -> tuple[AIAdviceResult, bool]:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return AIAdviceResult("accepted", {"confidence": 0.8}, None, "ai_task.generate_data"), True
+
+        coordinator._async_get_throttled_ai_advice = delayed_advice
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        task = coordinator._ai_advice_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert coordinator.store.ai_recommendations == []
+
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        assert coordinator._ai_advice_task is task
+        assert calls == 1
+
+        release.set()
+        await task
+        assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
+        assert updates == ["updated"]
+        assert "ai_background_ms" in coordinator._last_phase_durations
+        assert coordinator._ai_advice_task is None
+
+    asyncio.run(scenario())
+
+
+def test_background_ai_replaces_stale_flight_and_shutdown_cancels() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator._debounce_cancel = None
+        coordinator._boundary_cancel = None
+        coordinator._unsub_listeners = []
+        coordinator.async_update_listeners = lambda: None
+        context = SimpleNamespace(created_at=_plan("first").created_at)
+
+        async def blocked_advice(*args: object) -> tuple[AIAdviceResult, bool]:
+            started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        coordinator._async_get_throttled_ai_advice = blocked_advice
+        first = _plan("first")
+        coordinator._schedule_ai_advice(context, first, {}, {"ai_enabled": True})
+        first_task = coordinator._ai_advice_task
+        assert first_task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        second = _plan("second")
+        second.preview = [{"import_price": 0.42}]
+        started.clear()
+        coordinator._schedule_ai_advice(context, second, {}, {"ai_enabled": True})
+        second_task = coordinator._ai_advice_task
+        assert second_task is not None and second_task is not first_task
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert first_task.cancelled()
+
+        coordinator.async_shutdown()
+        try:
+            await second_task
+        except asyncio.CancelledError:
+            pass
+        assert second_task.cancelled()
+        assert coordinator._ai_advice_task is None
+
+    asyncio.run(scenario())
+
+
+def test_background_ai_is_cancelled_when_current_plan_becomes_unsafe() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
+
+        async def blocked(*args: object) -> tuple[AIAdviceResult, bool]:
+            started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        coordinator._async_get_throttled_ai_advice = blocked
+        safe = _plan("safe")
+        context = SimpleNamespace(created_at=safe.created_at)
+        coordinator._schedule_ai_advice(context, safe, {}, {"ai_enabled": True})
+        task = coordinator._ai_advice_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        unsafe = _plan("unsafe")
+        unsafe.health = InputHealth.UNSAFE
+        unsafe.status = "unsafe"
+        coordinator._schedule_ai_advice(context, unsafe, {}, {"ai_enabled": True})
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert task.cancelled()
+        assert coordinator.store.ai_recommendations == []
+        assert coordinator._ai_current_plan_safe is False
+
+    asyncio.run(scenario())
+
+
+def test_background_ai_rechecks_committed_plan_under_planner_lock() -> None:
+    async def scenario() -> None:
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator._last_phase_durations = {}
+        coordinator.async_update_listeners = lambda: None
+        plan = _plan("safe-race")
+        fingerprint = _material_plan_fingerprint(plan)
+        coordinator._ai_advice_fingerprint = fingerprint
+        coordinator._ai_current_plan_fingerprint = fingerprint
+        coordinator._ai_current_plan_safe = True
+
+        async def accepted(*args: object) -> tuple[AIAdviceResult, bool]:
+            return AIAdviceResult("accepted", {"confidence": 0.8}, None, "ai_task.generate_data"), True
+
+        coordinator._async_get_throttled_ai_advice = accepted
+        async with coordinator._planner_lock:
+            task = asyncio.create_task(
+                coordinator._async_run_ai_advice(
+                    SimpleNamespace(created_at=plan.created_at),
+                    plan,
+                    {},
+                    {"ai_enabled": True},
+                    fingerprint,
+                )
+            )
+            await asyncio.sleep(0)
+            coordinator._ai_current_plan_safe = False
+            coordinator._ai_current_plan_fingerprint = None
+        await task
+
+        assert coordinator.store.ai_recommendations == []
+
+    asyncio.run(scenario())
+
+
+def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    daikin_event = FakeEvent("climate.daikin", "off", "heat", new_attributes={"temperature": 21})
+    enphase_event = FakeEvent("select.enphase", "AI Optimisation", "Full Backup")
+    entry_data = {
+        "daikin_climate_entity": "climate.daikin",
+        "enphase_profile_entity": "select.enphase",
+    }
+
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(seconds=30),
+                    "desired_state": {"hvac_mode": "heat", "target_temperature": 21},
+                }
+            ]
+        },
+        daikin_event,
+        now,
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "enphase",
+                    "attempted_at": now - timedelta(seconds=30),
+                    "desired_state": {"profile": "Full Backup"},
+                }
+            ]
+        },
+        enphase_event,
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "failed",
+                    "asset": "enphase",
+                    "attempted_at": now - timedelta(seconds=10),
+                    "desired_state": {"profile": "Full Backup"},
+                }
+            ],
+            "command_rate_limits": {"enphase:set_profile": now},
+        },
+        enphase_event,
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        SimpleNamespace(data={"entity_id": "climate.daikin", "new_state": None}),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(minutes=5),
+                    "desired_state": {"hvac_mode": "heat"},
+                },
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": "bad",
+                },
+            ]
+        },
+        daikin_event,
+        now,
+    )
+    for observed_temperature in (22, "bad"):
+        assert not _is_planner_owned_control_feedback(
+            entry_data,
+            {
+                "execution_audit": [
+                    {
+                        "result": "applied",
+                        "asset": "daikin",
+                        "attempted_at": now,
+                        "desired_state": {"hvac_mode": "heat", "target_temperature": 21},
+                    }
+                ]
+            },
+            FakeEvent(
+                "climate.daikin",
+                "off",
+                "heat",
+                new_attributes={"temperature": observed_temperature},
+            ),
+            now,
+        )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(seconds=10),
+                    "desired_state": {"hvac_mode": "cool"},
+                }
+            ]
+        },
+        daikin_event,
+        now,
+    )
+
+
+def test_background_ai_cached_skip_and_failure_are_bounded() -> None:
+    async def scenario() -> None:
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator.async_update_listeners = lambda: None
+        plan = _plan("cached")
+        fingerprint = _material_plan_fingerprint(plan)
+        coordinator.store = FakeStore(
+            {"ai_recommendations": [{"status": "accepted", "rejected_detail": {"plan_fingerprint": fingerprint}}]}
+        )
+        context = SimpleNamespace(created_at=plan.created_at)
+
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        assert coordinator._ai_advice_task is None
+
+        async def skipped(*args: object) -> tuple[AIAdviceResult, bool]:
+            return AIAdviceResult("skipped", {}, "rate_limited", None), False
+
+        coordinator._async_get_throttled_ai_advice = skipped
+        coordinator._ai_advice_fingerprint = fingerprint
+        await coordinator._async_run_ai_advice(context, plan, {}, {"ai_enabled": True}, fingerprint)
+        assert coordinator.store.ai_recommendations == []
+
+        async def failed(*args: object) -> tuple[AIAdviceResult, bool]:
+            raise RuntimeError("provider failed")
+
+        coordinator._async_get_throttled_ai_advice = failed
+        await coordinator._async_run_ai_advice(context, plan, {}, {"ai_enabled": True}, fingerprint)
+        assert coordinator.store.ai_recommendations == []
+
+    asyncio.run(scenario())
+
+
+def test_material_ai_fingerprint_changes_with_forecast_preview_and_cost() -> None:
+    first = _plan("generated-1")
+    first.preview = [{"import_price": 0.1, "pv_forecast_kw": 1.0}]
+    first.estimated_daily_cost = 2.5
+    second = _plan("generated-2")
+    second.preview = [{"import_price": 0.2, "pv_forecast_kw": 1.0}]
+    second.estimated_daily_cost = 2.5
+
+    assert _material_plan_fingerprint(first) != _material_plan_fingerprint(second)
+    second.preview = [{"valid_at": "2026-06-27T00:05:00+00:00", "import_price": 0.1, "pv_forecast_kw": 1.0}]
+    first.preview = [{"valid_at": "2026-06-27T00:00:00+00:00", "import_price": 0.1, "pv_forecast_kw": 1.0}]
+    assert _material_plan_fingerprint(first) == _material_plan_fingerprint(second)
+
+
+def test_ai_advice_reuses_unchanged_material_plan() -> None:
+    plan = _plan("new-generated-id")
+    fingerprint = _material_plan_fingerprint(plan)
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.store = FakeStore(
+        {"ai_recommendations": [{"status": "accepted", "rejected_detail": {"plan_fingerprint": fingerprint}}]}
+    )
+
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+
+    assert should_store is False
+    assert result.rejected_reason == "ai_plan_unchanged"
+
+
+def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
+    assert _latest_ai_plan_fingerprint("bad") is None
+    assert _latest_ai_plan_fingerprint([{"ignored": True}, "bad"]) is None
+    assert _latest_ai_plan_fingerprint(["bad", {"status": "accepted", "plan_fingerprint": "top-level"}]) == "top-level"
+    assert (
+        _latest_ai_plan_fingerprint([{"status": "accepted", "rejected_detail": {"plan_fingerprint": "nested"}}])
+        == "nested"
+    )
+    hass = FakeHass({"sensor.price": "0.25"})
+    present = _decision_input_fingerprint(
+        hass,
+        {"amber_import_price_entity": "sensor.price"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 5},
+        [],
+        now=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    missing = _decision_input_fingerprint(
+        FakeHass(),
+        {"amber_import_price_entity": "sensor.price"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 5},
+        [],
+        now=datetime(2026, 6, 27, tzinfo=UTC),
+    )
+    assert present != missing
+
+
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline() -> None:
+    coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
+    coordinator.data = _plan("existing")
+    coordinator._last_decision_fingerprint = _decision_input_fingerprint(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.planner_options,
+        coordinator.overrides,
+        now=coordinator.data.created_at,
+    )
+    # Keep the interval bucket stable for this focused short-circuit test.
+    original = coordinator_module.dt_util.utcnow
+    coordinator_module.dt_util.utcnow = lambda: coordinator.data.created_at
+    try:
+        result = asyncio.run(coordinator._async_update_data_locked())
+    finally:
+        coordinator_module.dt_util.utcnow = original
+
+    assert result is coordinator.data
+    assert coordinator._refresh_counters["fingerprint_skipped"] == 1
+
+
+def test_explicit_replan_marks_next_refresh_as_forced() -> None:
+    coordinator = _coordinator_for_runtime_services()
+
+    asyncio.run(coordinator.async_request_replan())
+
+    assert coordinator._force_next_refresh is True
+    assert coordinator.refresh_requested == 1
+    assert coordinator._pending_refresh_trigger == "manual_replan"
 
 
 def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
@@ -883,6 +1398,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
         "custom_components.ha_energy_planner.coordinator.update_thermal_model",
         lambda model, previous, sample: ({"last_sample": sample, "enabled": True}, True),
     )
+
     def fake_apply_haeo_response(built_context: object, response: object) -> dict[str, int]:
         assert built_context is context
         context.last_haeo_response = response
@@ -926,8 +1442,8 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 7.25
     assert coordinator.store.haeo_runs[0]["second_pass"]["cache_hit"] is True
     assert coordinator.store.haeo_runs[0]["capabilities"]["supports_flexible_second_pass"] is True
-    assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
-    assert coordinator.store.forecast_snapshots[0]["ai"]["accepted_fields"] == ["confidence", "reasoning_summary"]
+    assert coordinator.store.ai_recommendations == []
+    assert coordinator.store.forecast_snapshots[0]["ai"] is None
     assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
     assert coordinator.store.saved_plans == [result]
     assert coordinator.executor.evaluated == [(result, context)]
@@ -944,10 +1460,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
 
     assert adapter.second_pass_calls == 1
     assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == "skipped"
-    assert (
-        coordinator.store.haeo_runs[0]["second_pass"]["reason"]
-        == "haeo_flexible_projection_unsupported"
-    )
+    assert coordinator.store.haeo_runs[0]["second_pass"]["reason"] == "haeo_flexible_projection_unsupported"
     assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 0.0
 
 
@@ -1320,6 +1833,7 @@ def test_request_replan_and_ready_by_mark_generation_and_refresh() -> None:
     assert coordinator.ready_by == "09:15"
     assert coordinator.refresh_requested == 2
     assert coordinator._refresh_generation == 2
+    assert coordinator._pending_refresh_trigger == "ready_by_changed"
 
 
 def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
@@ -1421,6 +1935,7 @@ def test_production_control_runtime_methods_update_store_and_refresh() -> None:
     assert coordinator.store.control_pause_saves[1]["reason"] == "maintenance_done"
     assert coordinator.refresh_requested == 2
     assert coordinator._refresh_generation == 2
+    assert coordinator._pending_refresh_trigger == "control_resumed"
 
 
 def test_production_pause_fallback_persistence_handles_lightweight_stores() -> None:
@@ -1523,6 +2038,9 @@ def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: 
     coordinator._schedule_next_boundary_refresh()
     boundary_callback = scheduled[-1][1]
     boundary_callback(None)
+    # Boundary scheduling bypasses the 20-second state debounce but still uses
+    # the coalescing/minimum-interval callback.
+    scheduled[-2][1](None)
 
     assert coordinator._refresh_generation == 2
     assert len(coordinator.hass.created_tasks) == 2

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import re
 from collections import OrderedDict
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from hashlib import sha256
-from math import isfinite
+from math import ceil, isfinite
 from time import monotonic, perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -207,24 +208,40 @@ class HAEOAdapter:
                 service_called=self.optimize_service,
             )
             return self._finish(result, started, fingerprint, cache_hit=False)
-
+        if not self.capabilities.supports_response:
+            # A fire-and-forget optimize service cannot provide evidence to the
+            # planner. Calling it on every refresh adds load while leaving the
+            # plan unchanged, so report the capability gap without invoking it.
+            result = HAEOSolveResult(
+                phase,
+                HAEOStatus.STALE,
+                "haeo_response_unsupported",
+                context.plan_id,
+                service_called=None,
+            )
+            return self._finish(result, started, fingerprint, cache_hit=False)
         cached = self._cached_result(fingerprint, context.plan_id)
         if cached is not None:
             return self._finish(cached, started, fingerprint, cache_hit=True)
 
         service_data = _service_data(context, phase, projections)
-        real_haeo_entry_id = self.capabilities.selected_entry_id
-        if real_haeo_entry_id:
-            service_data = {"config_entry": real_haeo_entry_id}
         try:
-            if not self.capabilities.supports_response:
-                response = await self.hass.services.async_call(domain, service, service_data, blocking=True)
-            else:
-                response = await self.hass.services.async_call(
-                    domain, service, service_data, blocking=True, return_response=True
-                )
+            response = await self.hass.services.async_call(
+                domain, service, service_data, blocking=True, return_response=True
+            )
         except Exception as err:  # noqa: BLE001 - adapter must fail closed and report redacted reason.
             result = _service_failed_result(phase, context, self.optimize_service, err)
+            return self._finish(result, started, fingerprint, cache_hit=False)
+        response_data = response if isinstance(response, dict) else None
+        if not _response_has_adequate_grid_evidence(context, response_data):
+            result = HAEOSolveResult(
+                phase,
+                HAEOStatus.STALE,
+                "haeo_response_without_usable_evidence",
+                context.plan_id,
+                service_called=self.optimize_service,
+                response=response_data,
+            )
             return self._finish(result, started, fingerprint, cache_hit=False)
         result = HAEOSolveResult(
             phase,
@@ -232,7 +249,7 @@ class HAEOAdapter:
             "haeo_service_called",
             context.plan_id,
             service_called=self.optimize_service,
-            response=response if isinstance(response, dict) else None,
+            response=response_data,
         )
         self._store_cached_result(fingerprint, result)
         return self._finish(result, started, fingerprint, cache_hit=False)
@@ -479,6 +496,24 @@ def _service_data(
             for projection in projections
         ],
     }
+
+
+def _response_has_adequate_grid_evidence(
+    context: DecisionContext,
+    response: dict[str, Any] | None,
+) -> bool:
+    """Require continuous import/export evidence for most of the solve horizon."""
+    if not context.slots:
+        return False
+    candidate = deepcopy(context)
+    apply_haeo_response_to_context(candidate, response)
+    required_slots = max(1, ceil(len(candidate.slots) * 0.8))
+    continuous_slots = 0
+    for slot in candidate.slots:
+        if slot.haeo_grid_import_forecast_kw is None or slot.haeo_grid_export_forecast_kw is None:
+            break
+        continuous_slots += 1
+    return continuous_slots >= required_slots
 
 
 def apply_haeo_response_to_context(context: DecisionContext, response: dict[str, Any] | None) -> dict[str, int]:

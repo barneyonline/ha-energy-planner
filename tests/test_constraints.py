@@ -339,6 +339,24 @@ def test_enphase_restore_ai_has_no_savings_threshold_violation() -> None:
     assert "enphase_takeover_savings_below_threshold" not in violations
 
 
+def test_enphase_restore_is_not_rejected_for_existing_grid_violation() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(now, ActionAsset.ENPHASE, ActionKind.RESTORE_AI, {"profile": "AI Optimisation"})
+    context = _context(now)
+    context.slots[0].baseline_load_forecast_kw = 20.0
+    context.slots[0].pv_forecast_kw = 0.0
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "grid_import_limit_kw": 5.0,
+    }
+
+    violations = ConstraintValidator(options).validate_action(context, _plan(now, action), action, now=now)
+
+    assert "grid_import_limit_exceeded" not in violations
+
+
 def test_ev_target_below_current_and_infeasible_evidence_exception() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = _context(now)
