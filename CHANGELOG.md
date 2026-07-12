@@ -5,6 +5,7 @@
 ### Changed
 
 - The AI-provider privacy notice is logged at informational level instead of surfacing as a Home Assistant warning.
+- The plan-fallback notification toggle now uses the same heading-and-description style as the surrounding safety controls.
 
 ## 0.5.1 - 2026-07-12
 

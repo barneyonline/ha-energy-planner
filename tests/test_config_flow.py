@@ -672,6 +672,26 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
         assert descriptions[key] != key
 
 
+def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
+    expected_heading = "Enable plan fallback notifications"
+    expected_description = (
+        "Shows persistent notifications when required inputs are unsafe, a grid limit is exceeded, or HAEO falls "
+        "back. Turning this off dismisses those notifications without weakening safety checks."
+    )
+
+    integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
+    for path in (
+        integration_dir / "strings.json",
+        integration_dir / "translations" / "en.json",
+        integration_dir / "translations" / "en-AU.json",
+        integration_dir / "translations" / "en-GB.json",
+    ):
+        strings = json.loads(path.read_text(encoding="utf-8"))
+        section = strings["options"]["step"][POLICY_STEP_AI_SAFETY]
+        assert section["data"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_heading
+        assert section["data_description"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_description
+
+
 def test_options_flow_init_shows_policy_section_menu() -> None:
     flow = OptionsFlow(SimpleNamespace(options={}))
 
