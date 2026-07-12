@@ -28,6 +28,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _float_state_value,
     _is_manual_hvac_change,
     _is_material_state_change,
+    _is_planner_owned_control_feedback,
     _latest_ai_plan_fingerprint,
     _latest_ai_service_call_at,
     _material_plan_fingerprint,
@@ -466,7 +467,9 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
     assert coordinator._unsub_listeners == []
 
 
-def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(monkeypatch: object) -> None:
+def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(
+    monkeypatch: object, caplog: object
+) -> None:
     def fake_data_update_init(
         self: object, hass: object, *, logger: object, name: str, update_interval: object
     ) -> None:
@@ -489,7 +492,10 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
             ]
         }
     )
-    entry = FakeEntry({"amber_import_price_entity": "sensor.import"}, {CONF_DEFAULT_READY_BY: "06:30"})
+    entry = FakeEntry(
+        {"amber_import_price_entity": "sensor.import"},
+        {CONF_DEFAULT_READY_BY: "06:30", "ai_enabled": True},
+    )
 
     coordinator = EnergyPlannerCoordinator(FakeHass(), entry, store)
 
@@ -502,6 +508,7 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.planner_enabled is False
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1
+    assert "provider may log bounded prompts" in caplog.text
 
 
 def test_coordinator_builds_configured_haeo_adapter_and_capability_metadata() -> None:
@@ -566,7 +573,9 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
         },
         {CONF_PLANNING_INTERVAL_MINUTES: 5},
     )
-    coordinator.store = FakeStore({"ownership": {}})
+    coordinator.store = FakeStore(
+        {"ownership": {"planner_hvac_action_expires_at": datetime.now(UTC) + timedelta(minutes=1)}}
+    )
     coordinator._boundary_cancel = None
     coordinator._debounce_cancel = None
     coordinator._unsub_listeners = []
@@ -574,6 +583,9 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
 
     coordinator.async_start_listeners()
     callback = callbacks[0]
+    callback(FakeEvent("climate.daikin", "off", "heat"))
+    assert coordinator.hass.created_tasks == []
+    coordinator.store.data["ownership"] = {}
     callback(FakeEvent("climate.daikin", "off", "heat"))
     callback(FakeEvent("sensor.ev_soc", "50", "51"))
     callback(FakeEvent("sensor.price", "100", "110"))
@@ -841,6 +853,80 @@ def test_background_ai_replaces_stale_flight_and_shutdown_cancels() -> None:
         assert coordinator._ai_advice_task is None
 
     asyncio.run(scenario())
+
+
+def test_background_ai_is_cancelled_when_current_plan_becomes_unsafe() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+
+        async def blocked(*args: object) -> tuple[AIAdviceResult, bool]:
+            started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        coordinator._async_get_throttled_ai_advice = blocked
+        safe = _plan("safe")
+        context = SimpleNamespace(created_at=safe.created_at)
+        coordinator._schedule_ai_advice(context, safe, {}, {"ai_enabled": True})
+        task = coordinator._ai_advice_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        unsafe = _plan("unsafe")
+        unsafe.health = InputHealth.UNSAFE
+        unsafe.status = "unsafe"
+        coordinator._schedule_ai_advice(context, unsafe, {}, {"ai_enabled": True})
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert task.cancelled()
+        assert coordinator.store.ai_recommendations == []
+        assert coordinator._ai_current_plan_safe is False
+
+    asyncio.run(scenario())
+
+
+def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    daikin_event = SimpleNamespace(data={"entity_id": "climate.daikin"})
+    enphase_event = SimpleNamespace(data={"entity_id": "select.enphase"})
+    entry_data = {
+        "daikin_climate_entity": "climate.daikin",
+        "enphase_profile_entity": "select.enphase",
+    }
+
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"ownership": {"planner_hvac_action_expires_at": now + timedelta(minutes=1)}},
+        daikin_event,
+        now,
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"command_rate_limits": {"enphase:set_profile": now - timedelta(seconds=30)}},
+        enphase_event,
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"command_rate_limits": {"ev:ev_start": now}},
+        enphase_event,
+        now,
+    )
 
 
 def test_background_ai_cached_skip_and_failure_are_bounded() -> None:
@@ -1605,6 +1691,7 @@ def test_request_replan_and_ready_by_mark_generation_and_refresh() -> None:
     assert coordinator.ready_by == "09:15"
     assert coordinator.refresh_requested == 2
     assert coordinator._refresh_generation == 2
+    assert coordinator._pending_refresh_trigger == "ready_by_changed"
 
 
 def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
@@ -1706,6 +1793,7 @@ def test_production_control_runtime_methods_update_store_and_refresh() -> None:
     assert coordinator.store.control_pause_saves[1]["reason"] == "maintenance_done"
     assert coordinator.refresh_requested == 2
     assert coordinator._refresh_generation == 2
+    assert coordinator._pending_refresh_trigger == "control_resumed"
 
 
 def test_production_pause_fallback_persistence_handles_lightweight_stores() -> None:

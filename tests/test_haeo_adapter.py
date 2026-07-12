@@ -49,7 +49,11 @@ class FakeServices:
         return_response: bool = False,
     ) -> dict[str, Any] | None:
         self.calls.append((domain, service, data))
-        return {"ok": True, "plan_id": data["plan_id"]} if return_response else {}
+        return (
+            {"slots": [{"valid_at": data["created_at"], "grid_import_kw": 1.0}]}
+            if return_response
+            else {}
+        )
 
 
 class FakeHass:
@@ -532,6 +536,24 @@ def test_haeo_adapter_reports_direct_service_exception() -> None:
     assert result.status == HAEOStatus.FAILED
     assert result.reason == "haeo_service_failed:RuntimeError"
     assert result.service_called == "haeo.optimize"
+
+
+def test_response_capable_haeo_rejects_empty_or_unusable_evidence() -> None:
+    class EmptyServices(FakeServices):
+        def __init__(self, response: object) -> None:
+            super().__init__()
+            self.response = response
+
+        async def async_call(self, *args: object, **kwargs: object) -> object:
+            return self.response
+
+    for response in (None, {}, {"slots": []}, {"slots": [{"valid_at": "bad", "grid_import_kw": "nan"}]}):
+        hass = FakeHass()
+        hass.services = EmptyServices(response)
+        result = asyncio.run(HAEOAdapter(hass, "haeo.optimize").async_solve_baseline(_context()))
+
+        assert result.status == HAEOStatus.STALE
+        assert result.reason == "haeo_response_without_usable_evidence"
 
 
 def test_first_haeo_entry_id_handles_missing_or_unexpected_managers() -> None:

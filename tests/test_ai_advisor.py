@@ -9,7 +9,9 @@ from typing import Any
 
 from custom_components.ha_energy_planner.ai_advisor import (
     LocalAIAdvisor,
+    _battery_soc_band,
     _build_instructions,
+    _build_prompt,
     _invalid_response_detail,
     _loads,
     _parse_response,
@@ -545,6 +547,16 @@ def test_build_instructions_supports_structured_prompt() -> None:
     assert "Return exactly one JSON object" not in instructions
     assert "Planner mode DISABLED is a control setting" in instructions
     assert "not an input health reason, advice reason, or OK outcome" in instructions
+
+
+def test_ai_prompt_minimizes_household_state_detail() -> None:
+    payload = json.loads(_build_prompt(_context(), _plan()))
+
+    assert "occupancy_state" not in payload["context"]
+    assert "battery_soc_percent" not in payload["context"]
+    assert payload["context"]["occupancy_known"] is True
+    assert payload["context"]["battery_soc_band"] == "medium"
+    assert [_battery_soc_band(value) for value in (None, 10, 50, 90)] == ["unknown", "low", "medium", "high"]
 
 
 def test_parse_response_supports_common_nested_shapes() -> None:

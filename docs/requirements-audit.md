@@ -70,12 +70,12 @@ Status as of 2026-06-28.
   codes before they can be persisted or shown in notifications.
 - Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
-- Local AI advice is disabled by default, redacted, JSON-only, whitelisted, and
-  advisory. Unsupported response fields are rejected, so it cannot call
-  services or change hard constraints. Docker smoke coverage exercises a
-  response-capable local AI advisor service through Home Assistant Core and
-  verifies accepted bounded advice in Store recommendations and forecast
-  snapshot metadata.
+- Local AI advice is disabled by default, minimized, JSON-only, whitelisted,
+  and advisory. Unsupported response fields are rejected, so it cannot call
+  services or change hard constraints. The integration warns that provider
+  integrations may independently log bounded prompts. Docker smoke coverage
+  exercises a response-capable local AI advisor service through Home Assistant
+  Core and verifies accepted bounded advice in Store recommendations.
 - Replay fixtures cover stale inputs, battery floor rejection, EV infeasible
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, and Enphase holds.

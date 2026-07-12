@@ -276,14 +276,25 @@ def _build_prompt(context: DecisionContext, plan: EnergyPlan) -> str:
         "context": {
             "input_health": str(context.input_health),
             "haeo_status": str(context.haeo_status),
-            "occupancy_state": str(context.occupancy_state),
-            "battery_soc_percent": context.current_battery_soc_percent,
+            "occupancy_known": str(context.occupancy_state) != "unknown",
+            "battery_soc_band": _battery_soc_band(context.current_battery_soc_percent),
             "ev_soc_known": context.current_ev_soc_percent is not None,
             "slot_count": len(context.slots),
             "active_override_kinds": [override.kind for override in context.active_overrides[:3]],
         },
     }
     return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def _battery_soc_band(value: Any) -> str:
+    """Return a coarse battery band instead of an exact household reading."""
+    if not isinstance(value, int | float):
+        return "unknown"
+    if value < 25:
+        return "low"
+    if value < 75:
+        return "medium"
+    return "high"
 
 
 def _build_instructions(context: DecisionContext, plan: EnergyPlan, *, structured: bool) -> str:

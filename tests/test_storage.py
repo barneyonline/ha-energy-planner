@@ -351,6 +351,7 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
     store = PlannerStore(object())
     now = datetime(2026, 6, 30, tzinfo=UTC)
     store.data["forecast_snapshots"] = [
+        "malformed",
         {"created_at": (now - timedelta(hours=49)).isoformat(), "plan_id": "expired"},
         *[{"created_at": (now - timedelta(hours=24)).isoformat(), "plan_id": f"burst-{index}"} for index in range(500)],
     ]
@@ -373,6 +374,7 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
 
     assert len(store.data["forecast_snapshots"]) == 501
     assert all(item["plan_id"] != "expired" for item in store.data["forecast_snapshots"])
+    assert all(isinstance(item, dict) for item in store.data["forecast_snapshots"])
     assert [item["plan_id"] for item in store.data["haeo_runs"]] == ["recent", "latest"]
     assert [item["planned_action_count"] for item in store.data["dry_run_comparisons"]] == [2, 3]
 
@@ -447,3 +449,4 @@ def test_audit_dedup_helpers_handle_malformed_and_sparse_records() -> None:
     naive = datetime(2026, 6, 27)
     assert _record_timestamp({"created_at": naive}) == naive.replace(tzinfo=UTC)
     assert _record_timestamp({"created_at": "bad"}) is None
+    assert _record_timestamp("bad") is None
