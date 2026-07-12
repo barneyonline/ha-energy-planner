@@ -352,6 +352,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         started_generation = self._refresh_generation
         options = self.planner_options
         entry_data = self.entry_data
+        self.executor.options = options
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
             entry_data,
