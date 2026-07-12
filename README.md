@@ -28,7 +28,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Supported device categories
 
 - Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
-- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
+- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional grid carbon-intensity forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
 - EV charging plan, current/next charging state, ready-by planning, charge energy estimates, and start/stop controls
 - Climate plan, current/next climate state, comfort targets, HVAC power modeling, manual override handling, and presence-aware control
 - Presence as a separate device, including multi-person occupancy inputs
@@ -40,14 +40,14 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Key features
 
 - Guided setup with no required inputs on initial install; add Energy, Climate, Presence, Enphase, AI, and EV inputs separately from the integration page
-- Forecast calibration is opt-in through separate observed PV and household-load power sensors; forecast entities are never treated as ground truth
+- Forecast calibration is opt-in through separate observed PV and household-load power sensors; validated lead-time models learn expected values plus conservative PV/load uncertainty bounds, and forecast entities are never treated as ground truth
 - Device structure aligned with Home Assistant hub-style integrations: each planning area appears as its own device with relevant sub-entities
 - Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
 - Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
 - Battery-aware decisions using configured usable capacity, reserve floor, round-trip efficiency, maximum charge power, and maximum discharge power
-- HAEO service support for optimization, with bounded fallback planning when HAEO is unavailable or returns an unhealthy result
+- HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, and bounded fallback planning when HAEO is unavailable or returns an unhealthy result
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
-- EV planning with connected state, SOC, start/stop entities, daily trip-history replay, estimated charging kWh, and solar-aware effective-cost scheduling
+- EV planning with connected state, SOC, start/stop entities, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
 - Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
 - 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
@@ -56,7 +56,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly
-- Home Assistant diagnostics, system health, repair/preflight evidence, entity translations, and icons for all exposed entities
+- Home Assistant diagnostics, system health, modular repair/preflight evidence for partial installations, native currency/device-class semantics, entity translations, and icons for all exposed entities
 - Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
 
 ## Installation
@@ -96,7 +96,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.3.0`
+- Current manifest version: `0.4.0`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `hub`
 - IoT class: `local_polling`
@@ -127,7 +127,7 @@ Energy Planner is built around conservative production controls:
 
 - The **Planner enabled** switch starts off.
 - The **Dry run** switch starts on.
-- Active control requires mapped inputs, healthy preflight status, production arming, and dry-run review.
+- Active control requires mapped inputs for each enabled control area, healthy modular preflight status, production arming, and dry-run review. Unconfigured or disabled device areas do not block a partial installation.
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
 - Device control is paused temporarily when a command fails or a recent planner-owned EV/Enphase state appears to have been changed externally.

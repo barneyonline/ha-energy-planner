@@ -73,6 +73,95 @@ def test_plan_preview_includes_weather_forecast_temperature() -> None:
     assert plan.preview[0]["outdoor_temperature_forecast_c"] == 18.5
 
 
+def test_plan_preview_exposes_uncertainty_and_carbon_inputs() -> None:
+    context = _context()
+    context.slots[0].pv_forecast_lower_kw = 0.7
+    context.slots[0].baseline_load_forecast_upper_kw = 2.4
+    context.slots[0].carbon_intensity_g_per_kwh = 325
+
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}).create_plan(context)
+
+    assert plan.preview[0]["pv_forecast_lower_kw"] == 0.7
+    assert plan.preview[0]["baseline_load_forecast_upper_kw"] == 2.4
+    assert plan.preview[0]["carbon_intensity_g_per_kwh"] == 325
+
+
+def test_carbon_objective_scores_low_carbon_ev_schedule_and_changes_weight_by_priority() -> None:
+    context = _context()
+    context.slots = [
+        DecisionSlot(context.created_at, 0.1, 0.05, 0.0, 1.0, carbon_intensity_g_per_kwh=800),
+        DecisionSlot(
+            context.created_at + timedelta(minutes=5),
+            0.2,
+            0.05,
+            0.0,
+            1.0,
+            carbon_intensity_g_per_kwh=100,
+        ),
+    ]
+    action = PlanAction(
+        action_id="ev-carbon",
+        plan_id=context.plan_id,
+        execute_not_before=context.created_at,
+        execute_not_after=context.created_at + timedelta(minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "required_charge_percent": 10,
+            "allocated_slots": [
+                {"carbon_intensity_g_per_kwh": 100, "grid_import_used_kw": 5.0}
+            ],
+        },
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+
+    components = planner_module._score_components(action, context)
+    carbon_first = {**DEFAULT_OPTIONS, "priority_weights": "carbon,cost,comfort,ev_readiness,battery_reserve,solar_self_consumption"}
+
+    assert components["carbon"] == 1.0
+    assert planner_module._carbon_schedule_weight(carbon_first) > planner_module._carbon_schedule_weight(
+        DEFAULT_OPTIONS
+    )
+
+
+def test_carbon_score_rewards_load_reduction_during_high_carbon_period() -> None:
+    context = _context()
+    context.slots = [
+        DecisionSlot(context.created_at, 0.2, 0.05, 0.0, 2.0, carbon_intensity_g_per_kwh=800),
+        DecisionSlot(
+            context.created_at + timedelta(minutes=5),
+            0.2,
+            0.05,
+            0.0,
+            2.0,
+            carbon_intensity_g_per_kwh=100,
+        ),
+    ]
+
+    def climate_action(mode: str) -> PlanAction:
+        return PlanAction(
+            action_id=f"climate-{mode}",
+            plan_id=context.plan_id,
+            execute_not_before=context.created_at,
+            execute_not_after=context.created_at + timedelta(minutes=5),
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.SET_HVAC,
+            desired_state={"mode": mode},
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=None,
+            confidence=1.0,
+            requires_haeo_plan_id=None,
+        )
+
+    assert planner_module._carbon_action_score(climate_action("off"), context) == 1.0
+    assert planner_module._carbon_action_score(climate_action("heat"), context) == 0.0
+
+
 def test_estimated_cost_uses_configured_planning_interval() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -446,6 +535,96 @@ def test_estimated_cost_returns_none_when_slots_lack_required_data() -> None:
     context.slots = [DecisionSlot(context.created_at, None, 0.05, 0, None)]
 
     assert DryRunPlanner(DEFAULT_OPTIONS)._estimate_cost(context) is None
+    assert DryRunPlanner(DEFAULT_OPTIONS)._estimated_cost_horizon_hours(context) is None
+
+
+def test_carbon_action_score_covers_allocation_and_asset_edges() -> None:
+    context = _context()
+    context.slots = [
+        DecisionSlot(context.created_at, 0.2, 0.05, 0, 1, carbon_intensity_g_per_kwh=100),
+        DecisionSlot(
+            context.created_at + timedelta(minutes=5),
+            0.2,
+            0.05,
+            0,
+            1,
+            carbon_intensity_g_per_kwh=500,
+        ),
+    ]
+
+    def action(asset: ActionAsset, desired_state: dict[str, object]) -> PlanAction:
+        return PlanAction(
+            action_id="carbon-test",
+            plan_id=context.plan_id,
+            execute_not_before=context.created_at,
+            execute_not_after=context.created_at + timedelta(minutes=5),
+            asset=asset,
+            kind=ActionKind.EV_SCHEDULE if asset == ActionAsset.EV else ActionKind.SET_PROFILE,
+            desired_state=desired_state,
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=None,
+            confidence=1.0,
+            requires_haeo_plan_id=None,
+        )
+
+    assert planner_module._carbon_action_score(action(ActionAsset.EV, {}), context) == 0.0
+    assert (
+        planner_module._carbon_action_score(
+            action(
+                ActionAsset.EV,
+                {
+                    "allocated_slots": [
+                        {
+                            "carbon_intensity_g_per_kwh": 100,
+                            "grid_import_used_kw": 0,
+                        }
+                    ]
+                },
+            ),
+            context,
+        )
+        == 1.0
+    )
+    assert (
+        planner_module._carbon_action_score(
+            action(
+                ActionAsset.EV,
+                {
+                    "allocated_slots": [
+                        {
+                            "carbon_intensity_g_per_kwh": 300,
+                            "grid_import_used_kw": 2,
+                        }
+                    ]
+                },
+            ),
+            context,
+        )
+        == 0.5
+    )
+
+    context.slots.append(
+        DecisionSlot(
+            context.created_at + timedelta(minutes=10),
+            0.2,
+            0.05,
+            0,
+            1,
+            carbon_intensity_g_per_kwh=100,
+        )
+    )
+    context.slots[0].carbon_intensity_g_per_kwh = None
+    assert planner_module._carbon_action_score(action(ActionAsset.ENPHASE, {}), context) == 0.0
+    context.slots[0].carbon_intensity_g_per_kwh = 500
+    context.slots[1].carbon_intensity_g_per_kwh = 100
+    assert (
+        planner_module._carbon_action_score(
+            action(ActionAsset.ENPHASE, {"arbitrage_direction": "consume"}), context
+        )
+        == 1.0
+    )
+    assert planner_module._carbon_action_score(action(ActionAsset.ENPHASE, {}), context) == 0.0
 
 
 def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None:
@@ -462,6 +641,90 @@ def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None
     context.input_health = InputHealth.DEGRADED
     assert DryRunPlanner(DEFAULT_OPTIONS)._confidence(context) == 0.65
     assert planner_module._display_text("   ") == "Unknown"
+
+
+def test_next_ready_by_uses_melbourne_standard_and_daylight_offsets() -> None:
+    winter_now = datetime(2026, 7, 11, 20, 30, tzinfo=UTC)  # 06:30 local (+10)
+    summer_now = datetime(2026, 1, 11, 19, 30, tzinfo=UTC)  # 06:30 local (+11)
+
+    assert _next_ready_by(winter_now, "07:00", "Australia/Melbourne") == datetime(
+        2026, 7, 11, 21, 0, tzinfo=UTC
+    )
+    assert _next_ready_by(summer_now, "07:00", "Australia/Melbourne") == datetime(
+        2026, 1, 11, 20, 0, tzinfo=UTC
+    )
+
+
+def test_ev_schedule_preserves_absolute_ready_by_timestamp() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": True,
+        "default_ready_by": "07:00",
+        "ev_fallback_target_soc_percent": 70,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 7, 11, 20, 30, tzinfo=UTC)
+    context.local_timezone = "Australia/Melbourne"
+    context.current_ev_soc_percent = 60
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.20,
+            export_price=0.05,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=1.0,
+        )
+        for offset in range(0, 60, 5)
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+    ev_action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+
+    assert ev_action.desired_state["ready_by_utc"] == "2026-07-11T21:00:00+00:00"
+    assert ev_action.desired_state["ready_by_timezone"] == "Australia/Melbourne"
+
+
+def test_next_ready_by_rolls_over_in_local_calendar_and_handles_dst_gap() -> None:
+    after_ready = datetime(2026, 7, 11, 22, 0, tzinfo=UTC)  # 08:00 local
+    before_spring_gap = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # 01:00 local
+
+    assert _next_ready_by(after_ready, "07:00", "Australia/Melbourne") == datetime(
+        2026, 7, 12, 21, 0, tzinfo=UTC
+    )
+    # 02:30 does not exist on this date, so the wall-clock deadline advances to 03:00.
+    assert _next_ready_by(before_spring_gap, "02:30", "Australia/Melbourne") == datetime(
+        2026, 10, 3, 16, 0, tzinfo=UTC
+    )
+    assert _next_ready_by(after_ready, "07:00", "Invalid/Timezone") == datetime(
+        2026, 7, 12, 7, 0, tzinfo=UTC
+    )
+
+
+def test_estimated_cost_reports_its_non_daily_horizon() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planning_horizon_hours": 6,
+        "planning_interval_minutes": 15,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.30,
+            export_price=0.05,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=1.0,
+        )
+        for offset in range(0, 6 * 60, 15)
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.horizon_hours == 6
+    assert plan.estimated_daily_cost == 1.8
+    assert plan.estimated_cost_horizon_hours == 6
 
 
 def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> None:
@@ -877,6 +1140,35 @@ def test_active_plan_suppresses_hvac_automation_during_expensive_period_when_com
     assert plan.actions[0].expected_cost_delta == 0.4
 
 
+def test_hvac_suppression_uses_two_hour_duration_at_non_default_interval() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "planning_interval_minutes": 30,
+        "hvac_suppression_min_price_delta": 0.20,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [(0, 0.60), (30, 0.55), (60, 0.55), (90, 0.55), (120, 0.10)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
+
+
 def test_active_plan_does_not_suppress_hvac_when_comfort_not_valid() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -1134,6 +1426,25 @@ def test_thermal_shift_helpers_cover_defensive_branches() -> None:
         max_slots=0,
         thermal_model={},
     ) == 0
+    assert planner_module._precondition_slot_count(
+        current_temperature=21,
+        target_temperature=23,
+        mode="heat",
+        interval_minutes=30,
+        max_slots=4,
+        thermal_model={},
+    ) == 4
+    assert planner_module._precondition_slot_count(
+        current_temperature=21,
+        target_temperature=22,
+        mode="heat",
+        interval_minutes=30,
+        max_slots=4,
+        thermal_model={
+            "enabled": True,
+            "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 1.0},
+        },
+    ) == 2
 
 
 def test_active_plan_uses_replayed_cold_thermal_samples_for_heat_preconditioning() -> None:
@@ -1270,6 +1581,36 @@ def test_active_plan_does_not_precondition_hvac_outside_lead_window() -> None:
     plan = DryRunPlanner(options).create_plan(context)
 
     assert plan.actions == []
+
+
+def test_hvac_precondition_lead_window_does_not_include_partial_next_slot() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "planning_interval_minutes": 15,
+        "hvac_precondition_lead_minutes": 10,
+        "hvac_precondition_min_price_delta": 0.20,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_temperature_c = 17.5
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [(0, 0.10), (15, 0.45), (30, 0.50)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
 
 
 def test_active_plan_prefers_haeo_export_value_for_enphase_arbitrage() -> None:

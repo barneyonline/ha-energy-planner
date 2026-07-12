@@ -51,6 +51,7 @@ from .const import (
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
+    CONF_CARBON_INTENSITY_FORECAST,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
@@ -151,6 +152,12 @@ _PRICE_SENSOR_UNITS = ("$/kWh", "AUD/kWh", "A$/kWh", "c/kWh", "¢/kWh", "cent/kW
 _POWER_SENSOR_UNITS = ("W", "kW", "MW")
 _FORECAST_SENSOR_UNITS = (*_POWER_SENSOR_UNITS, "Wh", "kWh", "MWh")
 _PERCENT_SENSOR_UNITS = ("%", "percent", "percentage")
+_CARBON_INTENSITY_SENSOR_UNITS = (
+    "gCO2/kWh",
+    "gCO₂/kWh",
+    "kgCO2/kWh",
+    "kgCO₂/kWh",
+)
 _EV_TARGET_SOC_FILTER = [
     {"domain": ["number", "input_number", "select", "input_select"]},
     {"domain": "sensor", "device_class": "battery", "unit_of_measurement": list(_PERCENT_SENSOR_UNITS)},
@@ -185,6 +192,9 @@ ENERGY_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
         vol.Required(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
         vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Optional(CONF_CARBON_INTENSITY_FORECAST): _entity_selector(
+            entity_filter=_sensor_filter(_CARBON_INTENSITY_SENSOR_UNITS)
+        ),
         vol.Optional(CONF_PV_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_BASELINE_LOAD_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Required(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
@@ -967,6 +977,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},
     CONF_BASELINE_LOAD_FORECAST: {"sensor"},
+    CONF_CARBON_INTENSITY_FORECAST: {"sensor"},
     CONF_PV_OBSERVED: {"sensor"},
     CONF_BASELINE_LOAD_OBSERVED: {"sensor"},
     CONF_BATTERY_SOC: {"sensor"},
@@ -1032,7 +1043,7 @@ def _validate_entity_unit(hass: HomeAssistant, entity_id: str, config_key: str) 
 
 
 def _normalize_unit(unit: str) -> str:
-    return unit.strip().lower().replace(" ", "").replace("aud", "$").replace("a$", "$")
+    return unit.strip().lower().replace(" ", "").replace("₂", "2").replace("aud", "$").replace("a$", "$")
 
 
 def _entity_values(value: Any) -> list[str]:
@@ -1111,12 +1122,14 @@ _ENERGY_UNITS = {
     "megawatthours",
 }
 _PERCENT_UNITS = {"%", "percent", "percentage"}
+_CARBON_INTENSITY_UNITS = {"gco2/kwh", "kgco2/kwh"}
 
 _ENTITY_UNIT_RULES = {
     CONF_AMBER_IMPORT_PRICE: _PRICE_UNITS,
     CONF_AMBER_EXPORT_PRICE: _PRICE_UNITS,
     CONF_PV_FORECAST: _POWER_UNITS | _ENERGY_UNITS,
     CONF_BASELINE_LOAD_FORECAST: _POWER_UNITS,
+    CONF_CARBON_INTENSITY_FORECAST: _CARBON_INTENSITY_UNITS,
     CONF_PV_OBSERVED: _POWER_UNITS,
     CONF_BASELINE_LOAD_OBSERVED: _POWER_UNITS,
     CONF_BATTERY_SOC: _PERCENT_UNITS,

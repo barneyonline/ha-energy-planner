@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.4.0 - 2026-07-12
+
+### Added
+
+- Optional grid carbon-intensity forecasts with carbon-aware EV slot allocation and action scoring.
+- Conservative PV lower bounds and load upper bounds learned independently per forecast lead time.
+- Refresh, HAEO latency/cache/capability, calibration, uncertainty, and cost-horizon telemetry.
+
+### Changed
+
+- EV ready-by deadlines now use the Home Assistant timezone, handle DST gaps/rollovers, and preserve an absolute UTC deadline.
+- HVAC lookahead and preconditioning windows now use elapsed time instead of assuming five-minute slots.
+- Forecast training retains dense near-term evidence and sparse samples across the full configured horizon.
+- HAEO calls detect response/flexible-load capabilities, skip unsupported second passes, cache equivalent short-lived solves, and fail closed on ambiguous native config entries.
+- Production preflight now requires only configured and enabled control areas, allowing safe partial installations.
+- Monetary forecasts use Home Assistant's configured currency and expose the actual priced horizon.
+
+### Fixed
+
+- Carbon priority no longer contributes an unconditional zero score.
+- Solar-flexibility and battery-safety decisions now use conservative learned forecast bounds while cost estimates retain expected values.
+
 ## 0.3.0 - 2026-07-12
 
 ### Added

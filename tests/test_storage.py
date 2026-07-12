@@ -250,6 +250,20 @@ def test_store_delay_save_without_mutations_does_not_write(monkeypatch: object) 
     assert FakeStore.save_count == 0
 
 
+def test_forecast_snapshot_retention_covers_day_ahead_training_at_five_minutes(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    store.data["forecast_snapshots"] = [{"index": index} for index in range(384)]
+
+    asyncio.run(store.async_add_forecast_snapshot({"index": 384}))
+
+    assert len(store.data["forecast_snapshots"]) == 384
+    assert store.data["forecast_snapshots"][0] == {"index": 1}
+    assert store.data["forecast_snapshots"][-1] == {"index": 384}
+
+
 def test_store_audit_entry_bounds_mapping_values(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.loaded = None

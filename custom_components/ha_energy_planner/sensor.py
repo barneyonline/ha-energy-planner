@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -24,6 +24,7 @@ from .const import (
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
+from .preflight import _control_area_report
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -54,26 +55,17 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         icon="mdi:clipboard-check-outline",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: "Unknown" if not coordinator.data else _display_state(coordinator.data.status),
-        attrs_fn=lambda coordinator: {}
-        if not coordinator.data
-        else to_jsonable(
-            {
-                "plan_id": coordinator.data.plan_id,
-                "created_at": coordinator.data.created_at.isoformat(),
-                "mode": coordinator.data.mode,
-                "health": coordinator.data.health,
-                "summary": coordinator.data.summary,
-                "issues": coordinator.data.input_issues[:20],
-                "preview": coordinator.data.preview[:12],
-            }
-        ),
+        attrs_fn=lambda coordinator: _plan_status_attrs(coordinator),
     ),
     PlannerSensorDescription(
         key="estimated_daily_cost",
         translation_key="estimated_daily_cost",
         icon="mdi:cash",
-        native_unit_of_measurement="AUD",
+        device_class=SensorDeviceClass.MONETARY,
         value_fn=lambda coordinator: None if not coordinator.data else coordinator.data.estimated_daily_cost,
+        attrs_fn=lambda coordinator: {}
+        if not coordinator.data
+        else {"cost_horizon_hours": coordinator.data.estimated_cost_horizon_hours},
     ),
     PlannerSensorDescription(
         key="forecast_confidence",
@@ -82,6 +74,7 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         native_unit_of_measurement="%",
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: None if not coordinator.data else round(coordinator.data.confidence * 100, 1),
+        attrs_fn=lambda coordinator: _forecast_calibration_attrs(coordinator),
     ),
     PlannerSensorDescription(
         key="confidence_breakdown",
@@ -318,9 +311,91 @@ class PlannerSensor(EnergyPlannerEntity, SensorEntity):
         return self.entity_description.value_fn(self.coordinator)
 
     @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Use Home Assistant's configured currency for monetary forecasts."""
+        if self.entity_description.key == "estimated_daily_cost":
+            config = getattr(getattr(self.coordinator, "hass", None), "config", None)
+            return getattr(config, "currency", None)
+        return self.entity_description.native_unit_of_measurement
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return state attributes."""
         return self.entity_description.attrs_fn(self.coordinator)
+
+
+def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Expose compact, bounded forecast learning and uncertainty telemetry."""
+    model = coordinator.store.data.get("forecast_calibration", {})
+    if not isinstance(model, dict):
+        return {"calibration_enabled": False, "fields": {}}
+    fields: dict[str, Any] = {}
+    for field in ("pv_forecast_kw", "baseline_load_forecast_kw"):
+        field_model = model.get(field, {})
+        if not isinstance(field_model, dict):
+            continue
+        buckets = field_model.get("buckets", {})
+        if not isinstance(buckets, dict):
+            buckets = {}
+        enabled = [
+            (lead, bucket)
+            for lead, bucket in buckets.items()
+            if isinstance(bucket, dict) and bucket.get("enabled")
+        ]
+        uncertainty_enabled = [
+            (lead, bucket)
+            for lead, bucket in buckets.items()
+            if isinstance(bucket, dict) and bucket.get("uncertainty_enabled")
+        ]
+        fields[field] = {
+            "sample_count": field_model.get("sample_count", 0),
+            "enabled_lead_buckets": len(enabled),
+            "uncertainty_enabled_lead_buckets": len(uncertainty_enabled),
+            "lead_buckets": {
+                str(lead): {
+                    "factor": bucket.get("factor"),
+                    "lower_factor": bucket.get("lower_factor"),
+                    "upper_factor": bucket.get("upper_factor"),
+                    "holdout_sample_count": bucket.get("holdout_sample_count"),
+                    "raw_abs_pct_error_sum": bucket.get("raw_abs_pct_error_sum"),
+                    "calibrated_abs_pct_error_sum": bucket.get("calibrated_abs_pct_error_sum"),
+                }
+                for lead, bucket in enabled[:12]
+            },
+        }
+    return {
+        "calibration_enabled": any(
+            item["enabled_lead_buckets"] or item["uncertainty_enabled_lead_buckets"]
+            for item in fields.values()
+        ),
+        "fields": fields,
+    }
+
+
+def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return plan status with bounded refresh and HAEO performance telemetry."""
+    if not coordinator.data:
+        return {}
+    latest_haeo = _latest_store_item(coordinator.store.data.get("haeo_runs"))
+    return to_jsonable(
+        {
+            "plan_id": coordinator.data.plan_id,
+            "created_at": coordinator.data.created_at.isoformat(),
+            "mode": coordinator.data.mode,
+            "health": coordinator.data.health,
+            "summary": coordinator.data.summary,
+            "issues": coordinator.data.input_issues[:20],
+            "preview": coordinator.data.preview[:12],
+            "refresh": getattr(coordinator, "last_refresh_metadata", None),
+            "haeo": latest_haeo,
+        }
+    )
+
+
+def _latest_store_item(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
+        return None
+    return value[-1]
 
 
 def _asset_plan_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
@@ -1094,6 +1169,9 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "climate": bool(coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
         "enphase": bool(coordinator.options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
     }
+    control_areas = _control_area_report(dict(coordinator.entry_data), coordinator.options)
+    required_areas = list(control_areas["required"])
+    required_configured = all(control_areas["details"][area]["configured"] for area in required_areas)
     dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
     return {
         "armed": bool(production.get("armed", False)),
@@ -1101,8 +1179,9 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
-        "ready_to_arm": dry_run_ready_cycles >= 3 and all(device_controls.values()),
+        "ready_to_arm": dry_run_ready_cycles >= 3 and bool(required_areas) and required_configured,
         "device_controls": device_controls,
+        "required_control_areas": required_areas,
         "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
     }
 

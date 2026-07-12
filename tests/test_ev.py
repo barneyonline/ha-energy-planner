@@ -106,6 +106,51 @@ def test_allocate_least_cost_charging_prefers_solar_surplus_effective_cost() -> 
     assert schedule.allocations[0].grid_import_used_kw == 0
 
 
+def test_allocate_charging_honors_carbon_priority_and_reports_emissions() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    slots = [
+        DecisionSlot(now, 0.10, 0.05, 0.0, 2.0, carbon_intensity_g_per_kwh=900),
+        DecisionSlot(
+            now + timedelta(minutes=30),
+            0.20,
+            0.05,
+            0.0,
+            2.0,
+            carbon_intensity_g_per_kwh=100,
+        ),
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=45,
+        ready_by=now + timedelta(hours=1),
+        charge_rate_kw=5,
+        soc_per_kwh=2,
+        interval_minutes=30,
+        carbon_weight=0.8,
+    )
+
+    assert schedule.allocations[0].valid_at == now + timedelta(minutes=30)
+    assert schedule.allocations[0].carbon_intensity_g_per_kwh == 100
+    assert schedule.allocations[0].estimated_carbon_g == 250
+
+
+def test_solar_surplus_uses_conservative_forecast_bounds() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    slot = DecisionSlot(
+        now,
+        0.20,
+        0.05,
+        8.0,
+        2.0,
+        pv_forecast_lower_kw=4.0,
+        baseline_load_forecast_upper_kw=3.0,
+    )
+
+    assert _solar_surplus_kw(slot) == 1.0
+
+
 def test_ev_solar_aware_cost_helpers_cover_fallbacks() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     zero_charge_slot = DecisionSlot(now, 0.25, 0.05, 6.0, 2.0)

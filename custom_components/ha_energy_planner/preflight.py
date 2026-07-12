@@ -10,13 +10,17 @@ from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_DAIKIN_CLIMATE,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_PROFILE,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_SMART_CHARGING,
+    CONF_EV_SMART_CHARGING_START,
+    CONF_EV_SMART_CHARGING_STOP,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
-    DEFAULT_HAEO_OPTIMIZE_SERVICE,
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
@@ -31,12 +35,13 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     """Return a redacted readiness report without calling device services."""
     entry_data = combined_entry_data(coordinator.entry)
     options = coordinator.options
+    control_areas = _control_area_report(entry_data, options)
     discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
-    entity_report = _entity_report(hass, entry_data)
-    service_report = _service_report(hass, entry_data)
+    entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
+    service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
     safety = _safety_report(options)
-    production = _production_report(coordinator.store.data, options)
+    production = _production_report(coordinator.store.data, options, control_areas)
     audit = _audit_report(coordinator.store.data)
 
     blocking = [
@@ -77,6 +82,12 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             ),
         },
         {
+            "check": "required_control_areas_supported",
+            "ok": all(bool(discovery[area]["supported"]) for area in control_areas["required"]),
+            "blocking": True,
+            "message": _control_area_message(control_areas, discovery),
+        },
+        {
             "check": "recorder_available",
             "ok": recorder["available"],
             "blocking": False,
@@ -106,7 +117,8 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     ]
     active_control_ready = (
         not blocking
-        and all(bool(discovery[area]["supported"]) for area in ("haeo", "ev", "hvac", "enphase"))
+        and bool(control_areas["required"])
+        and all(bool(discovery[area]["supported"]) for area in control_areas["required"])
         and production["armed"]
         and production["device_controls_enabled"]
     )
@@ -119,6 +131,7 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
         "entities": entity_report,
         "services": service_report,
         "recorder": recorder,
+        "control_areas": control_areas,
         "discovery": discovery,
         "audit": audit,
     }
@@ -139,17 +152,15 @@ def _availability_message(success_message: str, *, missing: list[str], unavailab
 def _production_gate_message(production: dict[str, Any]) -> str:
     """Return a concise production gate readiness message."""
     if production["ready_to_arm"]:
-        return "Production gate has enough dry-run evidence and all device controls are explicitly enabled."
+        return "Production gate has enough dry-run evidence and the configured control areas are explicitly enabled."
 
     details: list[str] = []
     dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
     if dry_run_ready_cycles < 3:
         details.append(f"{dry_run_ready_cycles}/3 healthy dry-run cycles recorded")
-    disabled_controls = [
-        name for name, enabled in dict(production.get("device_controls", {})).items() if not bool(enabled)
-    ]
-    if disabled_controls:
-        details.append(f"device controls disabled: {_bounded_join(disabled_controls)}")
+    required_areas = list(production.get("required_control_areas", []))
+    if "required_control_areas" in production and not required_areas:
+        details.append("no configured control areas are enabled")
     if not details:
         return "Production gate is not ready to arm yet."
     return f"Production gate is not ready to arm yet; {'; '.join(details)}."
@@ -163,8 +174,13 @@ def _bounded_join(values: list[str], *, limit: int = 5) -> str:
     return ", ".join(visible)
 
 
-def _entity_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str, Any]:
-    configured = _configured_entities(entry_data)
+def _entity_report(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    *,
+    required_areas: list[str] | None = None,
+) -> dict[str, Any]:
+    configured = _configured_entities(entry_data, required_areas=required_areas)
     missing: list[str] = []
     unavailable: list[str] = []
     for entity_id in configured:
@@ -190,8 +206,13 @@ def _entity_unavailable(entity_id: str, state_value: Any) -> bool:
     return state in {"unknown", "unavailable"}
 
 
-def _service_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str, Any]:
-    configured = _configured_services(entry_data)
+def _service_report(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    *,
+    required_areas: list[str] | None = None,
+) -> dict[str, Any]:
+    configured = _configured_services(entry_data, required_areas=required_areas)
     missing: list[str] = []
     unavailable: list[str] = []
     for service_name in configured:
@@ -209,10 +230,14 @@ def _service_report(hass: HomeAssistant, entry_data: dict[str, Any]) -> dict[str
     }
 
 
-def _configured_services(entry_data: dict[str, Any]) -> list[str]:
-    configured = [str(entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) or DEFAULT_HAEO_OPTIMIZE_SERVICE)]
+def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str] | None = None) -> list[str]:
+    configured: list[str] = []
+    if entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) and (required_areas is None or "haeo" in required_areas):
+        configured.append(str(entry_data[CONF_HAEO_OPTIMIZE_SERVICE]))
     configured.extend(
-        str(entry_data[key]) for key in _SERVICE_KEYS if key != CONF_HAEO_OPTIMIZE_SERVICE and entry_data.get(key)
+        str(entry_data[key])
+        for key in _SERVICE_KEYS
+        if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
     )
     return configured
 
@@ -235,7 +260,11 @@ def _safety_report(options: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _production_report(store_data: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+def _production_report(
+    store_data: dict[str, Any],
+    options: dict[str, Any],
+    control_areas: dict[str, Any],
+) -> dict[str, Any]:
     """Return production readiness state."""
     production = dict(store_data.get("production", {}))
     pause = dict(store_data.get("control_pause", {}))
@@ -244,6 +273,7 @@ def _production_report(store_data: dict[str, Any], options: dict[str, Any]) -> d
         "climate": bool(options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
         "enphase": bool(options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
     }
+    required_control_areas = list(control_areas.get("required", []))
     dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
     return {
         "armed": bool(production.get("armed", False)),
@@ -251,11 +281,60 @@ def _production_report(store_data: dict[str, Any], options: dict[str, Any]) -> d
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
-        "ready_to_arm": dry_run_ready_cycles >= 3 and all(device_controls.values()),
+        "ready_to_arm": dry_run_ready_cycles >= 3 and bool(required_control_areas),
         "device_controls": device_controls,
-        "device_controls_enabled": all(device_controls.values()),
+        "device_controls_enabled": bool(required_control_areas),
+        "required_control_areas": required_control_areas,
         "pause": pause,
     }
+
+
+def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
+    """Return configured, enabled, and required control surfaces."""
+    configured = {
+        "haeo": bool(str(entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE, "") or "").strip()),
+        "ev": any(
+            bool(str(entry_data.get(key, "") or "").strip())
+            for key in (CONF_EV_SMART_CHARGING, CONF_EV_SMART_CHARGING_START, CONF_EV_SMART_CHARGING_STOP)
+        ),
+        "hvac": bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
+        "enphase": bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
+    }
+    enabled = {
+        "haeo": bool(options.get(CONF_PLANNER_ENABLED, False)),
+        "ev": bool(options.get(CONF_EV_CONTROL_ENABLED, False)),
+        "hvac": bool(options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
+        "enphase": bool(options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
+    }
+    required = [
+        area
+        for area in ("haeo", "ev", "hvac", "enphase")
+        if enabled[area] and (area != "haeo" or configured[area])
+    ]
+    return {
+        "configured": [area for area, value in configured.items() if value],
+        "enabled": [area for area, value in enabled.items() if value],
+        "required": required,
+        "details": {
+            area: {
+                "configured": configured[area],
+                "enabled": enabled[area],
+                "required": area in required,
+            }
+            for area in ("haeo", "ev", "hvac", "enphase")
+        },
+    }
+
+
+def _control_area_message(control_areas: dict[str, Any], discovery: dict[str, Any]) -> str:
+    """Return a concise capability message for required control areas."""
+    required = list(control_areas.get("required", []))
+    if not required:
+        return "No configured control areas are enabled; capability discovery is advisory."
+    unsupported = [area for area in required if not bool(discovery[area]["supported"])]
+    if not unsupported:
+        return f"Required control areas are supported: {_bounded_join(required)}."
+    return f"Required control areas are unsupported: {_bounded_join(unsupported)}."
 
 
 def _audit_report(store_data: dict[str, Any]) -> dict[str, Any]:
@@ -268,12 +347,30 @@ def _audit_report(store_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _configured_entities(entry_data: dict[str, Any]) -> list[str]:
+def _configured_entities(
+    entry_data: dict[str, Any],
+    *,
+    required_areas: list[str] | None = None,
+) -> list[str]:
     entity_ids: set[str] = set()
     for key, value in entry_data.items():
+        control_area = _entity_control_area(key)
+        if required_areas is not None and control_area is not None and control_area not in required_areas:
+            continue
         if key.endswith("_entity") or key in {CONF_CLIMATE_AUTOMATIONS, CONF_PERSON_ENTITIES}:
             entity_ids.update(_split_entities(value))
     return sorted(entity_ids)
+
+
+def _entity_control_area(config_key: str) -> str | None:
+    """Return the optional device-control area owning an entity mapping."""
+    if config_key.startswith("ev_"):
+        return "ev"
+    if config_key.startswith(("daikin_", "climate_", "weather_")):
+        return "hvac"
+    if config_key.startswith("enphase_"):
+        return "enphase"
+    return None
 
 
 def _split_entities(value: Any) -> list[str]:

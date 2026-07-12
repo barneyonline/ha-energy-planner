@@ -501,4 +501,6 @@ def test_scalar_normalization_passthroughs_and_energy_units() -> None:
     assert normalize_scalar_value(25, value_kind="temperature", unit="C") == 25
     assert normalize_scalar_value(12, value_kind="price", unit="c/kWh") == 0.12
     assert normalize_scalar_value(2, value_kind="power", value_key="energy", unit="kWh") == 2
+    assert normalize_scalar_value(0.42, value_kind="carbon_intensity", unit="kgCO₂/kWh") == 420
+    assert normalize_scalar_value(420, value_kind="carbon_intensity", unit="gCO2/kWh") == 420
     assert normalize_scalar_value(7, value_kind="other") == 7

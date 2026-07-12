@@ -228,6 +228,7 @@ def test_run_preflight_reports_missing_configured_entities_and_services() -> Non
     coordinator = _coordinator()
     coordinator.entry.data["ev_smart_charging_stop_entity"] = "input_boolean.missing_stop"
     coordinator.entry.data["haeo_optimize_service"] = "haeo.missing"
+    coordinator.entry.options["planner_enabled"] = True
     hass = FakeHass(coordinator)
     asyncio.run(async_setup(hass, {}))
 
@@ -278,9 +279,132 @@ def test_run_preflight_reports_production_gate_reasons() -> None:
     assert response["ok"] is False
     assert checks["production_gate_ready"]["ok"] is False
     assert "1/3 healthy dry-run cycles" in checks["production_gate_ready"]["message"]
-    assert "ev" in checks["production_gate_ready"]["message"]
     assert checks["production_control_armed"]["ok"] is False
     assert "has not been armed" in checks["production_control_armed"]["message"]
+
+
+def test_run_preflight_supports_ev_only_control() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+        },
+        ev_control_enabled=True,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["control_areas"]["required"] == ["ev"]
+    assert response["production"]["required_control_areas"] == ["ev"]
+    assert response["discovery"]["hvac"]["supported"] is False
+    assert response["discovery"]["enphase"]["supported"] is False
+
+
+def test_run_preflight_supports_enphase_only_control() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "enphase_profile_entity": "select.enphase_profile",
+            "enphase_ai_profile": "AI Optimisation",
+        },
+        enphase_control_enabled=True,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["control_areas"]["required"] == ["enphase"]
+    assert response["services"]["missing"] == []
+
+
+def test_run_preflight_supports_hvac_only_control() -> None:
+    coordinator = _partial_coordinator(
+        {"daikin_climate_entity": "climate.daikin"},
+        climate_control_enabled=True,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["control_areas"]["required"] == ["hvac"]
+    assert response["production"]["ready_to_arm"] is True
+
+
+def test_run_preflight_blocks_enabled_but_unconfigured_control() -> None:
+    response = _run_preflight(_partial_coordinator({}, ev_control_enabled=True))
+
+    assert response["ok"] is False
+    assert response["control_areas"]["required"] == ["ev"]
+    assert response["control_areas"]["details"]["ev"]["configured"] is False
+    assert response["discovery"]["ev"]["supported"] is False
+
+
+def test_run_preflight_ignores_entities_for_disabled_control_areas() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "daikin_climate_entity": "climate.missing",
+        },
+        ev_control_enabled=True,
+        climate_control_enabled=False,
+    )
+
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["control_areas"]["required"] == ["ev"]
+    assert "climate.missing" not in response["entities"]["configured"]
+    assert response["entities"]["missing"] == []
+
+
+def test_run_preflight_no_control_dry_run_treats_discovery_as_advisory() -> None:
+    coordinator = _partial_coordinator(
+        {"haeo_optimize_service": "haeo.missing"},
+        planner_enabled=False,
+        dry_run=True,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is False
+    assert response["control_areas"]["configured"] == ["haeo"]
+    assert response["control_areas"]["required"] == []
+    assert response["services"]["configured"] == []
+    assert response["production"]["ready_to_arm"] is False
+    checks = {check["check"]: check for check in response["checks"]}
+    assert checks["required_control_areas_supported"]["ok"] is True
+    assert "advisory" in checks["required_control_areas_supported"]["message"]
+
+
+def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "daikin_climate_entity": "climate.missing",
+        },
+        ev_control_enabled=True,
+        climate_control_enabled=True,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is False
+    assert response["control_areas"]["required"] == ["ev", "hvac"]
+    assert response["discovery"]["ev"]["supported"] is True
+    assert response["discovery"]["hvac"]["supported"] is False
+    checks = {check["check"]: check for check in response["checks"]}
+    assert checks["required_control_areas_supported"]["ok"] is False
+    assert "hvac" in checks["required_control_areas_supported"]["message"]
+
+
+def test_run_preflight_requires_configured_haeo_for_enabled_planning() -> None:
+    coordinator = _partial_coordinator(
+        {"haeo_optimize_service": "haeo.optimize"},
+        planner_enabled=True,
+        dry_run=False,
+    )
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["control_areas"]["required"] == ["haeo"]
+    assert response["services"]["configured"] == ["haeo.optimize"]
 
 
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
@@ -421,3 +545,24 @@ def _coordinator() -> EnergyPlannerCoordinator:
     coordinator.async_pause_control = pause
     coordinator.async_resume_control = resume
     return coordinator
+
+
+def _partial_coordinator(data: dict[str, Any], **options: Any) -> EnergyPlannerCoordinator:
+    """Return an armed coordinator with only the requested control surfaces."""
+    coordinator = _coordinator()
+    coordinator.entry.data = dict(data)
+    coordinator.entry.options = {
+        "ev_control_enabled": False,
+        "climate_control_enabled": False,
+        "enphase_control_enabled": False,
+        **options,
+    }
+    return coordinator
+
+
+def _run_preflight(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Register and invoke the preflight service for a coordinator."""
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    return asyncio.run(handler(FakeCall({})))

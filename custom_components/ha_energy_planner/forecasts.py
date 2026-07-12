@@ -183,6 +183,8 @@ def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = ""
         return _normalize_price_value(value, unit)
     if value_kind == "power":
         return _normalize_power_value(value, value_key=value_key, unit=unit)
+    if value_kind == "carbon_intensity":
+        return _normalize_carbon_intensity_value(value, unit)
     return value
 
 
@@ -406,6 +408,14 @@ def _normalize_temperature_value(value: float, unit: str) -> float:
     unit_lower = _normalize_unit(unit)
     if unit_lower in {"f", "°f", "fahrenheit"}:
         return round((value - 32) * 5 / 9, 4)
+    return value
+
+
+def _normalize_carbon_intensity_value(value: float, unit: str) -> float:
+    """Normalize grid carbon intensity to grams CO2 equivalent per kWh."""
+    unit_lower = _normalize_unit(unit).replace("₂", "2")
+    if unit_lower.startswith("kgco2/"):
+        return value * 1000
     return value
 
 
