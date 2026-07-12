@@ -17,6 +17,7 @@ from .const import (
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
+    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
 )
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
@@ -431,6 +432,12 @@ class Executor:
 
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         """Create persistent notifications for major plan fallback classes."""
+        if not strict_bool(
+            self.options.get(CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED),
+            default=True,
+        ):
+            await self._async_dismiss_notifications(_PLAN_FALLBACK_NOTIFICATION_IDS)
+            return
         clean_violations = _clean_reason_codes(violations)
         grid_violations = [
             code for code in clean_violations if code in {"grid_import_limit_exceeded", "grid_export_limit_exceeded"}
