@@ -15,6 +15,7 @@ from custom_components.ha_energy_planner.forecasts import (
     forecast_coverage_details,
     forecast_coverage_ratio,
     forecast_series_from_state,
+    forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
 )
@@ -193,6 +194,27 @@ def test_latest_forecast_valid_at_skips_values_without_timestamps_and_normalizes
         state,
         value_keys=("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
     ) == datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+
+
+def test_forecast_timestamp_status_distinguishes_aware_naive_and_ordered_payloads() -> None:
+    keys = ("power", "value")
+
+    assert forecast_timestamp_status_from_state(
+        FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00+10:00", "power": 1.0}]}),
+        value_keys=keys,
+    ) == "aware_timestamps"
+    assert forecast_timestamp_status_from_state(
+        FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00", "power": 1.0}]}),
+        value_keys=keys,
+    ) == "naive_timestamps"
+    assert forecast_timestamp_status_from_state(
+        FakeState("0", {"forecast": [1.0, 2.0]}),
+        value_keys=keys,
+    ) == "untimestamped"
+    assert forecast_timestamp_status_from_state(
+        FakeState("0", {"forecast": [{"period_start": "bad", "power": 1.0}]}),
+        value_keys=keys,
+    ) == "untimestamped"
 
 
 def test_forecast_series_converts_solcast_wh_energy_buckets_to_average_kw() -> None:

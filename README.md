@@ -123,7 +123,9 @@ Energy Planner can be useful with different source integrations, but the current
 
 For Amber-backed planning, start with the 12-hour default. Energy Planner reports each source's first and last timestamps, covered and continuous hours, and leading, internal, and trailing gaps. A degraded 8-to-under-12-hour window remains visible but does not produce eligible device actions under the existing healthy-input action gate.
 
-For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Timestamped values are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. A baseline-load forecast may conservatively fill up to one hour of missing leading slots from its current numeric state; this is reported explicitly and reduces source confidence.
+Required Amber, PV, and baseline-load inputs must expose forecast series; a numeric current value is retained only for the current slot and cannot satisfy forecast coverage.
+
+For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Secondary values must have timezone-aware timestamps and are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. Until per-slot provenance is retained, secondary PV slots are deliberately excluded from forecast calibration. A baseline-load forecast may conservatively fill up to one hour of missing leading slots from its current numeric state; this is reported explicitly and reduces source confidence.
 
 ## Safety model
 

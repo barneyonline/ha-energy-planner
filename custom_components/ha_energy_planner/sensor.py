@@ -1184,6 +1184,10 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
         )
     if source_kind == "point_value_repeated":
         return "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
+    if source_kind == "point_value_only":
+        return (
+            "Only a current point value was found; required forecast coverage is unavailable and planning fails closed."
+        )
     if source_kind == "invalid_state":
         return "The entity state could not be converted into usable forecast data."
     return "Confidence source was not classified."

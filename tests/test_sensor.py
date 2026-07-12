@@ -312,6 +312,7 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
     assert "stitched" in sensor_module._confidence_source_reason({"source": "forecast_series_stitched"})
     assert "leading load gap" in sensor_module._confidence_source_reason({"source": "forecast_series_leading_fill"})
     assert "shorter" in sensor_module._confidence_source_reason({"source": "forecast_series_partial"})
+    assert "fails closed" in sensor_module._confidence_source_reason({"source": "point_value_only"})
     assert sensor_module._confidence_limiting_factor(0.0, 0.0, 0.0) == "unsafe_inputs"
     assert sensor_module._confidence_limiting_factor(0.65, 0.65, None) == "input_health"
     assert sensor_module._confidence_limiting_factor(1.0, 1.0, None) == "unknown"

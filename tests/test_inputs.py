@@ -241,8 +241,9 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     assert [slot.pv_forecast_kw for slot in context.slots] == [0.5, 1.0, None, None]
     assert context.input_health == InputHealth.UNSAFE
     assert "pv_forecast_entity_incomplete_horizon" in context.input_issues
-    assert context.forecast_confidence == 0.5
-    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.2, 1.2, 1.2, 1.2]
+    assert context.forecast_confidence == 0.175
+    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.2, None, None, None]
+    assert "baseline_load_forecast_entity_incomplete_horizon" in context.input_issues
     assert context.current_enphase_profile == "AI Optimisation"
     assert context.enphase_ai_profile == "AI Optimisation"
     assert context.enphase_self_consumption_profile == "Self-Consumption"
@@ -325,6 +326,58 @@ def test_required_forecast_under_eight_hours_remains_unsafe() -> None:
     assert manager.forecast_coverage_details[-1]["classification"] == "unsafe"
 
 
+@pytest.mark.parametrize(
+    ("config_key", "value_keys", "value_kind"),
+    [
+        (CONF_AMBER_IMPORT_PRICE, ("price", "value"), "price"),
+        (CONF_AMBER_EXPORT_PRICE, ("price", "value"), "price"),
+        (CONF_PV_FORECAST, ("power", "value"), "power"),
+        (CONF_BASELINE_LOAD_FORECAST, ("load_kw", "value"), "power"),
+    ],
+)
+def test_required_point_values_do_not_bypass_forecast_coverage(
+    config_key: str,
+    value_keys: tuple[str, ...],
+    value_kind: str,
+) -> None:
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
+    manager = InputManager(
+        FakeHass({"sensor.point": FakeState("2.0", last_updated=now)}),
+        {config_key: "sensor.point"},
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 12, "planning_interval_minutes": 60},
+    )
+
+    series, issue = manager._required_series(config_key, value_keys, value_kind, now, 12, 60)
+
+    assert series == [2.0, *([None] * 11)]
+    assert issue == f"{config_key}_incomplete_horizon"
+    assert manager.forecast_confidence_details[-1]["source"] == "point_value_only"
+    assert manager.forecast_coverage_details[-1]["classification"] == "unsafe"
+    assert manager.forecast_coverage_details[-1]["covered_hours"] == 1
+
+
+def test_optional_carbon_point_value_retains_legacy_repeated_fallback() -> None:
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
+    manager = InputManager(
+        FakeHass({"sensor.carbon": FakeState("450", last_updated=now)}),
+        {CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon"},
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 2, "planning_interval_minutes": 60},
+    )
+
+    series, issue = manager._required_series(
+        CONF_CARBON_INTENSITY_FORECAST,
+        ("carbon_intensity", "value"),
+        "carbon_intensity",
+        now,
+        2,
+        60,
+    )
+
+    assert issue is None
+    assert series == [450.0, 450.0]
+    assert manager.forecast_confidence_details[-1]["source"] == "point_value_repeated"
+
+
 def test_pv_today_and_tomorrow_are_stitched_across_dst_boundary() -> None:
     now = datetime(2026, 10, 3, 14, 0, tzinfo=UTC)
     manager = InputManager(
@@ -339,6 +392,7 @@ def test_pv_today_and_tomorrow_are_stitched_across_dst_boundary() -> None:
                             {"period_start": "2026-10-04T01:00:00+10:00", "pv_estimate": 2.0},
                         ],
                     },
+                    last_updated=now - timedelta(hours=2),
                 ),
                 "sensor.pv_tomorrow": FakeState(
                     "0",
@@ -349,6 +403,7 @@ def test_pv_today_and_tomorrow_are_stitched_across_dst_boundary() -> None:
                             {"period_start": "2026-10-04T04:00:00+11:00", "pv_estimate": 4.0},
                         ],
                     },
+                    last_updated=now - timedelta(hours=1),
                 ),
             },
             time_zone="Australia/Melbourne",
@@ -376,6 +431,131 @@ def test_pv_today_and_tomorrow_are_stitched_across_dst_boundary() -> None:
     details = manager.forecast_coverage_details[-1]
     assert details["source_count"] == 2
     assert details["continuous_hours"] == 4
+    assert manager._raw_forecast_series["pv_forecast_kw"] == [1.0, 2.0, None, None]
+    assert manager._forecast_source_issued_at["pv_forecast_kw"] == now - timedelta(hours=2)
+
+
+@pytest.mark.parametrize(
+    ("secondary_attributes", "expected_status"),
+    [
+        ({"forecast": [3.0, 4.0]}, "untimestamped"),
+        (
+            {
+                "forecast": [
+                    {"period_start": "2026-07-12T02:00:00", "power": 3.0},
+                    {"period_start": "2026-07-12T03:00:00", "power": 4.0},
+                ]
+            },
+            "naive_timestamps",
+        ),
+    ],
+)
+def test_secondary_pv_requires_timezone_aware_timestamps(
+    secondary_attributes: dict[str, Any],
+    expected_status: str,
+) -> None:
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
+    manager = InputManager(
+        FakeHass(
+            {
+                "sensor.primary": FakeState(
+                    "1.0",
+                    {
+                        "forecast": [
+                            {"period_start": "2026-07-12T00:00:00+00:00", "power": 1.0},
+                            {"period_start": "2026-07-12T01:00:00+00:00", "power": 2.0},
+                        ]
+                    },
+                    last_updated=now,
+                ),
+                "sensor.secondary": FakeState("3.0", secondary_attributes, last_updated=now),
+            }
+        ),
+        {
+            CONF_PV_FORECAST: "sensor.primary",
+            CONF_PV_FORECAST_SECONDARY: "sensor.secondary",
+        },
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 4, "planning_interval_minutes": 60},
+    )
+
+    series, issue = manager._required_series(
+        CONF_PV_FORECAST,
+        ("power", "value"),
+        "power",
+        now,
+        4,
+        60,
+        secondary_config_key=CONF_PV_FORECAST_SECONDARY,
+    )
+
+    assert series == [1.0, 2.0, None, None]
+    assert issue == "pv_forecast_entity_incomplete_horizon"
+    assert manager.forecast_coverage_details[0]["classification"] == expected_status
+
+
+def test_secondary_pv_slots_are_excluded_from_primary_calibration() -> None:
+    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
+    calibration = {
+        "pv_forecast_kw": {
+            "model_version": 3,
+            "buckets": {
+                str(index): {
+                    "enabled": True,
+                    "uncertainty_enabled": True,
+                    "factor": 0.8,
+                    "lower_factor": 0.7,
+                }
+                for index in range(8)
+            },
+        }
+    }
+    manager = InputManager(
+        FakeHass(
+            {
+                "sensor.primary": FakeState(
+                    "1.0",
+                    {
+                        "forecast": [
+                            {"period_start": "2026-07-12T00:00:00+00:00", "power": 1.0},
+                            {"period_start": "2026-07-12T01:00:00+00:00", "power": 2.0},
+                        ]
+                    },
+                    last_updated=now,
+                ),
+                "sensor.secondary": FakeState(
+                    "3.0",
+                    {
+                        "forecast": [
+                            {"period_start": "2026-07-12T02:00:00+00:00", "power": 3.0},
+                            {"period_start": "2026-07-12T03:00:00+00:00", "power": 4.0},
+                        ]
+                    },
+                    last_updated=now,
+                ),
+            }
+        ),
+        {
+            CONF_PV_FORECAST: "sensor.primary",
+            CONF_PV_FORECAST_SECONDARY: "sensor.secondary",
+        },
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 4, "planning_interval_minutes": 60},
+        forecast_calibration=calibration,
+    )
+
+    series, issue = manager._required_series(
+        CONF_PV_FORECAST,
+        ("power", "value"),
+        "power",
+        now,
+        4,
+        60,
+        secondary_config_key=CONF_PV_FORECAST_SECONDARY,
+    )
+
+    assert issue is None
+    assert series == [0.8, 1.6, 3.0, 4.0]
+    assert manager._conservative_forecast_series["pv_forecast_kw"] == [0.7, 1.4, 3.0, 4.0]
+    assert manager._raw_forecast_series["pv_forecast_kw"] == [1.0, 2.0, None, None]
 
 
 @pytest.mark.parametrize(("state", "status"), [(None, "unavailable"), ("stale", "stale")])
@@ -504,10 +684,10 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     }
     hass = FakeHass(
         {
-            "sensor.import": FakeState("0.20"),
-            "sensor.export": FakeState("0.05"),
-            "sensor.pv": FakeState("1.0"),
-            "sensor.load": FakeState("2.0"),
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
             "sensor.battery": FakeState("55"),
             "sensor.ev_soc": FakeState("72"),
             "binary_sensor.ev_connected": FakeState("on"),
@@ -658,8 +838,9 @@ def test_input_manager_converts_cent_price_point_sensors_to_dollars() -> None:
 
     context = InputManager(hass, entry_data, options).build_context()
 
-    assert [slot.import_price for slot in context.slots] == [0.12, 0.12, 0.12, 0.12]
-    assert [slot.export_price for slot in context.slots] == [0.05, 0.05, 0.05, 0.05]
+    assert [slot.import_price for slot in context.slots] == [0.12, None, None, None]
+    assert [slot.export_price for slot in context.slots] == [0.05, None, None, None]
+    assert context.input_health == InputHealth.UNSAFE
 
 
 def test_input_manager_normalizes_optional_power_point_sensors() -> None:
@@ -712,10 +893,10 @@ def test_input_manager_accepts_mini_like_ev_connected_state() -> None:
     }
     hass = FakeHass(
         {
-            "sensor.import": FakeState("0.20"),
-            "sensor.export": FakeState("0.05"),
-            "sensor.pv": FakeState("1.0"),
-            "sensor.load": FakeState("2.0"),
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
             "sensor.battery": FakeState("55"),
             "sensor.ev_connection": FakeState("connected_not_charging"),
             "person.james": FakeState("home"),
@@ -741,10 +922,10 @@ def test_input_manager_converts_weather_current_temperature_from_fahrenheit() ->
     }
     hass = FakeHass(
         {
-            "sensor.import": FakeState("0.20"),
-            "sensor.export": FakeState("0.05"),
-            "sensor.pv": FakeState("1.0"),
-            "sensor.load": FakeState("2.0"),
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
             "sensor.battery": FakeState("55"),
             "weather.home": FakeState(
                 "sunny",
@@ -778,10 +959,10 @@ def test_input_manager_parses_camel_case_current_weather_temperature() -> None:
     }
     hass = FakeHass(
         {
-            "sensor.import": FakeState("0.20"),
-            "sensor.export": FakeState("0.05"),
-            "sensor.pv": FakeState("1.0"),
-            "sensor.load": FakeState("2.0"),
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
             "sensor.battery": FakeState("55"),
             "weather.home": FakeState(
                 "sunny",
