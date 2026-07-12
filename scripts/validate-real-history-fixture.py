@@ -314,7 +314,7 @@ def _thermal_samples(fixture: dict[str, Any]) -> list[dict[str, Any]]:
     for item in histories.get(indoor_key, []):
         state = _state_from_item(item)
         value = _attribute_or_state(state, indoor_attribute)
-        events.append((state.last_changed, "indoor_temperature_c", value))
+        events.append((state.last_changed, "indoor_sample", (state.state, value)))
     for item in histories.get(power_key, []):
         state = _state_from_item(item)
         events.append((state.last_changed, "hvac_power_kw", state.state))
@@ -326,13 +326,16 @@ def _thermal_samples(fixture: dict[str, Any]) -> list[dict[str, Any]]:
     latest: dict[str, Any] = {}
     samples: list[dict[str, Any]] = []
     for timestamp, key, value in sorted(events, key=lambda event: event[0]):
-        latest[key] = value
+        if key == "indoor_sample":
+            latest["hvac_mode"], latest["indoor_temperature_c"] = value
+        else:
+            latest[key] = value
         if "indoor_temperature_c" not in latest or "hvac_power_kw" not in latest:
             continue
         samples.append(
             {
                 "sampled_at": timestamp.isoformat(),
-                "hvac_mode": fixture.get("hvac_mode"),
+                "hvac_mode": latest.get("hvac_mode", fixture.get("hvac_mode")),
                 "indoor_temperature_c": latest.get("indoor_temperature_c"),
                 "outdoor_temperature_c": latest.get("outdoor_temperature_c"),
                 "hvac_power_kw": latest.get("hvac_power_kw"),

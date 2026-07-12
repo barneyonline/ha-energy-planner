@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from custom_components.ha_energy_planner import async_setup
@@ -27,6 +27,7 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
 from custom_components.ha_energy_planner.models import EnergyPlan, InputHealth, PlannerMode
+from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
 
 @dataclass(slots=True)
@@ -448,6 +449,39 @@ def test_run_preflight_accepts_full_configured_horizon_when_shorter_than_eight_h
     assert response["current_plan"]["required_optimization_horizon_hours"] == 4.0
 
 
+def test_run_preflight_rejects_stale_or_unconfirmed_plan() -> None:
+    coordinator = _coordinator()
+    coordinator.data.created_at -= timedelta(hours=1)
+    stale = _run_preflight(coordinator)
+    coordinator = _coordinator()
+    coordinator.last_refresh_metadata["succeeded"] = False
+    failed = _run_preflight(coordinator)
+
+    assert stale["safe_to_activate_now"] is False
+    assert stale["current_plan"]["fresh"] is False
+    assert failed["safe_to_activate_now"] is False
+    assert failed["current_plan"]["last_refresh_succeeded"] is False
+
+
+def test_run_preflight_rejects_active_pause_and_changed_control_contract() -> None:
+    coordinator = _coordinator()
+    coordinator.store.data["control_pause"] = {
+        "active": True,
+        "until": datetime.now(UTC) + timedelta(minutes=10),
+        "assets": ["ev"],
+    }
+    paused = _run_preflight(coordinator)
+    coordinator = _coordinator()
+    coordinator.entry.options["climate_control_enabled"] = False
+    changed = _run_preflight(coordinator)
+
+    assert paused["safe_to_activate_now"] is False
+    assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is False
+    assert changed["production"]["dry_run_evidence_complete"] is False
+    checks = {item["check"]: item for item in changed["checks"]}
+    assert checks["production_gate_ready"]["deprecated_alias_for"] == "dry_run_evidence_complete"
+
+
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
     coordinator = _coordinator()
     hass = FakeHass(coordinator)
@@ -495,6 +529,7 @@ def test_pause_control_schema_validates_asset_duration_and_reason() -> None:
 
 
 def _coordinator() -> EnergyPlannerCoordinator:
+    now = datetime.now(UTC)
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.awaited = []
     coordinator.entry = type(
@@ -529,7 +564,7 @@ def _coordinator() -> EnergyPlannerCoordinator:
     coordinator.entry.runtime_data = coordinator
     coordinator.data = EnergyPlan(
         plan_id="current-plan",
-        created_at=datetime(2026, 6, 27, tzinfo=UTC),
+        created_at=now,
         horizon_hours=12,
         interval_minutes=5,
         status="current",
@@ -566,6 +601,15 @@ def _coordinator() -> EnergyPlannerCoordinator:
             }
         },
     )()
+    coordinator.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+        coordinator.entry.data,
+        coordinator.options,
+    )
+    coordinator.last_refresh_metadata = {
+        "succeeded": True,
+        "completed_at": now,
+        "duration_ms": 10.0,
+    }
 
     async def replan() -> None:
         coordinator.awaited.append(("replan", None))
@@ -612,6 +656,10 @@ def _partial_coordinator(data: dict[str, Any], **options: Any) -> EnergyPlannerC
         "enphase_control_enabled": False,
         **options,
     }
+    coordinator.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+        coordinator.entry.data,
+        coordinator.options,
+    )
     return coordinator
 
 

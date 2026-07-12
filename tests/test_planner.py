@@ -1462,12 +1462,14 @@ def test_active_plan_uses_replayed_cold_thermal_samples_for_heat_preconditioning
             thermal_model,
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * index),
+                "hvac_mode": "heat",
                 "indoor_temperature_c": 17.2 + index * 0.03,
                 "outdoor_temperature_c": 5.0,
                 "hvac_power_kw": 2.2,
             },
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * (index + 1)),
+                "hvac_mode": "heat",
                 "indoor_temperature_c": 17.4 + index * 0.03,
                 "outdoor_temperature_c": 5.2,
                 "hvac_power_kw": 2.1,
@@ -1515,12 +1517,14 @@ def test_active_plan_uses_replayed_warm_thermal_samples_for_cool_preconditioning
             thermal_model,
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * index),
+                "hvac_mode": "cool",
                 "indoor_temperature_c": 25.2 - index * 0.02,
                 "outdoor_temperature_c": 34.0,
                 "hvac_power_kw": 1.6,
             },
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * (index + 1)),
+                "hvac_mode": "cool",
                 "indoor_temperature_c": 25.0 - index * 0.02,
                 "outdoor_temperature_c": 33.5,
                 "hvac_power_kw": 1.7,

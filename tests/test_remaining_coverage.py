@@ -208,8 +208,13 @@ def test_remaining_thermal_and_input_branches() -> None:
     now = datetime.now(UTC)
     updated, changed = update_thermal_model(
         {},
-        {"sampled_at": now.isoformat(), "indoor_temperature_c": 20, "hvac_power_kw": 0.0},
-        {"sampled_at": (now + timedelta(hours=3)).isoformat(), "indoor_temperature_c": 21, "hvac_power_kw": 0.0},
+        {"sampled_at": now.isoformat(), "hvac_mode": "off", "indoor_temperature_c": 20, "hvac_power_kw": 0.0},
+        {
+            "sampled_at": (now + timedelta(hours=3)).isoformat(),
+            "hvac_mode": "off",
+            "indoor_temperature_c": 21,
+            "hvac_power_kw": 0.0,
+        },
     )
     assert changed is True
     assert updated["last_sample"]["indoor_temperature_c"] == 21

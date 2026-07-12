@@ -19,7 +19,8 @@ MIN_TEMPERATURE_DELTA_C = 0.05
 MAX_ACTIVE_RATE_C_PER_HOUR = 6.0
 MAX_PASSIVE_RATE_C_PER_HOUR = 3.0
 MAX_ROLLING_SAMPLES = 96
-_INACTIVE_HVAC_MODES = {"off", "fan_only", "dry", "idle", "unknown", "unavailable"}
+_INACTIVE_HVAC_MODES = {"off", "idle"}
+_ACTIVE_HVAC_MODES = {"heat", "cool"}
 
 
 def update_thermal_model(
@@ -61,7 +62,9 @@ def update_thermal_model(
     current_power = _float_or_none(current.get("hvac_power_kw"))
     previous_mode = _hvac_mode(previous.get("hvac_mode"))
     current_mode = _hvac_mode(current.get("hvac_mode"))
-    modes_stable = not previous_mode or not current_mode or previous_mode == current_mode
+    if previous_power is None or current_power is None or not previous_mode or not current_mode:
+        return updated, True
+    modes_stable = previous_mode == current_mode
     previous_active = previous_power is not None and previous_power >= ACTIVE_POWER_THRESHOLD_KW
     current_active = current_power is not None and current_power >= ACTIVE_POWER_THRESHOLD_KW
     temperature_delta = current_temp - previous_temp
@@ -71,7 +74,7 @@ def update_thermal_model(
     if not modes_stable or previous_active != current_active:
         return updated, True
 
-    if previous_active and current_active and current_mode not in _INACTIVE_HVAC_MODES:
+    if previous_active and current_active and current_mode in _ACTIVE_HVAC_MODES:
         if abs(temperature_delta) >= MIN_TEMPERATURE_DELTA_C:
             active_rate = temperature_delta / hours
             if 0 < active_rate <= MAX_ACTIVE_RATE_C_PER_HOUR and current_mode != "cool":
@@ -82,7 +85,13 @@ def update_thermal_model(
                 if MIN_HVAC_LOAD_KW <= previous_power <= MAX_HVAC_LOAD_KW:
                     _add_rolling_stat(updated, "active_hvac_load_kw", previous_power)
                 _add_rolling_stat(updated, "active_cool_rate_c_per_hour", abs(active_rate))
-    elif not previous_active and not current_active and abs(temperature_delta) >= MIN_TEMPERATURE_DELTA_C:
+    elif (
+        not previous_active
+        and not current_active
+        and previous_mode in _INACTIVE_HVAC_MODES
+        and current_mode in _INACTIVE_HVAC_MODES
+        and abs(temperature_delta) >= MIN_TEMPERATURE_DELTA_C
+    ):
         drift_per_hour = temperature_delta / hours
         if abs(drift_per_hour) <= MAX_PASSIVE_RATE_C_PER_HOUR:
             _add_rolling_stat(updated, "passive_indoor_drift_c_per_hour", drift_per_hour)
