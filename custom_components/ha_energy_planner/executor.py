@@ -33,6 +33,13 @@ from .models import (
     PlannerMode,
 )
 from .ownership import OwnershipState
+from .preflight import production_evidence_fingerprint
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 from .storage import PlannerStore
 
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
@@ -349,12 +356,16 @@ class Executor:
         pause_reason = _pause_rejection_reason(self.store.data.get("control_pause"), action, now)
         if pause_reason is not None:
             return pause_reason
-        production_value = self.store.data.get("production")
-        if production_value is None:
-            return None
-        production = dict(production_value)
-        if not production.get("armed"):
+        production = parse_production_state(self.store.data.get("production"))
+        if not production.armed:
             return "production_gate_not_armed"
+        if production.dry_run_evidence_fingerprint != production_evidence_fingerprint(
+            self.entry_data,
+            self.options,
+        ):
+            return "production_evidence_contract_changed"
+        if production.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
+            return "production_dry_run_evidence_incomplete"
         device_reason = _device_control_disabled_reason(action.asset, self.options)
         if device_reason is not None:
             return device_reason
@@ -628,24 +639,8 @@ def _latest_applied_audit_for_asset(audit: Any, asset: ActionAsset, now: datetim
 
 
 def _pause_rejection_reason(value: Any, action: Any, now: datetime) -> str | None:
-    """Return pause reason when all controls or the action asset is paused."""
-    if not isinstance(value, dict) or not value:
-        return None
-    until = _parse_datetime_or_none(value.get("until"))
-    if until is None or now >= until:
-        return None
-    assets = value.get("assets")
-    if assets is None:
-        return "planner_paused"
-    if isinstance(assets, str):
-        asset_values = {assets}
-    elif isinstance(assets, list):
-        asset_values = {str(item) for item in assets}
-    else:
-        asset_values = set()
-    if "all" in asset_values or str(action.asset) in asset_values:
-        return f"{action.asset}_control_paused"
-    return None
+    """Return shared fail-closed pause reason for an action."""
+    return control_pause_reason(value, now, asset=str(action.asset))
 
 
 def _device_control_disabled_reason(asset: ActionAsset, options: dict[str, Any]) -> str | None:
@@ -656,7 +651,7 @@ def _device_control_disabled_reason(asset: ActionAsset, options: dict[str, Any])
         ActionAsset.ENPHASE: (CONF_ENPHASE_CONTROL_ENABLED, "enphase_control_disabled"),
     }
     option_key, reason = option_by_asset[asset]
-    return None if bool(options.get(option_key, False)) else reason
+    return None if strict_bool(options.get(option_key), default=False) else reason
 
 
 def _daily_action_cap_reason(asset: ActionAsset, options: dict[str, Any], audit: Any, now: datetime) -> str | None:

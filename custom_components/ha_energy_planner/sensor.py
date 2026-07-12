@@ -11,6 +11,7 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, Sen
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .ai_advisor import ai_rejection_detail
 from .const import (
@@ -24,7 +25,13 @@ from .const import (
 from .coordinator import EnergyPlannerCoordinator, _material_plan_fingerprint
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
-from .preflight import _control_area_report
+from .preflight import _control_area_report, production_evidence_fingerprint
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -1214,32 +1221,50 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
 def _production_readiness_state(coordinator: EnergyPlannerCoordinator) -> str:
     """Return production readiness state."""
     attrs = _production_readiness_attrs(coordinator)
-    if attrs.get("armed"):
+    if attrs.get("armed") and attrs.get("dry_run_evidence_complete") and not attrs.get("control_paused"):
         return "Armed"
-    if attrs.get("ready_to_arm"):
-        return "Ready To Arm"
+    if attrs.get("armed"):
+        return "Armed - Blocked"
+    if attrs.get("dry_run_evidence_complete"):
+        return "Evidence Complete"
     return "Not Ready"
 
 
 def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return production gate attributes."""
-    production = dict(coordinator.store.data.get("production", {}))
+    production_state = parse_production_state(coordinator.store.data.get("production"))
+    production = production_state.raw
     device_controls = {
-        "ev": bool(coordinator.options.get(CONF_EV_CONTROL_ENABLED, False)),
-        "climate": bool(coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
-        "enphase": bool(coordinator.options.get(CONF_ENPHASE_CONTROL_ENABLED, False)),
+        "ev": strict_bool(coordinator.options.get(CONF_EV_CONTROL_ENABLED), default=False),
+        "climate": strict_bool(coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
+        "enphase": strict_bool(coordinator.options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
     }
     control_areas = _control_area_report(dict(coordinator.entry_data), coordinator.options)
     required_areas = list(control_areas["required"])
     required_configured = all(control_areas["details"][area]["configured"] for area in required_areas)
-    dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
+    dry_run_ready_cycles = production_state.dry_run_ready_cycles
+    evidence_matches = production_state.dry_run_evidence_fingerprint == production_evidence_fingerprint(
+        dict(coordinator.entry_data), coordinator.options
+    )
+    pause_reason = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow())
+    dry_run_evidence_complete = (
+        dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
+        and bool(required_areas)
+        and required_configured
+        and evidence_matches
+    )
     return {
-        "armed": bool(production.get("armed", False)),
+        "armed": production_state.armed,
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
-        "ready_to_arm": dry_run_ready_cycles >= 3 and bool(required_areas) and required_configured,
+        "dry_run_evidence_complete": dry_run_evidence_complete,
+        "dry_run_evidence_fingerprint_matches": evidence_matches,
+        "control_paused": pause_reason is not None,
+        "control_pause_reason": pause_reason,
+        # Retained for one release for consumers of the old attribute.
+        "ready_to_arm": dry_run_evidence_complete,
         "device_controls": device_controls,
         "required_control_areas": required_areas,
         "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
@@ -1255,24 +1280,30 @@ def _control_block_state(coordinator: EnergyPlannerCoordinator) -> str:
 def _control_block_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return active-control block details."""
     reasons: list[str] = []
-    production = dict(coordinator.store.data.get("production", {}))
-    pause = dict(coordinator.store.data.get("control_pause", {}))
-    if not production.get("armed"):
+    production_state = parse_production_state(coordinator.store.data.get("production"))
+    pause = coordinator.store.data.get("control_pause")
+    if not production_state.armed:
         reasons.append("production_gate_not_armed")
+    elif production_state.dry_run_evidence_fingerprint != production_evidence_fingerprint(
+        dict(coordinator.entry_data), coordinator.options
+    ):
+        reasons.append("production_evidence_contract_changed")
+    elif production_state.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
+        reasons.append("production_dry_run_evidence_incomplete")
     if _pause_active(pause):
         reasons.append("planner_paused")
-    if not coordinator.options.get(CONF_EV_CONTROL_ENABLED, False):
+    if not strict_bool(coordinator.options.get(CONF_EV_CONTROL_ENABLED), default=False):
         reasons.append("ev_control_disabled")
-    if not coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED, False):
+    if not strict_bool(coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False):
         reasons.append("climate_control_disabled")
-    if not coordinator.options.get(CONF_ENPHASE_CONTROL_ENABLED, False):
+    if not strict_bool(coordinator.options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False):
         reasons.append("enphase_control_disabled")
     if coordinator.data and coordinator.data.input_issues:
         reasons.extend(coordinator.data.input_issues[:8])
     return {
         "reason": reasons[0] if reasons else "none",
         "reasons": reasons[:12],
-        "armed": bool(production.get("armed", False)),
+        "armed": production_state.armed,
         "pause": _bounded_json(pause),
     }
 
@@ -1345,11 +1376,9 @@ def _support_bundle_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, An
     }
 
 
-def _pause_active(pause: dict[str, Any]) -> bool:
-    """Return whether a stored pause looks active."""
-    if not pause.get("active", bool(pause.get("until"))):
-        return False
-    return bool(pause.get("until"))
+def _pause_active(pause: Any) -> bool:
+    """Return shared fail-closed pause state for compatibility callers."""
+    return control_pause_reason(pause, dt_util.utcnow()) is not None
 
 
 def _first_asset_action(plan: EnergyPlan, asset: ActionAsset) -> PlanAction | None:

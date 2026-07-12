@@ -11,6 +11,7 @@ from custom_components.ha_energy_planner.forecast_calibration import (
     _bounded_uncertainty_factor,
     _finite_float_or_none,
     _nearest_observation,
+    _non_negative_int,
     _observations_for_field,
     _parse_datetime_or_none,
     _percentile,
@@ -362,8 +363,8 @@ def test_forecast_calibration_rejects_malformed_evidence() -> None:
         now=now,
     )
 
-    assert changed is False
-    assert model == {"pv_forecast_kw": "bad-shape"}
+    assert changed is True
+    assert model == {}
     assert _bounded_factor(float("nan")) == 1.0
     assert _finite_float_or_none("bad") is None
     assert _parse_datetime_or_none(datetime(2026, 6, 27, tzinfo=UTC)) == datetime(2026, 6, 27, tzinfo=UTC)
@@ -399,3 +400,168 @@ def test_calibration_storage_and_observation_helpers_reject_bad_shapes() -> None
     ) == [(now, 1.5)]
     assert _nearest_observation([], now) is None
     assert _as_utc(datetime(2026, 6, 27, 12, 0)) == now
+
+
+def test_forecast_calibration_resets_legacy_and_million_scale_counters() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    legacy, legacy_changed = update_forecast_calibration(
+        {"pv_forecast_kw": {"sample_count": 1_234_567, "factor": 1.3, "enabled": True}},
+        [],
+        {},
+        now=now,
+    )
+    contaminated, contaminated_changed = update_forecast_calibration(
+        {
+            "baseline_load_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 2_000_000,
+                "raw_sample_count": 2_000_000,
+                "samples": [],
+                "enabled": True,
+                "factor": 1.3,
+            }
+        },
+        [],
+        {},
+        now=now,
+    )
+
+    assert legacy_changed is True
+    assert legacy == {}
+    assert contaminated_changed is True
+    assert contaminated == {}
+
+
+def test_forecast_calibration_rebuild_preserves_processed_identities() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    model, changed = update_forecast_calibration(
+        {
+            "pv_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 2_000_000,
+                "raw_sample_count": 2_000_000,
+                "samples": [
+                    {
+                        "valid_at": valid_at.isoformat(),
+                        "lead_bucket": 2,
+                        "forecast": 1.0,
+                        "actual": 1.2,
+                    }
+                ],
+                "processed_sample_ids": ["observation:sample"],
+            }
+        },
+        [],
+        {},
+        now=now,
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["processed_sample_ids"] == ["observation:sample"]
+    assert _non_negative_int("invalid") == 0
+
+
+def test_forecast_calibration_only_processes_new_mature_observations() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    snapshots = [
+        {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=1),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+    ]
+    actuals = {"pv_forecast_kw": {valid_at.isoformat(): 1.2}}
+
+    model, changed = update_forecast_calibration({}, snapshots, actuals, now=now)
+    unchanged, changed_again = update_forecast_calibration(model, snapshots, actuals, now=now)
+
+    assert changed is True
+    assert changed_again is False
+    assert unchanged == model
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 1
+
+
+def test_forecast_calibration_accepts_out_of_order_unprocessed_observation() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    newer = now - timedelta(minutes=5)
+    older = now - timedelta(minutes=15)
+
+    def snapshot(valid_at: datetime) -> dict[str, object]:
+        return {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=1),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+
+    model, _changed = update_forecast_calibration(
+        {}, [snapshot(newer)], {"pv_forecast_kw": {newer.isoformat(): 1.2}}, now=now
+    )
+    model, changed = update_forecast_calibration(
+        model, [snapshot(older)], {"pv_forecast_kw": {older.isoformat(): 1.1}}, now=now
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["sample_count"] == 2
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 2
+
+
+def test_forecast_calibration_backfills_new_lead_bucket_for_processed_observation() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    observation = {"pv_forecast_kw": {valid_at.isoformat(): 1.2}}
+
+    def snapshot(hours_before: int) -> dict[str, object]:
+        return {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=hours_before),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+
+    model, _changed = update_forecast_calibration({}, [snapshot(1)], observation, now=now)
+    model, changed = update_forecast_calibration(model, [snapshot(2)], observation, now=now)
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["raw_sample_count"] == 2
+    assert set(model["pv_forecast_kw"]["buckets"]) == {"2", "4"}
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 2
+
+
+def test_forecast_calibration_rebuilds_inconsistent_unique_sample_count() -> None:
+    valid_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    sample = {
+        "sample_id": f"pv_forecast_kw:{valid_at.isoformat()}:2",
+        "valid_at": valid_at.isoformat(),
+        "lead_bucket": 2,
+        "forecast": 1.0,
+        "actual": 1.2,
+    }
+    model, changed = update_forecast_calibration(
+        {
+            "pv_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 999,
+                "raw_sample_count": 1,
+                "samples": [sample],
+            }
+        },
+        [],
+        {},
+        now=valid_at + timedelta(hours=1),
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["sample_count"] == 1

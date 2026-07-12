@@ -21,6 +21,7 @@ MAX_FACTOR = 1.30
 MIN_UNCERTAINTY_FACTOR = 0.50
 MAX_UNCERTAINTY_FACTOR = 1.50
 MIN_HOLDOUT_IMPROVEMENT = 0.02
+MAX_REASONABLE_LEGACY_COUNT = MAX_STORED_SAMPLES * 4
 
 
 def apply_forecast_calibration(
@@ -85,26 +86,24 @@ def update_forecast_calibration(
     every overdue forecast slot.  Callers may provide one ``{value, observed_at}``
     mapping, a list of those mappings, or a Recorder-style timestamp/value map.
     """
-    updated = {
-        key: dict(value) if isinstance(value, Mapping) else value
-        for key, value in dict(model or {}).items()
-    }
+    updated, changed = _migrate_calibration_model(model)
     observations = {
         field: _observations_for_field(actuals.get(field), now)
         for field in FORECAST_CALIBRATION_FIELDS
     }
     if not any(observations.values()):
-        return updated, False
+        return updated, changed
 
-    changed = False
     for field in FORECAST_CALIBRATION_FIELDS:
         field_observations = observations[field]
         if not field_observations:
             continue
         calibration = dict(updated.get(field, {})) if isinstance(updated.get(field), Mapping) else {}
+        processed_sample_ids = _processed_sample_ids(calibration.get("processed_sample_ids"))
         samples = _stored_samples(calibration.get("samples", []), field)
         seen = {str(sample["sample_id"]) for sample in samples}
         field_changed = False
+        newly_processed_ids: set[str] = set()
 
         for snapshot in snapshots:
             slots = snapshot.get("forecast_training_slots", [])
@@ -122,7 +121,8 @@ def update_forecast_calibration(
                     continue
                 lead_bucket = max(int((valid_at - issued_at).total_seconds() // 1800), 0)
                 sample_id = f"{field}:{valid_at.isoformat()}:{lead_bucket}"
-                if sample_id in seen:
+                processed_id = f"{observation[0].isoformat()}:{sample_id}"
+                if sample_id in seen or processed_id in processed_sample_ids:
                     continue
                 samples.append(
                     {
@@ -134,13 +134,64 @@ def update_forecast_calibration(
                     }
                 )
                 seen.add(sample_id)
+                newly_processed_ids.add(processed_id)
                 changed = True
                 field_changed = True
 
         if field_changed:
-            updated[field] = _rebuild_model(_trim_samples(samples))
+            rebuilt = _rebuild_model(_trim_samples(samples))
+            processed_sample_ids.update(newly_processed_ids)
+            rebuilt["processed_sample_ids"] = sorted(processed_sample_ids)[-MAX_STORED_SAMPLES:]
+            updated[field] = rebuilt
 
     return updated, changed
+
+
+def _migrate_calibration_model(
+    model: Mapping[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """Discard legacy/unbounded counters and rebuild current fields from evidence."""
+    updated = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in dict(model or {}).items()
+    }
+    changed = False
+    for field in FORECAST_CALIBRATION_FIELDS:
+        value = updated.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, Mapping) or value.get("model_version") != 3:
+            updated.pop(field, None)
+            changed = True
+            continue
+        calibration = dict(value)
+        samples = _trim_samples(_stored_samples(calibration.get("samples", []), field))
+        raw_count = _non_negative_int(calibration.get("raw_sample_count"))
+        sample_count = _non_negative_int(calibration.get("sample_count"))
+        unique_sample_count = len({str(sample["valid_at"]) for sample in samples})
+        if (
+            raw_count > MAX_REASONABLE_LEGACY_COUNT
+            or sample_count > MAX_REASONABLE_LEGACY_COUNT
+            or raw_count != len(samples)
+            or sample_count != unique_sample_count
+        ):
+            rebuilt = _rebuild_model(samples)
+            processed = _processed_sample_ids(calibration.get("processed_sample_ids"))
+            if processed:
+                rebuilt["processed_sample_ids"] = sorted(processed)[-MAX_STORED_SAMPLES:]
+            if samples:
+                updated[field] = rebuilt
+            else:
+                updated.pop(field, None)
+            changed = True
+    return updated, changed
+
+
+def _processed_sample_ids(value: Any) -> set[str]:
+    """Return bounded observation-plus-lead identities already trained."""
+    if not isinstance(value, list):
+        return set()
+    return {str(item) for item in value[-MAX_STORED_SAMPLES:] if isinstance(item, str) and item}
 
 
 def _trim_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -343,6 +394,14 @@ def _finite_float_or_none(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if isfinite(number) else None
+
+
+def _non_negative_int(value: Any) -> int:
+    """Return a defensive non-negative persisted counter."""
+    try:
+        return max(int(value), 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _parse_datetime_or_none(value: Any) -> datetime | None:

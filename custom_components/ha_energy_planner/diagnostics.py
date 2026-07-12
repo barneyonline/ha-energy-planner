@@ -75,18 +75,23 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "haeo": _redact(_latest_haeo_status(store_data)),
-        "refresh_performance": _redact(
-            {
-                "latest": getattr(coordinator, "last_refresh_metadata", None),
-                "metrics": getattr(coordinator, "refresh_metrics", None),
-            }
-        ),
+        "refresh_performance": _redact(_refresh_performance(coordinator)),
         "recent_outcomes": _redact(_recent_items(store_data, "outcomes", limit=10)),
         "recent_audit": _redact(_recent_items(store_data, "execution_audit", limit=20)),
         "recent_dry_run_comparisons": _redact(_recent_items(store_data, "dry_run_comparisons", limit=10)),
         "store": _redact(_store_summary(store_data)),
     }
     return data
+
+
+def _refresh_performance(coordinator: Any) -> dict[str, Any]:
+    """Return rolling runtime metrics when provided, with legacy fallback."""
+    rolling = getattr(coordinator, "refresh_metrics", None)
+    latest = getattr(coordinator, "last_refresh_metadata", None)
+    result = dict(rolling) if isinstance(rolling, dict) else {}
+    if isinstance(latest, dict):
+        result.setdefault("latest", dict(latest))
+    return result
 
 
 def _redact(value: Any) -> Any:

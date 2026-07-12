@@ -120,7 +120,10 @@ def test_carbon_objective_scores_low_carbon_ev_schedule_and_changes_weight_by_pr
     )
 
     components = planner_module._score_components(action, context)
-    carbon_first = {**DEFAULT_OPTIONS, "priority_weights": "carbon,cost,comfort,ev_readiness,battery_reserve,solar_self_consumption"}
+    carbon_first = {
+        **DEFAULT_OPTIONS,
+        "priority_weights": "carbon,cost,comfort,ev_readiness,battery_reserve,solar_self_consumption",
+    }
 
     assert components["carbon"] == 1.0
     assert planner_module._carbon_schedule_weight(carbon_first) > planner_module._carbon_schedule_weight(
@@ -335,6 +338,20 @@ def test_disabled_planner_suppresses_actions_and_marks_disabled() -> None:
 
     assert plan.mode == PlannerMode.DISABLED
     assert plan.actions == []
+
+
+def test_planner_mode_rejects_truthy_string_safety_options() -> None:
+    context = _context()
+
+    disabled = DryRunPlanner(
+        {**DEFAULT_OPTIONS, "planner_enabled": "true", "dry_run": False}
+    ).create_plan(context)
+    dry_run = DryRunPlanner(
+        {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": "false"}
+    ).create_plan(context)
+
+    assert disabled.mode == PlannerMode.DISABLED
+    assert dry_run.mode == PlannerMode.DRY_RUN
 
 
 def test_plan_confidence_is_capped_by_forecast_confidence() -> None:
@@ -1462,12 +1479,14 @@ def test_active_plan_uses_replayed_cold_thermal_samples_for_heat_preconditioning
             thermal_model,
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * index),
+                "hvac_mode": "heat",
                 "indoor_temperature_c": 17.2 + index * 0.03,
                 "outdoor_temperature_c": 5.0,
                 "hvac_power_kw": 2.2,
             },
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * (index + 1)),
+                "hvac_mode": "heat",
                 "indoor_temperature_c": 17.4 + index * 0.03,
                 "outdoor_temperature_c": 5.2,
                 "hvac_power_kw": 2.1,
@@ -1515,12 +1534,14 @@ def test_active_plan_uses_replayed_warm_thermal_samples_for_cool_preconditioning
             thermal_model,
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * index),
+                "hvac_mode": "cool",
                 "indoor_temperature_c": 25.2 - index * 0.02,
                 "outdoor_temperature_c": 34.0,
                 "hvac_power_kw": 1.6,
             },
             {
                 "sampled_at": sample_start + timedelta(minutes=5 * (index + 1)),
+                "hvac_mode": "cool",
                 "indoor_temperature_c": 25.0 - index * 0.02,
                 "outdoor_temperature_c": 33.5,
                 "hvac_power_kw": 1.7,
