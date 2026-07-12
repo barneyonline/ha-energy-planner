@@ -215,7 +215,9 @@ Status as of 2026-06-28.
   HVAC thermal model records current indoor temperature, optional Daikin power,
   and optional weather temperature samples. Version 2 requires samples at least
   five minutes apart, ignores sensor deltas below effective precision, excludes
-  HVAC start/stop/mode transitions, rejects implausible rates instead of
+  HVAC start/stop/mode transitions, requires explicit stable heat/cool mode and
+  power evidence for active learning plus explicit off/idle evidence for passive
+  learning, rejects implausible rates instead of
   clamping them, and derives medians from bounded rolling windows. Legacy
   unbounded statistics are reset before a new anchor is accepted. It also
   tolerates timezone-naive timestamps and comma-decimal strings and ignores
@@ -251,18 +253,21 @@ Status as of 2026-06-28.
   coordinator refresh duration, cache, evidence, and capability metadata are
   available in diagnostics, plan-status attributes, and system health.
 - Forecast calibration explicitly drops legacy models and rebuilds current
-  model fields from bounded timestamped evidence when persisted counters are
-  inconsistent or implausibly large. A processed-observation watermark ensures
-  an already matured timestamp is not trained repeatedly on later refreshes.
+  model fields from bounded timestamped evidence when persisted raw or unique
+  counters are inconsistent or implausibly large. Bounded processed-observation
+  identifiers prevent duplicate training without dropping older observations
+  that arrive out of order.
 - Preflight discovery blocks only configured and enabled control areas. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
   production readiness without an enabled controllable area.
 - Preflight distinguishes historical dry-run evidence from current activation
   safety. `safe_to_activate_now` additionally requires a current healthy,
-  non-zero-confidence plan and at least eight usable priced hours (or the full
-  configured horizon when shorter); `active_control_ready` still requires the
-  independent production arm.
+  non-zero-confidence plan, a recent successful coordinator refresh, at least
+  eight usable priced hours (or the full configured horizon when shorter), and
+  no active control pause. Historical evidence is invalidated when the required
+  control areas, mapped configuration, or options change;
+  `active_control_ready` still requires the independent production arm.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
   results are discarded before they can overwrite the active plan or execute
   device actions when a newer replan request has arrived.

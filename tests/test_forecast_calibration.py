@@ -453,4 +453,59 @@ def test_forecast_calibration_only_processes_new_mature_observations() -> None:
     assert changed is True
     assert changed_again is False
     assert unchanged == model
-    assert model["pv_forecast_kw"]["last_processed_observation_at"] == valid_at.isoformat()
+    assert model["pv_forecast_kw"]["processed_observation_ids"] == [valid_at.isoformat()]
+
+
+def test_forecast_calibration_accepts_out_of_order_unprocessed_observation() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    newer = now - timedelta(minutes=5)
+    older = now - timedelta(minutes=15)
+
+    def snapshot(valid_at: datetime) -> dict[str, object]:
+        return {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=1),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+
+    model, _changed = update_forecast_calibration(
+        {}, [snapshot(newer)], {"pv_forecast_kw": {newer.isoformat(): 1.2}}, now=now
+    )
+    model, changed = update_forecast_calibration(
+        model, [snapshot(older)], {"pv_forecast_kw": {older.isoformat(): 1.1}}, now=now
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["sample_count"] == 2
+    assert model["pv_forecast_kw"]["processed_observation_ids"] == [older.isoformat(), newer.isoformat()]
+
+
+def test_forecast_calibration_rebuilds_inconsistent_unique_sample_count() -> None:
+    valid_at = datetime(2026, 6, 27, 11, 0, tzinfo=UTC)
+    sample = {
+        "sample_id": f"pv_forecast_kw:{valid_at.isoformat()}:2",
+        "valid_at": valid_at.isoformat(),
+        "lead_bucket": 2,
+        "forecast": 1.0,
+        "actual": 1.2,
+    }
+    model, changed = update_forecast_calibration(
+        {
+            "pv_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 999,
+                "raw_sample_count": 1,
+                "samples": [sample],
+            }
+        },
+        [],
+        {},
+        now=valid_at + timedelta(hours=1),
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["sample_count"] == 1

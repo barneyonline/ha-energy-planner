@@ -99,9 +99,10 @@ def update_forecast_calibration(
         if not field_observations:
             continue
         calibration = dict(updated.get(field, {})) if isinstance(updated.get(field), Mapping) else {}
-        last_processed = _parse_datetime_or_none(calibration.get("last_processed_observation_at"))
-        if last_processed is not None:
-            field_observations = [item for item in field_observations if item[0] > last_processed]
+        processed_observation_ids = _processed_observation_ids(calibration.get("processed_observation_ids"))
+        field_observations = [
+            item for item in field_observations if item[0].isoformat() not in processed_observation_ids
+        ]
         if not field_observations:
             continue
         samples = _stored_samples(calibration.get("samples", []), field)
@@ -143,7 +144,8 @@ def update_forecast_calibration(
 
         if field_changed:
             rebuilt = _rebuild_model(_trim_samples(samples))
-            rebuilt["last_processed_observation_at"] = max(processed_observation_times).isoformat()
+            processed_observation_ids.update(item.isoformat() for item in processed_observation_times)
+            rebuilt["processed_observation_ids"] = sorted(processed_observation_ids)[-MAX_STORED_SAMPLES:]
             updated[field] = rebuilt
 
     return updated, changed
@@ -170,21 +172,35 @@ def _migrate_calibration_model(
         samples = _trim_samples(_stored_samples(calibration.get("samples", []), field))
         raw_count = _non_negative_int(calibration.get("raw_sample_count"))
         sample_count = _non_negative_int(calibration.get("sample_count"))
+        unique_sample_count = len({str(sample["valid_at"]) for sample in samples})
         if (
             raw_count > MAX_REASONABLE_LEGACY_COUNT
             or sample_count > MAX_REASONABLE_LEGACY_COUNT
             or raw_count != len(samples)
+            or sample_count != unique_sample_count
         ):
             rebuilt = _rebuild_model(samples)
-            last_processed = _parse_datetime_or_none(calibration.get("last_processed_observation_at"))
-            if last_processed is not None:
-                rebuilt["last_processed_observation_at"] = last_processed.isoformat()
+            processed = _processed_observation_ids(calibration.get("processed_observation_ids"))
+            if processed:
+                rebuilt["processed_observation_ids"] = sorted(processed)[-MAX_STORED_SAMPLES:]
             if samples:
                 updated[field] = rebuilt
             else:
                 updated.pop(field, None)
             changed = True
     return updated, changed
+
+
+def _processed_observation_ids(value: Any) -> set[str]:
+    """Return bounded valid timestamp identifiers already paired to forecasts."""
+    if not isinstance(value, list):
+        return set()
+    valid = {
+        parsed.isoformat()
+        for item in value[-MAX_STORED_SAMPLES:]
+        if (parsed := _parse_datetime_or_none(item)) is not None
+    }
+    return valid
 
 
 def _trim_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:

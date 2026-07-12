@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
@@ -41,8 +45,20 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
     safety = _safety_report(options)
-    production = _production_report(coordinator.store.data, options, control_areas)
-    current_plan = _current_plan_report(getattr(coordinator, "data", None))
+    now = dt_util.utcnow()
+    evidence_fingerprint = production_evidence_fingerprint(entry_data, options)
+    production = _production_report(
+        coordinator.store.data,
+        options,
+        control_areas,
+        expected_evidence_fingerprint=evidence_fingerprint,
+    )
+    current_plan = _current_plan_report(
+        getattr(coordinator, "data", None),
+        now=now,
+        last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
+    )
+    control_paused = _control_pause_active(production["pause"], now)
     audit = _audit_report(coordinator.store.data)
 
     blocking = [
@@ -103,6 +119,19 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             "message": _production_gate_message(production),
         },
         {
+            "check": "production_gate_ready",
+            "ok": production["dry_run_evidence_complete"],
+            "blocking": False,
+            "deprecated_alias_for": "dry_run_evidence_complete",
+            "message": _production_gate_message(production),
+        },
+        {
+            "check": "control_not_paused",
+            "ok": not control_paused,
+            "blocking": True,
+            "message": "Control is not paused." if not control_paused else "An active control pause is in effect.",
+        },
+        {
             "check": "current_plan_safe",
             "ok": current_plan["safe"],
             "blocking": True,
@@ -129,6 +158,7 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
         and production["dry_run_evidence_complete"]
         and current_plan["safe"]
         and production["device_controls_enabled"]
+        and not control_paused
     )
     production["safe_to_activate_now"] = safe_to_activate_now
     active_control_ready = safe_to_activate_now and production["armed"]
@@ -178,8 +208,14 @@ def _production_gate_message(production: dict[str, Any]) -> str:
     return f"Production gate is not ready to arm yet; {'; '.join(details)}."
 
 
-def _current_plan_report(plan: Any) -> dict[str, Any]:
+def _current_plan_report(
+    plan: Any,
+    *,
+    now: datetime | None = None,
+    last_refresh_metadata: Any = None,
+) -> dict[str, Any]:
     """Return whether a current plan has enough priced coverage for activation."""
+    now = _as_utc(now or dt_util.utcnow())
     if plan is None:
         return {
             "present": False,
@@ -188,12 +224,27 @@ def _current_plan_report(plan: Any) -> dict[str, Any]:
             "adequate_coverage": False,
             "usable_optimization_horizon_hours": None,
             "required_optimization_horizon_hours": 8.0,
+            "fresh": False,
+            "last_refresh_succeeded": False,
             "safe": False,
             "message": "No current plan is available.",
         }
     health = str(getattr(plan, "health", ""))
     status = str(getattr(plan, "status", ""))
     confidence = float(getattr(plan, "confidence", 0.0) or 0.0)
+    interval_minutes = max(int(getattr(plan, "interval_minutes", 5) or 5), 1)
+    max_age = timedelta(minutes=max(interval_minutes * 2, 15))
+    created_at = _datetime_or_none(getattr(plan, "created_at", None))
+    plan_age = None if created_at is None else now - created_at
+    fresh = bool(plan_age is not None and timedelta(0) <= plan_age <= max_age)
+    refresh = dict(last_refresh_metadata) if isinstance(last_refresh_metadata, dict) else {}
+    refresh_completed_at = _datetime_or_none(refresh.get("completed_at"))
+    refresh_age = None if refresh_completed_at is None else now - refresh_completed_at
+    last_refresh_succeeded = bool(
+        refresh.get("succeeded") is True
+        and refresh_age is not None
+        and timedelta(0) <= refresh_age <= max_age
+    )
     configured_horizon = max(float(getattr(plan, "horizon_hours", 0.0) or 0.0), 0.0)
     required_horizon = min(configured_horizon, 8.0) if configured_horizon else 8.0
     usable_horizon_value = getattr(plan, "estimated_cost_horizon_hours", None)
@@ -209,13 +260,17 @@ def _current_plan_report(plan: Any) -> dict[str, Any]:
         and usable_horizon >= required_horizon
         and not any("incomplete_horizon" in issue for issue in issues)
     )
-    safe = healthy and current and confidence > 0 and adequate_coverage
+    safe = healthy and current and confidence > 0 and adequate_coverage and fresh and last_refresh_succeeded
     if safe:
         message = f"Current healthy plan has {usable_horizon:g} usable priced hours."
     elif not healthy:
         message = "Current plan inputs are not healthy."
     elif not current:
         message = "The latest plan is not current."
+    elif not fresh:
+        message = "The latest plan is older than the allowed refresh age."
+    elif not last_refresh_succeeded:
+        message = "No recent successful coordinator refresh confirms the current plan."
     elif not adequate_coverage:
         shown = "unknown" if usable_horizon is None else f"{usable_horizon:g}"
         message = f"Usable priced coverage is {shown} hours; at least {required_horizon:g} hours are required."
@@ -227,6 +282,11 @@ def _current_plan_report(plan: Any) -> dict[str, Any]:
         "current": current,
         "confidence": confidence,
         "adequate_coverage": adequate_coverage,
+        "fresh": fresh,
+        "age_seconds": None if plan_age is None else round(plan_age.total_seconds(), 3),
+        "maximum_age_seconds": round(max_age.total_seconds(), 3),
+        "last_refresh_succeeded": last_refresh_succeeded,
+        "last_successful_refresh_at": None if refresh_completed_at is None else refresh_completed_at.isoformat(),
         "usable_optimization_horizon_hours": usable_horizon,
         "required_optimization_horizon_hours": required_horizon,
         "safe": safe,
@@ -332,6 +392,8 @@ def _production_report(
     store_data: dict[str, Any],
     options: dict[str, Any],
     control_areas: dict[str, Any],
+    *,
+    expected_evidence_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Return production readiness state."""
     production = dict(store_data.get("production", {}))
@@ -351,6 +413,8 @@ def _production_report(
         dry_run_ready_cycles >= 3
         and bool(required_control_areas)
         and required_areas_configured
+        and bool(expected_evidence_fingerprint)
+        and production.get("dry_run_evidence_fingerprint") == expected_evidence_fingerprint
     )
     return {
         "armed": bool(production.get("armed", False)),
@@ -358,6 +422,10 @@ def _production_report(
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
+        "dry_run_evidence_fingerprint_matches": bool(
+            expected_evidence_fingerprint
+            and production.get("dry_run_evidence_fingerprint") == expected_evidence_fingerprint
+        ),
         "dry_run_evidence_complete": dry_run_evidence_complete,
         # Retained for one release for consumers of the old response schema.
         "ready_to_arm": dry_run_evidence_complete,
@@ -366,6 +434,43 @@ def _production_report(
         "required_control_areas": required_control_areas,
         "pause": pause,
     }
+
+
+def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[str, Any]) -> str:
+    """Bind dry-run evidence to the currently configured control contract."""
+    control_areas = _control_area_report(entry_data, options)
+    required = list(control_areas["required"])
+    payload = {
+        "required": required,
+        "details": {area: control_areas["details"][area] for area in required},
+        "entry_data": {key: entry_data[key] for key in sorted(entry_data)},
+        "options": {key: options[key] for key in sorted(options)},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _control_pause_active(value: Any, now: datetime) -> bool:
+    """Return whether a stored control pause is active and unexpired."""
+    if not isinstance(value, dict) or not value.get("active", False):
+        return False
+    until = _datetime_or_none(value.get("until"))
+    return until is None or _as_utc(now) < until
+
+
+def _datetime_or_none(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return _as_utc(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
 
 def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:

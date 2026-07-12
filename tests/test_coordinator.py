@@ -1484,6 +1484,25 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
     assert comparison["recent_outcome_count"] == 1
 
 
+def test_production_evidence_resets_when_control_contract_changes() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        options={"ev_control_enabled": True},
+    )
+    dry_run = _plan("dry-run")
+    dry_run.mode = PlannerMode.DRY_RUN
+
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    first_fingerprint = coordinator.store.data["production"]["dry_run_evidence_fingerprint"]
+    coordinator.entry.data["enphase_profile_entity"] = "select.enphase"
+    coordinator.entry.options["enphase_control_enabled"] = True
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+
+    assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 1
+    assert coordinator.store.data["production"]["dry_run_evidence_fingerprint"] != first_fingerprint
+
+
 def test_shutdown_cancels_pending_callbacks_and_listeners() -> None:
     calls: list[str] = []
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)

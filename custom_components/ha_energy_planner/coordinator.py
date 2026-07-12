@@ -52,6 +52,7 @@ from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
 from .models import EnergyPlan, HAEOSolvePhase, HAEOStatus, Override, PlannerMode, to_jsonable
 from .planner import DryRunPlanner
+from .preflight import production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
@@ -546,6 +547,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Track dry-run readiness evidence for the production gate."""
         production = dict(self.store.data.get("production", {}))
         if plan.mode == PlannerMode.DRY_RUN and plan.health.value == "healthy" and not violations:
+            evidence_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
+            if production.get("dry_run_evidence_fingerprint") != evidence_fingerprint:
+                production["dry_run_ready_cycles"] = 0
+            production["dry_run_evidence_fingerprint"] = evidence_fingerprint
             production["dry_run_ready_cycles"] = int(production.get("dry_run_ready_cycles", 0) or 0) + 1
             production["last_dry_run_ready_at"] = plan.created_at
         elif plan.health.value == "unsafe":
