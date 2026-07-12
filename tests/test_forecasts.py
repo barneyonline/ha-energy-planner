@@ -12,6 +12,7 @@ from custom_components.ha_energy_planner.forecasts import (
     _items_from_value,
     _parse_datetime_or_none,
     constant_forecast,
+    forecast_coverage_details,
     forecast_coverage_ratio,
     forecast_series_from_state,
     latest_forecast_valid_at_from_state,
@@ -312,6 +313,57 @@ def test_forecast_series_rejects_non_finite_values() -> None:
     assert series == [1.0, None, None, None]
     assert forecast_coverage_ratio(series) == 0.25
     assert forecast_coverage_ratio(None) == 0.0
+
+
+def test_forecast_coverage_details_classifies_continuous_coverage() -> None:
+    starts_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+
+    assert (
+        forecast_coverage_details([1.0] * 24, starts_at=starts_at, interval_minutes=30)["classification"] == "healthy"
+    )
+    degraded = forecast_coverage_details(
+        [1.0] * 16 + [None] * 8,
+        starts_at=starts_at,
+        interval_minutes=30,
+    )
+    assert degraded["classification"] == "degraded"
+    assert degraded["covered_hours"] == 8
+    assert degraded["continuous_hours"] == 8
+    assert degraded["first_timestamp"] == "2026-06-27T00:00:00+00:00"
+    assert degraded["last_timestamp"] == "2026-06-27T07:30:00+00:00"
+    assert degraded["leading_missing_slots"] == 0
+    assert degraded["trailing_missing_slots"] == 8
+
+
+def test_forecast_coverage_details_fails_closed_on_leading_and_internal_gaps() -> None:
+    starts_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    leading = forecast_coverage_details(
+        [None] + [1.0] * 24,
+        starts_at=starts_at,
+        interval_minutes=30,
+    )
+    internal = forecast_coverage_details(
+        [1.0] * 15 + [None] + [1.0] * 24,
+        starts_at=starts_at,
+        interval_minutes=30,
+    )
+
+    assert leading["classification"] == "unsafe"
+    assert leading["continuous_hours"] == 0
+    assert leading["longest_continuous_hours"] == 12
+    assert internal["classification"] == "unsafe"
+    assert internal["continuous_hours"] == 7.5
+    assert internal["internal_missing_slots"] == 1
+
+
+def test_forecast_coverage_details_caps_thresholds_for_short_configured_horizon() -> None:
+    starts_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    complete = forecast_coverage_details([1.0] * 4, starts_at=starts_at, interval_minutes=15)
+    partial = forecast_coverage_details([1.0, 1.0, None, None], starts_at=starts_at, interval_minutes=15)
+
+    assert complete["classification"] == "healthy"
+    assert complete["healthy_threshold_hours"] == 1
+    assert partial["classification"] == "unsafe"
 
 
 def test_constant_forecast_builds_interval_points() -> None:

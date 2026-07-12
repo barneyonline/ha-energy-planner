@@ -49,9 +49,9 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
 - EV planning with connected state, SOC, start/stop entities, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
 - Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
-- 24-hour plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes
+- Configurable plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes; the recommended default horizon is 12 hours
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
-- Coverage-aware forecast confidence: short payloads retain missing slots and make required planning inputs unsafe instead of repeating the final value across the horizon
+- Coverage-aware forecast health and diagnostics: at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe; uncovered slots remain missing instead of repeating the final value
 - Decision audit, rejected action, upcoming timeline, and per-device decision sensors explaining what was selected and why alternatives were skipped
 - Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
@@ -120,6 +120,10 @@ Energy Planner can be useful with different source integrations, but the current
 - BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
 - Daikin climate and HVAC power entities from Home Assistant climate/sensor integrations.
 - Optional AI advice from an AI Task provider such as [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation), when it exposes an `ai_task` entity.
+
+For Amber-backed planning, start with the 12-hour default. Energy Planner reports each source's first and last timestamps, covered and continuous hours, and leading, internal, and trailing gaps. A degraded 8-to-under-12-hour window remains visible but does not produce eligible device actions under the existing healthy-input action gate.
+
+For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Timestamped values are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. A baseline-load forecast may conservatively fill up to one hour of missing leading slots from its current numeric state; this is reported explicitly and reduces source confidence.
 
 ## Safety model
 

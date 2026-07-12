@@ -223,6 +223,25 @@ def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
                             },
                         ],
                     },
+                    "forecast_coverage": [
+                        {
+                            "config_key": "pv_forecast_entity",
+                            "entity_id": "sensor.pv",
+                            "classification": "healthy",
+                            "first_timestamp": "2026-07-12T00:00:00+00:00",
+                            "last_timestamp": "2026-07-12T11:55:00+00:00",
+                            "covered_hours": 12.0,
+                            "continuous_hours": 12.0,
+                            "longest_continuous_hours": 12.0,
+                            "leading_missing_slots": 0,
+                            "trailing_missing_slots": 144,
+                            "internal_missing_slots": 0,
+                            "leading_gap_filled_slots": 0,
+                            "leading_gap_filled_hours": 0.0,
+                            "ignored_extra": "bounded",
+                        },
+                        "bad",
+                    ],
                 }
             ]
         },
@@ -248,6 +267,23 @@ def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
         "Replace PV forecast (sensor.pv) with an entity that exposes forecast data for the planning horizon, "
         "or add source confidence metadata."
     ]
+    assert attrs["forecast_coverage"] == [
+        {
+            "config_key": "pv_forecast_entity",
+            "entity_id": "sensor.pv",
+            "classification": "healthy",
+            "first_timestamp": "2026-07-12T00:00:00+00:00",
+            "last_timestamp": "2026-07-12T11:55:00+00:00",
+            "covered_hours": 12.0,
+            "continuous_hours": 12.0,
+            "longest_continuous_hours": 12.0,
+            "leading_missing_slots": 0,
+            "trailing_missing_slots": 144,
+            "internal_missing_slots": 0,
+            "leading_gap_filled_slots": 0,
+            "leading_gap_filled_hours": 0.0,
+        }
+    ]
 
 
 def test_confidence_helper_edge_cases_are_readable() -> None:
@@ -267,6 +303,15 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
         )
         == []
     )
+    assert (
+        sensor_module._forecast_coverage_sources(
+            _coordinator(plan, store_data={"forecast_snapshots": [{"plan_id": "plan-1", "forecast_coverage": "bad"}]})
+        )
+        == []
+    )
+    assert "stitched" in sensor_module._confidence_source_reason({"source": "forecast_series_stitched"})
+    assert "leading load gap" in sensor_module._confidence_source_reason({"source": "forecast_series_leading_fill"})
+    assert "shorter" in sensor_module._confidence_source_reason({"source": "forecast_series_partial"})
     assert sensor_module._confidence_limiting_factor(0.0, 0.0, 0.0) == "unsafe_inputs"
     assert sensor_module._confidence_limiting_factor(0.65, 0.65, None) == "input_health"
     assert sensor_module._confidence_limiting_factor(1.0, 1.0, None) == "unknown"

@@ -1004,6 +1004,7 @@ def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "health": str(coordinator.data.health),
         "breakdown": breakdown,
         "source_confidence": sources,
+        "forecast_coverage": _forecast_coverage_sources(coordinator),
         "improvement_actions": _confidence_improvement_actions(
             coordinator.data.confidence,
             health_score,
@@ -1057,6 +1058,32 @@ def _confidence_sources(coordinator: EnergyPlannerCoordinator) -> list[dict[str,
         }
         for source in sources[:12]
         if isinstance(source, dict)
+    ]
+
+
+def _forecast_coverage_sources(coordinator: EnergyPlannerCoordinator) -> list[dict[str, Any]]:
+    """Return bounded per-input temporal coverage from the current snapshot."""
+    latest = _latest_forecast_snapshot(coordinator)
+    sources = latest.get("forecast_coverage") if isinstance(latest, dict) else []
+    if not isinstance(sources, list):
+        return []
+    keys = (
+        "config_key",
+        "entity_id",
+        "classification",
+        "first_timestamp",
+        "last_timestamp",
+        "covered_hours",
+        "continuous_hours",
+        "longest_continuous_hours",
+        "leading_missing_slots",
+        "trailing_missing_slots",
+        "internal_missing_slots",
+        "leading_gap_filled_slots",
+        "leading_gap_filled_hours",
+    )
+    return [
+        {key: source.get(key) for key in keys if key in source} for source in sources[:12] if isinstance(source, dict)
     ]
 
 
@@ -1132,6 +1159,7 @@ def _confidence_source_label(source: dict[str, Any]) -> str:
         "amber_import_price_entity": "Amber import price",
         "amber_export_price_entity": "Amber export price",
         "pv_forecast_entity": "PV forecast",
+        "pv_forecast_secondary_entity": "Second PV forecast",
         "baseline_load_forecast_entity": "Baseline load forecast",
         "weather_entity": "Weather forecast",
     }
@@ -1144,6 +1172,16 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
     source_kind = source.get("source")
     if source_kind == "forecast_series":
         return "Forecast series found; confidence comes from entity metadata when present, otherwise 100%."
+    if source_kind == "forecast_series_stitched":
+        return "Timestamped forecast series were stitched, with the primary source taking precedence on overlap."
+    if source_kind == "forecast_series_leading_fill":
+        return (
+            "A short leading load gap was conservatively filled from the current numeric state at reduced confidence."
+        )
+    if source_kind == "forecast_series_partial":
+        return (
+            "Forecast series coverage is shorter than the displayed planning horizon; coverage thresholds limit health."
+        )
     if source_kind == "point_value_repeated":
         return "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
     if source_kind == "invalid_state":

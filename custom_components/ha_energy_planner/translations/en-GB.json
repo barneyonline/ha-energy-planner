@@ -8,6 +8,7 @@
           "amber_import_price_entity": "Amber import price sensor",
           "amber_export_price_entity": "Amber export price sensor",
           "pv_forecast_entity": "PV forecast sensor",
+          "pv_forecast_secondary_entity": "Second PV forecast sensor",
           "baseline_load_forecast_entity": "Baseline load forecast sensor",
           "carbon_intensity_forecast_entity": "Grid carbon intensity forecast sensor",
           "pv_observed_entity": "Observed PV power sensor",
@@ -39,7 +40,8 @@
         "data_description": {
           "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
           "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
-          "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use. Select a power or energy forecast sensor using W, kW, MW, Wh, kWh, or MWh; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
+          "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
+          "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timestamped values after Forecast Today.",
           "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data in W, kW, or MW.",
           "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
           "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
@@ -76,6 +78,7 @@
       "invalid_entity_domain": "Entity domain is not supported for this field.",
       "invalid_unit": "Entity unit is not compatible with this field.",
       "observation_must_differ_from_forecast": "Select a measured power sensor, not the forecast sensor.",
+      "forecast_sources_must_differ": "Select a different sensor for the second PV forecast.",
       "invalid_service_name": "Service name must use domain.service format.",
       "service_not_found": "Service was not found in Home Assistant."
     },
@@ -100,6 +103,7 @@
             "amber_import_price_entity": "Amber import price sensor",
             "amber_export_price_entity": "Amber export price sensor",
             "pv_forecast_entity": "PV forecast sensor",
+            "pv_forecast_secondary_entity": "Second PV forecast sensor",
             "baseline_load_forecast_entity": "Baseline load forecast sensor",
             "carbon_intensity_forecast_entity": "Grid carbon intensity forecast sensor",
             "pv_observed_entity": "Observed PV power sensor",
@@ -109,7 +113,8 @@
           "data_description": {
             "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
             "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
-            "pv_forecast_entity": "For Solcast PV Forecast, select Forecast Today, not Peak Forecast Today. It exposes detailedForecast half-hourly pv_estimate data that Energy Planner can use. Select a power or energy forecast sensor using W, kW, MW, Wh, kWh, or MWh; create a combined Today/Tomorrow template sensor if you need a full rolling 24-hour Solcast horizon.",
+            "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
+            "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timestamped values after Forecast Today.",
             "baseline_load_forecast_entity": "Sensor that exposes household baseline load forecast data in W, kW, or MW.",
             "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
             "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
@@ -295,7 +300,7 @@
           "default_ready_by": "Default EV ready-by time"
         },
         "data_description": {
-          "planning_horizon_hours": "How many hours ahead each planning run evaluates.",
+          "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
           "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
           "default_ready_by": "Fallback local time used when no EV ready-by helper value is configured."
         }
