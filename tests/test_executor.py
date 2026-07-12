@@ -10,8 +10,11 @@ from typing import Any
 
 from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.const import (
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DEFAULT_READY_BY,
     CONF_ENPHASE_AI_PROFILE,
+    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
     CONF_EV_CONTROL_ENABLED,
@@ -68,6 +71,17 @@ class FakeStore:
 
     async def async_clear_ownership(self) -> None:
         self.data["ownership"] = {}
+
+
+def _arm_store(store: FakeStore, executor: Executor) -> None:
+    """Install a complete production contract for active execution tests."""
+    store.data["production"] = {
+        "armed": True,
+        "dry_run_ready_cycles": 3,
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+            executor.entry_data, executor.options
+        ),
+    }
 
 
 @dataclass(slots=True)
@@ -191,8 +205,14 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
         store,
         hass=hass,
         entry_data={"ev_smart_charging_start_entity": "switch.ev_start"},
-        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
     )
+    _arm_store(store, executor)
     asyncio.run(executor.async_evaluate(plan, _context(now)))
     assert store.data["outcomes"][0].result == "rejected"
     assert store.data["outcomes"][0].reason == "ev_start_control_unavailable,ev_stop_control_not_configured"
@@ -549,8 +569,14 @@ def test_executor_preserves_first_ev_pre_takeover_state() -> None:
             CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
         },
-        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
     )
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
     asyncio.run(executor.async_evaluate(plan, _context(now)))
@@ -603,9 +629,11 @@ def test_executor_rate_limits_repeated_device_command() -> None:
             **DEFAULT_OPTIONS,
             "planner_enabled": True,
             "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
             CONF_COMMAND_RATE_LIMIT_SECONDS: 3600,
         },
     )
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
@@ -959,7 +987,24 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
             [action],
             [],
         )
-        asyncio.run(Executor(store, hass=FakeHass(states), entry_data=entry_data).async_evaluate(plan, _context(now)))
+        control_option = {
+            ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
+            ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
+            ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+        }[action.asset]
+        executor = Executor(
+            store,
+            hass=FakeHass(states),
+            entry_data=entry_data,
+            options={
+                **DEFAULT_OPTIONS,
+                "planner_enabled": True,
+                "dry_run": False,
+                control_option: True,
+            },
+        )
+        _arm_store(store, executor)
+        asyncio.run(executor.async_evaluate(plan, _context(now)))
         assert store.data["control_pause"]["reason"] == reason
         assert store.data["outcomes"][0].result == "failed"
 
@@ -1043,6 +1088,9 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     assert _device_control_disabled_reason(ActionAsset.EV, {}) == "ev_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.DAIKIN, {}) == "climate_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.ENPHASE, {}) == "enphase_control_disabled"
+    assert _device_control_disabled_reason(ActionAsset.EV, {CONF_EV_CONTROL_ENABLED: "true"}) == (
+        "ev_control_disabled"
+    )
     assert _device_control_disabled_reason(ActionAsset.EV, {CONF_EV_CONTROL_ENABLED: True}) is None
 
     audit = [
@@ -1070,7 +1118,7 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
 
     store = FakeStore()
     executor = Executor(store)
-    assert executor._control_rejection_reason(action, now) is None
+    assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
     store.data["control_pause"] = {"until": (now + timedelta(minutes=5)).isoformat(), "assets": ["all"]}
     assert executor._control_rejection_reason(action, now) == "planner_paused"
     store.data["control_pause"] = {}
@@ -1078,7 +1126,12 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
     store.data["production"] = {"armed": True}
     assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
+    store.data["production"] = {"armed": "true"}
+    assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
+    store.data["production"] = {"armed": True}
     store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint({}, {})
+    assert executor._control_rejection_reason(action, now) == "production_dry_run_evidence_incomplete"
+    store.data["production"]["dry_run_ready_cycles"] = 3
     assert executor._control_rejection_reason(action, now) == "ev_control_disabled"
     executor.options = {CONF_EV_CONTROL_ENABLED: True}
     store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
@@ -1114,10 +1167,13 @@ def test_executor_blocks_armed_control_when_entity_or_policy_contract_changes() 
     store = FakeStore()
     store.data["production"] = {
         "armed": True,
+        "dry_run_ready_cycles": 3,
         "dry_run_evidence_fingerprint": production_evidence_fingerprint(entry_data, options),
     }
     executor = Executor(store, entry_data=entry_data, options=options)
 
+    assert executor._control_rejection_reason(action, now) is None
+    executor.options = {**options, CONF_DEFAULT_READY_BY: "23:45"}
     assert executor._control_rejection_reason(action, now) is None
     executor.entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_replaced"}
     assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
@@ -1170,9 +1226,11 @@ def test_executor_ignores_malformed_command_rate_limit_timestamp() -> None:
             **DEFAULT_OPTIONS,
             "planner_enabled": True,
             "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
             CONF_COMMAND_RATE_LIMIT_SECONDS: 3600,
         },
     )
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
@@ -1229,8 +1287,14 @@ def test_executor_restore_ai_releases_enphase_ownership() -> None:
             CONF_ENPHASE_PROFILE_CONTROL_SERVICE: "input_select.select_option",
             CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
         },
-        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
     )
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
@@ -1363,8 +1427,12 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     )
     store = FakeStore()
     executor = Executor(
-        store, hass=FakeHass({"climate.daikin": "off"}), entry_data={"daikin_climate_entity": "climate.daikin"}
+        store,
+        hass=FakeHass({"climate.daikin": "off"}),
+        entry_data={"daikin_climate_entity": "climate.daikin"},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True},
     )
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan))
 
@@ -1424,9 +1492,13 @@ def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object
     )
     store = FakeStore()
     executor = Executor(
-        store, hass=FakeHass({"select.enphase": "AI Optimisation"}), entry_data={CONF_ENPHASE_PROFILE: "select.enphase"}
+        store,
+        hass=FakeHass({"select.enphase": "AI Optimisation"}),
+        entry_data={CONF_ENPHASE_PROFILE: "select.enphase"},
+        options={CONF_ENPHASE_CONTROL_ENABLED: True},
     )
     executor.entry_data[CONF_ENPHASE_AI_PROFILE] = "AI Optimisation"
+    _arm_store(store, executor)
 
     asyncio.run(executor.async_evaluate(plan))
 

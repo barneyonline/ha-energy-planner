@@ -329,6 +329,19 @@ def test_action_validation_reports_global_and_time_window_issues() -> None:
     assert "plan_expired" in violations
 
 
+def test_action_validation_rejects_truthy_string_safety_options() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(now, ActionAsset.EV, ActionKind.EV_START, {})
+    context = _context(now)
+    plan = _plan(now, action)
+    options = {**DEFAULT_OPTIONS, "planner_enabled": "true", "dry_run": "false"}
+
+    violations = ConstraintValidator(options).validate_action(context, plan, action, now=now)
+
+    assert "planner_disabled" in violations
+    assert "dry_run_enabled" in violations
+
+
 def test_enphase_restore_ai_has_no_savings_threshold_violation() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     action = _action(now, ActionAsset.ENPHASE, ActionKind.RESTORE_AI, {"profile": "AI Optimisation"})

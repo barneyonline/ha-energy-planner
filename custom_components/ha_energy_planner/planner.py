@@ -49,6 +49,7 @@ from .models import (
     PlanAction,
     PlannerMode,
 )
+from .safety import strict_bool
 from .thermal_model import (
     thermal_active_temperature_rate_c_per_hour,
     thermal_hvac_load_kw,
@@ -114,11 +115,13 @@ class DryRunPlanner:
         )
 
     def _mode(self, context: DecisionContext) -> PlannerMode:
+        planner_enabled = strict_bool(self.options.get(CONF_PLANNER_ENABLED), default=False)
+        dry_run = strict_bool(self.options.get(CONF_DRY_RUN), default=True)
         if context.input_health == InputHealth.UNSAFE:
-            return PlannerMode.ACTIVE_DEGRADED if self.options[CONF_PLANNER_ENABLED] else PlannerMode.DISABLED
-        if not self.options[CONF_PLANNER_ENABLED]:
+            return PlannerMode.ACTIVE_DEGRADED if planner_enabled else PlannerMode.DISABLED
+        if not planner_enabled:
             return PlannerMode.DISABLED
-        if self.options[CONF_DRY_RUN]:
+        if dry_run:
             return PlannerMode.DRY_RUN
         return PlannerMode.ACTIVE_HEALTHY
 

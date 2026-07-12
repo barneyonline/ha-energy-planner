@@ -54,6 +54,7 @@ from .models import EnergyPlan, HAEOSolvePhase, HAEOStatus, Override, PlannerMod
 from .planner import DryRunPlanner
 from .preflight import production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
+from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
 from .type_defs import EnergyPlannerConfigEntry
@@ -144,12 +145,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     @property
     def planner_enabled(self) -> bool:
         """Return whether planner execution is enabled."""
-        return bool(self.options.get(CONF_PLANNER_ENABLED, False))
+        return strict_bool(self.options.get(CONF_PLANNER_ENABLED), default=False)
 
     @property
     def dry_run(self) -> bool:
         """Return dry-run option state."""
-        return bool(self.options.get(CONF_DRY_RUN, True))
+        return strict_bool(self.options.get(CONF_DRY_RUN), default=True)
 
     def async_start_listeners(self) -> None:
         """Start debounced state listeners for configured input entities."""
@@ -492,7 +493,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_arm_production_control(self, reason: str = "user_acknowledged") -> None:
         """Arm production control after operator acknowledgement."""
-        production = dict(self.store.data.get("production", {}))
+        production = parse_production_state(self.store.data.get("production")).raw
         now = dt_util.utcnow()
         production.update(
             {
@@ -507,7 +508,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
         """Disarm production control."""
-        production = dict(self.store.data.get("production", {}))
+        production = parse_production_state(self.store.data.get("production")).raw
         production.update(
             {
                 "armed": False,
@@ -545,13 +546,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def _async_update_production_evidence(self, plan: EnergyPlan, violations: list[str]) -> None:
         """Track dry-run readiness evidence for the production gate."""
-        production = dict(self.store.data.get("production", {}))
+        production_state = parse_production_state(self.store.data.get("production"))
+        production = production_state.raw
         if plan.mode == PlannerMode.DRY_RUN and plan.health.value == "healthy" and not violations:
             evidence_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
+            ready_cycles = production_state.dry_run_ready_cycles
             if production.get("dry_run_evidence_fingerprint") != evidence_fingerprint:
-                production["dry_run_ready_cycles"] = 0
+                ready_cycles = 0
             production["dry_run_evidence_fingerprint"] = evidence_fingerprint
-            production["dry_run_ready_cycles"] = int(production.get("dry_run_ready_cycles", 0) or 0) + 1
+            production["dry_run_ready_cycles"] = min(
+                ready_cycles + 1,
+                DRY_RUN_READY_CYCLES_REQUIRED,
+            )
             production["last_dry_run_ready_at"] = plan.created_at
         elif plan.health.value == "unsafe":
             production["last_blocking_reason"] = "input_health_unsafe"

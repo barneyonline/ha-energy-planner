@@ -4,7 +4,27 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from custom_components.ha_energy_planner.safety import control_pause_reason
+from custom_components.ha_energy_planner.safety import (
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
+
+
+def test_production_state_parser_is_strict_bounded_and_fail_closed() -> None:
+    assert parse_production_state(None).armed is False
+    assert parse_production_state("corrupt").raw == {}
+    assert parse_production_state({"armed": "true", "dry_run_ready_cycles": "3"}).armed is False
+    assert parse_production_state({"armed": 1, "dry_run_ready_cycles": True}).dry_run_ready_cycles == 0
+    assert parse_production_state({"dry_run_ready_cycles": -1}).dry_run_ready_cycles == 0
+    assert parse_production_state({"dry_run_ready_cycles": 10_001}).dry_run_ready_cycles == 0
+    assert parse_production_state({"dry_run_ready_cycles": 42}).dry_run_ready_cycles == 3
+    assert parse_production_state(
+        {"dry_run_evidence_fingerprint": 123}
+    ).dry_run_evidence_fingerprint is None
+    assert strict_bool("true") is False
+    assert strict_bool("false", default=True) is True
+    assert strict_bool(True) is True
 
 
 def test_control_pause_parser_handles_current_and_legacy_shapes() -> None:

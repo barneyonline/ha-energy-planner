@@ -267,9 +267,11 @@ Status as of 2026-06-28.
   eight usable priced hours (or the full configured horizon when shorter), and
   no active control pause. Historical evidence is invalidated when the required
   control areas, mapped entities/services, or decision/control policies change,
-  while runtime planner/dry-run mode and advisory AI settings are excluded so
-  an intentional dry-run-to-active transition retains valid evidence. The
-  executor and readiness sensor independently fail closed on a mismatch. Pause
+  while runtime planner/dry-run mode, per-run EV ready-by changes, and advisory
+  AI settings are excluded so an intentional dry-run-to-active transition
+  retains valid evidence. The executor and readiness sensor independently fail
+  closed on a mismatch, missing state, non-boolean armed value, or malformed or
+  unreasonable evidence counter. Pause
   parsing is shared and timezone-aware; malformed active and legacy pause states
   remain paused rather than failing open.
   `active_control_ready` still requires the independent production arm.

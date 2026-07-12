@@ -2,8 +2,49 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+
+DRY_RUN_READY_CYCLES_REQUIRED = 3
+_MAX_REASONABLE_LEGACY_READY_CYCLES = 10_000
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSafetyState:
+    """Defensively parsed production-gate state."""
+
+    raw: dict[str, Any]
+    armed: bool
+    dry_run_ready_cycles: int
+    dry_run_evidence_fingerprint: str | None
+
+
+def strict_bool(value: Any, *, default: bool = False) -> bool:
+    """Accept only actual booleans, falling back safely for corrupt values."""
+    return value if isinstance(value, bool) else default
+
+
+def parse_production_state(value: Any) -> ProductionSafetyState:
+    """Return bounded fail-closed production state from persisted data."""
+    raw = dict(value) if isinstance(value, Mapping) else {}
+    cycles_value = raw.get("dry_run_ready_cycles", 0)
+    cycles = 0
+    if (
+        isinstance(cycles_value, int)
+        and not isinstance(cycles_value, bool)
+        and 0 <= cycles_value <= _MAX_REASONABLE_LEGACY_READY_CYCLES
+    ):
+        cycles = min(cycles_value, DRY_RUN_READY_CYCLES_REQUIRED)
+    fingerprint_value = raw.get("dry_run_evidence_fingerprint")
+    fingerprint = fingerprint_value if isinstance(fingerprint_value, str) and fingerprint_value else None
+    return ProductionSafetyState(
+        raw=raw,
+        armed=raw.get("armed") is True,
+        dry_run_ready_cycles=cycles,
+        dry_run_evidence_fingerprint=fingerprint,
+    )
 
 
 def control_pause_reason(value: Any, now: datetime, *, asset: str | None = None) -> str | None:
