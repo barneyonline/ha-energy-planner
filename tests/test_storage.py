@@ -15,7 +15,13 @@ from custom_components.ha_energy_planner.models import (
     Override,
     PlannerMode,
 )
-from custom_components.ha_energy_planner.storage import PlannerStore
+from custom_components.ha_energy_planner.storage import (
+    PlannerStore,
+    _audit_entry,
+    _dry_run_signature,
+    _same_audit_outcome,
+    _same_dry_run_comparison,
+)
 
 
 class FakeStore:
@@ -289,3 +295,104 @@ def test_store_audit_entry_bounds_mapping_values(monkeypatch: object) -> None:
     audit = store.data["execution_audit"][0]
     assert len(audit["pre_state"]) == 12
     assert audit["post_state"] == {}
+
+
+def test_store_coalesces_materially_identical_dry_run_outcomes(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    first_at = datetime(2026, 6, 27, tzinfo=UTC)
+    second_at = first_at + timedelta(minutes=1)
+
+    async def add_outcomes() -> None:
+        for action_id, plan_id, attempted_at in (
+            ("generated-action-1", "generated-plan-1", first_at),
+            ("generated-action-2", "generated-plan-2", second_at),
+        ):
+            await store.async_add_outcome(
+                ActionOutcome(
+                    action_id=action_id,
+                    attempted_at=attempted_at,
+                    result=OutcomeResult.SKIPPED,
+                    reason="dry_run",
+                    pre_state={},
+                    post_state={},
+                    plan_id=plan_id,
+                    asset="enphase",
+                    kind="restore_ai",
+                )
+            )
+
+    asyncio.run(add_outcomes())
+
+    assert len(store.data["execution_audit"]) == 1
+    assert store.data["execution_audit"][0]["occurrence_count"] == 2
+    assert store.data["execution_audit"][0]["last_attempted_at"] == second_at.isoformat()
+
+
+def test_store_coalesces_dry_run_comparisons_ignoring_generated_metadata(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    base_action = {
+        "asset": "ev",
+        "kind": "ev_start",
+        "desired_state": {"enabled": True},
+        "reason_codes": ["cheap_price"],
+    }
+
+    async def add_comparisons() -> None:
+        await store.async_add_dry_run_comparison(
+            {
+                "created_at": "first",
+                "plan_id": "plan-1",
+                "planned_action_count": 1,
+                "next_action": {**base_action, "action_id": "a-1"},
+            }
+        )
+        await store.async_add_dry_run_comparison(
+            {
+                "created_at": "second",
+                "plan_id": "plan-2",
+                "planned_action_count": 1,
+                "next_action": {**base_action, "action_id": "a-2"},
+            }
+        )
+
+    asyncio.run(add_comparisons())
+
+    assert len(store.data["dry_run_comparisons"]) == 1
+    assert store.data["dry_run_comparisons"][0]["occurrence_count"] == 2
+
+
+def test_audit_dedup_helpers_handle_malformed_and_sparse_records() -> None:
+    assert _same_audit_outcome("bad", {}) is False
+    assert _same_dry_run_comparison({}, "bad") is False
+    assert _dry_run_signature(
+        {"next_action": "unknown", "recent_outcomes": ["bad", {"asset": "ev", "result": "skipped"}]}
+    ) == {
+        "planned_action_count": None,
+        "next_action": "unknown",
+        "estimated_daily_cost": None,
+        "recent_outcomes": [
+            {
+                "asset": "ev",
+                "kind": None,
+                "desired_state": None,
+                "result": "skipped",
+                "reason": None,
+                "service_target": None,
+                "pre_state": None,
+                "post_state": None,
+            }
+        ],
+    }
+    outcome = ActionOutcome(
+        action_id="ev",
+        attempted_at=datetime(2026, 6, 27, tzinfo=UTC),
+        result=OutcomeResult.SKIPPED,
+        reason="dry_run",
+        pre_state={},
+        post_state={},
+        plan_id="plan",
+        desired_state={"target_soc_percent": 80},
+    )
+    assert _audit_entry(outcome)["desired_state"] == {"target_soc_percent": 80}

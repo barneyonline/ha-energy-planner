@@ -75,7 +75,12 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "haeo": _redact(_latest_haeo_status(store_data)),
-        "refresh_performance": _redact(getattr(coordinator, "last_refresh_metadata", None)),
+        "refresh_performance": _redact(
+            {
+                "latest": getattr(coordinator, "last_refresh_metadata", None),
+                "metrics": getattr(coordinator, "refresh_metrics", None),
+            }
+        ),
         "recent_outcomes": _redact(_recent_items(store_data, "outcomes", limit=10)),
         "recent_audit": _redact(_recent_items(store_data, "execution_audit", limit=20)),
         "recent_dry_run_comparisons": _redact(_recent_items(store_data, "dry_run_comparisons", limit=10)),

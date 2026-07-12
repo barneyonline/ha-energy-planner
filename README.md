@@ -45,7 +45,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
 - Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
 - Battery-aware decisions using configured usable capacity, reserve floor, round-trip efficiency, maximum charge power, and maximum discharge power
-- HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, and bounded fallback planning when HAEO is unavailable or returns an unhealthy result
+- HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, and bounded fallback planning when HAEO is unavailable, unhealthy, or unable to return planning evidence
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
 - EV planning with connected state, SOC, start/stop entities, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
 - Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
@@ -53,9 +53,10 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
 - Coverage-aware forecast confidence: short payloads retain missing slots and make required planning inputs unsafe instead of repeating the final value across the horizon
 - Decision audit, rejected action, upcoming timeline, and per-device decision sensors explaining what was selected and why alternatives were skipped
-- Optional AI advice through supported Home Assistant AI Task entities, rate-limited and treated as advisory only
+- Optional AI advice through supported Home Assistant AI Task entities, skipped for unsafe/zero-confidence plans, cached by a bounded material plan signature, rate-limited, and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
-- Execution audit and support bundle services for production review without reading Home Assistant storage files directly
+- Execution audit and support bundle services for production review without reading Home Assistant storage files directly; repeated identical dry-run outcomes are coalesced with occurrence counts
+- Explicit decision-input replan listeners, observation-only sampling for high-frequency power sensors, a one-minute non-manual refresh floor, unchanged-input short-circuiting, and refresh trigger/phase/counter telemetry
 - Home Assistant diagnostics, system health, modular repair/preflight evidence for partial installations, native currency/device-class semantics, entity translations, and icons for all exposed entities
 - Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
 

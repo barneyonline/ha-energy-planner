@@ -215,9 +215,10 @@ def test_real_haeo_optimize_service_uses_config_entry_schema() -> None:
 
     result = asyncio.run(adapter.async_solve_baseline(context))
 
-    assert result.status == HAEOStatus.READY
+    assert result.status == HAEOStatus.STALE
+    assert result.reason == "haeo_response_unsupported"
     assert result.response is None
-    assert hass.services.calls == [("haeo", "optimize", {"config_entry": "haeo-entry-1"})]
+    assert hass.services.calls == []
     assert adapter.supports_flexible_second_pass is False
 
 
@@ -256,8 +257,9 @@ def test_native_haeo_requires_explicit_selection_when_multiple_entries() -> None
 
     selected = HAEOAdapter(hass, "haeo.optimize", "haeo-z")
     result = asyncio.run(selected.async_solve_baseline(_context()))
-    assert result.status == HAEOStatus.READY
-    assert hass.services.calls == [("haeo", "optimize", {"config_entry": "haeo-z"})]
+    assert result.status == HAEOStatus.STALE
+    assert result.reason == "haeo_response_unsupported"
+    assert hass.services.calls == []
 
 
 def test_response_capable_custom_service_detects_projection_contract() -> None:
@@ -704,14 +706,8 @@ def test_haeo_capability_and_registry_defensive_branches() -> None:
         def async_services(self) -> object:
             return []
 
-    assert (
-        haeo_module._service_descriptor(SimpleNamespace(services=TypeErrorRegistry()), "haeo", "optimize")
-        is None
-    )
-    assert (
-        haeo_module._service_descriptor(SimpleNamespace(services=NonDictRegistry()), "haeo", "optimize")
-        is None
-    )
+    assert haeo_module._service_descriptor(SimpleNamespace(services=TypeErrorRegistry()), "haeo", "optimize") is None
+    assert haeo_module._service_descriptor(SimpleNamespace(services=NonDictRegistry()), "haeo", "optimize") is None
 
 
 def test_haeo_cache_expiry_capacity_and_disabled_edges(monkeypatch: Any) -> None:

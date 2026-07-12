@@ -57,7 +57,14 @@ class PlannerStore:
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""
         audit = list(self.data.get("execution_audit", []))
-        audit.append(_audit_entry(outcome))
+        entry = _audit_entry(outcome)
+        if audit and _same_audit_outcome(audit[-1], entry):
+            previous = dict(audit[-1])
+            previous["occurrence_count"] = int(previous.get("occurrence_count", 1)) + 1
+            previous["last_attempted_at"] = entry["attempted_at"]
+            audit[-1] = previous
+        else:
+            audit.append(entry)
         self.data["execution_audit"] = audit[-100:]
         outcomes = list(self.data.get("outcomes", []))
         outcomes.append(to_jsonable(outcome))
@@ -80,7 +87,14 @@ class PlannerStore:
     async def async_add_dry_run_comparison(self, comparison: dict[str, Any]) -> None:
         """Persist compact dry-run comparison metadata."""
         comparisons = list(self.data.get("dry_run_comparisons", []))
-        comparisons.append(to_jsonable(comparison))
+        item = to_jsonable(comparison)
+        if comparisons and _same_dry_run_comparison(comparisons[-1], item):
+            previous = dict(comparisons[-1])
+            previous["occurrence_count"] = int(previous.get("occurrence_count", 1)) + 1
+            previous["last_created_at"] = item.get("created_at")
+            comparisons[-1] = previous
+        else:
+            comparisons.append(item)
         self.data["dry_run_comparisons"] = comparisons[-96:]
         await self._async_save()
 
@@ -199,7 +213,7 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
 def _audit_entry(outcome: ActionOutcome) -> dict[str, Any]:
     """Return a compact, redacted execution audit entry."""
     entry = to_jsonable(outcome)
-    return {
+    audit = {
         "attempted_at": entry.get("attempted_at"),
         "plan_id": entry.get("plan_id"),
         "action_id": entry.get("action_id"),
@@ -210,6 +224,83 @@ def _audit_entry(outcome: ActionOutcome) -> dict[str, Any]:
         "service_target": entry.get("service_target"),
         "pre_state": _bounded_mapping(entry.get("pre_state")),
         "post_state": _bounded_mapping(entry.get("post_state")),
+    }
+    if isinstance(entry.get("desired_state"), dict):
+        audit["desired_state"] = _bounded_mapping(entry["desired_state"])
+    return audit
+
+
+def _same_audit_outcome(previous: object, current: object) -> bool:
+    """Return whether adjacent audit outcomes carry the same decision."""
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    # Generated plan/action identifiers and timestamps do not change the
+    # material execution decision and must not defeat coalescing.
+    keys = (
+        "asset",
+        "kind",
+        "desired_state",
+        "result",
+        "reason",
+        "service_target",
+        "pre_state",
+        "post_state",
+    )
+    return all(previous.get(key) == current.get(key) for key in keys)
+
+
+def _same_dry_run_comparison(previous: object, current: object) -> bool:
+    """Return whether adjacent dry-run comparisons are materially identical."""
+    if not isinstance(previous, dict) or not isinstance(current, dict):
+        return False
+    return _dry_run_signature(previous) == _dry_run_signature(current)
+
+
+def _dry_run_signature(item: dict[str, Any]) -> dict[str, Any]:
+    """Return material dry-run data without generated IDs and timestamps."""
+    next_action = item.get("next_action")
+    if isinstance(next_action, dict):
+        normalized_action: object = {
+            key: next_action.get(key)
+            for key in (
+                "asset",
+                "kind",
+                "desired_state",
+                "hard_constraints",
+                "reason_codes",
+                "expected_cost_delta",
+                "confidence",
+                "requires_haeo_plan_id",
+            )
+        }
+    else:
+        normalized_action = next_action
+    recent_outcomes = item.get("recent_outcomes")
+    normalized_outcomes = []
+    if isinstance(recent_outcomes, list):
+        for outcome in recent_outcomes:
+            if not isinstance(outcome, dict):
+                continue
+            normalized_outcomes.append(
+                {
+                    key: outcome.get(key)
+                    for key in (
+                        "asset",
+                        "kind",
+                        "desired_state",
+                        "result",
+                        "reason",
+                        "service_target",
+                        "pre_state",
+                        "post_state",
+                    )
+                }
+            )
+    return {
+        "planned_action_count": item.get("planned_action_count"),
+        "next_action": normalized_action,
+        "estimated_daily_cost": item.get("estimated_daily_cost"),
+        "recent_outcomes": normalized_outcomes,
     }
 
 
