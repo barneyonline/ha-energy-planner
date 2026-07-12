@@ -255,8 +255,8 @@ Status as of 2026-06-28.
 - Forecast calibration explicitly drops legacy models and rebuilds current
   model fields from bounded timestamped evidence when persisted raw or unique
   counters are inconsistent or implausibly large. Bounded processed-observation
-  identifiers prevent duplicate training without dropping older observations
-  that arrive out of order.
+  observation-plus-lead identities prevent duplicate training without dropping
+  older observations or newly available lead buckets that arrive out of order.
 - Preflight discovery blocks only configured and enabled control areas. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
@@ -266,7 +266,12 @@ Status as of 2026-06-28.
   non-zero-confidence plan, a recent successful coordinator refresh, at least
   eight usable priced hours (or the full configured horizon when shorter), and
   no active control pause. Historical evidence is invalidated when the required
-  control areas, mapped configuration, or options change;
+  control areas, mapped entities/services, or decision/control policies change,
+  while runtime planner/dry-run mode and advisory AI settings are excluded so
+  an intentional dry-run-to-active transition retains valid evidence. The
+  executor and readiness sensor independently fail closed on a mismatch. Pause
+  parsing is shared and timezone-aware; malformed active and legacy pause states
+  remain paused rather than failing open.
   `active_control_ready` still requires the independent production arm.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
   results are discarded before they can overwrite the active plan or execute

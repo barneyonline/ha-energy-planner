@@ -11,6 +11,7 @@ from custom_components.ha_energy_planner.forecast_calibration import (
     _bounded_uncertainty_factor,
     _finite_float_or_none,
     _nearest_observation,
+    _non_negative_int,
     _observations_for_field,
     _parse_datetime_or_none,
     _percentile,
@@ -431,6 +432,36 @@ def test_forecast_calibration_resets_legacy_and_million_scale_counters() -> None
     assert contaminated == {}
 
 
+def test_forecast_calibration_rebuild_preserves_processed_identities() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    model, changed = update_forecast_calibration(
+        {
+            "pv_forecast_kw": {
+                "model_version": 3,
+                "sample_count": 2_000_000,
+                "raw_sample_count": 2_000_000,
+                "samples": [
+                    {
+                        "valid_at": valid_at.isoformat(),
+                        "lead_bucket": 2,
+                        "forecast": 1.0,
+                        "actual": 1.2,
+                    }
+                ],
+                "processed_sample_ids": ["observation:sample"],
+            }
+        },
+        [],
+        {},
+        now=now,
+    )
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["processed_sample_ids"] == ["observation:sample"]
+    assert _non_negative_int("invalid") == 0
+
+
 def test_forecast_calibration_only_processes_new_mature_observations() -> None:
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     valid_at = now - timedelta(minutes=5)
@@ -453,7 +484,7 @@ def test_forecast_calibration_only_processes_new_mature_observations() -> None:
     assert changed is True
     assert changed_again is False
     assert unchanged == model
-    assert model["pv_forecast_kw"]["processed_observation_ids"] == [valid_at.isoformat()]
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 1
 
 
 def test_forecast_calibration_accepts_out_of_order_unprocessed_observation() -> None:
@@ -481,7 +512,32 @@ def test_forecast_calibration_accepts_out_of_order_unprocessed_observation() -> 
 
     assert changed is True
     assert model["pv_forecast_kw"]["sample_count"] == 2
-    assert model["pv_forecast_kw"]["processed_observation_ids"] == [older.isoformat(), newer.isoformat()]
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 2
+
+
+def test_forecast_calibration_backfills_new_lead_bucket_for_processed_observation() -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    valid_at = now - timedelta(minutes=5)
+    observation = {"pv_forecast_kw": {valid_at.isoformat(): 1.2}}
+
+    def snapshot(hours_before: int) -> dict[str, object]:
+        return {
+            "forecast_training_slots": [
+                {
+                    "issued_at": valid_at - timedelta(hours=hours_before),
+                    "valid_at": valid_at,
+                    "pv_forecast_kw": 1.0,
+                }
+            ]
+        }
+
+    model, _changed = update_forecast_calibration({}, [snapshot(1)], observation, now=now)
+    model, changed = update_forecast_calibration(model, [snapshot(2)], observation, now=now)
+
+    assert changed is True
+    assert model["pv_forecast_kw"]["raw_sample_count"] == 2
+    assert set(model["pv_forecast_kw"]["buckets"]) == {"2", "4"}
+    assert len(model["pv_forecast_kw"]["processed_sample_ids"]) == 2
 
 
 def test_forecast_calibration_rebuilds_inconsistent_unique_sample_count() -> None:

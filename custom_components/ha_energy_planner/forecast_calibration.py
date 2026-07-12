@@ -99,16 +99,11 @@ def update_forecast_calibration(
         if not field_observations:
             continue
         calibration = dict(updated.get(field, {})) if isinstance(updated.get(field), Mapping) else {}
-        processed_observation_ids = _processed_observation_ids(calibration.get("processed_observation_ids"))
-        field_observations = [
-            item for item in field_observations if item[0].isoformat() not in processed_observation_ids
-        ]
-        if not field_observations:
-            continue
+        processed_sample_ids = _processed_sample_ids(calibration.get("processed_sample_ids"))
         samples = _stored_samples(calibration.get("samples", []), field)
         seen = {str(sample["sample_id"]) for sample in samples}
         field_changed = False
-        processed_observation_times: list[datetime] = []
+        newly_processed_ids: set[str] = set()
 
         for snapshot in snapshots:
             slots = snapshot.get("forecast_training_slots", [])
@@ -126,7 +121,8 @@ def update_forecast_calibration(
                     continue
                 lead_bucket = max(int((valid_at - issued_at).total_seconds() // 1800), 0)
                 sample_id = f"{field}:{valid_at.isoformat()}:{lead_bucket}"
-                if sample_id in seen:
+                processed_id = f"{observation[0].isoformat()}:{sample_id}"
+                if sample_id in seen or processed_id in processed_sample_ids:
                     continue
                 samples.append(
                     {
@@ -138,14 +134,14 @@ def update_forecast_calibration(
                     }
                 )
                 seen.add(sample_id)
-                processed_observation_times.append(observation[0])
+                newly_processed_ids.add(processed_id)
                 changed = True
                 field_changed = True
 
         if field_changed:
             rebuilt = _rebuild_model(_trim_samples(samples))
-            processed_observation_ids.update(item.isoformat() for item in processed_observation_times)
-            rebuilt["processed_observation_ids"] = sorted(processed_observation_ids)[-MAX_STORED_SAMPLES:]
+            processed_sample_ids.update(newly_processed_ids)
+            rebuilt["processed_sample_ids"] = sorted(processed_sample_ids)[-MAX_STORED_SAMPLES:]
             updated[field] = rebuilt
 
     return updated, changed
@@ -180,9 +176,9 @@ def _migrate_calibration_model(
             or sample_count != unique_sample_count
         ):
             rebuilt = _rebuild_model(samples)
-            processed = _processed_observation_ids(calibration.get("processed_observation_ids"))
+            processed = _processed_sample_ids(calibration.get("processed_sample_ids"))
             if processed:
-                rebuilt["processed_observation_ids"] = sorted(processed)[-MAX_STORED_SAMPLES:]
+                rebuilt["processed_sample_ids"] = sorted(processed)[-MAX_STORED_SAMPLES:]
             if samples:
                 updated[field] = rebuilt
             else:
@@ -191,16 +187,11 @@ def _migrate_calibration_model(
     return updated, changed
 
 
-def _processed_observation_ids(value: Any) -> set[str]:
-    """Return bounded valid timestamp identifiers already paired to forecasts."""
+def _processed_sample_ids(value: Any) -> set[str]:
+    """Return bounded observation-plus-lead identities already trained."""
     if not isinstance(value, list):
         return set()
-    valid = {
-        parsed.isoformat()
-        for item in value[-MAX_STORED_SAMPLES:]
-        if (parsed := _parse_datetime_or_none(item)) is not None
-    }
-    return valid
+    return {str(item) for item in value[-MAX_STORED_SAMPLES:] if isinstance(item, str) and item}
 
 
 def _trim_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:

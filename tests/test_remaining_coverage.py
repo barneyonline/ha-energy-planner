@@ -70,10 +70,14 @@ from custom_components.ha_energy_planner.planner import DryRunPlanner
 from custom_components.ha_energy_planner.preflight import (
     _audit_report,
     _bounded_join,
+    _current_plan_report,
     _entity_report,
     _production_gate_message,
     _service_report,
     _split_entities,
+)
+from custom_components.ha_energy_planner.preflight import (
+    _datetime_or_none as preflight_datetime_or_none,
 )
 from custom_components.ha_energy_planner.replay import ReplayActionResult, ReplayResult
 from custom_components.ha_energy_planner.subentry_migration import (
@@ -202,6 +206,44 @@ def test_remaining_preflight_helpers() -> None:
         )
         == "Production gate is not ready to arm yet."
     )
+
+
+def test_current_plan_report_defensive_and_status_branches() -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+    refresh = {"succeeded": True, "completed_at": now}
+
+    assert _current_plan_report(None, now=now)["present"] is False
+    malformed_horizon = SimpleNamespace(
+        health="healthy",
+        status="current",
+        confidence=1.0,
+        interval_minutes=5,
+        horizon_hours=8,
+        estimated_cost_horizon_hours="bad",
+        input_issues=[],
+        created_at=now,
+    )
+    assert _current_plan_report(
+        malformed_horizon, now=now, last_refresh_metadata=refresh
+    )["adequate_coverage"] is False
+    stale_status = SimpleNamespace(
+        **{
+            **malformed_horizon.__dict__,
+            "status": "stale",
+            "estimated_cost_horizon_hours": 8,
+        }
+    )
+    assert _current_plan_report(stale_status, now=now, last_refresh_metadata=refresh)["message"] == (
+        "The latest plan is not current."
+    )
+    zero_confidence = SimpleNamespace(
+        **{**malformed_horizon.__dict__, "confidence": 0.0, "estimated_cost_horizon_hours": 8}
+    )
+    assert _current_plan_report(zero_confidence, now=now, last_refresh_metadata=refresh)["message"] == (
+        "Current plan confidence is zero."
+    )
+    assert preflight_datetime_or_none(123) is None
+    assert preflight_datetime_or_none("bad") is None
 
 
 def test_remaining_thermal_and_input_branches() -> None:
