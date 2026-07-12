@@ -45,6 +45,11 @@ async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
             "plan_health": None if plan is None else str(plan.health),
             "configured_input_groups": len(getattr(entry, "subentries", {})),
             "latest_haeo_status": _latest_status(store_data.get("haeo_runs")),
+            "last_refresh_duration_ms": (getattr(coordinator, "last_refresh_metadata", None) or {}).get(
+                "duration_ms"
+            ),
+            "latest_haeo_duration_ms": _latest_haeo_metric(store_data.get("haeo_runs"), "duration_ms"),
+            "latest_haeo_cache_hit": _latest_haeo_metric(store_data.get("haeo_runs"), "cache_hit"),
             "latest_ai_status": _latest_status(store_data.get("ai_recommendations")),
         }
     )
@@ -65,3 +70,25 @@ def _latest_status(value: Any) -> str | None:
     if isinstance(baseline, dict) and baseline.get("status") is not None:
         return str(baseline["status"])
     return None
+
+
+def _latest_value(value: Any, key: str) -> Any:
+    """Return a compact value from the latest stored dictionary."""
+    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
+        return None
+    return value[-1].get(key)
+
+
+def _latest_haeo_metric(value: Any, key: str) -> Any:
+    """Return a combined metric from the latest HAEO baseline/second pass."""
+    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
+        return None
+    phases = [value[-1].get(name) for name in ("baseline", "second_pass")]
+    phase_values = [phase.get(key) for phase in phases if isinstance(phase, dict) and phase.get(key) is not None]
+    if not phase_values:
+        return value[-1].get(key)
+    if key == "duration_ms":
+        return round(sum(float(item) for item in phase_values), 3)
+    if key == "cache_hit":
+        return any(bool(item) for item in phase_values)
+    return phase_values[-1]

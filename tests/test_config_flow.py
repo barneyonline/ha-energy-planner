@@ -48,6 +48,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
@@ -255,6 +256,7 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     export_filter = schema_fields[CONF_AMBER_EXPORT_PRICE].serialize()["selector"]["entity"]["filter"][0]
     pv_filter = schema_fields[CONF_PV_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     baseline_filter = schema_fields[CONF_BASELINE_LOAD_FORECAST].serialize()["selector"]["entity"]["filter"][0]
+    carbon_filter = schema_fields[CONF_CARBON_INTENSITY_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     pv_observed_filter = schema_fields[CONF_PV_OBSERVED].serialize()["selector"]["entity"]["filter"][0]
     load_observed_filter = schema_fields[CONF_BASELINE_LOAD_OBSERVED].serialize()["selector"]["entity"]["filter"][0]
     battery_filter = schema_fields[CONF_BATTERY_SOC].serialize()["selector"]["entity"]["filter"][0]
@@ -265,6 +267,7 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     assert {"W", "kW", "kWh"} <= set(pv_filter["unit_of_measurement"])
     assert "kW" in baseline_filter["unit_of_measurement"]
     assert "kWh" not in baseline_filter["unit_of_measurement"]
+    assert {"gCO2/kWh", "kgCO₂/kWh"} <= set(carbon_filter["unit_of_measurement"])
     assert pv_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
     assert load_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
     assert battery_filter["unit_of_measurement"] == ["%", "percent", "percentage"]
@@ -1160,6 +1163,34 @@ def test_validate_config_accepts_solcast_energy_units_for_pv_forecast() -> None:
     )
 
     assert _validate_config(hass, _valid_input()) == {}
+
+
+def test_validate_config_accepts_optional_carbon_intensity_sensor() -> None:
+    hass = FakeHass(
+        _valid_hass().states.entity_ids | {"sensor.carbon_intensity"},
+        _valid_hass().services.services,
+        {"sensor.carbon_intensity": {"unit_of_measurement": "gCO₂/kWh"}},
+    )
+
+    assert _validate_config(
+        hass,
+        _valid_input({CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon_intensity"}),
+    ) == {}
+
+
+def test_validate_config_rejects_invalid_carbon_intensity_unit() -> None:
+    hass = FakeHass(
+        _valid_hass().states.entity_ids | {"sensor.carbon_intensity"},
+        _valid_hass().services.services,
+        {"sensor.carbon_intensity": {"unit_of_measurement": "kW"}},
+    )
+
+    errors = _validate_config(
+        hass,
+        _valid_input({CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon_intensity"}),
+    )
+
+    assert errors[CONF_CARBON_INTENSITY_FORECAST] == "invalid_unit"
 
 
 def test_validate_config_rejects_incompatible_sensor_unit() -> None:

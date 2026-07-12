@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from math import ceil, isfinite
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .const import (
     CONF_BATTERY_MAX_CHARGE_KW,
@@ -57,6 +58,7 @@ from .thermal_model import (
 HVAC_PRECONDITION_PROJECTED_LOAD_KW = 1.0
 THERMAL_SHIFT_MIN_TARGET_DELTA_C = 0.3
 THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR = 0.5
+HVAC_SUPPRESSION_LOOKAHEAD = timedelta(hours=2)
 
 
 class DryRunPlanner:
@@ -74,6 +76,7 @@ class DryRunPlanner:
         actions = self._actions(context, mode)
         preview = self._preview(context)
         estimated_cost = self._estimate_cost(context)
+        estimated_cost_horizon = self._estimated_cost_horizon_hours(context)
         device_plans = self._device_plans(context, actions)
         confidence_breakdown = _confidence_breakdown(context, actions)
         decision_audit = _decision_audit(context, actions, self.options)
@@ -107,6 +110,7 @@ class DryRunPlanner:
             rejected_actions=rejected_actions,
             timeline_card=timeline_card,
             confidence_breakdown=confidence_breakdown,
+            estimated_cost_horizon_hours=estimated_cost_horizon,
         )
 
     def _mode(self, context: DecisionContext) -> PlannerMode:
@@ -127,7 +131,10 @@ class DryRunPlanner:
                 "import_price": slot.import_price,
                 "export_price": slot.export_price,
                 "pv_forecast_kw": slot.pv_forecast_kw,
+                "pv_forecast_lower_kw": slot.pv_forecast_lower_kw,
                 "baseline_load_forecast_kw": slot.baseline_load_forecast_kw,
+                "baseline_load_forecast_upper_kw": slot.baseline_load_forecast_upper_kw,
+                "carbon_intensity_g_per_kwh": slot.carbon_intensity_g_per_kwh,
                 "outdoor_temperature_forecast_c": slot.outdoor_temperature_forecast_c,
                 "battery_floor_percent": battery_floor,
                 "occupied": context.occupancy_state,
@@ -168,7 +175,7 @@ class DryRunPlanner:
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         if context.ev_connected is not False and context.current_ev_soc_percent is not None:
             ready_by_text = context.ev_ready_by or str(self.options[CONF_DEFAULT_READY_BY])
-            ready_by = _next_ready_by(context.created_at, ready_by_text)
+            ready_by = _next_ready_by(context.created_at, ready_by_text, context.local_timezone)
             charge_rate_kw = float(self.options[CONF_EV_CHARGE_RATE_KW])
             soc_per_kwh = float(self.options[CONF_EV_SOC_PER_KWH])
             target_soc = context.ev_target_soc_percent
@@ -202,6 +209,7 @@ class DryRunPlanner:
                     charge_rate_kw=charge_rate_kw,
                     soc_per_kwh=soc_per_kwh,
                     interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+                    carbon_weight=_carbon_schedule_weight(self.options),
                 )
                 allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
                 for slot in context.slots:
@@ -218,6 +226,8 @@ class DryRunPlanner:
                         desired_state={
                             "target_soc_percent": schedule.scheduled_soc_percent,
                             "ready_by": ready_by_text,
+                            "ready_by_utc": ready_by.isoformat(),
+                            "ready_by_timezone": context.local_timezone,
                             "configured_target_soc_percent": target_soc,
                             "required_charge_percent": target.required_charge_percent,
                             "max_attainable_soc_percent": target.max_attainable_soc_percent,
@@ -232,6 +242,8 @@ class DryRunPlanner:
                                     "effective_price": allocation.effective_price,
                                     "solar_surplus_used_kw": allocation.solar_surplus_used_kw,
                                     "grid_import_used_kw": allocation.grid_import_used_kw,
+                                    "carbon_intensity_g_per_kwh": allocation.carbon_intensity_g_per_kwh,
+                                    "estimated_carbon_g": allocation.estimated_carbon_g,
                                 }
                                 for allocation in schedule.allocations
                             ],
@@ -316,8 +328,19 @@ class DryRunPlanner:
             return None
         if not _comfort_valid(context, float(self.options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT])):
             return None
-        current_price = context.slots[0].import_price if context.slots else None
-        future_prices = [slot.import_price for slot in context.slots[1:24] if slot.import_price is not None]
+        current_slot = context.slots[0] if context.slots else None
+        current_price = current_slot.import_price if current_slot is not None else None
+        lookahead_end = (
+            current_slot.valid_at + HVAC_SUPPRESSION_LOOKAHEAD if current_slot is not None else None
+        )
+        future_prices = [
+            slot.import_price
+            for slot in context.slots
+            if current_slot is not None
+            and lookahead_end is not None
+            and current_slot.valid_at < slot.valid_at < lookahead_end
+            and slot.import_price is not None
+        ]
         if current_price is None or not future_prices:
             return None
         future_min = min(future_prices)
@@ -362,8 +385,13 @@ class DryRunPlanner:
         if lead_minutes <= 0:
             return None
         interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
-        lead_slots = max(1, lead_minutes // interval_minutes)
-        future_slots = [slot for slot in context.slots[1 : lead_slots + 1] if slot.import_price is not None]
+        current_valid_at = context.slots[0].valid_at
+        lead_end = current_valid_at + timedelta(minutes=lead_minutes)
+        future_slots = [
+            slot
+            for slot in context.slots
+            if current_valid_at < slot.valid_at <= lead_end and slot.import_price is not None
+        ]
         if not future_slots:
             return None
         future_peak_slot = max(future_slots, key=lambda slot: float(slot.import_price))
@@ -401,15 +429,15 @@ class DryRunPlanner:
 
         projected_load_kw = thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW)
         thermal_summary = thermal_model_summary(self.thermal_model)
-        precondition_slots = _precondition_slot_count(
+        precondition_slots = _precondition_slots(
+            context=context,
             current_temperature=current_temperature,
             target_temperature=float(target),
             mode=str(mode),
-            interval_minutes=interval_minutes,
-            max_slots=context.slots.index(future_peak_slot),
+            latest_end=future_peak_slot.valid_at,
             thermal_model=self.thermal_model,
         )
-        for slot in context.slots[:precondition_slots]:
+        for slot in precondition_slots:
             slot.projected_hvac_load_kw = max(slot.projected_hvac_load_kw, projected_load_kw)
 
         desired_extra.update(
@@ -419,7 +447,7 @@ class DryRunPlanner:
                 "active_heat_rate_c_per_hour": thermal_summary["active_heat_rate_c_per_hour"],
                 "active_cool_rate_c_per_hour": thermal_summary["active_cool_rate_c_per_hour"],
                 "passive_indoor_drift_c_per_hour": thermal_summary["passive_indoor_drift_c_per_hour"],
-                "precondition_slot_count": precondition_slots,
+                "precondition_slot_count": len(precondition_slots),
             }
         )
         return PlanAction(
@@ -495,6 +523,22 @@ class DryRunPlanner:
                 total += net_kw * interval_hours * slot.export_price
             has_data = True
         return round(total, 4) if has_data else None
+
+    def _estimated_cost_horizon_hours(self, context: DecisionContext) -> float | None:
+        """Return the duration represented by usable estimated-cost slots."""
+        usable_slots = 0
+        for slot in context.slots:
+            haeo_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
+            haeo_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
+            if haeo_import_kw is not None and haeo_export_kw is not None:
+                if slot.import_price is not None or slot.export_price is not None:
+                    usable_slots += 1
+                continue
+            if slot.import_price is not None and slot.baseline_load_forecast_kw is not None:
+                usable_slots += 1
+        if usable_slots == 0:
+            return None
+        return round(usable_slots * int(self.options[CONF_PLANNING_INTERVAL_MINUTES]) / 60, 4)
 
     @staticmethod
     def _confidence(context: DecisionContext) -> float:
@@ -697,7 +741,56 @@ def _score_components(action: PlanAction, context: DecisionContext) -> dict[str,
         direction = action.desired_state.get("arbitrage_direction")
         components["solar_self_consumption"] = 1.0 if direction == "consume" else 0.4
         components["battery_reserve"] = _battery_reserve_score(context)
+    components["carbon"] = _carbon_action_score(action, context)
     return components
+
+
+def _carbon_schedule_weight(options: Mapping[str, Any]) -> float:
+    """Return carbon's share of the joint cost/carbon EV objective."""
+    weights = _priority_weights(options)
+    carbon = weights.get("carbon", 0.0)
+    cost = weights.get("cost", 0.0)
+    return carbon / (carbon + cost) if carbon + cost > 0 else 0.0
+
+
+def _carbon_action_score(action: PlanAction, context: DecisionContext) -> float:
+    """Score how well an action aligns consumption with lower-grid-carbon slots."""
+    intensities = [
+        float(slot.carbon_intensity_g_per_kwh)
+        for slot in context.slots
+        if slot.carbon_intensity_g_per_kwh is not None
+    ]
+    if len(intensities) < 2 or max(intensities) <= min(intensities):
+        return 0.0
+    minimum, maximum = min(intensities), max(intensities)
+
+    def low_carbon_score(value: float) -> float:
+        return round(1.0 - (value - minimum) / (maximum - minimum), 4)
+
+    current = context.slots[0].carbon_intensity_g_per_kwh if context.slots else None
+    if action.asset == ActionAsset.EV:
+        allocations = [
+            item
+            for item in action.desired_state.get("allocated_slots", [])
+            if isinstance(item, dict) and item.get("carbon_intensity_g_per_kwh") is not None
+        ]
+        if not allocations:
+            return 0.0
+        total_grid = sum(float(item.get("grid_import_used_kw") or 0.0) for item in allocations)
+        if total_grid <= 0:
+            return 1.0
+        average = sum(
+            float(item["carbon_intensity_g_per_kwh"]) * float(item.get("grid_import_used_kw") or 0.0)
+            for item in allocations
+        ) / total_grid
+        return low_carbon_score(average)
+    if current is None:
+        return 0.0
+    if action.asset == ActionAsset.DAIKIN and str(action.desired_state.get("mode", "")).lower() == "off":
+        return round(1.0 - low_carbon_score(float(current)), 4)
+    if action.asset == ActionAsset.ENPHASE and action.desired_state.get("arbitrage_direction") == "consume":
+        return round(1.0 - low_carbon_score(float(current)), 4)
+    return low_carbon_score(float(current))
 
 
 def _battery_reserve_score(context: DecisionContext) -> float:
@@ -1006,6 +1099,25 @@ def _precondition_slot_count(
         return max_slots
     interval_hours = interval_minutes / 60
     return min(max(1, ceil((temperature_delta / rate) / interval_hours)), max_slots)
+
+
+def _precondition_slots(
+    *,
+    context: DecisionContext,
+    current_temperature: float,
+    target_temperature: float,
+    mode: str,
+    latest_end: datetime,
+    thermal_model: Mapping[str, Any],
+) -> list[Any]:
+    """Return timestamp-selected slots that carry projected HVAC load."""
+    start = context.slots[0].valid_at if context.slots else context.created_at
+    end = latest_end
+    rate = thermal_active_temperature_rate_c_per_hour(thermal_model, mode)
+    if rate is not None and rate > 0:
+        required = timedelta(hours=abs(target_temperature - current_temperature) / rate)
+        end = min(end, start + required)
+    return [slot for slot in context.slots if start <= slot.valid_at < end]
 
 
 def _device_plan(
@@ -1330,22 +1442,43 @@ def _planned_enphase_profile(actions: list[PlanAction]) -> str | None:
     return None
 
 
-def _next_ready_by(created_at: Any, ready_by: str) -> Any:
-    """Return next ready-by datetime in the context timezone."""
+def _next_ready_by(created_at: Any, ready_by: str, local_timezone: str | None = None) -> Any:
+    """Return the next local ready-by instant normalized to UTC."""
     try:
         hour_text, minute_text = ready_by.split(":", 1)
-        ready_time = time(hour=int(hour_text), minute=int(minute_text[:2]), tzinfo=created_at.tzinfo)
+        ready_time = time(hour=int(hour_text), minute=int(minute_text[:2]))
     except (TypeError, ValueError):
-        ready_time = time(hour=7, minute=0, tzinfo=created_at.tzinfo)
-    candidate = created_at.replace(
-        hour=ready_time.hour,
-        minute=ready_time.minute,
-        second=0,
-        microsecond=0,
-    )
-    if candidate <= created_at:
-        candidate += timedelta(days=1)
-    return candidate
+        ready_time = time(hour=7, minute=0)
+    try:
+        timezone = ZoneInfo(local_timezone or "UTC")
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("UTC")
+    created_at_utc = created_at.astimezone(UTC)
+    local_date = created_at_utc.astimezone(timezone).date()
+    day_offset = 0
+    while True:
+        candidates = _valid_local_instants(local_date + timedelta(days=day_offset), ready_time, timezone)
+        future = [candidate for candidate in candidates if candidate > created_at_utc]
+        if future:
+            return min(future)
+        day_offset += 1
+
+
+def _valid_local_instants(local_date: date, local_time: time, timezone: ZoneInfo) -> list[datetime]:
+    """Resolve a wall time, advancing through a DST gap when necessary."""
+    requested = datetime.combine(local_date, local_time)
+    minute_offset = 0
+    while True:
+        wall = requested + timedelta(minutes=minute_offset)
+        candidates: set[datetime] = set()
+        for fold in (0, 1):
+            aware = wall.replace(tzinfo=timezone, fold=fold)
+            instant = aware.astimezone(UTC)
+            if instant.astimezone(timezone).replace(tzinfo=None) == wall:
+                candidates.add(instant)
+        if candidates:
+            return sorted(candidates)
+        minute_offset += 1
 
 
 def _asset_label(asset: ActionAsset) -> str:
@@ -1491,8 +1624,14 @@ def _forecast_solar_export_value(
     accepted_surplus_kwh = 0.0
     forecast_surplus_kwh = 0.0
     for slot in context.slots:
-        pv_kw = _positive_or_none(slot.pv_forecast_kw)
-        load_kw = _positive_or_none(slot.baseline_load_forecast_kw)
+        pv_kw = _positive_or_none(
+            slot.pv_forecast_lower_kw if slot.pv_forecast_lower_kw is not None else slot.pv_forecast_kw
+        )
+        load_kw = _positive_or_none(
+            slot.baseline_load_forecast_upper_kw
+            if slot.baseline_load_forecast_upper_kw is not None
+            else slot.baseline_load_forecast_kw
+        )
         export_price = _float_or_none(slot.export_price)
         if pv_kw is None or load_kw is None or export_price is None:
             continue
@@ -1532,8 +1671,14 @@ def _forecast_surplus_kwh(context: DecisionContext, interval_minutes: int) -> fl
     interval_hours = interval_minutes / 60
     total = 0.0
     for slot in context.slots:
-        pv_kw = _positive_or_none(slot.pv_forecast_kw)
-        load_kw = _positive_or_none(slot.baseline_load_forecast_kw)
+        pv_kw = _positive_or_none(
+            slot.pv_forecast_lower_kw if slot.pv_forecast_lower_kw is not None else slot.pv_forecast_kw
+        )
+        load_kw = _positive_or_none(
+            slot.baseline_load_forecast_upper_kw
+            if slot.baseline_load_forecast_upper_kw is not None
+            else slot.baseline_load_forecast_kw
+        )
         if pv_kw is None or load_kw is None:
             continue
         flexible_kw = max(float(slot.projected_ev_load_kw or 0.0), 0.0) + max(
