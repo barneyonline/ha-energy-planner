@@ -34,6 +34,7 @@ def test_system_health_reports_loaded_planner_state() -> None:
         ),
         options={"planner_enabled": False, "dry_run": True},
         last_refresh_metadata={"duration_ms": 15.0},
+        refresh_metrics={"refreshes_last_hour": 12},
         store=SimpleNamespace(
             data={
                 "haeo_runs": [
@@ -66,6 +67,7 @@ def test_system_health_reports_loaded_planner_state() -> None:
         "configured_input_groups": 2,
         "latest_haeo_status": "ready",
         "last_refresh_duration_ms": 15.0,
+        "refresh_metrics": {"refreshes_last_hour": 12},
         "latest_haeo_duration_ms": 12.5,
         "latest_haeo_cache_hit": True,
         "latest_ai_status": "accepted",
