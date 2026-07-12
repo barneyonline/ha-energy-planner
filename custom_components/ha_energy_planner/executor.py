@@ -82,6 +82,22 @@ class Executor:
         now = dt_util.utcnow()
         if now < action.execute_not_before or now > action.execute_not_after:
             return
+        # Dry run is an intentional observation mode, not a safety rejection.
+        # Keep plan-level constraint findings on the plan itself and emit one
+        # unambiguous skipped action outcome here.
+        if plan.mode == PlannerMode.DRY_RUN or bool(self.options.get("dry_run", False)):
+            await self.store.async_add_outcome(
+                self._action_outcome(
+                    action,
+                    now,
+                    result=OutcomeResult.SKIPPED,
+                    reason="dry_run",
+                    pre_state={},
+                    post_state={},
+                    plan_id=plan.plan_id,
+                )
+            )
+            return
         ownership = self._ownership_from_store()
         if context is not None and self.options:
             violations = ConstraintValidator(self.options).validate_action(
@@ -319,6 +335,7 @@ class Executor:
             asset=str(action.asset),
             kind=str(action.kind),
             service_target=_service_target_for_action(action, self.entry_data),
+            desired_state=dict(action.desired_state),
         )
 
     def _rate_limit_reason(self, action: Any, now: datetime) -> str | None:
@@ -534,8 +551,6 @@ class Executor:
 
     @staticmethod
     def _rejection_reason(plan: EnergyPlan) -> str | None:
-        if plan.mode == PlannerMode.DRY_RUN:
-            return "dry_run"
         if plan.mode == PlannerMode.DISABLED:
             return "planner_disabled"
         if plan.mode == PlannerMode.ACTIVE_DEGRADED:

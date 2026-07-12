@@ -22,7 +22,7 @@ from .const import (
     CONF_EV_CONTROL_ENABLED,
     CONF_PERSON_ENTITIES,
 )
-from .coordinator import EnergyPlannerCoordinator
+from .coordinator import EnergyPlannerCoordinator, _material_plan_fingerprint
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .preflight import _control_area_report, production_evidence_fingerprint
@@ -394,6 +394,7 @@ def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
             "issues": coordinator.data.input_issues[:20],
             "preview": coordinator.data.preview[:12],
             "refresh": getattr(coordinator, "last_refresh_metadata", None),
+            "refresh_metrics": getattr(coordinator, "refresh_metrics", None),
             "haeo": latest_haeo,
         }
     )
@@ -918,9 +919,9 @@ def _presence_preview_value(plan: EnergyPlan) -> str:
 
 def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
     """Return concise state for the latest AI advice run."""
-    recommendations = coordinator.store.data.get("ai_recommendations", [])
-    if isinstance(recommendations, list) and recommendations:
-        status = recommendations[-1].get("status")
+    latest = _current_ai_recommendation(coordinator)
+    if latest is not None:
+        status = latest.get("status")
         return _display_state(status or "unknown")
     if not coordinator.options.get("ai_enabled", False):
         return "Disabled"
@@ -929,13 +930,13 @@ def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
 
 def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest bounded AI response details."""
-    recommendations = coordinator.store.data.get("ai_recommendations", [])
-    if not isinstance(recommendations, list) or not recommendations:
+    current = _current_ai_recommendation(coordinator)
+    if current is None:
         return {
             "enabled": bool(coordinator.options.get("ai_enabled", False)),
             "latest": None,
         }
-    latest = dict(recommendations[-1])
+    latest = dict(current)
     accepted = latest.get("accepted")
     if not isinstance(accepted, dict):
         accepted = {}
@@ -959,6 +960,23 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "suggested_forecast_buffer_percent": accepted.get("suggested_forecast_buffer_percent"),
         "suggested_takeover_savings_threshold": accepted.get("suggested_takeover_savings_threshold"),
     }
+
+
+def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
+    """Return advice only when it belongs to the current safe committed plan."""
+    plan = coordinator.data
+    if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
+        return None
+    fingerprint = _material_plan_fingerprint(plan)
+    recommendations = coordinator.store.data.get("ai_recommendations", [])
+    if not isinstance(recommendations, list):
+        return None
+    for item in reversed(recommendations):
+        if not isinstance(item, dict):
+            continue
+        if item.get("plan_id") == plan.plan_id and item.get("plan_fingerprint") == fingerprint:
+            return item
+    return None
 
 
 def _confidence_breakdown_state(coordinator: EnergyPlannerCoordinator) -> str:
@@ -1011,6 +1029,7 @@ def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "health": str(coordinator.data.health),
         "breakdown": breakdown,
         "source_confidence": sources,
+        "forecast_coverage": _forecast_coverage_sources(coordinator),
         "improvement_actions": _confidence_improvement_actions(
             coordinator.data.confidence,
             health_score,
@@ -1064,6 +1083,32 @@ def _confidence_sources(coordinator: EnergyPlannerCoordinator) -> list[dict[str,
         }
         for source in sources[:12]
         if isinstance(source, dict)
+    ]
+
+
+def _forecast_coverage_sources(coordinator: EnergyPlannerCoordinator) -> list[dict[str, Any]]:
+    """Return bounded per-input temporal coverage from the current snapshot."""
+    latest = _latest_forecast_snapshot(coordinator)
+    sources = latest.get("forecast_coverage") if isinstance(latest, dict) else []
+    if not isinstance(sources, list):
+        return []
+    keys = (
+        "config_key",
+        "entity_id",
+        "classification",
+        "first_timestamp",
+        "last_timestamp",
+        "covered_hours",
+        "continuous_hours",
+        "longest_continuous_hours",
+        "leading_missing_slots",
+        "trailing_missing_slots",
+        "internal_missing_slots",
+        "leading_gap_filled_slots",
+        "leading_gap_filled_hours",
+    )
+    return [
+        {key: source.get(key) for key in keys if key in source} for source in sources[:12] if isinstance(source, dict)
     ]
 
 
@@ -1139,6 +1184,7 @@ def _confidence_source_label(source: dict[str, Any]) -> str:
         "amber_import_price_entity": "Amber import price",
         "amber_export_price_entity": "Amber export price",
         "pv_forecast_entity": "PV forecast",
+        "pv_forecast_secondary_entity": "Second PV forecast",
         "baseline_load_forecast_entity": "Baseline load forecast",
         "weather_entity": "Weather forecast",
     }
@@ -1151,8 +1197,22 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
     source_kind = source.get("source")
     if source_kind == "forecast_series":
         return "Forecast series found; confidence comes from entity metadata when present, otherwise 100%."
+    if source_kind == "forecast_series_stitched":
+        return "Timestamped forecast series were stitched, with the primary source taking precedence on overlap."
+    if source_kind == "forecast_series_leading_fill":
+        return (
+            "A short leading load gap was conservatively filled from the current numeric state at reduced confidence."
+        )
+    if source_kind == "forecast_series_partial":
+        return (
+            "Forecast series coverage is shorter than the displayed planning horizon; coverage thresholds limit health."
+        )
     if source_kind == "point_value_repeated":
         return "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
+    if source_kind == "point_value_only":
+        return (
+            "Only a current point value was found; required forecast coverage is unavailable and planning fails closed."
+        )
     if source_kind == "invalid_state":
         return "The entity state could not be converted into usable forecast data."
     return "Confidence source was not classified."

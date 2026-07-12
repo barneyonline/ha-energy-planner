@@ -148,7 +148,16 @@ class ConstraintValidator:
             )
         if _plan_is_expired(plan, now):
             violations.append(_action_violation(action, "plan_expired", "Plan is older than the configured horizon."))
-        violations.extend(self.evaluate_plan(context, replace(plan, actions=[])))
+        # Plan-wide grid projections and unrelated asset constraints belong to
+        # plan health, not to an individual command rejection. In particular,
+        # a neutral Enphase restore must not be blamed for an existing grid
+        # limit violation that it did not cause.
+        if action.kind != ActionKind.RESTORE_AI:
+            violations.extend(
+                violation
+                for violation in self.evaluate_plan(context, replace(plan, actions=[]))
+                if violation.asset == action.asset
+            )
         if action.asset == ActionAsset.ENPHASE:
             violations.extend(self._evaluate_enphase_action(action, now, ownership))
         manual_hvac_conflict = action.asset == ActionAsset.DAIKIN and (

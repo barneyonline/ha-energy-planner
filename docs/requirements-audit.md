@@ -70,12 +70,12 @@ Status as of 2026-06-28.
   codes before they can be persisted or shown in notifications.
 - Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
-- Local AI advice is disabled by default, redacted, JSON-only, whitelisted, and
-  advisory. Unsupported response fields are rejected, so it cannot call
-  services or change hard constraints. Docker smoke coverage exercises a
-  response-capable local AI advisor service through Home Assistant Core and
-  verifies accepted bounded advice in Store recommendations and forecast
-  snapshot metadata.
+- Local AI advice is disabled by default, minimized, JSON-only, whitelisted,
+  and advisory. Unsupported response fields are rejected, so it cannot call
+  services or change hard constraints. The integration warns that provider
+  integrations may independently log bounded prompts. Docker smoke coverage
+  exercises a response-capable local AI advisor service through Home Assistant
+  Core and verifies accepted bounded advice in Store recommendations.
 - Replay fixtures cover stale inputs, battery floor rejection, EV infeasible
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, and Enphase holds.
@@ -106,9 +106,22 @@ Status as of 2026-06-28.
   `real_load_forecast_accuracy` fixtures, and the
   `ha-energy-planner-history-v1-real` profile verifies exported source entity
   metadata before real-history completion is claimed.
-- Forecast parsing retains uncovered horizon slots as missing values. Input
-  confidence is multiplied by temporal coverage, and incomplete required
-  forecast horizons fail closed rather than extrapolating the final bucket.
+- Forecast parsing retains uncovered horizon slots as missing values and never
+  extrapolates the final bucket. Per-input evidence reports first/last
+  timestamps, total and continuous coverage, and leading/internal/trailing
+  gaps. Continuous coverage is healthy at 12 hours, degraded from 8 to under
+  12 hours, and unsafe below 8 hours; thresholds are capped by deliberately
+  shorter configured horizons. Degraded inputs remain action-ineligible under
+  the planner's existing healthy-input action gate.
+- A second optional PV entity supports timestamp-safe Solcast Today/Tomorrow
+  stitching across midnight and daylight-saving changes. Secondary series must
+  expose timezone-aware timestamps; untimestamped and naive timestamps are
+  diagnosed and rejected, and secondary slots are excluded from calibration
+  until per-slot issue-time provenance is retained. Required Amber, PV, and
+  load point values cannot satisfy forecast coverage. Short baseline-load
+  leading gaps are filled from the current numeric state for at most one hour,
+  with explicit diagnostic evidence and reduced confidence; long or internal
+  gaps remain missing and fail closed.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
   enforces all real validation profiles in one command so full real-system
   evidence cannot accidentally skip live-schema, HAEO value, or Recorder
@@ -235,10 +248,14 @@ Status as of 2026-06-28.
   charge/discharge, and battery SOC forecast evidence where available. Direct
   replay or persisted non-finite HAEO evidence is ignored before Enphase value
   calculations so it cannot suppress restore or publish NaN plan values.
-- Material-change events are debounced and finite numeric state changes below
-  the configured material-change threshold are suppressed, while transitions
-  into or out of non-finite numeric states force a replan so input health can
-  fail closed.
+- Only an explicit allowlist of decision inputs can request replanning. AI
+  result, integration-owned control, climate automation, and high-frequency
+  observed power entities cannot create feedback loops; observation-only
+  values are sampled on planning boundaries. Material changes are debounced,
+  constrained by a one-minute non-manual refresh floor, and coalesced. A stable
+  decision-input fingerprint skips HAEO, planning, execution, snapshots, and
+  persistence when no material input changed, while explicit manual replans
+  always force a fresh computation.
 - Coordinator startup schedules recurring wall-clock planning-interval boundary
   refreshes, without also registering a fixed `DataUpdateCoordinator` poll, in
   addition to material-change replans. Planner cost previews use the configured
@@ -248,10 +265,28 @@ Status as of 2026-06-28.
   local times. HVAC suppression and precondition projection windows compare
   timestamps, so their duration is independent of planning interval.
 - HAEO integration detects response and flexible-projection capabilities,
-  deterministically selects a unique native config entry, skips unsupported
-  second passes, and uses a bounded 30-second equivalent-input cache. Solve and
-  coordinator refresh duration, cache, evidence, and capability metadata are
-  available in diagnostics, plan-status attributes, and system health.
+  deterministically selects a unique native config entry, skips services that
+  cannot return planner evidence and unsupported second passes, and uses a
+  bounded 30-second equivalent-input cache. Service-call status is distinct
+  from forecast-evidence status; READY requires continuous import and export
+  evidence across at least 80% of the requested solve slots. Solve and
+  coordinator refresh duration,
+  trigger, coalesced/skipped counters, refreshes/hour, phase timing, cache,
+  evidence, and capability metadata are available to diagnostics consumers.
+- Dry-run actions are recorded as intentionally skipped with the stable
+  `dry_run` reason. Plan-wide violations remain on plan health instead of being
+  copied to unrelated action rejections, including neutral Enphase restores,
+  and materially identical audit/comparison records are coalesced with first/
+  last occurrence evidence. AI advice is skipped for unsafe or zero-confidence
+  plans and reused only while a bounded action, forecast preview, issue, and
+  cost signature remains unchanged. Provider work runs as a cancellable
+  single-flight task after plan commit, so advisory latency cannot hold the
+  coordinator refresh lock. Final publication is serialized with plan commits,
+  and sensors expose advice only when its plan ID and material fingerprint match
+  the current safe plan.
+- Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
+  retention with defensive hard caps, preserving day-ahead training evidence
+  across manual refresh bursts without unbounded storage growth.
 - Forecast calibration explicitly drops legacy models and rebuilds current
   model fields from bounded timestamped evidence when persisted raw or unique
   counters are inconsistent or implausibly large. Bounded processed-observation

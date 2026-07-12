@@ -344,7 +344,7 @@ def test_remaining_coordinator_and_executor_branches(monkeypatch: pytest.MonkeyP
             plan, context
         )
     )
-    assert store.data["outcomes"][0].reason == "input_health_not_healthy,input_health_unsafe"
+    assert store.data["outcomes"][0].reason == "input_health_not_healthy"
     assert (
         Executor(store, options={"command_rate_limit_seconds": 1})._rate_limit_reason(
             action, now + timedelta(seconds=5)

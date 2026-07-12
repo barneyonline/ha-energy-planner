@@ -70,6 +70,9 @@ async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
             "latest_ai_status": _latest_status(store_data.get("ai_recommendations")),
         }
     )
+    refresh_metrics = getattr(coordinator, "refresh_metrics", None)
+    if refresh_metrics is not None:
+        info["refresh_metrics"] = refresh_metrics
     return info
 
 

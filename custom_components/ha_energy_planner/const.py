@@ -12,6 +12,7 @@ CONF_HAEO_OPTIMIZE_SERVICE = "haeo_optimize_service"
 CONF_AMBER_IMPORT_PRICE = "amber_import_price_entity"
 CONF_AMBER_EXPORT_PRICE = "amber_export_price_entity"
 CONF_PV_FORECAST = "pv_forecast_entity"
+CONF_PV_FORECAST_SECONDARY = "pv_forecast_secondary_entity"
 CONF_BASELINE_LOAD_FORECAST = "baseline_load_forecast_entity"
 CONF_CARBON_INTENSITY_FORECAST = "carbon_intensity_forecast_entity"
 CONF_PV_OBSERVED = "pv_observed_entity"
@@ -94,7 +95,7 @@ CONF_MIN_EV_CONFIDENCE = "minimum_ev_confidence"
 CONF_MIN_ENPHASE_CONFIDENCE = "minimum_enphase_confidence"
 
 DEFAULT_OPTIONS = {
-    CONF_PLANNING_HORIZON_HOURS: 24,
+    CONF_PLANNING_HORIZON_HOURS: 12,
     CONF_PLANNING_INTERVAL_MINUTES: 5,
     CONF_DEFAULT_READY_BY: "07:00",
     CONF_BATTERY_MIN_SOC_PERCENT: 10.0,
@@ -141,6 +142,7 @@ DEFAULT_OPTIONS = {
 }
 
 DEBOUNCE_SECONDS = 20
+MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS = 60
 AI_ADVICE_MIN_INTERVAL_SECONDS = 300
 
 STORE_VERSION = 1

@@ -45,6 +45,7 @@ from custom_components.ha_energy_planner.models import (
     HAEOStatus,
     InputHealth,
     OccupancyState,
+    OutcomeResult,
     PlanAction,
     PlannerMode,
 )
@@ -1375,6 +1376,38 @@ def test_executor_records_mode_rejections_without_hass() -> None:
         asyncio.run(Executor(store).async_evaluate(plan))
         assert store.data["outcomes"][0].result == expected_result
         assert store.data["outcomes"][0].reason == expected_reason
+
+
+def test_executor_reports_dry_run_as_skipped_before_plan_violations() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "restore",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.ENPHASE,
+        ActionKind.RESTORE_AI,
+        {"profile": "AI Optimisation"},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1", now, 24, 5, "unsafe", InputHealth.UNSAFE, PlannerMode.DRY_RUN, "test", 0.0, None, [action], []
+    )
+    context = _context(now)
+    context.input_health = InputHealth.UNSAFE
+    context.slots[0].baseline_load_forecast_kw = 50.0
+    store = FakeStore()
+    executor = Executor(store, options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True})
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert len(store.data["outcomes"]) == 1
+    assert store.data["outcomes"][0].result == OutcomeResult.SKIPPED
+    assert store.data["outcomes"][0].reason == "dry_run"
 
 
 def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object) -> None:

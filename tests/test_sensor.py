@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 from custom_components.ha_energy_planner import sensor as sensor_module
+from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -133,7 +134,7 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert comparison.value_fn(coordinator) == "2 Planned"
     assert comparison.attrs_fn(coordinator)["latest"]["plan_id"] == "plan-1"
     assert support.value_fn(coordinator) == "Needs Review"
-    assert support.attrs_fn(coordinator)["latest_ai"]["reasoning_summary"] == "Looks OK"
+    assert support.attrs_fn(coordinator)["latest_ai"] == {"enabled": True, "latest": None}
 
 
 def test_decision_audit_sensors_expose_accepted_rejected_and_timeline_rows() -> None:
@@ -224,6 +225,25 @@ def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
                             },
                         ],
                     },
+                    "forecast_coverage": [
+                        {
+                            "config_key": "pv_forecast_entity",
+                            "entity_id": "sensor.pv",
+                            "classification": "healthy",
+                            "first_timestamp": "2026-07-12T00:00:00+00:00",
+                            "last_timestamp": "2026-07-12T11:55:00+00:00",
+                            "covered_hours": 12.0,
+                            "continuous_hours": 12.0,
+                            "longest_continuous_hours": 12.0,
+                            "leading_missing_slots": 0,
+                            "trailing_missing_slots": 144,
+                            "internal_missing_slots": 0,
+                            "leading_gap_filled_slots": 0,
+                            "leading_gap_filled_hours": 0.0,
+                            "ignored_extra": "bounded",
+                        },
+                        "bad",
+                    ],
                 }
             ]
         },
@@ -249,6 +269,23 @@ def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
         "Replace PV forecast (sensor.pv) with an entity that exposes forecast data for the planning horizon, "
         "or add source confidence metadata."
     ]
+    assert attrs["forecast_coverage"] == [
+        {
+            "config_key": "pv_forecast_entity",
+            "entity_id": "sensor.pv",
+            "classification": "healthy",
+            "first_timestamp": "2026-07-12T00:00:00+00:00",
+            "last_timestamp": "2026-07-12T11:55:00+00:00",
+            "covered_hours": 12.0,
+            "continuous_hours": 12.0,
+            "longest_continuous_hours": 12.0,
+            "leading_missing_slots": 0,
+            "trailing_missing_slots": 144,
+            "internal_missing_slots": 0,
+            "leading_gap_filled_slots": 0,
+            "leading_gap_filled_hours": 0.0,
+        }
+    ]
 
 
 def test_confidence_helper_edge_cases_are_readable() -> None:
@@ -268,6 +305,16 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
         )
         == []
     )
+    assert (
+        sensor_module._forecast_coverage_sources(
+            _coordinator(plan, store_data={"forecast_snapshots": [{"plan_id": "plan-1", "forecast_coverage": "bad"}]})
+        )
+        == []
+    )
+    assert "stitched" in sensor_module._confidence_source_reason({"source": "forecast_series_stitched"})
+    assert "leading load gap" in sensor_module._confidence_source_reason({"source": "forecast_series_leading_fill"})
+    assert "shorter" in sensor_module._confidence_source_reason({"source": "forecast_series_partial"})
+    assert "fails closed" in sensor_module._confidence_source_reason({"source": "point_value_only"})
     assert sensor_module._confidence_limiting_factor(0.0, 0.0, 0.0) == "unsafe_inputs"
     assert sensor_module._confidence_limiting_factor(0.65, 0.65, None) == "input_health"
     assert sensor_module._confidence_limiting_factor(1.0, 1.0, None) == "unknown"
@@ -929,6 +976,7 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
                 {
                     "created_at": "2026-06-27T00:00:00+00:00",
                     "plan_id": "plan-1",
+                    "plan_fingerprint": _material_plan_fingerprint(_plan()),
                     "status": "accepted",
                     "service_called": "ai_task.generate_data",
                     "ai_task_entity": "ai_task.extended_openai_ai_task",
@@ -967,6 +1015,8 @@ def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads
         store_data={
             "ai_recommendations": [
                 {
+                    "plan_id": "plan-1",
+                    "plan_fingerprint": _material_plan_fingerprint(_plan()),
                     "status": None,
                     "accepted": "invalid",
                     "rejected_detail": "invalid",
@@ -981,6 +1031,13 @@ def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads
     assert attrs["alerts"] == []
     assert attrs["rejected_detail"] == {}
 
+    malformed = _coordinator(
+        _plan(), options={"ai_enabled": True}, store_data={"ai_recommendations": ["bad"]}
+    )
+    assert description.value_fn(malformed) == "No response"
+    malformed.store.data["ai_recommendations"] = "bad"
+    assert description.attrs_fn(malformed)["latest"] is None
+
 
 def test_ai_advice_sensor_exposes_rejection_detail() -> None:
     coordinator = _coordinator(
@@ -991,6 +1048,7 @@ def test_ai_advice_sensor_exposes_rejection_detail() -> None:
                 {
                     "created_at": "2026-06-27T00:00:00+00:00",
                     "plan_id": "plan-1",
+                    "plan_fingerprint": _material_plan_fingerprint(_plan()),
                     "status": "rejected",
                     "service_called": "ai_task.generate_data",
                     "ai_task_entity": "ai_task.extended_openai_ai_task",
@@ -1017,7 +1075,7 @@ def test_ai_advice_sensor_exposes_rejection_detail() -> None:
     assert attrs["rejected_detail"]["fields"] == ["hard_constraint_changes"]
 
 
-def test_ai_advice_sensor_builds_rejection_detail_for_legacy_history() -> None:
+def test_ai_advice_sensor_hides_legacy_history_without_plan_fingerprint() -> None:
     coordinator = _coordinator(
         _plan(),
         options={"ai_enabled": True},
@@ -1036,10 +1094,36 @@ def test_ai_advice_sensor_builds_rejection_detail_for_legacy_history() -> None:
 
     attrs = description.attrs_fn(coordinator)
 
-    assert attrs["rejected_detail"] == {
-        "reason": "ai_response_not_json",
-        "message": "The AI service did not return a JSON object.",
+    assert description.value_fn(coordinator) == "No response"
+    assert attrs == {"enabled": True, "latest": None}
+
+
+def test_ai_advice_sensor_hides_stale_or_unsafe_plan_advice() -> None:
+    plan = _plan()
+    recommendation = {
+        "plan_id": plan.plan_id,
+        "plan_fingerprint": _material_plan_fingerprint(plan),
+        "status": "accepted",
+        "accepted": {"reasoning_summary": "stale"},
     }
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+    changed = _plan(preview=[{"import_price": 0.4}])
+    changed_coordinator = _coordinator(
+        changed,
+        options={"ai_enabled": True},
+        store_data={"ai_recommendations": [recommendation]},
+    )
+    unsafe = _plan()
+    unsafe.health = InputHealth.UNSAFE
+    unsafe.status = "unsafe"
+    unsafe_coordinator = _coordinator(
+        unsafe,
+        options={"ai_enabled": True},
+        store_data={"ai_recommendations": [recommendation]},
+    )
+
+    assert description.value_fn(changed_coordinator) == "No response"
+    assert description.attrs_fn(unsafe_coordinator)["latest"] is None
 
 
 def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
