@@ -434,7 +434,7 @@ rules:
         - tests/test_config_flow.py
   repair-issues:
     status: n/a
-    comment: Planner fallback and recovery are exposed through persistent notifications and restore-safe-state services rather than Home Assistant Repairs.
+    comment: Planner fallback and recovery are exposed through optional persistent plan-fallback notifications and restore-safe-state services rather than Home Assistant Repairs.
     references:
       code:
         - custom_components/ha_energy_planner/executor.py

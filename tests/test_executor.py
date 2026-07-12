@@ -23,6 +23,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
+    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     DEFAULT_OPTIONS,
 )
 from custom_components.ha_energy_planner.executor import (
@@ -220,10 +221,14 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
     assert hass.services.calls == []
 
 
-def test_restore_safe_state_creates_persistent_notification() -> None:
+def test_restore_safe_state_notification_remains_enabled_when_plan_alerts_are_disabled() -> None:
     store = FakeStore()
     hass = FakeHass()
-    executor = Executor(store, hass=hass)
+    executor = Executor(
+        store,
+        hass=hass,
+        options={CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: False},
+    )
 
     outcome = asyncio.run(executor.async_restore_safe_state("test_restore_reason"))
 
@@ -388,6 +393,57 @@ def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
     executor = Executor(store, hass=hass, notification_grace_until=now + timedelta(minutes=5))
 
     asyncio.run(executor.async_notify_plan_fallback(plan, ["input_health_unsafe"]))
+
+    assert hass.services.calls == [
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_plan_unsafe"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_grid_limit_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+    ]
+
+
+def test_plan_fallback_notifications_can_be_disabled() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="test",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["input_health_unsafe", "haeo_service_unavailable"],
+    )
+    store = FakeStore()
+    hass = FakeHass()
+    executor = Executor(
+        store,
+        hass=hass,
+        options={CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: False},
+    )
+
+    asyncio.run(
+        executor.async_notify_plan_fallback(
+            plan,
+            ["input_health_unsafe", "grid_import_limit_exceeded"],
+        )
+    )
 
     assert hass.services.calls == [
         (
