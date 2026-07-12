@@ -175,7 +175,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._ai_current_plan_safe = False
         self.last_refresh_metadata: dict[str, Any] = {}
         if bool(self.options.get(CONF_AI_ENABLED, False)):
-            _LOGGER.warning(
+            _LOGGER.info(
                 "AI advice is enabled; the selected provider may log bounded prompts independently. "
                 "Review the provider logger configuration"
             )

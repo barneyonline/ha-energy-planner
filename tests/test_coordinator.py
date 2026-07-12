@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -473,6 +474,8 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
 def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(
     monkeypatch: object, caplog: object
 ) -> None:
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+
     def fake_data_update_init(
         self: object, hass: object, *, logger: object, name: str, update_interval: object
     ) -> None:
@@ -512,6 +515,7 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1
     assert "provider may log bounded prompts" in caplog.text
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
     coordinator.entry.options["planner_enabled"] = "true"
     coordinator.entry.options["dry_run"] = "false"
