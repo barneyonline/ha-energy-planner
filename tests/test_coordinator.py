@@ -304,9 +304,9 @@ def test_manual_hvac_change_ignored_when_scheduler_guard_on() -> None:
     )
 
 
-def test_manual_hvac_change_ignored_during_planner_grace() -> None:
+def test_manual_hvac_change_preserved_during_planner_grace_when_not_expected() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-    assert not _is_manual_hvac_change(
+    assert _is_manual_hvac_change(
         FakeHass(),
         {CONF_DAIKIN_CLIMATE: "climate.daikin"},
         {"ownership": {"planner_hvac_action_expires_at": (now + timedelta(minutes=1)).isoformat()}},
@@ -574,7 +574,17 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
         {CONF_PLANNING_INTERVAL_MINUTES: 5},
     )
     coordinator.store = FakeStore(
-        {"ownership": {"planner_hvac_action_expires_at": datetime.now(UTC) + timedelta(minutes=1)}}
+        {
+            "ownership": {},
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": datetime.now(UTC),
+                    "desired_state": {"hvac_mode": "heat"},
+                }
+            ],
+        }
     )
     coordinator._boundary_cancel = None
     coordinator._debounce_cancel = None
@@ -585,7 +595,7 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     callback = callbacks[0]
     callback(FakeEvent("climate.daikin", "off", "heat"))
     assert coordinator.hass.created_tasks == []
-    coordinator.store.data["ownership"] = {}
+    coordinator.store.data["execution_audit"] = []
     callback(FakeEvent("climate.daikin", "off", "heat"))
     callback(FakeEvent("sensor.ev_soc", "50", "51"))
     callback(FakeEvent("sensor.price", "100", "110"))
@@ -765,6 +775,7 @@ def test_background_ai_is_non_blocking_single_flight_and_persists() -> None:
         coordinator._ai_advice_task = None
         coordinator._ai_advice_fingerprint = None
         coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
         coordinator.async_update_listeners = lambda: updates.append("updated")
         plan = _plan("background-ai")
         context = SimpleNamespace(created_at=plan.created_at)
@@ -817,6 +828,7 @@ def test_background_ai_replaces_stale_flight_and_shutdown_cancels() -> None:
         coordinator._ai_advice_task = None
         coordinator._ai_advice_fingerprint = None
         coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
         coordinator._debounce_cancel = None
         coordinator._boundary_cancel = None
         coordinator._unsub_listeners = []
@@ -870,6 +882,7 @@ def test_background_ai_is_cancelled_when_current_plan_becomes_unsafe() -> None:
         coordinator._ai_advice_task = None
         coordinator._ai_advice_fingerprint = None
         coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
 
         async def blocked(*args: object) -> tuple[AIAdviceResult, bool]:
             started.set()
@@ -900,10 +913,47 @@ def test_background_ai_is_cancelled_when_current_plan_becomes_unsafe() -> None:
     asyncio.run(scenario())
 
 
+def test_background_ai_rechecks_committed_plan_under_planner_lock() -> None:
+    async def scenario() -> None:
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator._last_phase_durations = {}
+        coordinator.async_update_listeners = lambda: None
+        plan = _plan("safe-race")
+        fingerprint = _material_plan_fingerprint(plan)
+        coordinator._ai_advice_fingerprint = fingerprint
+        coordinator._ai_current_plan_fingerprint = fingerprint
+        coordinator._ai_current_plan_safe = True
+
+        async def accepted(*args: object) -> tuple[AIAdviceResult, bool]:
+            return AIAdviceResult("accepted", {"confidence": 0.8}, None, "ai_task.generate_data"), True
+
+        coordinator._async_get_throttled_ai_advice = accepted
+        async with coordinator._planner_lock:
+            task = asyncio.create_task(
+                coordinator._async_run_ai_advice(
+                    SimpleNamespace(created_at=plan.created_at),
+                    plan,
+                    {},
+                    {"ai_enabled": True},
+                    fingerprint,
+                )
+            )
+            await asyncio.sleep(0)
+            coordinator._ai_current_plan_safe = False
+            coordinator._ai_current_plan_fingerprint = None
+        await task
+
+        assert coordinator.store.ai_recommendations == []
+
+    asyncio.run(scenario())
+
+
 def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-    daikin_event = SimpleNamespace(data={"entity_id": "climate.daikin"})
-    enphase_event = SimpleNamespace(data={"entity_id": "select.enphase"})
+    daikin_event = FakeEvent("climate.daikin", "off", "heat", new_attributes={"temperature": 21})
+    enphase_event = FakeEvent("select.enphase", "AI Optimisation", "Full Backup")
     entry_data = {
         "daikin_climate_entity": "climate.daikin",
         "enphase_profile_entity": "select.enphase",
@@ -911,20 +961,111 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
 
     assert _is_planner_owned_control_feedback(
         entry_data,
-        {"ownership": {"planner_hvac_action_expires_at": now + timedelta(minutes=1)}},
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(seconds=30),
+                    "desired_state": {"hvac_mode": "heat", "target_temperature": 21},
+                }
+            ]
+        },
         daikin_event,
         now,
     )
     assert _is_planner_owned_control_feedback(
         entry_data,
-        {"command_rate_limits": {"enphase:set_profile": now - timedelta(seconds=30)}},
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "enphase",
+                    "attempted_at": now - timedelta(seconds=30),
+                    "desired_state": {"profile": "Full Backup"},
+                }
+            ]
+        },
         enphase_event,
         now,
     )
     assert not _is_planner_owned_control_feedback(
         entry_data,
-        {"command_rate_limits": {"ev:ev_start": now}},
+        {
+            "execution_audit": [
+                {
+                    "result": "failed",
+                    "asset": "enphase",
+                    "attempted_at": now - timedelta(seconds=10),
+                    "desired_state": {"profile": "Full Backup"},
+                }
+            ],
+            "command_rate_limits": {"enphase:set_profile": now},
+        },
         enphase_event,
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        SimpleNamespace(data={"entity_id": "climate.daikin", "new_state": None}),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(minutes=5),
+                    "desired_state": {"hvac_mode": "heat"},
+                },
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": "bad",
+                },
+            ]
+        },
+        daikin_event,
+        now,
+    )
+    for observed_temperature in (22, "bad"):
+        assert not _is_planner_owned_control_feedback(
+            entry_data,
+            {
+                "execution_audit": [
+                    {
+                        "result": "applied",
+                        "asset": "daikin",
+                        "attempted_at": now,
+                        "desired_state": {"hvac_mode": "heat", "target_temperature": 21},
+                    }
+                ]
+            },
+            FakeEvent(
+                "climate.daikin",
+                "off",
+                "heat",
+                new_attributes={"temperature": observed_temperature},
+            ),
+            now,
+        )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now - timedelta(seconds=10),
+                    "desired_state": {"hvac_mode": "cool"},
+                }
+            ]
+        },
+        daikin_event,
         now,
     )
 
@@ -941,6 +1082,7 @@ def test_background_ai_cached_skip_and_failure_are_bounded() -> None:
         coordinator._ai_advice_task = None
         coordinator._ai_advice_fingerprint = None
         coordinator._last_phase_durations = {}
+        coordinator._planner_lock = asyncio.Lock()
         coordinator.async_update_listeners = lambda: None
         plan = _plan("cached")
         fingerprint = _material_plan_fingerprint(plan)

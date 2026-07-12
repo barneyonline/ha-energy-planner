@@ -250,7 +250,8 @@ Status as of 2026-06-28.
   deterministically selects a unique native config entry, skips services that
   cannot return planner evidence and unsupported second passes, and uses a
   bounded 30-second equivalent-input cache. Service-call status is distinct
-  from forecast-evidence status. Solve and coordinator refresh duration,
+  from forecast-evidence status; READY requires continuous import and export
+  evidence across at least 80% of the requested solve slots. Solve and coordinator refresh duration,
   trigger, coalesced/skipped counters, refreshes/hour, phase timing, cache,
   evidence, and capability metadata are available to diagnostics consumers.
 - Dry-run actions are recorded as intentionally skipped with the stable
@@ -261,7 +262,9 @@ Status as of 2026-06-28.
   plans and reused only while a bounded action, forecast preview, issue, and
   cost signature remains unchanged. Provider work runs as a cancellable
   single-flight task after plan commit, so advisory latency cannot hold the
-  coordinator refresh lock; accepted results persist and notify entities.
+  coordinator refresh lock. Final publication is serialized with plan commits,
+  and sensors expose advice only when its plan ID and material fingerprint match
+  the current safe plan.
 - Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
   retention with defensive hard caps, preserving day-ahead training evidence
   across manual refresh bursts without unbounded storage growth.

@@ -21,7 +21,7 @@ from .const import (
     CONF_EV_CONTROL_ENABLED,
     CONF_PERSON_ENTITIES,
 )
-from .coordinator import EnergyPlannerCoordinator
+from .coordinator import EnergyPlannerCoordinator, _material_plan_fingerprint
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .preflight import _control_area_report
@@ -912,9 +912,9 @@ def _presence_preview_value(plan: EnergyPlan) -> str:
 
 def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
     """Return concise state for the latest AI advice run."""
-    recommendations = coordinator.store.data.get("ai_recommendations", [])
-    if isinstance(recommendations, list) and recommendations:
-        status = recommendations[-1].get("status")
+    latest = _current_ai_recommendation(coordinator)
+    if latest is not None:
+        status = latest.get("status")
         return _display_state(status or "unknown")
     if not coordinator.options.get("ai_enabled", False):
         return "Disabled"
@@ -923,13 +923,13 @@ def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
 
 def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest bounded AI response details."""
-    recommendations = coordinator.store.data.get("ai_recommendations", [])
-    if not isinstance(recommendations, list) or not recommendations:
+    current = _current_ai_recommendation(coordinator)
+    if current is None:
         return {
             "enabled": bool(coordinator.options.get("ai_enabled", False)),
             "latest": None,
         }
-    latest = dict(recommendations[-1])
+    latest = dict(current)
     accepted = latest.get("accepted")
     if not isinstance(accepted, dict):
         accepted = {}
@@ -953,6 +953,23 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "suggested_forecast_buffer_percent": accepted.get("suggested_forecast_buffer_percent"),
         "suggested_takeover_savings_threshold": accepted.get("suggested_takeover_savings_threshold"),
     }
+
+
+def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
+    """Return advice only when it belongs to the current safe committed plan."""
+    plan = coordinator.data
+    if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
+        return None
+    fingerprint = _material_plan_fingerprint(plan)
+    recommendations = coordinator.store.data.get("ai_recommendations", [])
+    if not isinstance(recommendations, list):
+        return None
+    for item in reversed(recommendations):
+        if not isinstance(item, dict):
+            continue
+        if item.get("plan_id") == plan.plan_id and item.get("plan_fingerprint") == fingerprint:
+            return item
+    return None
 
 
 def _confidence_breakdown_state(coordinator: EnergyPlannerCoordinator) -> str:

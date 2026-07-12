@@ -9,7 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
 from hashlib import sha256
-from math import isfinite
+from math import ceil, isfinite
 from time import monotonic, perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -233,8 +233,7 @@ class HAEOAdapter:
             result = _service_failed_result(phase, context, self.optimize_service, err)
             return self._finish(result, started, fingerprint, cache_hit=False)
         response_data = response if isinstance(response, dict) else None
-        evidence_counts = apply_haeo_response_to_context(deepcopy(context), response_data)
-        if not evidence_counts:
+        if not _response_has_adequate_grid_evidence(context, response_data):
             result = HAEOSolveResult(
                 phase,
                 HAEOStatus.STALE,
@@ -497,6 +496,24 @@ def _service_data(
             for projection in projections
         ],
     }
+
+
+def _response_has_adequate_grid_evidence(
+    context: DecisionContext,
+    response: dict[str, Any] | None,
+) -> bool:
+    """Require continuous import/export evidence for most of the solve horizon."""
+    if not context.slots:
+        return False
+    candidate = deepcopy(context)
+    apply_haeo_response_to_context(candidate, response)
+    required_slots = max(1, ceil(len(candidate.slots) * 0.8))
+    continuous_slots = 0
+    for slot in candidate.slots:
+        if slot.haeo_grid_import_forecast_kw is None or slot.haeo_grid_export_forecast_kw is None:
+            break
+        continuous_slots += 1
+    return continuous_slots >= required_slots
 
 
 def apply_haeo_response_to_context(context: DecisionContext, response: dict[str, Any] | None) -> dict[str, int]:
