@@ -35,6 +35,8 @@ async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
     coordinator = entry.runtime_data
     plan = coordinator.data
     store_data = dict(coordinator.store.data)
+    refresh_metrics = getattr(coordinator, "refresh_metrics", None)
+    refresh_metrics = dict(refresh_metrics) if isinstance(refresh_metrics, dict) else {}
     info.update(
         {
             "planner_enabled": bool(coordinator.options.get("planner_enabled", False)),
@@ -47,6 +49,21 @@ async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
             "latest_haeo_status": _latest_status(store_data.get("haeo_runs")),
             "last_refresh_duration_ms": (getattr(coordinator, "last_refresh_metadata", None) or {}).get(
                 "duration_ms"
+            ),
+            "refreshes_per_hour": refresh_metrics.get(
+                "refreshes_per_hour", refresh_metrics.get("refreshes_last_hour")
+            ),
+            "refresh_trigger_counts": refresh_metrics.get("trigger_counts", {}),
+            "last_refresh_trigger": refresh_metrics.get("last_trigger"),
+            "skipped_refresh_count": refresh_metrics.get(
+                "skipped_count", refresh_metrics.get("fingerprint_skipped", 0)
+            ),
+            "coalesced_refresh_count": refresh_metrics.get(
+                "coalesced_count", refresh_metrics.get("coalesced", 0)
+            ),
+            "refresh_phase_durations_ms": refresh_metrics.get("phase_durations_ms", {}),
+            "usable_optimization_horizon_hours": (
+                None if plan is None else getattr(plan, "estimated_cost_horizon_hours", None)
             ),
             "latest_haeo_duration_ms": _latest_haeo_metric(store_data.get("haeo_runs"), "duration_ms"),
             "latest_haeo_cache_hit": _latest_haeo_metric(store_data.get("haeo_runs"), "cache_hit"),

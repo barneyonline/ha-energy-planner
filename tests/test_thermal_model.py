@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.thermal_model import (
+    MAX_ROLLING_SAMPLES,
+    THERMAL_MODEL_VERSION,
     thermal_active_temperature_rate_c_per_hour,
     thermal_hvac_load_kw,
     thermal_model_summary,
@@ -184,3 +186,131 @@ def test_thermal_model_ignores_malformed_persisted_numbers() -> None:
         )
         == 0.75
     )
+
+
+def test_thermal_model_resets_legacy_unbounded_statistics() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    model, changed = update_thermal_model(
+        {
+            "enabled": True,
+            "active_heat_rate_c_per_hour": {
+                "sample_count": 1_000_000,
+                "average": 10.0,
+            },
+        },
+        {
+            "sampled_at": (now - timedelta(minutes=5)).isoformat(),
+            "hvac_mode": "heat",
+            "indoor_temperature_c": 19.9,
+            "hvac_power_kw": 1.5,
+        },
+        {
+            "sampled_at": now.isoformat(),
+            "hvac_mode": "heat",
+            "indoor_temperature_c": 20.0,
+            "hvac_power_kw": 1.5,
+        },
+    )
+
+    assert changed is True
+    assert model["model_version"] == THERMAL_MODEL_VERSION
+    assert model["migration"]["reset_reason"] == "legacy_unbounded_statistics"
+    assert thermal_model_summary(model)["active_heat_rate_sample_count"] == 0
+    assert "enabled" not in model
+
+
+def test_thermal_model_ignores_short_noisy_and_transition_samples() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    cases = [
+        # Too short: sensor noise would otherwise imply 360 C/hour.
+        (
+            {"sampled_at": now, "hvac_mode": "heat", "indoor_temperature_c": 20.0, "hvac_power_kw": 1.5},
+            {
+                "sampled_at": now + timedelta(seconds=10),
+                "hvac_mode": "heat",
+                "indoor_temperature_c": 21.0,
+                "hvac_power_kw": 1.5,
+            },
+        ),
+        # Below effective temperature precision.
+        (
+            {"sampled_at": now, "hvac_mode": "heat", "indoor_temperature_c": 20.0, "hvac_power_kw": 1.5},
+            {
+                "sampled_at": now + timedelta(minutes=10),
+                "hvac_mode": "heat",
+                "indoor_temperature_c": 20.01,
+                "hvac_power_kw": 1.5,
+            },
+        ),
+        # Startup and a mode change each span different operating regimes.
+        (
+            {"sampled_at": now, "hvac_mode": "off", "indoor_temperature_c": 20.0, "hvac_power_kw": 0.0},
+            {
+                "sampled_at": now + timedelta(minutes=10),
+                "hvac_mode": "heat",
+                "indoor_temperature_c": 20.2,
+                "hvac_power_kw": 1.5,
+            },
+        ),
+        (
+            {"sampled_at": now, "hvac_mode": "heat", "indoor_temperature_c": 20.0, "hvac_power_kw": 1.5},
+            {
+                "sampled_at": now + timedelta(minutes=10),
+                "hvac_mode": "cool",
+                "indoor_temperature_c": 19.8,
+                "hvac_power_kw": 1.5,
+            },
+        ),
+    ]
+    for previous, current in cases:
+        model, _changed = update_thermal_model({"model_version": THERMAL_MODEL_VERSION}, previous, current)
+        summary = thermal_model_summary(model)
+        assert summary["active_sample_count"] == 0
+        assert summary["active_heat_rate_sample_count"] == 0
+        assert summary["active_cool_rate_sample_count"] == 0
+
+
+def test_thermal_model_rejects_implausible_rates_instead_of_clamping() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    model, _changed = update_thermal_model(
+        {"model_version": THERMAL_MODEL_VERSION},
+        {"sampled_at": now, "hvac_mode": "heat", "indoor_temperature_c": 20.0, "hvac_power_kw": 1.5},
+        {
+            "sampled_at": now + timedelta(minutes=5),
+            "hvac_mode": "heat",
+            "indoor_temperature_c": 21.0,
+            "hvac_power_kw": 1.5,
+        },
+    )
+
+    summary = thermal_model_summary(model)
+    assert summary["active_sample_count"] == 0
+    assert summary["active_heat_rate_sample_count"] == 0
+    assert summary["active_heat_rate_c_per_hour"] is None
+
+
+def test_thermal_model_uses_bounded_robust_window() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    model: dict[str, object] = {"model_version": THERMAL_MODEL_VERSION}
+    for index in range(MAX_ROLLING_SAMPLES + 20):
+        power = 9.0 if index == MAX_ROLLING_SAMPLES + 19 else 1.5
+        model, _changed = update_thermal_model(
+            model,
+            {
+                "sampled_at": now + timedelta(minutes=10 * index),
+                "hvac_mode": "heat",
+                "indoor_temperature_c": 20.0,
+                "hvac_power_kw": power,
+            },
+            {
+                "sampled_at": now + timedelta(minutes=10 * (index + 1)),
+                "hvac_mode": "heat",
+                "indoor_temperature_c": 20.1,
+                "hvac_power_kw": power,
+            },
+        )
+
+    bucket = model["active_hvac_load_kw"]
+    assert bucket["sample_count"] == MAX_ROLLING_SAMPLES
+    assert bucket["total_sample_count"] == MAX_ROLLING_SAMPLES + 20
+    assert thermal_model_summary(model)["active_hvac_load_kw"] == 1.5

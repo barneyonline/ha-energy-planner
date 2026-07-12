@@ -42,6 +42,7 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     recorder = _recorder_report(hass)
     safety = _safety_report(options)
     production = _production_report(coordinator.store.data, options, control_areas)
+    current_plan = _current_plan_report(getattr(coordinator, "data", None))
     audit = _audit_report(coordinator.store.data)
 
     blocking = [
@@ -96,10 +97,16 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             else "Recorder is not detected.",
         },
         {
-            "check": "production_gate_ready",
-            "ok": production["ready_to_arm"],
+            "check": "dry_run_evidence_complete",
+            "ok": production["dry_run_evidence_complete"],
             "blocking": False,
             "message": _production_gate_message(production),
+        },
+        {
+            "check": "current_plan_safe",
+            "ok": current_plan["safe"],
+            "blocking": True,
+            "message": current_plan["message"],
         },
         {
             "check": "production_control_armed",
@@ -115,16 +122,21 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
             ),
         },
     ]
-    active_control_ready = (
+    safe_to_activate_now = (
         not blocking
         and bool(control_areas["required"])
         and all(bool(discovery[area]["supported"]) for area in control_areas["required"])
-        and production["armed"]
+        and production["dry_run_evidence_complete"]
+        and current_plan["safe"]
         and production["device_controls_enabled"]
     )
+    production["safe_to_activate_now"] = safe_to_activate_now
+    active_control_ready = safe_to_activate_now and production["armed"]
     return {
         "ok": active_control_ready,
         "active_control_ready": active_control_ready,
+        "safe_to_activate_now": safe_to_activate_now,
+        "current_plan": current_plan,
         "mode": safety,
         "production": production,
         "checks": checks,
@@ -151,7 +163,7 @@ def _availability_message(success_message: str, *, missing: list[str], unavailab
 
 def _production_gate_message(production: dict[str, Any]) -> str:
     """Return a concise production gate readiness message."""
-    if production["ready_to_arm"]:
+    if production.get("dry_run_evidence_complete", production.get("ready_to_arm", False)):
         return "Production gate has enough dry-run evidence and the configured control areas are explicitly enabled."
 
     details: list[str] = []
@@ -164,6 +176,62 @@ def _production_gate_message(production: dict[str, Any]) -> str:
     if not details:
         return "Production gate is not ready to arm yet."
     return f"Production gate is not ready to arm yet; {'; '.join(details)}."
+
+
+def _current_plan_report(plan: Any) -> dict[str, Any]:
+    """Return whether a current plan has enough priced coverage for activation."""
+    if plan is None:
+        return {
+            "present": False,
+            "healthy": False,
+            "current": False,
+            "adequate_coverage": False,
+            "usable_optimization_horizon_hours": None,
+            "required_optimization_horizon_hours": 8.0,
+            "safe": False,
+            "message": "No current plan is available.",
+        }
+    health = str(getattr(plan, "health", ""))
+    status = str(getattr(plan, "status", ""))
+    confidence = float(getattr(plan, "confidence", 0.0) or 0.0)
+    configured_horizon = max(float(getattr(plan, "horizon_hours", 0.0) or 0.0), 0.0)
+    required_horizon = min(configured_horizon, 8.0) if configured_horizon else 8.0
+    usable_horizon_value = getattr(plan, "estimated_cost_horizon_hours", None)
+    try:
+        usable_horizon = float(usable_horizon_value) if usable_horizon_value is not None else None
+    except (TypeError, ValueError):
+        usable_horizon = None
+    issues = [str(issue) for issue in list(getattr(plan, "input_issues", []) or [])]
+    healthy = health == "healthy"
+    current = status == "current"
+    adequate_coverage = bool(
+        usable_horizon is not None
+        and usable_horizon >= required_horizon
+        and not any("incomplete_horizon" in issue for issue in issues)
+    )
+    safe = healthy and current and confidence > 0 and adequate_coverage
+    if safe:
+        message = f"Current healthy plan has {usable_horizon:g} usable priced hours."
+    elif not healthy:
+        message = "Current plan inputs are not healthy."
+    elif not current:
+        message = "The latest plan is not current."
+    elif not adequate_coverage:
+        shown = "unknown" if usable_horizon is None else f"{usable_horizon:g}"
+        message = f"Usable priced coverage is {shown} hours; at least {required_horizon:g} hours are required."
+    else:
+        message = "Current plan confidence is zero."
+    return {
+        "present": True,
+        "healthy": healthy,
+        "current": current,
+        "confidence": confidence,
+        "adequate_coverage": adequate_coverage,
+        "usable_optimization_horizon_hours": usable_horizon,
+        "required_optimization_horizon_hours": required_horizon,
+        "safe": safe,
+        "message": message,
+    }
 
 
 def _bounded_join(values: list[str], *, limit: int = 5) -> str:
@@ -275,13 +343,24 @@ def _production_report(
     }
     required_control_areas = list(control_areas.get("required", []))
     dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
+    required_areas_configured = all(
+        bool(control_areas.get("details", {}).get(area, {}).get("configured"))
+        for area in required_control_areas
+    )
+    dry_run_evidence_complete = (
+        dry_run_ready_cycles >= 3
+        and bool(required_control_areas)
+        and required_areas_configured
+    )
     return {
         "armed": bool(production.get("armed", False)),
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
-        "ready_to_arm": dry_run_ready_cycles >= 3 and bool(required_control_areas),
+        "dry_run_evidence_complete": dry_run_evidence_complete,
+        # Retained for one release for consumers of the old response schema.
+        "ready_to_arm": dry_run_evidence_complete,
         "device_controls": device_controls,
         "device_controls_enabled": bool(required_control_areas),
         "required_control_areas": required_control_areas,

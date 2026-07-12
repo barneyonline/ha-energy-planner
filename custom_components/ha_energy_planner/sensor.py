@@ -1156,8 +1156,8 @@ def _production_readiness_state(coordinator: EnergyPlannerCoordinator) -> str:
     attrs = _production_readiness_attrs(coordinator)
     if attrs.get("armed"):
         return "Armed"
-    if attrs.get("ready_to_arm"):
-        return "Ready To Arm"
+    if attrs.get("dry_run_evidence_complete"):
+        return "Evidence Complete"
     return "Not Ready"
 
 
@@ -1173,13 +1173,16 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
     required_areas = list(control_areas["required"])
     required_configured = all(control_areas["details"][area]["configured"] for area in required_areas)
     dry_run_ready_cycles = int(production.get("dry_run_ready_cycles", 0) or 0)
+    dry_run_evidence_complete = dry_run_ready_cycles >= 3 and bool(required_areas) and required_configured
     return {
         "armed": bool(production.get("armed", False)),
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
         "last_dry_run_ready_at": production.get("last_dry_run_ready_at"),
-        "ready_to_arm": dry_run_ready_cycles >= 3 and bool(required_areas) and required_configured,
+        "dry_run_evidence_complete": dry_run_evidence_complete,
+        # Retained for one release for consumers of the old attribute.
+        "ready_to_arm": dry_run_evidence_complete,
         "device_controls": device_controls,
         "required_control_areas": required_areas,
         "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),

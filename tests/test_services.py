@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from custom_components.ha_energy_planner import async_setup
@@ -25,6 +26,7 @@ from custom_components.ha_energy_planner.const import (
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+from custom_components.ha_energy_planner.models import EnergyPlan, InputHealth, PlannerMode
 
 
 @dataclass(slots=True)
@@ -277,8 +279,8 @@ def test_run_preflight_reports_production_gate_reasons() -> None:
 
     checks = {check["check"]: check for check in response["checks"]}
     assert response["ok"] is False
-    assert checks["production_gate_ready"]["ok"] is False
-    assert "1/3 healthy dry-run cycles" in checks["production_gate_ready"]["message"]
+    assert checks["dry_run_evidence_complete"]["ok"] is False
+    assert "1/3 healthy dry-run cycles" in checks["dry_run_evidence_complete"]["message"]
     assert checks["production_control_armed"]["ok"] is False
     assert "has not been armed" in checks["production_control_armed"]["message"]
 
@@ -407,6 +409,45 @@ def test_run_preflight_requires_configured_haeo_for_enabled_planning() -> None:
     assert response["services"]["configured"] == ["haeo.optimize"]
 
 
+def test_run_preflight_separates_historical_evidence_from_current_safety() -> None:
+    coordinator = _coordinator()
+    coordinator.data.health = InputHealth.UNSAFE
+    coordinator.data.status = "unsafe"
+    coordinator.data.confidence = 0.0
+    coordinator.data.estimated_cost_horizon_hours = 16.0
+
+    response = _run_preflight(coordinator)
+
+    assert response["production"]["dry_run_evidence_complete"] is True
+    assert response["production"]["ready_to_arm"] is True
+    assert response["safe_to_activate_now"] is False
+    assert response["active_control_ready"] is False
+    assert response["current_plan"]["healthy"] is False
+
+
+def test_run_preflight_requires_eight_usable_priced_hours() -> None:
+    coordinator = _coordinator()
+    coordinator.data.estimated_cost_horizon_hours = 7.5
+
+    response = _run_preflight(coordinator)
+
+    assert response["safe_to_activate_now"] is False
+    assert response["current_plan"]["adequate_coverage"] is False
+    assert response["current_plan"]["required_optimization_horizon_hours"] == 8.0
+
+
+def test_run_preflight_accepts_full_configured_horizon_when_shorter_than_eight_hours() -> None:
+    coordinator = _coordinator()
+    coordinator.data.horizon_hours = 4
+    coordinator.data.estimated_cost_horizon_hours = 4.0
+
+    response = _run_preflight(coordinator)
+
+    assert response["safe_to_activate_now"] is True
+    assert response["active_control_ready"] is True
+    assert response["current_plan"]["required_optimization_horizon_hours"] == 4.0
+
+
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
     coordinator = _coordinator()
     hass = FakeHass(coordinator)
@@ -486,7 +527,21 @@ def _coordinator() -> EnergyPlannerCoordinator:
         },
     )()
     coordinator.entry.runtime_data = coordinator
-    coordinator.data = None
+    coordinator.data = EnergyPlan(
+        plan_id="current-plan",
+        created_at=datetime(2026, 6, 27, tzinfo=UTC),
+        horizon_hours=12,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.DRY_RUN,
+        summary="healthy dry-run",
+        confidence=0.9,
+        estimated_daily_cost=2.0,
+        estimated_cost_horizon_hours=12.0,
+        actions=[],
+        preview=[],
+    )
     coordinator.store = type(
         "Store",
         (),

@@ -31,9 +31,17 @@ def test_system_health_reports_loaded_planner_state() -> None:
             health=InputHealth.HEALTHY,
             status="current",
             mode=PlannerMode.DRY_RUN,
+            estimated_cost_horizon_hours=12.0,
         ),
         options={"planner_enabled": False, "dry_run": True},
         last_refresh_metadata={"duration_ms": 15.0},
+        refresh_metrics={
+            "refreshes_last_hour": 12,
+            "last_trigger": "boundary",
+            "fingerprint_skipped": 3,
+            "coalesced": 4,
+            "phase_durations_ms": {"inputs": 4.5},
+        },
         store=SimpleNamespace(
             data={
                 "haeo_runs": [
@@ -66,6 +74,13 @@ def test_system_health_reports_loaded_planner_state() -> None:
         "configured_input_groups": 2,
         "latest_haeo_status": "ready",
         "last_refresh_duration_ms": 15.0,
+        "refreshes_per_hour": 12,
+        "refresh_trigger_counts": {},
+        "last_refresh_trigger": "boundary",
+        "skipped_refresh_count": 3,
+        "coalesced_refresh_count": 4,
+        "refresh_phase_durations_ms": {"inputs": 4.5},
+        "usable_optimization_horizon_hours": 12.0,
         "latest_haeo_duration_ms": 12.5,
         "latest_haeo_cache_hit": True,
         "latest_ai_status": "accepted",
