@@ -384,6 +384,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "forecast_source_confidence": getattr(context, "forecast_confidence", plan.confidence),
                     "sources": getattr(manager, "forecast_confidence_details", []),
                 },
+                "forecast_coverage": getattr(manager, "forecast_coverage_details", []),
                 "input_issues": context.input_issues[:20],
                 "ai": None
                 if ai_result is None
