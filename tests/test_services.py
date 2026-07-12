@@ -482,6 +482,39 @@ def test_run_preflight_rejects_active_pause_and_changed_control_contract() -> No
     assert checks["production_gate_ready"]["deprecated_alias_for"] == "dry_run_evidence_complete"
 
 
+def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
+    entry_data = {
+        "ev_smart_charging_start_entity": "button.ev_start",
+        "haeo_optimize_service": "haeo.optimize",
+        "ai_task_entity": "ai_task.local",
+    }
+    options = {
+        "ev_control_enabled": True,
+        "planner_enabled": True,
+        "dry_run": True,
+        "ai_enabled": False,
+        "ai_timeout_seconds": 10,
+        "command_rate_limit_seconds": 60,
+    }
+    original = production_evidence_fingerprint(entry_data, options)
+    active = production_evidence_fingerprint(
+        {**entry_data, "ai_task_entity": "ai_task.replaced"},
+        {
+            **options,
+            "planner_enabled": False,
+            "dry_run": False,
+            "ai_enabled": True,
+            "ai_timeout_seconds": 30,
+        },
+    )
+    changed_policy = production_evidence_fingerprint(
+        entry_data, {**options, "command_rate_limit_seconds": 120}
+    )
+
+    assert active == original
+    assert changed_policy != original
+
+
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
     coordinator = _coordinator()
     hass = FakeHass(coordinator)

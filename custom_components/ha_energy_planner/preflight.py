@@ -28,11 +28,20 @@ from .const import (
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
+from .safety import control_pause_reason
 
 _SERVICE_KEYS = (
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_AI_ADVISOR_SERVICE,
 )
+_EVIDENCE_OPTION_EXCLUSIONS = {
+    CONF_AI_ADVISOR_SERVICE,
+    "ai_enabled",
+    "ai_timeout_seconds",
+    CONF_DRY_RUN,
+    CONF_PLANNER_ENABLED,
+}
+_EVIDENCE_ENTRY_EXCLUSIONS = {CONF_AI_ADVISOR_SERVICE, "ai_task_entity"}
 
 
 def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, Any]:
@@ -58,7 +67,7 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
         now=now,
         last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
     )
-    control_paused = _control_pause_active(production["pause"], now)
+    control_paused = control_pause_reason(production["pause"], now) is not None
     audit = _audit_report(coordinator.store.data)
 
     blocking = [
@@ -397,7 +406,7 @@ def _production_report(
 ) -> dict[str, Any]:
     """Return production readiness state."""
     production = dict(store_data.get("production", {}))
-    pause = dict(store_data.get("control_pause", {}))
+    pause = store_data.get("control_pause", {})
     device_controls = {
         "ev": bool(options.get(CONF_EV_CONTROL_ENABLED, False)),
         "climate": bool(options.get(CONF_CLIMATE_CONTROL_ENABLED, False)),
@@ -438,24 +447,21 @@ def _production_report(
 
 def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[str, Any]) -> str:
     """Bind dry-run evidence to the currently configured control contract."""
-    control_areas = _control_area_report(entry_data, options)
+    normalized_options = {**options, CONF_PLANNER_ENABLED: True}
+    control_areas = _control_area_report(entry_data, normalized_options)
     required = list(control_areas["required"])
     payload = {
         "required": required,
         "details": {area: control_areas["details"][area] for area in required},
-        "entry_data": {key: entry_data[key] for key in sorted(entry_data)},
-        "options": {key: options[key] for key in sorted(options)},
+        "entry_data": {
+            key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS
+        },
+        "options": {
+            key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS
+        },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _control_pause_active(value: Any, now: datetime) -> bool:
-    """Return whether a stored control pause is active and unexpired."""
-    if not isinstance(value, dict) or not value.get("active", False):
-        return False
-    until = _datetime_or_none(value.get("until"))
-    return until is None or _as_utc(now) < until
 
 
 def _datetime_or_none(value: Any) -> datetime | None:

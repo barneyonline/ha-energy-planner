@@ -90,7 +90,7 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
             },
             "control_pause": {
                 "active": True,
-                "until": "2026-06-27T01:00:00+00:00",
+                "until": (datetime.now(UTC) + timedelta(minutes=10)).isoformat(),
                 "assets": ["ev"],
             },
             "execution_audit": [
@@ -118,7 +118,7 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
 
     assert confidence.value_fn(coordinator) == "87.5%"
     assert confidence.attrs_fn(coordinator)["breakdown"]["pv"]["status"] == "degraded"
-    assert production.value_fn(coordinator) == "Armed"
+    assert production.value_fn(coordinator) == "Armed - Blocked"
     assert production.attrs_fn(coordinator)["ready_to_arm"] is True
     assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is True
     assert block.value_fn(coordinator) == "Planner Paused"
@@ -343,6 +343,7 @@ def test_operational_summary_sensors_handle_edge_shapes() -> None:
     assert comparison.attrs_fn(_coordinator(_plan(), store_data={"dry_run_comparisons": []})) == {}
     assert support.value_fn(ready) == "Ready"
     assert sensor_module._pause_active({}) is False
+    assert sensor_module._pause_active("corrupt") is True
 
 
 def test_production_readiness_supports_ev_only_installation() -> None:
@@ -360,6 +361,26 @@ def test_production_readiness_supports_ev_only_installation() -> None:
 
     assert production.value_fn(coordinator) == "Evidence Complete"
     assert production.attrs_fn(coordinator)["required_control_areas"] == ["ev"]
+
+    coordinator.store.data["production"]["armed"] = True
+    assert production.value_fn(coordinator) == "Armed"
+
+
+def test_production_readiness_blocks_armed_mismatched_contract() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={"ev_control_enabled": True},
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        store_data={"production": {"armed": True, "dry_run_ready_cycles": 3}},
+    )
+    coordinator.entry_data["ev_smart_charging_start_entity"] = "button.ev_replaced"
+    production = next(item for item in SENSORS if item.key == "production_readiness")
+
+    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert production.attrs_fn(coordinator)["dry_run_evidence_fingerprint_matches"] is False
+    assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is False
+    block = next(item for item in SENSORS if item.key == "control_block_reason")
+    assert "production_evidence_contract_changed" in block.attrs_fn(coordinator)["reasons"]
 
 
 def test_sensor_platform_setup_groups_planner_sensors(monkeypatch: object) -> None:
@@ -1153,11 +1174,22 @@ def _coordinator(
     entry_data: dict[str, object] | None = None,
     hass: object | None = None,
 ) -> SimpleNamespace:
+    stored = dict(store_data or {})
+    configured_options = dict(options or {})
+    configured_entry_data = dict(entry_data or {})
+    production = stored.get("production")
+    if isinstance(production, dict) and production.get("dry_run_ready_cycles", 0) >= 3:
+        production = dict(production)
+        production.setdefault(
+            "dry_run_evidence_fingerprint",
+            sensor_module.production_evidence_fingerprint(configured_entry_data, configured_options),
+        )
+        stored["production"] = production
     return SimpleNamespace(
         data=plan,
-        store=SimpleNamespace(data=store_data or {}),
-        options=options or {},
-        entry_data=entry_data or {},
+        store=SimpleNamespace(data=stored),
+        options=configured_options,
+        entry_data=configured_entry_data,
         entry=SimpleNamespace(entry_id="test_entry"),
         hass=hass,
     )

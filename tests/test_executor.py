@@ -45,6 +45,7 @@ from custom_components.ha_energy_planner.models import (
     PlanAction,
     PlannerMode,
 )
+from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
 
 class FakeStore:
@@ -1024,7 +1025,7 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     )
 
     assert _pause_rejection_reason({}, action, now) is None
-    assert _pause_rejection_reason({"until": "bad"}, action, now) is None
+    assert _pause_rejection_reason({"until": "bad"}, action, now) == "planner_paused"
     assert _pause_rejection_reason({"until": (now - timedelta(minutes=1)).isoformat()}, action, now) is None
     assert _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat()}, action, now) == "planner_paused"
     assert (
@@ -1035,9 +1036,9 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
         _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": ["daikin"]}, action, now)
         is None
     )
-    assert (
-        _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now) is None
-    )
+    assert _pause_rejection_reason(
+        {"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now
+    ) == "planner_paused"
 
     assert _device_control_disabled_reason(ActionAsset.EV, {}) == "ev_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.DAIKIN, {}) == "climate_control_disabled"
@@ -1071,17 +1072,58 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     executor = Executor(store)
     assert executor._control_rejection_reason(action, now) is None
     store.data["control_pause"] = {"until": (now + timedelta(minutes=5)).isoformat(), "assets": ["all"]}
-    assert executor._control_rejection_reason(action, now) == "ev_control_paused"
+    assert executor._control_rejection_reason(action, now) == "planner_paused"
     store.data["control_pause"] = {}
     store.data["production"] = {}
     assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
     store.data["production"] = {"armed": True}
+    assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
+    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint({}, {})
     assert executor._control_rejection_reason(action, now) == "ev_control_disabled"
     executor.options = {CONF_EV_CONTROL_ENABLED: True}
+    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+        {}, executor.options
+    )
     assert executor._control_rejection_reason(action, now) is None
     executor.options = {CONF_EV_CONTROL_ENABLED: True, CONF_MAX_DAILY_EV_ACTIONS: 3}
+    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+        {}, executor.options
+    )
     store.data["execution_audit"] = audit
     assert executor._control_rejection_reason(action, now) == "ev_daily_action_cap_reached"
+
+
+def test_executor_blocks_armed_control_when_entity_or_policy_contract_changes() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev",
+        plan_id="plan",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_start"}
+    options = {**DEFAULT_OPTIONS, CONF_EV_CONTROL_ENABLED: True}
+    store = FakeStore()
+    store.data["production"] = {
+        "armed": True,
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(entry_data, options),
+    }
+    executor = Executor(store, entry_data=entry_data, options=options)
+
+    assert executor._control_rejection_reason(action, now) is None
+    executor.entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_replaced"}
+    assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
+    executor.entry_data = entry_data
+    executor.options = {**options, "command_rate_limit_seconds": 999}
+    assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
 
 
 def test_executor_ignores_malformed_command_rate_limit_timestamp() -> None:

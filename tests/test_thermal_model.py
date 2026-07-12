@@ -120,6 +120,29 @@ def test_thermal_model_aligns_naive_and_aware_sample_timestamps() -> None:
     assert thermal_model_summary(model)["active_hvac_load_kw"] == 1.8
 
 
+def test_thermal_model_uses_persisted_last_sample_as_training_anchor() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    previous = {
+        "sampled_at": now.isoformat(),
+        "hvac_mode": "heat",
+        "indoor_temperature_c": 20.0,
+        "hvac_power_kw": 1.8,
+    }
+    model, changed = update_thermal_model(
+        {"model_version": THERMAL_MODEL_VERSION, "last_sample": previous},
+        None,
+        {
+            "sampled_at": (now + timedelta(minutes=30)).isoformat(),
+            "hvac_mode": "heat",
+            "indoor_temperature_c": 20.5,
+            "hvac_power_kw": 1.7,
+        },
+    )
+
+    assert changed is True
+    assert thermal_model_summary(model)["active_sample_count"] == 1
+
+
 def test_thermal_model_accepts_comma_decimal_sample_values() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
 
