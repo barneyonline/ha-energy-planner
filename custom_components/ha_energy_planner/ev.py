@@ -57,6 +57,8 @@ class EVChargeAllocation:
     effective_price: float | None = None
     solar_surplus_used_kw: float = 0.0
     grid_import_used_kw: float = 0.0
+    carbon_intensity_g_per_kwh: float | None = None
+    estimated_carbon_g: float | None = None
 
 
 @dataclass(slots=True)
@@ -283,6 +285,7 @@ def allocate_least_cost_charging(
     charge_rate_kw: float,
     soc_per_kwh: float,
     interval_minutes: int,
+    carbon_weight: float = 0.0,
 ) -> EVChargeSchedule:
     """Allocate EV charging to cheapest feasible slots before ready-by.
 
@@ -298,14 +301,7 @@ def allocate_least_cost_charging(
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, required, True, "ev_charge_rate_invalid")
 
     feasible_slots = [slot for slot in slots if slot.valid_at < ready_by and slot.import_price is not None]
-    ordered = sorted(
-        feasible_slots,
-        key=lambda slot: (
-            _effective_charge_price(slot, charge_rate_kw),
-            float(slot.import_price),
-            slot.valid_at,
-        ),
-    )
+    ordered = _rank_charging_slots(feasible_slots, charge_rate_kw, carbon_weight)
     remaining = required
     allocations: list[EVChargeAllocation] = []
     for slot in ordered:
@@ -315,6 +311,12 @@ def allocate_least_cost_charging(
         charge_fraction = added_soc / soc_per_slot
         charge_kw = round(charge_rate_kw * charge_fraction, 6)
         effective_price, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
+        carbon_intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
+        estimated_carbon = (
+            round(grid_kw * (interval_minutes / 60.0) * carbon_intensity, 3)
+            if carbon_intensity is not None
+            else None
+        )
         allocations.append(
             EVChargeAllocation(
                 valid_at=slot.valid_at,
@@ -324,6 +326,8 @@ def allocate_least_cost_charging(
                 effective_price=effective_price,
                 solar_surplus_used_kw=solar_kw,
                 grid_import_used_kw=grid_kw,
+                carbon_intensity_g_per_kwh=carbon_intensity,
+                estimated_carbon_g=estimated_carbon,
             )
         )
         remaining -= added_soc
@@ -343,6 +347,46 @@ def allocate_least_cost_charging(
         if used_solar_surplus
         else "least_cost_slots_before_ready_by",
     )
+
+
+def _rank_charging_slots(slots: list[Any], charge_kw: float, carbon_weight: float) -> list[Any]:
+    """Rank slots by normalized effective cost and grid carbon intensity."""
+    weighted_carbon = min(max(float(carbon_weight), 0.0), 1.0)
+    rows = []
+    for slot in slots:
+        cost = _effective_charge_price(slot, charge_kw)
+        _effective, _solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
+        intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
+        carbon = intensity * (grid_kw / charge_kw) if intensity is not None and charge_kw > 0 else None
+        rows.append((slot, cost, carbon))
+    available_carbon = [carbon for _slot, _cost, carbon in rows if carbon is not None]
+    if not available_carbon or weighted_carbon == 0:
+        return [row[0] for row in sorted(rows, key=lambda row: (row[1], row[0].valid_at))]
+    costs = [cost for _slot, cost, _carbon in rows]
+    min_cost, max_cost = min(costs), max(costs)
+    min_carbon, max_carbon = min(available_carbon), max(available_carbon)
+
+    def score(row: tuple[Any, float, float | None]) -> tuple[float, float, datetime]:
+        slot, cost, carbon = row
+        normalized_cost = _normalize_range(cost, min_cost, max_cost)
+        normalized_carbon = _normalize_range(
+            max_carbon if carbon is None else carbon,
+            min_carbon,
+            max_carbon,
+        )
+        return (
+            (1.0 - weighted_carbon) * normalized_cost + weighted_carbon * normalized_carbon,
+            cost,
+            slot.valid_at,
+        )
+
+    return [row[0] for row in sorted(rows, key=score)]
+
+
+def _normalize_range(value: float, minimum: float, maximum: float) -> float:
+    if maximum <= minimum:
+        return 0.0
+    return (value - minimum) / (maximum - minimum)
 
 
 def _effective_charge_price(slot: Any, charge_kw: float) -> float:
@@ -370,8 +414,12 @@ def _charge_cost_components(slot: Any, charge_kw: float) -> tuple[float | None, 
 
 def _solar_surplus_kw(slot: Any) -> float:
     """Return forecast PV surplus available for flexible EV charging."""
-    pv_kw = _float_or_none(getattr(slot, "pv_forecast_kw", None))
-    load_kw = _float_or_none(getattr(slot, "baseline_load_forecast_kw", None))
+    pv_value = getattr(slot, "pv_forecast_lower_kw", None)
+    load_value = getattr(slot, "baseline_load_forecast_upper_kw", None)
+    pv_kw = _float_or_none(getattr(slot, "pv_forecast_kw", None) if pv_value is None else pv_value)
+    load_kw = _float_or_none(
+        getattr(slot, "baseline_load_forecast_kw", None) if load_value is None else load_value
+    )
     if pv_kw is None or load_kw is None:
         return 0.0
     existing_flexible_load_kw = (

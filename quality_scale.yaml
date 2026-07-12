@@ -380,12 +380,14 @@ rules:
         - custom_components/ha_energy_planner/switch.py
         - custom_components/ha_energy_planner/button.py
   entity-device-class:
-    status: n/a
-    comment: Planner status, cost, confidence, control, and health entities do not have matching Home Assistant device classes beyond their platform semantics.
+    status: done
+    comment: The estimated-cost sensor uses Home Assistant's monetary device class and configured currency; remaining planner status/confidence entities have no matching device class.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
         - custom_components/ha_energy_planner/binary_sensor.py
+      tests:
+        - tests/test_sensor.py
   entity-disabled-by-default:
     status: n/a
     comment: The integration exposes only core planner status/control entities; no noisy diagnostic entities are created by default.

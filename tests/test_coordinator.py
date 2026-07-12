@@ -213,6 +213,25 @@ class FakeEntry:
     options: dict[str, object] = field(default_factory=dict)
 
 
+def test_coordinator_records_refresh_duration_in_memory() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.store = FakeStore()
+    expected = _plan("refresh-duration")
+
+    async def update_locked() -> EnergyPlan:
+        return expected
+
+    coordinator._async_update_data_locked = update_locked
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result is expected
+    assert coordinator.last_refresh_metadata["succeeded"] is True
+    assert coordinator.last_refresh_metadata["duration_ms"] >= 0
+    assert coordinator.last_refresh_metadata["completed_at"].tzinfo is not None
+
+
 class FakeEvent:
     """Minimal state changed event."""
 
@@ -456,6 +475,20 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.planner_enabled is False
     assert coordinator.dry_run is True
     assert len(coordinator.overrides) == 1
+
+
+def test_coordinator_builds_configured_haeo_adapter_and_capability_metadata() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass()
+    coordinator._haeo_adapter = None
+
+    adapter = coordinator._get_haeo_adapter(
+        {"haeo_optimize_service": "custom.optimize", "haeo_config_entry_id": "entry-1"}
+    )
+
+    assert adapter.optimize_service == "custom.optimize"
+    assert adapter.haeo_config_entry_id == "entry-1"
+    assert coordinator_module._haeo_capability_metadata(adapter) == adapter.capabilities.as_dict()
 
 
 def test_async_update_data_uses_lock_and_delay_save() -> None:
@@ -723,9 +756,25 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     class FakeHAEOAdapter:
         def __init__(self, hass: object, service_name: str) -> None:
             self.service_name = service_name
+            self.supports_flexible_second_pass = True
+            self.second_pass_calls = 0
+            self.capabilities = {
+                "supports_response": True,
+                "supports_flexible_projections": True,
+                "supports_flexible_second_pass": True,
+                "source": "test",
+            }
+            self.last_call_metadata: dict[str, object] = {}
 
         async def async_solve_baseline(self, built_context: object) -> HAEOSolveResult:
             assert built_context is context
+            self.last_call_metadata = {
+                "duration_ms": 12.5,
+                "cache_hit": False,
+                "input_fingerprint": "baseline-fingerprint",
+                "response_received": True,
+                "capabilities": self.capabilities,
+            }
             return HAEOSolveResult(
                 phase=HAEOSolvePhase.BASELINE,
                 status=HAEOStatus.READY,
@@ -742,6 +791,14 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
         ) -> HAEOSolveResult:
             assert built_context is context
             assert projections == ["projection"]
+            self.second_pass_calls += 1
+            self.last_call_metadata = {
+                "duration_ms": 7.25,
+                "cache_hit": True,
+                "input_fingerprint": "flex-fingerprint",
+                "response_received": True,
+                "capabilities": self.capabilities,
+            }
             return HAEOSolveResult(
                 phase=HAEOSolvePhase.FLEXIBLE_LOAD,
                 status=HAEOStatus.READY,
@@ -864,11 +921,34 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.thermal_models == [{"last_sample": {"sampled_at": now}, "enabled": True}]
     assert coordinator.store.haeo_runs[0]["flexible_projection_count"] == 1
     assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == HAEOStatus.READY
+    assert coordinator.store.haeo_runs[0]["baseline"]["duration_ms"] == 12.5
+    assert coordinator.store.haeo_runs[0]["baseline"]["evidence_status"] == "available"
+    assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 7.25
+    assert coordinator.store.haeo_runs[0]["second_pass"]["cache_hit"] is True
+    assert coordinator.store.haeo_runs[0]["capabilities"]["supports_flexible_second_pass"] is True
     assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
     assert coordinator.store.forecast_snapshots[0]["ai"]["accepted_fields"] == ["confidence", "reasoning_summary"]
     assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
     assert coordinator.store.saved_plans == [result]
     assert coordinator.executor.evaluated == [(result, context)]
+
+    adapter = coordinator._haeo_adapter
+    adapter.supports_flexible_second_pass = False
+    adapter.capabilities["supports_flexible_second_pass"] = False
+    context.slots[0].projected_ev_load_kw = 0.0
+    context.slots[0].projected_hvac_load_kw = 0.0
+    coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
+    coordinator.executor = FakeExecutor()
+
+    asyncio.run(coordinator._async_update_data_locked())
+
+    assert adapter.second_pass_calls == 1
+    assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == "skipped"
+    assert (
+        coordinator.store.haeo_runs[0]["second_pass"]["reason"]
+        == "haeo_flexible_projection_unsupported"
+    )
+    assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 0.0
 
 
 def test_update_data_locked_does_not_record_successful_haeo_baseline_as_issue(monkeypatch: object) -> None:

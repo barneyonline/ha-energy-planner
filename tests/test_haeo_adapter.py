@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
+from custom_components.ha_energy_planner import haeo_adapter as haeo_module
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 from custom_components.ha_energy_planner.haeo_adapter import (
     HAEOAdapter,
@@ -209,36 +211,133 @@ def test_haeo_second_pass_sends_flexible_projection() -> None:
 def test_real_haeo_optimize_service_uses_config_entry_schema() -> None:
     hass = HaeoConfigEntryHass()
     context = _context()
+    adapter = HAEOAdapter(hass, "haeo.optimize")
 
-    result = asyncio.run(HAEOAdapter(hass, "haeo.optimize").async_solve_baseline(context))
+    result = asyncio.run(adapter.async_solve_baseline(context))
 
     assert result.status == HAEOStatus.READY
     assert result.response is None
     assert hass.services.calls == [("haeo", "optimize", {"config_entry": "haeo-entry-1"})]
+    assert adapter.supports_flexible_second_pass is False
 
 
-def test_haeo_legacy_service_fallback_without_return_response() -> None:
+def test_native_haeo_skips_unsupported_flexible_solve() -> None:
+    hass = HaeoConfigEntryHass()
+    adapter = HAEOAdapter(hass, "haeo.optimize")
+
+    result = asyncio.run(
+        adapter.async_solve_with_flexible_load(_context(), DryRunPlanner({}).project_flexible_loads(_context()))
+    )
+
+    assert result.status == HAEOStatus.STALE
+    assert result.reason == "haeo_flexible_projection_unsupported"
+    assert hass.services.calls == []
+    assert adapter.last_call_metadata["capabilities"]["supports_response"] is False
+
+
+def test_native_haeo_requires_explicit_selection_when_multiple_entries() -> None:
+    class Entry:
+        def __init__(self, entry_id: str) -> None:
+            self.entry_id = entry_id
+
+    class Entries:
+        def async_entries(self, domain: str) -> list[Entry]:
+            return [Entry("haeo-z"), Entry("haeo-a")] if domain == "haeo" else []
+
+    hass = HaeoConfigEntryHass()
+    hass.config_entries = Entries()
+    ambiguous = HAEOAdapter(hass, "haeo.optimize")
+
+    result = asyncio.run(ambiguous.async_solve_baseline(_context()))
+
+    assert result.status == HAEOStatus.FAILED
+    assert result.reason == "haeo_config_entry_ambiguous"
+    assert hass.services.calls == []
+
+    selected = HAEOAdapter(hass, "haeo.optimize", "haeo-z")
+    result = asyncio.run(selected.async_solve_baseline(_context()))
+    assert result.status == HAEOStatus.READY
+    assert hass.services.calls == [("haeo", "optimize", {"config_entry": "haeo-z"})]
+
+
+def test_response_capable_custom_service_detects_projection_contract() -> None:
+    class Services(FakeServices):
+        def async_services(self) -> dict[str, dict[str, object]]:
+            return {
+                "haeo": {
+                    "optimize": SimpleNamespace(
+                        supports_response="optional",
+                        schema={"flexible_load_projection": object(), "phase": object()},
+                    )
+                }
+            }
+
+    hass = FakeHass()
+    hass.services = Services()
+    adapter = HAEOAdapter(hass, "haeo.optimize")
+
+    result = asyncio.run(
+        adapter.async_solve_with_flexible_load(_context(), DryRunPlanner({}).project_flexible_loads(_context()))
+    )
+
+    assert result.status == HAEOStatus.READY
+    assert adapter.supports_flexible_second_pass is True
+    assert adapter.last_call_metadata["capabilities"]["source"] == "service_registry"
+    assert adapter.last_call_metadata["response_received"] is True
+
+
+def test_haeo_cache_reuses_unchanged_inputs_and_invalidates_on_boundary() -> None:
+    hass = FakeHass()
+    adapter = HAEOAdapter(hass, "haeo.optimize")
+    context = _context()
+
+    first = asyncio.run(adapter.async_solve_baseline(context))
+    first_metadata = dict(adapter.last_call_metadata)
+    context.plan_id = "plan-2"
+    context.created_at += timedelta(seconds=5)
+    cached = asyncio.run(adapter.async_solve_baseline(context))
+
+    assert first.status == cached.status == HAEOStatus.READY
+    assert cached.plan_id == "plan-2"
+    assert len(hass.services.calls) == 1
+    assert first_metadata["cache_hit"] is False
+    assert adapter.last_call_metadata["cache_hit"] is True
+    assert adapter.last_call_metadata["duration_ms"] >= 0
+
+    for slot in context.slots:
+        slot.valid_at += timedelta(seconds=5)
+    asyncio.run(adapter.async_solve_baseline(context))
+    assert len(hass.services.calls) == 1
+    assert adapter.last_call_metadata["cache_hit"] is True
+
+    context.slots[0].valid_at += timedelta(minutes=5)
+    asyncio.run(adapter.async_solve_baseline(context))
+    assert len(hass.services.calls) == 2
+    assert adapter.last_call_metadata["cache_hit"] is False
+
+
+def test_haeo_type_error_fails_without_retrying_side_effectful_solve() -> None:
     hass = LegacyFallbackHass()
     context = _context()
 
     result = asyncio.run(HAEOAdapter(hass, "haeo.optimize").async_solve_baseline(context))
 
-    assert result.status == HAEOStatus.READY
+    assert result.status == HAEOStatus.FAILED
     assert result.response is None
-    assert hass.services.calls[0][0:2] == ("haeo", "optimize")
-    assert hass.services.calls[0][2]["phase"] == "baseline"
+    assert result.reason == "haeo_service_failed:TypeError"
+    assert hass.services.calls == []
 
 
-def test_haeo_legacy_service_fallback_failure_is_reported() -> None:
+def test_haeo_type_error_does_not_enter_legacy_fallback() -> None:
     hass = LegacyFallbackHass(fallback_fails=True)
     context = _context()
 
     result = asyncio.run(HAEOAdapter(hass, "haeo.optimize").async_solve_baseline(context))
 
     assert result.status == HAEOStatus.FAILED
-    assert result.reason == "haeo_service_failed:RuntimeError"
+    assert result.reason == "haeo_service_failed:TypeError"
     assert result.service_called == "haeo.optimize"
-    assert hass.services.calls[0][0:2] == ("haeo", "optimize")
+    assert hass.services.calls == []
 
 
 def test_haeo_response_populates_forecast_evidence_on_context_slots() -> None:
@@ -275,6 +374,25 @@ def test_haeo_response_populates_forecast_evidence_on_context_slots() -> None:
     assert context.slots[0].haeo_battery_soc_forecast_percent == 55
     assert context.slots[1].haeo_grid_export_forecast_kw == 2.0
     assert context.slots[1].haeo_battery_discharge_forecast_kw == 1.25
+
+
+def test_haeo_response_matches_refresh_jitter_within_planning_boundary() -> None:
+    context = _context()
+    for slot in context.slots:
+        slot.valid_at += timedelta(seconds=17)
+
+    counts = apply_haeo_response_to_context(
+        context,
+        {
+            "slots": [
+                {"valid_at": "2026-06-27T00:00:00+00:00", "grid_import_kw": 2.0},
+                {"valid_at": "2026-06-27T00:05:00+00:00", "grid_import_kw": 1.0},
+            ]
+        },
+    )
+
+    assert counts == {"haeo_grid_import_forecast_kw": 2}
+    assert [slot.haeo_grid_import_forecast_kw for slot in context.slots] == [2.0, 1.0]
 
 
 def test_haeo_response_rejects_non_finite_forecast_evidence() -> None:
@@ -551,3 +669,95 @@ def test_haeo_unavailable_degrades_without_service_call() -> None:
     assert result.status == HAEOStatus.STALE
     assert result.reason == "haeo_service_unavailable"
     assert hass.services.calls == []
+
+
+def test_haeo_capability_and_registry_defensive_branches() -> None:
+    class RegistryServices(FakeServices):
+        def async_services(self) -> dict[str, dict[str, object]]:
+            return {
+                "haeo": {
+                    "optimize": {
+                        "supports_response": "optional",
+                        "fields": {"flexible_load_projection": object()},
+                    }
+                }
+            }
+
+    hass = FakeHass()
+    hass.services = RegistryServices()
+    adapter = HAEOAdapter(hass, "haeo.optimize")
+    adapter._legacy_no_response = True
+
+    capabilities = adapter._detect_capabilities()
+
+    assert capabilities.supports_response is False
+    assert capabilities.supports_flexible_projections is True
+    assert haeo_module._descriptor_supports_response({"supports_response": "optional"}) is True
+    assert haeo_module._descriptor_supports_projection({"fields": {"flexible_load_projection": 1}}) is True
+    assert haeo_module._descriptor_supports_projection({"schema": "invalid"}) is False
+
+    class TypeErrorRegistry:
+        def async_services(self) -> object:
+            raise TypeError("unsupported")
+
+    class NonDictRegistry:
+        def async_services(self) -> object:
+            return []
+
+    assert (
+        haeo_module._service_descriptor(SimpleNamespace(services=TypeErrorRegistry()), "haeo", "optimize")
+        is None
+    )
+    assert (
+        haeo_module._service_descriptor(SimpleNamespace(services=NonDictRegistry()), "haeo", "optimize")
+        is None
+    )
+
+
+def test_haeo_cache_expiry_capacity_and_disabled_edges(monkeypatch: Any) -> None:
+    ready = haeo_module.HAEOSolveResult(
+        HAEOSolvePhase.BASELINE,
+        HAEOStatus.READY,
+        "ready",
+        "old-plan",
+    )
+    stale = haeo_module.HAEOSolveResult(
+        HAEOSolvePhase.BASELINE,
+        HAEOStatus.STALE,
+        "stale",
+        "old-plan",
+    )
+
+    disabled = HAEOAdapter(FakeHass(), "haeo.optimize", cache_ttl_seconds=0)
+    disabled._store_cached_result("disabled", ready)
+    assert disabled._cache == {}
+
+    adapter = HAEOAdapter(FakeHass(), "haeo.optimize", cache_ttl_seconds=30)
+    adapter._store_cached_result("stale", stale)
+    assert adapter._cache == {}
+
+    adapter._cache["expired"] = (0.0, ready)
+    monkeypatch.setattr(haeo_module, "monotonic", lambda: 31.0)
+    monkeypatch.setattr(adapter, "_expire_cache", lambda now: None)
+    assert adapter._cached_result("expired", "new-plan") is None
+    assert "expired" not in adapter._cache
+
+    capacity = HAEOAdapter(FakeHass(), "haeo.optimize", cache_ttl_seconds=30)
+    monkeypatch.setattr(haeo_module, "monotonic", lambda: 0.0)
+    for index in range(haeo_module._CACHE_MAX_ENTRIES + 1):
+        capacity._store_cached_result(str(index), ready)
+    assert len(capacity._cache) == haeo_module._CACHE_MAX_ENTRIES
+    assert "0" not in capacity._cache
+
+    capacity._cache["old"] = (0.0, ready)
+    capacity._expire_cache(31.0)
+    assert capacity._cache == {}
+
+
+def test_haeo_entry_selection_and_fingerprint_edges() -> None:
+    assert haeo_module._select_haeo_entry_id(["entry-a"], "missing") == (
+        None,
+        "haeo_config_entry_not_found",
+    )
+    assert haeo_module._select_haeo_entry_id([], None) == (None, "haeo_config_entry_not_found")
+    assert haeo_module._fingerprint_value(float("inf")) == "inf"

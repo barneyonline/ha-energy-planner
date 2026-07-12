@@ -8,10 +8,13 @@ from custom_components.ha_energy_planner.forecast_calibration import (
     MIN_CALIBRATION_SAMPLES,
     _as_utc,
     _bounded_factor,
+    _bounded_uncertainty_factor,
     _finite_float_or_none,
     _nearest_observation,
     _observations_for_field,
     _parse_datetime_or_none,
+    _percentile,
+    _rebuild_model,
     _stored_samples,
     apply_forecast_calibration,
     update_forecast_calibration,
@@ -44,6 +47,10 @@ def _evidence(
         )
         observations[valid_at.isoformat()] = actual
     return snapshots, {"pv_forecast_kw": observations}
+
+
+def test_uncertainty_factor_rejects_non_finite_values() -> None:
+    assert _bounded_uncertainty_factor(float("nan")) == 1.0
 
 
 def test_update_forecast_calibration_enables_bounded_out_of_sample_factor() -> None:
@@ -259,6 +266,80 @@ def test_lead_buckets_train_and_apply_independent_factors() -> None:
     assert calibration["buckets"]["2"]["factor"] == 0.8
     assert apply_forecast_calibration([1.0], model, "pv_forecast_kw") == [1.2]
     assert apply_forecast_calibration([1.0], model, "pv_forecast_kw", lead_offset_minutes=65) == [0.8]
+
+
+def test_apply_forecast_calibration_uses_conservative_uncertainty_factors() -> None:
+    model = {
+        "pv_forecast_kw": {
+            "model_version": 3,
+            "buckets": {
+                "0": {
+                    "enabled": True,
+                    "factor": 1.0,
+                    "lower_factor": 0.72,
+                    "upper_factor": 1.28,
+                }
+            },
+        }
+    }
+
+    assert apply_forecast_calibration(
+        [10.0], model, "pv_forecast_kw", uncertainty_mode="lower"
+    ) == [7.2]
+    assert apply_forecast_calibration(
+        [10.0], model, "pv_forecast_kw", uncertainty_mode="upper"
+    ) == [12.8]
+
+
+def test_unbiased_model_can_enable_uncertainty_without_bias_correction() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    samples = [
+        {
+            "sample_id": f"pv:{index}",
+            "valid_at": (now + timedelta(minutes=10 * index)).isoformat(),
+            "lead_bucket": 0,
+            "forecast": 10.0,
+            "actual": 8.0 if index % 2 == 0 else 12.0,
+        }
+        for index in range(48)
+    ]
+
+    model = {"pv_forecast_kw": _rebuild_model(samples)}
+    bucket = model["pv_forecast_kw"]["buckets"]["0"]
+
+    assert bucket["enabled"] is False
+    assert bucket["uncertainty_enabled"] is True
+    assert apply_forecast_calibration(
+        [10.0], model, "pv_forecast_kw", uncertainty_mode="lower"
+    ) == [8.0]
+    assert apply_forecast_calibration([10.0], model, "pv_forecast_kw") == [10.0]
+
+
+def test_uncertainty_bounds_cannot_invert_around_expected_factor() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    model = _rebuild_model(
+        [
+            {
+                "sample_id": f"load:{index}",
+                "valid_at": (now + timedelta(minutes=10 * index)).isoformat(),
+                "lead_bucket": 0,
+                "forecast": 10.0,
+                "actual": 6.0,
+            }
+            for index in range(48)
+        ]
+    )
+    bucket = model["buckets"]["0"]
+
+    assert bucket["lower_factor"] <= bucket["factor"] <= bucket["upper_factor"]
+
+
+def test_percentile_interpolates_and_bounds_quantile() -> None:
+    assert _percentile([], 0.5) == 1.0
+    assert _percentile([1.0, 2.0, 3.0], 0.5) == 2.0
+    assert _percentile([1.0, 3.0], 0.25) == 1.5
+    assert _percentile([1.0, 3.0], -1.0) == 1.0
+    assert _percentile([1.0, 3.0], 2.0) == 3.0
 
 
 def test_forecast_calibration_rejects_malformed_evidence() -> None:

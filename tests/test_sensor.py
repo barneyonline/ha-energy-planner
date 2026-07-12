@@ -77,6 +77,11 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
             "enphase_control_enabled": True,
             "ai_enabled": True,
         },
+        entry_data={
+            "ev_smart_charging_start_entity": "button.ev_start",
+            "daikin_climate_entity": "climate.home",
+            "enphase_profile_entity": "select.enphase_profile",
+        },
         store_data={
             "production": {
                 "armed": True,
@@ -305,11 +310,16 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
 def test_operational_summary_sensors_handle_edge_shapes() -> None:
     ready = _coordinator(
         _plan(),
-        options={
+            options={
             "ev_control_enabled": True,
             "climate_control_enabled": True,
-            "enphase_control_enabled": True,
-        },
+                "enphase_control_enabled": True,
+            },
+            entry_data={
+                "ev_smart_charging_start_entity": "button.ev_start",
+                "daikin_climate_entity": "climate.home",
+                "enphase_profile_entity": "select.enphase_profile",
+            },
         store_data={
             "production": {"dry_run_ready_cycles": 3},
             "execution_audit": ["invalid"],
@@ -332,6 +342,23 @@ def test_operational_summary_sensors_handle_edge_shapes() -> None:
     assert comparison.attrs_fn(_coordinator(_plan(), store_data={"dry_run_comparisons": []})) == {}
     assert support.value_fn(ready) == "Ready"
     assert sensor_module._pause_active({}) is False
+
+
+def test_production_readiness_supports_ev_only_installation() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={
+            "ev_control_enabled": True,
+            "climate_control_enabled": False,
+            "enphase_control_enabled": False,
+        },
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        store_data={"production": {"dry_run_ready_cycles": 3}},
+    )
+    production = next(item for item in SENSORS if item.key == "production_readiness")
+
+    assert production.value_fn(coordinator) == "Ready To Arm"
+    assert production.attrs_fn(coordinator)["required_control_areas"] == ["ev"]
 
 
 def test_sensor_platform_setup_groups_planner_sensors(monkeypatch: object) -> None:
@@ -357,7 +384,86 @@ def test_planner_sensor_delegates_value_and_attributes() -> None:
     sensor = PlannerSensor(coordinator, description)
 
     assert sensor.native_value == "Current"
+    assert sensor.native_unit_of_measurement is None
     assert sensor.extra_state_attributes["plan_id"] == "plan-1"
+
+
+def test_estimated_cost_sensor_uses_home_assistant_currency_and_horizon() -> None:
+    plan = _plan()
+    plan.estimated_cost_horizon_hours = 6.5
+    coordinator = _coordinator(plan, hass=SimpleNamespace(config=SimpleNamespace(currency="NZD")))
+    description = next(item for item in SENSORS if item.key == "estimated_daily_cost")
+    sensor = PlannerSensor(coordinator, description)
+
+    assert sensor.native_unit_of_measurement == "NZD"
+    assert sensor.extra_state_attributes == {"cost_horizon_hours": 6.5}
+
+
+def test_forecast_confidence_exposes_compact_calibration_uncertainty() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        store_data={
+            "forecast_calibration": {
+                "pv_forecast_kw": {
+                    "sample_count": 52,
+                    "buckets": {
+                        "0": {
+                            "enabled": True,
+                            "factor": 0.9,
+                            "lower_factor": 0.7,
+                            "upper_factor": 1.1,
+                            "holdout_sample_count": 12,
+                            "raw_abs_pct_error_sum": 4.0,
+                            "calibrated_abs_pct_error_sum": 3.0,
+                        }
+                    },
+                }
+            }
+        },
+    )
+    description = next(item for item in SENSORS if item.key == "forecast_confidence")
+
+    attrs = description.attrs_fn(coordinator)
+
+    assert attrs["calibration_enabled"] is True
+    assert attrs["fields"]["pv_forecast_kw"]["enabled_lead_buckets"] == 1
+    assert attrs["fields"]["pv_forecast_kw"]["lead_buckets"]["0"]["lower_factor"] == 0.7
+
+
+def test_forecast_calibration_attributes_reject_malformed_store_shapes() -> None:
+    assert sensor_module._forecast_calibration_attrs(
+        _coordinator(_plan(), store_data={"forecast_calibration": "invalid"})
+    ) == {"calibration_enabled": False, "fields": {}}
+
+    attrs = sensor_module._forecast_calibration_attrs(
+        _coordinator(
+            _plan(),
+            store_data={
+                "forecast_calibration": {
+                    "pv_forecast_kw": "invalid",
+                    "baseline_load_forecast_kw": {"sample_count": 1, "buckets": "invalid"},
+                }
+            },
+        )
+    )
+    assert attrs == {
+        "calibration_enabled": False,
+        "fields": {
+            "baseline_load_forecast_kw": {
+                "sample_count": 1,
+                "enabled_lead_buckets": 0,
+                "uncertainty_enabled_lead_buckets": 0,
+                "lead_buckets": {},
+            }
+        },
+    }
+
+
+def test_latest_store_item_rejects_malformed_history() -> None:
+    assert sensor_module._latest_store_item(None) is None
+    assert sensor_module._latest_store_item([]) is None
+    assert sensor_module._latest_store_item(["invalid"]) is None
+    assert sensor_module._latest_store_item([{"status": "ready"}]) == {"status": "ready"}
 
 
 def test_plan_status_attributes_are_json_friendly_and_bounded() -> None:

@@ -14,10 +14,12 @@ MIN_CALIBRATION_SAMPLES = 48
 MIN_HOLDOUT_SAMPLES = 12
 MIN_SAMPLE_SPAN = timedelta(hours=6)
 MAX_OBSERVATION_SKEW = timedelta(seconds=90)
-MAX_STORED_SAMPLES = 384
+MAX_STORED_SAMPLES = 768
 MAX_LEAD_BUCKETS_PER_TIMESTAMP = 4
 MIN_FACTOR = 0.70
 MAX_FACTOR = 1.30
+MIN_UNCERTAINTY_FACTOR = 0.50
+MAX_UNCERTAINTY_FACTOR = 1.50
 MIN_HOLDOUT_IMPROVEMENT = 0.02
 
 
@@ -28,8 +30,9 @@ def apply_forecast_calibration(
     *,
     interval_minutes: int = 5,
     lead_offset_minutes: float = 0.0,
+    uncertainty_mode: str | None = None,
 ) -> list[float | None]:
-    """Adjust values only with a proven factor for their lead-time bucket."""
+    """Adjust values with a proven expected or conservative lead-time factor."""
     calibration = dict((model or {}).get(field, {}))
     if calibration.get("model_version") != 3:
         return list(values)
@@ -43,15 +46,28 @@ def apply_forecast_calibration(
             adjusted.append(None)
             continue
         bucket = buckets.get(str(max(int((lead_offset_minutes + index * interval_minutes) // 30), 0)))
-        if not isinstance(bucket, Mapping) or not bucket.get("enabled"):
+        calibration_enabled = (
+            bucket.get("uncertainty_enabled", bucket.get("enabled"))
+            if uncertainty_mode in {"lower", "upper"}
+            else bucket.get("enabled")
+        ) if isinstance(bucket, Mapping) else False
+        if not isinstance(bucket, Mapping) or not calibration_enabled:
             adjusted.append(number)
             continue
+        factor_key = {
+            "lower": "lower_factor",
+            "upper": "upper_factor",
+        }.get(uncertainty_mode, "factor")
         try:
-            factor_value = float(bucket.get("factor", 1.0))
+            factor_value = float(bucket.get(factor_key, bucket.get("factor", 1.0)))
         except (TypeError, ValueError):
             adjusted.append(number)
             continue
-        factor = _bounded_factor(factor_value) if isfinite(factor_value) else 1.0
+        factor = (
+            _bounded_uncertainty_factor(factor_value)
+            if uncertainty_mode in {"lower", "upper"}
+            else _bounded_factor(factor_value)
+        ) if isfinite(factor_value) else 1.0
         adjusted.append(round(max(number * factor, 0.0), 4))
     return adjusted
 
@@ -157,12 +173,14 @@ def _rebuild_model(samples: list[dict[str, Any]]) -> dict[str, Any]:
         for lead_bucket, bucket_samples in sorted(grouped_by_bucket.items())
     }
     enabled_buckets = [bucket for bucket in buckets.values() if bucket["enabled"]]
+    uncertainty_buckets = [bucket for bucket in buckets.values() if bucket["uncertainty_enabled"]]
     return {
         "model_version": 3,
         "sample_count": len({str(sample["valid_at"]) for sample in samples}),
         "raw_sample_count": len(samples),
         "factor": enabled_buckets[0]["factor"] if enabled_buckets else 1.0,
         "enabled": bool(enabled_buckets),
+        "uncertainty_enabled": bool(uncertainty_buckets),
         "buckets": buckets,
         "samples": samples,
     }
@@ -185,6 +203,10 @@ def _rebuild_bucket(samples: list[dict[str, Any]]) -> dict[str, Any]:
         for _valid_at, group in training
     ]
     factor = _bounded_factor(median(training_ratios)) if training_ratios else 1.0
+    lower_factor = _bounded_uncertainty_factor(_percentile(training_ratios, 0.10)) if training_ratios else 1.0
+    upper_factor = _bounded_uncertainty_factor(_percentile(training_ratios, 0.90)) if training_ratios else 1.0
+    lower_factor = min(lower_factor, factor)
+    upper_factor = max(upper_factor, factor)
     raw_errors = [_group_absolute_pct_error(group, 1.0) for _valid_at, group in holdout]
     calibrated_errors = [_group_absolute_pct_error(group, factor) for _valid_at, group in holdout]
     raw_error = sum(raw_errors)
@@ -199,14 +221,22 @@ def _rebuild_bucket(samples: list[dict[str, Any]]) -> dict[str, Any]:
         and raw_error > 0
         and calibrated_error <= raw_error * (1.0 - MIN_HOLDOUT_IMPROVEMENT)
     )
+    uncertainty_enabled = (
+        unique_count >= MIN_CALIBRATION_SAMPLES
+        and len(training) >= MIN_CALIBRATION_SAMPLES - holdout_count
+        and sufficient_span
+    )
     return {
         "sample_count": unique_count,
         "training_sample_count": len(training),
         "holdout_sample_count": len(holdout),
         "factor": factor,
+        "lower_factor": lower_factor,
+        "upper_factor": upper_factor,
         "raw_abs_pct_error_sum": round(raw_error, 6),
         "calibrated_abs_pct_error_sum": round(calibrated_error, 6),
         "enabled": enabled,
+        "uncertainty_enabled": uncertainty_enabled,
     }
 
 
@@ -287,6 +317,24 @@ def _bounded_factor(value: float) -> float:
     if not isfinite(value):
         return 1.0
     return round(min(max(value, MIN_FACTOR), MAX_FACTOR), 4)
+
+
+def _bounded_uncertainty_factor(value: float) -> float:
+    if not isfinite(value):
+        return 1.0
+    return round(min(max(value, MIN_UNCERTAINTY_FACTOR), MAX_UNCERTAINTY_FACTOR), 4)
+
+
+def _percentile(values: list[float], quantile: float) -> float:
+    """Return a deterministic linearly interpolated percentile."""
+    if not values:
+        return 1.0
+    ordered = sorted(values)
+    position = min(max(quantile, 0.0), 1.0) * (len(ordered) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(ordered) - 1)
+    fraction = position - lower_index
+    return ordered[lower_index] + (ordered[upper_index] - ordered[lower_index]) * fraction
 
 
 def _finite_float_or_none(value: Any) -> float | None:
