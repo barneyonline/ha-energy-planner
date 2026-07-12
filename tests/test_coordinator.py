@@ -224,8 +224,10 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     expected = _plan("refresh-duration")
 
     async def update_locked() -> EnergyPlan:
+        coordinator._pending_refresh_trigger = "newer_request"
         return expected
 
+    coordinator._pending_refresh_trigger = "state_change"
     coordinator._async_update_data_locked = update_locked
 
     result = asyncio.run(coordinator._async_update_data())
@@ -234,6 +236,27 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     assert coordinator.last_refresh_metadata["succeeded"] is True
     assert coordinator.last_refresh_metadata["duration_ms"] >= 0
     assert coordinator.last_refresh_metadata["completed_at"].tzinfo is not None
+    assert coordinator.last_refresh_metadata["trigger"] == "state_change"
+    assert coordinator.refresh_metrics["trigger_counts"] == {"state_change": 1}
+    assert coordinator.refresh_metrics["succeeded"] == 1
+
+
+def test_coordinator_records_failed_refresh() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.store = FakeStore()
+
+    async def update_locked() -> EnergyPlan:
+        raise RuntimeError("failed refresh")
+
+    coordinator._async_update_data_locked = update_locked
+    try:
+        asyncio.run(coordinator._async_update_data())
+    except RuntimeError:
+        pass
+
+    assert coordinator.refresh_metrics["failed"] == 1
+    assert coordinator.last_refresh_metadata["succeeded"] is False
 
 
 class FakeEvent:
@@ -703,6 +726,163 @@ def test_ai_advice_skips_unsafe_or_zero_confidence_plan() -> None:
     assert should_store is False
     assert result.rejected_reason == "ai_skipped_unsafe_plan"
 
+    plan.health = InputHealth.HEALTHY
+    plan.status = "unsafe"
+    result, should_store = asyncio.run(
+        coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=plan.created_at), plan, {}, {})
+    )
+    assert should_store is False
+    assert result.rejected_reason == "ai_skipped_unsafe_plan"
+
+
+def test_background_ai_is_non_blocking_single_flight_and_persists() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        updates: list[str] = []
+        calls = 0
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator.async_update_listeners = lambda: updates.append("updated")
+        plan = _plan("background-ai")
+        context = SimpleNamespace(created_at=plan.created_at)
+
+        async def delayed_advice(
+            built_context: object,
+            built_plan: EnergyPlan,
+            entry_data: dict[str, object],
+            options: dict[str, object],
+        ) -> tuple[AIAdviceResult, bool]:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return AIAdviceResult("accepted", {"confidence": 0.8}, None, "ai_task.generate_data"), True
+
+        coordinator._async_get_throttled_ai_advice = delayed_advice
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        task = coordinator._ai_advice_task
+        assert task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert coordinator.store.ai_recommendations == []
+
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        assert coordinator._ai_advice_task is task
+        assert calls == 1
+
+        release.set()
+        await task
+        assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
+        assert updates == ["updated"]
+        assert "ai_background_ms" in coordinator._last_phase_durations
+        assert coordinator._ai_advice_task is None
+
+    asyncio.run(scenario())
+
+
+def test_background_ai_replaces_stale_flight_and_shutdown_cancels() -> None:
+    async def scenario() -> None:
+        started = asyncio.Event()
+
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.store = FakeStore({"ai_recommendations": []})
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator._debounce_cancel = None
+        coordinator._boundary_cancel = None
+        coordinator._unsub_listeners = []
+        coordinator.async_update_listeners = lambda: None
+        context = SimpleNamespace(created_at=_plan("first").created_at)
+
+        async def blocked_advice(*args: object) -> tuple[AIAdviceResult, bool]:
+            started.set()
+            await asyncio.Future()
+            raise AssertionError("unreachable")
+
+        coordinator._async_get_throttled_ai_advice = blocked_advice
+        first = _plan("first")
+        coordinator._schedule_ai_advice(context, first, {}, {"ai_enabled": True})
+        first_task = coordinator._ai_advice_task
+        assert first_task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        second = _plan("second")
+        second.preview = [{"import_price": 0.42}]
+        started.clear()
+        coordinator._schedule_ai_advice(context, second, {}, {"ai_enabled": True})
+        second_task = coordinator._ai_advice_task
+        assert second_task is not None and second_task is not first_task
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert first_task.cancelled()
+
+        coordinator.async_shutdown()
+        try:
+            await second_task
+        except asyncio.CancelledError:
+            pass
+        assert second_task.cancelled()
+        assert coordinator._ai_advice_task is None
+
+    asyncio.run(scenario())
+
+
+def test_background_ai_cached_skip_and_failure_are_bounded() -> None:
+    async def scenario() -> None:
+        class TaskHass:
+            @staticmethod
+            def async_create_task(coro: object) -> asyncio.Task[None]:
+                return asyncio.create_task(coro)
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator._ai_advice_task = None
+        coordinator._ai_advice_fingerprint = None
+        coordinator._last_phase_durations = {}
+        coordinator.async_update_listeners = lambda: None
+        plan = _plan("cached")
+        fingerprint = _material_plan_fingerprint(plan)
+        coordinator.store = FakeStore(
+            {"ai_recommendations": [{"status": "accepted", "rejected_detail": {"plan_fingerprint": fingerprint}}]}
+        )
+        context = SimpleNamespace(created_at=plan.created_at)
+
+        coordinator._schedule_ai_advice(context, plan, {}, {"ai_enabled": True})
+        assert coordinator._ai_advice_task is None
+
+        async def skipped(*args: object) -> tuple[AIAdviceResult, bool]:
+            return AIAdviceResult("skipped", {}, "rate_limited", None), False
+
+        coordinator._async_get_throttled_ai_advice = skipped
+        coordinator._ai_advice_fingerprint = fingerprint
+        await coordinator._async_run_ai_advice(context, plan, {}, {"ai_enabled": True}, fingerprint)
+        assert coordinator.store.ai_recommendations == []
+
+        async def failed(*args: object) -> tuple[AIAdviceResult, bool]:
+            raise RuntimeError("provider failed")
+
+        coordinator._async_get_throttled_ai_advice = failed
+        await coordinator._async_run_ai_advice(context, plan, {}, {"ai_enabled": True}, fingerprint)
+        assert coordinator.store.ai_recommendations == []
+
+    asyncio.run(scenario())
+
 
 def test_material_ai_fingerprint_changes_with_forecast_preview_and_cost() -> None:
     first = _plan("generated-1")
@@ -713,6 +893,9 @@ def test_material_ai_fingerprint_changes_with_forecast_preview_and_cost() -> Non
     second.estimated_daily_cost = 2.5
 
     assert _material_plan_fingerprint(first) != _material_plan_fingerprint(second)
+    second.preview = [{"valid_at": "2026-06-27T00:05:00+00:00", "import_price": 0.1, "pv_forecast_kw": 1.0}]
+    first.preview = [{"valid_at": "2026-06-27T00:00:00+00:00", "import_price": 0.1, "pv_forecast_kw": 1.0}]
+    assert _material_plan_fingerprint(first) == _material_plan_fingerprint(second)
 
 
 def test_ai_advice_reuses_unchanged_material_plan() -> None:
@@ -734,14 +917,9 @@ def test_ai_advice_reuses_unchanged_material_plan() -> None:
 def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
     assert _latest_ai_plan_fingerprint("bad") is None
     assert _latest_ai_plan_fingerprint([{"ignored": True}, "bad"]) is None
+    assert _latest_ai_plan_fingerprint(["bad", {"status": "accepted", "plan_fingerprint": "top-level"}]) == "top-level"
     assert (
-        _latest_ai_plan_fingerprint(["bad", {"status": "accepted", "plan_fingerprint": "top-level"}])
-        == "top-level"
-    )
-    assert (
-        _latest_ai_plan_fingerprint(
-            [{"status": "accepted", "rejected_detail": {"plan_fingerprint": "nested"}}]
-        )
+        _latest_ai_plan_fingerprint([{"status": "accepted", "rejected_detail": {"plan_fingerprint": "nested"}}])
         == "nested"
     )
     hass = FakeHass({"sensor.price": "0.25"})
@@ -1036,8 +1214,8 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 7.25
     assert coordinator.store.haeo_runs[0]["second_pass"]["cache_hit"] is True
     assert coordinator.store.haeo_runs[0]["capabilities"]["supports_flexible_second_pass"] is True
-    assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
-    assert coordinator.store.forecast_snapshots[0]["ai"]["accepted_fields"] == ["confidence", "reasoning_summary"]
+    assert coordinator.store.ai_recommendations == []
+    assert coordinator.store.forecast_snapshots[0]["ai"] is None
     assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
     assert coordinator.store.saved_plans == [result]
     assert coordinator.executor.evaluated == [(result, context)]
