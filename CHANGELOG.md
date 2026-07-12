@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The AI-provider privacy notice is logged at informational level instead of surfacing as a Home Assistant warning.
+
 ## 0.5.1 - 2026-07-12
 
 ### Added
