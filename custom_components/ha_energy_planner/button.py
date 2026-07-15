@@ -68,6 +68,14 @@ async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_resume_control("button_pressed")
 
 
+async def _start_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
+    await coordinator.async_manual_ev_charging(True)
+
+
+async def _stop_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
+    await coordinator.async_manual_ev_charging(False)
+
+
 BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="replan",
@@ -124,6 +132,20 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         icon="mdi:play-circle-outline",
         entity_category=EntityCategory.CONFIG,
         press_fn=_resume,
+    ),
+    PlannerButtonDescription(
+        key="ev_start_charging",
+        translation_key="ev_start_charging",
+        icon="mdi:ev-station",
+        entity_category=EntityCategory.CONFIG,
+        press_fn=_start_ev_charging,
+    ),
+    PlannerButtonDescription(
+        key="ev_stop_charging",
+        translation_key="ev_stop_charging",
+        icon="mdi:ev-station-off",
+        entity_category=EntityCategory.CONFIG,
+        press_fn=_stop_ev_charging,
     ),
 )
 

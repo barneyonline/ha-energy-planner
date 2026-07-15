@@ -147,6 +147,7 @@ class DecisionContext:
     current_hvac_power_kw: float | None = None
     current_outdoor_temperature_c: float | None = None
     ev_connected: bool | None = None
+    ev_charging: bool | None = None
     ev_target_soc_percent: float | None = None
     ev_ready_by: str | None = None
     ev_trip_observed_days: int = 0

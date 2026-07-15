@@ -14,12 +14,25 @@ restore_safe_state:
 
 set_ev_ready_by:
   name: Set EV ready by
-  description: Set a runtime EV ready-by time override.
+  description: Set and persist the native EV ready-by time.
   fields:
     ready_by:
       required: true
       selector:
         time:
+
+set_ev_target_soc:
+  name: Set EV target SOC
+  description: Set and persist the native smart-charging target SOC.
+  fields:
+    target_soc:
+      required: true
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 1
+          unit_of_measurement: "%"
 
 set_manual_hvac_override:
   name: Set manual HVAC override

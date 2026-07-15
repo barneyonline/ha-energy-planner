@@ -19,6 +19,9 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
@@ -215,9 +218,7 @@ def _production_gate_message(production: dict[str, Any]) -> str:
     details: list[str] = []
     dry_run_ready_cycles = parse_production_state(production).dry_run_ready_cycles
     if dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
-        details.append(
-            f"{dry_run_ready_cycles}/{DRY_RUN_READY_CYCLES_REQUIRED} healthy dry-run cycles recorded"
-        )
+        details.append(f"{dry_run_ready_cycles}/{DRY_RUN_READY_CYCLES_REQUIRED} healthy dry-run cycles recorded")
     required_areas = list(production.get("required_control_areas", []))
     if "required_control_areas" in production and not required_areas:
         details.append("no configured control areas are enabled")
@@ -259,9 +260,7 @@ def _current_plan_report(
     refresh_completed_at = _datetime_or_none(refresh.get("completed_at"))
     refresh_age = None if refresh_completed_at is None else now - refresh_completed_at
     last_refresh_succeeded = bool(
-        refresh.get("succeeded") is True
-        and refresh_age is not None
-        and timedelta(0) <= refresh_age <= max_age
+        refresh.get("succeeded") is True and refresh_age is not None and timedelta(0) <= refresh_age <= max_age
     )
     configured_horizon = max(float(getattr(plan, "horizon_hours", 0.0) or 0.0), 0.0)
     required_horizon = min(configured_horizon, 8.0) if configured_horizon else 8.0
@@ -381,9 +380,7 @@ def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str
     if entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) and (required_areas is None or "haeo" in required_areas):
         configured.append(str(entry_data[CONF_HAEO_OPTIMIZE_SERVICE]))
     configured.extend(
-        str(entry_data[key])
-        for key in _SERVICE_KEYS
-        if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
+        str(entry_data[key]) for key in _SERVICE_KEYS if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
     )
     return configured
 
@@ -425,8 +422,7 @@ def _production_report(
     required_control_areas = list(control_areas.get("required", []))
     dry_run_ready_cycles = production_state.dry_run_ready_cycles
     required_areas_configured = all(
-        bool(control_areas.get("details", {}).get(area, {}).get("configured"))
-        for area in required_control_areas
+        bool(control_areas.get("details", {}).get(area, {}).get("configured")) for area in required_control_areas
     )
     dry_run_evidence_complete = (
         dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
@@ -457,18 +453,23 @@ def _production_report(
 
 def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[str, Any]) -> str:
     """Bind dry-run evidence to the currently configured control contract."""
+    entry_data = dict(entry_data)
+    aliases = {
+        CONF_EV_CHARGER: CONF_EV_SMART_CHARGING,
+        CONF_EV_CHARGER_START: CONF_EV_SMART_CHARGING_START,
+        CONF_EV_CHARGER_STOP: CONF_EV_SMART_CHARGING_STOP,
+    }
+    for current_key, legacy_key in aliases.items():
+        if not entry_data.get(current_key) and entry_data.get(legacy_key):
+            entry_data[current_key] = entry_data[legacy_key]
     normalized_options = {**options, CONF_PLANNER_ENABLED: True}
     control_areas = _control_area_report(entry_data, normalized_options)
     required = list(control_areas["required"])
     payload = {
         "required": required,
         "details": {area: control_areas["details"][area] for area in required},
-        "entry_data": {
-            key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS
-        },
-        "options": {
-            key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS
-        },
+        "entry_data": {key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS},
+        "options": {key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS},
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -495,7 +496,14 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
         "haeo": bool(str(entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE, "") or "").strip()),
         "ev": any(
             bool(str(entry_data.get(key, "") or "").strip())
-            for key in (CONF_EV_SMART_CHARGING, CONF_EV_SMART_CHARGING_START, CONF_EV_SMART_CHARGING_STOP)
+            for key in (
+                CONF_EV_CHARGER,
+                CONF_EV_CHARGER_START,
+                CONF_EV_CHARGER_STOP,
+                CONF_EV_SMART_CHARGING,
+                CONF_EV_SMART_CHARGING_START,
+                CONF_EV_SMART_CHARGING_STOP,
+            )
         ),
         "hvac": bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
         "enphase": bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
@@ -507,9 +515,7 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
         "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
     }
     required = [
-        area
-        for area in ("haeo", "ev", "hvac", "enphase")
-        if enabled[area] and (area != "haeo" or configured[area])
+        area for area in ("haeo", "ev", "hvac", "enphase") if enabled[area] and (area != "haeo" or configured[area])
     ]
     return {
         "configured": [area for area, value in configured.items() if value],

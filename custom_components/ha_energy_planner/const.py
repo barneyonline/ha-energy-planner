@@ -6,7 +6,7 @@ DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"
 LEGACY_INTEGRATION_NAME = f"HA {INTEGRATION_NAME}"
 
-PLATFORMS = ["sensor", "binary_sensor", "switch", "button"]
+PLATFORMS = ["sensor", "binary_sensor", "switch", "button", "number", "time"]
 
 CONF_HAEO_OPTIMIZE_SERVICE = "haeo_optimize_service"
 CONF_AMBER_IMPORT_PRICE = "amber_import_price_entity"
@@ -35,6 +35,11 @@ CONF_PERSON_ENTITIES = "person_entities"
 CONF_EV_SOC = "ev_soc_entity"
 CONF_EV_CHARGING = "ev_charging_entity"
 CONF_EV_CONNECTED = "ev_connected_entity"
+# Native charger controls. The EV Smart Charging keys below remain readable
+# for upgrades, but are no longer exposed by the config flow.
+CONF_EV_CHARGER = "ev_charger_entity"
+CONF_EV_CHARGER_START = "ev_charger_start_entity"
+CONF_EV_CHARGER_STOP = "ev_charger_stop_entity"
 CONF_EV_SMART_CHARGING = "ev_smart_charging_entity"
 CONF_EV_SMART_CHARGING_START = "ev_smart_charging_start_entity"
 CONF_EV_SMART_CHARGING_STOP = "ev_smart_charging_stop_entity"
@@ -62,6 +67,12 @@ CONF_EV_MAX_SOC_PERCENT = "ev_max_soc_percent"
 CONF_EV_FALLBACK_TARGET_SOC_PERCENT = "ev_fallback_target_soc_percent"
 CONF_EV_CHARGE_RATE_KW = "ev_charge_rate_kw"
 CONF_EV_SOC_PER_KWH = "ev_soc_per_kwh"
+CONF_EV_CONTINUOUS_CHARGING = "ev_continuous_charging"
+CONF_EV_EARLIEST_START = "ev_earliest_start"
+CONF_EV_PRICE_LIMIT_ENABLED = "ev_price_limit_enabled"
+CONF_EV_MAX_IMPORT_PRICE = "ev_max_import_price"
+CONF_EV_LOW_PRICE_CHARGING_ENABLED = "ev_low_price_charging_enabled"
+CONF_EV_LOW_PRICE_THRESHOLD = "ev_low_price_threshold"
 CONF_GRID_IMPORT_LIMIT_KW = "grid_import_limit_kw"
 CONF_GRID_EXPORT_LIMIT_KW = "grid_export_limit_kw"
 CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT = "occupied_temperature_tolerance_percent"
@@ -109,6 +120,12 @@ DEFAULT_OPTIONS = {
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 80.0,
     CONF_EV_CHARGE_RATE_KW: 7.0,
     CONF_EV_SOC_PER_KWH: 5.0,
+    CONF_EV_CONTINUOUS_CHARGING: True,
+    CONF_EV_EARLIEST_START: "None",
+    CONF_EV_PRICE_LIMIT_ENABLED: False,
+    CONF_EV_MAX_IMPORT_PRICE: 1.0,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED: False,
+    CONF_EV_LOW_PRICE_THRESHOLD: 0.0,
     CONF_GRID_IMPORT_LIMIT_KW: 10.0,
     CONF_GRID_EXPORT_LIMIT_KW: 10.0,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT: 10.0,
@@ -153,6 +170,7 @@ STORE_KEY = f"{DOMAIN}_state"
 SERVICE_REPLAN = "replan"
 SERVICE_RESTORE_SAFE_STATE = "restore_safe_state"
 SERVICE_SET_EV_READY_BY = "set_ev_ready_by"
+SERVICE_SET_EV_TARGET_SOC = "set_ev_target_soc"
 SERVICE_SET_MANUAL_HVAC_OVERRIDE = "set_manual_hvac_override"
 SERVICE_EXPORT_DIAGNOSTICS = "export_diagnostics"
 SERVICE_EXPORT_SUPPORT_BUNDLE = "export_support_bundle"
@@ -164,6 +182,7 @@ SERVICE_RESUME_CONTROL = "resume_control"
 
 ATTR_REASON = "reason"
 ATTR_READY_BY = "ready_by"
+ATTR_TARGET_SOC = "target_soc"
 ATTR_DURATION_MINUTES = "duration_minutes"
 ATTR_ASSET = "asset"
 
