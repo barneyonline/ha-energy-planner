@@ -13,6 +13,7 @@ from custom_components.ha_energy_planner.const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
+    ATTR_TARGET_SOC,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
     SERVICE_DISARM_PRODUCTION_CONTROL,
@@ -23,6 +24,7 @@ from custom_components.ha_energy_planner.const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
+    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
@@ -123,6 +125,7 @@ def test_non_response_services_await_coordinator_work() -> None:
         (SERVICE_REPLAN, {}),
         (SERVICE_RESTORE_SAFE_STATE, {ATTR_REASON: "test_restore"}),
         (SERVICE_SET_EV_READY_BY, {ATTR_READY_BY: "08:30"}),
+        (SERVICE_SET_EV_TARGET_SOC, {ATTR_TARGET_SOC: 85}),
         (
             SERVICE_SET_MANUAL_HVAC_OVERRIDE,
             {ATTR_DURATION_MINUTES: 15, ATTR_REASON: "test_override"},
@@ -140,6 +143,7 @@ def test_non_response_services_await_coordinator_work() -> None:
         ("replan", None),
         ("restore", "test_restore"),
         ("ready_by", "08:30"),
+        ("target_soc", 85.0),
         ("manual_override", (15, "test_override")),
         ("arm", "test_arm"),
         ("disarm", "test_disarm"),
@@ -170,6 +174,21 @@ def test_set_ev_ready_by_schema_rejects_invalid_time() -> None:
         assert "ready_by must be a valid local time" in str(err)
     else:
         raise AssertionError("Invalid ready_by time was accepted")
+
+
+def test_set_ev_target_soc_schema_accepts_percentage_and_rejects_out_of_range() -> None:
+    coordinator = _coordinator()
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+    schema = hass.services.schemas[(DOMAIN, SERVICE_SET_EV_TARGET_SOC)]
+
+    assert schema({ATTR_TARGET_SOC: "85"}) == {ATTR_TARGET_SOC: 85.0}
+    try:
+        schema({ATTR_TARGET_SOC: 101})
+    except Exception as err:  # noqa: BLE001 - assert service bounds.
+        assert "value must be at most 100" in str(err)
+    else:
+        raise AssertionError("Invalid target SOC was accepted")
 
 
 def test_reason_code_schemas_accept_compact_codes() -> None:
@@ -489,9 +508,7 @@ def test_run_preflight_fails_closed_for_missing_and_malformed_production_state()
     coordinator.store.data["production"] = {
         "armed": "true",
         "dry_run_ready_cycles": "3",
-        "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-            coordinator.entry.data, coordinator.options
-        ),
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(coordinator.entry.data, coordinator.options),
     }
     malformed = _run_preflight(coordinator)
     coordinator.store.data["production"] = "corrupt"
@@ -559,9 +576,7 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
             "default_ready_by": "23:45",
         },
     )
-    changed_policy = production_evidence_fingerprint(
-        entry_data, {**options, "command_rate_limit_seconds": 120}
-    )
+    changed_policy = production_evidence_fingerprint(entry_data, {**options, "command_rate_limit_seconds": 120})
 
     assert active == original
     assert changed_policy != original
@@ -705,6 +720,9 @@ def _coordinator() -> EnergyPlannerCoordinator:
     async def ready_by(value: str) -> None:
         coordinator.awaited.append(("ready_by", value))
 
+    async def target_soc(value: float) -> None:
+        coordinator.awaited.append(("target_soc", value))
+
     async def manual_override(duration: int, reason: str) -> None:
         coordinator.awaited.append(("manual_override", (duration, reason)))
 
@@ -723,6 +741,7 @@ def _coordinator() -> EnergyPlannerCoordinator:
     coordinator.async_request_replan = replan
     coordinator.async_restore_safe_state = restore
     coordinator.async_set_ready_by = ready_by
+    coordinator.async_set_ev_target_soc = target_soc
     coordinator.async_set_manual_hvac_override = manual_override
     coordinator.async_arm_production_control = arm
     coordinator.async_disarm_production_control = disarm

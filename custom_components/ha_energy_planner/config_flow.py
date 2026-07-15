@@ -45,13 +45,13 @@ from .const import (
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC,
     CONF_BATTERY_USABLE_CAPACITY_KWH,
+    CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
-    CONF_CARBON_INTENSITY_FORECAST,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
@@ -65,12 +65,21 @@ from .const import (
     CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
+    CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+    CONF_EV_LOW_PRICE_THRESHOLD,
+    CONF_EV_MAX_IMPORT_PRICE,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
+    CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
@@ -254,17 +263,9 @@ EV_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_EV_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
         vol.Optional(CONF_EV_CHARGING): _entity_selector(["binary_sensor", "sensor", "switch"]),
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
-        vol.Optional(CONF_EV_SMART_CHARGING): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
-        vol.Optional(CONF_EV_SMART_CHARGING_START): _entity_selector(
-            ["switch", "button", "input_boolean", "input_button"]
-        ),
-        vol.Optional(CONF_EV_SMART_CHARGING_STOP): _entity_selector(
-            ["switch", "button", "input_boolean", "input_button"]
-        ),
-        vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(entity_filter=_EV_TARGET_SOC_FILTER),
-        vol.Optional(CONF_EV_SMART_CHARGING_READY_BY): _entity_selector(
-            ["time", "input_datetime", "input_text", "select", "input_select"]
-        ),
+        vol.Optional(CONF_EV_CHARGER): _entity_selector(["switch", "input_boolean"]),
+        vol.Optional(CONF_EV_CHARGER_START): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
+        vol.Optional(CONF_EV_CHARGER_STOP): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
     }
 )
 
@@ -323,6 +324,12 @@ _POLICY_SECTION_FIELDS = {
         CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
+        CONF_EV_CONTINUOUS_CHARGING,
+        CONF_EV_EARLIEST_START,
+        CONF_EV_PRICE_LIMIT_ENABLED,
+        CONF_EV_MAX_IMPORT_PRICE,
+        CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+        CONF_EV_LOW_PRICE_THRESHOLD,
         CONF_GRID_IMPORT_LIMIT_KW,
         CONF_GRID_EXPORT_LIMIT_KW,
     ),
@@ -439,6 +446,16 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_EV_SOC_PER_KWH: NumberSelector(
             NumberSelectorConfig(min=0.1, max=50, step=0.1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_EV_CONTINUOUS_CHARGING: BooleanSelector(),
+        CONF_EV_EARLIEST_START: TextSelector(TextSelectorConfig()),
+        CONF_EV_PRICE_LIMIT_ENABLED: BooleanSelector(),
+        CONF_EV_MAX_IMPORT_PRICE: NumberSelector(
+            NumberSelectorConfig(min=-10, max=10, step=0.01, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_EV_LOW_PRICE_CHARGING_ENABLED: BooleanSelector(),
+        CONF_EV_LOW_PRICE_THRESHOLD: NumberSelector(
+            NumberSelectorConfig(min=-10, max=10, step=0.01, mode=NumberSelectorMode.BOX)
         ),
         CONF_GRID_IMPORT_LIMIT_KW: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=0.1, mode=NumberSelectorMode.BOX)
@@ -942,6 +959,9 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
         errors[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = "ev_fallback_outside_bounds"
     if not _ready_by_valid(str(user_input[CONF_DEFAULT_READY_BY])):
         errors[CONF_DEFAULT_READY_BY] = "invalid_ready_by"
+    earliest_start = str(user_input[CONF_EV_EARLIEST_START])
+    if earliest_start.lower() != "none" and not _ready_by_valid(earliest_start):
+        errors[CONF_EV_EARLIEST_START] = "invalid_ready_by"
     priority_values = _priority_values_from_form(user_input)
     if not _priority_weights_valid(priority_values):
         errors["base"] = "invalid_priority_weights"
@@ -1009,6 +1029,9 @@ _ENTITY_DOMAIN_RULES = {
     CONF_EV_SOC: {"sensor"},
     CONF_EV_CHARGING: {"binary_sensor", "sensor", "switch"},
     CONF_EV_CONNECTED: {"binary_sensor", "sensor"},
+    CONF_EV_CHARGER: {"switch", "input_boolean"},
+    CONF_EV_CHARGER_START: {"switch", "button", "input_boolean", "input_button"},
+    CONF_EV_CHARGER_STOP: {"switch", "button", "input_boolean", "input_button"},
     CONF_EV_SMART_CHARGING: {"switch", "button", "input_boolean", "input_button"},
     CONF_EV_SMART_CHARGING_START: {"switch", "button", "input_boolean", "input_button"},
     CONF_EV_SMART_CHARGING_STOP: {"switch", "button", "input_boolean", "input_button"},

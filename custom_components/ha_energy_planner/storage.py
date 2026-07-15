@@ -124,6 +124,20 @@ class PlannerStore:
         self.data["ai_recommendations"] = recommendations[-50:]
         await self._async_save()
 
+    async def async_attach_ai_to_forecast_snapshot(self, plan_id: str, metadata: dict[str, Any]) -> None:
+        """Attach completed background AI metadata to its forecast snapshot."""
+        snapshots = list(self.data.get("forecast_snapshots", []))
+        for index in range(len(snapshots) - 1, -1, -1):
+            snapshot = snapshots[index]
+            if not isinstance(snapshot, dict) or snapshot.get("plan_id") != plan_id:
+                continue
+            updated = dict(snapshot)
+            updated["ai"] = to_jsonable(metadata)
+            snapshots[index] = updated
+            self.data["forecast_snapshots"] = snapshots
+            await self._async_save()
+            return
+
     async def async_save_discovery(self, report: dict[str, Any]) -> None:
         """Persist latest non-commanding discovery report."""
         await self._async_set_if_changed("discovery", report)

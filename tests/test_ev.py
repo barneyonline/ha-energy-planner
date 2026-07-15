@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.ev import (
     EVTripRecord,
+    _best_continuous_slots,
     _charge_cost_components,
     _connected_bool,
     _effective_charge_price,
@@ -181,6 +182,30 @@ def test_allocate_least_cost_charging_marks_infeasible() -> None:
     assert schedule.infeasible is True
     assert schedule.scheduled_soc_percent == 45
     assert schedule.reason == "infeasible_before_ready_by"
+
+
+def test_allocate_native_charging_honors_force_current_and_price_limit() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    slots = [
+        DecisionSlot(now + timedelta(minutes=offset), price, 0.05, 0, 1)
+        for offset, price in [(0, 0.8), (5, 0.1), (10, 0.2)]
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=50,
+        ready_by=now + timedelta(minutes=15),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        force_current=True,
+        max_import_price=0.15,
+    )
+
+    assert [allocation.valid_at for allocation in schedule.allocations] == [now, now + timedelta(minutes=5)]
+    assert schedule.infeasible is False
+    assert _best_continuous_slots([], [], required_slots=0, interval_minutes=5, force_current=False) == []
 
 
 def test_update_trip_history_records_completed_disconnected_trip() -> None:

@@ -29,7 +29,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 
 - Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
 - Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional grid carbon-intensity forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
-- EV charging plan, current/next charging state, ready-by planning, charge energy estimates, and start/stop controls
+- Native EV smart charging with target-SOC/ready-by controls, direct charger start/stop, minimum-SOC recovery, price limits, low-price charging, continuous or interval-based schedules, and charge energy estimates
 - Climate plan, current/next climate state, comfort targets, HVAC power modeling, manual override handling, and presence-aware control
 - Presence as a separate device, including multi-person occupancy inputs
 - Enphase profile monitoring and planned current/next battery profile state
@@ -97,7 +97,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.5.0`
+- Current manifest version: `0.6.0`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `hub`
 - IoT class: `local_polling`
@@ -117,7 +117,7 @@ Energy Planner can be useful with different source integrations, but the current
 - Weather inputs from [bremor/bureau_of_meteorology](https://github.com/bremor/bureau_of_meteorology) or another Home Assistant weather provider.
 - HAEO optimization through [hass-energy/haeo](https://github.com/hass-energy/haeo), using the response-capable `haeo.optimize` service.
 - Enphase profile monitoring and control through [barneyonline/ha-enphase-energy](https://github.com/barneyonline/ha-enphase-energy) or another integration that exposes the system profile as a selectable entity.
-- EV charge start/stop controls from [jonasbkarlsson/ev_smart_charging](https://github.com/jonasbkarlsson/ev_smart_charging) or equivalent Home Assistant switch/button entities.
+- A charger or vehicle integration that exposes a writable charging switch, or separate start/stop buttons. Energy Planner performs the smart-charging optimization itself.
 - BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
 - Daikin climate and HVAC power entities from Home Assistant climate/sensor integrations.
 - Optional AI advice from an AI Task provider such as [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation), when it exposes an `ai_task` entity.
@@ -125,6 +125,14 @@ Energy Planner can be useful with different source integrations, but the current
 For Amber-backed planning, start with the 12-hour default. Energy Planner reports each source's first and last timestamps, covered and continuous hours, and leading, internal, and trailing gaps. A degraded 8-to-under-12-hour window remains visible but does not produce eligible device actions under the existing healthy-input action gate.
 
 Required Amber, PV, and baseline-load inputs must expose forecast series; a numeric current value is retained only for the current slot and cannot satisfy forecast coverage.
+
+## Native EV smart charging
+
+Energy Planner no longer requires the separate EV Smart Charging integration. Add the **EV** planning area and map the vehicle SOC, connected and charging state entities, plus either one charger switch or separate start/stop controls. Energy Planner exposes its own **Target SOC**, **Ready by**, **Start charging**, and **Stop charging** entities.
+
+The planner chooses cost-, solar-, carbon-, battery-, and grid-aware charging windows inside the configured earliest-start and ready-by window. Continuous charging is the default to reduce charger cycling; it can be disabled for interval-level optimization. A configured maximum import price can exclude expensive intervals, low-price charging can claim the current interval, and an EV below the minimum SOC is charged immediately. Manual start/stop buttons create a one-hour override so the immediate replan does not undo the requested state. Active scheduled commands remain behind the normal dry-run, production-arming, health, confidence, grid-limit, rate-limit, and restore-safe-state gates.
+
+Existing entries that used the old `ev_smart_charging_*` control keys continue to work during migration. Reconfigure the EV planning area to store the new direct-charger fields. Legacy target-SOC and ready-by helpers are read only for compatibility; new setups use Energy Planner's native entities.
 
 For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Secondary values must have timezone-aware timestamps and are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. Until per-slot provenance is retained, secondary PV slots are deliberately excluded from forecast calibration. A baseline-load forecast may conservatively fill up to one hour of missing leading slots from its current numeric state; this is reported explicitly and reduces source confidence.
 
@@ -164,7 +172,8 @@ Energy Planner registers these Home Assistant services:
 - `ha_energy_planner.disarm_production_control`: block active device commands until production control is armed again.
 - `ha_energy_planner.pause_control`: temporarily pause planner-owned active control for all devices or a device class.
 - `ha_energy_planner.resume_control`: clear the active-control pause.
-- `ha_energy_planner.set_ev_ready_by`: set a runtime EV ready-by override.
+- `ha_energy_planner.set_ev_ready_by`: set and persist the native EV ready-by time.
+- `ha_energy_planner.set_ev_target_soc`: set and persist the native EV target SOC.
 - `ha_energy_planner.set_manual_hvac_override`: block planner HVAC control for a bounded manual override window.
 
 ## Production setup checklist
@@ -172,7 +181,7 @@ Energy Planner registers these Home Assistant services:
 1. Install Energy Planner and add it from **Devices & services**.
 2. Add planning areas from the integration page.
 3. Map the required source entities and services for the planning areas you want to use.
-4. Review the **EV, battery, and grid** policy settings, especially usable battery capacity, efficiency, and max charge/discharge power.
+4. Review the **EV, battery, and grid** policy settings, especially EV target/minimum/maximum SOC, charge rate, earliest start, continuous charging, price controls, usable home-battery capacity, efficiency, and max charge/discharge power.
 5. Review the **Data health** confidence thresholds for tariff, solar, load, climate, EV, and Enphase decisions.
 6. Leave active control disabled and dry-run enabled.
 7. Press the **Run preflight** button or run `ha_energy_planner.run_preflight`.

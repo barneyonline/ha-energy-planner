@@ -1,4 +1,4 @@
-"""EV Smart Charging execution adapter."""
+"""Direct EV charger execution adapter."""
 
 from __future__ import annotations
 
@@ -10,6 +10,9 @@ from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_O
 from homeassistant.core import HomeAssistant, State
 
 from .const import (
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING,
@@ -24,7 +27,7 @@ from .models import ActionKind, PlanAction
 
 @dataclass(slots=True)
 class EVCommandResult:
-    """Result of an EV Smart Charging adapter action."""
+    """Result of a direct EV charger action."""
 
     applied: bool
     reason: str
@@ -32,8 +35,8 @@ class EVCommandResult:
     post_state: dict[str, Any]
 
 
-class EVSmartChargingAdapter:
-    """Execute EV actions through configured EV Smart Charging controls only."""
+class EVChargerAdapter:
+    """Execute planner decisions through configured charger controls."""
 
     def __init__(self, hass: HomeAssistant, entry_data: dict[str, Any]) -> None:
         """Initialize adapter."""
@@ -56,12 +59,12 @@ class EVSmartChargingAdapter:
         return EVCommandResult(result.applied, result.reason, pre_state, post_state)
 
     async def async_restore(self, saved_state: dict[str, Any] | None = None) -> EVCommandResult:
-        """Restore EV Smart Charging to saved state, or stop as a safe fallback."""
+        """Restore charger controls to saved state, or stop as a safe fallback."""
         pre_state = self._snapshot()
         if saved_state:
             applied = False
             for key, state in saved_state.items():
-                entity_id = self.entry_data.get(key)
+                entity_id = self._configured_entity(key)
                 if entity_id and state in {"on", "off"} and entity_id.split(".", 1)[0] in {"switch", "input_boolean"}:
                     await self._async_call_control(entity_id, turn_on=state == "on")
                     applied = True
@@ -75,7 +78,7 @@ class EVSmartChargingAdapter:
         return EVCommandResult(result.applied, result.reason, pre_state, self._snapshot())
 
     async def async_set_ready_by(self, ready_by: str) -> EVCommandResult:
-        """Set the configured EV ready-by helper without starting or stopping charging."""
+        """Update a legacy external ready-by helper during the compatibility window."""
         pre_state = self._snapshot()
         ready_by_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
         if not ready_by_entity:
@@ -88,30 +91,41 @@ class EVSmartChargingAdapter:
             return EVCommandResult(False, "ev_ready_by_helper_unsupported", pre_state, self._snapshot())
         return EVCommandResult(True, "ev_ready_by_helper_updated", pre_state, self._snapshot())
 
-    async def _async_start(self, action: PlanAction) -> EVCommandResult:
+    async def async_set_charging(self, enabled: bool) -> EVCommandResult:
+        """Start or stop charging for a manual Energy Planner command."""
+        return await self._async_start(None) if enabled else await self._async_stop()
+
+    async def _async_start(self, action: PlanAction | None) -> EVCommandResult:
         connected = self._state(self.entry_data.get(CONF_EV_CONNECTED))
         if connected is not None and not _truthy_state(connected):
             return EVCommandResult(False, "ev_not_connected", self._snapshot(), self._snapshot())
-        start_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_START) or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        start_entity = self._start_entity()
         if not start_entity:
             return EVCommandResult(False, "ev_start_control_not_configured", self._snapshot(), self._snapshot())
         return await self._async_call_control(start_entity, turn_on=True)
 
     async def _async_stop(self) -> EVCommandResult:
-        stop_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
+        stop_entity = self._stop_entity(separate_only=True)
         if stop_entity:
             return await self._async_call_control(stop_entity, turn_on=False, press_button=True)
-        stop_entity = self.entry_data.get(CONF_EV_SMART_CHARGING)
+        stop_entity = self._stop_entity()
         if not stop_entity:
             return EVCommandResult(False, "ev_stop_control_not_configured", self._snapshot(), self._snapshot())
         return await self._async_call_control(stop_entity, turn_on=False, press_button=False)
 
     async def _async_schedule(self, action: PlanAction) -> EVCommandResult:
+        if "charging_required_now" not in action.desired_state:
+            return await self._async_legacy_schedule(action)
+        if bool(action.desired_state.get("charging_required_now")):
+            return await self._async_start(action)
+        return await self._async_stop()
+
+    async def _async_legacy_schedule(self, action: PlanAction) -> EVCommandResult:
+        """Honor saved helper-based entries while users migrate to native controls."""
         target_soc = action.desired_state.get("target_soc_percent")
         ready_by = action.desired_state.get("ready_by")
         target_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
         ready_by_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
-
         if target_soc is not None:
             if not target_entity:
                 return EVCommandResult(False, "ev_target_soc_helper_not_configured", self._snapshot(), self._snapshot())
@@ -131,6 +145,28 @@ class EVSmartChargingAdapter:
         if ready_by is not None and not await self._async_set_entity_value(ready_by_entity, ready_by):
             return EVCommandResult(False, "ev_ready_by_helper_unsupported", self._snapshot(), self._snapshot())
         return await self._async_start(action)
+
+    def _start_entity(self) -> str | None:
+        return (
+            self.entry_data.get(CONF_EV_CHARGER_START)
+            or self.entry_data.get(CONF_EV_CHARGER)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        )
+
+    def _stop_entity(self, *, separate_only: bool = False) -> str | None:
+        separate = self.entry_data.get(CONF_EV_CHARGER_STOP) or self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
+        if separate or separate_only:
+            return separate
+        return self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(CONF_EV_SMART_CHARGING)
+
+    def _configured_entity(self, key: str) -> str | None:
+        aliases = {
+            CONF_EV_SMART_CHARGING: CONF_EV_CHARGER,
+            CONF_EV_SMART_CHARGING_START: CONF_EV_CHARGER_START,
+            CONF_EV_SMART_CHARGING_STOP: CONF_EV_CHARGER_STOP,
+        }
+        return self.entry_data.get(key) or self.entry_data.get(aliases.get(key, ""))
 
     async def _async_call_control(self, entity_id: str, *, turn_on: bool, press_button: bool = True) -> EVCommandResult:
         raw_state = self.hass.states.get(entity_id)
@@ -207,8 +243,10 @@ class EVSmartChargingAdapter:
         if domain == "sensor":
             return _float_equal(state.state, value)
         if domain in {"select", "input_select"}:
-            return str(state.state) == str(value) or _float_equal(state.state, value) or _time_value_matches(
-                state.state, value
+            return (
+                str(state.state) == str(value)
+                or _float_equal(state.state, value)
+                or _time_value_matches(state.state, value)
             )
         return False
 
@@ -251,6 +289,9 @@ class EVSmartChargingAdapter:
             in {
                 CONF_EV_CHARGING,
                 CONF_EV_CONNECTED,
+                CONF_EV_CHARGER,
+                CONF_EV_CHARGER_START,
+                CONF_EV_CHARGER_STOP,
                 CONF_EV_SMART_CHARGING,
                 CONF_EV_SMART_CHARGING_START,
                 CONF_EV_SMART_CHARGING_STOP,
@@ -288,6 +329,10 @@ def _truthy_state(state: State) -> bool:
         "connected_not_charging",
         "fully_charged",
     }
+
+
+# Kept as an import alias for custom code and one-release test compatibility.
+EVSmartChargingAdapter = EVChargerAdapter
 
 
 def _float_equal(left: Any, right: Any) -> bool:

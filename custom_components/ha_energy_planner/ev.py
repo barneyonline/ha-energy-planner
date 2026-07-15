@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from math import ceil
 from typing import Any
 
 MAX_STORED_TRIPS = 120
@@ -286,6 +287,10 @@ def allocate_least_cost_charging(
     soc_per_kwh: float,
     interval_minutes: int,
     carbon_weight: float = 0.0,
+    earliest_start: datetime | None = None,
+    continuous: bool = False,
+    force_current: bool = False,
+    max_import_price: float | None = None,
 ) -> EVChargeSchedule:
     """Allocate EV charging to cheapest feasible slots before ready-by.
 
@@ -300,8 +305,34 @@ def allocate_least_cost_charging(
     if soc_per_slot <= 0:
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, required, True, "ev_charge_rate_invalid")
 
-    feasible_slots = [slot for slot in slots if slot.valid_at < ready_by and slot.import_price is not None]
-    ordered = _rank_charging_slots(feasible_slots, charge_rate_kw, carbon_weight)
+    feasible_slots = [
+        slot
+        for slot in slots
+        if slot.valid_at < ready_by
+        and (earliest_start is None or slot.valid_at >= earliest_start)
+        and slot.import_price is not None
+    ]
+    current_slot = min(feasible_slots, key=lambda slot: slot.valid_at, default=None)
+    price_eligible = [
+        slot
+        for slot in feasible_slots
+        if max_import_price is None
+        or float(slot.import_price) <= max_import_price
+        or (force_current and slot is current_slot)
+    ]
+    ranked = _rank_charging_slots(price_eligible, charge_rate_kw, carbon_weight)
+    if continuous:
+        ordered = _best_continuous_slots(
+            price_eligible,
+            ranked,
+            required_slots=ceil(required / soc_per_slot),
+            interval_minutes=interval_minutes,
+            force_current=force_current,
+        )
+    elif force_current and current_slot in ranked:
+        ordered = [current_slot, *(slot for slot in ranked if slot is not current_slot)]
+    else:
+        ordered = ranked
     remaining = required
     allocations: list[EVChargeAllocation] = []
     for slot in ordered:
@@ -313,9 +344,7 @@ def allocate_least_cost_charging(
         effective_price, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
         carbon_intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
         estimated_carbon = (
-            round(grid_kw * (interval_minutes / 60.0) * carbon_intensity, 3)
-            if carbon_intensity is not None
-            else None
+            round(grid_kw * (interval_minutes / 60.0) * carbon_intensity, 3) if carbon_intensity is not None else None
         )
         allocations.append(
             EVChargeAllocation(
@@ -341,12 +370,46 @@ def allocate_least_cost_charging(
         scheduled_soc_percent=round(scheduled, 3),
         required_charge_percent=round(required, 3),
         infeasible=infeasible,
-        reason="infeasible_before_ready_by"
+        reason="infeasible_before_ready_by_or_price_limit"
+        if infeasible and max_import_price is not None
+        else "infeasible_before_ready_by"
         if infeasible
+        else "continuous_charging_window_before_ready_by"
+        if continuous
         else "least_cost_solar_aware_slots_before_ready_by"
         if used_solar_surplus
         else "least_cost_slots_before_ready_by",
     )
+
+
+def _best_continuous_slots(
+    feasible_slots: list[Any],
+    ranked_slots: list[Any],
+    *,
+    required_slots: int,
+    interval_minutes: int,
+    force_current: bool,
+) -> list[Any]:
+    """Return the lowest-ranked contiguous window in chronological order."""
+    chronological = sorted(feasible_slots, key=lambda slot: slot.valid_at)
+    if required_slots <= 0 or not chronological:
+        return []
+    rank = {slot.valid_at: index for index, slot in enumerate(ranked_slots)}
+    windows: list[list[Any]] = []
+    for index in range(len(chronological)):
+        window = chronological[index : index + required_slots]
+        if len(window) != required_slots:
+            continue
+        if all(
+            (right.valid_at - left.valid_at).total_seconds() == interval_minutes * 60
+            for left, right in zip(window, window[1:], strict=False)
+        ):
+            windows.append(window)
+    if force_current:
+        windows = [window for window in windows if window[0] is chronological[0]]
+    if not windows:
+        return chronological[:required_slots]
+    return min(windows, key=lambda window: (sum(rank[slot.valid_at] for slot in window), window[0].valid_at))
 
 
 def _rank_charging_slots(slots: list[Any], charge_kw: float, carbon_weight: float) -> list[Any]:
@@ -417,14 +480,11 @@ def _solar_surplus_kw(slot: Any) -> float:
     pv_value = getattr(slot, "pv_forecast_lower_kw", None)
     load_value = getattr(slot, "baseline_load_forecast_upper_kw", None)
     pv_kw = _float_or_none(getattr(slot, "pv_forecast_kw", None) if pv_value is None else pv_value)
-    load_kw = _float_or_none(
-        getattr(slot, "baseline_load_forecast_kw", None) if load_value is None else load_value
-    )
+    load_kw = _float_or_none(getattr(slot, "baseline_load_forecast_kw", None) if load_value is None else load_value)
     if pv_kw is None or load_kw is None:
         return 0.0
-    existing_flexible_load_kw = (
-        (_float_or_none(getattr(slot, "projected_hvac_load_kw", None)) or 0.0)
-        + (_float_or_none(getattr(slot, "projected_ev_load_kw", None)) or 0.0)
+    existing_flexible_load_kw = (_float_or_none(getattr(slot, "projected_hvac_load_kw", None)) or 0.0) + (
+        _float_or_none(getattr(slot, "projected_ev_load_kw", None)) or 0.0
     )
     return round(max(pv_kw - load_kw - existing_flexible_load_kw, 0.0), 6)
 
