@@ -1344,15 +1344,67 @@ def _dry_run_comparison_state(coordinator: EnergyPlannerCoordinator) -> str:
 
 
 def _dry_run_comparison_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return latest dry-run comparison details."""
+    """Return recorder-safe dry-run comparison summaries."""
     comparisons = coordinator.store.data.get("dry_run_comparisons", [])
     if not isinstance(comparisons, list) or not comparisons:
         return {}
     latest = comparisons[-1] if isinstance(comparisons[-1], dict) else {}
     return {
-        "latest": _bounded_json(latest),
-        "recent": _bounded_json([item for item in comparisons[-5:] if isinstance(item, dict)]),
+        "latest": _dry_run_comparison_summary(latest, include_next_action=True),
+        "recent": [
+            _dry_run_comparison_summary(item, include_next_action=False)
+            for item in comparisons[-5:]
+            if isinstance(item, dict)
+        ],
     }
+
+
+def _dry_run_comparison_summary(item: dict[str, Any], *, include_next_action: bool) -> dict[str, Any]:
+    """Return a compact comparison summary suitable for state attributes."""
+    summary = {
+        key: _bounded_attribute_scalar(item.get(key))
+        for key in (
+            "created_at",
+            "plan_id",
+            "planned_action_count",
+            "estimated_daily_cost",
+            "recent_outcome_count",
+            "occurrence_count",
+            "first_created_at",
+            "last_created_at",
+        )
+        if key in item
+    }
+    next_action = item.get("next_action")
+    if include_next_action:
+        summary["next_action"] = (
+            {
+                key: _bounded_attribute_scalar(next_action.get(key))
+                for key in (
+                    "action_id",
+                    "asset",
+                    "kind",
+                    "execute_not_before",
+                    "execute_not_after",
+                    "expected_cost_delta",
+                    "confidence",
+                    "requires_haeo_plan_id",
+                )
+                if key in next_action
+            }
+            if isinstance(next_action, dict)
+            else None
+        )
+    return summary
+
+
+def _bounded_attribute_scalar(value: Any) -> str | int | float | bool | None:
+    """Return a scalar with text bounded for recorder-facing attributes."""
+    value = to_jsonable(value)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    text = value if isinstance(value, str) else str(value)
+    return text if len(text) <= 256 else f"{text[:253]}..."
 
 
 def _support_bundle_state(coordinator: EnergyPlannerCoordinator) -> str:

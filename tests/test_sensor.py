@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -135,6 +136,43 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert comparison.attrs_fn(coordinator)["latest"]["plan_id"] == "plan-1"
     assert support.value_fn(coordinator) == "Needs Review"
     assert support.attrs_fn(coordinator)["latest_ai"] == {"enabled": True, "latest": None}
+
+
+def test_dry_run_comparison_attributes_stay_below_recorder_limit() -> None:
+    huge_text = "x" * 20_000
+    comparisons = [
+        {
+            "created_at": f"2026-07-{day:02d}T00:00:00+00:00",
+            "plan_id": f"plan-{day}-{huge_text}",
+            "planned_action_count": day,
+            "estimated_daily_cost": 1.23,
+            "recent_outcome_count": 5,
+            "recent_outcomes": [{"pre_state": huge_text, "post_state": huge_text}] * 5,
+            "next_action": {
+                "action_id": huge_text,
+                "asset": huge_text,
+                "kind": huge_text,
+                "execute_not_before": huge_text,
+                "execute_not_after": huge_text,
+                "desired_state": {huge_text: huge_text},
+                "hard_constraints": [huge_text] * 8,
+                "reason_codes": [huge_text] * 8,
+                "requires_haeo_plan_id": huge_text,
+            },
+        }
+        for day in range(1, 7)
+    ]
+    coordinator = _coordinator(_plan(), store_data={"dry_run_comparisons": comparisons})
+    comparison = next(item for item in SENSORS if item.key == "dry_run_comparison")
+
+    attrs = comparison.attrs_fn(coordinator)
+
+    assert len(json.dumps(attrs, separators=(",", ":")).encode()) < 16_384
+    assert len(attrs["recent"]) == 5
+    assert len(attrs["latest"]["plan_id"]) == 256
+    assert len(attrs["latest"]["next_action"]["action_id"]) == 256
+    assert "recent_outcomes" not in attrs["latest"]
+    assert "next_action" not in attrs["recent"][-1]
 
 
 def test_decision_audit_sensors_expose_accepted_rejected_and_timeline_rows() -> None:

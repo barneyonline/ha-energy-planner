@@ -31,9 +31,10 @@ Status as of 2026-06-28.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, HAEO, forecast, bounded action, AI, ownership, override, and outcome
   records.
-- Published plan-status and next-action sensor attributes are compact,
-  JSON-friendly, and bounded so enum/datetime values are serialized before
-  reaching Home Assistant state attributes.
+- Published plan-status, next-action, and dry-run comparison sensor attributes
+  are compact, JSON-friendly, and bounded so enum/datetime values are
+  serialized and nested audit evidence cannot exceed Recorder's state-attribute
+  limit. Full bounded dry-run evidence remains available through diagnostics.
 - Forecast confidence is calculated from source confidence metadata where
   exposed, uses a conservative lower confidence for point-sensor forecast
   fallback, and caps the published plan/action confidence without weakening
