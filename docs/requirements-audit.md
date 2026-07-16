@@ -59,7 +59,7 @@ Status as of 2026-06-28.
 - Configurable grid import/export kW limits are represented as options and
   validated as hard constraints against HAEO grid-flow evidence when available,
   otherwise against normalized PV/load plus projected EV/HVAC flexible load.
-- EV Smart Charging, Daikin HVAC, and Enphase profile adapters execute through
+- Native EV charger, Daikin HVAC, and Enphase profile adapters execute through
   mapped Home Assistant entities/services and support restore where configured.
 - Manual Daikin changes create a temporary override, persisted across restart,
   and planner-owned HVAC changes have a short guard window.
@@ -158,9 +158,9 @@ Status as of 2026-06-28.
   active-mode HVAC away-off execution path against a Home Assistant
   `generic_thermostat`. It also runs the `set_ev_ready_by`
   service through Home Assistant Core and verifies the normalized runtime value
-  reaches the EV Smart Charging ready-by helper during active scheduling, an
-  active-mode EV Smart Charging execution path against local Home Assistant
-  helpers, an active-mode Enphase arbitrage profile takeover against a local
+  updates Energy Planner's native ready-by setting during active scheduling, a
+  direct active-mode EV charger execution path against local Home Assistant
+  controls, an active-mode Enphase arbitrage profile takeover against a local
   `input_select`, an active-mode Enphase restore-to-AI profile action when
   arbitrage value drops below threshold, active-mode Enphase command-cooldown
   rejection for a repeated arbitrage opportunity, final safe-state restoration,
@@ -319,14 +319,13 @@ Status as of 2026-06-28.
   Assistant task loop so service calls return quickly; only the explicit
   `export_diagnostics` response service awaits and returns a payload. Service
   reason inputs are bounded and restricted to compact audit codes.
-- The `set_ev_ready_by` service validates local time input and normalizes
-  accepted values to `HH:MM` before queueing planner work; the runtime override
-  is applied to EV scheduling without mutating stored config-entry options.
-  Docker smoke coverage validates the service through Home Assistant Core and
-  observes the normalized ready-by helper value on the EV Smart Charging action.
+- The `set_ev_ready_by` service validates local time input, normalizes accepted
+  values to `HH:MM`, persists the native setting, and queues planner work. The
+  `set_ev_target_soc` service validates and persists a percentage target. Native
+  time/number entities expose the same controls on the EV device.
 - EV, Enphase, and Daikin adapters avoid duplicate commands where current
-  observable state already matches the requested state, including EV Smart
-  Charging helper writes for target SOC and ready-by time.
+  observable state already matches the requested state. Native EV no-op
+  decisions are skipped without consuming command caps.
 - EV, Enphase, and Daikin adapters fail closed on Home Assistant service-layer
   errors and return auditable command results instead of raising through the
   planner task.

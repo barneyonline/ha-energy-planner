@@ -14,12 +14,14 @@ from custom_components.ha_energy_planner.models import (
     HAEOStatus,
     InputHealth,
     OccupancyState,
+    Override,
     PlanAction,
     PlannerMode,
 )
 from custom_components.ha_energy_planner.planner import (
     DryRunPlanner,
     _arbitrage_spread,
+    _ev_earliest_start,
     _haeo_battery_arbitrage_value,
     _next_ready_by,
 )
@@ -108,9 +110,7 @@ def test_carbon_objective_scores_low_carbon_ev_schedule_and_changes_weight_by_pr
         kind=ActionKind.EV_SCHEDULE,
         desired_state={
             "required_charge_percent": 10,
-            "allocated_slots": [
-                {"carbon_intensity_g_per_kwh": 100, "grid_import_used_kw": 5.0}
-            ],
+            "allocated_slots": [{"carbon_intensity_g_per_kwh": 100, "grid_import_used_kw": 5.0}],
         },
         hard_constraints=[],
         reason_codes=[],
@@ -343,12 +343,8 @@ def test_disabled_planner_suppresses_actions_and_marks_disabled() -> None:
 def test_planner_mode_rejects_truthy_string_safety_options() -> None:
     context = _context()
 
-    disabled = DryRunPlanner(
-        {**DEFAULT_OPTIONS, "planner_enabled": "true", "dry_run": False}
-    ).create_plan(context)
-    dry_run = DryRunPlanner(
-        {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": "false"}
-    ).create_plan(context)
+    disabled = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": "true", "dry_run": False}).create_plan(context)
+    dry_run = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": "false"}).create_plan(context)
 
     assert disabled.mode == PlannerMode.DISABLED
     assert dry_run.mode == PlannerMode.DRY_RUN
@@ -404,61 +400,80 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert plan.actions[0].asset == ActionAsset.EV
     assert plan.actions[0].kind == ActionKind.EV_SCHEDULE
     assert plan.actions[0].desired_state["target_soc_percent"] == 70.0
+    assert plan.actions[0].desired_state["charging_required_now"] is True
+    assert plan.actions[0].desired_state["continuous_charging"] is True
     assert plan.actions[0].requires_haeo_plan_id == context.plan_id
-    assert [slot.projected_ev_load_kw for slot in context.slots] == [0.0, 6, 0.0, 6]
+    assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0, 0.0]
     assert plan.device_plans["ev"]["total_estimated_energy_kwh"] == 1.0
-    assert plan.device_plans["ev"]["timeline"] == [
-        {
-            "state": "idle",
-            "start": "2026-06-27T00:00:00+00:00",
-            "end": "2026-06-27T00:05:00+00:00",
-        },
-        {
-            "state": "charging",
-            "charge_kw": 6,
-            "estimated_energy_kwh": 0.5,
-            "reason_codes": [
-                "ev_soc_below_target",
-                "fallback_until_history_sufficient",
-                "least_cost_slots_before_ready_by",
-            ],
-            "target_soc_percent": 70.0,
-            "ready_by": "00:20",
-            "infeasible": False,
-            "start": "2026-06-27T00:05:00+00:00",
-            "end": "2026-06-27T00:10:00+00:00",
-        },
-        {
-            "state": "idle",
-            "start": "2026-06-27T00:10:00+00:00",
-            "end": "2026-06-27T00:15:00+00:00",
-        },
-        {
-            "state": "charging",
-            "charge_kw": 6,
-            "estimated_energy_kwh": 0.5,
-            "reason_codes": [
-                "ev_soc_below_target",
-                "fallback_until_history_sufficient",
-                "least_cost_slots_before_ready_by",
-            ],
-            "target_soc_percent": 70.0,
-            "ready_by": "00:20",
-            "infeasible": False,
-            "start": "2026-06-27T00:15:00+00:00",
-            "end": "2026-06-27T00:20:00+00:00",
-        },
-    ]
+    timeline = plan.device_plans["ev"]["timeline"]
+    assert [item["state"] for item in timeline] == ["charging", "idle"]
+    assert timeline[0]["start"] == "2026-06-27T00:00:00+00:00"
+    assert timeline[0]["end"] == "2026-06-27T00:10:00+00:00"
 
 
-def test_ev_target_at_or_below_current_soc_does_not_create_charge_action() -> None:
+def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
     context = _context()
     context.current_ev_soc_percent = 80
 
     plan = DryRunPlanner(options).create_plan(context)
 
-    assert [action for action in plan.actions if action.asset == ActionAsset.EV] == []
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["allocated_slots"] == []
+    assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
+
+
+def test_native_ev_low_price_charging_starts_current_interval() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_min_soc_percent": 40,
+        "ev_fallback_target_soc_percent": 80,
+        "ev_low_price_charging_enabled": True,
+        "ev_low_price_threshold": 0,
+        "ev_continuous_charging": False,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 60
+    context.slots[0].import_price = -0.1
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["charging_reason"] == "ev_low_price_charge_now"
+
+
+def test_native_ev_manual_overrides_survive_immediate_replan() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    context = _context()
+    context.current_ev_soc_percent = 80
+    context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_start")]
+
+    start = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+    context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_stop")]
+    stop = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert start.desired_state["charging_required_now"] is True
+    assert start.desired_state["charging_reason"] == "ev_manual_start_override"
+    assert stop.desired_state["charging_required_now"] is False
+    assert stop.desired_state["charging_reason"] == "ev_manual_stop_override"
+
+
+def test_ev_earliest_start_handles_window_timezone_and_invalid_values() -> None:
+    created = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    ready = datetime(2026, 6, 27, 21, 0, tzinfo=UTC)
+
+    assert _ev_earliest_start(created, ready, "None", "UTC") == created
+    assert _ev_earliest_start(created, ready, "bad", "UTC") == created
+    assert _ev_earliest_start(created, ready, "20:00", "Missing/Timezone") == datetime(2026, 6, 27, 20, 0, tzinfo=UTC)
 
 
 def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
@@ -466,7 +481,7 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 45,
+        "ev_min_soc_percent": 35,
         "default_ready_by": "00:15",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -496,9 +511,9 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
 
     allocation = plan.actions[0].desired_state["allocated_slots"][0]
     assert plan.actions[0].reason_codes == [
-        "ev_soc_below_target",
+        "ev_outside_allocated_charging_window",
         "fallback_until_history_sufficient",
-        "least_cost_solar_aware_slots_before_ready_by",
+        "continuous_charging_window_before_ready_by",
     ]
     assert allocation["valid_at"] == "2026-06-27T00:05:00+00:00"
     assert allocation["import_price"] == 0.3
@@ -636,9 +651,7 @@ def test_carbon_action_score_covers_allocation_and_asset_edges() -> None:
     context.slots[0].carbon_intensity_g_per_kwh = 500
     context.slots[1].carbon_intensity_g_per_kwh = 100
     assert (
-        planner_module._carbon_action_score(
-            action(ActionAsset.ENPHASE, {"arbitrage_direction": "consume"}), context
-        )
+        planner_module._carbon_action_score(action(ActionAsset.ENPHASE, {"arbitrage_direction": "consume"}), context)
         == 1.0
     )
     assert planner_module._carbon_action_score(action(ActionAsset.ENPHASE, {}), context) == 0.0
@@ -664,12 +677,8 @@ def test_next_ready_by_uses_melbourne_standard_and_daylight_offsets() -> None:
     winter_now = datetime(2026, 7, 11, 20, 30, tzinfo=UTC)  # 06:30 local (+10)
     summer_now = datetime(2026, 1, 11, 19, 30, tzinfo=UTC)  # 06:30 local (+11)
 
-    assert _next_ready_by(winter_now, "07:00", "Australia/Melbourne") == datetime(
-        2026, 7, 11, 21, 0, tzinfo=UTC
-    )
-    assert _next_ready_by(summer_now, "07:00", "Australia/Melbourne") == datetime(
-        2026, 1, 11, 20, 0, tzinfo=UTC
-    )
+    assert _next_ready_by(winter_now, "07:00", "Australia/Melbourne") == datetime(2026, 7, 11, 21, 0, tzinfo=UTC)
+    assert _next_ready_by(summer_now, "07:00", "Australia/Melbourne") == datetime(2026, 1, 11, 20, 0, tzinfo=UTC)
 
 
 def test_ev_schedule_preserves_absolute_ready_by_timestamp() -> None:
@@ -706,16 +715,10 @@ def test_next_ready_by_rolls_over_in_local_calendar_and_handles_dst_gap() -> Non
     after_ready = datetime(2026, 7, 11, 22, 0, tzinfo=UTC)  # 08:00 local
     before_spring_gap = datetime(2026, 10, 3, 15, 0, tzinfo=UTC)  # 01:00 local
 
-    assert _next_ready_by(after_ready, "07:00", "Australia/Melbourne") == datetime(
-        2026, 7, 12, 21, 0, tzinfo=UTC
-    )
+    assert _next_ready_by(after_ready, "07:00", "Australia/Melbourne") == datetime(2026, 7, 12, 21, 0, tzinfo=UTC)
     # 02:30 does not exist on this date, so the wall-clock deadline advances to 03:00.
-    assert _next_ready_by(before_spring_gap, "02:30", "Australia/Melbourne") == datetime(
-        2026, 10, 3, 16, 0, tzinfo=UTC
-    )
-    assert _next_ready_by(after_ready, "07:00", "Invalid/Timezone") == datetime(
-        2026, 7, 12, 7, 0, tzinfo=UTC
-    )
+    assert _next_ready_by(before_spring_gap, "02:30", "Australia/Melbourne") == datetime(2026, 10, 3, 16, 0, tzinfo=UTC)
+    assert _next_ready_by(after_ready, "07:00", "Invalid/Timezone") == datetime(2026, 7, 12, 7, 0, tzinfo=UTC)
 
 
 def test_estimated_cost_reports_its_non_daily_horizon() -> None:
@@ -1417,51 +1420,69 @@ def test_thermal_shift_helpers_cover_defensive_branches() -> None:
         )
         == -0.25
     )
-    assert planner_module._thermal_coast_hours(
-        mode="heat",
-        target_temperature=23,
-        comfort_boundary=19,
-        passive_drift_c_per_hour=None,
-    ) is None
-    assert planner_module._thermal_coast_hours(
-        mode="cool",
-        target_temperature=19,
-        comfort_boundary=23,
-        passive_drift_c_per_hour=0.5,
-    ) == 8
-    assert planner_module._thermal_coast_hours(
-        mode="heat",
-        target_temperature=23,
-        comfort_boundary=19,
-        passive_drift_c_per_hour=0.5,
-    ) is None
-    assert planner_module._precondition_slot_count(
-        current_temperature=21,
-        target_temperature=23,
-        mode="heat",
-        interval_minutes=5,
-        max_slots=0,
-        thermal_model={},
-    ) == 0
-    assert planner_module._precondition_slot_count(
-        current_temperature=21,
-        target_temperature=23,
-        mode="heat",
-        interval_minutes=30,
-        max_slots=4,
-        thermal_model={},
-    ) == 4
-    assert planner_module._precondition_slot_count(
-        current_temperature=21,
-        target_temperature=22,
-        mode="heat",
-        interval_minutes=30,
-        max_slots=4,
-        thermal_model={
-            "enabled": True,
-            "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 1.0},
-        },
-    ) == 2
+    assert (
+        planner_module._thermal_coast_hours(
+            mode="heat",
+            target_temperature=23,
+            comfort_boundary=19,
+            passive_drift_c_per_hour=None,
+        )
+        is None
+    )
+    assert (
+        planner_module._thermal_coast_hours(
+            mode="cool",
+            target_temperature=19,
+            comfort_boundary=23,
+            passive_drift_c_per_hour=0.5,
+        )
+        == 8
+    )
+    assert (
+        planner_module._thermal_coast_hours(
+            mode="heat",
+            target_temperature=23,
+            comfort_boundary=19,
+            passive_drift_c_per_hour=0.5,
+        )
+        is None
+    )
+    assert (
+        planner_module._precondition_slot_count(
+            current_temperature=21,
+            target_temperature=23,
+            mode="heat",
+            interval_minutes=5,
+            max_slots=0,
+            thermal_model={},
+        )
+        == 0
+    )
+    assert (
+        planner_module._precondition_slot_count(
+            current_temperature=21,
+            target_temperature=23,
+            mode="heat",
+            interval_minutes=30,
+            max_slots=4,
+            thermal_model={},
+        )
+        == 4
+    )
+    assert (
+        planner_module._precondition_slot_count(
+            current_temperature=21,
+            target_temperature=22,
+            mode="heat",
+            interval_minutes=30,
+            max_slots=4,
+            thermal_model={
+                "enabled": True,
+                "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 1.0},
+            },
+        )
+        == 2
+    )
 
 
 def test_active_plan_uses_replayed_cold_thermal_samples_for_heat_preconditioning() -> None:

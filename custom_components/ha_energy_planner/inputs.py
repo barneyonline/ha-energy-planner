@@ -23,11 +23,14 @@ from .const import (
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
+    CONF_DEFAULT_READY_BY,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
+    CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
@@ -175,9 +178,7 @@ class InputManager:
                 "valid_at": now + timedelta(minutes=offset),
                 "pv_forecast_kw_issued_at": self._forecast_source_issued_at.get("pv_forecast_kw"),
                 "pv_forecast_kw": _series_value(self._raw_forecast_series.get("pv_forecast_kw", pv_forecasts), index),
-                "baseline_load_forecast_kw_issued_at": self._forecast_source_issued_at.get(
-                    "baseline_load_forecast_kw"
-                ),
+                "baseline_load_forecast_kw_issued_at": self._forecast_source_issued_at.get("baseline_load_forecast_kw"),
                 "baseline_load_forecast_kw": _series_value(
                     self._raw_forecast_series.get("baseline_load_forecast_kw", baseline_loads),
                     index,
@@ -189,8 +190,17 @@ class InputManager:
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
         ev_connected, ev_connected_issue = self._optional_bool_state(CONF_EV_CONNECTED)
-        ev_target_soc, ev_target_soc_issue = self._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC)
-        ev_ready_by, ev_ready_by_issue = self._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY)
+        ev_charging, ev_charging_issue = self._optional_bool_state(CONF_EV_CHARGING)
+        if self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC):
+            ev_target_soc, ev_target_soc_issue = self._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC)
+        else:
+            ev_target_soc = _finite_float_or_none(self.options.get(CONF_EV_FALLBACK_TARGET_SOC_PERCENT))
+            ev_target_soc_issue = None
+        if self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
+            ev_ready_by, ev_ready_by_issue = self._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY)
+        else:
+            ev_ready_by = str(self.options.get(CONF_DEFAULT_READY_BY, "07:00"))
+            ev_ready_by_issue = None
         enphase_profile, enphase_profile_issue = self._optional_string_state(CONF_ENPHASE_PROFILE)
         hvac_mode, hvac_temperature, hvac_issue = self._optional_climate_state(CONF_DAIKIN_CLIMATE)
         hvac_power, hvac_power_issue = self._optional_numeric_state(CONF_DAIKIN_POWER)
@@ -235,6 +245,7 @@ class InputManager:
                 battery_issue,
                 ev_issue,
                 ev_connected_issue,
+                ev_charging_issue,
                 ev_target_soc_issue,
                 ev_ready_by_issue,
                 enphase_profile_issue,
@@ -286,6 +297,7 @@ class InputManager:
             current_hvac_power_kw=hvac_power,
             current_outdoor_temperature_c=outdoor_temperature,
             ev_connected=ev_connected,
+            ev_charging=ev_charging,
             ev_target_soc_percent=ev_target_soc,
             ev_ready_by=ev_ready_by,
             ev_trip_observed_days=ev_trip_summary.observed_days,
@@ -830,9 +842,7 @@ def _retain_uncalibrated_secondary_slots(
 ) -> list[float | None]:
     """Apply calibration only where the primary source supplied the slot."""
     return [
-        calibrated[index]
-        if index < len(primary) and primary[index] is not None
-        else value
+        calibrated[index] if index < len(primary) and primary[index] is not None else value
         for index, value in enumerate(original)
     ]
 
@@ -845,11 +855,7 @@ def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> lis
     target_minutes = (0, 30, 60, 120, 240, 480, 720, 1080, horizon_hours * 60 - interval_minutes)
     return sorted(
         set(range(min(12, slot_count)))
-        | {
-            min(max(round(minutes / interval_minutes), 0), slot_count - 1)
-            for minutes in target_minutes
-            if minutes >= 0
-        }
+        | {min(max(round(minutes / interval_minutes), 0), slot_count - 1) for minutes in target_minutes if minutes >= 0}
     )
 
 

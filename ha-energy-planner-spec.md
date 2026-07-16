@@ -1,5 +1,7 @@
 # ha-energy-planner: Custom Integration Specification
 
+> **v0.6 native EV uplift:** Energy Planner now owns EV smart-charging optimization and directly controls a configured charger switch or start/stop controls. Native Target SOC and Ready by entities supersede the v1 dependency on EV Smart Charging. Legacy keys remain readable only for migration. Where the historical v1 text below refers to EV Smart Charging, the v0.6 implementation and requirement evidence in `docs/requirements-audit.md` take precedence.
+
 ## 1. Purpose
 
 `ha-energy-planner` is a Home Assistant custom integration that coordinates

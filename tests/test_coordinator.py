@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
 
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
@@ -137,6 +139,7 @@ class FakeStore:
         self.thermal_models: list[dict[str, object]] = []
         self.haeo_runs: list[dict[str, object]] = []
         self.ai_recommendations: list[dict[str, object]] = []
+        self.snapshot_ai: list[tuple[str, dict[str, object]]] = []
         self.forecast_snapshots: list[dict[str, object]] = []
         self.dry_run_comparisons: list[dict[str, object]] = []
         self.production_saves: list[dict[str, object]] = []
@@ -171,6 +174,9 @@ class FakeStore:
 
     async def async_add_ai_recommendation(self, recommendation: dict[str, object]) -> None:
         self.ai_recommendations.append(recommendation)
+
+    async def async_attach_ai_to_forecast_snapshot(self, plan_id: str, metadata: dict[str, object]) -> None:
+        self.snapshot_ai.append((plan_id, metadata))
 
     async def async_add_forecast_snapshot(self, snapshot: dict[str, object]) -> None:
         self.forecast_snapshots.append(snapshot)
@@ -669,6 +675,50 @@ def test_current_planner_result_saves_and_executes() -> None:
     assert coordinator.executor.options == {"planner_enabled": True}
 
 
+def test_current_plan_evaluates_each_coordinated_action() -> None:
+    plan = _plan("current-with-ev")
+    now = plan.created_at
+    higher_priority = PlanAction(
+        action_id="hvac",
+        plan_id=plan.plan_id,
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={"hvac_mode": "heat"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    ev_action = PlanAction(
+        action_id="ev",
+        plan_id=plan.plan_id,
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={"charging_required_now": True},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan.actions = [higher_priority, ev_action]
+    context = object()
+    coordinator = _coordinator_for_commit(None, current_generation=3)
+
+    result = asyncio.run(coordinator._async_commit_plan_if_current(3, plan, context, {"planner_enabled": True}))
+
+    assert result is plan
+    assert coordinator.executor.evaluated == [
+        (plan, context),
+        (replace(plan, actions=[ev_action]), context),
+    ]
+
+
 def test_planner_options_include_runtime_ready_by_override() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = FakeEntry({}, {CONF_DEFAULT_READY_BY: "07:00"})
@@ -818,6 +868,19 @@ def test_background_ai_is_non_blocking_single_flight_and_persists() -> None:
         release.set()
         await task
         assert coordinator.store.ai_recommendations[0]["status"] == "accepted"
+        assert coordinator.store.snapshot_ai == [
+            (
+                "background-ai",
+                {
+                    "status": "accepted",
+                    "accepted_fields": ["confidence"],
+                    "rejected_reason": None,
+                    "rejected_detail": {},
+                    "service_called": "ai_task.generate_data",
+                    "ai_task_entity": None,
+                },
+            )
+        ]
         assert updates == ["updated"]
         assert "ai_background_ms" in coordinator._last_phase_durations
         assert coordinator._ai_advice_task is None
@@ -1878,6 +1941,53 @@ def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
     assert calls == [(coordinator.hass, coordinator.entry_data, "23:45")]
 
 
+def test_native_ev_settings_persist_and_manual_control_replans(monkeypatch: object) -> None:
+    updates: list[dict[str, Any]] = []
+    charger_calls: list[bool] = []
+    refreshes: list[str] = []
+
+    class ConfigEntries:
+        def async_update_entry(self, entry: object, *, options: dict[str, Any]) -> None:
+            entry.options = options
+            updates.append(options)
+
+    class FakeChargerAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_set_charging(self, enabled: bool) -> None:
+            charger_calls.append(enabled)
+            return SimpleNamespace(applied=True)
+
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = SimpleNamespace(entry_id="entry", data={"ev_charger_entity": "switch.ev"}, options={})
+    coordinator.hass = SimpleNamespace(config_entries=ConfigEntries())
+    coordinator.ready_by = "07:00"
+    coordinator.overrides = []
+    coordinator.store = SimpleNamespace(async_save_overrides=AsyncMock())
+    coordinator._refresh_generation = 0
+    coordinator._force_next_refresh = False
+
+    async def request_refresh() -> None:
+        refreshes.append("refresh")
+
+    coordinator.async_request_refresh = request_refresh
+    monkeypatch.setattr(coordinator_module, "EVChargerAdapter", FakeChargerAdapter)
+
+    asyncio.run(coordinator.async_set_ready_by("08:10"))
+    asyncio.run(coordinator.async_set_ev_target_soc(85))
+    asyncio.run(coordinator.async_manual_ev_charging(True))
+    asyncio.run(coordinator.async_manual_ev_charging(False))
+
+    assert coordinator.ready_by == "08:10"
+    assert updates[0]["default_ready_by"] == "08:10"
+    assert updates[1]["ev_fallback_target_soc_percent"] == 85
+    assert charger_calls == [True, False]
+    assert coordinator.overrides[0].reason == "manual_stop"
+    assert coordinator.store.async_save_overrides.await_count == 2
+    assert refreshes == ["refresh"] * 4
+
+
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
@@ -2042,9 +2152,7 @@ def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:
     dry_run.mode = PlannerMode.DRY_RUN
 
     for corrupt in ("3", True, 3.0, -1, 10_001):
-        coordinator = _coordinator_for_runtime_services(
-            store_data={"production": {"dry_run_ready_cycles": corrupt}}
-        )
+        coordinator = _coordinator_for_runtime_services(store_data={"production": {"dry_run_ready_cycles": corrupt}})
         asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
         assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 1
 

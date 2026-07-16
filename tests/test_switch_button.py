@@ -52,6 +52,7 @@ class FakeCoordinator:
         self.disarm_calls: list[str] = []
         self.pause_calls: list[tuple[int, str, str]] = []
         self.resume_calls: list[str] = []
+        self.ev_charging_calls: list[bool] = []
 
     @property
     def options(self) -> dict[str, object]:
@@ -79,6 +80,9 @@ class FakeCoordinator:
 
     async def async_resume_control(self, reason: str) -> None:
         self.resume_calls.append(reason)
+
+    async def async_manual_ev_charging(self, enabled: bool) -> None:
+        self.ev_charging_calls.append(enabled)
 
 
 def test_switch_updates_config_entry_option_and_replans() -> None:
@@ -178,6 +182,23 @@ def test_restore_button_restores_safe_state() -> None:
 
     assert coordinator.restore_calls == ["button_pressed"]
     assert coordinator.replan_count == 0
+
+
+def test_manual_ev_charging_buttons_use_native_controller() -> None:
+    coordinator = FakeCoordinator()
+    start = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "ev_start_charging"),
+    )
+    stop = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "ev_stop_charging"),
+    )
+
+    asyncio.run(PlannerButton.async_press(start))
+    asyncio.run(PlannerButton.async_press(stop))
+
+    assert coordinator.ev_charging_calls == [True, False]
 
 
 def test_preflight_button_creates_notification(monkeypatch: object) -> None:

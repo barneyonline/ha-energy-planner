@@ -271,6 +271,30 @@ def test_forecast_snapshot_retention_covers_day_ahead_training_at_five_minutes(
     assert store.data["forecast_snapshots"][-1] == {"index": 384}
 
 
+def test_background_ai_metadata_attaches_to_matching_forecast_snapshot(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    store.data["forecast_snapshots"] = [
+        {"plan_id": "current", "ai": None},
+        {"plan_id": "newer", "ai": None},
+    ]
+
+    asyncio.run(
+        store.async_attach_ai_to_forecast_snapshot(
+            "current",
+            {"status": "accepted", "accepted_fields": ["confidence"]},
+        )
+    )
+
+    assert store.data["forecast_snapshots"] == [
+        {
+            "plan_id": "current",
+            "ai": {"status": "accepted", "accepted_fields": ["confidence"]},
+        },
+        {"plan_id": "newer", "ai": None},
+    ]
+
+
 def test_store_audit_entry_bounds_mapping_values(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.loaded = None
@@ -366,11 +390,7 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
         {"created_at": (now - timedelta(days=8)).isoformat(), "planned_action_count": 1},
         {"created_at": (now - timedelta(days=1)).isoformat(), "planned_action_count": 2},
     ]
-    asyncio.run(
-        store.async_add_dry_run_comparison(
-            {"created_at": now, "planned_action_count": 3, "next_action": None}
-        )
-    )
+    asyncio.run(store.async_add_dry_run_comparison({"created_at": now, "planned_action_count": 3, "next_action": None}))
 
     assert len(store.data["forecast_snapshots"]) == 501
     assert all(item["plan_id"] != "expired" for item in store.data["forecast_snapshots"])
