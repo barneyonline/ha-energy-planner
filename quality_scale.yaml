@@ -97,12 +97,19 @@ rules:
         - custom_components/ha_energy_planner/forecasts.py
         - custom_components/ha_energy_planner/storage.py
         - custom_components/ha_energy_planner/preflight.py
+        - custom_components/ha_energy_planner/ev.py
+        - custom_components/ha_energy_planner/ev_adapter.py
+        - custom_components/ha_energy_planner/number.py
+        - custom_components/ha_energy_planner/time.py
       tests:
         - tests/test_planner.py
         - tests/test_inputs.py
         - tests/test_forecasts.py
         - tests/test_storage.py
         - tests/test_services.py
+        - tests/test_ev.py
+        - tests/test_ev_adapter.py
+        - tests/test_ev_control_entities.py
   config-flow-test-coverage:
     status: done
     references:

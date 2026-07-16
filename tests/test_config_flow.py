@@ -47,8 +47,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
-    CONF_CLIMATE_AUTOMATIONS,
     CONF_CARBON_INTENSITY_FORECAST,
+    CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
@@ -60,6 +60,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
+    CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
@@ -468,17 +472,21 @@ def test_enphase_profile_entity_form_prefills_current_selection() -> None:
     assert result["step_id"] == "user"
 
 
-def test_ev_start_stop_controls_accept_buttons_and_input_buttons() -> None:
+def test_ev_charger_controls_accept_switches_buttons_and_input_buttons() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
     schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
 
-    assert schema_fields[CONF_EV_SMART_CHARGING_START].serialize()["selector"]["entity"]["domain"] == [
+    assert schema_fields[CONF_EV_CHARGER].serialize()["selector"]["entity"]["domain"] == [
+        "switch",
+        "input_boolean",
+    ]
+    assert schema_fields[CONF_EV_CHARGER_START].serialize()["selector"]["entity"]["domain"] == [
         "switch",
         "button",
         "input_boolean",
         "input_button",
     ]
-    assert schema_fields[CONF_EV_SMART_CHARGING_STOP].serialize()["selector"]["entity"]["domain"] == [
+    assert schema_fields[CONF_EV_CHARGER_STOP].serialize()["selector"]["entity"]["domain"] == [
         "switch",
         "button",
         "input_boolean",
@@ -486,20 +494,12 @@ def test_ev_start_stop_controls_accept_buttons_and_input_buttons() -> None:
     ]
 
 
-def test_ev_target_soc_and_ready_by_accept_select_and_sensor_entities() -> None:
+def test_ev_target_soc_and_ready_by_are_native_not_external_helpers() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
     schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
 
-    target_filter = schema_fields[CONF_EV_SMART_CHARGING_TARGET_SOC].serialize()["selector"]["entity"]["filter"]
-    ready_by_domains = schema_fields[CONF_EV_SMART_CHARGING_READY_BY].serialize()["selector"]["entity"]["domain"]
-
-    assert target_filter[0]["domain"] == ["number", "input_number", "select", "input_select"]
-    assert target_filter[1]["domain"] == ["sensor"]
-    assert target_filter[1]["device_class"] == ["battery"]
-    assert "%" in target_filter[1]["unit_of_measurement"]
-    assert target_filter[2]["domain"] == ["sensor"]
-    assert "%" in target_filter[2]["unit_of_measurement"]
-    assert ready_by_domains == ["time", "input_datetime", "input_text", "select", "input_select"]
+    assert CONF_EV_SMART_CHARGING_TARGET_SOC not in schema_fields
+    assert CONF_EV_SMART_CHARGING_READY_BY not in schema_fields
 
 
 def test_validate_config_accepts_input_button_ev_controls() -> None:
@@ -621,9 +621,7 @@ def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["config_subentries"]["energy"]["step"]["user"]["data_description"][
-            CONF_PV_FORECAST
-        ]
+        description = translations["config_subentries"]["energy"]["step"]["user"]["data_description"][CONF_PV_FORECAST]
 
         assert "Forecast Today" in description
         assert "Peak Forecast Today" in description
@@ -635,9 +633,7 @@ def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["config_subentries"]["climate"]["step"]["user"]["data_description"][
-            CONF_WEATHER
-        ]
+        description = translations["config_subentries"]["climate"]["step"]["user"]["data_description"][CONF_WEATHER]
 
         assert "Bureau of Meteorology" in description
         assert "Hourly" in description
@@ -1230,10 +1226,13 @@ def test_validate_config_accepts_optional_carbon_intensity_sensor() -> None:
         {"sensor.carbon_intensity": {"unit_of_measurement": "gCO₂/kWh"}},
     )
 
-    assert _validate_config(
-        hass,
-        _valid_input({CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon_intensity"}),
-    ) == {}
+    assert (
+        _validate_config(
+            hass,
+            _valid_input({CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon_intensity"}),
+        )
+        == {}
+    )
 
 
 def test_validate_config_rejects_invalid_carbon_intensity_unit() -> None:
@@ -1362,6 +1361,12 @@ def test_validate_options_rejects_invalid_default_ready_by() -> None:
     errors = _validate_options({**DEFAULT_OPTIONS, CONF_DEFAULT_READY_BY: "24:90"})
 
     assert errors[CONF_DEFAULT_READY_BY] == "invalid_ready_by"
+
+
+def test_validate_options_rejects_invalid_ev_earliest_start() -> None:
+    errors = _validate_options({**DEFAULT_OPTIONS, CONF_EV_EARLIEST_START: "25:00"})
+
+    assert errors[CONF_EV_EARLIEST_START] == "invalid_ready_by"
 
 
 def test_validate_options_rejects_invalid_priority_weights() -> None:

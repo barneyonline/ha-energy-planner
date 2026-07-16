@@ -18,9 +18,15 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_CONTINUOUS_CHARGING,
+    CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+    CONF_EV_LOW_PRICE_THRESHOLD,
+    CONF_EV_MAX_IMPORT_PRICE,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
+    CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SOC_PER_KWH,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
@@ -179,6 +185,12 @@ class DryRunPlanner:
         if context.ev_connected is not False and context.current_ev_soc_percent is not None:
             ready_by_text = context.ev_ready_by or str(self.options[CONF_DEFAULT_READY_BY])
             ready_by = _next_ready_by(context.created_at, ready_by_text, context.local_timezone)
+            earliest_start = _ev_earliest_start(
+                context.created_at,
+                ready_by,
+                str(self.options.get(CONF_EV_EARLIEST_START, "None")),
+                context.local_timezone,
+            )
             charge_rate_kw = float(self.options[CONF_EV_CHARGE_RATE_KW])
             soc_per_kwh = float(self.options[CONF_EV_SOC_PER_KWH])
             target_soc = context.ev_target_soc_percent
@@ -198,67 +210,101 @@ class DryRunPlanner:
                 ev_min_soc_percent=ev_min,
                 ev_max_soc_percent=float(self.options[CONF_EV_MAX_SOC_PERCENT]),
                 fallback_target_soc_percent=fallback_target_soc,
-                available_charge_hours=max((ready_by - context.created_at).total_seconds() / 3600, 0.0),
+                available_charge_hours=max((ready_by - earliest_start).total_seconds() / 3600, 0.0),
                 charge_rate_percent_per_hour=charge_rate_kw * soc_per_kwh,
             )
-            if target.required_charge_percent <= 0:
-                target = None
-            if target is not None:
-                schedule = allocate_least_cost_charging(
-                    context.slots,
-                    current_soc_percent=context.current_ev_soc_percent,
-                    target_soc_percent=target.target_soc_percent,
-                    ready_by=ready_by,
-                    charge_rate_kw=charge_rate_kw,
-                    soc_per_kwh=soc_per_kwh,
-                    interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
-                    carbon_weight=_carbon_schedule_weight(self.options),
+            current_slot = context.slots[0] if context.slots else None
+            emergency_charge = context.current_ev_soc_percent < ev_min
+            low_price_charge = bool(self.options.get(CONF_EV_LOW_PRICE_CHARGING_ENABLED, False)) and bool(
+                current_slot is not None
+                and current_slot.import_price is not None
+                and float(current_slot.import_price) <= float(self.options[CONF_EV_LOW_PRICE_THRESHOLD])
+            )
+            schedule = allocate_least_cost_charging(
+                context.slots,
+                current_soc_percent=context.current_ev_soc_percent,
+                target_soc_percent=target.target_soc_percent,
+                ready_by=ready_by,
+                charge_rate_kw=charge_rate_kw,
+                soc_per_kwh=soc_per_kwh,
+                interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+                carbon_weight=_carbon_schedule_weight(self.options),
+                earliest_start=earliest_start,
+                continuous=bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True)),
+                force_current=emergency_charge or low_price_charge,
+                max_import_price=float(self.options[CONF_EV_MAX_IMPORT_PRICE])
+                if bool(self.options.get(CONF_EV_PRICE_LIMIT_ENABLED, False))
+                else None,
+            )
+            allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
+            for slot in context.slots:
+                if slot.valid_at in allocation_by_time:
+                    slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
+            charging_required_now = bool(current_slot and current_slot.valid_at in allocation_by_time)
+            manual_ev = next(
+                (override for override in context.active_overrides if override.kind == "manual_ev_charging"),
+                None,
+            )
+            if manual_ev is not None:
+                charging_required_now = manual_ev.reason == "manual_start"
+                charging_reason = "ev_manual_start_override" if charging_required_now else "ev_manual_stop_override"
+            elif emergency_charge and target.required_charge_percent > 0:
+                charging_reason = "ev_below_minimum_soc_charge_now"
+            elif low_price_charge and charging_required_now:
+                charging_reason = "ev_low_price_charge_now"
+            elif charging_required_now:
+                charging_reason = "ev_in_allocated_charging_window"
+            else:
+                charging_reason = "ev_outside_allocated_charging_window"
+            actions.append(
+                PlanAction(
+                    action_id=f"{context.plan_id}-ev-native-smart-charge",
+                    plan_id=context.plan_id,
+                    execute_not_before=execute_not_before,
+                    execute_not_after=execute_not_after,
+                    asset=ActionAsset.EV,
+                    kind=ActionKind.EV_SCHEDULE,
+                    desired_state={
+                        "charging_required_now": charging_required_now,
+                        "charging_observed": context.ev_charging,
+                        "charging_reason": charging_reason,
+                        "target_soc_percent": schedule.scheduled_soc_percent,
+                        "ready_by": ready_by_text,
+                        "ready_by_utc": ready_by.isoformat(),
+                        "ready_by_timezone": context.local_timezone,
+                        "earliest_start_utc": earliest_start.isoformat(),
+                        "configured_target_soc_percent": target_soc,
+                        "required_charge_percent": target.required_charge_percent,
+                        "max_attainable_soc_percent": target.max_attainable_soc_percent,
+                        "continuous_charging": bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True)),
+                        "price_limit": float(self.options[CONF_EV_MAX_IMPORT_PRICE])
+                        if bool(self.options.get(CONF_EV_PRICE_LIMIT_ENABLED, False))
+                        else None,
+                        "trip_history_observed_days": context.ev_trip_observed_days,
+                        "trip_history_sufficient": context.ev_trip_history_sufficient,
+                        "allocated_slots": [
+                            {
+                                "valid_at": allocation.valid_at.isoformat(),
+                                "charge_kw": allocation.charge_kw,
+                                "added_soc_percent": allocation.added_soc_percent,
+                                "import_price": allocation.import_price,
+                                "effective_price": allocation.effective_price,
+                                "solar_surplus_used_kw": allocation.solar_surplus_used_kw,
+                                "grid_import_used_kw": allocation.grid_import_used_kw,
+                                "carbon_intensity_g_per_kwh": allocation.carbon_intensity_g_per_kwh,
+                                "estimated_carbon_g": allocation.estimated_carbon_g,
+                            }
+                            for allocation in schedule.allocations
+                        ],
+                        "infeasible": schedule.infeasible,
+                    },
+                    hard_constraints=["ev_min_soc", "ready_by", "charger_connected"],
+                    reason_codes=[charging_reason, target.reason, schedule.reason],
+                    expected_cost_delta=None,
+                    confidence=confidence_from_context(context),
+                    requires_haeo_plan_id=context.plan_id,
                 )
-                allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
-                for slot in context.slots:
-                    if slot.valid_at in allocation_by_time:
-                        slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
-                actions.append(
-                    PlanAction(
-                        action_id=f"{context.plan_id}-ev-minimum-soc",
-                        plan_id=context.plan_id,
-                        execute_not_before=execute_not_before,
-                        execute_not_after=execute_not_after,
-                        asset=ActionAsset.EV,
-                        kind=ActionKind.EV_SCHEDULE,
-                        desired_state={
-                            "target_soc_percent": schedule.scheduled_soc_percent,
-                            "ready_by": ready_by_text,
-                            "ready_by_utc": ready_by.isoformat(),
-                            "ready_by_timezone": context.local_timezone,
-                            "configured_target_soc_percent": target_soc,
-                            "required_charge_percent": target.required_charge_percent,
-                            "max_attainable_soc_percent": target.max_attainable_soc_percent,
-                            "trip_history_observed_days": context.ev_trip_observed_days,
-                            "trip_history_sufficient": context.ev_trip_history_sufficient,
-                            "allocated_slots": [
-                                {
-                                    "valid_at": allocation.valid_at.isoformat(),
-                                    "charge_kw": allocation.charge_kw,
-                                    "added_soc_percent": allocation.added_soc_percent,
-                                    "import_price": allocation.import_price,
-                                    "effective_price": allocation.effective_price,
-                                    "solar_surplus_used_kw": allocation.solar_surplus_used_kw,
-                                    "grid_import_used_kw": allocation.grid_import_used_kw,
-                                    "carbon_intensity_g_per_kwh": allocation.carbon_intensity_g_per_kwh,
-                                    "estimated_carbon_g": allocation.estimated_carbon_g,
-                                }
-                                for allocation in schedule.allocations
-                            ],
-                            "infeasible": schedule.infeasible,
-                        },
-                        hard_constraints=["ev_min_soc", "ready_by"],
-                        reason_codes=["ev_soc_below_target", target.reason, schedule.reason],
-                        expected_cost_delta=None,
-                        confidence=confidence_from_context(context),
-                        requires_haeo_plan_id=context.plan_id,
-                    )
-                )
+            )
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
         if enphase_action is not None:
             actions.append(enphase_action)
@@ -333,9 +379,7 @@ class DryRunPlanner:
             return None
         current_slot = context.slots[0] if context.slots else None
         current_price = current_slot.import_price if current_slot is not None else None
-        lookahead_end = (
-            current_slot.valid_at + HVAC_SUPPRESSION_LOOKAHEAD if current_slot is not None else None
-        )
+        lookahead_end = current_slot.valid_at + HVAC_SUPPRESSION_LOOKAHEAD if current_slot is not None else None
         future_prices = [
             slot.import_price
             for slot in context.slots
@@ -690,10 +734,7 @@ def _decision_summary(scored: list[dict[str, Any]]) -> str:
     if not scored:
         return "No device changes were selected for this planning run."
     first = scored[0]
-    return (
-        f"Selected {len(scored)} action(s). Highest priority is {first['device']} "
-        f"because {first['reason']}."
-    )
+    return f"Selected {len(scored)} action(s). Highest priority is {first['device']} because {first['reason']}."
 
 
 def _action_score(action: PlanAction, context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
@@ -759,9 +800,7 @@ def _carbon_schedule_weight(options: Mapping[str, Any]) -> float:
 def _carbon_action_score(action: PlanAction, context: DecisionContext) -> float:
     """Score how well an action aligns consumption with lower-grid-carbon slots."""
     intensities = [
-        float(slot.carbon_intensity_g_per_kwh)
-        for slot in context.slots
-        if slot.carbon_intensity_g_per_kwh is not None
+        float(slot.carbon_intensity_g_per_kwh) for slot in context.slots if slot.carbon_intensity_g_per_kwh is not None
     ]
     if len(intensities) < 2 or max(intensities) <= min(intensities):
         return 0.0
@@ -782,10 +821,13 @@ def _carbon_action_score(action: PlanAction, context: DecisionContext) -> float:
         total_grid = sum(float(item.get("grid_import_used_kw") or 0.0) for item in allocations)
         if total_grid <= 0:
             return 1.0
-        average = sum(
-            float(item["carbon_intensity_g_per_kwh"]) * float(item.get("grid_import_used_kw") or 0.0)
-            for item in allocations
-        ) / total_grid
+        average = (
+            sum(
+                float(item["carbon_intensity_g_per_kwh"]) * float(item.get("grid_import_used_kw") or 0.0)
+                for item in allocations
+            )
+            / total_grid
+        )
         return low_carbon_score(average)
     if current is None:
         return 0.0
@@ -1465,6 +1507,34 @@ def _next_ready_by(created_at: Any, ready_by: str, local_timezone: str | None = 
         if future:
             return min(future)
         day_offset += 1
+
+
+def _ev_earliest_start(
+    created_at: datetime,
+    ready_by: datetime,
+    configured_start: str,
+    local_timezone: str | None,
+) -> datetime:
+    """Return the active charging window's earliest UTC instant."""
+    if configured_start.strip().lower() == "none":
+        return created_at.astimezone(UTC)
+    try:
+        hour_text, minute_text = configured_start.split(":", 1)
+        start_time = time(hour=int(hour_text), minute=int(minute_text[:2]))
+    except (TypeError, ValueError):
+        return created_at.astimezone(UTC)
+    try:
+        timezone = ZoneInfo(local_timezone or "UTC")
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("UTC")
+    ready_date = ready_by.astimezone(timezone).date()
+    candidates = [
+        instant
+        for candidate_date in (ready_date - timedelta(days=1), ready_date)
+        for instant in _valid_local_instants(candidate_date, start_time, timezone)
+        if instant <= ready_by
+    ]
+    return max(created_at.astimezone(UTC), max(candidates))
 
 
 def _valid_local_instants(local_date: date, local_time: time, timezone: ZoneInfo) -> list[datetime]:

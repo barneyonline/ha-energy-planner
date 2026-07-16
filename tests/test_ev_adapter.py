@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from custom_components.ha_energy_planner.const import (
+    CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
@@ -687,3 +688,24 @@ def test_ev_value_match_helpers_handle_invalid_values() -> None:
     assert adapter._select_option_for_value("select.missing", "hello") is None
     assert adapter._select_option_for_value("select.no_match", "missing") is None
     assert adapter._can_set_entity_value(None) is False
+
+
+def test_native_schedule_and_manual_commands_control_charger_directly() -> None:
+    hass = FakeHass({"switch.charger": "off"})
+    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+
+    start = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"charging_required_now": True})))
+    stop = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"charging_required_now": False})))
+    manual_start = asyncio.run(adapter.async_set_charging(True))
+    manual_stop = asyncio.run(adapter.async_set_charging(False))
+
+    assert start.applied is True
+    assert stop.applied is True
+    assert manual_start.applied is True
+    assert manual_stop.applied is True
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.charger"}),
+        ("switch", "turn_off", {"entity_id": "switch.charger"}),
+        ("switch", "turn_on", {"entity_id": "switch.charger"}),
+        ("switch", "turn_off", {"entity_id": "switch.charger"}),
+    ]

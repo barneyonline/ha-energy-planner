@@ -29,11 +29,9 @@
           "ev_soc_entity": "EV SOC sensor",
           "ev_charging_entity": "EV charging state entity",
           "ev_connected_entity": "EV connected entity",
-          "ev_smart_charging_entity": "EV Smart Charging control",
-          "ev_smart_charging_start_entity": "EV Smart Charging Start Control",
-          "ev_smart_charging_stop_entity": "EV Smart Charging Stop Control",
-          "ev_smart_charging_target_soc_entity": "EV target SOC helper",
-          "ev_smart_charging_ready_by_entity": "EV ready-by helper",
+          "ev_charger_entity": "EV charger control",
+          "ev_charger_start_entity": "EV charger start control",
+          "ev_charger_stop_entity": "EV charger stop control",
           "ai_advisor_service": "Local AI advisor service",
           "weather_entity": "Weather Forecast"
         },
@@ -62,11 +60,9 @@
           "ev_soc_entity": "EV state-of-charge sensor.",
           "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
           "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
-          "ev_smart_charging_entity": "Legacy single EV Smart Charging control, if separate start and stop controls are not used.",
-          "ev_smart_charging_start_entity": "Switch, button, input_boolean, or input_button used to start EV Smart Charging.",
-          "ev_smart_charging_stop_entity": "Switch, button, input_boolean, or input_button used to stop EV Smart Charging.",
-          "ev_smart_charging_target_soc_entity": "Optional number, input_number, select, input_select, or battery percentage sensor used for EV target SOC. Sensors are read-only and only validate the current target; use a writable helper if Energy Planner must change the target.",
-          "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, input_text, select, or input_select helper used for EV ready-by time.",
+          "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
+          "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
+          "ev_charger_stop_entity": "Optional separate switch or button used to stop charging.",
           "ai_advisor_service": "Optional local AI Task advisory service.",
           "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points."
         }
@@ -251,26 +247,22 @@
       "step": {
         "user": {
           "title": "EV",
-          "description": "Configure EV state and smart-charging controls.",
+          "description": "Configure vehicle state and the charger controls Energy Planner will operate directly.",
           "data": {
             "ev_soc_entity": "EV SOC sensor",
             "ev_charging_entity": "EV charging state entity",
             "ev_connected_entity": "EV connected entity",
-            "ev_smart_charging_entity": "EV Smart Charging control",
-            "ev_smart_charging_start_entity": "EV Smart Charging Start Control",
-            "ev_smart_charging_stop_entity": "EV Smart Charging Stop Control",
-            "ev_smart_charging_target_soc_entity": "EV target SOC helper",
-            "ev_smart_charging_ready_by_entity": "EV ready-by helper"
+            "ev_charger_entity": "EV charger control",
+            "ev_charger_start_entity": "EV charger start control",
+            "ev_charger_stop_entity": "EV charger stop control"
           },
           "data_description": {
             "ev_soc_entity": "EV state-of-charge sensor.",
             "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
             "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
-            "ev_smart_charging_entity": "Legacy single EV Smart Charging control, if separate start and stop controls are not used.",
-            "ev_smart_charging_start_entity": "Switch, button, input_boolean, or input_button used to start EV Smart Charging.",
-            "ev_smart_charging_stop_entity": "Switch, button, input_boolean, or input_button used to stop EV Smart Charging.",
-            "ev_smart_charging_target_soc_entity": "Optional number, input_number, select, input_select, or battery percentage sensor used for EV target SOC. Sensors are read-only and only validate the current target; use a writable helper if Energy Planner must change the target.",
-            "ev_smart_charging_ready_by_entity": "Optional time, input_datetime, input_text, select, or input_select helper used for EV ready-by time."
+            "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
+            "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
+            "ev_charger_stop_entity": "Optional separate switch or button used to stop charging."
           }
         }
       }
@@ -302,7 +294,7 @@
         "data_description": {
           "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
           "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
-          "default_ready_by": "Fallback local time used when no EV ready-by helper value is configured."
+          "default_ready_by": "Local completion time exposed by the native EV Ready by entity."
         }
       },
       "ev_battery_grid": {
@@ -316,9 +308,15 @@
           "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
           "ev_min_soc_percent": "Minimum EV SOC",
           "ev_max_soc_percent": "Maximum EV SOC",
-          "ev_fallback_target_soc_percent": "Fallback EV target SOC",
+          "ev_fallback_target_soc_percent": "EV target SOC",
           "ev_charge_rate_kw": "EV charge rate (kW)",
           "ev_soc_per_kwh": "EV SOC gained per kWh",
+          "ev_continuous_charging": "Prefer one continuous charging session",
+          "ev_earliest_start": "Earliest charging start",
+          "ev_price_limit_enabled": "Apply maximum import price",
+          "ev_max_import_price": "Maximum import price",
+          "ev_low_price_charging_enabled": "Charge immediately at low prices",
+          "ev_low_price_threshold": "Low-price charging threshold",
           "grid_import_limit_kw": "Grid import limit",
           "grid_export_limit_kw": "Grid export limit"
         },
@@ -330,9 +328,15 @@
           "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
           "ev_min_soc_percent": "Lowest EV state of charge the planner treats as acceptable before charging is prioritised.",
           "ev_max_soc_percent": "Upper EV state of charge limit used when planning smart charging.",
-          "ev_fallback_target_soc_percent": "EV target used when trip history or a ready-by target is unavailable.",
+          "ev_fallback_target_soc_percent": "Target state of charge exposed by the native EV target SOC entity.",
           "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
           "ev_soc_per_kwh": "Estimated EV battery percentage gained from each kWh added.",
+          "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
+          "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
+          "ev_price_limit_enabled": "Exclude charging intervals above the maximum import price, except an immediate minimum-SOC recovery interval.",
+          "ev_max_import_price": "Highest grid import price allowed for normal scheduled charging.",
+          "ev_low_price_charging_enabled": "Start immediately when the current price is at or below the configured threshold and the EV still needs charge.",
+          "ev_low_price_threshold": "Import price that triggers immediate low-price charging.",
           "grid_import_limit_kw": "Maximum grid import power allowed in planned actions.",
           "grid_export_limit_kw": "Maximum grid export power allowed in planned actions."
         }
@@ -557,6 +561,16 @@
         "name": "Control enabled"
       }
     },
+    "number": {
+      "ev_target_soc": {
+        "name": "Target SOC"
+      }
+    },
+    "time": {
+      "ev_ready_by": {
+        "name": "Ready by"
+      }
+    },
     "button": {
       "replan": {
         "name": "Replan"
@@ -581,6 +595,12 @@
       },
       "resume_control": {
         "name": "Resume control"
+      },
+      "ev_start_charging": {
+        "name": "Start charging"
+      },
+      "ev_stop_charging": {
+        "name": "Stop charging"
       }
     }
   }

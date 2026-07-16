@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta
 from math import isfinite
 from time import monotonic, perf_counter
@@ -37,8 +38,8 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CONNECTED,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -58,7 +59,7 @@ from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import update_trip_history_from_values
-from .ev_adapter import EVSmartChargingAdapter
+from .ev_adapter import EVChargerAdapter, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
@@ -127,8 +128,6 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_PERSON_ENTITIES,
         CONF_EV_SOC,
         CONF_EV_CONNECTED,
-        CONF_EV_SMART_CHARGING_TARGET_SOC,
-        CONF_EV_SMART_CHARGING_READY_BY,
         CONF_WEATHER,
     }
 )
@@ -554,12 +553,45 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_request_refresh()
 
     async def async_set_ready_by(self, ready_by: str) -> None:
-        """Set runtime ready-by override."""
+        """Persist the native EV ready-by setting and replan."""
         self.ready_by = ready_by
-        entry_data = self.entry_data
-        if entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
-            await EVSmartChargingAdapter(self.hass, entry_data).async_set_ready_by(ready_by)
+        options = self.options
+        options[CONF_DEFAULT_READY_BY] = ready_by
+        config_entries = getattr(self.hass, "config_entries", None)
+        update_entry = getattr(config_entries, "async_update_entry", None)
+        if callable(update_entry):
+            update_entry(self.entry, options=options)
+        if self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
+            await EVSmartChargingAdapter(self.hass, self.entry_data).async_set_ready_by(ready_by)
         self._mark_forced_refresh("ready_by_changed")
+        await self.async_request_refresh()
+
+    async def async_set_ev_target_soc(self, target_soc: float) -> None:
+        """Persist the native EV target SOC setting and replan."""
+        options = self.options
+        options[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = float(target_soc)
+        config_entries = getattr(self.hass, "config_entries", None)
+        update_entry = getattr(config_entries, "async_update_entry", None)
+        if callable(update_entry):
+            update_entry(self.entry, options=options)
+        self._mark_forced_refresh("ev_target_soc_changed")
+        await self.async_request_refresh()
+
+    async def async_manual_ev_charging(self, enabled: bool) -> None:
+        """Apply a manual charger command through Energy Planner's adapter."""
+        result = await EVChargerAdapter(self.hass, self.entry_data).async_set_charging(enabled)
+        if result.applied:
+            self.overrides = [override for override in self.overrides if override.kind != "manual_ev_charging"]
+            self.overrides.append(
+                Override(
+                    kind="manual_ev_charging",
+                    source="button",
+                    expires_at=dt_util.utcnow() + timedelta(hours=1),
+                    reason="manual_start" if enabled else "manual_stop",
+                )
+            )
+            await self.store.async_save_overrides(self.overrides)
+        self._mark_forced_refresh("manual_ev_charging")
         await self.async_request_refresh()
 
     async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
@@ -761,6 +793,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.options = options
         self.executor.entry_data = self.entry_data
         await self.executor.async_evaluate(plan, context)
+        next_action = plan.next_action
+        for action in plan.actions:
+            if action is next_action:
+                continue
+            # The priority score orders presentation and the first command, but
+            # every coordinated device action keeps its own execution gate.
+            await self.executor.async_evaluate(replace(plan, actions=[action]), context)
         return plan
 
     async def _async_get_throttled_ai_advice(
@@ -887,10 +926,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ):
                 return
             async with self._planner_lock:
-                if (
-                    not self._ai_current_plan_safe
-                    or self._ai_current_plan_fingerprint != fingerprint
-                ):
+                if not self._ai_current_plan_safe or self._ai_current_plan_fingerprint != fingerprint:
                     return
                 await self.store.async_add_ai_recommendation(
                     {
@@ -905,6 +941,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         "service_called": ai_result.service_called,
                         CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
                     }
+                )
+                await self.store.async_attach_ai_to_forecast_snapshot(
+                    plan.plan_id,
+                    {
+                        "status": ai_result.status,
+                        "accepted_fields": sorted(ai_result.accepted),
+                        "rejected_reason": ai_result.rejected_reason,
+                        "rejected_detail": ai_result.rejected_detail,
+                        "service_called": ai_result.service_called,
+                        CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
+                    },
                 )
             self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
             self.async_update_listeners()

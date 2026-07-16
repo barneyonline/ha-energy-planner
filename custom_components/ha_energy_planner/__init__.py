@@ -10,6 +10,7 @@ from .const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
+    ATTR_TARGET_SOC,
     DEFAULT_OPTIONS,
     DOMAIN,
     INTEGRATION_NAME,
@@ -25,6 +26,7 @@ from .const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
+    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .type_defs import EnergyPlannerConfigEntry
@@ -76,6 +78,11 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         ready_by = str(call.data[ATTR_READY_BY])
         if coordinator := await _first_coordinator():
             await coordinator.async_set_ready_by(ready_by)
+
+    async def handle_target_soc(call: ServiceCall) -> None:
+        target_soc = float(call.data[ATTR_TARGET_SOC])
+        if coordinator := await _first_coordinator():
+            await coordinator.async_set_ev_target_soc(target_soc)
 
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
@@ -137,6 +144,19 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         SERVICE_SET_EV_READY_BY,
         handle_ready_by,
         schema=vol.Schema({vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time)}),
+    )
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_EV_TARGET_SOC,
+        handle_target_soc,
+        schema=vol.Schema(
+            {
+                vol.Required(ATTR_TARGET_SOC): vol.All(
+                    vol.Coerce(float),
+                    vol.Range(min=0, max=100),
+                )
+            }
+        ),
     )
     hass.services.async_register(
         DOMAIN,

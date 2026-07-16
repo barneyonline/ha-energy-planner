@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.0 - 2026-07-15
+
+### Added
+
+- Native EV smart charging, removing the requirement to install the separate EV Smart Charging integration.
+- Direct charger switch or separate start/stop control, native Target SOC and Ready by entities, and manual Start charging/Stop charging buttons.
+- Continuous least-cost charging windows by default, optional interval scheduling, earliest-start limits, maximum import-price filtering, low-price immediate charging, and minimum-SOC immediate recovery.
+- A persistent `ha_energy_planner.set_ev_target_soc` service alongside the now-persistent ready-by service.
+
+### Changed
+
+- EV schedule actions now decide whether the charger must be on in the current planning interval; they no longer delegate schedule execution to an external integration.
+- No-op charger decisions are audited as skipped and do not consume daily command caps or command cooldowns.
+- New EV configurations expose direct charger controls only. Existing `ev_smart_charging_*` controls and helper-backed entries remain readable for migration compatibility.
+
+### Validation
+
+- Full Docker validation: `662 passed`, `100%` across `7,536` statements, plus replay, schema, history,
+  Home Assistant configuration, and end-to-end smoke checks.
+
 ## 0.5.2 - 2026-07-12
 
 ### Changed

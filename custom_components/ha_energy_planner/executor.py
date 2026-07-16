@@ -183,10 +183,12 @@ class Executor:
             return
         if reason is None and action.asset == ActionAsset.EV and self.hass is not None:
             result = await EVSmartChargingAdapter(self.hass, self.entry_data).async_execute(action)
-            await self._async_record_command_attempt(action, now)
+            no_change = result.reason == "already_in_desired_state"
+            if not no_change:
+                await self._async_record_command_attempt(action, now)
             if not result.applied:
                 await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
-            if result.applied:
+            if result.applied and not no_change:
                 ownership = dict(self.store.data.get("ownership", {}))
                 if "ev_smart_charging_state" not in ownership:
                     ownership["ev_smart_charging_state"] = result.pre_state
@@ -195,7 +197,13 @@ class Executor:
                 self._action_outcome(
                     action,
                     now,
-                    result=OutcomeResult.APPLIED if result.applied else OutcomeResult.FAILED,
+                    result=(
+                        OutcomeResult.SKIPPED
+                        if no_change
+                        else OutcomeResult.APPLIED
+                        if result.applied
+                        else OutcomeResult.FAILED
+                    ),
                     reason=result.reason,
                     pre_state=result.pre_state,
                     post_state=result.post_state,
@@ -419,13 +427,14 @@ class Executor:
         post_state = dict(recent.get("post_state", {}))
         if action.asset == ActionAsset.ENPHASE:
             expected = (
-                post_state.get("current_profile")
-                or post_state.get("profile")
-                or action.desired_state.get("profile")
+                post_state.get("current_profile") or post_state.get("profile") or action.desired_state.get("profile")
             )
             if expected and observed != str(expected):
                 return "external_enphase_profile_conflict"
-        if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_START, ActionKind.EV_SCHEDULE}:
+        if action.asset == ActionAsset.EV and (
+            action.kind == ActionKind.EV_START
+            or (action.kind == ActionKind.EV_SCHEDULE and action.desired_state.get("charging_required_now"))
+        ):
             if observed.lower() in {"off", "false", "0", "idle", "not_charging"}:
                 return "external_ev_charging_conflict"
         return None
@@ -597,6 +606,9 @@ def _service_target_for_action(action: Any, entry_data: dict[str, Any]) -> str |
     from .const import (
         CONF_DAIKIN_CLIMATE,
         CONF_ENPHASE_PROFILE,
+        CONF_EV_CHARGER,
+        CONF_EV_CHARGER_START,
+        CONF_EV_CHARGER_STOP,
         CONF_EV_SMART_CHARGING,
         CONF_EV_SMART_CHARGING_START,
         CONF_EV_SMART_CHARGING_STOP,
@@ -604,9 +616,26 @@ def _service_target_for_action(action: Any, entry_data: dict[str, Any]) -> str |
 
     if action.asset == ActionAsset.EV:
         if action.kind in {ActionKind.EV_START, ActionKind.EV_SCHEDULE}:
-            return entry_data.get(CONF_EV_SMART_CHARGING_START) or entry_data.get(CONF_EV_SMART_CHARGING)
+            if action.kind == ActionKind.EV_SCHEDULE and not action.desired_state.get("charging_required_now"):
+                return (
+                    entry_data.get(CONF_EV_CHARGER_STOP)
+                    or entry_data.get(CONF_EV_CHARGER)
+                    or entry_data.get(CONF_EV_SMART_CHARGING_STOP)
+                    or entry_data.get(CONF_EV_SMART_CHARGING)
+                )
+            return (
+                entry_data.get(CONF_EV_CHARGER_START)
+                or entry_data.get(CONF_EV_CHARGER)
+                or entry_data.get(CONF_EV_SMART_CHARGING_START)
+                or entry_data.get(CONF_EV_SMART_CHARGING)
+            )
         if action.kind == ActionKind.EV_STOP:
-            return entry_data.get(CONF_EV_SMART_CHARGING_STOP) or entry_data.get(CONF_EV_SMART_CHARGING)
+            return (
+                entry_data.get(CONF_EV_CHARGER_STOP)
+                or entry_data.get(CONF_EV_CHARGER)
+                or entry_data.get(CONF_EV_SMART_CHARGING_STOP)
+                or entry_data.get(CONF_EV_SMART_CHARGING)
+            )
     if action.asset == ActionAsset.DAIKIN:
         return entry_data.get(CONF_DAIKIN_CLIMATE)
     if action.asset == ActionAsset.ENPHASE:

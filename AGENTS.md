@@ -6,7 +6,7 @@
   - `coordinator.py`: planner refresh, Home Assistant state listeners, persistence orchestration.
   - `planner.py`: deterministic planning logic.
   - `executor.py`: active-mode safety gate and device action execution.
-  - `*_adapter.py`: Home Assistant service adapters for Enphase, EV Smart Charging, and Daikin.
+  - `*_adapter.py`: Home Assistant service adapters for Enphase, direct EV charger control, and Daikin.
 - `tests/`: pytest coverage for planner logic, adapters, services, fixtures, and maintenance scripts.
 - `tests/fixtures/`: replay, live-schema, and real-history validation fixtures.
 - `scripts/`: Docker validation, smoke testing, replay, export, and quality-scale tools.

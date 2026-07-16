@@ -16,6 +16,9 @@ from .const import (
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
@@ -92,8 +95,18 @@ class CapabilityDiscovery:
     def _inspect_ev(self) -> CapabilityEvidence:
         issues: list[str] = []
         details: dict[str, Any] = {}
-        control = self.entry_data.get(CONF_EV_SMART_CHARGING_START) or self.entry_data.get(CONF_EV_SMART_CHARGING)
-        stop = self.entry_data.get(CONF_EV_SMART_CHARGING_STOP) or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        control = (
+            self.entry_data.get(CONF_EV_CHARGER_START)
+            or self.entry_data.get(CONF_EV_CHARGER)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        )
+        stop = (
+            self.entry_data.get(CONF_EV_CHARGER_STOP)
+            or self.entry_data.get(CONF_EV_CHARGER)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
+            or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        )
         if not control:
             issues.append("ev_start_control_not_configured")
         elif _state_missing(self.hass, control):
@@ -102,12 +115,13 @@ class CapabilityDiscovery:
             issues.append("ev_stop_control_not_configured")
         elif _state_missing(self.hass, stop):
             issues.append("ev_stop_control_unavailable")
+        details["start_control"] = control
+        details["stop_control"] = stop
+        details["controller"] = "ha_energy_planner"
         for key in (CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_EV_SMART_CHARGING_READY_BY):
             entity_id = self.entry_data.get(key)
             if entity_id:
                 details[key] = {"entity_id": entity_id, "available": not _state_missing(self.hass, entity_id)}
-        details["start_control"] = control
-        details["stop_control"] = stop
         return CapabilityEvidence(not issues, issues, details)
 
     def _inspect_hvac(self) -> CapabilityEvidence:
