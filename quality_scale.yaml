@@ -308,12 +308,14 @@ rules:
         - scripts/docker-ha-smoke.sh
   diagnostics:
     status: done
-    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, and usable optimization horizon when available.
+    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, and detailed dry-run evidence while recorder-facing sensor attributes use compact summaries.
     references:
       code:
         - custom_components/ha_energy_planner/diagnostics.py
+        - custom_components/ha_energy_planner/sensor.py
       tests:
         - tests/test_diagnostics.py
+        - tests/test_sensor.py
         - scripts/docker-ha-smoke.sh
   discovery-update-info:
     status: done

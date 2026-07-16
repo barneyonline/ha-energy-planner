@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Dry-run comparison sensor attributes now publish compact recorder-safe
+  summaries instead of repeating nested execution evidence that could exceed
+  Home Assistant's 16,384-byte state-attribute limit.
+
 ## 0.6.0 - 2026-07-15
 
 ### Added

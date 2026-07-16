@@ -191,6 +191,10 @@ Energy Planner registers these Home Assistant services:
 11. Arm production control only after the dry-run plan matches your expectations.
 12. Keep dry-run enabled for the first production-readiness review, then disable dry-run only when you are ready for real service calls.
 
+The dry-run comparison entity publishes compact latest/recent summaries so its
+state attributes remain recorder-safe. Detailed bounded comparison and outcome
+evidence remains available in the exported support bundle.
+
 ## Rollback and manual recovery
 
 If active control behaves unexpectedly:
