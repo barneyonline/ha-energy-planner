@@ -51,8 +51,8 @@ def test_repository_quality_scale_matches_manifest_claim() -> None:
     assert exit_code == 0, "\n".join(messages)
 
 
-def test_platinum_claim_requires_rules_from_every_level(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, "platinum")
+def test_gold_claim_requires_rules_from_every_claimed_level(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "gold")
     _write_reference(tmp_path, "README.md")
     _write_quality_scale(
         tmp_path,
@@ -64,8 +64,6 @@ levels:
     required: [test-coverage]
   gold:
     required: [diagnostics]
-  platinum:
-    required: [strict-typing]
 rules:
   config-flow:
     status: done
@@ -75,17 +73,13 @@ rules:
     status: done
     references:
       docs: [README.md]
-  diagnostics:
-    status: done
-    references:
-      docs: [README.md]
 """,
     )
 
     exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
 
     assert exit_code == 1
-    assert "strict-typing" in "\n".join(messages)
+    assert "diagnostics" in "\n".join(messages)
 
 
 def test_unclaimed_manifest_is_not_enough_for_this_project(tmp_path: Path) -> None:
@@ -109,7 +103,7 @@ rules:
     exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
 
     assert exit_code == 1
-    assert "Manifest must claim quality_scale 'platinum'" in "\n".join(messages)
+    assert "Manifest must claim quality_scale 'gold'" in "\n".join(messages)
 
 
 def test_generated_integration_cache_directories_are_rejected(tmp_path: Path) -> None:
@@ -162,7 +156,7 @@ rules:
 
 
 def test_documented_integration_exceptions_may_be_na(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, "platinum")
+    _write_manifest(tmp_path, "gold")
     _write_reference(tmp_path, "README.md")
     _write_quality_scale(
         tmp_path,
@@ -175,18 +169,75 @@ levels:
   gold:
     required: [entity-device-class]
   platinum:
-    required: [inject-websession]
+    required: []
 rules:
   entity-device-class:
     status: n/a
     comment: Device classes do not apply to this entity platform.
     references:
       docs: [README.md]
-  inject-websession:
-    status: n/a
-    comment: No aiohttp client is created for this integration.
+""",
+    )
+
+    exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
+
+    assert exit_code == 0, "\n".join(messages)
+
+
+def test_strict_typing_done_requires_an_enforced_strict_checker(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "gold")
+    _write_reference(tmp_path, "README.md")
+    _write_reference(tmp_path, "pyproject.toml")
+    _write_reference(tmp_path, "scripts/docker-validate.sh")
+    _write_quality_scale(
+        tmp_path,
+        """
+levels:
+  bronze:
+    required: []
+  silver:
+    required: []
+  gold:
+    required: []
+  platinum:
+    required: [strict-typing]
+rules:
+  strict-typing:
+    status: done
     references:
-      docs: [README.md]
+      code: [pyproject.toml, scripts/docker-validate.sh]
+""",
+    )
+
+    exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
+
+    assert exit_code == 1
+    assert "strict-typing cannot be marked done" in "\n".join(messages)
+
+
+def test_strict_typing_done_accepts_an_enforced_strict_checker(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "gold")
+    _write_reference(tmp_path, "README.md")
+    _write_reference(tmp_path, "scripts/docker-validate.sh")
+    (tmp_path / "pyproject.toml").write_text("[tool.mypy]\nstrict = true\n", encoding="utf-8")
+    (tmp_path / "scripts" / "docker-validate.sh").write_text("mypy custom_components\n", encoding="utf-8")
+    _write_quality_scale(
+        tmp_path,
+        """
+levels:
+  bronze:
+    required: []
+  silver:
+    required: []
+  gold:
+    required: []
+  platinum:
+    required: [strict-typing]
+rules:
+  strict-typing:
+    status: done
+    references:
+      code: [pyproject.toml, scripts/docker-validate.sh]
 """,
     )
 

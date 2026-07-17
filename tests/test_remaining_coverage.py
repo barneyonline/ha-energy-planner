@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.ha_energy_planner import (
     _async_remove_legacy_device,
@@ -591,13 +592,11 @@ def test_remaining_setup_services_without_entries() -> None:
     )
 
     assert asyncio.run(async_setup(hass, {})) is True
-    assert asyncio.run(services.handlers["export_diagnostics"](SimpleNamespace(data={}))) == {
-        "error": "no_config_entry"
-    }
-    assert asyncio.run(services.handlers["run_preflight"](SimpleNamespace(data={}))) == {
-        "ok": False,
-        "error": "no_config_entry",
-    }
+    for service in ("export_diagnostics", "run_preflight"):
+        with pytest.raises(ServiceValidationError) as error:
+            asyncio.run(services.handlers[service](SimpleNamespace(data={})))
+        assert error.value.translation_domain == DOMAIN
+        assert error.value.translation_key == "no_config_entry"
 
 
 def test_remaining_planner_guard_branches() -> None:

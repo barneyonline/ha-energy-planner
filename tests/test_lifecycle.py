@@ -13,6 +13,7 @@ from custom_components.ha_energy_planner import (
     _async_remove_legacy_device,
     _async_sync_planner_devices,
     _async_update_listener,
+    _freeze_config_value,
     async_setup_entry,
     async_unload_entry,
 )
@@ -21,17 +22,19 @@ from custom_components.ha_energy_planner import (
 class FakeConfigEntries:
     """Minimal config-entry manager."""
 
-    def __init__(self, *, fail_forward: bool = False) -> None:
+    def __init__(self, *, fail_forward: bool = False, unload_ok: bool = True) -> None:
         self.fail_forward = fail_forward
+        self.unload_ok = unload_ok
         self.updated_entries: list[Any] = []
         self.forwarded: list[tuple[Any, Any]] = []
         self.unloaded: list[tuple[Any, Any]] = []
+        self.reloads: list[str] = []
 
     def async_update_entry(self, entry: Any, **kwargs: Any) -> None:
         self.updated_entries.append((entry, kwargs))
 
     async def async_reload(self, entry_id: str) -> None:
-        raise AssertionError(f"Unexpected reload for options update: {entry_id}")
+        self.reloads.append(entry_id)
 
     async def async_forward_entry_setups(self, entry: Any, platforms: Any) -> None:
         self.forwarded.append((entry, platforms))
@@ -40,7 +43,7 @@ class FakeConfigEntries:
 
     async def async_unload_platforms(self, entry: Any, platforms: Any) -> bool:
         self.unloaded.append((entry, platforms))
-        return True
+        return self.unload_ok
 
 
 @dataclass(slots=True)
@@ -105,6 +108,7 @@ class FakeCoordinator:
         self.start_count = 0
         self.shutdown_count = 0
         self.restore_calls: list[tuple[str, bool]] = []
+        self.replan_count = 0
         FakeCoordinator.last_instance = self
 
     async def async_config_entry_first_refresh(self) -> None:
@@ -119,15 +123,23 @@ class FakeCoordinator:
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> None:
         self.restore_calls.append((reason, refresh))
 
+    async def async_request_replan(self) -> None:
+        self.replan_count += 1
+
 
 class FakeRuntimeCoordinator:
     """Minimal runtime coordinator for update-listener tests."""
 
     def __init__(self) -> None:
         self.replan_count = 0
+        self.options_update_count = 0
 
     async def async_request_replan(self) -> None:
         self.replan_count += 1
+
+    async def async_handle_options_update(self) -> None:
+        self.options_update_count += 1
+        await self.async_request_replan()
 
 
 def test_unload_restores_safe_state_without_refresh() -> None:
@@ -142,6 +154,20 @@ def test_unload_restores_safe_state_without_refresh() -> None:
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert entry.runtime_data is None
     assert len(hass.config_entries.unloaded) == 1
+
+
+def test_failed_platform_unload_keeps_coordinator_running() -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries(unload_ok=False))
+
+    result = asyncio.run(async_unload_entry(hass, entry))
+
+    assert result is False
+    assert coordinator.restore_calls == [("entry_unload", False)]
+    assert coordinator.shutdown_count == 0
+    assert entry.runtime_data is coordinator
+    assert coordinator.replan_count == 1
 
 
 def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,6 +198,59 @@ def test_options_update_listener_requests_replan_without_reload() -> None:
     asyncio.run(_async_update_listener(hass, entry))
 
     assert coordinator.replan_count == 1
+    assert coordinator.options_update_count == 1
+    assert hass.config_entries.reloads == []
+
+
+def test_subentry_update_listener_reloads_when_topology_changes() -> None:
+    coordinator = FakeRuntimeCoordinator()
+    entry = FakeEntry(runtime_data=coordinator)
+    coordinator.entry_topology_signature = (
+        (),
+        (("haep_energy", "energy", (("amber_import_price_entity", "sensor.old_price"),)),),
+    )
+    entry.subentries = {
+        "energy": type(
+            "Subentry",
+            (),
+            {
+                "subentry_id": "haep_energy",
+                "subentry_type": "energy",
+                "data": {"amber_import_price_entity": "sensor.new_price"},
+            },
+        )()
+    }
+    hass = FakeHass(FakeConfigEntries())
+
+    asyncio.run(_async_update_listener(hass, entry))
+
+    assert hass.config_entries.reloads == ["test_entry"]
+    assert coordinator.replan_count == 0
+
+
+def test_update_listener_supports_legacy_replan_runtime() -> None:
+    class LegacyRuntime:
+        entry_topology_signature = None
+
+        def __init__(self) -> None:
+            self.replan_count = 0
+
+        async def async_request_replan(self) -> None:
+            self.replan_count += 1
+
+    coordinator = LegacyRuntime()
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries())
+
+    asyncio.run(_async_update_listener(hass, entry))
+
+    assert coordinator.replan_count == 1
+
+
+def test_topology_freezer_normalizes_nested_sequences_and_sets() -> None:
+    assert _freeze_config_value({"entities": ["sensor.b", {"sensor.a", "sensor.c"}]}) == (
+        ("entities", ("sensor.b", ("sensor.a", "sensor.c"))),
+    )
 
 
 def test_setup_entry_migrates_legacy_display_title(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -59,12 +59,21 @@ from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import update_trip_history_from_values
-from .ev_adapter import EVChargerAdapter, EVSmartChargingAdapter
+from .ev_adapter import EVChargerAdapter, EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
-from .models import EnergyPlan, HAEOSolvePhase, HAEOStatus, InputHealth, Override, PlannerMode, to_jsonable
+from .models import (
+    ActionOutcome,
+    EnergyPlan,
+    HAEOSolvePhase,
+    HAEOStatus,
+    InputHealth,
+    Override,
+    PlannerMode,
+    to_jsonable,
+)
 from .planner import DryRunPlanner
 from .preflight import production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
@@ -107,6 +116,19 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
         "forecast_interval_minutes",
         "interval_minutes",
         "resolution_minutes",
+    }
+)
+
+_HVAC_CONTROL_ATTRIBUTE_KEYS = frozenset(
+    {
+        "temperature",
+        "target_temp_low",
+        "target_temp_high",
+        "preset_mode",
+        "fan_mode",
+        "swing_mode",
+        "swing_horizontal_mode",
+        "aux_heat",
     }
 )
 
@@ -153,6 +175,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
         self._planner_lock = asyncio.Lock()
+        self._options_update_lock = asyncio.Lock()
+        self._last_control_mode_state = (self.planner_enabled, self.dry_run)
+        self.entry_topology_signature: tuple[Any, ...] | None = None
         self._refresh_generation = 0
         self._last_non_manual_refresh_requested_at: float | None = None
         self._pending_refresh_trigger = "startup"
@@ -241,7 +266,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         def _handle_state_change(event: Any) -> None:
             entry_data = self.entry_data
             now = dt_util.utcnow()
-            if _is_planner_owned_control_feedback(entry_data, self.store.data, event, now):
+            if _is_planner_owned_control_feedback(
+                entry_data,
+                self.store.data,
+                event,
+                now,
+                pending_hvac_desired_state=getattr(
+                    getattr(self, "executor", None), "pending_hvac_desired_state", None
+                ),
+            ):
                 return
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
@@ -552,6 +585,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("manual_replan")
         await self.async_request_refresh()
 
+    async def async_handle_options_update(self) -> None:
+        """Apply option transitions, restoring ownership when control becomes safe."""
+        async with self._options_update_lock:
+            previous_enabled, previous_dry_run = self._last_control_mode_state
+            current_mode = (self.planner_enabled, self.dry_run)
+            self._last_control_mode_state = current_mode
+            planner_disabled = previous_enabled and not current_mode[0]
+            dry_run_enabled = not previous_dry_run and current_mode[1]
+            if planner_disabled or dry_run_enabled:
+                reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
+                await self.async_restore_safe_state(reason, refresh=False)
+            await self.async_request_replan()
+
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Persist the native EV ready-by setting and replan."""
         self.ready_by = ready_by
@@ -577,7 +623,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("ev_target_soc_changed")
         await self.async_request_refresh()
 
-    async def async_manual_ev_charging(self, enabled: bool) -> None:
+    async def async_manual_ev_charging(self, enabled: bool) -> EVCommandResult:
         """Apply a manual charger command through Energy Planner's adapter."""
         result = await EVChargerAdapter(self.hass, self.entry_data).async_set_charging(enabled)
         if result.applied:
@@ -593,6 +639,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_overrides(self.overrides)
         self._mark_forced_refresh("manual_ev_charging")
         await self.async_request_refresh()
+        return result
 
     async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
         """Set a manual HVAC override."""
@@ -642,12 +689,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if changed:
             await self.store.async_save_trip_history(updated)
 
-    async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> None:
+    async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
         """Restore safe state and refresh."""
-        await self.executor.async_restore_safe_state(reason)
+        outcome = await self.executor.async_restore_safe_state(reason)
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
+        return outcome
 
     async def async_arm_production_control(self, reason: str = "user_acknowledged") -> None:
         """Arm production control after operator acknowledgement."""
@@ -1225,7 +1273,15 @@ def _is_manual_hvac_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None or old_state.state == new_state.state:
+    if old_state is None or new_state is None:
+        return False
+    state_changed = old_state.state != new_state.state
+    old_attributes = getattr(old_state, "attributes", {}) or {}
+    new_attributes = getattr(new_state, "attributes", {}) or {}
+    control_attribute_changed = any(
+        old_attributes.get(key) != new_attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+    )
+    if not state_changed and not control_attribute_changed:
         return False
     guard_entity = entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
     if guard_entity:
@@ -1240,6 +1296,8 @@ def _is_planner_owned_control_feedback(
     store_data: dict[str, Any],
     event: Any,
     now: datetime,
+    *,
+    pending_hvac_desired_state: dict[str, Any] | None = None,
 ) -> bool:
     """Return whether a control-state event follows a recent planner command."""
     entity_id = event.data.get("entity_id")
@@ -1255,6 +1313,8 @@ def _is_planner_owned_control_feedback(
     new_state = event.data.get("new_state")
     if new_state is None:
         return False
+    if asset == "daikin" and pending_hvac_desired_state is not None:
+        return _matches_hvac_command_feedback(pending_hvac_desired_state, event)
     for outcome in reversed(list(store_data.get("execution_audit", []))):
         if not isinstance(outcome, dict) or outcome.get("result") != "applied" or outcome.get("asset") != asset:
             continue
@@ -1267,20 +1327,42 @@ def _is_planner_owned_control_feedback(
         observed = str(getattr(new_state, "state", ""))
         if asset == "enphase":
             return bool(desired.get("profile")) and observed == str(desired["profile"])
-        desired_mode = desired.get("hvac_mode")
-        if desired_mode is not None and observed != str(desired_mode):
-            return False
-        desired_temperature = desired.get("target_temperature")
-        if desired_temperature is not None:
-            attributes = getattr(new_state, "attributes", {}) or {}
-            observed_temperature = attributes.get("temperature")
-            try:
-                if float(observed_temperature) != float(desired_temperature):
-                    return False
-            except (TypeError, ValueError):
-                return False
-        return desired_mode is not None or desired_temperature is not None
+        return _matches_hvac_command_feedback(desired, event)
     return False
+
+
+def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
+    """Return whether changed HVAC controls match the planner's command."""
+    new_state = event.data.get("new_state")
+    old_state = event.data.get("old_state")
+    observed = str(getattr(new_state, "state", ""))
+    old_observed = None if old_state is None else str(getattr(old_state, "state", ""))
+    desired_mode = desired.get("hvac_mode")
+    mode_changed = old_state is None or old_observed != observed
+    matched_command_change = False
+    if mode_changed:
+        if desired_mode is None or observed != str(desired_mode):
+            return False
+        matched_command_change = True
+    old_attributes = {} if old_state is None else (getattr(old_state, "attributes", {}) or {})
+    attributes = getattr(new_state, "attributes", {}) or {}
+    if any(
+        old_attributes.get(key) != attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS - {"temperature"}
+    ):
+        return False
+    desired_temperature = desired.get("target_temperature")
+    temperature_changed = old_state is None or old_attributes.get("temperature") != attributes.get("temperature")
+    if temperature_changed:
+        if desired_temperature is None:
+            return False
+        observed_temperature = attributes.get("temperature")
+        try:
+            if float(observed_temperature) != float(desired_temperature):
+                return False
+        except (TypeError, ValueError):
+            return False
+        matched_command_change = True
+    return matched_command_change
 
 
 def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:

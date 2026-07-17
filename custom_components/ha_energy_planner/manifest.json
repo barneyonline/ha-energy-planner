@@ -7,10 +7,11 @@
   "config_flow": true,
   "dependencies": [],
   "documentation": "https://github.com/barneyonline/ha-energy-planner",
-  "integration_type": "hub",
-  "iot_class": "local_polling",
+  "integration_type": "helper",
+  "iot_class": "calculated",
   "issue_tracker": "https://github.com/barneyonline/ha-energy-planner/issues",
-  "quality_scale": "platinum",
+  "quality_scale": "gold",
   "requirements": [],
+  "single_config_entry": true,
   "version": "0.6.1"
 }

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
+from typing import Any
+
+import pytest
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import button as button_module
 from custom_components.ha_energy_planner import switch as switch_module
 from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
 from custom_components.ha_energy_planner.const import CONF_AI_ENABLED, CONF_DRY_RUN, CONF_PLANNER_ENABLED
+from custom_components.ha_energy_planner.models import OutcomeResult
 from custom_components.ha_energy_planner.switch import SWITCHES, PlannerSwitch
 
 
@@ -47,12 +52,18 @@ class FakeCoordinator:
         self.entry = SimpleNamespace(entry_id="entry-1", options=options or {})
         self.hass = SimpleNamespace(config_entries=FakeConfigEntries(), services=FakeServices())
         self.replan_count = 0
-        self.restore_calls: list[str] = []
+        self.restore_calls: list[tuple[str, bool]] = []
         self.arm_calls: list[str] = []
         self.disarm_calls: list[str] = []
         self.pause_calls: list[tuple[int, str, str]] = []
         self.resume_calls: list[str] = []
         self.ev_charging_calls: list[bool] = []
+        self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
+        self.ev_charging_result = SimpleNamespace(applied=True, reason="applied")
+        self.last_control_mode = (
+            bool(self.options[CONF_PLANNER_ENABLED]),
+            bool(self.options[CONF_DRY_RUN]),
+        )
 
     @property
     def options(self) -> dict[str, object]:
@@ -66,8 +77,22 @@ class FakeCoordinator:
     async def async_request_replan(self) -> None:
         self.replan_count += 1
 
-    async def async_restore_safe_state(self, reason: str) -> None:
-        self.restore_calls.append(reason)
+    async def async_handle_options_update(self) -> None:
+        previous_enabled, previous_dry_run = self.last_control_mode
+        current_mode = (
+            bool(self.options[CONF_PLANNER_ENABLED]),
+            bool(self.options[CONF_DRY_RUN]),
+        )
+        self.last_control_mode = current_mode
+        if previous_enabled and not current_mode[0]:
+            await self.async_restore_safe_state("planner_disabled", refresh=False)
+        elif not previous_dry_run and current_mode[1]:
+            await self.async_restore_safe_state("dry_run_enabled", refresh=False)
+        await self.async_request_replan()
+
+    async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> Any:
+        self.restore_calls.append((reason, refresh))
+        return self.restore_result
 
     async def async_arm_production_control(self, reason: str) -> None:
         self.arm_calls.append(reason)
@@ -81,8 +106,9 @@ class FakeCoordinator:
     async def async_resume_control(self, reason: str) -> None:
         self.resume_calls.append(reason)
 
-    async def async_manual_ev_charging(self, enabled: bool) -> None:
+    async def async_manual_ev_charging(self, enabled: bool) -> Any:
         self.ev_charging_calls.append(enabled)
+        return self.ev_charging_result
 
 
 def test_switch_updates_config_entry_option_and_replans() -> None:
@@ -141,6 +167,40 @@ def test_switch_preserves_other_options_when_updated() -> None:
     assert coordinator.entry.options[CONF_AI_ENABLED] is True
 
 
+def test_disabling_planner_restores_owned_state_before_replan() -> None:
+    coordinator = FakeCoordinator({CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(
+            description for description in SWITCHES if description.option_key == CONF_PLANNER_ENABLED
+        ),
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: None
+
+    asyncio.run(PlannerSwitch.async_turn_off(switch))
+
+    assert coordinator.entry.options[CONF_PLANNER_ENABLED] is False
+    assert coordinator.restore_calls == [("planner_disabled", False)]
+    assert coordinator.replan_count == 1
+
+
+def test_enabling_dry_run_restores_owned_state_before_replan() -> None:
+    coordinator = FakeCoordinator({CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in SWITCHES if description.option_key == CONF_DRY_RUN),
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: None
+
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+
+    assert coordinator.entry.options[CONF_DRY_RUN] is True
+    assert coordinator.restore_calls == [("dry_run_enabled", False)]
+    assert coordinator.replan_count == 1
+
+
 def test_button_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator()
     entry = SimpleNamespace(runtime_data=coordinator)
@@ -180,7 +240,7 @@ def test_restore_button_restores_safe_state() -> None:
 
     asyncio.run(PlannerButton.async_press(button))
 
-    assert coordinator.restore_calls == ["button_pressed"]
+    assert coordinator.restore_calls == [("button_pressed", True)]
     assert coordinator.replan_count == 0
 
 
@@ -199,6 +259,37 @@ def test_manual_ev_charging_buttons_use_native_controller() -> None:
     asyncio.run(PlannerButton.async_press(stop))
 
     assert coordinator.ev_charging_calls == [True, False]
+
+
+def test_restore_button_raises_translated_error_when_restore_is_incomplete() -> None:
+    coordinator = FakeCoordinator()
+    coordinator.restore_result = SimpleNamespace(result=OutcomeResult.FAILED, reason="hvac_restore_failed")
+    button = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "restore_safe_state"),
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(PlannerButton.async_press(button))
+
+    assert error.value.translation_domain == "ha_energy_planner"
+    assert error.value.translation_key == "restore_safe_state_failed"
+
+
+def test_manual_ev_charging_button_raises_translated_error_when_command_fails() -> None:
+    coordinator = FakeCoordinator()
+    coordinator.ev_charging_result = SimpleNamespace(applied=False, reason="charger_unavailable")
+    button = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "ev_start_charging"),
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(PlannerButton.async_press(button))
+
+    assert error.value.translation_domain == "ha_energy_planner"
+    assert error.value.translation_key == "manual_ev_control_failed"
+    assert error.value.translation_placeholders == {"reason": "charger_unavailable"}
 
 
 def test_preflight_button_creates_notification(monkeypatch: object) -> None:

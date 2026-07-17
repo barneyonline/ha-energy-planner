@@ -123,8 +123,9 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
         await self._async_set_option(False)
 
     async def _async_set_option(self, value: bool) -> None:
+        option_key = self.entity_description.option_key
         options = self.coordinator.options
-        options[self.entity_description.option_key] = value
+        options[option_key] = value
         self.coordinator.hass.config_entries.async_update_entry(self.coordinator.entry, options=options)
         self.async_write_ha_state()
-        await self.coordinator.async_request_replan()
+        await self.coordinator.async_handle_options_update()

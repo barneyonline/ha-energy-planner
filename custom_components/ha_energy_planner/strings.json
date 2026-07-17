@@ -461,6 +461,17 @@
       "invalid_priority_weights": "Each planning priority must use a different objective."
     }
   },
+  "exceptions": {
+    "no_config_entry": {
+      "message": "No loaded Energy Planner configuration is available."
+    },
+    "restore_safe_state_failed": {
+      "message": "Energy Planner could not fully restore safe state: {reason}"
+    },
+    "manual_ev_control_failed": {
+      "message": "Energy Planner could not change EV charging: {reason}"
+    }
+  },
   "entity": {
     "sensor": {
       "next_action": {

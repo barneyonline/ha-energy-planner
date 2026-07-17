@@ -5,7 +5,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
+
+import pytest
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 
 from custom_components.ha_energy_planner import async_setup
 from custom_components.ha_energy_planner.const import (
@@ -28,7 +32,7 @@ from custom_components.ha_energy_planner.const import (
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
-from custom_components.ha_energy_planner.models import EnergyPlan, InputHealth, PlannerMode
+from custom_components.ha_energy_planner.models import EnergyPlan, InputHealth, OutcomeResult, PlannerMode
 from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
 
@@ -594,19 +598,35 @@ def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
     assert response["diagnostics"]["recent_audit"][0]["action_id"] == "restore_safe_state"
 
 
-def test_response_services_report_missing_config_entry() -> None:
+def test_services_raise_translated_error_for_missing_config_entry() -> None:
     coordinator = _coordinator()
     hass = FakeHass(coordinator)
     hass.config_entries.async_entries = lambda domain: []
     asyncio.run(async_setup(hass, {}))
 
-    assert asyncio.run(hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)](FakeCall({}))) == {
-        "ok": False,
-        "error": "no_config_entry",
-    }
-    assert asyncio.run(hass.services.handlers[(DOMAIN, SERVICE_EXPORT_SUPPORT_BUNDLE)](FakeCall({}))) == {
-        "error": "no_config_entry"
-    }
+    for service in (SERVICE_REPLAN, SERVICE_RUN_PREFLIGHT, SERVICE_EXPORT_SUPPORT_BUNDLE):
+        with pytest.raises(ServiceValidationError) as error:
+            asyncio.run(hass.services.handlers[(DOMAIN, service)](FakeCall({})))
+        assert error.value.translation_domain == DOMAIN
+        assert error.value.translation_key == "no_config_entry"
+
+
+def test_restore_service_raises_translated_error_when_restore_is_incomplete() -> None:
+    coordinator = _coordinator()
+
+    async def failed_restore(reason: str) -> SimpleNamespace:
+        return SimpleNamespace(result=OutcomeResult.FAILED, reason="ev_restore_failed:unavailable")
+
+    coordinator.async_restore_safe_state = failed_restore
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(hass.services.handlers[(DOMAIN, SERVICE_RESTORE_SAFE_STATE)](FakeCall({})))
+
+    assert error.value.translation_domain == DOMAIN
+    assert error.value.translation_key == "restore_safe_state_failed"
+    assert error.value.translation_placeholders == {"reason": "ev_restore_failed:unavailable"}
 
 
 def test_pause_control_schema_validates_asset_duration_and_reason() -> None:
@@ -714,8 +734,9 @@ def _coordinator() -> EnergyPlannerCoordinator:
     async def replan() -> None:
         coordinator.awaited.append(("replan", None))
 
-    async def restore(reason: str) -> None:
+    async def restore(reason: str) -> SimpleNamespace:
         coordinator.awaited.append(("restore", reason))
+        return SimpleNamespace(result=OutcomeResult.RESTORED, reason=reason)
 
     async def ready_by(value: str) -> None:
         coordinator.awaited.append(("ready_by", value))

@@ -250,6 +250,31 @@ def test_restore_safe_state_notification_remains_enabled_when_plan_alerts_are_di
     ]
 
 
+def test_restore_safe_state_attempts_configured_enphase_without_ownership() -> None:
+    store = FakeStore()
+    hass = FakeHass({"select.enphase": "Self Consumption"})
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_ENPHASE_PROFILE: "select.enphase",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("manual"))
+
+    assert outcome.result == "restored"
+    assert outcome.reason == "manual:enphase_profile_applied"
+    assert outcome.post_state["ownership"] == "cleared"
+    assert hass.states.values["select.enphase"] == "AI Optimisation"
+    assert hass.services.calls[0] == (
+        "select",
+        "select_option",
+        {"entity_id": "select.enphase", "option": "AI Optimisation"},
+    )
+
+
 def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection() -> None:
     now = datetime.now(UTC)
     action = PlanAction(
@@ -1637,6 +1662,9 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
     store.data["ownership"] = {
         "ev_smart_charging_state": {"switch.ev": "on"},
         "climate_automations": {"automation.hvac": "off"},
+        "planner_takeover_started_at": "2026-01-01T00:00:00+00:00",
+        "enphase_profile": "AI Optimisation",
+        "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
     }
     executor = Executor(store, hass=FakeHass())
 
@@ -1644,7 +1672,134 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
 
     assert outcome.result == "failed"
     assert outcome.reason == "manual:ev_restore_failed:hvac_restored:enphase_profile_unavailable"
-    assert store.data["ownership"] == {}
+    assert store.data["ownership"] == {
+        "ev_smart_charging_state": {"switch.ev": "on"},
+        "enphase_profile": "AI Optimisation",
+        "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
+    }
+    assert outcome.post_state["ownership"] == "partially_cleared"
+    assert outcome.post_state["remaining_ownership"] == [
+        "enphase_profile",
+        "enphase_profile_changed_at",
+        "ev_smart_charging_state",
+    ]
+
+
+def test_executor_restore_safe_state_retains_ownership_without_hass() -> None:
+    store = FakeStore()
+    ownership = {
+        "ev_smart_charging_state": {"switch.ev": "on"},
+        "climate_automations": {"automation.hvac": "on"},
+    }
+    store.data["ownership"] = ownership
+
+    outcome = asyncio.run(Executor(store).async_restore_safe_state("shutdown"))
+
+    assert outcome.result == "failed"
+    assert outcome.reason == "shutdown:home_assistant_unavailable"
+    assert outcome.post_state == {
+        "ownership": "retained",
+        "remaining_ownership": ["climate_automations", "ev_smart_charging_state"],
+    }
+    assert store.data["ownership"] == ownership
+
+
+def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch: object) -> None:
+    class RaisingEVAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            raise RuntimeError("service failure")
+
+    class SuccessfulDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            return SimpleNamespace(
+                applied=True,
+                reason="hvac_restored",
+                pre_state={"automation.hvac": "off"},
+                post_state={"automation.hvac": "on"},
+            )
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", RaisingEVAdapter)
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", SuccessfulDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {"switch.ev": "on"},
+        "climate_automations": {"automation.hvac": "on"},
+    }
+
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_restore_safe_state("manual"))
+
+    assert outcome.result == "failed"
+    assert outcome.reason == "manual:ev_restore_exception:hvac_restored:enphase_ai_profile_not_configured"
+    assert outcome.post_state["automation.hvac"] == "on"
+    assert outcome.post_state["ownership"] == "partially_cleared"
+    assert store.data["ownership"] == {"ev_smart_charging_state": {"switch.ev": "on"}}
+
+
+def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypatch: object) -> None:
+    class SuccessfulEVAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            return SimpleNamespace(applied=True, reason="ev_restored", pre_state={}, post_state={})
+
+    class FailedDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            return SimpleNamespace(applied=False, reason="hvac_unavailable", pre_state={}, post_state={})
+
+    class RaisingEnphaseAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore_ai(self) -> object:
+            raise RuntimeError("service failure")
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", SuccessfulEVAdapter)
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedDaikinAdapter)
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", RaisingEnphaseAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {"switch.ev": "on"},
+        "climate_automations": {"automation.hvac": "on"},
+        "enphase_profile": "AI Optimisation",
+    }
+
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_restore_safe_state("manual"))
+
+    assert outcome.result == "failed"
+    assert outcome.reason == "manual:ev_restored:hvac_unavailable:enphase_restore_exception"
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "enphase_profile": "AI Optimisation",
+    }
+
+
+def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: object) -> None:
+    class RaisingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            raise RuntimeError("service failure")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {"climate_automations": {"automation.hvac": "on"}}
+
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_restore_safe_state("manual"))
+
+    assert outcome.result == "failed"
+    assert "hvac_restore_exception" in outcome.reason
+    assert store.data["ownership"] == {"climate_automations": {"automation.hvac": "on"}}
 
 
 def test_executor_notification_helpers_skip_when_unavailable() -> None:
