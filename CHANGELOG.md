@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Config-entry and subentry mapping changes now rebuild runtime listeners and
+  entities, while failed platform unloads leave the coordinator operational.
+- The manifest and quality evidence now describe Energy Planner as a
+  single-entry calculated helper with a defensible Gold quality target.
+- Explicit services and control buttons now raise translated Home Assistant
+  errors when no runtime is loaded or a requested device action fails.
+
+### Fixed
+
+- Safe-state restoration retains ownership for each asset until its restore is
+  confirmed, and entering disabled or dry-run mode restores planner takeovers.
+- Manual HVAC detection now includes control-attribute changes without treating
+  the planner's own in-flight setpoint changes as manual overrides.
+
+### Validation
+
+- Full Docker validation: `683 passed`, `100%` across `7,672` statements, plus
+  Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
+  smoke checks.
+
 ## 0.6.1 - 2026-07-17
 
 ### Fixed

@@ -9,10 +9,13 @@ from typing import Any
 from homeassistant.components.button import ButtonEntity, ButtonEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import DOMAIN
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .models import OutcomeResult
 from .preflight import build_preflight_report
 from .type_defs import EnergyPlannerConfigEntry
 
@@ -31,7 +34,14 @@ async def _replan(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 async def _restore(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_restore_safe_state("button_pressed")
+    outcome = await coordinator.async_restore_safe_state("button_pressed")
+    if outcome.result == OutcomeResult.FAILED:
+        raise HomeAssistantError(
+            f"Energy Planner could not fully restore safe state: {outcome.reason}",
+            translation_domain=DOMAIN,
+            translation_key="restore_safe_state_failed",
+            translation_placeholders={"reason": outcome.reason},
+        )
 
 
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
@@ -69,11 +79,23 @@ async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 async def _start_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_manual_ev_charging(True)
+    await _manual_ev_charging(coordinator, True)
 
 
 async def _stop_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_manual_ev_charging(False)
+    await _manual_ev_charging(coordinator, False)
+
+
+async def _manual_ev_charging(coordinator: EnergyPlannerCoordinator, enabled: bool) -> None:
+    """Apply a manual EV command and surface adapter rejection to the user."""
+    result = await coordinator.async_manual_ev_charging(enabled)
+    if not result.applied:
+        raise HomeAssistantError(
+            f"Energy Planner could not change EV charging: {result.reason}",
+            translation_domain=DOMAIN,
+            translation_key="manual_ev_control_failed",
+            translation_placeholders={"reason": result.reason},
+        )
 
 
 BUTTONS: tuple[PlannerButtonDescription, ...] = (

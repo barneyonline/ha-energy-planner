@@ -74,6 +74,7 @@ class Executor:
         self.entry_data = entry_data or {}
         self.options = options or {}
         self.notification_grace_until = notification_grace_until
+        self.pending_hvac_desired_state: dict[str, Any] | None = None
 
     async def async_evaluate(self, plan: EnergyPlan, context: DecisionContext | None = None) -> None:
         """Audit why an action was not executed."""
@@ -212,7 +213,11 @@ class Executor:
             )
             return
         if reason is None and action.asset == ActionAsset.DAIKIN and self.hass is not None:
-            result = await DaikinHVACAdapter(self.hass, self.entry_data).async_execute(action)
+            self.pending_hvac_desired_state = dict(action.desired_state)
+            try:
+                result = await DaikinHVACAdapter(self.hass, self.entry_data).async_execute(action)
+            finally:
+                self.pending_hvac_desired_state = None
             await self._async_record_command_attempt(action, now)
             if not result.applied:
                 await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
@@ -277,36 +282,96 @@ class Executor:
     async def async_restore_safe_state(self, reason: str) -> ActionOutcome:
         """Restore planner ownership state and notify the user."""
         now = dt_util.utcnow()
-        ev_result = None
-        hvac_result = None
-        enphase_result = None
         ownership = dict(self.store.data.get("ownership", {}))
-        if self.hass is not None:
-            ev_state = dict(ownership.get("ev_smart_charging_state", {}))
-            hvac_state = dict(ownership.get("climate_automations", {}))
-            if ev_state:
-                ev_result = await EVSmartChargingAdapter(self.hass, self.entry_data).async_restore(ev_state)
-            if hvac_state:
-                hvac_result = await DaikinHVACAdapter(self.hass, self.entry_data).async_restore(hvac_state)
-            enphase_result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_restore_ai()
-        await self.store.async_clear_ownership()
-        restore_failed = any(
-            result is not None
-            and not result.applied
-            and "not_configured" not in result.reason
-            and "unavailable" not in result.reason
-            for result in (ev_result, hvac_result, enphase_result)
-        )
-        pre_state = {}
-        post_state = {"ownership": "cleared"}
+        remaining_ownership = dict(ownership)
+        results: list[Any] = []
         reasons = [reason]
-        for result in (ev_result, hvac_result, enphase_result):
-            if result is None:
-                continue
-            reasons.append(result.reason)
+        restore_failed = False
+
+        ev_state = dict(ownership.get("ev_smart_charging_state", {}))
+        hvac_state = dict(ownership.get("climate_automations", {}))
+        enphase_owned = bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
+        restore_requested = bool(ev_state or hvac_state or enphase_owned)
+
+        if restore_requested and self.hass is None:
+            restore_failed = True
+            reasons.append("home_assistant_unavailable")
+        elif self.hass is not None:
+            if ev_state:
+                try:
+                    ev_result = await EVSmartChargingAdapter(self.hass, self.entry_data).async_restore(ev_state)
+                except Exception:  # noqa: BLE001 - restoration must continue for the other assets.
+                    restore_failed = True
+                    reasons.append("ev_restore_exception")
+                else:
+                    results.append(ev_result)
+                    reasons.append(ev_result.reason)
+                    if ev_result.applied:
+                        remaining_ownership.pop("ev_smart_charging_state", None)
+                    else:
+                        restore_failed = True
+
+            if hvac_state:
+                try:
+                    hvac_result = await DaikinHVACAdapter(self.hass, self.entry_data).async_restore(hvac_state)
+                except Exception:  # noqa: BLE001 - restoration must continue for the other assets.
+                    restore_failed = True
+                    reasons.append("hvac_restore_exception")
+                else:
+                    results.append(hvac_result)
+                    reasons.append(hvac_result.reason)
+                    if hvac_result.applied:
+                        for key in (
+                            "climate_automations",
+                            "planner_takeover_started_at",
+                            "planner_hvac_action_expires_at",
+                            "manual_hvac_override_expires_at",
+                        ):
+                            remaining_ownership.pop(key, None)
+                    else:
+                        restore_failed = True
+
+            # Safe-state restore has always included a best-effort return to the
+            # configured Enphase AI profile, even without a recorded takeover.
+            try:
+                enphase_result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_restore_ai()
+            except Exception:  # noqa: BLE001 - restoration must preserve retry state.
+                restore_failed = True
+                reasons.append("enphase_restore_exception")
+            else:
+                results.append(enphase_result)
+                reasons.append(enphase_result.reason)
+                if enphase_result.applied:
+                    remaining_ownership.pop("enphase_profile", None)
+                    remaining_ownership.pop("enphase_profile_changed_at", None)
+                elif enphase_owned or "not_configured" not in enphase_result.reason:
+                    restore_failed = True
+
+        # Ownership metadata that cannot represent a pending device restore can
+        # always be released. Device baselines above are retained until their
+        # corresponding adapter confirms restoration.
+        if not hvac_state:
+            for key in (
+                "planner_takeover_started_at",
+                "planner_hvac_action_expires_at",
+                "manual_hvac_override_expires_at",
+            ):
+                remaining_ownership.pop(key, None)
+
+        await self.store.async_save_ownership(remaining_ownership)
+        pre_state: dict[str, Any] = {}
+        post_state: dict[str, Any] = {}
+        for result in results:
             pre_state.update(result.pre_state)
             post_state.update(result.post_state)
-        post_state["ownership"] = "cleared"
+        if not remaining_ownership:
+            ownership_status = "cleared"
+        elif remaining_ownership == ownership:
+            ownership_status = "retained"
+        else:
+            ownership_status = "partially_cleared"
+        post_state["ownership"] = ownership_status
+        post_state["remaining_ownership"] = sorted(remaining_ownership)
         outcome = ActionOutcome(
             action_id="restore_safe_state",
             attempted_at=now,

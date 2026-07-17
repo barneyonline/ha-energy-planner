@@ -9,7 +9,6 @@ from custom_components.ha_energy_planner.forecast_accuracy import (
     summarize_forecast_accuracy,
 )
 
-
 BUCKETS = [
     {"name": "near", "min_hours": 0, "max_hours": 4},
     {"name": "day", "min_hours": 4, "max_hours": 12},

@@ -22,7 +22,10 @@ from custom_components.ha_energy_planner.forecast_accuracy import (  # noqa: E40
     accuracy_threshold_errors,
     summarize_forecast_accuracy,
 )
-from custom_components.ha_energy_planner.forecasts import forecast_series_from_state, normalize_scalar_value  # noqa: E402
+from custom_components.ha_energy_planner.forecasts import (  # noqa: E402
+    forecast_series_from_state,
+    normalize_scalar_value,
+)
 from custom_components.ha_energy_planner.thermal_model import (  # noqa: E402
     thermal_model_summary,
     update_thermal_model,
