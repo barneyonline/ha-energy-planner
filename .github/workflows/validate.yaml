@@ -56,6 +56,7 @@ jobs:
               "integration_type",
               "iot_class",
               "quality_scale",
+              "single_config_entry",
               "version",
           }
           missing = sorted(required - set(manifest))
@@ -63,8 +64,12 @@ jobs:
               raise SystemExit(f"manifest.json missing required keys: {', '.join(missing)}")
           if manifest["domain"] != "ha_energy_planner":
               raise SystemExit(f"unexpected manifest domain: {manifest['domain']}")
-          if manifest["quality_scale"] != "platinum":
+          if manifest["quality_scale"] != "gold":
               raise SystemExit(f"unexpected quality scale: {manifest['quality_scale']}")
+          if manifest["integration_type"] != "helper" or manifest["iot_class"] != "calculated":
+              raise SystemExit("unexpected integration classification")
+          if manifest["single_config_entry"] is not True:
+              raise SystemExit("Energy Planner must remain a single-config-entry integration")
           pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
           project_version = pyproject["project"]["version"]
           if manifest["version"] != project_version:

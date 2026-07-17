@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
+import pytest
+
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
@@ -18,10 +20,12 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
+    CONF_DRY_RUN,
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
+    CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
 from custom_components.ha_energy_planner.coordinator import (
@@ -228,6 +232,62 @@ class FakeEntry:
     options: dict[str, object] = field(default_factory=dict)
 
 
+def test_options_update_restores_when_direct_update_enables_safe_mode() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: False,
+            CONF_DRY_RUN: True,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, False)
+    restore_calls: list[tuple[str, bool]] = []
+    replan_calls: list[str] = []
+
+    async def restore(reason: str, *, refresh: bool = True) -> None:
+        restore_calls.append((reason, refresh))
+
+    async def replan() -> None:
+        replan_calls.append("replan")
+
+    coordinator.async_restore_safe_state = restore
+    coordinator.async_request_replan = replan
+
+    asyncio.run(coordinator.async_handle_options_update())
+
+    assert restore_calls == [("planner_disabled", False)]
+    assert replan_calls == ["replan"]
+    assert coordinator._last_control_mode_state == (False, True)
+
+
+def test_options_update_surfaces_restore_error_after_safe_option_is_applied() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: True,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, False)
+
+    async def restore(reason: str, *, refresh: bool = True) -> None:
+        raise RuntimeError(f"{reason}:{refresh}")
+
+    coordinator.async_restore_safe_state = restore
+    coordinator.async_request_replan = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="dry_run_enabled:False"):
+        asyncio.run(coordinator.async_handle_options_update())
+
+    assert coordinator.dry_run is True
+    assert coordinator._last_control_mode_state == (True, True)
+    coordinator.async_request_replan.assert_not_awaited()
+
+
 def test_coordinator_records_refresh_duration_in_memory() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator._planner_lock = asyncio.Lock()
@@ -296,6 +356,40 @@ def test_manual_hvac_change_detected_without_guard() -> None:
         {CONF_DAIKIN_CLIMATE: "climate.daikin"},
         {"ownership": {}},
         FakeEvent("climate.daikin", "heat", "off"),
+        now,
+    )
+
+
+def test_manual_hvac_setpoint_change_detected_without_mode_change() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    assert _is_manual_hvac_change(
+        FakeHass(),
+        {CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        {"ownership": {}},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20, "current_temperature": 19},
+            new_attributes={"temperature": 22, "current_temperature": 19},
+        ),
+        now,
+    )
+
+
+def test_hvac_observation_attribute_change_is_not_manual_control() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    assert not _is_manual_hvac_change(
+        FakeHass(),
+        {CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        {"ownership": {}},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20, "current_temperature": 19},
+            new_attributes={"temperature": 20, "current_temperature": 19.5},
+        ),
         now,
     )
 
@@ -1047,6 +1141,82 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
             ]
         },
         daikin_event,
+        now,
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={"target_temperature": 21},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {"target_temperature": 21},
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {"hvac_mode": "heat"},
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 22},
+        ),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {"target_temperature": 21},
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20, "fan_mode": "auto"},
+            new_attributes={"temperature": 21, "fan_mode": "quiet"},
+        ),
         now,
     )
     assert _is_planner_owned_control_feedback(

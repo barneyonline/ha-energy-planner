@@ -14,12 +14,15 @@ def _hacs_manifest() -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_manifest_claims_platinum_quality_scale() -> None:
+def test_manifest_classifies_single_entry_calculated_helper() -> None:
     manifest = _manifest()
 
     assert manifest["domain"] == "ha_energy_planner"
     assert manifest["name"] == "Energy Planner"
-    assert manifest["quality_scale"] == "platinum"
+    assert manifest["integration_type"] == "helper"
+    assert manifest["iot_class"] == "calculated"
+    assert manifest["single_config_entry"] is True
+    assert manifest["quality_scale"] == "gold"
 
 
 def test_manifest_keeps_dependency_surface_explicit() -> None:

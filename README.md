@@ -17,7 +17,7 @@
 [![Hassfest](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/hassfest.yml?branch=main&label=hassfest)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/hassfest.yml)
 [![Codespell](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/codespell.yml?branch=main&label=codespell)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/codespell.yml)
 
-[![Quality Scale](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbarneyonline%2Fha-energy-planner%2Fmain%2Fcustom_components%2Fha_energy_planner%2Fmanifest.json&query=%24.quality_scale&label=quality%20scale&cacheSeconds=3600)](https://developers.home-assistant.io/docs/integration_quality_scale_index)
+[![Quality target](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbarneyonline%2Fha-energy-planner%2Fmain%2Fcustom_components%2Fha_energy_planner%2Fmanifest.json&query=%24.quality_scale&label=quality%20target&cacheSeconds=3600)](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
 [![Install](https://img.shields.io/badge/install-manual-blue)](#installation)
 
 [![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
@@ -58,7 +58,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly; repeated identical skipped dry-run outcomes are coalesced with occurrence counts, while applied/failed safety events remain distinct
 - Explicit decision-input replan listeners, observation-only sampling for high-frequency power sensors, a one-minute non-manual refresh floor, unchanged-input short-circuiting, and refresh trigger/phase/counter telemetry
 - Home Assistant diagnostics, system health, modular repair/preflight evidence for partial installations, native currency/device-class semantics, entity translations, and icons for all exposed entities
-- Dockerized validation gate covering compile checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
+- Dockerized validation gate covering compile and Ruff checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
 
 ## Installation
 
@@ -99,9 +99,9 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 - Integration display name: `Energy Planner`
 - Current manifest version: `0.6.1`
 - Minimum Home Assistant version: `2026.6.0`
-- Integration type: `hub`
-- IoT class: `local_polling`
-- Claimed Home Assistant quality scale: `platinum`
+- Integration type: `helper`
+- IoT class: `calculated`
+- Project quality-scale target: `gold` (custom integrations remain in Home Assistant's Custom tier)
 - Python: `3.14+`
 - Home Assistant setup: custom integration installed under `custom_components`
 
@@ -217,6 +217,7 @@ scripts/docker-validate.sh
 This runs:
 
 - Python compile checks
+- Ruff lint and import-order checks
 - Shell syntax checks
 - Quality-scale evidence validation
 - Pytest inside the Home Assistant Docker image with 100% coverage

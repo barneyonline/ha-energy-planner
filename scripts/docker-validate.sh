@@ -36,6 +36,7 @@ run() {
 }
 
 run env PYTHONPYCACHEPREFIX="$PYCACHE_DIR" python3 -m compileall -q custom_components tests scripts
+run docker run --rm -v "$PWD:/work" -w /work ghcr.io/astral-sh/ruff:0.14.1 check custom_components tests scripts
 run bash -n scripts/docker-ha-smoke.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run

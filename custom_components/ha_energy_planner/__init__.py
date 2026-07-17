@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from .const import (
@@ -51,6 +52,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up integration-level services."""
     import voluptuous as vol
     from homeassistant.core import SupportsResponse
+    from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
     from homeassistant.helpers import config_validation as cv
 
     from .coordinator import EnergyPlannerCoordinator
@@ -65,70 +67,85 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 return coordinator
         return None
 
+    async def _require_coordinator() -> EnergyPlannerCoordinator:
+        """Return the loaded coordinator or raise a translated service error."""
+        coordinator = await _first_coordinator()
+        if coordinator is None:
+            raise ServiceValidationError(
+                "No loaded Energy Planner configuration is available.",
+                translation_domain=DOMAIN,
+                translation_key="no_config_entry",
+            )
+        return coordinator
+
     async def handle_replan(call: ServiceCall) -> None:
-        if coordinator := await _first_coordinator():
-            await coordinator.async_request_replan()
+        coordinator = await _require_coordinator()
+        await coordinator.async_request_replan()
 
     async def handle_restore(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_restore_safe_state(reason)
+        coordinator = await _require_coordinator()
+        outcome = await coordinator.async_restore_safe_state(reason)
+        if outcome.result.value == "failed":
+            raise HomeAssistantError(
+                f"Energy Planner could not fully restore safe state: {outcome.reason}",
+                translation_domain=DOMAIN,
+                translation_key="restore_safe_state_failed",
+                translation_placeholders={"reason": outcome.reason},
+            )
 
     async def handle_ready_by(call: ServiceCall) -> None:
         ready_by = str(call.data[ATTR_READY_BY])
-        if coordinator := await _first_coordinator():
-            await coordinator.async_set_ready_by(ready_by)
+        coordinator = await _require_coordinator()
+        await coordinator.async_set_ready_by(ready_by)
 
     async def handle_target_soc(call: ServiceCall) -> None:
         target_soc = float(call.data[ATTR_TARGET_SOC])
-        if coordinator := await _first_coordinator():
-            await coordinator.async_set_ev_target_soc(target_soc)
+        coordinator = await _require_coordinator()
+        await coordinator.async_set_ev_target_soc(target_soc)
 
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_set_manual_hvac_override(duration, reason)
+        coordinator = await _require_coordinator()
+        await coordinator.async_set_manual_hvac_override(duration, reason)
 
     async def handle_export_diagnostics(call: ServiceCall) -> dict[str, Any]:
-        if coordinator := await _first_coordinator():
-            return await async_get_config_entry_diagnostics(hass, coordinator.entry)
-        return {"error": "no_config_entry"}
+        coordinator = await _require_coordinator()
+        return await async_get_config_entry_diagnostics(hass, coordinator.entry)
 
     async def handle_run_preflight(call: ServiceCall) -> dict[str, Any]:
-        if coordinator := await _first_coordinator():
-            return build_preflight_report(hass, coordinator)
-        return {"ok": False, "error": "no_config_entry"}
+        coordinator = await _require_coordinator()
+        return build_preflight_report(hass, coordinator)
 
     async def handle_export_support_bundle(call: ServiceCall) -> dict[str, Any]:
-        if coordinator := await _first_coordinator():
-            return {
-                "preflight": build_preflight_report(hass, coordinator),
-                "diagnostics": await async_get_config_entry_diagnostics(hass, coordinator.entry),
-            }
-        return {"error": "no_config_entry"}
+        coordinator = await _require_coordinator()
+        return {
+            "preflight": build_preflight_report(hass, coordinator),
+            "diagnostics": await async_get_config_entry_diagnostics(hass, coordinator.entry),
+        }
 
     async def handle_arm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_acknowledged"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_arm_production_control(reason)
+        coordinator = await _require_coordinator()
+        await coordinator.async_arm_production_control(reason)
 
     async def handle_disarm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_disarm_production_control(reason)
+        coordinator = await _require_coordinator()
+        await coordinator.async_disarm_production_control(reason)
 
     async def handle_pause_control(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
         asset = str(call.data.get(ATTR_ASSET, "all"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_pause_control(duration, reason, asset)
+        coordinator = await _require_coordinator()
+        await coordinator.async_pause_control(duration, reason, asset)
 
     async def handle_resume_control(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
-        if coordinator := await _first_coordinator():
-            await coordinator.async_resume_control(reason)
+        coordinator = await _require_coordinator()
+        await coordinator.async_resume_control(reason)
 
     hass.services.async_register(DOMAIN, SERVICE_REPLAN, handle_replan)
     hass.services.async_register(
@@ -240,6 +257,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     store = PlannerStore(hass)
     await store.async_load()
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
+    coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
     try:
         await coordinator.async_config_entry_first_refresh()
@@ -260,20 +278,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
 async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Unload a config entry."""
     coordinator = entry.runtime_data
-    coordinator.async_shutdown()
     await coordinator.async_restore_safe_state("entry_unload", refresh=False)
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
+        coordinator.async_shutdown()
         entry.runtime_data = None
+    else:
+        await coordinator.async_request_replan()
     return unload_ok
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Handle options updates."""
+    """Handle options and subentry updates."""
     coordinator = getattr(entry, "runtime_data", None)
+    topology_signature = _entry_topology_signature(entry)
+    previous_topology_signature = getattr(coordinator, "entry_topology_signature", None)
+    if previous_topology_signature is not None and topology_signature != previous_topology_signature:
+        await hass.config_entries.async_reload(entry.entry_id)
+        return
+    handle_options_update = getattr(coordinator, "async_handle_options_update", None)
+    if callable(handle_options_update):
+        await handle_options_update()
+        return
     request_replan = getattr(coordinator, "async_request_replan", None)
     if callable(request_replan):
         await request_replan()
+
+
+def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...]:
+    """Return stable config data that requires rebuilding platforms and listeners."""
+    subentries = getattr(entry, "subentries", {})
+    return (
+        _freeze_config_value(getattr(entry, "data", {})),
+        tuple(
+            sorted(
+                (
+                    str(getattr(subentry, "subentry_id", subentry_id)),
+                    str(getattr(subentry, "subentry_type", "")),
+                    _freeze_config_value(getattr(subentry, "data", {})),
+                )
+                for subentry_id, subentry in subentries.items()
+            )
+        ),
+    )
+
+
+def _freeze_config_value(value: Any) -> Any:
+    """Convert config-entry values into a deterministic comparable shape."""
+    if isinstance(value, Mapping):
+        return tuple(sorted((str(key), _freeze_config_value(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config_value(item) for item in value)
+    if isinstance(value, set):
+        return tuple(sorted(_freeze_config_value(item) for item in value))
+    return value
 
 
 def _async_remove_legacy_device(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
