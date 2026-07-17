@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -17,11 +18,12 @@ except Exception:  # pragma: no cover
     raise
 
 DOMAIN = "ha_energy_planner"
-EXPECTED_QUALITY_SCALE = "platinum"
+EXPECTED_QUALITY_SCALE = "gold"
 QUALITY_LEVEL_ORDER = ("bronze", "silver", "gold", "platinum")
 NA_ALLOWED_RULES = {
     "discovery",
     "discovery-update-info",
+    "dynamic-devices",
     "entity-category",
     "entity-device-class",
     "entity-disabled-by-default",
@@ -94,6 +96,18 @@ def _reference_path_exists(root: Path, reference: str) -> bool:
     return bool(path_text) and (root / path_text).exists()
 
 
+def _strict_typing_gate_is_configured(root: Path) -> bool:
+    """Return whether strict mypy is configured and enforced by the full gate."""
+
+    try:
+        pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        validation_script = (root / "scripts" / "docker-validate.sh").read_text(encoding="utf-8")
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    mypy = pyproject.get("tool", {}).get("mypy", {})
+    return mypy.get("strict") is True and "mypy" in validation_script
+
+
 def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     """Return exit code and validation messages."""
 
@@ -158,6 +172,11 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
         messages.append(
             "ERROR: Generated cache directories must not be present in the integration: "
             + ", ".join(generated_artifacts)
+        )
+    if _status_for_rule(rules.get("strict-typing")) == "done" and not _strict_typing_gate_is_configured(root):
+        messages.append(
+            "ERROR: strict-typing cannot be marked done without strict mypy configuration "
+            "enforced by scripts/docker-validate.sh"
         )
 
     return (1 if messages else 0), messages

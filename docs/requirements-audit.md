@@ -132,7 +132,7 @@ Status as of 2026-06-28.
   `real_*.json` fixtures without calling Home Assistant again.
 - Docker Home Assistant validation is available through
   `scripts/docker-validate.sh`, `scripts/docker-ha-smoke.sh`, and
-  `docker compose`. The full validation gate runs compile checks, Dockerized
+  `docker compose`. The full validation gate runs compile and Ruff checks, Dockerized
   pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant
   `check_config`, and the smoke test in one repeatable sequence. The smoke test
   now verifies coordinator refresh, entity
