@@ -97,7 +97,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.6.1`
+- Current manifest version: `0.7.0`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `helper`
 - IoT class: `calculated`
