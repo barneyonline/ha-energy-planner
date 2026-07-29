@@ -819,7 +819,8 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
             {"daikin_climate_entity": "climate.daikin", "climate_automation_entities": "automation.hvac"},
         ).async_execute(suppress_action)
     )
-    assert suppress_result.reason == "hvac_automation_service_failed"
+    assert suppress_result.reason == "hvac_automation_rollback_failed"
+    assert suppress_result.saved_automation_states == {"automation.hvac": "on"}
     state = SimpleNamespace(state="cool", attributes={"target_temp_low": 20, "target_temp_high": "bad"})
     from custom_components.ha_energy_planner.hvac_adapter import _already_in_desired_state
 
@@ -1059,7 +1060,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     class Store:
-        def __init__(self, hass: Any) -> None:
+        def __init__(self, hass: Any, entry_id: str, *, legacy_fallback: bool = False) -> None:
             pass
 
         async def async_load(self) -> None:
@@ -1092,10 +1093,12 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
     hass = SimpleNamespace(
         config_entries=SimpleNamespace(
             async_update_entry=lambda entry, **kwargs: updates.append(kwargs),
+            async_entries=lambda domain: [entry],
             async_forward_entry_setups=lambda entry, platforms: _noop_true(),
         )
     )
     entry = SimpleNamespace(
+        entry_id="entry-1",
         options={},
         title="Energy Planner",
         data={},

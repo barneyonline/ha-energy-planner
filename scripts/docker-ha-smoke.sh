@@ -122,11 +122,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     async def capture_persistent_notification(call: ServiceCall) -> None:
         """Capture persistent notification calls for smoke validation."""
         notification_id = str(call.data.get("notification_id", ""))
+        restore_notification_id = "ha_energy_planner_restore_safe_state_01KW3HATESTENERGYPLANNER000"
         if notification_id:
             current = hass.states.get("input_text.planner_restore_notification_seen")
             if (
-                getattr(current, "state", None) == "ha_energy_planner_restore_safe_state"
-                and notification_id != "ha_energy_planner_restore_safe_state"
+                getattr(current, "state", None) == restore_notification_id
+                and notification_id != restore_notification_id
             ):
                 return
             hass.states.async_set(
@@ -316,6 +317,9 @@ input_boolean:
   ev_connected:
     name: EV connected
     initial: true
+  ev_charging:
+    name: EV charging feedback
+    initial: false
   ev_smart_charging_start:
     name: EV charger start
     initial: false
@@ -429,6 +433,32 @@ template:
           detailedForecast: "{{ ([{'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}, {'nativeTemperature': 23.0}, {'nativeTemperature': 24.0}] * 48) }}"
 
 automation:
+  - alias: Fake EV charger start feedback
+    id: fake_ev_charger_start_feedback
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.ev_smart_charging_start
+        to: "on"
+    actions:
+      - action: input_boolean.turn_on
+        data:
+          entity_id:
+            - input_boolean.ev_smart_charging_stop
+            - input_boolean.ev_charging
+  - alias: Fake EV charger stop feedback
+    id: fake_ev_charger_stop_feedback
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_boolean.ev_smart_charging_stop
+        to: "off"
+    actions:
+      - action: input_boolean.turn_off
+        data:
+          entity_id:
+            - input_boolean.ev_smart_charging_start
+            - input_boolean.ev_charging
   - alias: Fake climate conflict
     id: fake_climate_conflict
     mode: single
@@ -598,6 +628,26 @@ automation:
       - delay: "00:00:01"
       - action: ha_energy_planner.restore_safe_state
         data:
+          reason: docker_smoke_ev_baseline_reset
+      - delay: "00:00:02"
+      - action: input_boolean.turn_off
+        data:
+          entity_id:
+            - input_boolean.ev_smart_charging_start
+            - input_boolean.ev_charging
+      - action: input_boolean.turn_on
+        data:
+          entity_id: input_boolean.ev_smart_charging_stop
+      - action: ha_energy_planner.resume_control
+        data:
+          reason: docker_smoke_ev_restore_setup
+      - delay: "00:00:01"
+      - action: button.press
+        data:
+          entity_id: button.ev_start_charging
+      - delay: "00:00:02"
+      - action: ha_energy_planner.restore_safe_state
+        data:
           reason: docker_smoke_restore
       - delay: "00:00:03"
       - action: switch.turn_off
@@ -746,6 +796,9 @@ automation:
         data:
           entity_id: input_number.diagnostics_response_seen
           value: "{{ 1 if hep_diagnostics.plan is defined else 0 }}"
+      - action: button.press
+        data:
+          entity_id: button.ev_stop_charging
 
 logger:
   default: warning
@@ -885,7 +938,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           {
             "data": {
               "ev_soc_entity": "input_number.ev_soc",
-              "ev_charging_entity": "",
+              "ev_charging_entity": "input_boolean.ev_charging",
               "ev_connected_entity": "input_boolean.ev_connected",
               "ev_charger_start_entity": "input_boolean.ev_smart_charging_start",
               "ev_charger_stop_entity": "input_boolean.ev_smart_charging_stop"
@@ -922,7 +975,7 @@ cat > "$TMP_DIR/.storage/ha_energy_planner_state" <<'JSON'
       "armed_reason": "docker_smoke",
       "acknowledged_at": "2026-06-27T00:00:00+00:00",
       "dry_run_ready_cycles": 3,
-      "dry_run_evidence_fingerprint": "f977171eaf23d605b389d4d760d6090031ee515fc2883679f439a2907a0339a4"
+      "dry_run_evidence_fingerprint": "6c768c3429a8be31c1608b726aead98caa622fa68d5b90176bf9b130f1bc5132"
     }
   }
 }
@@ -989,6 +1042,8 @@ expected_entities = {
     "switch.ai_enabled",
     "button.system_replan",
     "button.system_restore_safe_state",
+    "button.ev_start_charging",
+    "button.ev_stop_charging",
 }
 missing = expected_entities - entities
 if missing:
@@ -1013,7 +1068,7 @@ missing_devices = expected_device_identifiers - device_identifiers
 if missing_devices:
     raise SystemExit(f"Missing HA Energy Planner device registry entries: {sorted(missing_devices)}")
 
-planner_store = load_storage("ha_energy_planner_state")
+planner_store = load_storage("ha_energy_planner_state_01KW3HATESTENERGYPLANNER000")
 store_data = planner_store["data"]
 active_plan = store_data.get("active_plan")
 if not active_plan or active_plan.get("horizon_hours") != 24 or active_plan.get("interval_minutes") != 5:
@@ -1109,7 +1164,10 @@ if not any(
     and action.get("desired_state", {}).get("allocated_slots")
     for action in snapshot_actions
 ):
-    raise SystemExit("Forecast snapshots did not persist an active EV schedule action with ready-by metadata")
+    raise SystemExit(
+        "Forecast snapshots did not persist an active EV schedule action with ready-by metadata: "
+        f"{snapshot_actions}"
+    )
 if not any(
     str(action.get("action_id", "")).endswith("-ev-native-smart-charge")
     and action.get("kind") == "ev_schedule"
@@ -1211,13 +1269,15 @@ if not restore_outcomes:
     raise SystemExit("restore_safe_state service did not persist the smoke outcome")
 all_restore_outcomes = [item for item in outcomes if item.get("action_id") == "restore_safe_state"]
 if not any(
-    "ev_saved_state_restored" in item.get("reason", "")
+    item.get("result") == "restored"
+    and "ev_saved_state_safe_stop" in item.get("reason", "")
     and item.get("post_state", {}).get("ev_charger_start_entity") == "off"
-    for item in all_restore_outcomes
+    and item.get("post_state", {}).get("ev_charging_entity") == "off"
+    for item in restore_outcomes
 ):
     raise SystemExit(
-        "restore_safe_state did not restore the direct EV charger control to its pre-takeover state: "
-        f"{all_restore_outcomes}"
+        "restore_safe_state did not confirm stopped EV charging and neutralize the start helper: "
+        f"{restore_outcomes}"
     )
 if not any("hvac_automation_state_restored" in item.get("reason", "") for item in all_restore_outcomes):
     raise SystemExit("restore_safe_state did not restore the mapped climate automation state")
@@ -1282,7 +1342,8 @@ if not any(
 if not any(
     item.get("result") == "applied"
     and str(item.get("action_id", "")).endswith("-ev-native-smart-charge")
-    and item.get("reason") in {"input_boolean_turn_on_called", "input_boolean_turn_off_called"}
+    and item.get("reason")
+    in {"ev_charging_confirmed", "ev_charging_stopped_confirmed"}
     for item in outcomes
 ):
     raise SystemExit("Active-mode native EV charger action was not applied in the smoke run")
@@ -1370,7 +1431,9 @@ expected_helper_states = {
     "input_text.planner_dry_run_seen": "on",
     "input_text.planner_enabled_seen": "on",
     "input_text.planner_ai_enabled_seen": "on",
-    "input_text.planner_restore_notification_seen": "ha_energy_planner_restore_safe_state",
+    "input_text.planner_restore_notification_seen": (
+        "ha_energy_planner_restore_safe_state_01KW3HATESTENERGYPLANNER000"
+    ),
     "input_text.diagnostics_data_token_seen": "**REDACTED**",
     "input_text.diagnostics_data_address_seen": "**REDACTED**",
     "input_text.diagnostics_option_token_seen": "**REDACTED**",

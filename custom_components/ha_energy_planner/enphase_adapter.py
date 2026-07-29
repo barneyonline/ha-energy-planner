@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -27,15 +28,26 @@ class EnphaseCommandResult:
     post_state: dict[str, Any]
     saved_profile: str | None
     changed_profile_at: bool
+    command_sent: bool = False
+    rollback_succeeded: bool | None = None
 
 
 class EnphaseProfileAdapter:
     """Change Enphase profile through configured Home Assistant service mapping."""
 
-    def __init__(self, hass: HomeAssistant, entry_data: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_data: dict[str, Any],
+        *,
+        confirmation_attempts: int = 3,
+        confirmation_interval_seconds: float = 0.25,
+    ) -> None:
         """Initialize adapter."""
         self.hass = hass
         self.entry_data = entry_data
+        self.confirmation_attempts = max(int(confirmation_attempts), 1)
+        self.confirmation_interval_seconds = max(float(confirmation_interval_seconds), 0.0)
 
     async def async_execute(self, action: PlanAction) -> EnphaseCommandResult:
         """Execute an Enphase profile action."""
@@ -52,12 +64,18 @@ class EnphaseProfileAdapter:
 
     async def async_restore_ai(self) -> EnphaseCommandResult:
         """Restore Enphase AI Optimisation profile where configured."""
-        pre_state = self._snapshot()
-        current_profile = pre_state.get(CONF_ENPHASE_PROFILE)
         ai_profile = self.entry_data.get(CONF_ENPHASE_AI_PROFILE)
         if not ai_profile:
+            pre_state = self._snapshot()
+            current_profile = pre_state.get(CONF_ENPHASE_PROFILE)
             return self._result(False, "enphase_ai_profile_not_configured", pre_state, current_profile, False)
-        return await self._async_set_profile(str(ai_profile), pre_state, current_profile)
+        return await self.async_restore_profile(str(ai_profile))
+
+    async def async_restore_profile(self, profile: str) -> EnphaseCommandResult:
+        """Restore a previously saved Enphase profile."""
+        pre_state = self._snapshot()
+        current_profile = pre_state.get(CONF_ENPHASE_PROFILE)
+        return await self._async_set_profile(profile, pre_state, current_profile)
 
     async def _async_set_profile(
         self,
@@ -81,17 +99,42 @@ class EnphaseProfileAdapter:
         try:
             await self.hass.services.async_call(domain, service, service_data, blocking=True)
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-            return self._result(False, "enphase_profile_service_failed", pre_state, current_profile, False)
-        post_state = self._snapshot()
-        observed_profile = post_state.get(CONF_ENPHASE_PROFILE)
-        if observed_profile != desired_profile:
+            rollback_succeeded = await self._async_rollback_profile(
+                profile_entity,
+                control_service,
+                current_profile,
+            )
             return EnphaseCommandResult(
                 applied=False,
-                reason="enphase_profile_not_confirmed",
+                reason="enphase_profile_service_failed",
                 pre_state=pre_state,
-                post_state=post_state,
+                post_state=self._snapshot(),
                 saved_profile=current_profile,
                 changed_profile_at=False,
+                command_sent=True,
+                rollback_succeeded=rollback_succeeded,
+            )
+        confirmed = await self._async_confirm_profile(profile_entity, desired_profile)
+        post_state = self._snapshot()
+        if not confirmed:
+            rollback_succeeded = await self._async_rollback_profile(
+                profile_entity,
+                control_service,
+                current_profile,
+            )
+            return EnphaseCommandResult(
+                applied=False,
+                reason=(
+                    "enphase_profile_not_confirmed_rolled_back"
+                    if rollback_succeeded
+                    else "enphase_profile_not_confirmed_rollback_failed"
+                ),
+                pre_state=pre_state,
+                post_state=self._snapshot(),
+                saved_profile=current_profile,
+                changed_profile_at=False,
+                command_sent=True,
+                rollback_succeeded=rollback_succeeded,
             )
         return EnphaseCommandResult(
             applied=True,
@@ -100,7 +143,38 @@ class EnphaseProfileAdapter:
             post_state=post_state,
             saved_profile=current_profile,
             changed_profile_at=True,
+            command_sent=True,
         )
+
+    async def _async_confirm_profile(self, profile_entity: str, desired_profile: str) -> bool:
+        """Wait a bounded time for Home Assistant to expose the requested profile."""
+        for attempt in range(self.confirmation_attempts):
+            if self._state_value(profile_entity) == desired_profile:
+                return True
+            if attempt + 1 < self.confirmation_attempts:
+                await asyncio.sleep(self.confirmation_interval_seconds)
+        return False
+
+    async def _async_rollback_profile(
+        self,
+        profile_entity: str,
+        control_service: str,
+        saved_profile: str | None,
+    ) -> bool:
+        """Compensate an uncertain profile command and confirm the saved profile."""
+        if saved_profile is None or "." not in control_service:
+            return False
+        domain, service = control_service.split(".", 1)
+        try:
+            await self.hass.services.async_call(
+                domain,
+                service,
+                self._service_data(profile_entity, saved_profile),
+                blocking=True,
+            )
+        except Exception:  # noqa: BLE001 - compensation must fail closed.
+            return False
+        return await self._async_confirm_profile(profile_entity, saved_profile)
 
     @staticmethod
     def _service_data(profile_entity: str, desired_profile: str) -> dict[str, Any]:

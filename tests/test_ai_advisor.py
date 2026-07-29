@@ -79,6 +79,20 @@ def test_ai_response_rejects_unsupported_or_forbidden_fields() -> None:
     assert validate_ai_response({"reasoning_summary": "ok", "extra_note": "unsupported"}) == {}
 
 
+def test_ai_response_rejects_boolean_and_non_finite_numeric_advice() -> None:
+    result = validate_ai_response(
+        {
+            "suggested_precondition_lead_minutes": True,
+            "suggested_forecast_buffer_percent": float("nan"),
+            "suggested_takeover_savings_threshold": float("inf"),
+            "confidence": float("-inf"),
+            "reasoning_summary": "Finite text remains usable.",
+        }
+    )
+
+    assert result == {"reasoning_summary": "Finite text remains usable."}
+
+
 class FakeServices:
     """Minimal HA service bus."""
 

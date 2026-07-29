@@ -30,6 +30,7 @@ from .const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
+    CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
@@ -189,10 +190,26 @@ class InputManager:
         ]
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
-        ev_connected, ev_connected_issue = self._optional_bool_state(CONF_EV_CONNECTED)
+        if self.entry_data.get(CONF_EV_CONNECTED):
+            ev_connected, ev_connected_issue = self._optional_bool_state(CONF_EV_CONNECTED)
+        else:
+            ev_connected = bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
+            ev_connected_issue = None
         ev_charging, ev_charging_issue = self._optional_bool_state(CONF_EV_CHARGING)
+        ev_target_soc_fallback_active = False
         if self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC):
             ev_target_soc, ev_target_soc_issue = self._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC)
+            if ev_target_soc is None:
+                ev_target_soc_fallback_active = True
+                native_target_soc = _finite_float_or_none(
+                    self.options.get(CONF_EV_FALLBACK_TARGET_SOC_PERCENT)
+                )
+                if native_target_soc is not None:
+                    ev_target_soc = native_target_soc
+                    if ev_target_soc_issue:
+                        ev_target_soc_issue = (
+                            f"advisory_{ev_target_soc_issue}_using_native_fallback"
+                        )
         else:
             ev_target_soc = _finite_float_or_none(self.options.get(CONF_EV_FALLBACK_TARGET_SOC_PERCENT))
             ev_target_soc_issue = None
@@ -299,6 +316,7 @@ class InputManager:
             ev_connected=ev_connected,
             ev_charging=ev_charging,
             ev_target_soc_percent=ev_target_soc,
+            ev_target_soc_fallback_active=ev_target_soc_fallback_active,
             ev_ready_by=ev_ready_by,
             ev_trip_observed_days=ev_trip_summary.observed_days,
             ev_trip_max_daily_soc_percent=ev_trip_summary.max_daily_soc_percent,
@@ -758,11 +776,18 @@ class InputManager:
 
     @staticmethod
     def _health_from_issues(issues: list[str]) -> InputHealth:
+        blocking_issues = [
+            issue for issue in issues if not issue.startswith("advisory_")
+        ]
         required_fragments = ("import_price", "export_price", "pv_forecast", "baseline_load", "battery_soc")
-        required_issues = [issue for issue in issues if any(fragment in issue for fragment in required_fragments)]
+        required_issues = [
+            issue
+            for issue in blocking_issues
+            if any(fragment in issue for fragment in required_fragments)
+        ]
         if any(not issue.endswith("_forecast_coverage_degraded") for issue in required_issues):
             return InputHealth.UNSAFE
-        if issues:
+        if blocking_issues:
             return InputHealth.DEGRADED
         return InputHealth.HEALTHY
 

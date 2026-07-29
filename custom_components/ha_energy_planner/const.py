@@ -5,6 +5,7 @@ from __future__ import annotations
 DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"
 LEGACY_INTEGRATION_NAME = f"HA {INTEGRATION_NAME}"
+CONF_INSTANCE_NAME = "instance_name"
 
 PLATFORMS = ["sensor", "binary_sensor", "switch", "button", "number", "time"]
 
@@ -35,6 +36,8 @@ CONF_PERSON_ENTITIES = "person_entities"
 CONF_EV_SOC = "ev_soc_entity"
 CONF_EV_CHARGING = "ev_charging_entity"
 CONF_EV_CONNECTED = "ev_connected_entity"
+CONF_EV_CONNECTED_HELPER = "ev_connected_helper"
+CONF_EV_KEEP_CHARGER_ON = "ev_keep_charger_on"
 # Native charger controls. The EV Smart Charging keys below remain readable
 # for upgrades, but are no longer exposed by the config flow.
 CONF_EV_CHARGER = "ev_charger_entity"
@@ -73,6 +76,8 @@ CONF_EV_PRICE_LIMIT_ENABLED = "ev_price_limit_enabled"
 CONF_EV_MAX_IMPORT_PRICE = "ev_max_import_price"
 CONF_EV_LOW_PRICE_CHARGING_ENABLED = "ev_low_price_charging_enabled"
 CONF_EV_LOW_PRICE_THRESHOLD = "ev_low_price_threshold"
+CONF_EV_CONFIRMATION_TIMEOUT_SECONDS = "ev_confirmation_timeout_seconds"
+CONF_EV_CONFIRMATION_RETRIES = "ev_confirmation_retries"
 CONF_GRID_IMPORT_LIMIT_KW = "grid_import_limit_kw"
 CONF_GRID_EXPORT_LIMIT_KW = "grid_export_limit_kw"
 CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT = "occupied_temperature_tolerance_percent"
@@ -126,6 +131,10 @@ DEFAULT_OPTIONS = {
     CONF_EV_MAX_IMPORT_PRICE: 1.0,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED: False,
     CONF_EV_LOW_PRICE_THRESHOLD: 0.0,
+    CONF_EV_CONNECTED_HELPER: False,
+    CONF_EV_KEEP_CHARGER_ON: False,
+    CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 30,
+    CONF_EV_CONFIRMATION_RETRIES: 1,
     CONF_GRID_IMPORT_LIMIT_KW: 10.0,
     CONF_GRID_EXPORT_LIMIT_KW: 10.0,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT: 10.0,
@@ -185,5 +194,8 @@ ATTR_READY_BY = "ready_by"
 ATTR_TARGET_SOC = "target_soc"
 ATTR_DURATION_MINUTES = "duration_minutes"
 ATTR_ASSET = "asset"
+ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 
 STATE_UNKNOWN_VALUES = {"unknown", "unavailable", None}
+EV_RESERVATION_RETAIN_WHEN_UNLOADED = "retain_when_unloaded"
+EV_RESERVATION_EXTERNAL_BASELINE = "external_baseline"

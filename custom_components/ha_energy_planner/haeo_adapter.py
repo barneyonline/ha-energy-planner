@@ -506,6 +506,11 @@ def _response_has_adequate_grid_evidence(
     if not context.slots:
         return False
     candidate = deepcopy(context)
+    for slot in candidate.slots:
+        # A flexible solve must prove its own grid coverage. Retaining baseline
+        # values here would let an empty or partial response pass this gate.
+        slot.haeo_grid_import_forecast_kw = None
+        slot.haeo_grid_export_forecast_kw = None
     apply_haeo_response_to_context(candidate, response)
     required_slots = max(1, ceil(len(candidate.slots) * 0.8))
     continuous_slots = 0
@@ -516,7 +521,12 @@ def _response_has_adequate_grid_evidence(
     return continuous_slots >= required_slots
 
 
-def apply_haeo_response_to_context(context: DecisionContext, response: dict[str, Any] | None) -> dict[str, int]:
+def apply_haeo_response_to_context(
+    context: DecisionContext,
+    response: dict[str, Any] | None,
+    *,
+    grid_includes_flexible_loads: bool = False,
+) -> dict[str, int]:
     """Populate HAEO forecast evidence on decision slots from a service response."""
     items = _response_forecast_items(response)
     if not items:
@@ -527,6 +537,7 @@ def apply_haeo_response_to_context(context: DecisionContext, response: dict[str,
         _planning_boundary(slot.valid_at, interval_seconds, default_tz): slot for slot in context.slots
     }
     counts: dict[str, int] = {}
+    grid_evidence_fields: dict[int, set[str]] = {}
     for index, item in enumerate(items):
         item = _flatten_item(item)
         slot = None
@@ -551,6 +562,19 @@ def apply_haeo_response_to_context(context: DecisionContext, response: dict[str,
                 continue
             setattr(slot, field_name, value)
             counts[field_name] = counts.get(field_name, 0) + 1
+            if field_name in {
+                "haeo_grid_import_forecast_kw",
+                "haeo_grid_export_forecast_kw",
+            }:
+                grid_evidence_fields.setdefault(id(slot), set()).add(field_name)
+    if grid_includes_flexible_loads:
+        required_grid_fields = {
+            "haeo_grid_import_forecast_kw",
+            "haeo_grid_export_forecast_kw",
+        }
+        for slot in context.slots:
+            if grid_evidence_fields.get(id(slot), set()) == required_grid_fields:
+                slot.haeo_grid_includes_flexible_loads = True
     return counts
 
 

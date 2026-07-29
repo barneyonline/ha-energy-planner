@@ -82,3 +82,34 @@ def test_manual_override_metadata_is_not_planner_takeover() -> None:
             }
         }
     )
+
+
+def test_takeover_active_reports_reservation_only_ev_recovery() -> None:
+    assert _planner_ownership_active(
+        {
+            "ownership": {},
+            "ev_grid_reservation": {"active": True, "load_kw": 7.2},
+        }
+    )
+    assert _planner_ownership_active(
+        {
+            "ownership": {
+                "ev_smart_charging_command_entity_id": "button.ev_start",
+                "ev_smart_charging_control_topology": {"ev_charger_stop_entity": "button.ev_stop"},
+            },
+            "ev_grid_reservation": {"active": False},
+        }
+    )
+    assert not _planner_ownership_active(
+        {"ownership": {}, "ev_grid_reservation": {"active": False}}
+    )
+    assert not _planner_ownership_active(
+        {
+            "ownership": {},
+            "ev_grid_reservation": {
+                "active": True,
+                "external_baseline": True,
+                "load_kw": 7.2,
+            },
+        }
+    )

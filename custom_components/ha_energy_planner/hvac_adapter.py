@@ -21,6 +21,7 @@ class HVACCommandResult:
     pre_state: dict[str, Any]
     post_state: dict[str, Any]
     saved_automation_states: dict[str, str]
+    rollback_succeeded: bool | None = None
 
 
 class DaikinHVACAdapter:
@@ -46,9 +47,22 @@ class DaikinHVACAdapter:
         if action.desired_state.get("suppress_automations"):
             if not any(state == "on" for state in saved_automation_states.values()):
                 return HVACCommandResult(True, "already_in_desired_hvac_state", pre_state, self._snapshot(), {})
-            if not await self._async_disable_automations(saved_automation_states):
+            disabled, changed_states = await self._async_disable_automations(saved_automation_states)
+            if not disabled:
+                rollback_succeeded, unresolved_states = await self._async_restore_automation_states(
+                    changed_states
+                )
                 return HVACCommandResult(
-                    False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states
+                    False,
+                    (
+                        "hvac_automation_service_failed"
+                        if rollback_succeeded
+                        else "hvac_automation_rollback_failed"
+                    ),
+                    pre_state,
+                    self._snapshot(),
+                    unresolved_states,
+                    rollback_succeeded,
                 )
             return HVACCommandResult(
                 True, "hvac_automations_suppressed", pre_state, self._snapshot(), saved_automation_states
@@ -56,9 +70,22 @@ class DaikinHVACAdapter:
         if _already_in_desired_state(climate_state, action.desired_state):
             return HVACCommandResult(True, "already_in_desired_hvac_state", pre_state, self._snapshot(), {})
 
-        if not await self._async_disable_automations(saved_automation_states):
+        disabled, changed_states = await self._async_disable_automations(saved_automation_states)
+        if not disabled:
+            rollback_succeeded, unresolved_states = await self._async_restore_automation_states(
+                changed_states
+            )
             return HVACCommandResult(
-                False, "hvac_automation_service_failed", pre_state, self._snapshot(), saved_automation_states
+                False,
+                (
+                    "hvac_automation_service_failed"
+                    if rollback_succeeded
+                    else "hvac_automation_rollback_failed"
+                ),
+                pre_state,
+                self._snapshot(),
+                unresolved_states,
+                rollback_succeeded,
             )
         desired_mode = action.desired_state.get("hvac_mode")
         desired_temperature = action.desired_state.get("target_temperature")
@@ -92,8 +119,16 @@ class DaikinHVACAdapter:
                     blocking=True,
                 )
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
+            rollback_succeeded, unresolved_states = await self._async_restore_automation_states(
+                changed_states
+            )
             return HVACCommandResult(
-                False, "hvac_control_service_failed", pre_state, self._snapshot(), saved_automation_states
+                False,
+                "hvac_control_service_failed" if rollback_succeeded else "hvac_automation_rollback_failed",
+                pre_state,
+                self._snapshot(),
+                unresolved_states,
+                rollback_succeeded,
             )
         return HVACCommandResult(True, "hvac_action_applied", pre_state, self._snapshot(), saved_automation_states)
 
@@ -101,7 +136,47 @@ class DaikinHVACAdapter:
         """Restore saved climate automation states."""
         pre_state = self._snapshot()
         states = dict(saved_automation_states or {})
-        failed = False
+        restored, unresolved_states = await self._async_restore_automation_states(states)
+        reason = "no_hvac_automation_state_saved"
+        if not restored:
+            reason = "hvac_automation_restore_failed"
+        elif states:
+            reason = "hvac_automation_state_restored"
+        return HVACCommandResult(
+            applied=bool(states) and restored,
+            reason=reason,
+            pre_state=pre_state,
+            post_state=self._snapshot(),
+            saved_automation_states=unresolved_states,
+            rollback_succeeded=restored,
+        )
+
+    async def _async_disable_automations(
+        self, states: dict[str, str]
+    ) -> tuple[bool, dict[str, str]]:
+        """Disable enabled automations and return the states actually changed."""
+        changed_states: dict[str, str] = {}
+        for automation_id, state in states.items():
+            if state == "on":
+                # Treat the boundary as uncertain: a service handler can apply
+                # the state change before propagating an exception.
+                changed_states[automation_id] = state
+                try:
+                    await self.hass.services.async_call(
+                        "automation",
+                        SERVICE_TURN_OFF,
+                        {ATTR_ENTITY_ID: automation_id},
+                        blocking=True,
+                    )
+                except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
+                    return False, changed_states
+        return True, changed_states
+
+    async def _async_restore_automation_states(
+        self, states: dict[str, str]
+    ) -> tuple[bool, dict[str, str]]:
+        """Restore every supplied automation, retaining any state that could not be restored."""
+        unresolved: dict[str, str] = {}
         for automation_id, state in states.items():
             try:
                 if state == "on":
@@ -112,34 +187,9 @@ class DaikinHVACAdapter:
                     await self.hass.services.async_call(
                         "automation", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: automation_id}, blocking=True
                     )
-            except Exception:  # noqa: BLE001 - restore must continue and report failure.
-                failed = True
-        reason = "no_hvac_automation_state_saved"
-        if failed:
-            reason = "hvac_automation_restore_failed"
-        elif states:
-            reason = "hvac_automation_state_restored"
-        return HVACCommandResult(
-            applied=bool(states) and not failed,
-            reason=reason,
-            pre_state=pre_state,
-            post_state=self._snapshot(),
-            saved_automation_states=states,
-        )
-
-    async def _async_disable_automations(self, states: dict[str, str]) -> bool:
-        for automation_id, state in states.items():
-            if state == "on":
-                try:
-                    await self.hass.services.async_call(
-                        "automation",
-                        SERVICE_TURN_OFF,
-                        {ATTR_ENTITY_ID: automation_id},
-                        blocking=True,
-                    )
-                except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-                    return False
-        return True
+            except Exception:  # noqa: BLE001 - restore must continue and retain retry state.
+                unresolved[automation_id] = state
+        return not unresolved, unresolved
 
     def _automation_states(self) -> dict[str, str]:
         states: dict[str, str] = {}

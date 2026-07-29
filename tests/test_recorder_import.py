@@ -147,7 +147,7 @@ def test_recorder_import_prefers_recorder_database_executor(monkeypatch: Any) ->
     monkeypatch.setattr(recorder_import, "import_module", fake_import_module)
     monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
 
-    _history, changed, reason = asyncio.run(
+    history, changed, reason = asyncio.run(
         recorder_import.async_import_ev_trip_history_from_recorder(
             hass,
             {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
@@ -156,8 +156,9 @@ def test_recorder_import_prefers_recorder_database_executor(monkeypatch: Any) ->
         )
     )
 
-    assert changed is False
-    assert reason == "recorder_no_new_trips"
+    assert changed is True
+    assert reason == "recorder_imported"
+    assert history["recorder_imported_at"] == now.isoformat()
     assert recorder_instance.calls == 1
     assert hass.generic_executor_calls == 0
 
@@ -177,7 +178,7 @@ def test_recorder_import_falls_back_to_home_assistant_executor(monkeypatch: Any)
     monkeypatch.setattr(recorder_import, "import_module", fake_import_module)
     monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
 
-    _history, changed, reason = asyncio.run(
+    history, changed, reason = asyncio.run(
         recorder_import.async_import_ev_trip_history_from_recorder(
             hass,
             {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
@@ -186,8 +187,9 @@ def test_recorder_import_falls_back_to_home_assistant_executor(monkeypatch: Any)
         )
     )
 
-    assert changed is False
-    assert reason == "recorder_no_new_trips"
+    assert changed is True
+    assert reason == "recorder_imported"
+    assert history["recorder_imported_at"] == now.isoformat()
     assert hass.generic_executor_calls == 1
 
 

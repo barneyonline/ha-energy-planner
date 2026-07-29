@@ -22,6 +22,7 @@ from custom_components.ha_energy_planner.config_flow import (
     POLICY_STEP_PRIORITIES,
     POLICY_STEP_SCHEDULE,
     STEP_USER_DATA_SCHEMA,
+    SUBENTRY_EV,
     AISubentryFlow,
     ClimateSubentryFlow,
     ConfigFlow,
@@ -38,6 +39,7 @@ from custom_components.ha_energy_planner.config_flow import (
     _ready_by_valid,
     _validate_config,
     _validate_options,
+    _validate_subentry_config,
 )
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
@@ -65,14 +67,17 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER_STOP,
     CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
+    CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
+    CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNING_HORIZON_HOURS,
@@ -186,6 +191,7 @@ def _valid_hass() -> FakeHass:
             "automation.heat",
             "automation.cool",
             "select.enphase_profile",
+            "switch.shared_charger",
             "ai_task.extended_openai_ai_task",
         },
         {
@@ -221,8 +227,117 @@ def test_validate_config_accepts_multi_entity_selector_lists() -> None:
     )
 
 
-def test_initial_config_schema_requires_no_inputs() -> None:
-    assert STEP_USER_DATA_SCHEMA.schema == {}
+def test_subentry_validation_rejects_household_actuators_owned_by_another_entry() -> None:
+    hass = _valid_hass()
+    current_entry = SimpleNamespace(entry_id="entry-current", data={}, subentries={})
+    other_entry = SimpleNamespace(
+        entry_id="entry-other",
+        data={},
+        subentries={
+            "climate": SimpleNamespace(
+                data={
+                    CONF_DAIKIN_CLIMATE: "climate.daikin",
+                    CONF_CLIMATE_AUTOMATIONS: ["automation.heat"],
+                }
+            ),
+            "enphase": SimpleNamespace(
+                data={CONF_ENPHASE_PROFILE: "select.enphase_profile"}
+            ),
+        },
+    )
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [current_entry, other_entry]
+    )
+
+    errors = _validate_subentry_config(
+        hass,
+        current_entry,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: ["automation.heat", "automation.cool"],
+            CONF_ENPHASE_PROFILE: "select.enphase_profile",
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+    )
+
+    assert errors[CONF_DAIKIN_CLIMATE] == "household_actuator_in_use"
+    assert errors[CONF_CLIMATE_AUTOMATIONS] == "household_actuator_in_use"
+    assert errors[CONF_ENPHASE_PROFILE] == "household_actuator_in_use"
+
+
+def test_subentry_validation_allows_current_entry_to_keep_its_actuators() -> None:
+    hass = _valid_hass()
+    current_entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={},
+        subentries={
+            "climate": SimpleNamespace(data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
+        },
+    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry])
+
+    errors = _validate_subentry_config(
+        hass,
+        current_entry,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+    )
+
+    assert errors == {}
+
+
+def test_subentry_validation_rejects_ev_controls_owned_under_another_key() -> None:
+    hass = _valid_hass()
+    current_entry = SimpleNamespace(entry_id="entry-current", data={}, subentries={})
+    other_entry = SimpleNamespace(
+        entry_id="entry-other",
+        data={},
+        subentries={
+            "ev": SimpleNamespace(
+                data={CONF_EV_SMART_CHARGING: "switch.shared_charger"}
+            )
+        },
+    )
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [current_entry, other_entry]
+    )
+
+    errors = _validate_subentry_config(
+        hass,
+        current_entry,
+        {CONF_EV_CHARGER_START: "switch.shared_charger"},
+        subentry_type=SUBENTRY_EV,
+    )
+
+    assert errors[CONF_EV_CHARGER_START] == "household_actuator_in_use"
+
+
+def test_ev_subentry_rejects_keep_on_without_persistent_control() -> None:
+    hass = _valid_hass()
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={},
+        options={CONF_EV_KEEP_CHARGER_ON: True},
+        subentries={},
+    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+
+    errors = _validate_subentry_config(
+        hass,
+        entry,
+        {},
+        subentry_type=SUBENTRY_EV,
+    )
+
+    assert errors["base"] == "ev_keep_on_requires_persistent_control"
+
+
+def test_initial_config_schema_requires_a_planner_name() -> None:
+    assert {getattr(key, "schema", key) for key in STEP_USER_DATA_SCHEMA.schema} == {CONF_INSTANCE_NAME}
 
 
 def test_config_schema_does_not_default_environment_specific_people() -> None:
@@ -494,11 +609,11 @@ def test_ev_charger_controls_accept_switches_buttons_and_input_buttons() -> None
     ]
 
 
-def test_ev_target_soc_and_ready_by_are_native_not_external_helpers() -> None:
+def test_ev_target_soc_can_follow_vehicle_and_ready_by_remains_native() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
     schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
 
-    assert CONF_EV_SMART_CHARGING_TARGET_SOC not in schema_fields
+    assert CONF_EV_SMART_CHARGING_TARGET_SOC in schema_fields
     assert CONF_EV_SMART_CHARGING_READY_BY not in schema_fields
 
 
@@ -713,12 +828,39 @@ def test_config_flow_user_step_creates_entry_after_confirmation() -> None:
     flow.async_show_form = Mock(return_value={"type": "form"})
 
     form = asyncio.run(flow.async_step_user())
-    created = asyncio.run(flow.async_step_user({}))
+    created = asyncio.run(flow.async_step_user({CONF_INSTANCE_NAME: "Commuter EV"}))
 
     assert form == {"type": "form"}
     assert created == {"type": "create_entry"}
-    flow.async_set_unique_id.assert_awaited_once_with("ha_energy_planner")
-    flow._abort_if_unique_id_configured.assert_called_once_with()
+    flow.async_set_unique_id.assert_not_awaited()
+    flow._abort_if_unique_id_configured.assert_not_called()
+    flow.async_create_entry.assert_called_once_with(
+        title="Commuter EV",
+        data={CONF_INSTANCE_NAME: "Commuter EV"},
+        options=DEFAULT_OPTIONS,
+    )
+
+
+def test_config_flow_rejects_duplicate_planner_name() -> None:
+    flow = ConfigFlow.__new__(ConfigFlow)
+    flow.hass = SimpleNamespace()
+    flow._async_current_entries = Mock(return_value=[SimpleNamespace(title="Commuter EV")])
+    flow.async_show_form = Mock(return_value={"type": "form"})
+
+    result = asyncio.run(flow.async_step_user({CONF_INSTANCE_NAME: "Commuter EV"}))
+
+    assert result == {"type": "form"}
+    assert flow.async_show_form.call_args.kwargs["errors"] == {CONF_INSTANCE_NAME: "instance_name_in_use"}
+
+
+def test_config_flow_rejects_blank_planner_name() -> None:
+    flow = ConfigFlow.__new__(ConfigFlow)
+    flow.async_show_form = Mock(return_value={"type": "form"})
+
+    result = asyncio.run(flow.async_step_user({CONF_INSTANCE_NAME: "   "}))
+
+    assert result == {"type": "form"}
+    assert flow.async_show_form.call_args.kwargs["errors"] == {CONF_INSTANCE_NAME: "instance_name_required"}
 
 
 def test_config_flow_reports_options_and_subentry_flow_types() -> None:
@@ -818,6 +960,32 @@ def test_options_flow_section_validation_returns_form_errors() -> None:
 
     assert result["type"] == "form"
     assert result["errors"]["base"] == "ev_min_above_max"
+
+
+def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
+    flow = OptionsFlow(
+        SimpleNamespace(
+            data={},
+            options={},
+            subentries={
+                "ev": SimpleNamespace(
+                    data={
+                        CONF_EV_SMART_CHARGING_START: "button.ev_start",
+                        CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
+                    }
+                )
+            },
+        )
+    )
+
+    result = asyncio.run(
+        flow.async_step_ev_battery_grid({CONF_EV_KEEP_CHARGER_ON: True})
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"][CONF_EV_KEEP_CHARGER_ON] == (
+        "ev_keep_on_requires_persistent_control"
+    )
 
 
 def test_options_flow_uses_ordered_priority_dropdowns() -> None:

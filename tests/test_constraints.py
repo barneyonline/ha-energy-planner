@@ -393,6 +393,21 @@ def test_ev_target_below_current_and_infeasible_evidence_exception() -> None:
     assert "ev_target_soc_outside_bounds" not in violations
     assert "ev_target_soc_below_current" in violations
 
+    action.desired_state = {
+        "target_soc_percent": 80,
+        "keep_charger_on": True,
+    }
+    context.current_ev_soc_percent = 100
+
+    keep_on_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+    )
+
+    assert "ev_target_soc_below_current" not in keep_on_violations
+
 
 def test_hvac_unknown_occupancy_and_missing_comfort_bounds_are_rejected() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
@@ -466,3 +481,23 @@ def test_plan_applies_flexible_load_to_haeo_grid_limit_evidence() -> None:
     violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
 
     assert "grid_import_limit_exceeded" in violations
+
+
+def test_plan_does_not_double_count_flexible_load_in_second_pass_grid_evidence() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
+    context = _context(now)
+    context.slots[0].haeo_grid_import_forecast_kw = 4.5
+    context.slots[0].haeo_grid_export_forecast_kw = 0.0
+    context.slots[0].haeo_grid_includes_flexible_loads = True
+    context.slots[0].projected_ev_load_kw = 3.0
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "grid_import_limit_kw": 5.0,
+    }
+
+    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
+
+    assert "grid_import_limit_exceeded" not in violations

@@ -208,6 +208,46 @@ def test_allocate_native_charging_honors_force_current_and_price_limit() -> None
     assert _best_continuous_slots([], [], required_slots=0, interval_minutes=5, force_current=False) == []
 
 
+def test_continuous_charging_uses_only_contiguous_partial_windows() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    slots = [
+        DecisionSlot(now + timedelta(minutes=offset), price, 0.05, 0, 1)
+        for offset, price in [(0, 0.01), (10, 0.20), (15, 0.30)]
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=55,
+        ready_by=now + timedelta(minutes=20),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        continuous=True,
+    )
+    forced = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=55,
+        ready_by=now + timedelta(minutes=20),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        continuous=True,
+        force_current=True,
+    )
+
+    assert [item.valid_at for item in schedule.allocations] == [
+        now + timedelta(minutes=10),
+        now + timedelta(minutes=15),
+    ]
+    assert schedule.scheduled_soc_percent == 50
+    assert schedule.infeasible is True
+    assert [item.valid_at for item in forced.allocations] == [now]
+    assert forced.scheduled_soc_percent == 45
+    assert forced.infeasible is True
+
+
 def test_update_trip_history_records_completed_disconnected_trip() -> None:
     started = datetime(2026, 6, 26, 22, 0, tzinfo=UTC)
     ended = datetime(2026, 6, 27, 8, 0, tzinfo=UTC)
@@ -242,13 +282,28 @@ def test_update_trip_history_records_completed_disconnected_trip() -> None:
     assert summary.max_daily_soc_percent == 8
 
 
+def test_live_trip_updates_preserve_recorder_import_throttle_timestamp() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    imported_at = (now - timedelta(hours=1)).isoformat()
+
+    history, changed = update_trip_history_from_values(
+        {"recorder_imported_at": imported_at},
+        connected=False,
+        soc_percent=82,
+        now=now,
+    )
+
+    assert changed is True
+    assert history["recorder_imported_at"] == imported_at
+
+
 def test_trip_history_helpers_ignore_invalid_records_and_noop_updates() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     assert trip_records_from_store({"records": ["bad", {"started_at": "bad"}]}) == []
 
     history, changed = update_trip_history_from_values({}, connected=None, soc_percent=80, now=now)
     assert changed is False
-    assert history == {"active_trip": {}, "records": []}
+    assert history == {"active_trip": {}, "records": [], "recorder_imported_at": None}
 
     active = {"active_trip": {"started_at": now.isoformat(), "start_soc_percent": 80}, "records": []}
     assert update_trip_history_from_values(active, connected=False, soc_percent=79, now=now)[1] is False

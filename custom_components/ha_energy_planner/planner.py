@@ -21,6 +21,7 @@ from .const import (
     CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_MAX_IMPORT_PRICE,
@@ -241,13 +242,33 @@ class DryRunPlanner:
                 if slot.valid_at in allocation_by_time:
                     slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
             charging_required_now = bool(current_slot and current_slot.valid_at in allocation_by_time)
+            keep_charger_on = bool(self.options.get(CONF_EV_KEEP_CHARGER_ON, False))
+            keep_on_target_soc = (
+                float(target_soc)
+                if target_soc is not None
+                else float(target.target_soc_percent)
+            )
+            keep_on_after_target = bool(
+                keep_charger_on
+                and not context.ev_target_soc_fallback_active
+                and not target.infeasible
+                and ev_min <= keep_on_target_soc <= float(
+                    self.options[CONF_EV_MAX_SOC_PERCENT]
+                )
+                and context.current_ev_soc_percent >= keep_on_target_soc
+            )
             manual_ev = next(
                 (override for override in context.active_overrides if override.kind == "manual_ev_charging"),
                 None,
             )
+            preconditioning_required_now = False
             if manual_ev is not None:
                 charging_required_now = manual_ev.reason == "manual_start"
                 charging_reason = "ev_manual_start_override" if charging_required_now else "ev_manual_stop_override"
+            elif keep_on_after_target:
+                charging_required_now = True
+                preconditioning_required_now = True
+                charging_reason = "ev_keep_charger_on_for_preconditioning"
             elif emergency_charge and target.required_charge_percent > 0:
                 charging_reason = "ev_below_minimum_soc_charge_now"
             elif low_price_charge and charging_required_now:
@@ -256,6 +277,13 @@ class DryRunPlanner:
                 charging_reason = "ev_in_allocated_charging_window"
             else:
                 charging_reason = "ev_outside_allocated_charging_window"
+            if charging_required_now and current_slot is not None:
+                current_slot.projected_ev_load_kw = max(current_slot.projected_ev_load_kw, charge_rate_kw)
+            projected_load_kw_now = (
+                max(float(current_slot.projected_ev_load_kw), 0.0)
+                if charging_required_now and current_slot is not None
+                else 0.0
+            )
             actions.append(
                 PlanAction(
                     action_id=f"{context.plan_id}-ev-native-smart-charge",
@@ -268,7 +296,11 @@ class DryRunPlanner:
                         "charging_required_now": charging_required_now,
                         "charging_observed": context.ev_charging,
                         "charging_reason": charging_reason,
-                        "target_soc_percent": schedule.scheduled_soc_percent,
+                        "target_soc_percent": (
+                            target.target_soc_percent
+                            if preconditioning_required_now
+                            else schedule.scheduled_soc_percent
+                        ),
                         "ready_by": ready_by_text,
                         "ready_by_utc": ready_by.isoformat(),
                         "ready_by_timezone": context.local_timezone,
@@ -277,6 +309,8 @@ class DryRunPlanner:
                         "required_charge_percent": target.required_charge_percent,
                         "max_attainable_soc_percent": target.max_attainable_soc_percent,
                         "continuous_charging": bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True)),
+                        "keep_charger_on": preconditioning_required_now,
+                        "projected_load_kw_now": projected_load_kw_now,
                         "price_limit": float(self.options[CONF_EV_MAX_IMPORT_PRICE])
                         if bool(self.options.get(CONF_EV_PRICE_LIMIT_ENABLED, False))
                         else None,
@@ -545,6 +579,13 @@ class DryRunPlanner:
             haeo_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
             haeo_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
             if haeo_import_kw is not None and haeo_export_kw is not None:
+                if not bool(getattr(slot, "haeo_grid_includes_flexible_loads", False)):
+                    flexible_load_kw = max(float(slot.projected_ev_load_kw or 0.0), 0.0) + max(
+                        float(slot.projected_hvac_load_kw or 0.0),
+                        0.0,
+                    )
+                    haeo_import_kw += max(flexible_load_kw - haeo_export_kw, 0.0)
+                    haeo_export_kw = max(haeo_export_kw - flexible_load_kw, 0.0)
                 if slot.import_price is not None:
                     total += haeo_import_kw * interval_hours * slot.import_price
                     has_data = True
@@ -639,7 +680,11 @@ def confidence_from_context(context: DecisionContext) -> float:
 def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
     """Return confidence by planning subsystem."""
     base = confidence_from_context(context)
-    issue_text = " ".join(context.input_issues)
+    issue_text = " ".join(
+        issue
+        for issue in context.input_issues
+        if not issue.startswith("advisory_")
+    )
     breakdown = {
         "overall": base,
         "tariff": _subsystem_confidence(base, issue_text, ("amber_", "price_")),

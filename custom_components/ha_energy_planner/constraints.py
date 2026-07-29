@@ -238,7 +238,11 @@ class ConstraintValidator:
                     f"EV target SOC {float(desired_soc):.1f}% is outside configured bounds.",
                 )
             )
-        if context.current_ev_soc_percent is not None and float(desired_soc) < context.current_ev_soc_percent:
+        if (
+            not action.desired_state.get("keep_charger_on")
+            and context.current_ev_soc_percent is not None
+            and float(desired_soc) < context.current_ev_soc_percent
+        ):
             violations.append(
                 _action_violation(
                     action,
@@ -375,6 +379,8 @@ def _projected_grid_flows_kw(slot: Any) -> tuple[float | None, float | None]:
     if haeo_import is not None or haeo_export is not None:
         base_import = haeo_import or 0.0
         base_export = haeo_export or 0.0
+        if bool(getattr(slot, "haeo_grid_includes_flexible_loads", False)):
+            return base_import, base_export
         return base_import + max(flexible_load_kw - base_export, 0.0), max(base_export - flexible_load_kw, 0.0)
     if slot.baseline_load_forecast_kw is None or slot.pv_forecast_kw is None:
         return None, None

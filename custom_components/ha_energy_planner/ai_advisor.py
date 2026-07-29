@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from .const import (
@@ -183,20 +184,25 @@ def validate_ai_response(
         accepted["alerts"] = [item[:160] for item in _split_alerts(alerts)[:5]]
     for key, bounds in ALLOWED_ADJUSTMENTS.items():
         value = response.get(key)
-        if isinstance(value, int | float):
+        if _finite_number(value):
             low, high = bounds
             accepted[key] = min(max(value, low), high)
     takeover_value = response.get("suggested_takeover_savings_threshold")
-    if isinstance(takeover_value, int | float):
+    if _finite_number(takeover_value):
         low, high = takeover_bounds or (0.0, 10.0)
         accepted["suggested_takeover_savings_threshold"] = min(max(float(takeover_value), low), high)
     confidence = response.get("confidence")
-    if isinstance(confidence, int | float):
+    if _finite_number(confidence):
         accepted["confidence"] = min(max(float(confidence), 0.0), 1.0)
     summary = response.get("reasoning_summary")
     if isinstance(summary, str):
         accepted["reasoning_summary"] = summary[:500]
     return accepted
+
+
+def _finite_number(value: Any) -> bool:
+    """Return whether a value is a real finite number, excluding JSON booleans."""
+    return not isinstance(value, bool) and isinstance(value, int | float) and isfinite(float(value))
 
 
 def _invalid_response_reason(response: Mapping[str, Any]) -> str | None:

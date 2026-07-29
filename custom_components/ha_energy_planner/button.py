@@ -46,13 +46,18 @@ async def _restore(coordinator: EnergyPlannerCoordinator) -> None:
 
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
     report = build_preflight_report(coordinator.hass, coordinator)
+    entry = coordinator.entry
+    title = getattr(entry, "title", None) or "Energy Planner"
+    entry_id = getattr(entry, "entry_id", None)
     await coordinator.hass.services.async_call(
         "persistent_notification",
         "create",
         {
-            "title": "Energy Planner preflight passed" if report.get("ok") else "Energy Planner preflight failed",
+            "title": f"{title}: preflight passed" if report.get("ok") else f"{title}: preflight failed",
             "message": _preflight_notification_message(report),
-            "notification_id": _PREFLIGHT_NOTIFICATION_ID,
+            "notification_id": (
+                f"{_PREFLIGHT_NOTIFICATION_ID}_{entry_id}" if entry_id else _PREFLIGHT_NOTIFICATION_ID
+            ),
         },
         blocking=False,
     )

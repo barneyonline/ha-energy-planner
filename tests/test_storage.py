@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
+
+import pytest
 
 from custom_components.ha_energy_planner import storage as storage_module
 from custom_components.ha_energy_planner.models import (
@@ -31,18 +34,103 @@ class FakeStore:
     loaded: dict[str, Any] | None = None
     saved: dict[str, Any] | None = None
     save_count: int = 0
+    created_keys: list[str] = []
+    loaded_by_key: dict[str, dict[str, Any] | None] | None = None
+    saved_by_key: dict[str, dict[str, Any]] = {}
 
     def __init__(self, hass: object, version: int, key: str) -> None:
         self.hass = hass
         self.version = version
         self.key = key
+        FakeStore.created_keys.append(key)
 
     async def async_load(self) -> dict[str, Any] | None:
+        if self.loaded_by_key is not None:
+            return self.loaded_by_key.get(self.key)
         return self.loaded
 
     async def async_save(self, data: dict[str, Any]) -> None:
         FakeStore.saved = data
+        FakeStore.saved_by_key[self.key] = data
         FakeStore.save_count += 1
+
+
+def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.created_keys = []
+
+    PlannerStore(object(), "vehicle-one", legacy_fallback=True)
+    PlannerStore(object(), "vehicle-two")
+
+    assert FakeStore.created_keys == [
+        "ha_energy_planner_state_vehicle-one",
+        "ha_energy_planner_state",
+        "ha_energy_planner_state_vehicle-two",
+    ]
+
+
+def test_store_persists_ev_grid_reservation_high_watermark(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.saved = None
+    store = PlannerStore(object(), "vehicle-one")
+
+    asyncio.run(
+        store.async_save_ev_grid_reservation(
+            {
+                "active": True,
+                "load_kw": 11.0,
+                "limit_kw": 10.0,
+                "reserved_at": "2026-07-26T00:00:00+00:00",
+            }
+        )
+    )
+
+    assert store.data["ev_grid_reservation"]["load_kw"] == 11.0
+
+
+def test_store_imports_legacy_state_into_first_entry_namespace(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(
+        FakeStore,
+        "loaded_by_key",
+        {
+            "ha_energy_planner_state_vehicle-one": None,
+            "ha_energy_planner_state": {"ownership": {"ev": {"switch.ev": "off"}}},
+        },
+    )
+    FakeStore.saved = None
+    FakeStore.saved_by_key = {}
+    store = PlannerStore(object(), "vehicle-one", legacy_fallback=True)
+
+    asyncio.run(store.async_load())
+
+    assert store.data["ownership"] == {"ev": {"switch.ev": "off"}}
+    assert FakeStore.saved_by_key["ha_energy_planner_state_vehicle-one"]["ownership"] == {
+        "ev": {"switch.ev": "off"}
+    }
+    assert FakeStore.saved_by_key["ha_energy_planner_state"]["_entry_store_migrated_to"] == "vehicle-one"
+
+
+def test_store_does_not_reimport_marked_legacy_state(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(
+        FakeStore,
+        "loaded_by_key",
+        {
+            "ha_energy_planner_state_vehicle-one": None,
+            "ha_energy_planner_state": {
+                "ownership": {"ev": {"switch.ev": "off"}},
+                "_entry_store_migrated_to": "vehicle-one",
+            },
+        },
+    )
+    FakeStore.saved_by_key = {}
+    store = PlannerStore(object(), "vehicle-one", legacy_fallback=True)
+
+    asyncio.run(store.async_load())
+
+    assert store.data["ownership"] == {}
+    assert FakeStore.saved_by_key == {}
 
 
 def test_store_load_fills_missing_schema_defaults(monkeypatch: object) -> None:
@@ -146,6 +234,33 @@ def test_store_delay_save_batches_multiple_mutations(monkeypatch: object) -> Non
     assert FakeStore.saved["discovery"] == {"ok": True}
 
 
+def test_store_forced_flush_persists_inside_delay_context(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    FakeStore.saved = None
+    FakeStore.save_count = 0
+    store = PlannerStore(object())
+
+    async def mutate_store() -> None:
+        async with store.async_delay_save():
+            await store.async_save_ownership({"ev": "provisional"})
+            assert FakeStore.save_count == 0
+
+            await store.async_flush()
+
+            assert FakeStore.save_count == 1
+            assert FakeStore.saved is not None
+            assert FakeStore.saved["ownership"] == {"ev": "provisional"}
+            await store.async_save_trip_history({"records": [{"soc": 50}]})
+            assert FakeStore.save_count == 1
+
+    asyncio.run(mutate_store())
+
+    assert FakeStore.save_count == 2
+    assert FakeStore.saved is not None
+    assert FakeStore.saved["trip_history"] == {"records": [{"soc": 50}]}
+
+
 def test_store_skips_unchanged_setter_writes(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.loaded = None
@@ -157,6 +272,188 @@ def test_store_skips_unchanged_setter_writes(monkeypatch: object) -> None:
 
     assert FakeStore.saved is None
     assert FakeStore.save_count == 0
+
+
+def test_store_retries_unchanged_value_after_transient_save_failure(monkeypatch: object) -> None:
+    class FailsOnceStore(FakeStore):
+        attempts = 0
+
+        async def async_save(self, data: dict[str, Any]) -> None:
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise OSError("temporary storage failure")
+            await super().async_save(data)
+
+    monkeypatch.setattr(storage_module, "Store", FailsOnceStore)
+    FailsOnceStore.attempts = 0
+    FakeStore.save_count = 0
+    store = PlannerStore(object())
+
+    with pytest.raises(OSError, match="temporary storage failure"):
+        asyncio.run(store.async_save_ownership({"ev": "owned"}))
+    asyncio.run(store.async_save_ownership({"ev": "owned"}))
+
+    assert FailsOnceStore.attempts == 2
+    assert FakeStore.save_count == 1
+    assert FakeStore.saved == store.data
+
+
+def test_store_delayed_save_keeps_dirty_marker_after_failure(monkeypatch: object) -> None:
+    class FailsOnceStore(FakeStore):
+        attempts = 0
+
+        async def async_save(self, data: dict[str, Any]) -> None:
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise OSError("temporary storage failure")
+            await super().async_save(data)
+
+    monkeypatch.setattr(storage_module, "Store", FailsOnceStore)
+    FailsOnceStore.attempts = 0
+    FakeStore.save_count = 0
+    store = PlannerStore(object())
+
+    async def fail_delayed_save() -> None:
+        async with store.async_delay_save():
+            await store.async_save_ownership({"ev": "owned"})
+
+    with pytest.raises(OSError, match="temporary storage failure"):
+        asyncio.run(fail_delayed_save())
+    asyncio.run(store.async_save_ownership({"ev": "owned"}))
+
+    assert FailsOnceStore.attempts == 2
+    assert FakeStore.save_count == 1
+
+
+def test_store_flushes_mutation_that_arrives_during_inflight_save(monkeypatch: object) -> None:
+    class BarrierStore(FakeStore):
+        started: asyncio.Event
+        release: asyncio.Event
+        snapshots: list[dict[str, Any]]
+
+        async def async_save(self, data: dict[str, Any]) -> None:
+            snapshot = deepcopy(data)
+            if not self.snapshots:
+                self.started.set()
+                await self.release.wait()
+            self.snapshots.append(snapshot)
+
+    monkeypatch.setattr(storage_module, "Store", BarrierStore)
+
+    async def save_concurrently() -> list[dict[str, Any]]:
+        BarrierStore.started = asyncio.Event()
+        BarrierStore.release = asyncio.Event()
+        BarrierStore.snapshots = []
+        store = PlannerStore(object())
+        first = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
+        await BarrierStore.started.wait()
+        second = asyncio.create_task(store.async_save_trip_history({"records": [{"soc": 50}]}))
+        await asyncio.sleep(0)
+        BarrierStore.release.set()
+        await asyncio.gather(first, second)
+        return BarrierStore.snapshots
+
+    snapshots = asyncio.run(save_concurrently())
+
+    assert len(snapshots) == 2
+    assert snapshots[0]["trip_history"] == {}
+    assert snapshots[-1]["ownership"] == {"ev": "owned"}
+    assert snapshots[-1]["trip_history"] == {"records": [{"soc": 50}]}
+
+
+def test_store_concurrent_failure_retains_later_generation_for_retry(monkeypatch: object) -> None:
+    class BarrierFailsSecondStore(FakeStore):
+        started: asyncio.Event
+        release: asyncio.Event
+        attempts: int
+        snapshots: list[dict[str, Any]]
+
+        async def async_save(self, data: dict[str, Any]) -> None:
+            type(self).attempts += 1
+            attempt = type(self).attempts
+            snapshot = deepcopy(data)
+            if attempt == 1:
+                self.started.set()
+                await self.release.wait()
+            if attempt == 2:
+                raise OSError("temporary concurrent failure")
+            self.snapshots.append(snapshot)
+
+    monkeypatch.setattr(storage_module, "Store", BarrierFailsSecondStore)
+
+    async def save_concurrently() -> tuple[list[object], list[dict[str, Any]], int]:
+        BarrierFailsSecondStore.started = asyncio.Event()
+        BarrierFailsSecondStore.release = asyncio.Event()
+        BarrierFailsSecondStore.attempts = 0
+        BarrierFailsSecondStore.snapshots = []
+        store = PlannerStore(object())
+        first = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
+        await BarrierFailsSecondStore.started.wait()
+        second = asyncio.create_task(
+            store.async_save_trip_history({"records": [{"soc": 50}]})
+        )
+        await asyncio.sleep(0)
+        BarrierFailsSecondStore.release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        return results, BarrierFailsSecondStore.snapshots, BarrierFailsSecondStore.attempts
+
+    results, snapshots, attempts = asyncio.run(save_concurrently())
+
+    assert sum(isinstance(result, OSError) for result in results) == 1
+    assert attempts == 3
+    assert snapshots[-1]["ownership"] == {"ev": "owned"}
+    assert snapshots[-1]["trip_history"] == {"records": [{"soc": 50}]}
+
+
+def test_store_defers_inflight_flush_while_delay_context_is_active(
+    monkeypatch: object,
+) -> None:
+    class BarrierStore(FakeStore):
+        started: asyncio.Event
+        release_first: asyncio.Event
+        delayed_mutation_ready: asyncio.Event
+        release_delay: asyncio.Event
+        snapshots: list[dict[str, Any]]
+
+        async def async_save(self, data: dict[str, Any]) -> None:
+            snapshot = deepcopy(data)
+            if not self.snapshots:
+                self.started.set()
+                await self.release_first.wait()
+            self.snapshots.append(snapshot)
+
+    monkeypatch.setattr(storage_module, "Store", BarrierStore)
+
+    async def save_with_overlapping_delay() -> list[dict[str, Any]]:
+        BarrierStore.started = asyncio.Event()
+        BarrierStore.release_first = asyncio.Event()
+        BarrierStore.delayed_mutation_ready = asyncio.Event()
+        BarrierStore.release_delay = asyncio.Event()
+        BarrierStore.snapshots = []
+        store = PlannerStore(object())
+
+        first = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
+        await BarrierStore.started.wait()
+
+        async def delayed_writer() -> None:
+            async with store.async_delay_save():
+                await store.async_save_trip_history({"records": [{"soc": 50}]})
+                BarrierStore.delayed_mutation_ready.set()
+                await BarrierStore.release_delay.wait()
+
+        second = asyncio.create_task(delayed_writer())
+        await BarrierStore.delayed_mutation_ready.wait()
+        BarrierStore.release_first.set()
+        await first
+        BarrierStore.release_delay.set()
+        await second
+        return BarrierStore.snapshots
+
+    snapshots = asyncio.run(save_with_overlapping_delay())
+
+    assert len(snapshots) == 2
+    assert snapshots[0]["trip_history"] == {}
+    assert snapshots[1]["trip_history"] == {"records": [{"soc": 50}]}
 
 
 def test_store_persists_command_rate_limits(monkeypatch: object) -> None:

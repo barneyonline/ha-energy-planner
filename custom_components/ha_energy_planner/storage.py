@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -25,6 +26,7 @@ _LIST_FIELDS = {
 _DICT_FIELDS = {
     "command_rate_limits",
     "discovery",
+    "ev_grid_reservation",
     "forecast_calibration",
     "ownership",
     "control_pause",
@@ -33,20 +35,38 @@ _DICT_FIELDS = {
     "trip_history",
 }
 
+_LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
+
 
 class PlannerStore:
     """Versioned Store wrapper."""
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, entry_id: str | None = None, *, legacy_fallback: bool = False) -> None:
         """Initialize storage."""
-        self._store: Store[dict[str, Any]] = Store(hass, STORE_VERSION, STORE_KEY)
+        storage_key = STORE_KEY if entry_id is None else f"{STORE_KEY}_{entry_id}"
+        self._entry_id = entry_id
+        self._store: Store[dict[str, Any]] = Store(hass, STORE_VERSION, storage_key)
+        self._legacy_store: Store[dict[str, Any]] | None = (
+            Store(hass, STORE_VERSION, STORE_KEY) if entry_id is not None and legacy_fallback else None
+        )
         self.data: dict[str, Any] = _default_data()
         self._save_delay_depth = 0
-        self._save_pending = False
+        self._mutation_generation = 0
+        self._saved_generation = 0
+        self._save_lock = asyncio.Lock()
 
     async def async_load(self) -> None:
         """Load persisted state."""
         loaded = await self._store.async_load()
+        if self._legacy_store is not None:
+            legacy_loaded = await self._legacy_store.async_load()
+            if legacy_loaded and not legacy_loaded.get(_LEGACY_MIGRATION_MARKER):
+                if loaded is None:
+                    loaded = legacy_loaded
+                    await self._store.async_save(legacy_loaded)
+                marked_legacy = dict(legacy_loaded)
+                marked_legacy[_LEGACY_MIGRATION_MARKER] = self._entry_id
+                await self._legacy_store.async_save(marked_legacy)
         if loaded:
             self.data = _normalize_loaded_data(loaded)
 
@@ -154,6 +174,10 @@ class PlannerStore:
         """Persist planner ownership state."""
         await self._async_set_if_changed("ownership", ownership)
 
+    async def async_save_ev_grid_reservation(self, reservation: dict[str, Any]) -> None:
+        """Persist the conservative active EV grid reservation."""
+        await self._async_set_if_changed("ev_grid_reservation", reservation)
+
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         """Persist command rate-limit timestamps."""
         await self._async_set_if_changed("command_rate_limits", limits)
@@ -178,19 +202,43 @@ class PlannerStore:
             yield
         finally:
             self._save_delay_depth -= 1
-            if self._save_delay_depth == 0 and self._save_pending:
-                self._save_pending = False
-                await self._store.async_save(self.data)
+            if self._save_delay_depth == 0 and self._is_dirty:
+                await self._async_flush()
 
     async def _async_save(self) -> None:
+        """Mark the current mutation dirty and persist it when not delayed."""
+        self._mutation_generation += 1
         if self._save_delay_depth:
-            self._save_pending = True
             return
-        await self._store.async_save(self.data)
+        await self._async_flush()
+
+    async def async_flush(self) -> None:
+        """Force all observed mutations to durable storage."""
+        await self._async_flush(force=True)
+
+    async def _async_flush(self, *, force: bool = False) -> None:
+        """Serialize Store writes until every observed mutation is durable."""
+        async with self._save_lock:
+            while self._is_dirty:
+                if self._save_delay_depth and not force:
+                    return
+                generation = self._mutation_generation
+                await self._store.async_save(self.data)
+                # A writer may have mutated data while this save was in flight.
+                # Acknowledge only the generation captured before the await so
+                # the loop performs another write for any later mutation.
+                self._saved_generation = generation
+
+    @property
+    def _is_dirty(self) -> bool:
+        """Return whether in-memory state is newer than the last successful save."""
+        return self._saved_generation < self._mutation_generation
 
     async def _async_set_if_changed(self, key: str, value: Any) -> None:
         jsonable = to_jsonable(value)
         if self.data.get(key) == jsonable:
+            if self._is_dirty:
+                await self._async_flush()
             return
         self.data[key] = jsonable
         await self._async_save()
@@ -205,6 +253,7 @@ def _default_data() -> dict[str, Any]:
         "overrides": [],
         "forecast_snapshots": [],
         "dry_run_comparisons": [],
+        "ev_grid_reservation": {},
         "forecast_calibration": {},
         "haeo_runs": [],
         "discovery": {},

@@ -102,6 +102,89 @@ def test_system_health_handles_unloaded_entries() -> None:
     assert info == {"configured_entries": 1, "loaded_entries": 0}
 
 
+def test_system_health_aggregates_multiple_entries_deterministically() -> None:
+    def entry(
+        entry_id: str,
+        health: InputHealth,
+        *,
+        planner_enabled: bool,
+        dry_run: bool,
+    ) -> SimpleNamespace:
+        coordinator = SimpleNamespace(
+            data=SimpleNamespace(
+                health=health,
+                status="unsafe" if health == InputHealth.UNSAFE else "current",
+                mode=PlannerMode.ACTIVE_HEALTHY if planner_enabled and not dry_run else PlannerMode.DRY_RUN,
+                estimated_cost_horizon_hours=8.0,
+            ),
+            options={"planner_enabled": planner_enabled, "dry_run": dry_run},
+            last_refresh_metadata={"duration_ms": 5.0},
+            refresh_metrics={"refreshes_last_hour": 2},
+            store=SimpleNamespace(data={}),
+        )
+        return SimpleNamespace(
+            entry_id=entry_id,
+            runtime_data=coordinator,
+            subentries={"ev": object()},
+        )
+
+    unsafe = entry("entry-b", InputHealth.UNSAFE, planner_enabled=True, dry_run=False)
+    healthy = entry("entry-a", InputHealth.HEALTHY, planner_enabled=False, dry_run=True)
+    hass = SimpleNamespace(config_entries=FakeConfigEntries([unsafe, healthy]))
+
+    info = asyncio.run(system_health_info(hass))
+
+    assert info["configured_entries"] == 2
+    assert info["loaded_entries"] == 2
+    assert info["planner_enabled"] is True
+    assert info["dry_run"] is False
+    assert info["data_healthy"] is False
+    assert info["plan_health"] == "unsafe"
+    assert info["plan_status"] == "unsafe"
+    assert info["worst_entry_id"] == "entry-b"
+    assert info["unhealthy_entry_count"] == 1
+    assert list(info["entries"]) == ["entry-a", "entry-b"]
+    assert info["entries"]["entry-a"]["data_healthy"] is True
+    assert info["entries"]["entry-b"]["data_healthy"] is False
+    assert info["entries_truncated"] == 0
+    assert "refresh_metrics" not in info
+
+
+def test_system_health_keeps_worst_entry_in_truncated_details() -> None:
+    def entry(entry_id: str, health: InputHealth) -> SimpleNamespace:
+        coordinator = SimpleNamespace(
+            data=SimpleNamespace(
+                health=health,
+                status="unsafe" if health == InputHealth.UNSAFE else "current",
+                mode=PlannerMode.ACTIVE_HEALTHY,
+                estimated_cost_horizon_hours=8.0,
+            ),
+            options={"planner_enabled": True, "dry_run": False},
+            last_refresh_metadata={"duration_ms": 5.0},
+            refresh_metrics={},
+            store=SimpleNamespace(data={}),
+        )
+        return SimpleNamespace(
+            entry_id=entry_id,
+            runtime_data=coordinator,
+            subentries={"ev": object()},
+        )
+
+    entries = [
+        *(entry(f"entry-{index}", InputHealth.HEALTHY) for index in range(8)),
+        entry("entry-z", InputHealth.UNSAFE),
+    ]
+    hass = SimpleNamespace(config_entries=FakeConfigEntries(entries))
+
+    info = asyncio.run(system_health_info(hass))
+
+    assert info["worst_entry_id"] == "entry-z"
+    assert len(info["entries"]) == 8
+    assert "entry-z" in info["entries"]
+    assert info["entries"]["entry-z"]["data_healthy"] is False
+    assert info["entries_truncated"] == 1
+
+
 def test_latest_value_rejects_malformed_history() -> None:
     assert _latest_value(None, "duration_ms") is None
     assert _latest_value([], "duration_ms") is None

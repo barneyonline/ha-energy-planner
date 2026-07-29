@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .const import (
     ATTR_ASSET,
+    ATTR_CONFIG_ENTRY_ID,
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
     ATTR_TARGET_SOC,
+    CONF_EV_CHARGE_RATE_KW,
+    CONF_GRID_IMPORT_LIMIT_KW,
+    CONF_INSTANCE_NAME,
     DEFAULT_OPTIONS,
     DOMAIN,
+    EV_RESERVATION_EXTERNAL_BASELINE,
+    EV_RESERVATION_RETAIN_WHEN_UNLOADED,
     INTEGRATION_NAME,
     LEGACY_INTEGRATION_NAME,
     PLATFORMS,
@@ -59,32 +66,49 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     from .diagnostics import async_get_config_entry_diagnostics
     from .preflight import build_preflight_report
 
-    async def _first_coordinator() -> EnergyPlannerCoordinator | None:
-        entries = hass.config_entries.async_entries(DOMAIN)
-        for entry in entries:
-            coordinator = getattr(entry, "runtime_data", None)
-            if isinstance(coordinator, EnergyPlannerCoordinator):
-                return coordinator
-        return None
+    await _async_rehydrate_all_ev_grid_reservations(hass)
 
-    async def _require_coordinator() -> EnergyPlannerCoordinator:
+    async def _require_coordinator(call: ServiceCall) -> EnergyPlannerCoordinator:
         """Return the loaded coordinator or raise a translated service error."""
-        coordinator = await _first_coordinator()
-        if coordinator is None:
+        loaded = [
+            (str(getattr(entry, "entry_id", getattr(coordinator.entry, "entry_id", ""))), coordinator)
+            for entry in hass.config_entries.async_entries(DOMAIN)
+            if isinstance((coordinator := getattr(entry, "runtime_data", None)), EnergyPlannerCoordinator)
+        ]
+        requested_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
+        if requested_entry_id:
+            for entry_id, coordinator in loaded:
+                if entry_id == requested_entry_id:
+                    return coordinator
+            raise ServiceValidationError(
+                "The selected Energy Planner configuration is not loaded.",
+                translation_domain=DOMAIN,
+                translation_key="config_entry_not_found",
+            )
+        if not loaded:
             raise ServiceValidationError(
                 "No loaded Energy Planner configuration is available.",
                 translation_domain=DOMAIN,
                 translation_key="no_config_entry",
             )
-        return coordinator
+        if len(loaded) > 1:
+            raise ServiceValidationError(
+                "Multiple Energy Planner configurations are loaded; select config_entry_id.",
+                translation_domain=DOMAIN,
+                translation_key="config_entry_required",
+            )
+        return loaded[0][1]
+
+    def _config_entry_field() -> dict[Any, Any]:
+        return {vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string}
 
     async def handle_replan(call: ServiceCall) -> None:
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_request_replan()
 
     async def handle_restore(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         outcome = await coordinator.async_restore_safe_state(reason)
         if outcome.result.value == "failed":
             raise HomeAssistantError(
@@ -96,30 +120,30 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
     async def handle_ready_by(call: ServiceCall) -> None:
         ready_by = str(call.data[ATTR_READY_BY])
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_set_ready_by(ready_by)
 
     async def handle_target_soc(call: ServiceCall) -> None:
         target_soc = float(call.data[ATTR_TARGET_SOC])
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_set_ev_target_soc(target_soc)
 
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_set_manual_hvac_override(duration, reason)
 
     async def handle_export_diagnostics(call: ServiceCall) -> dict[str, Any]:
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         return await async_get_config_entry_diagnostics(hass, coordinator.entry)
 
     async def handle_run_preflight(call: ServiceCall) -> dict[str, Any]:
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         return build_preflight_report(hass, coordinator)
 
     async def handle_export_support_bundle(call: ServiceCall) -> dict[str, Any]:
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         return {
             "preflight": build_preflight_report(hass, coordinator),
             "diagnostics": await async_get_config_entry_diagnostics(hass, coordinator.entry),
@@ -127,40 +151,53 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 
     async def handle_arm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_acknowledged"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_arm_production_control(reason)
 
     async def handle_disarm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_disarm_production_control(reason)
 
     async def handle_pause_control(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
         asset = str(call.data.get(ATTR_ASSET, "all"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_pause_control(duration, reason, asset)
 
     async def handle_resume_control(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
-        coordinator = await _require_coordinator()
+        coordinator = await _require_coordinator(call)
         await coordinator.async_resume_control(reason)
 
-    hass.services.async_register(DOMAIN, SERVICE_REPLAN, handle_replan)
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REPLAN,
+        handle_replan,
+        schema=vol.Schema(_config_entry_field()),
+    )
     hass.services.async_register(
         DOMAIN,
         SERVICE_RESTORE_SAFE_STATE,
         handle_restore,
         schema=vol.Schema(
-            {vol.Optional(ATTR_REASON, default="manual_service_call"): vol.All(cv.string, _validate_reason_code)}
+            {
+                **_config_entry_field(),
+                vol.Optional(ATTR_REASON, default="manual_service_call"): vol.All(cv.string, _validate_reason_code),
+            }
         ),
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_SET_EV_READY_BY,
         handle_ready_by,
-        schema=vol.Schema({vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time)}),
+        schema=vol.Schema(
+            {
+                **_config_entry_field(),
+                vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time),
+            }
+        ),
     )
     hass.services.async_register(
         DOMAIN,
@@ -168,6 +205,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         handle_target_soc,
         schema=vol.Schema(
             {
+                **_config_entry_field(),
                 vol.Required(ATTR_TARGET_SOC): vol.All(
                     vol.Coerce(float),
                     vol.Range(min=0, max=100),
@@ -181,6 +219,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         handle_manual_override,
         schema=vol.Schema(
             {
+                **_config_entry_field(),
                 vol.Required(ATTR_DURATION_MINUTES): vol.All(vol.Coerce(int), vol.Range(min=1, max=1440)),
                 vol.Optional(ATTR_REASON, default="manual_service_call"): vol.All(cv.string, _validate_reason_code),
             }
@@ -190,18 +229,21 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         DOMAIN,
         SERVICE_EXPORT_DIAGNOSTICS,
         handle_export_diagnostics,
+        schema=vol.Schema(_config_entry_field()),
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_RUN_PREFLIGHT,
         handle_run_preflight,
+        schema=vol.Schema(_config_entry_field()),
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
         DOMAIN,
         SERVICE_EXPORT_SUPPORT_BUNDLE,
         handle_export_support_bundle,
+        schema=vol.Schema(_config_entry_field()),
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.async_register(
@@ -209,7 +251,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         SERVICE_ARM_PRODUCTION_CONTROL,
         handle_arm_production,
         schema=vol.Schema(
-            {vol.Optional(ATTR_REASON, default="user_acknowledged"): vol.All(cv.string, _validate_reason_code)}
+            {
+                **_config_entry_field(),
+                vol.Optional(ATTR_REASON, default="user_acknowledged"): vol.All(cv.string, _validate_reason_code),
+            }
         ),
     )
     hass.services.async_register(
@@ -217,7 +262,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         SERVICE_DISARM_PRODUCTION_CONTROL,
         handle_disarm_production,
         schema=vol.Schema(
-            {vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}
+            {
+                **_config_entry_field(),
+                vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code),
+            }
         ),
     )
     hass.services.async_register(
@@ -226,6 +274,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         handle_pause_control,
         schema=vol.Schema(
             {
+                **_config_entry_field(),
                 vol.Required(ATTR_DURATION_MINUTES): vol.All(vol.Coerce(int), vol.Range(min=1, max=10080)),
                 vol.Optional(ATTR_ASSET, default="all"): vol.In(["all", "ev", "daikin", "enphase"]),
                 vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code),
@@ -237,7 +286,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         SERVICE_RESUME_CONTROL,
         handle_resume_control,
         schema=vol.Schema(
-            {vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code)}
+            {
+                **_config_entry_field(),
+                vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code),
+            }
         ),
     )
     return True
@@ -254,8 +306,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     if getattr(entry, "title", None) == LEGACY_INTEGRATION_NAME:
         hass.config_entries.async_update_entry(entry, title=INTEGRATION_NAME)
     async_consolidate_subentries(hass, entry)
-    store = PlannerStore(hass)
+    domain_entries = hass.config_entries.async_entries(DOMAIN)
+    legacy_store_entry_id = _legacy_store_owner_entry_id(domain_entries)
+    store = PlannerStore(
+        hass,
+        entry.entry_id,
+        legacy_fallback=entry.entry_id == legacy_store_entry_id,
+    )
     await store.async_load()
+    _rehydrate_ev_grid_reservation(hass, entry, getattr(store, "data", {}))
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
     coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
@@ -278,14 +337,123 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
 async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Unload a config entry."""
     coordinator = entry.runtime_data
-    await coordinator.async_restore_safe_state("entry_unload", refresh=False)
-    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
-    if unload_ok:
-        coordinator.async_shutdown()
-        entry.runtime_data = None
-    else:
-        await coordinator.async_request_replan()
-    return unload_ok
+    # Stop new listener/timer work before waiting for any in-flight planner
+    # execution. The coordinator's teardown marker also prevents an already
+    # queued refresh from committing a new device command after restoration.
+    coordinator.async_shutdown()
+    unload_completed = False
+    try:
+        restore_outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
+        store_data = getattr(getattr(coordinator, "store", None), "data", {})
+        remaining_ownership = store_data.get("ownership") if isinstance(store_data, Mapping) else None
+        ev_reservation = store_data.get("ev_grid_reservation") if isinstance(store_data, Mapping) else None
+        unresolved_restore = bool(remaining_ownership) or bool(
+            isinstance(ev_reservation, Mapping) and ev_reservation.get("active") is True
+        )
+        if (
+            getattr(getattr(restore_outcome, "result", None), "value", None) == "failed"
+            and unresolved_restore
+        ):
+            await coordinator.async_disarm_production_control("entry_unload_restore_failed")
+            return False
+        unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+        if unload_ok:
+            entry.runtime_data = None
+            unload_completed = True
+        else:
+            await coordinator.async_disarm_production_control("entry_platform_unload_failed")
+        return unload_ok
+    finally:
+        if not unload_completed and entry.runtime_data is coordinator:
+            coordinator.async_start_listeners()
+
+
+async def _async_rehydrate_all_ev_grid_reservations(hass: HomeAssistant) -> None:
+    """Restore conservative EV reservations before config entries can execute."""
+    from .storage import PlannerStore
+
+    entries = hass.config_entries.async_entries(DOMAIN)
+    legacy_store_entry_id = _legacy_store_owner_entry_id(entries)
+    for entry in entries:
+        if getattr(entry, "runtime_data", None) is not None:
+            continue
+        store = PlannerStore(
+            hass,
+            entry.entry_id,
+            legacy_fallback=entry.entry_id == legacy_store_entry_id,
+        )
+        await store.async_load()
+        _rehydrate_ev_grid_reservation(hass, entry, store.data)
+
+
+def _legacy_store_owner_entry_id(entries: list[Any]) -> str | None:
+    """Return the first actual legacy entry eligible for global-store import."""
+    for entry in entries:
+        if not bool(getattr(entry, "data", {}).get(CONF_INSTANCE_NAME)):
+            return str(getattr(entry, "entry_id", "")) or None
+    return None
+
+
+def _rehydrate_ev_grid_reservation(
+    hass: HomeAssistant,
+    entry: EnergyPlannerConfigEntry,
+    store_data: dict[str, Any],
+) -> None:
+    """Reserve conservative headroom for persisted planner-owned EV state."""
+    ownership = store_data.get("ownership")
+    persisted_reservation = store_data.get("ev_grid_reservation")
+    if (
+        isinstance(persisted_reservation, dict)
+        and persisted_reservation.get("active") is False
+    ):
+        return
+    has_owned_ev_state = isinstance(ownership, dict) and bool(
+        ownership.get("ev_smart_charging_state")
+    )
+    has_persisted_reservation = isinstance(persisted_reservation, dict) and (
+        persisted_reservation.get("active") is True or bool(persisted_reservation)
+    )
+    if not has_owned_ev_state and not has_persisted_reservation:
+        return
+    hass_data = getattr(hass, "data", None)
+    if not isinstance(hass_data, dict):
+        return
+    domain_data = hass_data.setdefault(DOMAIN, {})
+    if not isinstance(domain_data, dict):
+        return
+    reservations = domain_data.setdefault("ev_grid_reservations", {})
+    if not isinstance(reservations, dict):
+        return
+    options = {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))}
+    persisted_load_kw = (
+        _non_negative_finite_float(persisted_reservation.get("load_kw"))
+        if isinstance(persisted_reservation, dict)
+        else 0.0
+    )
+    reservation = {
+        "load_kw": max(
+            _non_negative_finite_float(options[CONF_EV_CHARGE_RATE_KW]),
+            persisted_load_kw,
+        ),
+        "limit_kw": _non_negative_finite_float(options[CONF_GRID_IMPORT_LIMIT_KW]),
+        "reserved_at": datetime.now(UTC).isoformat(),
+        EV_RESERVATION_RETAIN_WHEN_UNLOADED: True,
+    }
+    if (
+        isinstance(persisted_reservation, dict)
+        and persisted_reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is True
+    ):
+        reservation[EV_RESERVATION_EXTERNAL_BASELINE] = True
+    reservations.setdefault(entry.entry_id, reservation)
+
+
+def _non_negative_finite_float(value: Any) -> float:
+    """Return a finite non-negative float for lifecycle reservation recovery."""
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return numeric if numeric >= 0 and numeric < float("inf") else 0.0
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
@@ -412,7 +580,7 @@ def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigE
             )
 
     for entity in list(ent_reg.entities.values()):
-        if entity.platform != DOMAIN:
+        if entity.platform != DOMAIN or getattr(entity, "config_entry_id", None) != entry.entry_id:
             continue
         entity_key = _planner_entity_key(entry.entry_id, entity)
         device_key = planner_device_key_for_entity(entity_key)

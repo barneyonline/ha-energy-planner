@@ -120,6 +120,7 @@ class DecisionSlot:
     haeo_grid_export_forecast_kw: float | None = None
     haeo_battery_charge_forecast_kw: float | None = None
     haeo_battery_discharge_forecast_kw: float | None = None
+    haeo_grid_includes_flexible_loads: bool = False
     pv_forecast_lower_kw: float | None = None
     baseline_load_forecast_upper_kw: float | None = None
     carbon_intensity_g_per_kwh: float | None = None
@@ -149,6 +150,7 @@ class DecisionContext:
     ev_connected: bool | None = None
     ev_charging: bool | None = None
     ev_target_soc_percent: float | None = None
+    ev_target_soc_fallback_active: bool = False
     ev_ready_by: str | None = None
     ev_trip_observed_days: int = 0
     ev_trip_max_daily_soc_percent: float = 0.0

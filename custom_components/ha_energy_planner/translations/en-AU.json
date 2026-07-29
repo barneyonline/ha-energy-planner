@@ -3,8 +3,9 @@
     "step": {
       "user": {
         "title": "Energy Planner",
-        "description": "Click Submit to create the Planner Hub. Add energy, climate, EV, and Enphase inputs from the integration page after setup.",
+        "description": "Name this Planner Hub, then add energy, climate, EV, and Enphase inputs from the integration page. Create one named hub per EV when managing multiple vehicles.",
         "data": {
+          "instance_name": "Planner name",
           "amber_import_price_entity": "Amber import price sensor",
           "amber_export_price_entity": "Amber export price sensor",
           "pv_forecast_entity": "PV forecast sensor",
@@ -36,6 +37,7 @@
           "weather_entity": "Weather Forecast"
         },
         "data_description": {
+          "instance_name": "Unique name for this planner and its EV, for example Energy Planner - Commuter EV.",
           "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
           "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
           "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
@@ -76,7 +78,11 @@
       "observation_must_differ_from_forecast": "Select a measured power sensor, not the forecast sensor.",
       "forecast_sources_must_differ": "Select a different sensor for the second PV forecast.",
       "invalid_service_name": "Service name must use domain.service format.",
-      "service_not_found": "Service was not found in Home Assistant."
+      "service_not_found": "Service was not found in Home Assistant.",
+      "instance_name_required": "Enter a planner name.",
+      "instance_name_in_use": "Choose a unique planner name.",
+      "household_actuator_in_use": "This actuator is already controlled by another Energy Planner entry.",
+      "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -252,6 +258,7 @@
             "ev_soc_entity": "EV SOC sensor",
             "ev_charging_entity": "EV charging state entity",
             "ev_connected_entity": "EV connected entity",
+            "ev_smart_charging_target_soc_entity": "Vehicle target SOC entity",
             "ev_charger_entity": "EV charger control",
             "ev_charger_start_entity": "EV charger start control",
             "ev_charger_stop_entity": "EV charger stop control"
@@ -260,6 +267,7 @@
             "ev_soc_entity": "EV state-of-charge sensor.",
             "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
             "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
+            "ev_smart_charging_target_soc_entity": "Optional vehicle or charger target-SOC entity. Its live percentage overrides the native fallback target.",
             "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
             "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
             "ev_charger_stop_entity": "Optional separate switch or button used to stop charging."
@@ -317,6 +325,9 @@
           "ev_max_import_price": "Maximum import price",
           "ev_low_price_charging_enabled": "Charge immediately at low prices",
           "ev_low_price_threshold": "Low-price charging threshold",
+          "ev_keep_charger_on": "Keep charger enabled after target SOC",
+          "ev_confirmation_timeout_seconds": "Charging confirmation timeout",
+          "ev_confirmation_retries": "Charging confirmation retries",
           "grid_import_limit_kw": "Grid import limit",
           "grid_export_limit_kw": "Grid export limit"
         },
@@ -337,6 +348,9 @@
           "ev_max_import_price": "Highest grid import price allowed for normal scheduled charging.",
           "ev_low_price_charging_enabled": "Start immediately when the current price is at or below the configured threshold and the EV still needs charge.",
           "ev_low_price_threshold": "Import price that triggers immediate low-price charging.",
+          "ev_keep_charger_on": "Keep the charger enabled after the EV reaches target SOC so vehicle preconditioning can use grid power. Enable only when the vehicle enforces its own target SOC.",
+          "ev_confirmation_timeout_seconds": "Seconds to wait for the mapped charging-state entity to confirm each start or stop command. Set to 0 for an immediate check.",
+          "ev_confirmation_retries": "Additional bounded command attempts when charging feedback does not confirm the requested state.",
           "grid_import_limit_kw": "Maximum grid import power allowed in planned actions.",
           "grid_export_limit_kw": "Maximum grid export power allowed in planned actions."
         }
@@ -465,11 +479,20 @@
     "no_config_entry": {
       "message": "No loaded Energy Planner configuration is available."
     },
+    "config_entry_required": {
+      "message": "Multiple Energy Planner configurations are loaded. Select a config_entry_id for this service call."
+    },
+    "config_entry_not_found": {
+      "message": "The selected Energy Planner configuration is not loaded."
+    },
     "restore_safe_state_failed": {
       "message": "Energy Planner could not fully restore safe state: {reason}"
     },
     "manual_ev_control_failed": {
       "message": "Energy Planner could not change EV charging: {reason}"
+    },
+    "ev_keep_on_requires_persistent_control": {
+      "message": "Keep charger on requires a persistent EV charger switch or input boolean."
     }
   },
   "entity": {
@@ -564,6 +587,12 @@
       },
       "ev_control_enabled": {
         "name": "Control enabled"
+      },
+      "ev_connected_helper": {
+        "name": "EV connected helper"
+      },
+      "ev_keep_charger_on": {
+        "name": "Keep charger on"
       },
       "climate_control_enabled": {
         "name": "Control enabled"
