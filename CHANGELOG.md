@@ -1,5 +1,198 @@
 # Changelog
 
+## 0.8.0 - 2026-07-26
+
+### Added
+
+- Charging-state confirmation with bounded retries and a fail-closed timeout
+  after direct EV start and stop commands.
+- Optional external vehicle target-SOC input, a native connected helper, and a
+  keep-charger-on policy for vehicle preconditioning after the charge target is
+  reached.
+- Multiple named Energy Planner entries so each EV has isolated entities,
+  history, production arming, execution audit, and persisted planner state.
+
+### Changed
+
+- Integration services accept `config_entry_id`; it is required when more than
+  one Energy Planner entry is loaded.
+- Initial setup now asks for an instance name and rejects duplicate names.
+- The first upgraded entry imports the legacy unscoped store into its new
+  entry-scoped store once, marks the legacy source as consumed, and never
+  offers that source to newly named entries.
+- Failed EV charging confirmation now issues an immediate compensating restore
+  or safe-stop command and retains ownership evidence when compensation cannot
+  be completed.
+- Connected-helper state is treated as runtime evidence, so plugging or
+  unplugging does not invalidate an otherwise current production arming record.
+- Preconditioning keep-on confirms the stateful charger control rather than
+  requiring active charging feedback, and per-entry notifications no longer
+  overwrite or dismiss alerts from another EV planner.
+- Active EV entries share an atomic household grid-capacity reservation, with
+  reservations retained until stop or safe-state restoration is confirmed.
+  Observed disconnection now requests that confirmed stop instead of releasing
+  capacity while a persistent charger control may remain enabled.
+
+### Fixed
+
+- EV starts now persist their provisional grid claim and original actuator
+  topology before crossing the Home Assistant service boundary. After an
+  interrupted command, active control confirms a recovery stop before allowing
+  another start, including when the EV mapping changed during recovery.
+- Existing reservation high-watermarks are checked against tightened import
+  limits even when only one EV remains active. Shedding claims held by unloaded
+  entries are relinquished so a loaded EV can shed controllable load while the
+  unloaded entry's uncertain reservation remains protected.
+- Ordinary below-target charging no longer inherits preconditioning-only
+  control confirmation when keep-on is enabled.
+- Preconditioning reserves the configured charger rate in the current grid and
+  battery projection instead of presenting as a zero-load action.
+- Safe-state restoration of a momentary start-button takeover issues the
+  configured stop command when the saved button state cannot be replayed.
+- Manual and scheduled starts now honour the native Connected helper when no
+  external vehicle connected-state entity is mapped.
+- Manual starts now require a usable grid projection, use the shared multi-EV
+  capacity reservation, include their own charger load when absent from that
+  projection, and preserve a restorable ownership baseline after successful or
+  uncertain commands.
+- Uncertain EV reservations survive config-entry unload, while each active
+  reservation retains only its owner's configured import limit so departed
+  entries cannot leave obsolete limits behind.
+- Configured vehicle connection entities now fail closed while unavailable,
+  and device grouping updates are isolated to the current config entry.
+- Safe-state restore now honours charging-confirmation options and accepts a
+  confirmed nested safe-stop compensation as a successful recovery.
+- Manual EV starts reject stale or unsafe committed grid evidence instead of
+  authorizing a command from an obsolete decision context.
+- Persisted EV ownership now rehydrates conservative household reservations
+  before entries execute after an unclean Home Assistant restart.
+- Runtime option changes synchronize active reservation load and import-limit
+  metadata before restore or replanning uses the updated configuration.
+- Config-entry unload now stops when safe-state restoration fails, retaining
+  the live coordinator for retry and diagnostics instead of abandoning state.
+- Active EV reservations can increase but no longer shrink from a model-only
+  charge-rate option change or a later start/no-op action while the charger may
+  still be drawing power.
+- Manual EV starts now expire decision evidence with the planning interval;
+  manual device failures are persisted, placed into EV control backoff, and
+  subsequent manual starts honour both that pause and command cooldown.
+- Planner-owned EV power now receives one prioritized, audited safety-stop
+  attempt per plan when the vehicle disconnects, EV control is disabled,
+  required inputs become unhealthy, or a hard grid-import violation degrades
+  an otherwise healthy plan. Reservations and ownership remain held when that
+  stop cannot be confirmed.
+- Failed config-entry unloads disarm production control without scheduling a
+  replan that could issue new commands during teardown recovery.
+- Preconditioning keep-on now uses only the persistent charger control, even
+  when an optional separate start command is also mapped; options, EV
+  reconfiguration, and preflight reject incompatible mappings before execution.
+- Config flows reject native or legacy EV charger controls, Daikin,
+  climate-automation, and Enphase actuators already controlled by another
+  Energy Planner entry.
+- Failed confirmation after a momentary start always uses the configured safe
+  stop instead of treating restoration of an unrelated already-enabled control
+  as a successful rollback.
+- Safe-state restoration now persists the control that initiated EV ownership,
+  so a successful momentary takeover cannot later skip its configured stop.
+- Active EV reservation high-watermarks are persisted across unclean restarts;
+  confirmed releases are persisted explicitly and do not rehydrate from stale
+  ownership metadata.
+- Scheduled EV stops now bypass failure pauses, command cooldowns, and daily
+  action caps, matching manual-stop recovery behavior.
+- Legacy helper-based EV schedules are consistently treated as charging starts
+  for safety gates, household reservations, audit targets, and restoration.
+- Separate start switches and input booleans now use the configured safe-stop
+  control during restoration and failed-confirmation compensation instead of
+  treating the command helper's prior state as proof that charging stopped.
+- Separate stop switches now issue a stop command even when their helper state
+  already appears off, and successful stops neutralize latched switch-based
+  start commands before ownership and grid reservations are released.
+- Legacy helper-based charging starts now participate in external-control
+  conflict detection instead of overriding a recent third-party stop; conflict
+  evidence is now bound to the prior command's direction and entity so the
+  planner's own stop cannot block the next charging start.
+- EV execution audits record the control actually commanded; conflict detection
+  observes available charging feedback for momentary starts, falls back to a
+  stateful charger control when feedback is unavailable, and uses the persistent
+  control for preconditioning keep-on actions. Normal fully charged and
+  disconnected states no longer trigger false external-override conflicts.
+- Unavailable or invalid external vehicle targets now use the native target as
+  a non-blocking advisory fallback. Preconditioning keep-on cannot energise the
+  charger while that fallback is active or when the authoritative target
+  exceeds configured SOC bounds.
+- Coordinated execution now abandons remaining device commands when an input
+  change or teardown makes the source plan obsolete during an earlier command.
+- Restoring an already-active charger baseline clears planner stop ownership
+  while retaining its load in shared multi-EV household capacity accounting.
+- EV safety stops now ignore unrelated input/plan constraints and unavailable
+  start controls. An unhealthy refresh with planner-owned EV power synthesizes
+  a stop, retries through normal failure backoff, and clears ownership only
+  after the stop succeeds.
+- Safety-stop command acceptance is now distinct from proven-safe confirmation.
+  Disconnected feedback and separate stop-helper state retain EV ownership and
+  household capacity until the persistent charger control, meaningful charging
+  feedback, or rollback proves the charger safe. A compensating stop that does
+  prove the safe state is recorded as successful and releases ownership.
+- Confirmed manual EV stops now clear the same persisted charger ownership as
+  scheduled safety stops, avoiding a redundant restore after charging is safe.
+- Owned automated and manual stops now use the persisted actuator topology, so
+  a failed reconfiguration reload cannot stop the replacement charger and then
+  discard recovery ownership for the original charger.
+- Reservation-only restore failures now retain their provisional actuator
+  topology, so every later retry continues targeting the charger that may still
+  be active rather than a reconfigured replacement.
+- Manual stops now treat a proven-safe compensating stop as successful, while
+  an accepted but unconfirmed owned stop fails closed and retains ownership.
+- EV ownership now persists the actuator topology that created it, so config
+  entry reload after EV reconfiguration restores the original charger instead
+  of resolving ownership through the replacement mapping.
+- Existing multi-EV reservations that no longer fit the strictest household
+  import limit now use one atomic shedding claim so a single planner-owned entry
+  takes the confirmed safety-stop path; concurrent evaluations no longer stop
+  every EV before the remaining capacity is re-evaluated.
+- The integration-created Keep charger on switch now rejects start/stop-only
+  mappings instead of bypassing options-flow validation.
+- Planner-owned disconnect and recovery stops now run even when automation is
+  disabled, dry-run is enabled, or the source plan has aged past its normal
+  action window. A connected manual start still honours its one-hour override,
+  and expired or malformed bounded overrides are pruned during live refreshes.
+- Legacy global storage is migrated and rehydrated for the first actual legacy
+  entry before any named multi-EV entry can execute, independent of config-entry
+  ordering. Legacy single-button mappings are also rejected by capability
+  discovery and manual-start gating because they cannot provide the required
+  stop path.
+- Manual EV commands, scheduled execution, explicit restoration, and config-entry
+  teardown are now serialized. Queued refreshes cannot issue a new command during
+  unload, and every planner-owned scheduled stop requires proven-safe completion
+  before releasing ownership or household capacity.
+- Failed multi-EV shedding claims rotate to another loaded charger while retaining
+  the uncertain reservation, and continuous-charging mode returns an explicitly
+  infeasible contiguous partial window instead of silently scheduling gaps.
+- HVAC automation suppression and Enphase profile changes now use transactional
+  compensation. Failed rollbacks retain only the unresolved baseline ownership so
+  restore-safe-state can retry it after service or confirmation failures.
+- Flexible HAEO responses must provide their own continuous grid evidence and now
+  carry per-slot provenance, preventing both inherited-baseline acceptance and
+  double-counting projected EV/HVAC load in limits and cost estimates.
+- Store writes use serialized mutation generations, so transient or concurrent
+  save failures remain retryable. Recorder import timestamps also survive live EV
+  events and successful empty imports, avoiding repeated 30-day history scans.
+- External ready-by and secondary-PV changes now trigger replanning, arbitrary
+  configured planning intervals share one epoch cadence, and expired manual HVAC
+  helpers are cleared with retryable ownership evidence.
+- Advisory AI configuration no longer blocks production preflight, non-finite or
+  boolean AI numerics are rejected, Enphase discovery honours custom control
+  services, takeover diagnostics include reservation-only recovery, and system
+  health aggregates multiple entries deterministically.
+- Release metadata validation now agrees with multi-entry support and the
+  manifest and package versions are aligned at 0.8.0.
+
+### Validation
+
+- Full Docker validation: `823 passed`, `100%` across `8,708` statements, plus
+  Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
+  smoke checks.
+
 ## 0.7.0 - 2026-07-17
 
 ### Changed

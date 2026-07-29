@@ -12,18 +12,30 @@ from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
+    CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
+    CONF_EV_CHARGING,
+    CONF_EV_CONFIRMATION_RETRIES,
+    CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
+    CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
+    CONF_GRID_IMPORT_LIMIT_KW,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
+    CONF_PLANNING_INTERVAL_MINUTES,
     DEFAULT_OPTIONS,
 )
 from custom_components.ha_energy_planner.executor import (
@@ -31,6 +43,7 @@ from custom_components.ha_energy_planner.executor import (
     _clean_reason_codes,
     _daily_action_cap_reason,
     _device_control_disabled_reason,
+    _ev_command_entity_for_action,
     _pause_rejection_reason,
     _plan_fallback_message,
     _profile_control_service_for_target,
@@ -47,6 +60,7 @@ from custom_components.ha_energy_planner.models import (
     InputHealth,
     OccupancyState,
     OutcomeResult,
+    Override,
     PlanAction,
     PlannerMode,
 )
@@ -58,6 +72,7 @@ class FakeStore:
 
     def __init__(self) -> None:
         self.data: dict[str, Any] = {"ownership": {}, "outcomes": []}
+        self.flush_count = 0
 
     async def async_add_outcome(self, outcome: Any) -> None:
         self.data["outcomes"].append(outcome)
@@ -74,15 +89,16 @@ class FakeStore:
     async def async_clear_ownership(self) -> None:
         self.data["ownership"] = {}
 
+    async def async_flush(self) -> None:
+        self.flush_count += 1
+
 
 def _arm_store(store: FakeStore, executor: Executor) -> None:
     """Install a complete production contract for active execution tests."""
     store.data["production"] = {
         "armed": True,
         "dry_run_ready_cycles": 3,
-        "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-            executor.entry_data, executor.options
-        ),
+        "dry_run_evidence_fingerprint": production_evidence_fingerprint(executor.entry_data, executor.options),
     }
 
 
@@ -221,6 +237,155 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
     assert hass.services.calls == []
 
 
+def test_executor_keep_on_ignores_unavailable_separate_start_control() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev-keep-on",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={"keep_charger_on": True},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    store = FakeStore()
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_control": "off",
+            "button.ev_start": "unavailable",
+        }
+    )
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "switch.ev_control",
+            CONF_EV_CHARGER_START: "button.ev_start",
+        },
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.ev_control"})
+    ]
+    assert store.data["outcomes"][0].result == "applied"
+    assert store.data["outcomes"][0].reason == (
+        "ev_charger_enabled_for_preconditioning"
+    )
+
+
+def test_executor_keep_on_rejects_invalid_persistent_controls() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev-keep-on",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={"keep_charger_on": True},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    cases = [
+        (
+            {
+                CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+                CONF_EV_CHARGER_START: "input_boolean.ev_start",
+                CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+            },
+            {
+                "binary_sensor.ev_connected": "on",
+                "input_boolean.ev_start": "off",
+                "input_boolean.ev_stop": "on",
+            },
+            "ev_keep_on_requires_stateful_control",
+        ),
+        (
+            {
+                CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+                CONF_EV_CHARGER: "switch.missing_control",
+                CONF_EV_CHARGER_START: "input_boolean.ev_start",
+                CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+            },
+            {
+                "binary_sensor.ev_connected": "on",
+                "input_boolean.ev_start": "off",
+                "input_boolean.ev_stop": "on",
+            },
+            "ev_keep_on_control_unavailable",
+        ),
+    ]
+
+    for entry_data, states, expected_reason in cases:
+        store = FakeStore()
+        hass = FakeHass(states)
+        executor = Executor(
+            store,
+            hass=hass,
+            entry_data=entry_data,
+            options={
+                **DEFAULT_OPTIONS,
+                "planner_enabled": True,
+                "dry_run": False,
+                CONF_EV_CONTROL_ENABLED: True,
+            },
+        )
+        _arm_store(store, executor)
+
+        asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+        assert hass.services.calls == []
+        assert store.data["outcomes"][0].result == "rejected"
+        assert store.data["outcomes"][0].reason == expected_reason
+
+
 def test_restore_safe_state_notification_remains_enabled_when_plan_alerts_are_disabled() -> None:
     store = FakeStore()
     hass = FakeHass()
@@ -331,6 +496,20 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
         )
     ]
     assert store.data["outcomes"][0].result == "rejected"
+
+
+def test_notification_ids_and_titles_are_isolated_per_config_entry() -> None:
+    garage = Executor(FakeStore(), entry_id="entry-garage", entry_title="Garage EV")
+    driveway = Executor(FakeStore(), entry_id="entry-driveway", entry_title="Driveway EV")
+
+    garage_ids = set(garage._plan_fallback_notification_ids())
+    driveway_ids = set(driveway._plan_fallback_notification_ids())
+
+    assert garage_ids.isdisjoint(driveway_ids)
+    assert garage._notification_id("ha_energy_planner_restore_safe_state") == (
+        "ha_energy_planner_restore_safe_state_entry-garage"
+    )
+    assert driveway._notification_title("plan unsafe") == "Driveway EV: plan unsafe"
 
 
 def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> None:
@@ -643,11 +822,18 @@ def test_executor_preserves_first_ev_pre_takeover_state() -> None:
         preview=[],
     )
     store = FakeStore()
-    hass = FakeHass({"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"})
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_start": "off",
+            "input_boolean.ev_stop": "on",
+        }
+    )
     executor = Executor(
         store,
         hass=hass,
         entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
             CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
         },
@@ -699,11 +885,18 @@ def test_executor_rate_limits_repeated_device_command() -> None:
     )
     store = FakeStore()
     store.data["command_rate_limits"] = {"ev:ev_start": now.isoformat()}
-    hass = FakeHass({"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"})
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_start": "off",
+            "input_boolean.ev_stop": "on",
+        }
+    )
     executor = Executor(
         store,
         hass=hass,
         entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
             CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
         },
@@ -746,7 +939,10 @@ def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> No
         {
             "attempted_at": now.isoformat(),
             "asset": "ev",
+            "kind": "ev_start",
             "result": "applied",
+            "service_target": "input_boolean.ev_start",
+            "desired_state": {"charging_required_now": True},
             "post_state": {"input_boolean.ev_start": "on"},
         }
     ]
@@ -757,6 +953,31 @@ def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> No
     )
 
     assert executor._observed_conflict_reason(action, now) == "external_ev_charging_conflict"
+    action.kind = ActionKind.EV_SCHEDULE
+    assert executor._observed_conflict_reason(action, now) == "external_ev_charging_conflict"
+    store.data["execution_audit"][-1].update(
+        {
+            "kind": "ev_schedule",
+            "desired_state": {},
+        }
+    )
+    assert executor._observed_conflict_reason(action, now) == "external_ev_charging_conflict"
+    store.data["execution_audit"][-1].update(
+        {
+            "kind": "ev_stop",
+            "service_target": "input_boolean.ev_stop",
+            "desired_state": {"charging_required_now": False},
+        }
+    )
+    assert executor._observed_conflict_reason(action, now) is None
+    store.data["execution_audit"][-1].update(
+        {
+            "kind": "ev_start",
+            "service_target": "input_boolean.other_ev_start",
+            "desired_state": {"charging_required_now": True},
+        }
+    )
+    assert executor._observed_conflict_reason(action, now) is None
     asyncio.run(
         executor._async_pause_asset_control(
             ActionAsset.EV,
@@ -767,6 +988,154 @@ def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> No
     )
     assert store.data["control_pause"]["assets"] == ["ev"]
     assert store.data["control_pause"]["reason"] == "external_ev_charging_conflict"
+
+
+def test_executor_ev_conflict_uses_actual_command_and_feedback_entities() -> None:
+    now = datetime.now(UTC)
+    keep_on_action = PlanAction(
+        action_id="keep-on",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={"keep_charger_on": True},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    keep_on_entry_data = {
+        CONF_EV_CHARGER: "switch.ev_control",
+        CONF_EV_CHARGER_START: "button.ev_start",
+        CONF_EV_CHARGING: "binary_sensor.ev_charging",
+    }
+    keep_on_store = FakeStore()
+    keep_on_executor = Executor(
+        keep_on_store,
+        hass=FakeHass(
+            {
+                "switch.ev_control": "off",
+                "button.ev_start": "unknown",
+                "binary_sensor.ev_charging": "fully_charged",
+            }
+        ),
+        entry_data=keep_on_entry_data,
+    )
+    keep_on_outcome = keep_on_executor._action_outcome(
+        keep_on_action,
+        now,
+        result=OutcomeResult.APPLIED,
+        reason="ev_charger_enabled_for_preconditioning",
+        pre_state={},
+        post_state={},
+        plan_id="plan-1",
+    )
+    keep_on_store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "ev",
+            "kind": "ev_start",
+            "result": "applied",
+            "service_target": keep_on_outcome.service_target,
+            "desired_state": {"keep_charger_on": True},
+            "post_state": {},
+        }
+    ]
+
+    assert keep_on_outcome.service_target == "switch.ev_control"
+    assert keep_on_executor._observed_conflict_reason(keep_on_action, now) == "external_ev_charging_conflict"
+
+    button_action = PlanAction(
+        action_id="button-start",
+        plan_id="plan-1",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    button_store = FakeStore()
+    button_store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "ev",
+            "kind": "ev_start",
+            "result": "applied",
+            "service_target": "button.ev_start",
+            "desired_state": {},
+            "post_state": {},
+        }
+    ]
+    button_hass = FakeHass(
+        {
+            "button.ev_start": "unknown",
+            "binary_sensor.ev_charging": "off",
+        }
+    )
+    button_executor = Executor(
+        button_store,
+        hass=button_hass,
+        entry_data={
+            CONF_EV_CHARGER_START: "button.ev_start",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        },
+    )
+
+    for stopped_state in ("off", "connected_not_charging"):
+        button_hass.states.values["binary_sensor.ev_charging"] = stopped_state
+        assert button_executor._observed_conflict_reason(button_action, now) == "external_ev_charging_conflict"
+    for expected_state in (
+        "charging",
+        "fully_charged",
+        "disconnected",
+        "unplugged",
+        "not_plugged_in",
+        "unavailable",
+    ):
+        button_hass.states.values["binary_sensor.ev_charging"] = expected_state
+        assert button_executor._observed_conflict_reason(button_action, now) is None
+    button_hass.states.values.pop("binary_sensor.ev_charging")
+    assert button_executor._observed_conflict_reason(button_action, now) is None
+
+    stateful_store = FakeStore()
+    stateful_store.data["execution_audit"] = [
+        {
+            "attempted_at": now.isoformat(),
+            "asset": "ev",
+            "kind": "ev_start",
+            "result": "applied",
+            "service_target": "switch.ev_control",
+            "desired_state": {},
+            "post_state": {},
+        }
+    ]
+    stateful_hass = FakeHass(
+        {
+            "switch.ev_control": "off",
+            "binary_sensor.ev_charging": "unavailable",
+        }
+    )
+    stateful_executor = Executor(
+        stateful_store,
+        hass=stateful_hass,
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev_control",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        },
+    )
+
+    assert stateful_executor._observed_conflict_reason(button_action, now) == "external_ev_charging_conflict"
+    stateful_hass.states.values.pop("binary_sensor.ev_charging")
+    assert stateful_executor._observed_conflict_reason(button_action, now) == "external_ev_charging_conflict"
+    stateful_hass.states.values["switch.ev_control"] = "unavailable"
+    assert stateful_executor._observed_conflict_reason(button_action, now) is None
 
 
 def test_executor_detects_recent_enphase_external_conflict() -> None:
@@ -804,6 +1173,8 @@ def test_executor_detects_recent_enphase_external_conflict() -> None:
     )
 
     assert executor._observed_conflict_reason(action, now) == "external_enphase_profile_conflict"
+    executor.hass.states.values.pop("input_select.enphase_profile")
+    assert executor._observed_conflict_reason(action, now) is None
 
 
 def test_executor_conflict_helpers_cover_defensive_branches() -> None:
@@ -914,7 +1285,10 @@ def test_executor_rejects_and_pauses_on_observed_conflict() -> None:
         {
             "attempted_at": now.isoformat(),
             "asset": "ev",
+            "kind": "ev_start",
             "result": "applied",
+            "service_target": "input_boolean.ev_start",
+            "desired_state": {},
             "post_state": {"input_boolean.ev_start": "on"},
         }
     ]
@@ -943,7 +1317,14 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
             pass
 
         async def async_execute(self, action: Any) -> Any:
-            return SimpleNamespace(applied=False, reason="ev_failed", pre_state={}, post_state={})
+            return SimpleNamespace(
+                applied=False,
+                reason="ev_failed",
+                pre_state={"ev_smart_charging_start_entity": "off"},
+                post_state={"ev_smart_charging_start_entity": "on"},
+                command_sent=True,
+                rollback_succeeded=False,
+            )
 
     class FailedHVACAdapter:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -1089,6 +1470,8 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
         asyncio.run(executor.async_evaluate(plan, _context(now)))
         assert store.data["control_pause"]["reason"] == reason
         assert store.data["outcomes"][0].result == "failed"
+        if action.asset == ActionAsset.EV:
+            assert store.data["ownership"]["ev_smart_charging_state"] == {"ev_smart_charging_start_entity": "off"}
 
 
 def test_executor_rejects_active_command_when_production_gate_not_armed() -> None:
@@ -1163,16 +1546,15 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
         _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": ["daikin"]}, action, now)
         is None
     )
-    assert _pause_rejection_reason(
-        {"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now
-    ) == "planner_paused"
+    assert (
+        _pause_rejection_reason({"until": (now + timedelta(minutes=1)).isoformat(), "assets": 123}, action, now)
+        == "planner_paused"
+    )
 
     assert _device_control_disabled_reason(ActionAsset.EV, {}) == "ev_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.DAIKIN, {}) == "climate_control_disabled"
     assert _device_control_disabled_reason(ActionAsset.ENPHASE, {}) == "enphase_control_disabled"
-    assert _device_control_disabled_reason(ActionAsset.EV, {CONF_EV_CONTROL_ENABLED: "true"}) == (
-        "ev_control_disabled"
-    )
+    assert _device_control_disabled_reason(ActionAsset.EV, {CONF_EV_CONTROL_ENABLED: "true"}) == ("ev_control_disabled")
     assert _device_control_disabled_reason(ActionAsset.EV, {CONF_EV_CONTROL_ENABLED: True}) is None
 
     audit = [
@@ -1216,14 +1598,10 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     store.data["production"]["dry_run_ready_cycles"] = 3
     assert executor._control_rejection_reason(action, now) == "ev_control_disabled"
     executor.options = {CONF_EV_CONTROL_ENABLED: True}
-    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
-        {}, executor.options
-    )
+    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint({}, executor.options)
     assert executor._control_rejection_reason(action, now) is None
     executor.options = {CONF_EV_CONTROL_ENABLED: True, CONF_MAX_DAILY_EV_ACTIONS: 3}
-    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
-        {}, executor.options
-    )
+    store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint({}, executor.options)
     store.data["execution_audit"] = audit
     assert executor._control_rejection_reason(action, now) == "ev_daily_action_cap_reached"
 
@@ -1296,11 +1674,18 @@ def test_executor_ignores_malformed_command_rate_limit_timestamp() -> None:
     )
     store = FakeStore()
     store.data["command_rate_limits"] = {"ev:ev_start": "not-a-date"}
-    hass = FakeHass({"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"})
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_start": "off",
+            "input_boolean.ev_stop": "on",
+        }
+    )
     executor = Executor(
         store,
         hass=hass,
         entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
             CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
             CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
         },
@@ -1555,6 +1940,80 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     assert "planner_hvac_action_expires_at" in store.data["ownership"]
 
 
+def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: object) -> None:
+    restored_states: list[dict[str, str]] = []
+
+    class TransactionalDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_execute(self, action: PlanAction) -> object:
+            return SimpleNamespace(
+                applied=False,
+                reason="hvac_automation_rollback_failed",
+                pre_state={"automation.hvac": "on"},
+                post_state={"automation.hvac": "off"},
+                saved_automation_states={"automation.hvac": "on"},
+                rollback_succeeded=False,
+            )
+
+        async def async_restore(self, states: dict[str, str]) -> object:
+            restored_states.append(dict(states))
+            return SimpleNamespace(
+                applied=True,
+                reason="hvac_automation_state_restored",
+                pre_state={"automation.hvac": "off"},
+                post_state={"automation.hvac": "on"},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", TransactionalDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-rollback",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"hvac_mode": "cool"},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "heat"}),
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={**DEFAULT_OPTIONS, CONF_CLIMATE_CONTROL_ENABLED: True, "planner_enabled": True, "dry_run": False},
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+    assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+    outcome = asyncio.run(executor.async_restore_safe_state("retry"))
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored_states == [{"automation.hvac": "on"}]
+    assert store.data["ownership"] == {}
+
+
 def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object) -> None:
     class FakeEnphaseAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -1621,10 +2080,92 @@ def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object
     assert "enphase_profile_changed_at" in store.data["ownership"]
 
 
-def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object) -> None:
-    class FakeEVAdapter:
+def test_executor_retains_uncertain_enphase_command_until_safe_restore(monkeypatch: object) -> None:
+    restored_profiles: list[str] = []
+
+    class UncertainEnphaseAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
+
+        async def async_execute(self, action: PlanAction) -> object:
+            return SimpleNamespace(
+                applied=False,
+                reason="enphase_profile_not_confirmed_rollback_failed",
+                pre_state={CONF_ENPHASE_PROFILE: "AI Optimisation"},
+                post_state={CONF_ENPHASE_PROFILE: "unknown"},
+                saved_profile="AI Optimisation",
+                changed_profile_at=False,
+                command_sent=True,
+                rollback_succeeded=False,
+            )
+
+        async def async_restore_profile(self, profile: str) -> object:
+            restored_profiles.append(profile)
+            return SimpleNamespace(
+                applied=True,
+                reason="enphase_profile_applied",
+                pre_state={CONF_ENPHASE_PROFILE: "unknown"},
+                post_state={CONF_ENPHASE_PROFILE: "AI Optimisation"},
+            )
+
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", UncertainEnphaseAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "enphase-uncertain",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.ENPHASE,
+        ActionKind.SET_PROFILE,
+        {"profile": "Self-Consumption"},
+        [],
+        [],
+        1.0,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=FakeHass({"select.enphase": "AI Optimisation"}),
+        entry_data={
+            CONF_ENPHASE_PROFILE: "select.enphase",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+        options={**DEFAULT_OPTIONS, CONF_ENPHASE_CONTROL_ENABLED: True, "planner_enabled": True, "dry_run": False},
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+    assert store.data["ownership"]["enphase_profile"] == "AI Optimisation"
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    outcome = asyncio.run(executor.async_restore_safe_state("retry"))
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored_profiles == ["AI Optimisation"]
+    assert store.data["ownership"] == {}
+
+
+def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object) -> None:
+    ev_adapter_kwargs: list[dict[str, Any]] = []
+
+    class FakeEVAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any], **kwargs: Any) -> None:
+            ev_adapter_kwargs.append(kwargs)
 
         async def async_restore(self, state: dict[str, Any]) -> object:
             return type(
@@ -1666,7 +2207,14 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
         "enphase_profile": "AI Optimisation",
         "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
     }
-    executor = Executor(store, hass=FakeHass())
+    executor = Executor(
+        store,
+        hass=FakeHass(),
+        options={
+            CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 17,
+            CONF_EV_CONFIRMATION_RETRIES: 4,
+        },
+    )
 
     outcome = asyncio.run(executor.async_restore_safe_state("manual"))
 
@@ -1682,6 +2230,12 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
         "enphase_profile",
         "enphase_profile_changed_at",
         "ev_smart_charging_state",
+    ]
+    assert ev_adapter_kwargs == [
+        {
+            "confirmation_timeout_seconds": 17.0,
+            "confirmation_retries": 4,
+        }
     ]
 
 
@@ -1704,9 +2258,156 @@ def test_executor_restore_safe_state_retains_ownership_without_hass() -> None:
     assert store.data["ownership"] == ownership
 
 
+def test_executor_restore_confirms_reservation_only_ev_stop() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass({"switch.ev_charger": "on"})
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: "switch.ev_charger"},
+        options={CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0},
+        entry_id="ev-a",
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert hass.services.calls[0] == (
+        "switch",
+        "turn_off",
+        {"entity_id": "switch.ev_charger"},
+    )
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["ev_grid_reservation"] == {"active": False}
+
+
+def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.old_charging": "disconnected",
+            "button.old_stop": "unknown",
+            "switch.new_charger": "on",
+        }
+    )
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {"ev-a": reservation},
+        }
+    }
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_command_entity_id": "button.old_start",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGING: "binary_sensor.old_charging",
+            CONF_EV_CHARGER_STOP: "button.old_stop",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER: "switch.new_charger",
+        },
+        options={CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0},
+        entry_id="ev-a",
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert outcome.reason == (
+        "entry_unload:ev_stop_not_confirmed:enphase_ai_profile_not_configured"
+    )
+    assert hass.services.calls[0] == (
+        "button",
+        "press",
+        {"entity_id": "button.old_stop"},
+    )
+    assert all(
+        call[2].get("entity_id") != "switch.new_charger"
+        for call in hass.services.calls
+    )
+    retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert retained["retain_when_unloaded"] is True
+    assert store.data["ev_grid_reservation"]["active"] is True
+    assert store.data["ownership"] == {
+        "ev_smart_charging_command_entity_id": "button.old_start",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGING: "binary_sensor.old_charging",
+            CONF_EV_CHARGER_STOP: "button.old_stop",
+        },
+    }
+
+
+def test_executor_restore_uses_owned_ev_control_topology_after_reconfigure() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.old_charging": "off",
+            "button.old_start": "unknown",
+            "input_boolean.old_stop": "on",
+            "button.new_start": "unknown",
+            "input_boolean.new_stop": "on",
+        }
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {
+            CONF_EV_CHARGER_START: "unknown",
+            CONF_EV_CHARGER_STOP: "on",
+        },
+        "ev_smart_charging_command_entity_id": "button.old_start",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGING: "binary_sensor.old_charging",
+            CONF_EV_CHARGER_START: "button.old_start",
+            CONF_EV_CHARGER_STOP: "input_boolean.old_stop",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER_START: "button.new_start",
+            CONF_EV_CHARGER_STOP: "input_boolean.new_stop",
+        },
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert store.data["ownership"] == {}
+    assert hass.services.calls[0] == (
+        "input_boolean",
+        "turn_off",
+        {"entity_id": "input_boolean.old_stop"},
+    )
+    assert all(
+        call[2].get("entity_id") != "input_boolean.new_stop"
+        for call in hass.services.calls
+    )
+    assert hass.states.values["input_boolean.new_stop"] == "on"
+
+
 def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch: object) -> None:
     class RaisingEVAdapter:
-        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+        def __init__(self, hass: object, entry_data: dict[str, Any], **kwargs: Any) -> None:
             pass
 
         async def async_restore(self, state: dict[str, Any]) -> object:
@@ -1743,7 +2444,7 @@ def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch
 
 def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypatch: object) -> None:
     class SuccessfulEVAdapter:
-        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+        def __init__(self, hass: object, entry_data: dict[str, Any], **kwargs: Any) -> None:
             pass
 
         async def async_restore(self, state: dict[str, Any]) -> object:
@@ -1846,3 +2547,2543 @@ def test_executor_message_and_service_target_helpers_cover_edge_cases() -> None:
         "Summary.",
         [],
     )
+
+
+def test_multiple_ev_entries_share_atomic_grid_capacity_reservations() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_a_connected": "on",
+            "binary_sensor.ev_b_connected": "on",
+            "input_boolean.ev_a_charger": "off",
+            "input_boolean.ev_b_charger": "off",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object()),
+            SimpleNamespace(entry_id="ev-b", runtime_data=object()),
+        ]
+    )
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_EV_CHARGE_RATE_KW: 7.0,
+        CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+    }
+    store_a = FakeStore()
+    store_b = FakeStore()
+    executor_a = Executor(
+        store_a,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_a_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_a_charger",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    executor_b = Executor(
+        store_b,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_b_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_b_charger",
+        },
+        options=options,
+        entry_id="ev-b",
+    )
+    _arm_store(store_a, executor_a)
+    _arm_store(store_b, executor_b)
+
+    def plan_for(entry_id: str, kind: ActionKind, charging: bool) -> EnergyPlan:
+        action = PlanAction(
+            action_id=f"{entry_id}-{kind}",
+            plan_id=f"plan-{entry_id}-{kind}",
+            execute_not_before=now - timedelta(minutes=1),
+            execute_not_after=now + timedelta(minutes=1),
+            asset=ActionAsset.EV,
+            kind=kind,
+            desired_state={
+                "charging_required_now": charging,
+                "projected_load_kw_now": 7.0 if charging else 0.0,
+            },
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=None,
+            confidence=1.0,
+            requires_haeo_plan_id=None,
+        )
+        return EnergyPlan(
+            plan_id=action.plan_id,
+            created_at=now,
+            horizon_hours=24,
+            interval_minutes=5,
+            status="current",
+            health=InputHealth.HEALTHY,
+            mode=PlannerMode.ACTIVE_HEALTHY,
+            summary="test",
+            confidence=1.0,
+            estimated_daily_cost=None,
+            actions=[action],
+            preview=[],
+        )
+
+    context_a = _context(now)
+    context_a.ev_connected = True
+    context_a.slots[0].projected_ev_load_kw = 7.0
+    context_b = _context(now)
+    context_b.ev_connected = True
+    context_b.slots[0].projected_ev_load_kw = 7.0
+
+    asyncio.run(executor_a.async_evaluate(plan_for("ev-a", ActionKind.EV_START, True), context_a))
+    asyncio.run(executor_b.async_evaluate(plan_for("ev-b", ActionKind.EV_START, True), context_b))
+
+    assert store_a.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store_b.data["outcomes"][-1].result == OutcomeResult.REJECTED
+    assert store_b.data["outcomes"][-1].reason == "multi_ev_grid_import_limit_exceeded"
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
+
+    asyncio.run(executor_a.async_evaluate(plan_for("ev-a", ActionKind.EV_STOP, False), context_a))
+    asyncio.run(executor_b.async_evaluate(plan_for("ev-b", ActionKind.EV_START, True), context_b))
+
+    assert store_a.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store_b.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-b"}
+
+    disconnected = _context(now)
+    disconnected.ev_connected = False
+    empty_plan = plan_for("ev-b", ActionKind.EV_STOP, False)
+    empty_plan.actions = []
+    asyncio.run(executor_b.async_evaluate(empty_plan, disconnected))
+
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store_b.data["ownership"] == {}
+    assert store_b.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store_b.data["outcomes"][-1].desired_state["charging_reason"] == "ev_disconnected_safety_stop"
+
+
+def test_manual_ev_commands_share_capacity_and_release_it_on_stop() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_a_connected": "on",
+            "binary_sensor.ev_b_connected": "on",
+            "input_boolean.ev_a_charger": "off",
+            "input_boolean.ev_b_charger": "off",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object()),
+            SimpleNamespace(entry_id="ev-b", runtime_data=object()),
+        ]
+    )
+    options = {
+        CONF_EV_CHARGE_RATE_KW: 7.0,
+        CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+    }
+    store_a = FakeStore()
+    store_b = FakeStore()
+    executor_a = Executor(
+        store_a,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_a_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_a_charger",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    executor_b = Executor(
+        store_b,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_b_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_b_charger",
+        },
+        options=options,
+        entry_id="ev-b",
+    )
+    context_a = _context(now)
+    context_b = _context(now)
+
+    started_a = asyncio.run(executor_a.async_manual_ev_charging(True, context_a))
+    blocked_b = asyncio.run(executor_b.async_manual_ev_charging(True, context_b))
+    assert store_a.data["ownership"]["ev_smart_charging_command_entity_id"] == (
+        "input_boolean.ev_a_charger"
+    )
+
+    stopped_a = asyncio.run(executor_a.async_manual_ev_charging(False, None))
+    started_b = asyncio.run(executor_b.async_manual_ev_charging(True, context_b))
+
+    assert started_a.applied is True
+    assert blocked_b.applied is False
+    assert blocked_b.reason == "multi_ev_grid_import_limit_exceeded"
+    assert stopped_a.applied is True
+    assert store_a.data["ownership"] == {}
+    assert started_b.applied is True
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-b"}
+
+
+def test_manual_ev_start_is_safety_stopped_while_planner_is_disabled_and_dry_run() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_charger": "off",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object()),
+            SimpleNamespace(entry_id="ev-b", runtime_data=object()),
+        ]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_charger",
+        },
+        options={
+            **DEFAULT_OPTIONS,
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    started = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+    assert started.applied is True
+    assert hass.states.values["input_boolean.ev_charger"] == "on"
+
+    inactive_context = _context(now)
+    inactive_context.ev_connected = True
+    inactive_context.active_overrides = [
+        Override(
+            kind="manual_ev_charging",
+            source="button",
+            expires_at=now + timedelta(hours=1),
+            reason="manual_start",
+        )
+    ]
+    inactive_plan = EnergyPlan(
+        plan_id="inactive-disconnect",
+        created_at=now - timedelta(minutes=10),
+        horizon_hours=24,
+        interval_minutes=5,
+        status="disabled",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.DISABLED,
+        summary="Planner disabled and dry-run enabled",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+
+    asyncio.run(executor.async_evaluate(inactive_plan, inactive_context))
+
+    assert hass.states.values["input_boolean.ev_charger"] == "on"
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
+        "ev-a"
+    }
+
+    hass.states.values["binary_sensor.ev_connected"] = "off"
+    inactive_context.ev_connected = False
+    asyncio.run(executor.async_evaluate(inactive_plan, inactive_context))
+
+    assert hass.states.values["input_boolean.ev_charger"] == "off"
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["ownership"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert (
+        store.data["outcomes"][-1].desired_state["charging_reason"]
+        == "ev_disconnected_safety_stop"
+    )
+
+
+def test_manual_ev_stop_uses_owned_topology_after_reconfigure() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "switch.old_charger": "on",
+            "switch.new_charger": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+        "ev_smart_charging_command_entity_id": "switch.old_charger",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER: "switch.old_charger",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: "switch.new_charger"},
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(False, None))
+
+    assert result.applied is True
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
+    ]
+    assert hass.states.values["switch.old_charger"] == "off"
+    assert hass.states.values["switch.new_charger"] == "on"
+    assert store.data["ownership"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].service_target == "switch.old_charger"
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["outcomes"][-1].service_target == "switch.old_charger"
+
+
+def test_compensated_manual_ev_stop_is_successful() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "unavailable",
+            "switch.ev_charger": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+        "ev_smart_charging_command_entity_id": "switch.ev_charger",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER: "switch.ev_charger",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev_charger",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+            CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0,
+            CONF_EV_CONFIRMATION_RETRIES: 0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(False, None))
+
+    assert result.applied is True
+    assert result.reason == "ev_safe_stop_compensated"
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
+        ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
+    ]
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert "control_pause" not in store.data
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].reason == "ev_safe_stop_compensated"
+
+
+def test_unconfirmed_owned_manual_ev_stop_fails_closed() -> None:
+    now = datetime.now(UTC)
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass = FakeHass(
+        {
+            "input_boolean.ev_start": "off",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {"ev-a": reservation},
+        }
+    }
+    ownership = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER_START: "off"},
+        "ev_smart_charging_command_entity_id": "input_boolean.ev_start",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER_START: "input_boolean.ev_start",
+            CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+        },
+    }
+    store = FakeStore()
+    store.data["ownership"] = ownership
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER_START: "input_boolean.ev_start",
+            CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(False, None))
+
+    assert result.applied is False
+    assert result.reason == "ev_stop_not_confirmed"
+    assert store.data["ownership"] == ownership
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"] == {
+        **reservation,
+        "retain_when_unloaded": True,
+    }
+    assert store.data["control_pause"]["reason"] == "ev_stop_not_confirmed"
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+
+
+def test_manual_ev_start_rejects_missing_grid_projection_context() -> None:
+    hass = FakeHass()
+    hass.data = {}
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(True, None))
+    unavailable_context = _context(datetime.now(UTC))
+    unavailable_context.slots[0].baseline_load_forecast_kw = None
+    unavailable_context.slots[0].pv_forecast_kw = None
+    unavailable_result = asyncio.run(executor.async_manual_ev_charging(True, unavailable_context))
+    stale_context = _context(datetime.now(UTC) - timedelta(hours=3))
+    stale_result = asyncio.run(executor.async_manual_ev_charging(True, stale_context))
+    expired_plan_context = _context(datetime.now(UTC) - timedelta(minutes=6))
+    expired_plan_result = asyncio.run(executor.async_manual_ev_charging(True, expired_plan_context))
+    future_context = _context(datetime.now(UTC) + timedelta(minutes=1))
+    future_result = asyncio.run(executor.async_manual_ev_charging(True, future_context))
+    unsafe_context = _context(datetime.now(UTC))
+    unsafe_context.input_health = InputHealth.UNSAFE
+    unsafe_result = asyncio.run(executor.async_manual_ev_charging(True, unsafe_context))
+    naive_context = _context(datetime.now(UTC))
+    naive_context.created_at = datetime.now()
+    naive_result = asyncio.run(executor.async_manual_ev_charging(True, naive_context))
+
+    assert result.applied is False
+    assert result.reason == "ev_grid_projection_unavailable"
+    assert unavailable_result.applied is False
+    assert unavailable_result.reason == "ev_grid_projection_unavailable"
+    assert stale_result.reason == "ev_grid_projection_stale"
+    assert expired_plan_result.reason == "ev_grid_projection_stale"
+    assert future_result.reason == "ev_grid_projection_stale"
+    assert unsafe_result.reason == "ev_grid_projection_unsafe"
+    assert naive_result.reason == "ev_grid_projection_stale"
+    assert hass.services.calls == []
+    assert all(outcome.result == OutcomeResult.REJECTED for outcome in executor.store.data["outcomes"])
+
+
+def test_manual_ev_start_rejects_control_without_safe_stop_path() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass({"button.ev_control": "unknown"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_SMART_CHARGING: "button.ev_control"},
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+
+    assert result.applied is False
+    assert result.reason == "ev_stop_control_unsupported"
+    assert hass.services.calls == []
+    assert hass.data.get("ha_energy_planner", {}).get(
+        "ev_grid_reservations",
+        {},
+    ) == {}
+    assert store.data["ownership"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.REJECTED
+
+
+def test_successful_manual_ev_start_is_owned_and_restorable() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_charger": "off",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_charger",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    started = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+
+    assert started.applied is True
+    assert store.data["ownership"]["ev_smart_charging_state"][CONF_EV_CHARGER] == "off"
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
+
+    restored = asyncio.run(executor.async_restore_safe_state("manual"))
+
+    assert restored.result == OutcomeResult.RESTORED
+    assert hass.states.values["input_boolean.ev_charger"] == "off"
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+
+
+def test_manual_ev_start_adopts_and_restores_already_active_charger() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_charger": "on",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "switch.ev_charger",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    started = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+
+    assert started.applied is True
+    assert started.reason == "already_in_desired_state"
+    assert started.command_sent is False
+    assert store.data["ownership"]["ev_smart_charging_state"] == {
+        CONF_EV_CHARGER: "on",
+        CONF_EV_CONNECTED: "on",
+    }
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
+        "ev-a"
+    }
+    assert hass.services.calls == []
+
+    restored = asyncio.run(executor.async_restore_safe_state("entry_unload"))
+
+    assert restored.result == OutcomeResult.RESTORED
+    assert hass.states.values["switch.ev_charger"] == "on"
+    assert all(call[1] != "turn_off" for call in hass.services.calls)
+    assert store.data["ownership"] == {}
+    reservation = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert reservation["external_baseline"] is True
+    assert reservation["retain_when_unloaded"] is True
+    assert store.data["ev_grid_reservation"]["active"] is True
+    assert store.data["ev_grid_reservation"]["external_baseline"] is True
+    assert executor._has_ev_grid_reservation() is False
+
+    other_executor = Executor(
+        FakeStore(),
+        hass=hass,
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-b",
+    )
+    reason, _previous = other_executor._reserve_ev_grid_capacity(
+        SimpleNamespace(
+            kind=ActionKind.EV_START,
+            desired_state={"projected_load_kw_now": 7.0},
+        ),
+        _context(now),
+        now,
+    )
+
+    assert reason == "multi_ev_grid_import_limit_exceeded"
+
+
+def test_external_ev_reservation_helper_handles_missing_runtime_state() -> None:
+    Executor(FakeStore())._retain_external_ev_grid_reservation()
+
+    hass = FakeHass()
+    hass.data = {}
+    executor = Executor(FakeStore(), hass=hass, entry_id="ev-a")
+
+    executor._retain_external_ev_grid_reservation()
+
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+
+
+def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
+    monkeypatch: object,
+) -> None:
+    result = SimpleNamespace(
+        applied=False,
+        reason="ev_charging_confirmation_timeout",
+        pre_state={CONF_EV_SMART_CHARGING_START: "off"},
+        post_state={CONF_EV_SMART_CHARGING_START: "on"},
+        command_sent=True,
+        rollback_succeeded=False,
+    )
+
+    class UncertainAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_set_charging(self, enabled: bool) -> Any:
+            assert enabled is True
+            assert store.data["ev_grid_reservation"]["active"] is True
+            assert store.data["ownership"][
+                "ev_smart_charging_command_entity_id"
+            ] == executor_module._ev_command_entity_for_action(
+                SimpleNamespace(
+                    asset=ActionAsset.EV,
+                    kind=ActionKind.EV_START,
+                    desired_state={"charging_required_now": True},
+                ),
+                executor.entry_data,
+            )
+            return result
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", UncertainAdapter)
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "button.ev_start": "unknown",
+            "button.ev_stop": "unknown",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_SMART_CHARGING_START: "button.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    actual = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+
+    assert actual is result
+    assert store.data["ownership"]["ev_smart_charging_state"] == result.pre_state
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
+    reservation = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert reservation["retain_when_unloaded"] is True
+    assert store.data["control_pause"]["reason"] == "ev_charging_confirmation_timeout"
+    assert isinstance(store.data["command_rate_limits"]["ev:ev_start"], datetime)
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    assert store.data["outcomes"][-1].action_id == "manual_ev_start"
+
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [])
+    executor._discard_stale_ev_grid_reservations(hass.data["ha_energy_planner"]["ev_grid_reservations"])
+
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
+
+
+def test_manual_ev_rolled_back_start_clears_provisional_recovery_state(
+    monkeypatch: object,
+) -> None:
+    class RolledBackAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_set_charging(self, enabled: bool) -> Any:
+            assert enabled is True
+            return SimpleNamespace(
+                applied=False,
+                reason="ev_charging_confirmation_timeout",
+                pre_state={CONF_EV_CHARGER: "off"},
+                post_state={CONF_EV_CHARGER: "off"},
+                command_sent=True,
+                rollback_succeeded=True,
+                safe_state_confirmed=True,
+            )
+
+    monkeypatch.setattr(
+        executor_module,
+        "EVSmartChargingAdapter",
+        RolledBackAdapter,
+    )
+    now = datetime.now(UTC)
+    hass = FakeHass({"switch.ev_charger": "off"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: "switch.ev_charger"},
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    result = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+
+    assert result.rollback_succeeded is True
+    assert store.data["ownership"] == {}
+    assert store.data["ev_grid_reservation"] == {"active": False}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+
+
+def test_ev_grid_reservation_counts_load_missing_from_context_projection() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+    context = _context(now)
+    context.slots[0].baseline_load_forecast_kw = 8.0
+    action = SimpleNamespace(
+        kind=ActionKind.EV_START,
+        desired_state={"projected_load_kw_now": 7.0},
+    )
+
+    reason, previous = executor._reserve_ev_grid_capacity(action, context, now)
+
+    assert reason == "multi_ev_grid_import_limit_exceeded"
+    assert previous is None
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+
+
+def test_ev_grid_reservations_keep_only_each_entrys_configured_limit() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id=entry_id, runtime_data=object()) for entry_id in ("ev-a", "ev-b", "ev-c", "ev-d")
+        ]
+    )
+
+    def executor(entry_id: str, limit_kw: float) -> Executor:
+        return Executor(
+            FakeStore(),
+            hass=hass,
+            options={
+                CONF_EV_CHARGE_RATE_KW: 2.0,
+                CONF_GRID_IMPORT_LIMIT_KW: limit_kw,
+            },
+            entry_id=entry_id,
+        )
+
+    def reserve(target: Executor, load_kw: float) -> str | None:
+        context = _context(now)
+        context.slots[0].baseline_load_forecast_kw = 0.0
+        context.slots[0].projected_ev_load_kw = load_kw
+        action = SimpleNamespace(
+            kind=ActionKind.EV_START,
+            desired_state={"projected_load_kw_now": load_kw},
+        )
+        reason, _previous = target._reserve_ev_grid_capacity(action, context, now)
+        return reason
+
+    executor_a = executor("ev-a", 10.0)
+    executor_b = executor("ev-b", 8.0)
+    executor_c = executor("ev-c", 12.0)
+    executor_d = executor("ev-d", 12.0)
+
+    assert reserve(executor_a, 2.0) is None
+    assert reserve(executor_b, 2.0) is None
+    assert reserve(executor_c, 2.0) is None
+    reservations = hass.data["ha_energy_planner"]["ev_grid_reservations"]
+    assert reservations["ev-c"]["limit_kw"] == 12.0
+
+    executor_b._release_ev_grid_reservation()
+
+    assert reserve(executor_d, 5.0) is None
+    assert set(reservations) == {"ev-a", "ev-c", "ev-d"}
+
+
+def test_active_ev_reservation_synchronizes_changed_options() -> None:
+    now = datetime.now(UTC)
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+        "retain_when_unloaded": True,
+    }
+    hass = FakeHass()
+    hass.data = {"ha_energy_planner": {"ev_grid_reservations": {"ev-a": reservation}}}
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        options={
+            CONF_EV_CHARGE_RATE_KW: 11.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 8.0,
+        },
+        entry_id="ev-a",
+    )
+
+    executor.sync_ev_grid_reservation()
+    asyncio.run(executor.async_persist_ev_grid_reservation())
+
+    assert reservation == {
+        "load_kw": 11.0,
+        "limit_kw": 8.0,
+        "reserved_at": now.isoformat(),
+        "retain_when_unloaded": True,
+    }
+    assert store.data["ev_grid_reservation"]["active"] is True
+    assert store.data["ev_grid_reservation"]["load_kw"] == 11.0
+
+    executor._release_ev_grid_reservation()
+    asyncio.run(executor.async_persist_ev_grid_reservation())
+
+    assert store.data["ev_grid_reservation"] == {"active": False}
+
+
+def test_ev_grid_reservation_uses_store_persistence_api() -> None:
+    class PersistingStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.saved_reservation: dict[str, Any] | None = None
+
+        async def async_save_ev_grid_reservation(
+            self,
+            reservation: dict[str, Any],
+        ) -> None:
+            self.saved_reservation = reservation
+
+    store = PersistingStore()
+    executor = Executor(store)
+
+    asyncio.run(executor.async_persist_ev_grid_reservation())
+
+    assert store.saved_reservation == {"active": False}
+
+
+def test_ev_keep_on_command_target_uses_persistent_control() -> None:
+    action = SimpleNamespace(desired_state={"keep_charger_on": True})
+
+    assert (
+        _ev_command_entity_for_action(
+            action,
+            {"ev_charger_entity": "switch.ev_control"},
+        )
+        == "switch.ev_control"
+    )
+
+
+def test_active_ev_reservation_does_not_shrink_from_an_options_change() -> None:
+    now = datetime.now(UTC)
+    reservation = {
+        "load_kw": 11.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass = FakeHass()
+    hass.data = {"ha_energy_planner": {"ev_grid_reservations": {"ev-a": reservation}}}
+    executor = Executor(
+        FakeStore(),
+        hass=hass,
+        options={
+            CONF_EV_CHARGE_RATE_KW: 3.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 8.0,
+            CONF_PLANNING_INTERVAL_MINUTES: 5,
+        },
+        entry_id="ev-a",
+    )
+
+    executor.sync_ev_grid_reservation()
+
+    assert reservation["load_kw"] == 11.0
+    assert reservation["limit_kw"] == 8.0
+
+    context = _context(now)
+    context.slots[0].pv_forecast_kw = 20.0
+    context.slots[0].baseline_load_forecast_kw = 0.0
+    context.slots[0].projected_ev_load_kw = 3.0
+    action = SimpleNamespace(
+        kind=ActionKind.EV_START,
+        desired_state={"projected_load_kw_now": 3.0},
+    )
+
+    reason, previous = executor._reserve_ev_grid_capacity(action, context, now)
+
+    assert reason is None
+    assert previous is reservation
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]["load_kw"] == 11.0
+
+
+def test_manual_ev_start_honors_backoff_while_stop_remains_available() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "input_boolean.ev_start": "off",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {}
+    store = FakeStore()
+    store.data["control_pause"] = {
+        "active": True,
+        "assets": ["ev"],
+        "until": now + timedelta(minutes=10),
+        "reason": "ev_charging_confirmation_timeout",
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+        options={
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+
+    start = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+    store.data["control_pause"] = {}
+    store.data["command_rate_limits"] = {"ev:ev_start": now}
+    executor.options[CONF_COMMAND_RATE_LIMIT_SECONDS] = 60
+    rate_limited_start = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+    stop = asyncio.run(executor.async_manual_ev_charging(False, None))
+
+    assert start.applied is False
+    assert start.reason == "ev_control_paused"
+    assert store.data["outcomes"][0].result == OutcomeResult.REJECTED
+    assert rate_limited_start.applied is False
+    assert rate_limited_start.reason == "device_command_rate_limited"
+    assert store.data["outcomes"][1].result == OutcomeResult.REJECTED
+    assert stop.applied is True
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+
+
+def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "button.ev_start": "unavailable",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_COMMAND_RATE_LIMIT_SECONDS: 3600,
+        CONF_MAX_DAILY_EV_ACTIONS: 1,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_START: "button.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    store.data["control_pause"] = {
+        "active": True,
+        "assets": ["ev"],
+        "until": now + timedelta(minutes=10),
+        "reason": "ev_charging_confirmation_timeout",
+    }
+    store.data["command_rate_limits"] = {"ev:ev_stop": now}
+    store.data["execution_audit"] = [{"asset": "ev", "result": "applied", "attempted_at": now}]
+    action = PlanAction(
+        action_id="ev-stop",
+        plan_id="plan-stop",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_STOP,
+        desired_state={"charging_required_now": False},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="plan-stop",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="stop",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = True
+    context.input_health = InputHealth.UNSAFE
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert store.data["ownership"] == {}
+
+
+def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "switch.ev_charger": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "on"},
+        "ev_smart_charging_command_entity_id": "switch.ev_charger",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER: "switch.ev_charger"
+        },
+    }
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "switch.ev_charger",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    action = PlanAction(
+        action_id="regular-owned-stop",
+        plan_id="regular-owned-stop-plan",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={"charging_required_now": False},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="regular-owned-stop-plan",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="regular stop",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = True
+
+    asyncio.run(executor.async_evaluate(plan, context))
+    calls_after_stop = list(hass.services.calls)
+    asyncio.run(executor.async_restore_safe_state("entry_unload"))
+
+    assert calls_after_stop == [
+        ("switch", "turn_off", {"entity_id": "switch.ev_charger"})
+    ]
+    assert not any(
+        domain == "switch"
+        and service == "turn_on"
+        and data.get("entity_id") == "switch.ev_charger"
+        for domain, service, data in hass.services.calls
+    )
+    assert hass.states.values["switch.ev_charger"] == "off"
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["outcomes"][0].result == OutcomeResult.APPLIED
+
+
+def test_regular_planner_owned_stop_requires_confirmed_safe_state(
+    monkeypatch: object,
+) -> None:
+    class SupportedDiscovery:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def inspect(self) -> SupportedDiscovery:
+            return self
+
+        def for_asset(self, asset: Any) -> Any:
+            return SimpleNamespace(supported=True, issues=[])
+
+    class UnconfirmedStopAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_execute(self, action: Any) -> Any:
+            return SimpleNamespace(
+                applied=True,
+                reason="ev_stop_command_accepted",
+                pre_state={CONF_EV_CHARGER: "on"},
+                post_state={CONF_EV_CHARGER: "off"},
+                command_sent=True,
+                rollback_succeeded=False,
+                safe_state_confirmed=False,
+            )
+
+    monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
+    monkeypatch.setattr(
+        executor_module,
+        "EVSmartChargingAdapter",
+        UnconfirmedStopAdapter,
+    )
+    now = datetime.now(UTC)
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {"ev-a": reservation}
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    ownership = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "on"},
+        "ev_smart_charging_command_entity_id": "switch.ev_charger",
+    }
+    store.data["ownership"] = ownership
+    executor = Executor(
+        store,
+        hass=hass,
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    action = PlanAction(
+        "regular-unconfirmed-stop",
+        "regular-unconfirmed-plan",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.EV,
+        ActionKind.EV_STOP,
+        {"charging_required_now": False},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "regular-unconfirmed-plan",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "regular unconfirmed stop",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    context = _context(now)
+    context.ev_connected = True
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    assert store.data["outcomes"][-1].reason == "ev_stop_not_confirmed"
+    assert store.data["ownership"] == ownership
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"][
+        "retain_when_unloaded"
+    ] is True
+
+
+def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "off",
+            "button.ev_start": "unavailable",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {
+            CONF_EV_SMART_CHARGING_START: "off",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_start",
+    }
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_START: "button.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    plan = EnergyPlan(
+        plan_id="unsafe-plan",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="unsafe",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+    context = _context(now)
+    context.input_health = InputHealth.UNSAFE
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert store.data["ownership"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].desired_state["input_health_safety_stop"] is True
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert len(hass.services.calls) == 1
+    assert len(store.data["outcomes"]) == 1
+
+
+def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "off",
+            "button.ev_start": "unknown",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {
+            CONF_EV_SMART_CHARGING_START: "unknown",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_start",
+    }
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_START: "button.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    action = PlanAction(
+        action_id="ev-start",
+        plan_id="grid-degraded-plan",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={
+            "charging_required_now": True,
+            "projected_load_kw_now": 7.0,
+        },
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="grid-degraded-plan",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="grid limit exceeded",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+        input_issues=["grid_import_limit_exceeded"],
+    )
+    context = _context(now)
+    context.ev_connected = True
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].desired_state["charging_reason"] == "ev_grid_import_limit_exceeded_safety_stop"
+
+
+def test_disabling_ev_control_stops_owned_power_before_honouring_gate() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "off",
+            "button.ev_start": "unknown",
+            "input_boolean.ev_stop": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {
+            CONF_EV_SMART_CHARGING_START: "unknown",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_start",
+    }
+    enabled_options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_START: "button.ev_start",
+            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+        },
+        options=enabled_options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    executor.options = {**enabled_options, CONF_EV_CONTROL_ENABLED: False}
+    action = PlanAction(
+        action_id="ev-start",
+        plan_id="ev-control-disabled-plan",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={
+            "charging_required_now": True,
+            "projected_load_kw_now": 7.0,
+        },
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="ev-control-disabled-plan",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="EV control disabled",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = True
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].desired_state["charging_reason"] == "ev_control_disabled_safety_stop"
+
+
+def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
+    monkeypatch: object,
+) -> None:
+    now = datetime.now(UTC)
+
+    class SupportedDiscovery:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def inspect(self) -> SupportedDiscovery:
+            return self
+
+        def for_asset(self, asset: Any) -> Any:
+            return SimpleNamespace(supported=True, issues=[])
+
+    class FailedStopAdapter:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def async_execute(self, action: Any) -> Any:
+            return SimpleNamespace(
+                applied=False,
+                reason="ev_stop_failed",
+                pre_state={"input_boolean.ev_stop": "on"},
+                post_state={"input_boolean.ev_stop": "on"},
+                command_sent=True,
+                rollback_succeeded=False,
+            )
+
+    monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedStopAdapter)
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 9.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": reservation,
+                "ev-b": {
+                    "load_kw": 3.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                },
+            },
+            "ev_grid_shedding_entry_id": "ev-a",
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id=entry_id, runtime_data=object())
+            for entry_id in ("ev-a", "ev-b")
+        ]
+    )
+    store = FakeStore()
+    ownership = {
+        "ev_smart_charging_state": {
+            CONF_EV_SMART_CHARGING_START: "off",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_start",
+    }
+    store.data["ownership"] = ownership
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    plan = EnergyPlan(
+        plan_id="disconnected-stop-failed",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="disconnected",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = False
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert retained["load_kw"] == 7.0
+    assert retained["retain_when_unloaded"] is True
+    assert store.data["ownership"] == ownership
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    assert "ev_grid_shedding_entry_id" not in hass.data["ha_energy_planner"]
+
+    executor_b = Executor(FakeStore(), hass=hass, entry_id="ev-b")
+    context_b = _context(now)
+    context_b.slots[0].baseline_load_forecast_kw = 0.0
+    context_b.slots[0].pv_forecast_kw = 0.0
+    context_b.slots[0].projected_ev_load_kw = 3.0
+    assert (
+        executor_b._ev_reservation_safety_issue(context_b)
+        == "multi_ev_grid_import_limit_exceeded"
+    )
+    assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-b"
+
+
+def test_disconnected_ev_retains_capacity_when_button_stop_is_unconfirmed() -> None:
+    now = datetime.now(UTC)
+    reservation = {
+        "load_kw": 7.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+    }
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "disconnected",
+            "button.ev_start": "unknown",
+            "button.ev_stop": "unknown",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {"ev-a": reservation},
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    ownership = {
+        "ev_smart_charging_state": {
+            CONF_EV_CHARGER_START: "unknown",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_start",
+    }
+    store.data["ownership"] = ownership
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_CHARGER_START: "button.ev_start",
+            CONF_EV_CHARGER_STOP: "button.ev_stop",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    plan = EnergyPlan(
+        plan_id="disconnected-button-stop",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="disconnected",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = False
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert retained["retain_when_unloaded"] is True
+    assert store.data["ownership"] == ownership
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    assert store.data["outcomes"][-1].reason == "ev_stop_not_confirmed"
+
+
+def test_compensated_owned_safety_stop_clears_ownership_and_capacity() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "unavailable",
+            "switch.ev_charger": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                }
+            }
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+        "ev_smart_charging_command_entity_id": "switch.ev_charger",
+    }
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0,
+        CONF_EV_CONFIRMATION_RETRIES: 0,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev_charger",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    plan = EnergyPlan(
+        plan_id="compensated-safety-stop",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="unsafe",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+    context = _context(now)
+    context.input_health = InputHealth.UNSAFE
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
+        ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
+    ]
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert "control_pause" not in store.data
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].reason == "ev_safe_stop_compensated"
+
+
+def test_owned_safety_stop_uses_persisted_topology_after_reconfigure() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "switch.old_charger": "on",
+            "switch.new_charger": "on",
+        }
+    )
+    hass.data = {"ha_energy_planner": {"ev_grid_reservations": {}}}
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+        "ev_smart_charging_command_entity_id": "switch.old_charger",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER: "switch.old_charger",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: "switch.new_charger"},
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    plan = EnergyPlan(
+        plan_id="old-topology-safety-stop",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="unsafe",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+    )
+    context = _context(now)
+    context.input_health = InputHealth.UNSAFE
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
+    ]
+    assert hass.states.values["switch.old_charger"] == "off"
+    assert hass.states.values["switch.new_charger"] == "on"
+    assert store.data["ownership"] == {}
+
+
+def test_recovered_reservation_stops_provisional_topology_before_new_start() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "switch.old_charger": "on",
+            "switch.new_charger": "off",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                },
+            },
+        },
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    store = FakeStore()
+    # This is the durable state possible after a service command is accepted
+    # but before its pre-state snapshot can be committed as full ownership.
+    store.data["ownership"] = {
+        "ev_smart_charging_command_entity_id": "switch.old_charger",
+        "ev_smart_charging_control_topology": {
+            CONF_EV_CHARGER: "switch.old_charger",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: "switch.new_charger"},
+        options={
+            **DEFAULT_OPTIONS,
+            "planner_enabled": True,
+            "dry_run": False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+        },
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    action = PlanAction(
+        action_id="new-topology-start",
+        plan_id="recovered-reservation",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={
+            "charging_required_now": True,
+            "projected_load_kw_now": 7.0,
+        },
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="recovered-reservation",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="recover provisional EV command",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = True
+    context.slots[0].projected_ev_load_kw = 7.0
+
+    manual_start = asyncio.run(
+        executor.async_manual_ev_charging(True, context)
+    )
+
+    assert manual_start.applied is False
+    assert manual_start.reason == "ev_recovery_stop_required"
+    assert hass.services.calls == []
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
+    ]
+    assert hass.states.values["switch.old_charger"] == "off"
+    assert hass.states.values["switch.new_charger"] == "off"
+    assert store.data["ownership"] == {}
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
+    assert (
+        store.data["outcomes"][-1].desired_state["charging_reason"]
+        == "ev_recovered_reservation_safety_stop"
+    )
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert store.data["outcomes"][-1].service_target == "switch.old_charger"
+
+
+def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_a_charging": "off",
+            "button.ev_a_start": "unknown",
+            "input_boolean.ev_a_stop": "on",
+        }
+    )
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 9.0,
+                    "reserved_at": (now - timedelta(minutes=2)).isoformat(),
+                },
+                "ev-b": {
+                    "load_kw": 3.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": (now - timedelta(minutes=1)).isoformat(),
+                },
+            },
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id=entry_id, runtime_data=object())
+            for entry_id in ("ev-a", "ev-b")
+        ]
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {
+            CONF_EV_CHARGER_START: "unknown",
+        },
+        "ev_smart_charging_command_entity_id": "button.ev_a_start",
+    }
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_EV_CHARGE_RATE_KW: 7.0,
+        CONF_GRID_IMPORT_LIMIT_KW: 9.0,
+    }
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGING: "binary_sensor.ev_a_charging",
+            CONF_EV_CHARGER_START: "button.ev_a_start",
+            CONF_EV_CHARGER_STOP: "input_boolean.ev_a_stop",
+        },
+        options=options,
+        entry_id="ev-a",
+    )
+    _arm_store(store, executor)
+    action = PlanAction(
+        action_id="ev-a-continue",
+        plan_id="multi-ev-over-limit",
+        execute_not_before=now - timedelta(minutes=1),
+        execute_not_after=now + timedelta(minutes=1),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={
+            "charging_required_now": True,
+            "projected_load_kw_now": 7.0,
+        },
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan = EnergyPlan(
+        plan_id="multi-ev-over-limit",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="shared limit changed",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[action],
+        preview=[],
+    )
+    context = _context(now)
+    context.ev_connected = True
+    context.slots[0].baseline_load_forecast_kw = 0.0
+    context.slots[0].pv_forecast_kw = 0.0
+    context.slots[0].projected_ev_load_kw = 7.0
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert hass.services.calls == [
+        (
+            "input_boolean",
+            "turn_off",
+            {"entity_id": "input_boolean.ev_a_stop"},
+        )
+    ]
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
+        "ev-b"
+    }
+    assert store.data["ownership"] == {}
+    assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
+    assert (
+        store.data["outcomes"][-1].desired_state["charging_reason"]
+        == "ev_multi_ev_grid_import_limit_exceeded_safety_stop"
+    )
+    assert "ev_grid_shedding_entry_id" not in hass.data["ha_energy_planner"]
+
+
+def test_multi_ev_limit_conflict_claims_only_one_shedding_entry() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 9.0,
+                    "reserved_at": now.isoformat(),
+                },
+                "ev-b": {
+                    "load_kw": 3.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                },
+            },
+            "ev_grid_shedding_entry_id": "missing-entry",
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id=entry_id, runtime_data=object())
+            for entry_id in ("ev-a", "ev-b")
+        ]
+    )
+    executor_a = Executor(FakeStore(), hass=hass, entry_id="ev-a")
+    executor_b = Executor(FakeStore(), hass=hass, entry_id="ev-b")
+    context_a = _context(now)
+    context_a.slots[0].baseline_load_forecast_kw = 0.0
+    context_a.slots[0].pv_forecast_kw = 0.0
+    context_a.slots[0].projected_ev_load_kw = 7.0
+    context_b = _context(now)
+    context_b.slots[0].baseline_load_forecast_kw = 0.0
+    context_b.slots[0].pv_forecast_kw = 0.0
+    context_b.slots[0].projected_ev_load_kw = 3.0
+
+    assert executor_a._ev_grid_shedding_claim() is None
+    assert (
+        executor_a._ev_reservation_safety_issue(context_a)
+        == "multi_ev_grid_import_limit_exceeded"
+    )
+    assert executor_b._ev_reservation_safety_issue(context_b) is None
+    assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-a"
+
+    executor_a._release_ev_grid_reservation()
+
+    assert "ev_grid_shedding_entry_id" not in hass.data["ha_energy_planner"]
+    assert executor_b._ev_reservation_safety_issue(context_b) is None
+
+
+def test_loaded_ev_can_replace_unloaded_retained_shedding_claim() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 9.0,
+                    "reserved_at": now.isoformat(),
+                    "retain_when_unloaded": True,
+                },
+                "ev-b": {
+                    "load_kw": 3.0,
+                    "limit_kw": 10.0,
+                    "reserved_at": now.isoformat(),
+                },
+            },
+            "ev_grid_shedding_entry_id": "ev-a",
+        },
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=None),
+            SimpleNamespace(entry_id="ev-b", runtime_data=object()),
+        ]
+    )
+    executor = Executor(FakeStore(), hass=hass, entry_id="ev-b")
+    context = _context(now)
+    context.slots[0].baseline_load_forecast_kw = 0.0
+    context.slots[0].pv_forecast_kw = 0.0
+    context.slots[0].projected_ev_load_kw = 3.0
+
+    assert executor._ev_grid_shedding_claim() is None
+    assert (
+        executor._ev_reservation_safety_issue(context)
+        == "multi_ev_grid_import_limit_exceeded"
+    )
+    assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-b"
+
+
+def test_single_ev_reservation_detects_tightened_import_limit() -> None:
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 11.0,
+                    "limit_kw": 8.0,
+                    "reserved_at": now.isoformat(),
+                },
+            },
+        },
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object())
+        ]
+    )
+    executor = Executor(FakeStore(), hass=hass, entry_id="ev-a")
+    context = _context(now)
+    context.slots[0].baseline_load_forecast_kw = 0.0
+    context.slots[0].pv_forecast_kw = 0.0
+    # The current plan reflects a reduced 3 kW option, but the running charger
+    # still owns the persisted 11 kW high-watermark until a confirmed stop.
+    context.slots[0].projected_ev_load_kw = 3.0
+
+    assert (
+        executor._ev_reservation_safety_issue(context)
+        == "grid_import_limit_exceeded"
+    )
+    assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-a"
+
+
+def test_ev_reservation_safety_issue_ignores_incomplete_or_safe_evidence() -> None:
+    now = datetime.now(UTC)
+    context = _context(now)
+    executor = Executor(FakeStore(), entry_id="ev-a")
+
+    assert executor._ev_reservation_safety_issue(context) is None
+
+    hass = FakeHass()
+    hass.data = {"ha_energy_planner": {"ev_grid_reservations": {}}}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id=entry_id, runtime_data=object())
+            for entry_id in ("ev-a", "ev-b")
+        ]
+    )
+    executor.hass = hass
+
+    assert executor._ev_reservation_safety_issue(context) is None
+
+    hass.data["ha_energy_planner"]["ev_grid_reservations"] = {
+        "ev-a": {
+            "load_kw": 2.0,
+            "limit_kw": 10.0,
+            "reserved_at": now.isoformat(),
+        },
+        "ev-b": {
+            "load_kw": 1.0,
+            "limit_kw": 10.0,
+            "reserved_at": now.isoformat(),
+        },
+    }
+    context.slots[0].baseline_load_forecast_kw = None
+    context.slots[0].pv_forecast_kw = None
+
+    assert executor._ev_reservation_safety_issue(context) is None
+
+    context.slots[0].baseline_load_forecast_kw = 1.0
+    context.slots[0].pv_forecast_kw = 0.0
+    context.slots[0].projected_ev_load_kw = 2.0
+
+    assert executor._ev_reservation_safety_issue(context) is None
+
+
+def test_ev_grid_reservation_reconciles_failed_commands(monkeypatch: object) -> None:
+    now = datetime.now(UTC)
+
+    class SupportedDiscovery:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def inspect(self) -> SupportedDiscovery:
+            return self
+
+        def for_asset(self, asset: Any) -> Any:
+            return SimpleNamespace(supported=True, issues=[])
+
+    monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
+
+    def execute(
+        *,
+        kind: ActionKind,
+        command_sent: bool,
+        rollback_succeeded: bool | None,
+        previous: dict[str, Any] | None,
+    ) -> dict[str, dict[str, Any]]:
+        result = SimpleNamespace(
+            applied=False,
+            reason="ev_failed",
+            pre_state={},
+            post_state={},
+            command_sent=command_sent,
+            rollback_succeeded=rollback_succeeded,
+        )
+
+        class FailedAdapter:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                pass
+
+            async def async_execute(self, action: Any) -> Any:
+                if action.kind != ActionKind.EV_STOP:
+                    assert store.flush_count == 1
+                    assert store.data["ev_grid_reservation"]["active"] is True
+                    assert store.data["ownership"].get(
+                        "ev_smart_charging_control_topology"
+                    ) == executor_module._ev_control_topology(executor.entry_data)
+                return result
+
+        monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedAdapter)
+        hass = FakeHass()
+        reservations = {"ev-a": previous} if previous is not None else {}
+        hass.data = {"ha_energy_planner": {"ev_grid_reservations": reservations}}
+        hass.config_entries = SimpleNamespace(
+            async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+        )
+        store = FakeStore()
+        executor = Executor(
+            store,
+            hass=hass,
+            options={
+                **DEFAULT_OPTIONS,
+                "planner_enabled": True,
+                "dry_run": False,
+                CONF_EV_CONTROL_ENABLED: True,
+                CONF_EV_CHARGE_RATE_KW: 7.0,
+                CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+            },
+            entry_id="ev-a",
+        )
+        _arm_store(store, executor)
+        action = PlanAction(
+            "ev",
+            "plan",
+            now - timedelta(minutes=1),
+            now + timedelta(minutes=1),
+            ActionAsset.EV,
+            kind,
+            {"charging_required_now": kind != ActionKind.EV_STOP},
+            [],
+            [],
+            None,
+            1.0,
+            None,
+        )
+        plan = EnergyPlan(
+            "plan",
+            now,
+            24,
+            5,
+            "current",
+            InputHealth.HEALTHY,
+            PlannerMode.ACTIVE_HEALTHY,
+            "test",
+            1.0,
+            None,
+            [action],
+            [],
+        )
+        context = _context(now)
+        context.ev_connected = True
+        context.slots[0].projected_ev_load_kw = 7.0
+
+        asyncio.run(executor.async_evaluate(plan, context))
+
+        return reservations
+
+    prior = {"load_kw": 6.0, "limit_kw": 10.0, "reserved_at": now.isoformat()}
+    assert (
+        execute(
+            kind=ActionKind.EV_START,
+            command_sent=True,
+            rollback_succeeded=True,
+            previous=None,
+        )
+        == {}
+    )
+    assert (
+        execute(
+            kind=ActionKind.EV_START,
+            command_sent=False,
+            rollback_succeeded=None,
+            previous=None,
+        )
+        == {}
+    )
+    assert execute(
+        kind=ActionKind.EV_START,
+        command_sent=False,
+        rollback_succeeded=None,
+        previous=prior,
+    ) == {"ev-a": prior}
+    assert execute(
+        kind=ActionKind.EV_STOP,
+        command_sent=False,
+        rollback_succeeded=False,
+        previous=prior,
+    ) == {"ev-a": prior}
+
+
+def test_ev_grid_reservation_defensive_branches() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "ev",
+        "plan",
+        now,
+        now,
+        ActionAsset.EV,
+        ActionKind.EV_SCHEDULE,
+        {"charging_required_now": True},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    previous = {"load_kw": 6.0, "limit_kw": 10.0, "reserved_at": now.isoformat()}
+    other = {"load_kw": 3.0, "limit_kw": 10.0, "reserved_at": now.isoformat()}
+    retained = {
+        "load_kw": 2.0,
+        "limit_kw": 10.0,
+        "reserved_at": now.isoformat(),
+        "retain_when_unloaded": True,
+    }
+    hass = FakeHass()
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": previous,
+                "ev-b": other,
+                "retained": retained,
+                "stale": other,
+            }
+        }
+    }
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="ev-a", runtime_data=object()),
+            SimpleNamespace(entry_id="ev-b", runtime_data=object()),
+        ]
+    )
+    executor = Executor(
+        FakeStore(),
+        hass=hass,
+        options={CONF_EV_CHARGE_RATE_KW: 7.0, CONF_GRID_IMPORT_LIMIT_KW: 10.0},
+        entry_id="ev-a",
+    )
+    unavailable = _context(now)
+    unavailable.slots[0].baseline_load_forecast_kw = None
+    unavailable.slots[0].pv_forecast_kw = None
+
+    missing_reason, missing_previous = executor._reserve_ev_grid_capacity(
+        action,
+        None,
+        now,
+    )
+    reason, restored = executor._reserve_ev_grid_capacity(action, unavailable, now)
+
+    assert missing_reason == "ev_grid_projection_unavailable"
+    assert missing_previous == previous
+    assert reason == "multi_ev_grid_projection_unavailable"
+    assert restored == previous
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"] == previous
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["retained"] == retained
+    assert "stale" not in hass.data["ha_energy_planner"]["ev_grid_reservations"]
+
+    constrained = _context(now)
+    constrained.slots[0].projected_ev_load_kw = 7.0
+    reason, restored = executor._reserve_ev_grid_capacity(action, constrained, now)
+
+    assert reason == "multi_ev_grid_import_limit_exceeded"
+    assert restored == previous
+
+    no_entries_hass = FakeHass()
+    no_entries_hass.data = {}
+    no_entries_executor = Executor(FakeStore(), hass=no_entries_hass, entry_id="ev-a")
+    no_entries_executor._discard_stale_ev_grid_reservations({})
+    no_entries_executor._retain_ev_grid_reservation_when_unloaded()
+    no_entries_executor.sync_ev_grid_reservation()
+    Executor(FakeStore(), hass=no_entries_hass).sync_ev_grid_reservation()
+    bad_domain_hass = FakeHass()
+    bad_domain_hass.data = {"ha_energy_planner": []}
+    bad_domain_executor = Executor(FakeStore(), hass=bad_domain_hass)
+    assert bad_domain_executor._ev_grid_reservations() is None
+    assert bad_domain_executor._ev_grid_shedding_claim() is None
+
+    assert executor_module._ev_action_wants_power(action) is True
+    action.desired_state["charging_required_now"] = False
+    assert executor_module._ev_action_wants_power(action) is False
+    legacy_controls = {
+        CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+        CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop",
+    }
+    assert _service_target_for_action(action, legacy_controls) == "switch.ev_stop"
+    action.desired_state.pop("charging_required_now")
+    assert executor_module._ev_action_wants_power(action) is True
+    assert _service_target_for_action(action, legacy_controls) == "switch.ev_start"
+    assert _ev_command_entity_for_action(action, legacy_controls) == "switch.ev_start"
+    action.kind = ActionKind.SET_HVAC
+    assert executor_module._ev_action_wants_power(action) is False
+    assert executor_module._positive_float("bad") == 0.0
+    assert executor_module._positive_float(float("nan")) == 0.0
+
+    action.kind = ActionKind.EV_START
+    action.desired_state["charging_required_now"] = True
+    executor._reconcile_ev_grid_reservation(
+        action,
+        SimpleNamespace(
+            applied=False,
+            command_sent=False,
+            rollback_succeeded=None,
+        ),
+        previous,
+    )
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"] == previous
+
+    executor.store.data["ownership"] = []
+    assert executor._owned_ev_control_topology() is None
+    executor.store.data["ownership"] = {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"}
+    }
+    assert (
+        asyncio.run(
+            executor._async_save_provisional_ev_ownership(
+                action,
+                {CONF_EV_CHARGER: "switch.ev"},
+            )
+        )
+        is False
+    )
+    asyncio.run(executor._async_clear_provisional_ev_ownership())
+    assert executor.store.data["ownership"] == {
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"}
+    }

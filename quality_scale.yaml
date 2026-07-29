@@ -204,14 +204,21 @@ rules:
         - tests/test_lifecycle.py
   unique-config-entry:
     status: done
+    comment: Multiple EV planners are intentional; each entry requires a unique operator-selected instance name, active EV commands share an atomic household grid-capacity reservation and single-entry over-limit shedding claim, and EV charger plus household climate/Enphase actuators are single-owner across entries.
     references:
       code:
+        - custom_components/ha_energy_planner/__init__.py
         - custom_components/ha_energy_planner/config_flow.py
+        - custom_components/ha_energy_planner/executor.py
+        - custom_components/ha_energy_planner/storage.py
       tests:
         - tests/test_config_flow.py
+        - tests/test_executor.py
+        - tests/test_lifecycle.py
+        - tests/test_storage.py
   action-exceptions:
     status: done
-    comment: Automated execution remains fail-closed and auditable, while explicit services and buttons raise translated Home Assistant errors for missing runtime state or rejected device commands.
+    comment: Automated execution remains fail-closed and auditable, mapped EV charging feedback must confirm bounded start/stop attempts, and explicit services and buttons raise translated Home Assistant errors for missing or ambiguous runtime state and rejected device commands.
     references:
       code:
         - custom_components/ha_energy_planner/__init__.py

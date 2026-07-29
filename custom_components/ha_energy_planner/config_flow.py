@@ -69,11 +69,14 @@ from .const import (
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
+    CONF_EV_CONFIRMATION_RETRIES,
+    CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
     CONF_EV_CONNECTED,
     CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_MAX_IMPORT_PRICE,
@@ -95,6 +98,7 @@ from .const import (
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
+    CONF_INSTANCE_NAME,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
@@ -125,6 +129,7 @@ from .const import (
     DOMAIN,
     INTEGRATION_NAME,
 )
+from .entry_data import combined_entry_data
 
 SUBENTRY_ENERGY = "energy"
 SUBENTRY_CLIMATE = "climate"
@@ -195,7 +200,11 @@ def _entity_selector(
     return EntitySelector(config)
 
 
-STEP_USER_DATA_SCHEMA = vol.Schema({})
+STEP_USER_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_INSTANCE_NAME, default=INTEGRATION_NAME): TextSelector(TextSelectorConfig()),
+    }
+)
 
 ENERGY_DATA_SCHEMA = vol.Schema(
     {
@@ -263,6 +272,7 @@ EV_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_EV_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
         vol.Optional(CONF_EV_CHARGING): _entity_selector(["binary_sensor", "sensor", "switch"]),
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
+        vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(entity_filter=_EV_TARGET_SOC_FILTER),
         vol.Optional(CONF_EV_CHARGER): _entity_selector(["switch", "input_boolean"]),
         vol.Optional(CONF_EV_CHARGER_START): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
         vol.Optional(CONF_EV_CHARGER_STOP): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
@@ -286,6 +296,20 @@ PLANNER_SUBENTRY_TITLES = {
     SUBENTRY_AI: "AI",
     SUBENTRY_EV: "EV",
 }
+
+_HOUSEHOLD_ACTUATOR_KEYS = (
+    CONF_DAIKIN_CLIMATE,
+    CONF_CLIMATE_AUTOMATIONS,
+    CONF_ENPHASE_PROFILE,
+)
+_EV_ACTUATOR_KEYS = (
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
+    CONF_EV_SMART_CHARGING,
+    CONF_EV_SMART_CHARGING_START,
+    CONF_EV_SMART_CHARGING_STOP,
+)
 
 _MULTI_ENTITY_KEYS = {CONF_CLIMATE_AUTOMATIONS, CONF_PERSON_ENTITIES}
 
@@ -330,6 +354,9 @@ _POLICY_SECTION_FIELDS = {
         CONF_EV_MAX_IMPORT_PRICE,
         CONF_EV_LOW_PRICE_CHARGING_ENABLED,
         CONF_EV_LOW_PRICE_THRESHOLD,
+        CONF_EV_KEEP_CHARGER_ON,
+        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
+        CONF_EV_CONFIRMATION_RETRIES,
         CONF_GRID_IMPORT_LIMIT_KW,
         CONF_GRID_EXPORT_LIMIT_KW,
     ),
@@ -457,6 +484,13 @@ def _option_selector(field: str) -> Any:
         CONF_EV_LOW_PRICE_THRESHOLD: NumberSelector(
             NumberSelectorConfig(min=-10, max=10, step=0.01, mode=NumberSelectorMode.BOX)
         ),
+        CONF_EV_KEEP_CHARGER_ON: BooleanSelector(),
+        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: NumberSelector(
+            NumberSelectorConfig(min=0, max=120, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_EV_CONFIRMATION_RETRIES: NumberSelector(
+            NumberSelectorConfig(min=0, max=3, step=1, mode=NumberSelectorMode.BOX)
+        ),
         CONF_GRID_IMPORT_LIMIT_KW: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=0.1, mode=NumberSelectorMode.BOX)
         ),
@@ -551,11 +585,23 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     ) -> config_entries.ConfigFlowResult:
         """Handle the initial step."""
         if user_input is not None:
-            await self.async_set_unique_id(DOMAIN)
-            self._abort_if_unique_id_configured()
+            title = str(user_input.get(CONF_INSTANCE_NAME, INTEGRATION_NAME)).strip()
+            if not title:
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_USER_DATA_SCHEMA,
+                    errors={CONF_INSTANCE_NAME: "instance_name_required"},
+                )
+            current_entries = self._async_current_entries() if getattr(self, "hass", None) is not None else []
+            if any(entry.title == title for entry in current_entries):
+                return self.async_show_form(
+                    step_id="user",
+                    data_schema=STEP_USER_DATA_SCHEMA,
+                    errors={CONF_INSTANCE_NAME: "instance_name_in_use"},
+                )
             return self.async_create_entry(
-                title=INTEGRATION_NAME,
-                data={},
+                title=title,
+                data={CONF_INSTANCE_NAME: title},
                 options=DEFAULT_OPTIONS,
             )
         return self.async_show_form(
@@ -607,7 +653,12 @@ class PlannerSubentryFlow(ConfigSubentryFlow):
         entry = self._get_entry()
         subentry = self._get_active_subentry() or self._existing_subentry(entry)
         if user_input is not None:
-            errors = _validate_config(self.hass, user_input)
+            errors = _validate_subentry_config(
+                self.hass,
+                entry,
+                user_input,
+                subentry_type=self.subentry_type,
+            )
             if not errors:
                 if subentry is not None:
                     return self.async_update_and_abort(entry, subentry, title=self.title, data=user_input)
@@ -687,7 +738,12 @@ class EnphaseSubentryFlow(PlannerSubentryFlow):
         subentry = self._get_active_subentry() or self._existing_subentry(entry)
         current = dict(getattr(subentry, "data", {}) or {})
         if user_input is not None:
-            errors = _validate_config(self.hass, user_input)
+            errors = _validate_subentry_config(
+                self.hass,
+                entry,
+                user_input,
+                subentry_type=self.subentry_type,
+            )
             if not errors:
                 self._enphase_pending_data = {
                     **current,
@@ -712,7 +768,12 @@ class EnphaseSubentryFlow(PlannerSubentryFlow):
         errors: dict[str, str] = {}
         if user_input is not None:
             data = {**base, **user_input}
-            errors = _validate_config(self.hass, data)
+            errors = _validate_subentry_config(
+                self.hass,
+                entry,
+                data,
+                subentry_type=self.subentry_type,
+            )
             if not errors:
                 if subentry is not None:
                     return self.async_update_and_abort(entry, subentry, title=self.title, data=data)
@@ -829,6 +890,16 @@ class OptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             updated = {**options, **user_input}
             errors = _validate_options(updated)
+            entry_data = (
+                combined_entry_data(self._config_entry)
+                if hasattr(self._config_entry, "data")
+                else {}
+            )
+            if step_id == POLICY_STEP_EV_BATTERY_GRID and not _ev_keep_on_control_compatible(
+                entry_data,
+                updated,
+            ):
+                errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
             if not errors:
                 self._async_save_options(_normalize_options_input(updated))
                 return await self.async_step_init()
@@ -1005,6 +1076,85 @@ def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[st
                 errors[key] = unit_error
                 break
     return errors
+
+
+def _validate_subentry_config(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    user_input: dict[str, Any],
+    *,
+    subentry_type: str | None = None,
+) -> dict[str, str]:
+    """Validate one subentry, including cross-entry actuator ownership."""
+    errors = _validate_config(hass, user_input)
+    duplicate_errors = _duplicate_household_actuator_errors(hass, entry, user_input)
+    for key, error in duplicate_errors.items():
+        errors.setdefault(key, error)
+    if subentry_type == SUBENTRY_EV and not _ev_keep_on_control_compatible(
+        user_input,
+        {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))},
+    ):
+        errors.setdefault("base", "ev_keep_on_requires_persistent_control")
+    return errors
+
+
+def _duplicate_household_actuator_errors(
+    hass: HomeAssistant,
+    current_entry: ConfigEntry,
+    user_input: dict[str, Any],
+) -> dict[str, str]:
+    """Reject household actuators already owned by another planner entry."""
+    config_entries = getattr(hass, "config_entries", None)
+    async_entries = getattr(config_entries, "async_entries", None)
+    if not callable(async_entries):
+        return {}
+    current_entry_id = str(getattr(current_entry, "entry_id", ""))
+    requested = {
+        key: set(_entity_values(user_input.get(key)))
+        for key in _HOUSEHOLD_ACTUATOR_KEYS
+        if user_input.get(key)
+    }
+    requested_ev_controls = {
+        entity_id
+        for key in _EV_ACTUATOR_KEYS
+        for entity_id in _entity_values(user_input.get(key))
+    }
+    errors: dict[str, str] = {}
+    for other_entry in async_entries(DOMAIN):
+        if other_entry is current_entry or (
+            current_entry_id
+            and str(getattr(other_entry, "entry_id", "")) == current_entry_id
+        ):
+            continue
+        other_data = combined_entry_data(other_entry)
+        for key, requested_entities in requested.items():
+            if requested_entities.intersection(_entity_values(other_data.get(key))):
+                errors[key] = "household_actuator_in_use"
+        other_ev_controls = {
+            entity_id
+            for key in _EV_ACTUATOR_KEYS
+            for entity_id in _entity_values(other_data.get(key))
+        }
+        conflicting_ev_controls = requested_ev_controls.intersection(other_ev_controls)
+        if conflicting_ev_controls:
+            for key in _EV_ACTUATOR_KEYS:
+                if conflicting_ev_controls.intersection(_entity_values(user_input.get(key))):
+                    errors[key] = "household_actuator_in_use"
+    return errors
+
+
+def _ev_keep_on_control_compatible(
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+) -> bool:
+    """Return whether keep-on has an authoritative persistent charger control."""
+    if options.get(CONF_EV_KEEP_CHARGER_ON) is not True:
+        return True
+    entity_id = entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)
+    return bool(
+        entity_id
+        and str(entity_id).split(".", 1)[0] in {"switch", "input_boolean"}
+    )
 
 
 _ENTITY_DOMAIN_RULES = {

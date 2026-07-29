@@ -272,6 +272,39 @@ def test_estimated_cost_prefers_haeo_grid_flow_forecasts() -> None:
     assert plan.estimated_daily_cost == 0.025
 
 
+def test_estimated_cost_adds_flexible_load_only_to_baseline_haeo_grid_flow() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at,
+            import_price=0.30,
+            export_price=0.10,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=1.0,
+            projected_ev_load_kw=3.0,
+            haeo_grid_import_forecast_kw=2.0,
+            haeo_grid_export_forecast_kw=0.0,
+        ),
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=5),
+            import_price=0.30,
+            export_price=0.10,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=1.0,
+            projected_ev_load_kw=3.0,
+            haeo_grid_import_forecast_kw=5.0,
+            haeo_grid_export_forecast_kw=0.0,
+            haeo_grid_includes_flexible_loads=True,
+        ),
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.estimated_daily_cost == 0.25
+
+
 def test_estimated_cost_accounts_for_haeo_battery_power_without_grid_flow() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
     context = _context()
@@ -424,6 +457,113 @@ def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> Non
     assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
 
 
+def test_keep_charger_on_reserves_grid_power_for_preconditioning_after_target() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_keep_charger_on": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 80
+    context.ev_connected = True
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["keep_charger_on"] is True
+    assert action.desired_state["charging_reason"] == "ev_keep_charger_on_for_preconditioning"
+    assert action.desired_state["projected_load_kw_now"] == options["ev_charge_rate_kw"]
+    assert context.slots[0].projected_ev_load_kw == options["ev_charge_rate_kw"]
+
+
+def test_keep_charger_on_policy_does_not_change_confirmation_for_normal_charging() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_keep_charger_on": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 40
+    context.ev_connected = True
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["keep_charger_on"] is False
+    assert action.desired_state["projected_load_kw_now"] == options["ev_charge_rate_kw"]
+
+
+def test_keep_charger_on_never_bypasses_external_target_policy_bounds() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_keep_charger_on": True,
+        "ev_max_soc_percent": 90,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 90
+    context.ev_connected = True
+    context.ev_target_soc_percent = 100
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["keep_charger_on"] is False
+    assert action.desired_state["configured_target_soc_percent"] == 100
+
+
+def test_keep_charger_on_is_suppressed_during_external_target_fallback() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_keep_charger_on": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 80
+    context.ev_connected = True
+    context.ev_target_soc_percent = 80
+    context.ev_target_soc_fallback_active = True
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["keep_charger_on"] is False
+    assert action.desired_state["configured_target_soc_percent"] == 80
+
+
+def test_keep_charger_on_uses_bounded_target_when_current_soc_is_higher() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_keep_charger_on": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 100
+    context.ev_connected = True
+    context.ev_target_soc_percent = 80
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["keep_charger_on"] is True
+    assert action.desired_state["target_soc_percent"] == 80
+
+
 def test_native_ev_low_price_charging_starts_current_interval() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -449,22 +589,31 @@ def test_native_ev_low_price_charging_starts_current_interval() -> None:
 
 def test_native_ev_manual_overrides_survive_immediate_replan() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
-    context = _context()
-    context.current_ev_soc_percent = 80
-    context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_start")]
+    start_context = _context()
+    start_context.current_ev_soc_percent = 80
+    start_context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_start")]
 
     start = next(
-        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+        action
+        for action in DryRunPlanner(options).create_plan(start_context).actions
+        if action.asset == ActionAsset.EV
     )
-    context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_stop")]
+    stop_context = _context()
+    stop_context.current_ev_soc_percent = 80
+    stop_context.active_overrides = [Override("manual_ev_charging", "button", None, "manual_stop")]
     stop = next(
-        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+        action
+        for action in DryRunPlanner(options).create_plan(stop_context).actions
+        if action.asset == ActionAsset.EV
     )
 
     assert start.desired_state["charging_required_now"] is True
     assert start.desired_state["charging_reason"] == "ev_manual_start_override"
+    assert start.desired_state["projected_load_kw_now"] == options["ev_charge_rate_kw"]
+    assert start_context.slots[0].projected_ev_load_kw == options["ev_charge_rate_kw"]
     assert stop.desired_state["charging_required_now"] is False
     assert stop.desired_state["charging_reason"] == "ev_manual_stop_override"
+    assert stop_context.slots[0].projected_ev_load_kw == 0.0
 
 
 def test_ev_earliest_start_handles_window_timezone_and_invalid_values() -> None:

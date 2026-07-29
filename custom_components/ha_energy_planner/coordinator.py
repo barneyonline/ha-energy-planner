@@ -9,12 +9,13 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from time import monotonic, perf_counter
 from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -37,9 +38,14 @@ from .const import (
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_PROFILE,
+    CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
+    CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -48,6 +54,7 @@ from .const import (
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PV_FORECAST,
+    CONF_PV_FORECAST_SECONDARY,
     CONF_WEATHER,
     DEBOUNCE_SECONDS,
     DEFAULT_HAEO_OPTIMIZE_SERVICE,
@@ -59,13 +66,14 @@ from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import update_trip_history_from_values
-from .ev_adapter import EVChargerAdapter, EVCommandResult, EVSmartChargingAdapter
+from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
 from .models import (
     ActionOutcome,
+    DecisionContext,
     EnergyPlan,
     HAEOSolvePhase,
     HAEOStatus,
@@ -150,6 +158,9 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_PERSON_ENTITIES,
         CONF_EV_SOC,
         CONF_EV_CONNECTED,
+        CONF_EV_SMART_CHARGING_READY_BY,
+        CONF_EV_SMART_CHARGING_TARGET_SOC,
+        CONF_PV_FORECAST_SECONDARY,
         CONF_WEATHER,
     }
 )
@@ -170,6 +181,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entry_data=self.entry_data,
             options=self.options,
             notification_grace_until=dt_util.utcnow() + PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE,
+            entry_id=getattr(entry, "entry_id", None),
+            entry_title=getattr(entry, "title", None),
         )
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
@@ -182,6 +195,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_non_manual_refresh_requested_at: float | None = None
         self._pending_refresh_trigger = "startup"
         self._last_decision_fingerprint: str | None = None
+        self._last_decision_context: DecisionContext | None = None
+        self._tearing_down = False
         self._force_next_refresh = False
         self._refresh_counters: dict[str, int] = {
             "requested": 0,
@@ -256,6 +271,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     def async_start_listeners(self) -> None:
         """Start debounced state listeners for configured input entities."""
+        self._tearing_down = False
         self._schedule_next_boundary_refresh()
         entry_data = self.entry_data
         entity_ids = _configured_entity_ids(entry_data)
@@ -289,6 +305,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     def async_shutdown(self) -> None:
         """Cancel listeners and pending debounced refresh."""
+        # A refresh task may already be queued even after its timer/listener is
+        # cancelled. Suppress its eventual commit until setup is resumed.
+        self._tearing_down = True
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._debounce_cancel = None
@@ -382,6 +401,26 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Refresh planner data while holding the planner lock."""
         preparation_started = perf_counter()
         started_generation = self._refresh_generation
+        now = dt_util.utcnow()
+        active_overrides = _unexpired_overrides(
+            self.overrides,
+            now,
+        )
+        stored_overrides = self.store.data.get("overrides", [])
+        expired_manual_hvac_state = _expired_manual_hvac_state(
+            self.store.data,
+            now,
+        )
+        overrides_changed = active_overrides != self.overrides
+        if overrides_changed:
+            self.overrides = active_overrides
+        if stored_overrides != to_jsonable(self.overrides):
+            await self.store.async_save_overrides(self.overrides)
+        if (
+            not any(override.kind == "manual_hvac" for override in self.overrides)
+            and expired_manual_hvac_state
+        ):
+            await self._async_clear_expired_manual_hvac_state()
         options = self.planner_options
         entry_data = self.entry_data
         self.executor.options = options
@@ -468,7 +507,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     context.haeo_status = second_pass_result.status
                     plan.input_issues.append(second_pass_result.reason)
                 else:
-                    second_pass_evidence_counts = apply_haeo_response_to_context(context, second_pass_result.response)
+                    second_pass_evidence_counts = _apply_flexible_haeo_response(
+                        context,
+                        second_pass_result.response,
+                    )
                     _reset_flexible_load_projections(context)
                     planner_started = perf_counter()
                     plan = await self.hass.async_add_executor_job(planner.create_plan, context)
@@ -588,6 +630,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
         async with self._options_update_lock:
+            self.executor.options = self.options
+            self.executor.entry_data = self.entry_data
+            self.executor.sync_ev_grid_reservation()
+            await self.executor.async_persist_ev_grid_reservation()
             previous_enabled, previous_dry_run = self._last_control_mode_state
             current_mode = (self.planner_enabled, self.dry_run)
             self._last_control_mode_state = current_mode
@@ -625,21 +671,67 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_manual_ev_charging(self, enabled: bool) -> EVCommandResult:
         """Apply a manual charger command through Energy Planner's adapter."""
-        result = await EVChargerAdapter(self.hass, self.entry_data).async_set_charging(enabled)
-        if result.applied:
-            self.overrides = [override for override in self.overrides if override.kind != "manual_ev_charging"]
-            self.overrides.append(
-                Override(
-                    kind="manual_ev_charging",
-                    source="button",
-                    expires_at=dt_util.utcnow() + timedelta(hours=1),
-                    reason="manual_start" if enabled else "manual_stop",
-                )
+        async with self._planner_lock:
+            self.executor.options = self.options
+            self.executor.entry_data = self.entry_data
+            result = await self.executor.async_manual_ev_charging(
+                enabled,
+                getattr(self, "_last_decision_context", None),
             )
-            await self.store.async_save_overrides(self.overrides)
+            if result.applied:
+                self.overrides = [
+                    override
+                    for override in self.overrides
+                    if override.kind != "manual_ev_charging"
+                ]
+                self.overrides.append(
+                    Override(
+                        kind="manual_ev_charging",
+                        source="button",
+                        expires_at=dt_util.utcnow() + timedelta(hours=1),
+                        reason="manual_start" if enabled else "manual_stop",
+                    )
+                )
+                await self.store.async_save_overrides(self.overrides)
         self._mark_forced_refresh("manual_ev_charging")
         await self.async_request_refresh()
         return result
+
+    async def async_set_ev_connected_helper(self, connected: bool) -> None:
+        """Persist the native connected helper and refresh EV history and planning."""
+        options = self.options
+        options[CONF_EV_CONNECTED_HELPER] = connected
+        config_entries = getattr(self.hass, "config_entries", None)
+        update_entry = getattr(config_entries, "async_update_entry", None)
+        if callable(update_entry):
+            update_entry(self.entry, options=options)
+        if not self.entry_data.get(CONF_EV_CONNECTED):
+            await self._async_record_ev_trip_event()
+        self._mark_forced_refresh("ev_connected_helper_changed")
+        await self.async_request_refresh()
+
+    async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
+        """Validate and persist the preconditioning keep-on policy."""
+        entry_data = self.entry_data
+        persistent_control = entry_data.get(CONF_EV_CHARGER) or entry_data.get(
+            CONF_EV_SMART_CHARGING
+        )
+        if enabled and (
+            not persistent_control
+            or str(persistent_control).split(".", 1)[0]
+            not in {"switch", "input_boolean"}
+        ):
+            raise HomeAssistantError(
+                "Keep charger on requires a persistent EV charger switch or input boolean.",
+                translation_domain=DOMAIN,
+                translation_key="ev_keep_on_requires_persistent_control",
+            )
+        options = self.options
+        options[CONF_EV_KEEP_CHARGER_ON] = enabled
+        update_entry = getattr(self.hass.config_entries, "async_update_entry", None)
+        if callable(update_entry):
+            update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
 
     async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
         """Set a manual HVAC override."""
@@ -679,6 +771,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Record compact EV trip history from current connection/SOC states."""
         entry_data = self.entry_data
         connected = _bool_state_value(self.hass, entry_data.get(CONF_EV_CONNECTED))
+        if connected is None and not entry_data.get(CONF_EV_CONNECTED):
+            connected = bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
         soc_percent = _float_state_value(self.hass, entry_data.get(CONF_EV_SOC))
         updated, changed = update_trip_history_from_values(
             dict(self.store.data.get("trip_history", {})),
@@ -691,7 +785,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
         """Restore safe state and refresh."""
-        outcome = await self.executor.async_restore_safe_state(reason)
+        async with self._planner_lock:
+            outcome = await self.executor.async_restore_safe_state(reason)
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
@@ -785,6 +880,28 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         else:
             self.store.data["control_pause"] = to_jsonable(pause)
 
+    async def _async_clear_expired_manual_hvac_state(self) -> None:
+        """Clear planner-managed manual HVAC exposure after its timeout."""
+        ownership = dict(self.store.data.get("ownership", {}))
+        manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+        if manual_override_entity:
+            try:
+                await self.hass.services.async_call(
+                    "input_boolean",
+                    "turn_off",
+                    {"entity_id": manual_override_entity},
+                    blocking=True,
+                )
+            except Exception:  # noqa: BLE001 - helper cleanup must not block planning.
+                _LOGGER.warning(
+                    "Could not clear expired manual HVAC helper %s",
+                    manual_override_entity,
+                )
+                return
+        if "manual_hvac_override_expires_at" in ownership:
+            ownership.pop("manual_hvac_override_expires_at", None)
+            await self.store.async_save_ownership(ownership)
+
     async def _async_record_dry_run_comparison(self, plan: EnergyPlan) -> None:
         """Record compact dry-run plan versus recent real outcomes context."""
         outcomes = list(self.store.data.get("execution_audit", []))
@@ -827,6 +944,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options: dict[str, Any],
     ) -> EnergyPlan:
         """Persist and execute only the newest planner result."""
+        if getattr(self, "_tearing_down", False):
+            _LOGGER.debug(
+                "Discarding planner result %s while the config entry is unloading",
+                plan.plan_id,
+            )
+            return self.data or plan
         if started_generation != self._refresh_generation:
             _LOGGER.debug(
                 "Discarding obsolete planner result %s from generation %s; current generation is %s",
@@ -837,6 +960,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if hasattr(self, "hass"):
                 self.hass.async_create_task(self.async_request_refresh())
             return self.data or plan
+        self._last_decision_context = context
         await self.store.async_save_plan(plan)
         self.executor.options = options
         self.executor.entry_data = self.entry_data
@@ -845,6 +969,23 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         for action in plan.actions:
             if action is next_action:
                 continue
+            if getattr(self, "_tearing_down", False):
+                _LOGGER.debug(
+                    "Stopping coordinated execution for plan %s while the config entry is unloading",
+                    plan.plan_id,
+                )
+                break
+            if started_generation != self._refresh_generation:
+                _LOGGER.debug(
+                    "Stopping coordinated execution for obsolete plan %s from generation %s; "
+                    "current generation is %s",
+                    plan.plan_id,
+                    started_generation,
+                    self._refresh_generation,
+                )
+                if hasattr(self, "hass"):
+                    self.hass.async_create_task(self.async_request_refresh())
+                break
             # The priority score orders presentation and the first command, but
             # every coordinated device action keeps its own execution gate.
             await self.executor.async_evaluate(replace(plan, actions=[action]), context)
@@ -1037,6 +1178,38 @@ def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     return sorted(entity_ids)
 
 
+def _apply_flexible_haeo_response(
+    context: DecisionContext,
+    response: dict[str, Any] | None,
+) -> dict[str, int]:
+    """Apply flexible-pass evidence without losing uncovered baseline slots."""
+    baseline_grid_evidence = [
+        (
+            slot.haeo_grid_import_forecast_kw,
+            slot.haeo_grid_export_forecast_kw,
+        )
+        for slot in context.slots
+    ]
+    for slot in context.slots:
+        slot.haeo_grid_import_forecast_kw = None
+        slot.haeo_grid_export_forecast_kw = None
+        slot.haeo_grid_includes_flexible_loads = False
+    counts = apply_haeo_response_to_context(
+        context,
+        response,
+        grid_includes_flexible_loads=True,
+    )
+    for slot, (baseline_import, baseline_export) in zip(
+        context.slots,
+        baseline_grid_evidence,
+        strict=True,
+    ):
+        if not slot.haeo_grid_includes_flexible_loads:
+            slot.haeo_grid_import_forecast_kw = baseline_import
+            slot.haeo_grid_export_forecast_kw = baseline_export
+    return counts
+
+
 def _decision_input_fingerprint(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
@@ -1144,9 +1317,9 @@ def _latest_ai_service_call_at(recommendations: Any) -> datetime | None:
 
 
 def _seconds_until_next_interval_boundary(now: Any, interval_minutes: int) -> float:
-    """Return seconds until the next wall-clock planning boundary."""
+    """Return seconds until the next shared epoch planning boundary."""
     interval_seconds = max(int(interval_minutes), 1) * 60
-    elapsed_seconds = now.minute * 60 + now.second + (now.microsecond / 1_000_000)
+    elapsed_seconds = float(now.timestamp())
     remainder = elapsed_seconds % interval_seconds
     if remainder == 0:
         return float(interval_seconds)
@@ -1243,7 +1416,7 @@ def _bounded_json(value: Any, *, depth: int = 0) -> Any:
         return "<truncated>"
     value = to_jsonable(value)
     if isinstance(value, dict):
-        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:16]}
+        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:20]}
     if isinstance(value, list):
         items = [_bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:
@@ -1481,21 +1654,77 @@ def _parse_datetime_or_none(value: Any) -> Any | None:
     return None
 
 
-def _overrides_from_store(store_data: dict[str, Any], now: Any) -> list[Override]:
+def _overrides_from_store(
+    store_data: dict[str, Any],
+    now: datetime,
+) -> list[Override]:
     """Restore non-expired overrides from Store data."""
     restored: list[Override] = []
     for item in store_data.get("overrides", []):
         if not isinstance(item, dict):
             continue
+        kind = str(item.get("kind", ""))
         expires_at = _parse_datetime_or_none(item.get("expires_at"))
-        if expires_at is not None and expires_at <= now:
+        if kind in {"manual_ev_charging", "manual_hvac"} and expires_at is None:
+            continue
+        if _override_is_expired(expires_at, now):
             continue
         restored.append(
             Override(
-                kind=str(item.get("kind", "")),
+                kind=kind,
                 source=str(item.get("source", "store")),
                 expires_at=expires_at,
                 reason=str(item.get("reason", "")),
             )
         )
     return restored
+
+
+def _unexpired_overrides(
+    overrides: list[Override],
+    now: datetime,
+) -> list[Override]:
+    """Return runtime overrides that remain active at this refresh."""
+    return [
+        override
+        for override in overrides
+        if not _override_is_expired(override.expires_at, now)
+    ]
+
+
+def _expired_manual_hvac_state(
+    store_data: dict[str, Any],
+    now: datetime,
+) -> bool:
+    """Return whether persisted manual HVAC state has reached its timeout."""
+    ownership = store_data.get("ownership")
+    if isinstance(ownership, dict):
+        ownership_expiry = _parse_datetime_or_none(
+            ownership.get("manual_hvac_override_expires_at")
+        )
+        if ownership_expiry is not None and _override_is_expired(ownership_expiry, now):
+            return True
+    overrides = store_data.get("overrides")
+    if not isinstance(overrides, list):
+        return False
+    for item in overrides:
+        if not isinstance(item, dict) or str(item.get("kind", "")) != "manual_hvac":
+            continue
+        expires_at = _parse_datetime_or_none(item.get("expires_at"))
+        if expires_at is None or _override_is_expired(expires_at, now):
+            return True
+    return False
+
+
+def _override_is_expired(
+    expires_at: datetime | None,
+    now: datetime,
+) -> bool:
+    """Compare override timestamps defensively across legacy naive values."""
+    if expires_at is None:
+        return False
+    normalized_expires_at = (
+        expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=UTC)
+    )
+    normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+    return normalized_expires_at <= normalized_now

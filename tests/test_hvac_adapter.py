@@ -205,7 +205,8 @@ def test_hvac_action_fails_closed_when_automation_service_fails() -> None:
 
     assert result.applied is False
     assert result.reason == "hvac_automation_service_failed"
-    assert result.saved_automation_states == {"automation.climate": "on"}
+    assert result.saved_automation_states == {}
+    assert result.rollback_succeeded is True
     assert hass.states.values["climate.daikin"] == "heat"
 
 
@@ -224,7 +225,167 @@ def test_hvac_action_fails_closed_when_climate_service_fails() -> None:
 
     assert result.applied is False
     assert result.reason == "hvac_control_service_failed"
+    assert result.rollback_succeeded is True
     assert hass.states.values["climate.daikin"] == "heat"
+
+
+def test_hvac_partial_automation_failure_restores_every_changed_automation() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "automation.first": "on",
+            "automation.second": "on",
+        }
+    )
+    original_call = hass.services.async_call
+
+    async def fail_second_disable(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        if service == "turn_off" and data["entity_id"] == "automation.second":
+            raise RuntimeError("second automation failed")
+        await original_call(domain, service, data, blocking)
+
+    hass.services.async_call = fail_second_disable
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.first,automation.second",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.applied is False
+    assert result.reason == "hvac_automation_service_failed"
+    assert result.rollback_succeeded is True
+    assert result.saved_automation_states == {}
+    assert hass.states.values["automation.first"] == "on"
+    assert hass.states.values["automation.second"] == "on"
+
+
+def test_hvac_suppression_failure_uses_transactional_rollback() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "automation.first": "on",
+            "automation.second": "on",
+        }
+    )
+    original_call = hass.services.async_call
+
+    async def fail_second_disable(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        if service == "turn_off" and data["entity_id"] == "automation.second":
+            raise RuntimeError("second automation failed")
+        await original_call(domain, service, data, blocking)
+
+    hass.services.async_call = fail_second_disable
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.first,automation.second",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert result.applied is False
+    assert result.reason == "hvac_automation_service_failed"
+    assert result.rollback_succeeded is True
+    assert hass.states.values["automation.first"] == "on"
+
+
+def test_hvac_disable_exception_after_side_effect_restores_failing_automation() -> None:
+    hass = FakeHass({"climate.daikin": "heat", "automation.climate": "on"})
+    original_call = hass.services.async_call
+
+    async def apply_then_fail(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        await original_call(domain, service, data, blocking)
+        if domain == "automation" and service == "turn_off":
+            raise RuntimeError("handler failed after applying state")
+
+    hass.services.async_call = apply_then_fail
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+
+    assert result.applied is False
+    assert result.reason == "hvac_automation_service_failed"
+    assert result.rollback_succeeded is True
+    assert result.saved_automation_states == {}
+    assert hass.states.values["automation.climate"] == "on"
+
+
+def test_hvac_climate_failure_restores_disabled_automation() -> None:
+    hass = FakeHass({"climate.daikin": "heat", "automation.climate": "on"})
+    hass.services.fail_services.add(("climate", "set_hvac_mode"))
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.applied is False
+    assert result.reason == "hvac_control_service_failed"
+    assert result.rollback_succeeded is True
+    assert hass.states.values["automation.climate"] == "on"
+
+
+def test_hvac_failed_compensation_retains_unresolved_automation_state() -> None:
+    hass = FakeHass({"climate.daikin": "heat", "automation.climate": "on"})
+    original_call = hass.services.async_call
+
+    async def fail_climate_and_rollback(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        if domain == "climate" or (service == "turn_on" and data["entity_id"] == "automation.climate"):
+            raise RuntimeError("service failed")
+        await original_call(domain, service, data, blocking)
+
+    hass.services.async_call = fail_climate_and_rollback
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.applied is False
+    assert result.reason == "hvac_automation_rollback_failed"
+    assert result.rollback_succeeded is False
+    assert result.saved_automation_states == {"automation.climate": "on"}
+    assert hass.states.values["automation.climate"] == "off"
 
 
 def test_hvac_restore_reports_service_failure() -> None:

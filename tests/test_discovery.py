@@ -11,6 +11,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_PROFILE,
+    CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
+    CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
@@ -113,6 +115,25 @@ def test_discovery_treats_unknown_button_controls_as_available() -> None:
     assert report.ev.issues == []
 
 
+def test_discovery_rejects_legacy_single_button_without_stop_control() -> None:
+    hass = FakeHass({"button.ev_control": "unknown"}, set())
+
+    report = CapabilityDiscovery(
+        hass,
+        {CONF_EV_SMART_CHARGING: "button.ev_control"},
+    ).inspect()
+
+    assert report.ev.supported is False
+    assert report.ev.issues == ["ev_stop_control_unsupported"]
+    assert report.ev.details["start_control"] == "button.ev_control"
+    assert report.ev.details["stop_control"] == "button.ev_control"
+    assert report.ev.details["persistent_control"] == {
+        "entity_id": "button.ev_control",
+        "available": True,
+        "stateful": False,
+    }
+
+
 def test_discovery_reports_missing_climate_automation() -> None:
     hass = FakeHass({"climate.daikin": "heat"}, set())
     report = CapabilityDiscovery(
@@ -124,6 +145,35 @@ def test_discovery_reports_missing_climate_automation() -> None:
     ).inspect()
     assert report.hvac.supported is False
     assert "climate_automation_unavailable" in report.hvac.issues
+
+
+def test_discovery_honors_configured_enphase_profile_control_service() -> None:
+    hass = FakeHass(
+        {"sensor.enphase_profile": "AI Optimisation"},
+        {("custom_enphase", "set_profile")},
+    )
+
+    report = CapabilityDiscovery(
+        hass,
+        {
+            CONF_ENPHASE_PROFILE: "sensor.enphase_profile",
+            CONF_ENPHASE_PROFILE_CONTROL_SERVICE: "custom_enphase.set_profile",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+    ).inspect()
+
+    assert report.enphase.supported is True
+    assert report.enphase.details["control_service"] == "custom_enphase.set_profile"
+
+    unavailable = CapabilityDiscovery(
+        FakeHass({"sensor.enphase_profile": "AI Optimisation"}, set()),
+        {
+            CONF_ENPHASE_PROFILE: "sensor.enphase_profile",
+            CONF_ENPHASE_PROFILE_CONTROL_SERVICE: "custom_enphase.set_profile",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+    ).inspect()
+    assert unavailable.enphase.issues == ["enphase_profile_control_unavailable"]
 
 
 def test_discovery_reports_unavailable_service() -> None:

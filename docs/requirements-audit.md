@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-06-28.
+Status as of 2026-07-26.
 
 ## Covered
 
@@ -54,6 +54,10 @@ Status as of 2026-06-28.
   the Enphase arbitrage planner path. Non-finite and out-of-horizon timestamped
   HAEO evidence is ignored before it can influence grid-limit validation or
   arbitrage-value calculations.
+- Flexible-load second-pass readiness clears inherited baseline grid fields
+  before checking response coverage. Accepted import/export pairs carry per-slot
+  provenance so constraints and cost estimates do not add projected EV/HVAC
+  demand twice; uncovered slots retain their baseline evidence instead.
 - Safety defaults are fail-closed: execution disabled, dry-run enabled, stale
   required inputs unsafe, non-finite numeric inputs rejected, and due actions
   revalidated before execution.
@@ -62,6 +66,101 @@ Status as of 2026-06-28.
   otherwise against normalized PV/load plus projected EV/HVAC flexible load.
 - Native EV charger, Daikin HVAC, and Enphase profile adapters execute through
   mapped Home Assistant entities/services and support restore where configured.
+- Native EV execution optionally confirms mapped charging-state feedback after
+  start and stop commands. Confirmation is bounded by configurable timeout and
+  retry limits; unavailable feedback and exhausted retries trigger an immediate
+  compensating restore or safe-stop, preserve ownership if compensation fails,
+  and are covered by adapter and executor tests. Manual commands persist the
+  same outcome evidence and engage the EV control pause after device or
+  confirmation failures. Subsequent starts honour that pause and the command
+  cooldown, while manual and scheduled stops bypass failure backoff, command
+  cooldowns, and daily caps for recovery. Safe-state ownership records the
+  actual commanded entity and its complete EV actuator topology so momentary
+  takeovers cannot be mistaken for a restorable unrelated persistent control.
+  Restore, automated safety-stop, and manual-stop paths use that persisted
+  topology after EV mapping changes rather than clearing ownership through a
+  replacement actuator. Command
+  acceptance is tracked separately from proven-safe stop confirmation. Neither
+  disconnected feedback nor the state of a separate stop command helper can
+  release safety ownership; meaningful charging feedback, the persistent EV
+  charger control, or rollback must prove the safe state. A compensating stop
+  that does prove the safe state is recorded as a successful recovery and
+  clears ownership and household capacity. Manual compensation follows the same
+  success contract and creates the normal stop override, while unconfirmed owned
+  stops retain ownership and capacity for recovery.
+- Manual EV commands, scheduled execution, and explicit restoration are
+  serialized by the coordinator. Regular planner-owned schedule stops use the
+  same proven-safe release contract as synthetic safety stops, and unowned stop
+  commands cannot create a restorable takeover baseline.
+- EV target SOC can be sourced from an external vehicle sensor, with the native
+  number retained as the fallback. Unavailable, nonnumeric, and out-of-range
+  external values use that fallback without degrading active control while
+  remaining visible as advisory input evidence. Preconditioning keep-on is
+  suppressed while this fallback is active because the vehicle-enforced target
+  cannot be verified. When no connected-state entity
+  is mapped, a native EV-device helper switch provides connected state and
+  drives the same compact trip-history path.
+- The optional preconditioning policy keeps the charger control enabled after
+  target SOC is reached while preserving manual-stop and execution safety-gate
+  precedence. Only the actual after-target preconditioning action selects the
+  control-state confirmation path, that path requires the persistent direct
+  charger control rather than an optional start command, and the current slot
+  reserves the full configured charger rate for grid and battery evaluation.
+  Options, EV reconfiguration, preflight, and the integration-created keep-on
+  switch reject keep-on without that persistent switch/input-boolean control.
+  Keep-on also requires the authoritative target to be available and remain
+  within configured SOC policy bounds, preventing an external vehicle target
+  from bypassing the hard planner maximum.
+- EV safety stops use direction-specific validation: unrelated unhealthy plan
+  inputs and unavailable start controls cannot block an available stop path.
+  When unhealthy inputs, an observed disconnect, disabled EV control, or a hard
+  grid-import violation leave EV power planner-owned or reserved, execution
+  prioritizes one audited safety-stop attempt for that plan, retains its
+  reservation after an uncertain outcome, and clears ownership only after
+  success. Existing single- and cross-entry reservations are also re-evaluated
+  against the strictest current household limit. A shared atomic shedding claim
+  selects one loaded over-limit reservation for the confirmed safety-stop path,
+  while other entries retain their reservations until that claim releases. An
+  unloaded claimant relinquishes the claim without releasing its uncertain
+  capacity, allowing a loaded EV to shed controllable load instead of either
+  leaving a running charger behind a rejected continuation action or stopping
+  every EV during concurrent evaluations.
+- A failed loaded shedding claimant also releases only the atomic claim while
+  retaining its uncertain capacity, allowing another loaded charger to attempt
+  a confirmed stop. Continuous-charging allocation never returns a fragmented
+  fallback; a contiguous partial window is explicitly marked infeasible.
+- Multiple EVs are supported as separate named config entries. Entry-scoped
+  storage isolates plans, history, production state, pauses, and audit records;
+  services require `config_entry_id` when multiple runtimes are loaded. Each
+  planner remains independent for cost optimization, while active EV commands
+  share an atomic in-memory household grid-capacity reservation. Reservations
+  are held through uncertain stop/rollback outcomes and released only after a
+  confirmed stop or safe-state restoration. Observed disconnection triggers a
+  confirmed stop instead of optimistically releasing capacity, preventing both
+  reconnection races and two entries spending the same projected grid headroom.
+  Manual starts use the latest committed decision projection, include their own
+  charger load when it is not already represented, fail closed when that
+  projection is unavailable, older than the planning interval, or unsafe, and
+  participate in the same reservation lifecycle.
+  Successful and uncertain manual starts preserve the original charger state
+  for later safe-state restoration. Unavailable configured connection evidence
+  blocks a start, and uncertain reservations remain protected across config-entry
+  unload. The active reservation high-watermark is persisted independently of
+  ownership and rehydrated before entry execution after restart; explicit
+  releases are persisted as inactive. The provisional reservation and actuator
+  topology are committed before the start service call, and reservation-only
+  recovery requires a confirmed stop on that topology before another start.
+  Each reservation stores its owner's
+  configured import limit. Runtime option updates apply import-limit changes and
+  reservation increases immediately, while an active reservation cannot shrink
+  during later start/no-op actions or across an unclean restart and remains
+  conservative until a confirmed stop. Cross-entry config validation prevents native or legacy EV
+  charger controls, the same Daikin climate control, climate automation, or
+  Enphase profile actuator from having two planners.
+- Legacy global storage is eligible only for the first upgraded unnamed entry
+  and is marked consumed after the entry-scoped store exists. Stable persistent
+  notification IDs are suffixed with the config-entry ID so one planner cannot
+  overwrite or dismiss another planner's alert.
 - Manual Daikin changes create a temporary override, persisted across restart,
   and planner-owned HVAC changes have a short guard window.
 - Persistent notifications are emitted for restore-safe-state, infeasible EV
@@ -223,6 +322,9 @@ Status as of 2026-06-28.
   smoke coverage now validates one Recorder-imported EV trip from Home
   Assistant state history, and real-history replay fixtures validate broader
   MINI-like state names and SOC formats outside the running HA smoke container.
+- Live trip updates preserve Recorder import metadata and successful empty
+  imports advance it, so installations without recent trips do not repeat a
+  30-day Recorder query on every planner refresh.
 - HVAC active planning is conservative: away mode off, occupied comfort-helper
   hard bounds, expensive-period automation suppression, bounded occupied
   preconditioning before near-future expensive periods, and persisted
@@ -251,6 +353,9 @@ Status as of 2026-06-28.
   charge/discharge, and battery SOC forecast evidence where available. Direct
   replay or persisted non-finite HAEO evidence is ignored before Enphase value
   calculations so it cannot suppress restore or publish NaN plan values.
+- HVAC automation suppression and Enphase profile commands use bounded,
+  transactional compensation. Any automation or saved profile that cannot be
+  restored remains in ownership for a later restore-safe-state retry.
 - Only an explicit allowlist of decision inputs can request replanning. AI
   result, integration-owned control, climate automation, and high-frequency
   observed power entities cannot create feedback loops; observation-only
@@ -260,9 +365,11 @@ Status as of 2026-06-28.
   persistence when no material input changed, while explicit manual replans
   always force a fresh computation.
 - Coordinator startup schedules recurring wall-clock planning-interval boundary
-  refreshes, without also registering a fixed `DataUpdateCoordinator` poll, in
-  addition to material-change replans. Planner cost previews use the configured
-  planning interval rather than assuming a fixed slot duration.
+  refreshes on the same epoch cadence used by decision fingerprints, without
+  also registering a fixed `DataUpdateCoordinator` poll, in addition to material-
+  change replans. Non-hour-divisor intervals therefore neither drift nor share a
+  stale fingerprint bucket. Planner cost previews use the configured planning
+  interval rather than assuming a fixed slot duration.
 - EV ready-by wall times are resolved in Home Assistant's configured timezone,
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare
@@ -290,12 +397,18 @@ Status as of 2026-06-28.
 - Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
   retention with defensive hard caps, preserving day-ahead training evidence
   across manual refresh bursts without unbounded storage growth.
+- Store persistence serializes concurrent writers and tracks mutation/saved
+  generations. Transient failures remain dirty and retryable, including writes
+  arriving during an in-flight or delayed save.
 - Forecast calibration explicitly drops legacy models and rebuilds current
   model fields from bounded timestamped evidence when persisted raw or unique
   counters are inconsistent or implausibly large. Bounded processed-observation
   observation-plus-lead identities prevent duplicate training without dropping
   older observations or newly available lead buckets that arrive out of order.
-- Preflight discovery blocks only configured and enabled control areas. Partial
+- Preflight discovery blocks only configured and enabled control areas. AI
+  provider configuration remains advisory, custom Enphase control services are
+  discovered consistently with execution, and keep-on requires an available
+  persistent switch/input-boolean. Partial
   EV, Climate, Enphase, or explicit HAEO installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
   production readiness without an enabled controllable area.
@@ -324,6 +437,9 @@ Status as of 2026-06-28.
   values to `HH:MM`, persists the native setting, and queues planner work. The
   `set_ev_target_soc` service validates and persists a percentage target. Native
   time/number entities expose the same controls on the EV device.
+- All integration services accept an optional `config_entry_id`. A single
+  loaded runtime remains backward compatible, while multiple runtimes reject
+  ambiguous calls and route explicitly targeted calls to the selected entry.
 - EV, Enphase, and Daikin adapters avoid duplicate commands where current
   observable state already matches the requested state. Native EV no-op
   decisions are skipped without consuming command caps.
@@ -334,7 +450,11 @@ Status as of 2026-06-28.
   command cooldown, while failsafe restore remains exempt so recovery is not
   blocked.
 - Config-entry unload and setup-failure paths restore planner ownership without
-  scheduling fresh planner work during teardown or failed setup.
+  scheduling fresh planner work during teardown or failed setup. Listener/timer
+  shutdown and an explicit teardown marker also suppress already-queued plan
+  commits until a failed unload resumes the coordinator. A failed
+  unload restore refuses the unload, disarms production control, and keeps the
+  coordinator operational for retry and diagnostics without a fresh replan.
 - `export_diagnostics` returns the same redacted compact config-entry
   diagnostics payload exposed through Home Assistant diagnostics, with tests for
   token, coordinate, address, raw prompt, raw model response, location-history
@@ -344,6 +464,9 @@ Status as of 2026-06-28.
   the coordinator, including refreshes per hour, last trigger,
   skipped/coalesced counts, phase durations, and the usable optimization
   horizon, while remaining compatible with older coordinators.
+- Multi-entry system health is deterministic, reports aggregate worst-case
+  health, and includes bounded per-entry summaries. The takeover diagnostic also
+  reflects reservation-only and provisional EV recovery state.
 - Estimated-cost telemetry reports the usable priced horizon and uses Home
   Assistant's configured currency with the monetary sensor device class.
 - Home Assistant validation is covered by Docker smoke coverage, Home Assistant

@@ -22,10 +22,13 @@ from .const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
+    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -50,6 +53,7 @@ _EVIDENCE_OPTION_EXCLUSIONS = {
     "ai_timeout_seconds",
     CONF_DRY_RUN,
     CONF_PLANNER_ENABLED,
+    CONF_EV_CONNECTED_HELPER,
 }
 _EVIDENCE_ENTRY_EXCLUSIONS = {CONF_AI_ADVISOR_SERVICE, "ai_task_entity"}
 
@@ -60,6 +64,7 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     options = coordinator.options
     control_areas = _control_area_report(entry_data, options)
     discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
+    _apply_ev_keep_on_preflight(discovery, entry_data, options)
     entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
@@ -198,6 +203,37 @@ def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, A
     }
 
 
+def _apply_ev_keep_on_preflight(
+    discovery: dict[str, Any],
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+) -> None:
+    """Block production readiness when keep-on lacks persistent control."""
+    if not strict_bool(options.get(CONF_EV_KEEP_CHARGER_ON), default=False):
+        return
+    entity_id = entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)
+    ev_discovery = discovery["ev"]
+    persistent_control = ev_discovery.get("details", {}).get(
+        "persistent_control", {}
+    )
+    if (
+        entity_id
+        and str(entity_id).split(".", 1)[0] in {"switch", "input_boolean"}
+        and persistent_control.get("available") is True
+    ):
+        return
+    issues = list(ev_discovery.get("issues", []))
+    issue = (
+        "ev_keep_on_control_unavailable"
+        if persistent_control.get("stateful") is True
+        else "ev_keep_on_requires_stateful_control"
+    )
+    if issue not in issues:
+        issues.append(issue)
+    ev_discovery["issues"] = issues
+    ev_discovery["supported"] = False
+
+
 def _availability_message(success_message: str, *, missing: list[str], unavailable: list[str]) -> str:
     """Return a concise availability check message."""
     details = []
@@ -326,19 +362,38 @@ def _entity_report(
     required_areas: list[str] | None = None,
 ) -> dict[str, Any]:
     configured = _configured_entities(entry_data, required_areas=required_areas)
+    advisory_entities = set(
+        _split_entities(entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC))
+    )
     missing: list[str] = []
     unavailable: list[str] = []
+    advisory_missing: list[str] = []
+    advisory_unavailable: list[str] = []
     for entity_id in configured:
         state = hass.states.get(entity_id)
         if state is None:
-            missing.append(entity_id)
+            target = advisory_missing if entity_id in advisory_entities else missing
+            target.append(entity_id)
         elif _entity_unavailable(entity_id, getattr(state, "state", "")):
-            unavailable.append(entity_id)
+            target = (
+                advisory_unavailable
+                if entity_id in advisory_entities
+                else unavailable
+            )
+            target.append(entity_id)
     return {
         "configured": configured,
         "missing": missing,
         "unavailable": unavailable,
-        "available_count": len(configured) - len(missing) - len(unavailable),
+        "advisory_missing": advisory_missing,
+        "advisory_unavailable": advisory_unavailable,
+        "available_count": (
+            len(configured)
+            - len(missing)
+            - len(unavailable)
+            - len(advisory_missing)
+            - len(advisory_unavailable)
+        ),
     }
 
 
@@ -379,9 +434,12 @@ def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str
     configured: list[str] = []
     if entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) and (required_areas is None or "haeo" in required_areas):
         configured.append(str(entry_data[CONF_HAEO_OPTIMIZE_SERVICE]))
-    configured.extend(
-        str(entry_data[key]) for key in _SERVICE_KEYS if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
-    )
+    if required_areas is None:
+        configured.extend(
+            str(entry_data[key])
+            for key in _SERVICE_KEYS
+            if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
+        )
     return configured
 
 
@@ -570,6 +628,8 @@ def _configured_entities(
 
 def _entity_control_area(config_key: str) -> str | None:
     """Return the optional device-control area owning an entity mapping."""
+    if config_key.startswith("ai_"):
+        return "ai"
     if config_key.startswith("ev_"):
         return "ev"
     if config_key.startswith(("daikin_", "climate_", "weather_")):

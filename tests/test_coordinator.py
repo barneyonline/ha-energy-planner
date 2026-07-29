@@ -12,6 +12,7 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
@@ -21,7 +22,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
+    CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
+    CONF_EV_CONNECTED_HELPER,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
@@ -30,9 +34,11 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
+    _apply_flexible_haeo_response,
     _bool_state_value,
     _configured_entity_ids,
     _decision_input_fingerprint,
+    _expired_manual_hvac_state,
     _float_state_value,
     _is_manual_hvac_change,
     _is_material_state_change,
@@ -45,6 +51,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _seconds_until_next_interval_boundary,
     _snapshot_actions,
     _split_entity_values,
+    _unexpired_overrides,
 )
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -56,6 +63,7 @@ from custom_components.ha_energy_planner.models import (
     HAEOStatus,
     InputHealth,
     OccupancyState,
+    Override,
     PlanAction,
     PlannerMode,
 )
@@ -74,13 +82,17 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
             "ai_task_entity": "ai_task.local",
             "daikin_power_entity": "sensor.daikin_power",
             "ev_smart_charging_entity": "switch.ev_control",
+            "ev_smart_charging_ready_by_entity": "select.ev_ready_by",
+            "pv_forecast_secondary_entity": "sensor.pv_tomorrow",
             "empty_entity": "",
         }
     )
     assert entity_ids == [
         "person.cath",
         "person.james",
+        "select.ev_ready_by",
         "sensor.import_price",
+        "sensor.pv_tomorrow",
     ]
 
 
@@ -212,12 +224,27 @@ class FakeExecutor:
         self.entry_data = {}
         self.evaluated: list[tuple[EnergyPlan, object]] = []
         self.restored: list[str] = []
+        self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
+        self.reservation_syncs = 0
+        self.reservation_persists = 0
 
     async def async_evaluate(self, plan: EnergyPlan, context: object) -> None:
         self.evaluated.append((plan, context))
 
     async def async_restore_safe_state(self, reason: str) -> None:
         self.restored.append(reason)
+
+    async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
+        self.manual_ev_commands.append(
+            (enabled, context, dict(self.options), dict(self.entry_data))
+        )
+        return SimpleNamespace(applied=True)
+
+    def sync_ev_grid_reservation(self) -> None:
+        self.reservation_syncs += 1
+
+    async def async_persist_ev_grid_reservation(self) -> None:
+        self.reservation_persists += 1
 
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         self.fallback = (plan, violations)
@@ -243,6 +270,7 @@ def test_options_update_restores_when_direct_update_enables_safe_mode() -> None:
     )
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._last_control_mode_state = (True, False)
+    coordinator.executor = FakeExecutor()
     restore_calls: list[tuple[str, bool]] = []
     replan_calls: list[str] = []
 
@@ -260,6 +288,8 @@ def test_options_update_restores_when_direct_update_enables_safe_mode() -> None:
     assert restore_calls == [("planner_disabled", False)]
     assert replan_calls == ["replan"]
     assert coordinator._last_control_mode_state == (False, True)
+    assert coordinator.executor.options[CONF_DRY_RUN] is True
+    assert coordinator.executor.reservation_syncs == 1
 
 
 def test_options_update_surfaces_restore_error_after_safe_option_is_applied() -> None:
@@ -273,6 +303,7 @@ def test_options_update_surfaces_restore_error_after_safe_option_is_applied() ->
     )
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._last_control_mode_state = (True, False)
+    coordinator.executor = FakeExecutor()
 
     async def restore(reason: str, *, refresh: bool = True) -> None:
         raise RuntimeError(f"{reason}:{refresh}")
@@ -286,6 +317,51 @@ def test_options_update_surfaces_restore_error_after_safe_option_is_applied() ->
     assert coordinator.dry_run is True
     assert coordinator._last_control_mode_state == (True, True)
     coordinator.async_request_replan.assert_not_awaited()
+
+
+def test_keep_on_option_rejects_nonpersistent_control_before_persisting() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {"ev_charger_start_entity": "button.ev_start"},
+        {CONF_EV_KEEP_CHARGER_ON: False},
+    )
+
+    with pytest.raises(HomeAssistantError):
+        asyncio.run(coordinator.async_set_ev_keep_charger_on(True))
+
+    assert coordinator.entry.options[CONF_EV_KEEP_CHARGER_ON] is False
+
+
+def test_keep_on_option_accepts_persistent_control_and_runs_option_update() -> None:
+    class ConfigEntries:
+        def async_update_entry(
+            self,
+            entry: FakeEntry,
+            *,
+            options: dict[str, object],
+        ) -> None:
+            entry.options = options
+
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {CONF_EV_CHARGER: "switch.ev_control"},
+        {
+            CONF_PLANNER_ENABLED: False,
+            CONF_DRY_RUN: True,
+            CONF_EV_KEEP_CHARGER_ON: False,
+        },
+    )
+    coordinator.hass = SimpleNamespace(config_entries=ConfigEntries())
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (False, True)
+    coordinator.executor = FakeExecutor()
+    coordinator.async_request_replan = AsyncMock()
+
+    asyncio.run(coordinator.async_set_ev_keep_charger_on(True))
+
+    assert coordinator.entry.options[CONF_EV_KEEP_CHARGER_ON] is True
+    assert coordinator.executor.reservation_persists == 1
+    assert coordinator.async_request_replan.await_count == 1
 
 
 def test_coordinator_records_refresh_duration_in_memory() -> None:
@@ -521,12 +597,53 @@ def test_overrides_restored_only_when_active() -> None:
                     "expires_at": (now - timedelta(minutes=5)).isoformat(),
                     "reason": "expired",
                 },
+                {
+                    "kind": "manual_ev_charging",
+                    "source": "button",
+                    "expires_at": (
+                        now.replace(tzinfo=None) - timedelta(minutes=5)
+                    ).isoformat(),
+                    "reason": "legacy_naive_expired",
+                },
+                {
+                    "kind": "manual_ev_charging",
+                    "source": "button",
+                    "expires_at": "not-a-timestamp",
+                    "reason": "malformed_expiry",
+                },
+                {
+                    "kind": "manual_hvac",
+                    "source": "service",
+                    "reason": "missing_expiry",
+                },
             ]
         },
         now,
     )
     assert len(overrides) == 1
     assert overrides[0].reason == "active"
+
+
+def test_unexpired_overrides_prunes_runtime_expiry_and_keeps_unbounded_values() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    active = Override(
+        "manual_ev_charging",
+        "button",
+        now + timedelta(minutes=5),
+        "manual_start",
+    )
+    unbounded = Override("manual_hvac", "service", None, "manual")
+    expired = Override(
+        "manual_ev_charging",
+        "button",
+        now.replace(tzinfo=None) - timedelta(minutes=5),
+        "manual_stop",
+    )
+
+    assert _unexpired_overrides([expired, active, unbounded], now) == [
+        active,
+        unbounded,
+    ]
 
 
 def test_seconds_until_next_interval_boundary() -> None:
@@ -543,6 +660,13 @@ def test_seconds_until_next_interval_boundary() -> None:
             5,
         )
         == 300.0
+    )
+    assert (
+        _seconds_until_next_interval_boundary(
+            datetime(2026, 6, 27, 11, 20, 0, tzinfo=UTC),
+            40,
+        )
+        == 2400.0
     )
 
 
@@ -767,6 +891,27 @@ def test_current_planner_result_saves_and_executes() -> None:
     assert coordinator.store.saved_plans == [plan]
     assert coordinator.executor.evaluated == [(plan, context)]
     assert coordinator.executor.options == {"planner_enabled": True}
+    assert coordinator._last_decision_context is context
+
+
+def test_teardown_discards_queued_current_planner_result() -> None:
+    previous = _plan("previous")
+    queued = _plan("queued-during-unload")
+    coordinator = _coordinator_for_commit(previous, current_generation=3)
+    coordinator._tearing_down = True
+
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(
+            3,
+            queued,
+            object(),
+            {"planner_enabled": True},
+        )
+    )
+
+    assert result is previous
+    assert coordinator.store.saved_plans == []
+    assert coordinator.executor.evaluated == []
 
 
 def test_current_plan_evaluates_each_coordinated_action() -> None:
@@ -811,6 +956,76 @@ def test_current_plan_evaluates_each_coordinated_action() -> None:
         (plan, context),
         (replace(plan, actions=[ev_action]), context),
     ]
+
+
+def test_current_plan_stops_coordinated_actions_after_generation_changes() -> None:
+    plan = _plan("current-with-follow-up")
+    plan.actions = [
+        _coordinated_action(plan, "first", ActionAsset.EV, ActionKind.EV_START),
+        _coordinated_action(
+            plan,
+            "follow-up",
+            ActionAsset.ENPHASE,
+            ActionKind.SET_PROFILE,
+        ),
+    ]
+    context = object()
+    coordinator = _coordinator_for_commit(None, current_generation=3)
+    coordinator.hass = FakeHass()
+
+    class InvalidatingExecutor(FakeExecutor):
+        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> None:
+            await super().async_evaluate(evaluated_plan, evaluated_context)
+            coordinator._refresh_generation += 1
+
+    coordinator.executor = InvalidatingExecutor()
+
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(
+            3,
+            plan,
+            context,
+            {"planner_enabled": True},
+        )
+    )
+
+    assert result is plan
+    assert coordinator.executor.evaluated == [(plan, context)]
+    assert len(coordinator.hass.created_tasks) == 1
+
+
+def test_current_plan_stops_coordinated_actions_when_teardown_starts() -> None:
+    plan = _plan("current-with-follow-up")
+    plan.actions = [
+        _coordinated_action(plan, "first", ActionAsset.EV, ActionKind.EV_START),
+        _coordinated_action(
+            plan,
+            "follow-up",
+            ActionAsset.ENPHASE,
+            ActionKind.SET_PROFILE,
+        ),
+    ]
+    context = object()
+    coordinator = _coordinator_for_commit(None, current_generation=3)
+
+    class TeardownExecutor(FakeExecutor):
+        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> None:
+            await super().async_evaluate(evaluated_plan, evaluated_context)
+            coordinator._tearing_down = True
+
+    coordinator.executor = TeardownExecutor()
+
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(
+            3,
+            plan,
+            context,
+            {"planner_enabled": True},
+        )
+    )
+
+    assert result is plan
+    assert coordinator.executor.evaluated == [(plan, context)]
 
 
 def test_planner_options_include_runtime_ready_by_override() -> None:
@@ -1468,6 +1683,94 @@ def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
     assert _parse_datetime_or_none(123) is None
 
 
+def test_flexible_haeo_response_restores_baseline_for_uncovered_slots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = SimpleNamespace(
+        slots=[
+            DecisionSlot(
+                valid_at=now,
+                import_price=0.2,
+                export_price=0.08,
+                pv_forecast_kw=1.0,
+                baseline_load_forecast_kw=0.5,
+                haeo_grid_import_forecast_kw=1.0,
+                haeo_grid_export_forecast_kw=2.0,
+            ),
+            DecisionSlot(
+                valid_at=now + timedelta(minutes=5),
+                import_price=0.2,
+                export_price=0.08,
+                pv_forecast_kw=1.0,
+                baseline_load_forecast_kw=0.5,
+                haeo_grid_import_forecast_kw=3.0,
+                haeo_grid_export_forecast_kw=4.0,
+            ),
+        ]
+    )
+
+    def fake_apply(
+        built_context: object,
+        response: object,
+        *,
+        grid_includes_flexible_loads: bool,
+    ) -> dict[str, int]:
+        assert built_context is context
+        assert response == {"flexible": True}
+        assert grid_includes_flexible_loads is True
+        context.slots[0].haeo_grid_import_forecast_kw = 8.0
+        context.slots[0].haeo_grid_export_forecast_kw = 0.0
+        context.slots[0].haeo_grid_includes_flexible_loads = True
+        context.slots[1].haeo_grid_import_forecast_kw = 9.0
+        return {"haeo_grid_import_forecast_kw": 2}
+
+    monkeypatch.setattr(coordinator_module, "apply_haeo_response_to_context", fake_apply)
+
+    counts = _apply_flexible_haeo_response(context, {"flexible": True})
+
+    assert counts == {"haeo_grid_import_forecast_kw": 2}
+    assert (
+        context.slots[0].haeo_grid_import_forecast_kw,
+        context.slots[0].haeo_grid_export_forecast_kw,
+        context.slots[0].haeo_grid_includes_flexible_loads,
+    ) == (8.0, 0.0, True)
+    assert (
+        context.slots[1].haeo_grid_import_forecast_kw,
+        context.slots[1].haeo_grid_export_forecast_kw,
+        context.slots[1].haeo_grid_includes_flexible_loads,
+    ) == (3.0, 4.0, False)
+
+
+def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+
+    assert _expired_manual_hvac_state({"overrides": "bad"}, now) is False
+    assert (
+        _expired_manual_hvac_state(
+            {
+                "overrides": [
+                    "bad",
+                    {"kind": "manual_ev_charging"},
+                    {
+                        "kind": "manual_hvac",
+                        "expires_at": (now + timedelta(minutes=5)).isoformat(),
+                    },
+                ]
+            },
+            now,
+        )
+        is False
+    )
+    assert (
+        _expired_manual_hvac_state(
+            {"overrides": [{"kind": "manual_hvac"}]},
+            now,
+        )
+        is True
+    )
+
+
 def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: object) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = SimpleNamespace(
@@ -1644,9 +1947,17 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
         lambda model, previous, sample: ({"last_sample": sample, "enabled": True}, True),
     )
 
-    def fake_apply_haeo_response(built_context: object, response: object) -> dict[str, int]:
+    def fake_apply_haeo_response(
+        built_context: object,
+        response: object,
+        *,
+        grid_includes_flexible_loads: bool = False,
+    ) -> dict[str, int]:
         assert built_context is context
         context.last_haeo_response = response
+        context.slots[0].haeo_grid_import_forecast_kw = 8.0 if response == {"flexible": True} else 1.0
+        context.slots[0].haeo_grid_export_forecast_kw = 0.0
+        context.slots[0].haeo_grid_includes_flexible_loads = grid_includes_flexible_loads
         return {"evidence": len(response or {})}
 
     monkeypatch.setattr(
@@ -1660,10 +1971,37 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry({"haeo_optimize_service": "haeo.optimize"}, {"ai_enabled": True})
-    coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
+    coordinator.entry = FakeEntry(
+        {
+            "haeo_optimize_service": "haeo.optimize",
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override",
+        },
+        {"ai_enabled": True},
+    )
+    coordinator.store = FakeStore(
+        {
+            "trip_history": {},
+            "forecast_snapshots": [],
+            "overrides": [
+                {
+                    "kind": "manual_hvac",
+                    "expires_at": "2000-01-01T00:00:00+00:00",
+                }
+            ],
+            "ownership": {
+                "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+            },
+        }
+    )
     coordinator.executor = FakeExecutor()
-    coordinator.overrides = []
+    coordinator.overrides = [
+        Override(
+            "manual_ev_charging",
+            "button",
+            datetime(2000, 1, 1, tzinfo=UTC),
+            "manual_start",
+        )
+    ]
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0
 
@@ -1673,6 +2011,8 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert result.summary == "{'flexible': True}"
     assert FakePlanner.initial_projected_loads == [(0.0, 0.0), (0.0, 0.0)]
     assert (context.slots[0].projected_ev_load_kw, context.slots[0].projected_hvac_load_kw) == (7.0, 1.0)
+    assert context.slots[0].haeo_grid_import_forecast_kw == 8.0
+    assert context.slots[0].haeo_grid_includes_flexible_loads is True
     assert result.status == "unsafe"
     assert result.mode == PlannerMode.ACTIVE_DEGRADED
     assert result.input_issues == ["input_health_unsafe"]
@@ -1690,6 +2030,17 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.ai_recommendations == []
     assert coordinator.store.forecast_snapshots[0]["ai"] is None
     assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
+    assert coordinator.overrides == []
+    assert coordinator.store.data["overrides"] == []
+    assert coordinator.store.data["ownership"] == {}
+    assert coordinator.hass.services.calls == [
+        (
+            "input_boolean",
+            "turn_off",
+            {"entity_id": "input_boolean.manual_override"},
+            True,
+        )
+    ]
     assert coordinator.store.saved_plans == [result]
     assert coordinator.executor.evaluated == [(result, context)]
 
@@ -2076,6 +2427,45 @@ def test_restore_safe_state_can_skip_refresh_for_teardown() -> None:
     assert coordinator._refresh_generation == 0
 
 
+def test_manual_ev_and_restore_commands_share_planner_serialization_lock() -> None:
+    async def scenario() -> None:
+        coordinator = _coordinator_for_runtime_services()
+        lock_observations: list[tuple[str, bool]] = []
+
+        async def save_overrides(overrides: list[object]) -> None:
+            lock_observations.append(("save_override", coordinator._planner_lock.locked()))
+
+        async def request_refresh() -> None:
+            lock_observations.append(("refresh", coordinator._planner_lock.locked()))
+
+        coordinator.store.async_save_overrides = save_overrides
+        coordinator.async_request_refresh = request_refresh
+
+        await coordinator._planner_lock.acquire()
+        manual_task = asyncio.create_task(coordinator.async_manual_ev_charging(True))
+        await asyncio.sleep(0)
+        assert coordinator.executor.manual_ev_commands == []
+        coordinator._planner_lock.release()
+        await manual_task
+
+        await coordinator._planner_lock.acquire()
+        restore_task = asyncio.create_task(
+            coordinator.async_restore_safe_state("serialized_restore")
+        )
+        await asyncio.sleep(0)
+        assert coordinator.executor.restored == []
+        coordinator._planner_lock.release()
+        await restore_task
+
+        assert lock_observations == [
+            ("save_override", True),
+            ("refresh", False),
+            ("refresh", False),
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_request_replan_and_ready_by_mark_generation_and_refresh() -> None:
     coordinator = _coordinator_for_runtime_services()
 
@@ -2111,9 +2501,8 @@ def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
     assert calls == [(coordinator.hass, coordinator.entry_data, "23:45")]
 
 
-def test_native_ev_settings_persist_and_manual_control_replans(monkeypatch: object) -> None:
+def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     updates: list[dict[str, Any]] = []
-    charger_calls: list[bool] = []
     refreshes: list[str] = []
 
     class ConfigEntries:
@@ -2121,29 +2510,22 @@ def test_native_ev_settings_persist_and_manual_control_replans(monkeypatch: obje
             entry.options = options
             updates.append(options)
 
-    class FakeChargerAdapter:
-        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
-            pass
-
-        async def async_set_charging(self, enabled: bool) -> None:
-            charger_calls.append(enabled)
-            return SimpleNamespace(applied=True)
-
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = SimpleNamespace(entry_id="entry", data={"ev_charger_entity": "switch.ev"}, options={})
     coordinator.hass = SimpleNamespace(config_entries=ConfigEntries())
     coordinator.ready_by = "07:00"
     coordinator.overrides = []
     coordinator.store = SimpleNamespace(async_save_overrides=AsyncMock())
+    coordinator.executor = FakeExecutor()
+    coordinator._last_decision_context = SimpleNamespace(plan_id="latest-context")
     coordinator._refresh_generation = 0
     coordinator._force_next_refresh = False
+    coordinator._planner_lock = asyncio.Lock()
 
     async def request_refresh() -> None:
         refreshes.append("refresh")
 
     coordinator.async_request_refresh = request_refresh
-    monkeypatch.setattr(coordinator_module, "EVChargerAdapter", FakeChargerAdapter)
-
     asyncio.run(coordinator.async_set_ready_by("08:10"))
     asyncio.run(coordinator.async_set_ev_target_soc(85))
     asyncio.run(coordinator.async_manual_ev_charging(True))
@@ -2152,10 +2534,37 @@ def test_native_ev_settings_persist_and_manual_control_replans(monkeypatch: obje
     assert coordinator.ready_by == "08:10"
     assert updates[0]["default_ready_by"] == "08:10"
     assert updates[1]["ev_fallback_target_soc_percent"] == 85
-    assert charger_calls == [True, False]
+    assert [item[0] for item in coordinator.executor.manual_ev_commands] == [True, False]
+    assert all(
+        item[1] is coordinator._last_decision_context
+        for item in coordinator.executor.manual_ev_commands
+    )
+    assert all(item[2][CONF_EV_CONNECTED_HELPER] is False for item in coordinator.executor.manual_ev_commands)
     assert coordinator.overrides[0].reason == "manual_stop"
     assert coordinator.store.async_save_overrides.await_count == 2
     assert refreshes == ["refresh"] * 4
+
+
+def test_connected_helper_persists_and_records_trip_state_without_external_entity() -> None:
+    updates: list[dict[str, object]] = []
+    hass = FakeHass({"sensor.ev_soc": "50"})
+
+    def update_entry(entry: FakeEntry, *, options: dict[str, object]) -> None:
+        entry.options = options
+        updates.append(options)
+
+    hass.config_entries = SimpleNamespace(async_update_entry=update_entry)
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_SOC: "sensor.ev_soc"},
+        options={CONF_EV_CONNECTED_HELPER: True},
+        hass=hass,
+    )
+
+    asyncio.run(coordinator.async_set_ev_connected_helper(False))
+
+    assert updates[-1][CONF_EV_CONNECTED_HELPER] is False
+    assert coordinator.store.data["trip_history"]["active_trip"]["start_soc_percent"] == 50
+    assert coordinator.refresh_requested == 1
 
 
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
@@ -2183,6 +2592,24 @@ def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -
     ]
     assert coordinator.refresh_requested == 1
     assert coordinator._refresh_generation == 1
+
+
+def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+    coordinator.store.data["ownership"] = {
+        "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+    }
+
+    async def fail_service(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("helper unavailable")
+
+    coordinator.hass.services.async_call = fail_service
+
+    asyncio.run(coordinator._async_clear_expired_manual_hvac_state())
+
+    assert "manual_hvac_override_expires_at" in coordinator.store.data["ownership"]
 
 
 def test_manual_hvac_change_handler_uses_configured_duration() -> None:
@@ -2406,9 +2833,33 @@ def _coordinator_for_commit(previous: EnergyPlan | None, *, current_generation: 
     return coordinator
 
 
+def _coordinated_action(
+    plan: EnergyPlan,
+    action_id: str,
+    asset: ActionAsset,
+    kind: ActionKind,
+) -> PlanAction:
+    """Return one due action for coordinator commit-order tests."""
+    return PlanAction(
+        action_id=action_id,
+        plan_id=plan.plan_id,
+        execute_not_before=plan.created_at,
+        execute_not_after=plan.created_at + timedelta(minutes=5),
+        asset=asset,
+        kind=kind,
+        desired_state={},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+
+
 def _coordinator_for_restore() -> EnergyPlannerCoordinator:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.executor = FakeExecutor()
+    coordinator._planner_lock = asyncio.Lock()
     coordinator._refresh_generation = 0
     coordinator.refresh_requested = 0
 
@@ -2431,6 +2882,7 @@ def _coordinator_for_runtime_services(
     coordinator.entry = FakeEntry(entry_data or {}, options or {})
     coordinator.store = FakeStore(store_data or {})
     coordinator.executor = FakeExecutor()
+    coordinator._planner_lock = asyncio.Lock()
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0

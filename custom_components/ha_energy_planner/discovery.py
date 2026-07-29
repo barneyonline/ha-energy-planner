@@ -15,6 +15,7 @@ from .const import (
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
+    CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -101,22 +102,42 @@ class CapabilityDiscovery:
             or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
             or self.entry_data.get(CONF_EV_SMART_CHARGING)
         )
-        stop = (
+        separate_stop = (
             self.entry_data.get(CONF_EV_CHARGER_STOP)
-            or self.entry_data.get(CONF_EV_CHARGER)
             or self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING)
         )
+        shared_stop = self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(
+            CONF_EV_SMART_CHARGING
+        )
+        persistent_control = shared_stop
+        stop = separate_stop or shared_stop
         if not control:
             issues.append("ev_start_control_not_configured")
         elif _state_missing(self.hass, control):
             issues.append("ev_start_control_unavailable")
         if not stop:
             issues.append("ev_stop_control_not_configured")
+        elif (
+            not separate_stop
+            and str(stop).split(".", 1)[0] in {"button", "input_button"}
+        ):
+            issues.append("ev_stop_control_unsupported")
         elif _state_missing(self.hass, stop):
             issues.append("ev_stop_control_unavailable")
         details["start_control"] = control
         details["stop_control"] = stop
+        details["persistent_control"] = {
+            "entity_id": persistent_control,
+            "available": bool(
+                persistent_control
+                and not _state_missing(self.hass, persistent_control)
+            ),
+            "stateful": bool(
+                persistent_control
+                and str(persistent_control).split(".", 1)[0]
+                in {"switch", "input_boolean"}
+            ),
+        }
         details["controller"] = "ha_energy_planner"
         for key in (CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_EV_SMART_CHARGING_READY_BY):
             entity_id = self.entry_data.get(key)
@@ -148,7 +169,9 @@ class CapabilityDiscovery:
     def _inspect_enphase(self) -> CapabilityEvidence:
         issues: list[str] = []
         profile = self.entry_data.get(CONF_ENPHASE_PROFILE)
-        service = _profile_control_service(profile)
+        service = self.entry_data.get(CONF_ENPHASE_PROFILE_CONTROL_SERVICE) or _profile_control_service(
+            profile
+        )
         ai_profile = self.entry_data.get(CONF_ENPHASE_AI_PROFILE)
         self_consumption_profile = self.entry_data.get(CONF_ENPHASE_SELF_CONSUMPTION_PROFILE)
         full_backup_profile = self.entry_data.get(CONF_ENPHASE_FULL_BACKUP_PROFILE)

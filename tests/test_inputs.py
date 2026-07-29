@@ -25,6 +25,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CONNECTED,
+    CONF_EV_CONNECTED_HELPER,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
@@ -669,7 +671,14 @@ def test_long_baseline_leading_gap_is_not_filled() -> None:
 
 
 def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
-    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "planning_horizon_hours": 1,
+        "planning_interval_minutes": 15,
+        CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 75,
+    }
     entry_data = {
         CONF_AMBER_IMPORT_PRICE: "sensor.import",
         CONF_AMBER_EXPORT_PRICE: "sensor.export",
@@ -702,8 +711,58 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     assert context.current_ev_soc_percent == 72
     assert context.ev_connected is True
     assert context.ev_target_soc_percent == 80
+    assert context.ev_target_soc_fallback_active is False
     assert context.ev_ready_by == "08:00"
     assert context.input_health == InputHealth.HEALTHY
+
+    hass.states.values["sensor.ev_target"] = FakeState("unavailable")
+    fallback_context = InputManager(hass, entry_data, options).build_context()
+    fallback_plan = DryRunPlanner(options).create_plan(fallback_context)
+
+    assert fallback_context.ev_target_soc_percent == 75
+    assert fallback_context.ev_target_soc_fallback_active is True
+    assert fallback_context.input_health == InputHealth.HEALTHY
+    assert (
+        "advisory_ev_smart_charging_target_soc_entity_unavailable_using_native_fallback"
+        in fallback_context.input_issues
+    )
+    assert any(action.asset.value == "ev" for action in fallback_plan.actions)
+    assert fallback_plan.confidence_breakdown["ev"] == 1.0
+
+
+def test_input_manager_uses_connected_helper_only_without_external_entity() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planning_horizon_hours": 1,
+        "planning_interval_minutes": 15,
+        CONF_EV_CONNECTED_HELPER: False,
+    }
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_BATTERY_SOC: "sensor.battery",
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
+            "sensor.battery": FakeState("55"),
+        }
+    )
+
+    disconnected = InputManager(hass, entry_data, options).build_context()
+    connected = InputManager(
+        hass,
+        entry_data,
+        {**options, CONF_EV_CONNECTED_HELPER: True},
+    ).build_context()
+
+    assert disconnected.ev_connected is False
+    assert connected.ev_connected is True
 
 
 def test_input_manager_ev_helper_state_edge_cases() -> None:

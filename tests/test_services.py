@@ -14,10 +14,13 @@ from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from custom_components.ha_energy_planner import async_setup
 from custom_components.ha_energy_planner.const import (
     ATTR_ASSET,
+    ATTR_CONFIG_ENTRY_ID,
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
     ATTR_TARGET_SOC,
+    CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
     SERVICE_DISARM_PRODUCTION_CONTROL,
@@ -102,7 +105,7 @@ class FakeConfigEntries:
         self.coordinator = coordinator
 
     def async_entries(self, domain: str) -> list[Any]:
-        return [type("Entry", (), {"runtime_data": self.coordinator})()]
+        return [type("Entry", (), {"entry_id": "entry-1", "runtime_data": self.coordinator})()]
 
 
 class FakeHass:
@@ -324,6 +327,111 @@ def test_run_preflight_supports_ev_only_control() -> None:
     assert response["production"]["required_control_areas"] == ["ev"]
     assert response["discovery"]["hvac"]["supported"] is False
     assert response["discovery"]["enphase"]["supported"] is False
+
+
+def test_run_preflight_blocks_keep_on_without_persistent_control() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+        },
+        ev_control_enabled=True,
+        **{CONF_EV_KEEP_CHARGER_ON: True},
+    )
+
+    response = _run_preflight(coordinator)
+
+    checks = {check["check"]: check for check in response["checks"]}
+    assert response["ok"] is False
+    assert response["discovery"]["ev"]["supported"] is False
+    assert "ev_keep_on_requires_stateful_control" in response["discovery"]["ev"]["issues"]
+    assert checks["required_control_areas_supported"]["ok"] is False
+
+
+def test_run_preflight_accepts_keep_on_with_persistent_control() -> None:
+    coordinator = _partial_coordinator(
+        {"ev_charger_entity": "input_boolean.ev_start"},
+        ev_control_enabled=True,
+        **{CONF_EV_KEEP_CHARGER_ON: True},
+    )
+
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert response["discovery"]["ev"]["supported"] is True
+
+
+def test_run_preflight_blocks_keep_on_with_unavailable_persistent_control() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_charger_entity": "switch.missing_charger",
+            "ev_charger_start_entity": "input_boolean.ev_start",
+            "ev_charger_stop_entity": "input_boolean.ev_stop",
+        },
+        ev_control_enabled=True,
+        **{CONF_EV_KEEP_CHARGER_ON: True},
+    )
+
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is False
+    assert response["discovery"]["ev"]["supported"] is False
+    assert (
+        "ev_keep_on_control_unavailable"
+        in response["discovery"]["ev"]["issues"]
+    )
+    assert response["discovery"]["ev"]["details"]["persistent_control"] == {
+        "entity_id": "switch.missing_charger",
+        "available": False,
+        "stateful": True,
+    }
+
+
+def test_run_preflight_keeps_unavailable_ai_configuration_advisory() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ai_task_entity": "ai_task.missing",
+            "ai_advisor_service": "ai_task.generate_data",
+        },
+        ev_control_enabled=True,
+        ai_enabled=True,
+    )
+
+    response = _run_preflight(coordinator)
+
+    assert response["ok"] is True
+    assert "ai_task.missing" not in response["entities"]["configured"]
+    assert "ai_task.generate_data" not in response["services"]["configured"]
+    assert response["discovery"]["ai"]["supported"] is False
+    assert "ai_task_entity_unavailable" in response["discovery"]["ai"]["issues"]
+
+
+def test_run_preflight_keeps_unavailable_external_ev_target_advisory() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+        },
+        ev_control_enabled=True,
+    )
+    hass = FakeHass(coordinator)
+    hass.states.values["sensor.ev_target"] = "unavailable"
+    asyncio.run(async_setup(hass, {}))
+
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    response = asyncio.run(handler(FakeCall({})))
+
+    checks = {check["check"]: check for check in response["checks"]}
+    assert response["ok"] is True
+    assert checks["configured_entities_available"]["ok"] is True
+    assert response["entities"]["unavailable"] == []
+    assert response["entities"]["advisory_unavailable"] == [
+        "sensor.ev_target"
+    ]
+    assert response["entities"]["available_count"] == 2
 
 
 def test_run_preflight_supports_enphase_only_control() -> None:
@@ -567,6 +675,7 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
         "ai_timeout_seconds": 10,
         "default_ready_by": "07:00",
         "command_rate_limit_seconds": 60,
+        "ev_connected_helper": False,
     }
     original = production_evidence_fingerprint(entry_data, options)
     active = production_evidence_fingerprint(
@@ -578,6 +687,7 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
             "ai_enabled": True,
             "ai_timeout_seconds": 30,
             "default_ready_by": "23:45",
+            "ev_connected_helper": True,
         },
     )
     changed_policy = production_evidence_fingerprint(entry_data, {**options, "command_rate_limit_seconds": 120})
@@ -609,6 +719,31 @@ def test_services_raise_translated_error_for_missing_config_entry() -> None:
             asyncio.run(hass.services.handlers[(DOMAIN, service)](FakeCall({})))
         assert error.value.translation_domain == DOMAIN
         assert error.value.translation_key == "no_config_entry"
+
+
+def test_services_require_and_honor_config_entry_id_with_multiple_planners() -> None:
+    first = _coordinator("entry-1")
+    second = _coordinator("entry-2")
+    hass = FakeHass(first)
+    hass.config_entries.async_entries = lambda domain: [
+        type("Entry", (), {"entry_id": "entry-1", "runtime_data": first})(),
+        type("Entry", (), {"entry_id": "entry-2", "runtime_data": second})(),
+    ]
+    asyncio.run(async_setup(hass, {}))
+    handler = hass.services.handlers[(DOMAIN, SERVICE_REPLAN)]
+
+    with pytest.raises(ServiceValidationError) as ambiguous:
+        asyncio.run(handler(FakeCall({})))
+    assert ambiguous.value.translation_key == "config_entry_required"
+
+    asyncio.run(handler(FakeCall({ATTR_CONFIG_ENTRY_ID: "entry-2"})))
+
+    assert first.awaited == []
+    assert second.awaited == [("replan", None)]
+
+    with pytest.raises(ServiceValidationError) as missing:
+        asyncio.run(handler(FakeCall({ATTR_CONFIG_ENTRY_ID: "missing"})))
+    assert missing.value.translation_key == "config_entry_not_found"
 
 
 def test_restore_service_raises_translated_error_when_restore_is_incomplete() -> None:
@@ -648,7 +783,7 @@ def test_pause_control_schema_validates_asset_duration_and_reason() -> None:
         raise AssertionError("Invalid pause asset was accepted")
 
 
-def _coordinator() -> EnergyPlannerCoordinator:
+def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     now = datetime.now(UTC)
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.awaited = []
@@ -656,6 +791,7 @@ def _coordinator() -> EnergyPlannerCoordinator:
         "Entry",
         (),
         {
+            "entry_id": entry_id,
             "data": {
                 "haeo_optimize_service": "haeo.optimize",
                 "amber_import_price_entity": "sensor.import_price",

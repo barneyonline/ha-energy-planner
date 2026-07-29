@@ -222,6 +222,44 @@ def test_haeo_second_pass_sends_flexible_projection() -> None:
     ]
 
 
+def test_haeo_second_pass_requires_response_grid_evidence_not_inherited_baseline() -> None:
+    class PartialServices(FakeServices):
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+            return_response: bool = False,
+        ) -> dict[str, Any]:
+            return {
+                "slots": [
+                    {
+                        "valid_at": data["created_at"],
+                        "grid_import_kw": 2.0,
+                        "grid_export_kw": 0.0,
+                    }
+                ]
+            }
+
+    context = _context()
+    for slot in context.slots:
+        slot.haeo_grid_import_forecast_kw = 1.0
+        slot.haeo_grid_export_forecast_kw = 0.0
+    hass = FakeHass()
+    hass.services = PartialServices()
+
+    result = asyncio.run(
+        HAEOAdapter(hass, "haeo.optimize").async_solve_with_flexible_load(
+            context,
+            DryRunPlanner({}).project_flexible_loads(context),
+        )
+    )
+
+    assert result.status == HAEOStatus.STALE
+    assert result.reason == "haeo_response_without_usable_evidence"
+
+
 def test_real_haeo_optimize_service_uses_config_entry_schema() -> None:
     hass = HaeoConfigEntryHass()
     context = _context()
@@ -390,6 +428,31 @@ def test_haeo_response_populates_forecast_evidence_on_context_slots() -> None:
     assert context.slots[0].haeo_battery_soc_forecast_percent == 55
     assert context.slots[1].haeo_grid_export_forecast_kw == 2.0
     assert context.slots[1].haeo_battery_discharge_forecast_kw == 1.25
+
+
+def test_haeo_response_marks_only_returned_grid_slots_as_flexible_inclusive() -> None:
+    context = _context()
+
+    counts = apply_haeo_response_to_context(
+        context,
+        {
+            "slots": [
+                {
+                    "valid_at": "2026-06-27T00:00:00+00:00",
+                    "grid_import_kw": 3.0,
+                    "grid_export_kw": 0.0,
+                }
+            ]
+        },
+        grid_includes_flexible_loads=True,
+    )
+
+    assert counts == {
+        "haeo_grid_import_forecast_kw": 1,
+        "haeo_grid_export_forecast_kw": 1,
+    }
+    assert context.slots[0].haeo_grid_includes_flexible_loads is True
+    assert context.slots[1].haeo_grid_includes_flexible_loads is False
 
 
 def test_haeo_response_matches_refresh_jitter_within_planning_boundary() -> None:

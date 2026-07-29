@@ -54,6 +54,8 @@ ENTITY_DEVICE_BY_KEY = {
     "enphase_plan": DEVICE_ENPHASE,
     "estimated_daily_cost": DEVICE_ENERGY,
     "ev_control_enabled": DEVICE_EV,
+    "ev_connected_helper": DEVICE_EV,
+    "ev_keep_charger_on": DEVICE_EV,
     "ev_target_soc": DEVICE_EV,
     "ev_ready_by": DEVICE_EV,
     "ev_start_charging": DEVICE_EV,

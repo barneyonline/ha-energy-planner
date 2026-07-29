@@ -12,7 +12,13 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.ha_energy_planner import button as button_module
 from custom_components.ha_energy_planner import switch as switch_module
 from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
-from custom_components.ha_energy_planner.const import CONF_AI_ENABLED, CONF_DRY_RUN, CONF_PLANNER_ENABLED
+from custom_components.ha_energy_planner.const import (
+    CONF_AI_ENABLED,
+    CONF_DRY_RUN,
+    CONF_EV_CONNECTED_HELPER,
+    CONF_EV_KEEP_CHARGER_ON,
+    CONF_PLANNER_ENABLED,
+)
 from custom_components.ha_energy_planner.models import OutcomeResult
 from custom_components.ha_energy_planner.switch import SWITCHES, PlannerSwitch
 
@@ -49,7 +55,7 @@ class FakeCoordinator:
     """Minimal coordinator for entity methods."""
 
     def __init__(self, options: dict[str, object] | None = None) -> None:
-        self.entry = SimpleNamespace(entry_id="entry-1", options=options or {})
+        self.entry = SimpleNamespace(entry_id="entry-1", title="Garage EV", options=options or {})
         self.hass = SimpleNamespace(config_entries=FakeConfigEntries(), services=FakeServices())
         self.replan_count = 0
         self.restore_calls: list[tuple[str, bool]] = []
@@ -58,6 +64,8 @@ class FakeCoordinator:
         self.pause_calls: list[tuple[int, str, str]] = []
         self.resume_calls: list[str] = []
         self.ev_charging_calls: list[bool] = []
+        self.ev_connected_helper_calls: list[bool] = []
+        self.ev_keep_on_calls: list[bool] = []
         self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
         self.ev_charging_result = SimpleNamespace(applied=True, reason="applied")
         self.last_control_mode = (
@@ -109,6 +117,18 @@ class FakeCoordinator:
     async def async_manual_ev_charging(self, enabled: bool) -> Any:
         self.ev_charging_calls.append(enabled)
         return self.ev_charging_result
+
+    async def async_set_ev_connected_helper(self, connected: bool) -> None:
+        self.ev_connected_helper_calls.append(connected)
+        options = self.options
+        options[CONF_EV_CONNECTED_HELPER] = connected
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+
+    async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
+        self.ev_keep_on_calls.append(enabled)
+        options = self.options
+        options[CONF_EV_KEEP_CHARGER_ON] = enabled
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
 
 
 def test_switch_updates_config_entry_option_and_replans() -> None:
@@ -165,6 +185,50 @@ def test_switch_preserves_other_options_when_updated() -> None:
     assert coordinator.entry.options[CONF_PLANNER_ENABLED] is True
     assert coordinator.entry.options[CONF_DRY_RUN] is True
     assert coordinator.entry.options[CONF_AI_ENABLED] is True
+
+
+def test_connected_helper_switch_uses_coordinator_trip_history_path() -> None:
+    coordinator = FakeCoordinator({CONF_EV_CONNECTED_HELPER: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(
+            description for description in SWITCHES if description.option_key == CONF_EV_CONNECTED_HELPER
+        ),
+        write_count=0,
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
+
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+
+    assert coordinator.ev_connected_helper_calls == [True]
+    assert coordinator.entry.options[CONF_EV_CONNECTED_HELPER] is True
+    assert switch.write_count == 1
+
+
+def test_keep_on_switch_uses_coordinator_validation_path() -> None:
+    coordinator = FakeCoordinator({CONF_EV_KEEP_CHARGER_ON: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(
+            description
+            for description in SWITCHES
+            if description.option_key == CONF_EV_KEEP_CHARGER_ON
+        ),
+        write_count=0,
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: setattr(
+        switch,
+        "write_count",
+        switch.write_count + 1,
+    )
+
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+
+    assert coordinator.ev_keep_on_calls == [True]
+    assert coordinator.entry.options[CONF_EV_KEEP_CHARGER_ON] is True
+    assert switch.write_count == 1
 
 
 def test_disabling_planner_restores_owned_state_before_replan() -> None:
@@ -323,13 +387,13 @@ def test_preflight_button_creates_notification(monkeypatch: object) -> None:
             "persistent_notification",
             "create",
             {
-                "title": "Energy Planner preflight failed",
+                "title": "Garage EV: preflight failed",
                 "message": (
                     "Active control is not ready.\n\n"
                     "Failing checks:\n"
                     "- Configured entities available (blocking): Configured entities are missing."
                 ),
-                "notification_id": "ha_energy_planner_preflight",
+                "notification_id": "ha_energy_planner_preflight_entry-1",
             },
             False,
         )

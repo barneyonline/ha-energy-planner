@@ -15,6 +15,7 @@ from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import EV_RESERVATION_EXTERNAL_BASELINE
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import InputHealth
@@ -51,6 +52,13 @@ BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
 def _planner_ownership_active(store_data: dict[str, Any]) -> bool:
     """Return whether persisted ownership means the planner owns a control."""
     ownership = dict(store_data.get("ownership", {}))
+    reservation = store_data.get("ev_grid_reservation")
+    if (
+        isinstance(reservation, dict)
+        and reservation.get("active") is True
+        and reservation.get(EV_RESERVATION_EXTERNAL_BASELINE) is not True
+    ):
+        return True
     if dict(ownership.get("ev_smart_charging_state", {})):
         return True
     if dict(ownership.get("climate_automations", {})):
@@ -62,6 +70,8 @@ def _planner_ownership_active(store_data: dict[str, Any]) -> bool:
             "enphase_profile_changed_at",
             "planner_hvac_action_expires_at",
             "planner_takeover_started_at",
+            "ev_smart_charging_command_entity_id",
+            "ev_smart_charging_control_topology",
         )
     )
 

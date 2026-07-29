@@ -14,7 +14,9 @@ from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_KEEP_CHARGER_ON,
     CONF_PLANNER_ENABLED,
 )
 from .coordinator import EnergyPlannerCoordinator
@@ -62,6 +64,22 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         icon="mdi:ev-station",
         entity_category=EntityCategory.CONFIG,
         option_key=CONF_EV_CONTROL_ENABLED,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="ev_connected_helper",
+        translation_key="ev_connected_helper",
+        icon="mdi:ev-plug-type2",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_EV_CONNECTED_HELPER,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="ev_keep_charger_on",
+        translation_key="ev_keep_charger_on",
+        icon="mdi:car-defrost-front",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_EV_KEEP_CHARGER_ON,
         default=False,
     ),
     PlannerSwitchDescription(
@@ -124,6 +142,14 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
 
     async def _async_set_option(self, value: bool) -> None:
         option_key = self.entity_description.option_key
+        if option_key == CONF_EV_CONNECTED_HELPER:
+            await self.coordinator.async_set_ev_connected_helper(value)
+            self.async_write_ha_state()
+            return
+        if option_key == CONF_EV_KEEP_CHARGER_ON:
+            await self.coordinator.async_set_ev_keep_charger_on(value)
+            self.async_write_ha_state()
+            return
         options = self.coordinator.options
         options[option_key] = value
         self.coordinator.hass.config_entries.async_update_entry(self.coordinator.entry, options=options)

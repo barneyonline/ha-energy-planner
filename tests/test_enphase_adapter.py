@@ -134,13 +134,99 @@ def test_enphase_profile_change_infers_input_select_service() -> None:
     ]
 
 
+def test_enphase_restore_profile_uses_saved_profile_instead_of_ai_default() -> None:
+    hass = FakeHass({"select.enphase_profile": "Full Backup"})
+    adapter = EnphaseProfileAdapter(hass, _entry_data())
+
+    result = asyncio.run(adapter.async_restore_profile("Self-Consumption"))
+
+    assert result.applied is True
+    assert result.saved_profile == "Full Backup"
+    assert hass.states.values["select.enphase_profile"] == "Self-Consumption"
+
+
 def test_enphase_profile_change_fails_when_not_confirmed() -> None:
     hass = FakeHass({"select.enphase_profile": "AI Optimisation"}, confirm_change=False)
-    adapter = EnphaseProfileAdapter(hass, _entry_data())
+    adapter = EnphaseProfileAdapter(hass, _entry_data(), confirmation_interval_seconds=0)
     result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"})))
     assert result.applied is False
-    assert result.reason == "enphase_profile_not_confirmed"
+    assert result.reason == "enphase_profile_not_confirmed_rolled_back"
+    assert result.command_sent is True
+    assert result.rollback_succeeded is True
+    assert hass.services.calls[-1][2]["option"] == "AI Optimisation"
+
+
+def test_enphase_profile_change_accepts_delayed_state_confirmation() -> None:
+    hass = FakeHass({"select.enphase_profile": "AI Optimisation"}, confirm_change=False)
+    original_get = hass.states.get
+    reads = 0
+
+    def delayed_get(entity_id: str) -> FakeState | None:
+        nonlocal reads
+        reads += 1
+        if reads >= 4:
+            hass.states.values[entity_id] = "Full Backup"
+        return original_get(entity_id)
+
+    hass.states.get = delayed_get
+    adapter = EnphaseProfileAdapter(
+        hass,
+        _entry_data(),
+        confirmation_attempts=3,
+        confirmation_interval_seconds=0,
+    )
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"})))
+
+    assert result.applied is True
+    assert result.reason == "enphase_profile_applied"
+    assert result.command_sent is True
+    assert len(hass.services.calls) == 1
+
+
+def test_enphase_profile_change_retains_uncertainty_when_rollback_fails() -> None:
+    hass = FakeHass({"select.enphase_profile": "AI Optimisation"}, confirm_change=False)
+    original_call = hass.services.async_call
+    call_count = 0
+
+    async def fail_rollback(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 2:
+            raise RuntimeError("rollback failed")
+        await original_call(domain, service, data, blocking)
+
+    hass.services.async_call = fail_rollback
+    adapter = EnphaseProfileAdapter(hass, _entry_data(), confirmation_interval_seconds=0)
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"})))
+
+    assert result.applied is False
+    assert result.reason == "enphase_profile_not_confirmed_rollback_failed"
+    assert result.command_sent is True
+    assert result.rollback_succeeded is False
+    assert result.saved_profile == "AI Optimisation"
     assert result.post_state[CONF_ENPHASE_PROFILE] == "AI Optimisation"
+
+
+def test_enphase_rollback_rejects_missing_profile_or_invalid_service() -> None:
+    adapter = EnphaseProfileAdapter(
+        FakeHass({"select.enphase_profile": "AI Optimisation"}),
+        _entry_data(),
+        confirmation_interval_seconds=0,
+    )
+
+    assert asyncio.run(
+        adapter._async_rollback_profile("select.enphase_profile", "select.select_option", None)
+    ) is False
+    assert asyncio.run(
+        adapter._async_rollback_profile("select.enphase_profile", "invalid", "AI Optimisation")
+    ) is False
 
 
 def test_enphase_profile_change_fails_closed_when_service_fails() -> None:
@@ -151,9 +237,43 @@ def test_enphase_profile_change_fails_closed_when_service_fails() -> None:
 
     assert result.applied is False
     assert result.reason == "enphase_profile_service_failed"
+    assert result.command_sent is True
+    assert result.rollback_succeeded is False
     assert result.post_state[CONF_ENPHASE_PROFILE] == "AI Optimisation"
     assert hass.services.calls == [
         ("select", "select_option", {"entity_id": "select.enphase_profile", "option": "Full Backup"}),
+        ("select", "select_option", {"entity_id": "select.enphase_profile", "option": "AI Optimisation"}),
+    ]
+
+
+def test_enphase_profile_service_exception_rolls_back_a_mutated_profile() -> None:
+    class ApplyThenRaiseServices(FakeServices):
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            self.calls.append((domain, service, data))
+            self.states.values[data["entity_id"]] = str(data["option"])
+            if len(self.calls) == 1:
+                raise RuntimeError("service failed after applying profile")
+
+    hass = FakeHass({"select.enphase_profile": "AI Optimisation"})
+    hass.services = ApplyThenRaiseServices(hass.states)
+    adapter = EnphaseProfileAdapter(hass, _entry_data())
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"})))
+
+    assert result.applied is False
+    assert result.reason == "enphase_profile_service_failed"
+    assert result.command_sent is True
+    assert result.rollback_succeeded is True
+    assert result.post_state[CONF_ENPHASE_PROFILE] == "AI Optimisation"
+    assert hass.services.calls == [
+        ("select", "select_option", {"entity_id": "select.enphase_profile", "option": "Full Backup"}),
+        ("select", "select_option", {"entity_id": "select.enphase_profile", "option": "AI Optimisation"}),
     ]
 
 

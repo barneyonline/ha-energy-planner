@@ -1,12 +1,22 @@
 replan:
   name: Replan
   description: Request an immediate planner refresh.
-  fields: {}
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
 
 restore_safe_state:
   name: Restore safe state
   description: Restore planner-owned EV, Enphase, and HVAC state where supported.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     reason:
       required: false
       selector:
@@ -16,6 +26,11 @@ set_ev_ready_by:
   name: Set EV ready by
   description: Set and persist the native EV ready-by time.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     ready_by:
       required: true
       selector:
@@ -25,6 +40,11 @@ set_ev_target_soc:
   name: Set EV target SOC
   description: Set and persist the native smart-charging target SOC.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     target_soc:
       required: true
       selector:
@@ -38,6 +58,11 @@ set_manual_hvac_override:
   name: Set manual HVAC override
   description: Block planner HVAC control for a bounded manual override window.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     duration_minutes:
       required: true
       selector:
@@ -54,22 +79,42 @@ set_manual_hvac_override:
 export_diagnostics:
   name: Export diagnostics
   description: Return redacted diagnostic state for this integration.
-  fields: {}
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
 
 export_support_bundle:
   name: Export support bundle
   description: Return preflight plus redacted diagnostics for production review.
-  fields: {}
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
 
 run_preflight:
   name: Run preflight
   description: Check active-mode readiness without issuing device commands.
-  fields: {}
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
 
 arm_production_control:
   name: Arm production control
   description: Acknowledge production readiness and allow active device commands when other safety checks pass.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     reason:
       required: false
       selector:
@@ -79,6 +124,11 @@ disarm_production_control:
   name: Disarm production control
   description: Block active device commands until production control is armed again.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     reason:
       required: false
       selector:
@@ -88,6 +138,11 @@ pause_control:
   name: Pause control
   description: Temporarily pause planner-owned active control for all devices or one device class.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     duration_minutes:
       required: true
       selector:
@@ -114,6 +169,11 @@ resume_control:
   name: Resume control
   description: Clear the active control pause.
   fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner
     reason:
       required: false
       selector:

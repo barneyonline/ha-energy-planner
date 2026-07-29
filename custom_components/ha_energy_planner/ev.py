@@ -139,6 +139,7 @@ def update_trip_history_from_values(
     updated = {
         "active_trip": dict((history or {}).get("active_trip") or {}),
         "records": list((history or {}).get("records") or []),
+        "recorder_imported_at": (history or {}).get("recorder_imported_at"),
     }
     if connected is None or soc_percent is None:
         return updated, False
@@ -190,7 +191,10 @@ def import_trip_history_from_state_sequences(
     }
     events = _trip_history_events(connected_states, soc_states)
     if not events:
-        return updated, False
+        imported_timestamp = imported_at.isoformat()
+        changed = updated.get("recorder_imported_at") != imported_timestamp
+        updated["recorder_imported_at"] = imported_timestamp
+        return updated, changed
 
     records = list(updated.get("records") or [])
     known_keys = {_record_key(record) for record in records if isinstance(record, dict)}
@@ -407,9 +411,40 @@ def _best_continuous_slots(
             windows.append(window)
     if force_current:
         windows = [window for window in windows if window[0] is chronological[0]]
-    if not windows:
-        return chronological[:required_slots]
-    return min(windows, key=lambda window: (sum(rank[slot.valid_at] for slot in window), window[0].valid_at))
+    if windows:
+        return min(
+            windows,
+            key=lambda window: (
+                sum(rank[slot.valid_at] for slot in window),
+                window[0].valid_at,
+            ),
+        )
+
+    # Missing/price-ineligible slots can make a full continuous window
+    # impossible. Return the best contiguous partial run so allocation is
+    # explicitly infeasible instead of silently cycling across gaps.
+    runs: list[list[Any]] = []
+    for slot in chronological:
+        if (
+            not runs
+            or (slot.valid_at - runs[-1][-1].valid_at).total_seconds()
+            != interval_minutes * 60
+        ):
+            runs.append([slot])
+        else:
+            runs[-1].append(slot)
+    if force_current:
+        runs = [run for run in runs if run[0] is chronological[0]]
+    candidates = [run[:required_slots] for run in runs if run]
+    return min(
+        candidates,
+        key=lambda run: (
+            -len(run),
+            sum(rank[slot.valid_at] for slot in run),
+            run[0].valid_at,
+        ),
+        default=[],
+    )
 
 
 def _rank_charging_slots(slots: list[Any], charge_kw: float, carbon_weight: float) -> list[Any]:
