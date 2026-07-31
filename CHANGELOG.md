@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.1 - 2026-07-31
+
+### Fixed
+
+- Energy Planner is classified as a service integration so configured entries
+  appear on the main **Settings -> Devices & services -> Integrations** page
+  instead of being grouped only with Helpers.
+
+### Validation
+
+- Full Docker validation: `837 passed`, `100%` across `8,768` statements, plus
+  Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
+  smoke checks.
+
 ## 0.8.0 - 2026-07-26
 
 ### Added
