@@ -1,11 +1,14 @@
 # Requirements Audit
 
-Status as of 2026-07-26.
+Status as of 2026-07-31.
 
 ## Covered
 
 - Custom integration scaffold, config flow, options flow, entities, services,
   diagnostics, and versioned Home Assistant `Store` persistence are present.
+  The manifest classifies Energy Planner as a service integration so configured
+  entries remain visible on the main Devices & services integration page rather
+  than being routed to the Helpers-only experience.
   Diagnostics expose redacted entity/service mapping, input-health metadata,
   plan metadata, latest HAEO run status, bounded recent outcomes, and compact
   Store summaries rather than relying on unbounded raw Store inspection.

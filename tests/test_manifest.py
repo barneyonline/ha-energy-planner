@@ -15,12 +15,12 @@ def _hacs_manifest() -> dict[str, object]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def test_manifest_classifies_multi_entry_calculated_helper() -> None:
+def test_manifest_classifies_multi_entry_calculated_service() -> None:
     manifest = _manifest()
 
     assert manifest["domain"] == "ha_energy_planner"
     assert manifest["name"] == "Energy Planner"
-    assert manifest["integration_type"] == "helper"
+    assert manifest["integration_type"] == "service"
     assert manifest["iot_class"] == "calculated"
     assert manifest["single_config_entry"] is False
     assert manifest["quality_scale"] == "gold"
@@ -30,7 +30,7 @@ def test_release_metadata_versions_match() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert _manifest()["version"] == pyproject["project"]["version"] == "0.8.0"
+    assert _manifest()["version"] == pyproject["project"]["version"] == "0.8.1"
 
 
 def test_manifest_keeps_dependency_surface_explicit() -> None:
