@@ -10,7 +10,7 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from math import isfinite
+from math import ceil, isfinite
 from time import monotonic, perf_counter
 from typing import Any
 
@@ -212,6 +212,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._haeo_adapter: HAEOAdapter | None = None
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._ai_advice_fingerprint: str | None = None
+        self._ai_advice_retry_cancel: Callable[[], None] | None = None
+        self._ai_advice_retry_fingerprint: str | None = None
+        self._ai_advice_retry_at: datetime | None = None
+        self._ai_advice_pending_fingerprint: str | None = None
+        self._ai_advice_pending_reason: str | None = None
         self._ai_current_plan_fingerprint: str | None = None
         self._ai_current_plan_safe = False
         self.last_refresh_metadata: dict[str, Any] = {}
@@ -320,6 +325,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if ai_task is not None and not ai_task.done():
             ai_task.cancel()
         self._ai_advice_task = None
+        self._cancel_ai_advice_retry()
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
 
@@ -1054,7 +1060,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             elapsed = context.created_at - last_called_at
             if elapsed < timedelta(seconds=AI_ADVICE_MIN_INTERVAL_SECONDS):
                 remaining_seconds = max(
-                    int(AI_ADVICE_MIN_INTERVAL_SECONDS - elapsed.total_seconds()),
+                    ceil(AI_ADVICE_MIN_INTERVAL_SECONDS - elapsed.total_seconds()),
                     1,
                 )
                 return (
@@ -1097,6 +1103,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         ):
             self._ai_current_plan_safe = False
             self._ai_current_plan_fingerprint = None
+            self._cancel_ai_advice_retry()
             current = getattr(self, "_ai_advice_task", None)
             if current is not None and not current.done():
                 current.cancel()
@@ -1105,13 +1112,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._ai_current_plan_safe = True
         self._ai_current_plan_fingerprint = fingerprint
         if _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == fingerprint:
+            self._cancel_ai_advice_retry()
             return
+        retry_cancel = getattr(self, "_ai_advice_retry_cancel", None)
+        if retry_cancel is not None:
+            if getattr(self, "_ai_advice_retry_fingerprint", None) == fingerprint:
+                self._set_ai_advice_pending(fingerprint, "ai_rate_limited")
+                return
+            self._cancel_ai_advice_retry()
         current = getattr(self, "_ai_advice_task", None)
         if current is not None and not current.done():
             if getattr(self, "_ai_advice_fingerprint", None) == fingerprint:
+                self._set_ai_advice_pending(fingerprint, "request_in_flight")
                 return
             current.cancel()
         self._ai_advice_fingerprint = fingerprint
+        self._set_ai_advice_pending(fingerprint, "request_in_flight")
         self._ai_advice_task = self.hass.async_create_task(
             self._async_run_ai_advice(context, plan, entry_data, options, fingerprint)
         )
@@ -1128,15 +1144,30 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         started = perf_counter()
         try:
             ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
+            if not should_store:
+                if (
+                    ai_result.rejected_reason == "ai_rate_limited"
+                    and self._ai_advice_fingerprint == fingerprint
+                    and self._ai_current_plan_safe
+                    and self._ai_current_plan_fingerprint == fingerprint
+                ):
+                    retry_after = ai_result.rejected_detail.get("retry_after_seconds")
+                    delay_seconds = float(retry_after) if isinstance(retry_after, int | float) else 1.0
+                    self._schedule_ai_advice_retry(fingerprint, delay_seconds)
+                else:
+                    self._clear_ai_advice_pending(fingerprint)
+                self.async_update_listeners()
+                return
             if (
-                not should_store
-                or self._ai_advice_fingerprint != fingerprint
+                self._ai_advice_fingerprint != fingerprint
                 or not self._ai_current_plan_safe
                 or self._ai_current_plan_fingerprint != fingerprint
             ):
+                self._clear_ai_advice_pending(fingerprint)
                 return
             async with self._planner_lock:
                 if not self._ai_current_plan_safe or self._ai_current_plan_fingerprint != fingerprint:
+                    self._clear_ai_advice_pending(fingerprint)
                     return
                 await self.store.async_add_ai_recommendation(
                     {
@@ -1163,15 +1194,83 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
                     },
                 )
+            self._cancel_ai_advice_retry(clear_pending=False)
+            self._clear_ai_advice_pending(fingerprint)
             self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
             self.async_update_listeners()
         except asyncio.CancelledError:
+            self._clear_ai_advice_pending(fingerprint)
             raise
         except Exception:  # noqa: BLE001 - advice must never fail the planner task.
+            self._clear_ai_advice_pending(fingerprint)
+            self.async_update_listeners()
             _LOGGER.exception("Background AI advice failed")
         finally:
             if getattr(self, "_ai_advice_task", None) is asyncio.current_task():
                 self._ai_advice_task = None
+
+    @callback
+    def _set_ai_advice_pending(self, fingerprint: str, reason: str) -> None:
+        """Expose bounded in-memory status for advice awaiting completion."""
+        self._ai_advice_pending_fingerprint = fingerprint
+        self._ai_advice_pending_reason = reason
+
+    @callback
+    def _clear_ai_advice_pending(self, fingerprint: str | None = None) -> None:
+        """Clear pending status when it still belongs to the selected plan."""
+        current = getattr(self, "_ai_advice_pending_fingerprint", None)
+        if fingerprint is not None and current != fingerprint:
+            return
+        self._ai_advice_pending_fingerprint = None
+        self._ai_advice_pending_reason = None
+
+    @callback
+    def _cancel_ai_advice_retry(self, *, clear_pending: bool = True) -> None:
+        """Cancel a delayed AI retry and clear its bounded metadata."""
+        cancel = getattr(self, "_ai_advice_retry_cancel", None)
+        if cancel is not None:
+            cancel()
+        self._ai_advice_retry_cancel = None
+        self._ai_advice_retry_fingerprint = None
+        self._ai_advice_retry_at = None
+        if clear_pending:
+            self._clear_ai_advice_pending()
+
+    @callback
+    def _schedule_ai_advice_retry(self, fingerprint: str, delay_seconds: float) -> None:
+        """Retry rate-limited advice once the provider call window opens."""
+        self._cancel_ai_advice_retry(clear_pending=False)
+        delay = max(float(delay_seconds), 1.0)
+        self._ai_advice_retry_fingerprint = fingerprint
+        self._ai_advice_retry_at = dt_util.utcnow() + timedelta(seconds=delay)
+        self._set_ai_advice_pending(fingerprint, "ai_rate_limited")
+
+        @callback
+        def _retry(now: Any) -> None:
+            self._ai_advice_retry_cancel = None
+            self._ai_advice_retry_fingerprint = None
+            self._ai_advice_retry_at = None
+            plan = getattr(self, "data", None)
+            context = getattr(self, "_last_decision_context", None)
+            if (
+                getattr(self, "_tearing_down", False)
+                or not self._ai_current_plan_safe
+                or self._ai_current_plan_fingerprint != fingerprint
+                or plan is None
+                or context is None
+                or _material_plan_fingerprint(plan) != fingerprint
+            ):
+                self._clear_ai_advice_pending(fingerprint)
+                self.async_update_listeners()
+                return
+            try:
+                retry_context = replace(context, created_at=dt_util.utcnow())
+            except TypeError:
+                retry_context = context
+            self._schedule_ai_advice(retry_context, plan, self.entry_data, self.options)
+            self.async_update_listeners()
+
+        self._ai_advice_retry_cancel = async_call_later(self.hass, delay, _retry)
 
     def _non_manual_refresh_delay(self) -> float:
         """Return delay needed to enforce the safe non-manual refresh cadence."""
@@ -1302,21 +1401,30 @@ def _material_preview(value: Any) -> Any:
 
 def _latest_ai_plan_fingerprint(recommendations: Any) -> str | None:
     """Return the last stored material plan fingerprint."""
+    latest = _latest_accepted_ai_recommendation(recommendations)
+    return _ai_recommendation_fingerprint(latest)
+
+
+def _ai_recommendation_fingerprint(recommendation: Any) -> str | None:
+    """Return the current or legacy material fingerprint for one recommendation."""
+    if not isinstance(recommendation, dict):
+        return None
+    fingerprint = recommendation.get("plan_fingerprint")
+    if isinstance(fingerprint, str) and fingerprint:
+        return fingerprint
+    detail = recommendation.get("rejected_detail")
+    if isinstance(detail, dict) and isinstance(detail.get("plan_fingerprint"), str):
+        return detail["plan_fingerprint"]
+    return None
+
+
+def _latest_accepted_ai_recommendation(recommendations: Any) -> dict[str, Any] | None:
+    """Return the latest accepted recommendation eligible for reuse."""
     if not isinstance(recommendations, list):
         return None
     for item in reversed(recommendations):
-        if not isinstance(item, dict):
-            continue
-        # Transient skipped/rejected results must be retried after their rate
-        # limit; only accepted advice is reusable by plan fingerprint.
-        if item.get("status") != "accepted":
-            continue
-        fingerprint = item.get("plan_fingerprint")
-        if isinstance(fingerprint, str) and fingerprint:
-            return fingerprint
-        detail = item.get("rejected_detail")
-        if isinstance(detail, dict) and isinstance(detail.get("plan_fingerprint"), str):
-            return detail["plan_fingerprint"]
+        if isinstance(item, dict) and item.get("status") == "accepted":
+            return item
     return None
 
 

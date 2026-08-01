@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -1039,6 +1040,139 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
     assert attrs["alerts"] == ["PV forecast confidence is low"]
     assert attrs["reasoning_summary"] == "Use extra forecast buffer."
     assert attrs["suggested_forecast_buffer_percent"] == 12
+
+
+def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> None:
+    previous = _plan()
+    current = replace(previous, plan_id="plan-2")
+    coordinator = _coordinator(
+        current,
+        options={"ai_enabled": True},
+        store_data={
+            "ai_recommendations": [
+                {
+                    "created_at": "2026-06-27T00:00:00+00:00",
+                    "plan_id": previous.plan_id,
+                    "plan_fingerprint": _material_plan_fingerprint(previous),
+                    "status": "accepted",
+                    "accepted": {"reasoning_summary": "Still applicable."},
+                }
+            ]
+        },
+    )
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+
+    attrs = description.attrs_fn(coordinator)
+
+    assert description.value_fn(coordinator) == "Accepted"
+    assert attrs["plan_id"] == "plan-1"
+    assert "current_plan_id" not in attrs
+    assert attrs["reused_for_current_plan"] is True
+    assert attrs["reasoning_summary"] == "Still applicable."
+
+
+def test_ai_advice_sensor_reuses_latest_legacy_nested_fingerprint() -> None:
+    previous = _plan()
+    current = replace(previous, plan_id="plan-2")
+    coordinator = _coordinator(
+        current,
+        options={"ai_enabled": True},
+        store_data={
+            "ai_recommendations": [
+                {
+                    "plan_id": previous.plan_id,
+                    "status": "accepted",
+                    "rejected_detail": {"plan_fingerprint": _material_plan_fingerprint(previous)},
+                    "accepted": {"reasoning_summary": "Legacy advice remains applicable."},
+                }
+            ]
+        },
+    )
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+
+    assert description.value_fn(coordinator) == "Accepted"
+    assert description.attrs_fn(coordinator)["reasoning_summary"] == "Legacy advice remains applicable."
+
+
+def test_ai_advice_sensor_hides_cached_and_pending_advice_when_disabled() -> None:
+    previous = _plan()
+    current = replace(previous, plan_id="plan-2")
+    fingerprint = _material_plan_fingerprint(current)
+    coordinator = _coordinator(
+        current,
+        options={"ai_enabled": False},
+        store_data={
+            "ai_recommendations": [
+                {
+                    "plan_id": previous.plan_id,
+                    "plan_fingerprint": fingerprint,
+                    "status": "accepted",
+                    "accepted": {"reasoning_summary": "Should be hidden."},
+                }
+            ]
+        },
+    )
+    coordinator._ai_advice_pending_fingerprint = fingerprint
+    coordinator._ai_advice_pending_reason = "ai_rate_limited"
+    coordinator._ai_advice_retry_at = datetime(2026, 6, 27, 0, 5, tzinfo=UTC)
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+
+    assert description.value_fn(coordinator) == "Disabled"
+    assert description.attrs_fn(coordinator) == {"enabled": False, "latest": None}
+
+
+def test_ai_advice_sensor_does_not_reuse_older_matching_response() -> None:
+    older = _plan()
+    latest = _plan(preview=[{"import_price": 0.4}])
+    current = replace(older, plan_id="plan-3")
+    current_fingerprint = _material_plan_fingerprint(current)
+    coordinator = _coordinator(
+        current,
+        options={"ai_enabled": True},
+        store_data={
+            "ai_recommendations": [
+                {
+                    "plan_id": older.plan_id,
+                    "plan_fingerprint": _material_plan_fingerprint(older),
+                    "status": "accepted",
+                    "accepted": {"reasoning_summary": "Old A advice."},
+                },
+                {
+                    "plan_id": latest.plan_id,
+                    "plan_fingerprint": _material_plan_fingerprint(latest),
+                    "status": "accepted",
+                    "accepted": {"reasoning_summary": "Latest B advice."},
+                },
+            ]
+        },
+    )
+    coordinator._ai_advice_pending_fingerprint = current_fingerprint
+    coordinator._ai_advice_pending_reason = "request_in_flight"
+    coordinator._ai_advice_retry_at = None
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+
+    assert description.value_fn(coordinator) == "Pending"
+    assert description.attrs_fn(coordinator)["latest"] is None
+
+
+def test_ai_advice_sensor_reports_pending_for_current_plan() -> None:
+    plan = _plan()
+    coordinator = _coordinator(plan, options={"ai_enabled": True})
+    coordinator._ai_advice_pending_fingerprint = _material_plan_fingerprint(plan)
+    coordinator._ai_advice_pending_reason = "ai_rate_limited"
+    coordinator._ai_advice_retry_at = datetime(2026, 6, 27, 0, 5, tzinfo=UTC)
+    description = next(item for item in SENSORS if item.key == "ai_advice")
+
+    assert description.value_fn(coordinator) == "Pending"
+    assert description.attrs_fn(coordinator) == {
+        "enabled": True,
+        "latest": None,
+        "pending_reason": "ai_rate_limited",
+        "retry_at": "2026-06-27T00:05:00+00:00",
+    }
+
+    coordinator._ai_advice_pending_fingerprint = "stale"
+    assert description.value_fn(coordinator) == "No response"
 
 
 def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads() -> None:
