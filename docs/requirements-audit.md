@@ -397,8 +397,11 @@ Status as of 2026-07-31.
   cost signature remains unchanged. Provider work runs as a cancellable
   single-flight task after plan commit, so advisory latency cannot hold the
   coordinator refresh lock. Final publication is serialized with plan commits,
-  and sensors expose advice only when its plan ID and material fingerprint match
-  the current safe plan.
+  and sensors expose advice only when its material fingerprint matches the
+  current safe plan. Accepted advice remains visible across regenerated plan IDs
+  with an equivalent material signature. Changed plans show bounded pending
+  metadata while provider work is in flight or rate-limited, and a single
+  delayed retry runs when the provider-call window opens.
 - Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
   retention with defensive hard caps, preserving day-ahead training evidence
   across manual refresh bursts without unbounded storage growth.
