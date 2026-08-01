@@ -28,9 +28,11 @@ Status as of 2026-07-31.
   units where exposed, entity availability, and configured service availability
   without issuing commands. The user must provide mapped people/entities rather
   than receiving environment-specific person defaults in production Python.
-  Options flow validation enforces coherent EV SOC bounds, valid default
-  ready-by time, and supported unique priority-weight tokens before policy
-  values reach the planner.
+  Options flow validation enforces coherent device constraints and supported
+  unique priority-weight tokens before configuration values reach the planner.
+  Settings backed by native entities are centrally excluded from the Options
+  schema, keeping configuration and day-to-day control on distinct surfaces
+  without deleting existing stored values during upgrade.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, HAEO, forecast, bounded action, AI, ownership, override, and outcome
   records.
@@ -109,8 +111,8 @@ Status as of 2026-07-31.
   control-state confirmation path, that path requires the persistent direct
   charger control rather than an optional start command, and the current slot
   reserves the full configured charger rate for grid and battery evaluation.
-  Options, EV reconfiguration, preflight, and the integration-created keep-on
-  switch reject keep-on without that persistent switch/input-boolean control.
+  EV reconfiguration, preflight, and the integration-created keep-on switch
+  reject keep-on without that persistent switch/input-boolean control.
   Keep-on also requires the authoritative target to be available and remain
   within configured SOC policy bounds, preventing an external vehicle target
   from bypassing the hard planner maximum.
@@ -131,7 +133,11 @@ Status as of 2026-07-31.
 - A failed loaded shedding claimant also releases only the atomic claim while
   retaining its uncertain capacity, allowing another loaded charger to attempt
   a confirmed stop. Continuous-charging allocation never returns a fragmented
-  fallback; a contiguous partial window is explicitly marked infeasible.
+  fallback; a contiguous partial window is explicitly marked infeasible. An
+  explicitly forced current slot is the bounded exception: minimum-SOC recovery
+  and enabled below-threshold opportunistic charging may claim the current slot
+  before the configured earliest start, while any remaining continuous window
+  stays within the configured hours.
 - Multiple EVs are supported as separate named config entries. Entry-scoped
   storage isolates plans, history, production state, pauses, and audit records;
   services require `config_entry_id` when multiple runtimes are loaded. Each
@@ -444,7 +450,10 @@ Status as of 2026-07-31.
 - The `set_ev_ready_by` service validates local time input, normalizes accepted
   values to `HH:MM`, persists the native setting, and queues planner work. The
   `set_ev_target_soc` service validates and persists a percentage target. Native
-  time/number entities expose the same controls on the EV device.
+  time/number entities expose the same controls on the EV device. The EV device
+  also exposes a native opportunistic-charging switch and import-price threshold
+  number; both persist the corresponding planner option and request an immediate
+  replan.
 - All integration services accept an optional `config_entry_id`. A single
   loaded runtime remains backward compatible, while multiple runtimes reject
   ambiguous calls and route explicitly targeted calls to the selected entry.

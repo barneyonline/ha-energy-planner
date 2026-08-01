@@ -587,6 +587,106 @@ def test_native_ev_low_price_charging_starts_current_interval() -> None:
     assert action.desired_state["charging_reason"] == "ev_low_price_charge_now"
 
 
+def test_native_ev_low_price_charging_bypasses_earliest_start() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_min_soc_percent": 40,
+        "ev_fallback_target_soc_percent": 80,
+        "ev_low_price_charging_enabled": True,
+        "ev_low_price_threshold": 0.05,
+        "ev_earliest_start": "23:00",
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.01 if offset == 0 else 0.20,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset in range(0, 24 * 60, 5)
+    ]
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    allocated = [datetime.fromisoformat(item["valid_at"]) for item in action.desired_state["allocated_slots"]]
+    earliest_start = datetime.fromisoformat(action.desired_state["earliest_start_utc"])
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["charging_reason"] == "ev_low_price_charge_now"
+    assert allocated[0] == context.created_at
+    assert all(valid_at >= earliest_start for valid_at in allocated[1:])
+
+
+def test_native_ev_price_above_threshold_does_not_bypass_earliest_start() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_low_price_charging_enabled": True,
+        "ev_low_price_threshold": 0.05,
+        "ev_earliest_start": "23:00",
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.06,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset in range(0, 24 * 60, 5)
+    ]
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
+    assert context.slots[0].projected_ev_load_kw == 0.0
+
+
+def test_native_ev_opportunistic_charge_honors_maximum_import_price() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "ev_low_price_charging_enabled": True,
+        "ev_low_price_threshold": 0.50,
+        "ev_price_limit_enabled": True,
+        "ev_max_import_price": 0.20,
+        "ev_earliest_start": "23:00",
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.30,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset in range(0, 24 * 60, 5)
+    ]
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
+    assert context.slots[0].projected_ev_load_kw == 0.0
+
+
 def test_native_ev_manual_overrides_survive_immediate_replan() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     start_context = _context()

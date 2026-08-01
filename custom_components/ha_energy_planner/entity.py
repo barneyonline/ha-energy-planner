@@ -56,6 +56,8 @@ ENTITY_DEVICE_BY_KEY = {
     "ev_control_enabled": DEVICE_EV,
     "ev_connected_helper": DEVICE_EV,
     "ev_keep_charger_on": DEVICE_EV,
+    "ev_opportunistic_charging": DEVICE_EV,
+    "ev_opportunistic_charging_price_threshold": DEVICE_EV,
     "ev_target_soc": DEVICE_EV,
     "ev_ready_by": DEVICE_EV,
     "ev_start_charging": DEVICE_EV,

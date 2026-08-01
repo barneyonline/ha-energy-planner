@@ -4,6 +4,23 @@
 
 ## 0.8.2 - 2026-08-01
 
+### Added
+
+- Added native EV-device entities for enabling opportunistic charging and
+  setting its import-price threshold. Both controls persist their values and
+  request an immediate replan.
+
+### Changed
+
+- Reserved the Options UI for configuration and operating constraints. Settings
+  backed by native Home Assistant entities are now omitted from Options while
+  retaining their persisted values for upgrade compatibility.
+- Enabled opportunistic EV charging before the configured earliest start when
+  low-price charging is enabled and the current import price is at or below its
+  threshold. Only the current interval bypasses the charging hours; later
+  allocations remain inside the configured window and existing safety gates
+  continue to apply.
+
 ### Fixed
 
 - Plan fallback notifications are no longer recreated on every refresh when
@@ -18,7 +35,7 @@
 
 ### Validation
 
-- Full Docker validation: `846 passed`, `100%` across `8,891` statements, plus
+- Full Docker validation: `855 passed`, `100%` across `8,942` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
   smoke checks.
 

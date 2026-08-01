@@ -17,6 +17,7 @@ from .const import (
     CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_PLANNER_ENABLED,
 )
 from .coordinator import EnergyPlannerCoordinator
@@ -80,6 +81,14 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         icon="mdi:car-defrost-front",
         entity_category=EntityCategory.CONFIG,
         option_key=CONF_EV_KEEP_CHARGER_ON,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="ev_opportunistic_charging",
+        translation_key="ev_opportunistic_charging",
+        icon="mdi:cash-clock",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_EV_LOW_PRICE_CHARGING_ENABLED,
         default=False,
     ),
     PlannerSwitchDescription(
