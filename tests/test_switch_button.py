@@ -17,6 +17,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_DRY_RUN,
     CONF_EV_CONNECTED_HELPER,
     CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_PLANNER_ENABLED,
 )
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -203,6 +204,27 @@ def test_connected_helper_switch_uses_coordinator_trip_history_path() -> None:
 
     assert coordinator.ev_connected_helper_calls == [True]
     assert coordinator.entry.options[CONF_EV_CONNECTED_HELPER] is True
+    assert switch.write_count == 1
+
+
+def test_opportunistic_charging_switch_persists_and_replans() -> None:
+    coordinator = FakeCoordinator({CONF_EV_LOW_PRICE_CHARGING_ENABLED: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(
+            description
+            for description in SWITCHES
+            if description.option_key == CONF_EV_LOW_PRICE_CHARGING_ENABLED
+        ),
+        write_count=0,
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
+
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+
+    assert coordinator.entry.options[CONF_EV_LOW_PRICE_CHARGING_ENABLED] is True
+    assert coordinator.replan_count == 1
     assert switch.write_count == 1
 
 

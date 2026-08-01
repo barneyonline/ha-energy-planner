@@ -43,6 +43,7 @@ from custom_components.ha_energy_planner.config_flow import (
 )
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
+    CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -51,12 +52,15 @@ from custom_components.ha_energy_planner.const import (
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
+    CONF_DRY_RUN,
     CONF_ENPHASE_AI_PROFILE,
+    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
@@ -65,9 +69,13 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
+    CONF_EV_CONNECTED_HELPER,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+    CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_SMART_CHARGING,
@@ -80,6 +88,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
+    CONF_PLANNER_ENABLED,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRIORITY_WEIGHTS,
@@ -889,6 +898,30 @@ def test_options_flow_all_policy_section_steps_show_forms() -> None:
         assert result["step_id"] == step_id
 
 
+def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
+    schema_keys = {
+        str(getattr(key, "schema", key))
+        for key in _options_schema(dict(DEFAULT_OPTIONS)).schema
+    }
+
+    assert schema_keys.isdisjoint(
+        {
+            CONF_DEFAULT_READY_BY,
+            CONF_PLANNER_ENABLED,
+            CONF_DRY_RUN,
+            CONF_AI_ENABLED,
+            CONF_EV_CONTROL_ENABLED,
+            CONF_CLIMATE_CONTROL_ENABLED,
+            CONF_ENPHASE_CONTROL_ENABLED,
+            CONF_EV_CONNECTED_HELPER,
+            CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+            CONF_EV_KEEP_CHARGER_ON,
+            CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+            CONF_EV_LOW_PRICE_THRESHOLD,
+        }
+    )
+
+
 def test_options_flow_section_update_preserves_other_options() -> None:
     updates: list[dict[str, Any]] = []
     flow = OptionsFlow(
@@ -962,6 +995,28 @@ def test_options_flow_section_validation_returns_form_errors() -> None:
     assert result["errors"]["base"] == "ev_min_above_max"
 
 
+def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> None:
+    flow = OptionsFlow(
+        SimpleNamespace(
+            data={},
+            options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90},
+            subentries={},
+        )
+    )
+
+    result = asyncio.run(
+        flow.async_step_ev_battery_grid(
+            {
+                CONF_EV_MIN_SOC_PERCENT: 40,
+                CONF_EV_MAX_SOC_PERCENT: 80,
+            }
+        )
+    )
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "ev_fallback_outside_bounds"}
+
+
 def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     flow = OptionsFlow(
         SimpleNamespace(
@@ -983,9 +1038,7 @@ def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     )
 
     assert result["type"] == "form"
-    assert result["errors"][CONF_EV_KEEP_CHARGER_ON] == (
-        "ev_keep_on_requires_persistent_control"
-    )
+    assert result["errors"] == {"base": "ev_keep_on_requires_persistent_control"}
 
 
 def test_options_flow_uses_ordered_priority_dropdowns() -> None:

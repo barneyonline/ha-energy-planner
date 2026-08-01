@@ -1040,6 +1040,8 @@ expected_entities = {
     "switch.system_enabled",
     "switch.system_dry_run",
     "switch.ai_enabled",
+    "switch.ev_opportunistic_charging",
+    "number.ev_opportunistic_charging_price_threshold",
     "button.system_replan",
     "button.system_restore_safe_state",
     "button.ev_start_charging",
