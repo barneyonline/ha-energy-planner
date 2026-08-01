@@ -208,6 +208,58 @@ def test_allocate_native_charging_honors_force_current_and_price_limit() -> None
     assert _best_continuous_slots([], [], required_slots=0, interval_minutes=5, force_current=False) == []
 
 
+def test_forced_current_slot_bypasses_earliest_start_without_moving_future_window() -> None:
+    now = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    earliest_start = now + timedelta(hours=1)
+    slots = [
+        DecisionSlot(now, -0.05, 0.05, 0, 1),
+        DecisionSlot(earliest_start, 0.20, 0.05, 0, 1),
+        DecisionSlot(earliest_start + timedelta(minutes=5), 0.10, 0.05, 0, 1),
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=55,
+        ready_by=earliest_start + timedelta(minutes=10),
+        earliest_start=earliest_start,
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        continuous=True,
+        force_current=True,
+    )
+
+    assert [allocation.valid_at for allocation in schedule.allocations] == [
+        now,
+        earliest_start,
+        earliest_start + timedelta(minutes=5),
+    ]
+    assert schedule.infeasible is False
+
+
+def test_current_slot_still_honors_earliest_start_without_override() -> None:
+    now = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    earliest_start = now + timedelta(hours=1)
+    slots = [
+        DecisionSlot(now, -0.05, 0.05, 0, 1),
+        DecisionSlot(earliest_start, 0.20, 0.05, 0, 1),
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=40,
+        target_soc_percent=45,
+        ready_by=earliest_start + timedelta(minutes=5),
+        earliest_start=earliest_start,
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+    )
+
+    assert [allocation.valid_at for allocation in schedule.allocations] == [earliest_start]
+
+
 def test_continuous_charging_uses_only_contiguous_partial_windows() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     slots = [

@@ -44,6 +44,8 @@ def test_planner_entity_can_target_group_device() -> None:
 
 def test_control_switches_target_optional_devices() -> None:
     assert planner_device_key_for_entity("ev_control_enabled") == DEVICE_EV
+    assert planner_device_key_for_entity("ev_opportunistic_charging") == DEVICE_EV
+    assert planner_device_key_for_entity("ev_opportunistic_charging_price_threshold") == DEVICE_EV
     assert planner_device_key_for_entity("climate_control_enabled") == DEVICE_CLIMATE
     assert planner_device_key_for_entity("enphase_control_enabled") == DEVICE_ENPHASE
 

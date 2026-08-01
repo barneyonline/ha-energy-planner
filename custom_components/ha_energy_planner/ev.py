@@ -300,6 +300,9 @@ def allocate_least_cost_charging(
 
     Slot ranking is solar-aware: surplus PV is valued at the foregone feed-in
     price, and any remaining charge power is valued at the grid import price.
+    A forced current slot may bypass ``earliest_start`` for immediate minimum-
+    SOC recovery or opportunistic low-price charging; all later slots continue
+    to honour the configured charging window.
     """
     required = max(target_soc_percent - current_soc_percent, 0.0)
     if required == 0:
@@ -309,14 +312,28 @@ def allocate_least_cost_charging(
     if soc_per_slot <= 0:
         return EVChargeSchedule([], target_soc_percent, current_soc_percent, required, True, "ev_charge_rate_invalid")
 
-    feasible_slots = [
+    candidate_slots = [
         slot
         for slot in slots
-        if slot.valid_at < ready_by
-        and (earliest_start is None or slot.valid_at >= earliest_start)
-        and slot.import_price is not None
+        if slot.valid_at < ready_by and slot.import_price is not None
     ]
-    current_slot = min(feasible_slots, key=lambda slot: slot.valid_at, default=None)
+    current_slot = min(candidate_slots, key=lambda slot: slot.valid_at, default=None)
+    regular_slots = [
+        slot
+        for slot in candidate_slots
+        if earliest_start is None or slot.valid_at >= earliest_start
+    ]
+    current_outside_window = bool(
+        force_current
+        and current_slot is not None
+        and earliest_start is not None
+        and current_slot.valid_at < earliest_start
+    )
+    feasible_slots = (
+        [current_slot, *regular_slots]
+        if current_outside_window and current_slot is not None
+        else regular_slots
+    )
     price_eligible = [
         slot
         for slot in feasible_slots
@@ -326,13 +343,28 @@ def allocate_least_cost_charging(
     ]
     ranked = _rank_charging_slots(price_eligible, charge_rate_kw, carbon_weight)
     if continuous:
-        ordered = _best_continuous_slots(
-            price_eligible,
-            ranked,
-            required_slots=ceil(required / soc_per_slot),
-            interval_minutes=interval_minutes,
-            force_current=force_current,
-        )
+        required_slots = ceil(required / soc_per_slot)
+        if current_outside_window and current_slot in price_eligible:
+            regular_price_eligible = [slot for slot in price_eligible if slot is not current_slot]
+            regular_ranked = [slot for slot in ranked if slot is not current_slot]
+            ordered = [
+                current_slot,
+                *_best_continuous_slots(
+                    regular_price_eligible,
+                    regular_ranked,
+                    required_slots=max(required_slots - 1, 0),
+                    interval_minutes=interval_minutes,
+                    force_current=False,
+                ),
+            ]
+        else:
+            ordered = _best_continuous_slots(
+                price_eligible,
+                ranked,
+                required_slots=required_slots,
+                interval_minutes=interval_minutes,
+                force_current=force_current,
+            )
     elif force_current and current_slot in ranked:
         ordered = [current_slot, *(slot for slot in ranked if slot is not current_slot)]
     else:
