@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.8.2 - 2026-08-01
+
 ### Added
 
 - Added native EV-device entities for enabling opportunistic charging and
@@ -24,11 +26,18 @@
 - Plan fallback notifications are no longer recreated on every refresh when
   their title, message, and reason codes have not changed. A cleared condition
   can still notify again if it later recurs.
+- AI advice remains visible across regenerated plan IDs when the material plan
+  is unchanged, reports pending work while a provider call is in flight or
+  rate-limited, and retries automatically when the provider-call window opens.
+- Cached advice now follows the coordinator's latest-accepted policy, supports
+  legacy nested fingerprints, stays hidden when AI advice is disabled, and no
+  longer adds regenerated plan IDs to recorder-facing attributes.
 
 ### Validation
 
-- Full Docker validation with `100%` statement coverage, plus Ruff, replay,
-  schema, history, Home Assistant configuration, and end-to-end smoke checks.
+- Full Docker validation: `855 passed`, `100%` across `8,942` statements, plus
+  Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
+  smoke checks.
 
 ## 0.8.1 - 2026-07-31
 

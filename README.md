@@ -54,7 +54,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
 - Coverage-aware forecast health and diagnostics: at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe; uncovered slots remain missing instead of repeating the final value
 - Decision audit, rejected action, upcoming timeline, and per-device decision sensors explaining what was selected and why alternatives were skipped
-- Optional AI advice through supported Home Assistant AI Task entities, scheduled after plan commit, skipped for unsafe/zero-confidence plans, single-flight cached by a bounded material plan signature, rate-limited, and treated as advisory only
+- Optional AI advice through supported Home Assistant AI Task entities, scheduled after plan commit, skipped for unsafe/zero-confidence plans, single-flight cached across equivalent plans by a bounded material signature, visibly pending while in flight or rate-limited, automatically retried when the rate-limit window opens, and treated as advisory only
 - AI advice rejection reasons, compact summaries, and no permission for AI output to call services or bypass hard constraints
 - Execution audit and support bundle services for production review without reading Home Assistant storage files directly; repeated identical skipped dry-run outcomes are coalesced with occurrence counts, while applied/failed safety events remain distinct
 - Explicit decision-input replan listeners, observation-only sampling for high-frequency power sensors, a one-minute non-manual refresh floor, epoch-aligned scheduling for every supported interval, unchanged-input short-circuiting, and refresh trigger/phase/counter telemetry
@@ -98,7 +98,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.8.1`
+- Current manifest version: `0.8.2`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `service`
 - IoT class: `calculated`
