@@ -22,7 +22,12 @@ from .const import (
     CONF_EV_CONTROL_ENABLED,
     CONF_PERSON_ENTITIES,
 )
-from .coordinator import EnergyPlannerCoordinator, _material_plan_fingerprint
+from .coordinator import (
+    EnergyPlannerCoordinator,
+    _ai_recommendation_fingerprint,
+    _latest_accepted_ai_recommendation,
+    _material_plan_fingerprint,
+)
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .preflight import _control_area_report, production_evidence_fingerprint
@@ -925,6 +930,8 @@ def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
         return _display_state(status or "unknown")
     if not coordinator.options.get("ai_enabled", False):
         return "Disabled"
+    if _current_ai_pending(coordinator) is not None:
+        return "Pending"
     return "No response"
 
 
@@ -932,10 +939,14 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest bounded AI response details."""
     current = _current_ai_recommendation(coordinator)
     if current is None:
-        return {
+        attributes: dict[str, Any] = {
             "enabled": bool(coordinator.options.get("ai_enabled", False)),
             "latest": None,
         }
+        pending = _current_ai_pending(coordinator)
+        if pending is not None:
+            attributes.update(pending)
+        return attributes
     latest = dict(current)
     accepted = latest.get("accepted")
     if not isinstance(accepted, dict):
@@ -944,10 +955,13 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     if not isinstance(rejected_detail, dict):
         rejected_reason = latest.get("rejected_reason")
         rejected_detail = ai_rejection_detail(rejected_reason) if isinstance(rejected_reason, str) else {}
+    current_plan_id = getattr(getattr(coordinator, "data", None), "plan_id", None)
+    source_plan_id = latest.get("plan_id")
     return {
         "enabled": bool(coordinator.options.get("ai_enabled", False)),
         "created_at": latest.get("created_at"),
-        "plan_id": latest.get("plan_id"),
+        "plan_id": source_plan_id,
+        "reused_for_current_plan": bool(source_plan_id and source_plan_id != current_plan_id),
         "status": latest.get("status"),
         "service_called": latest.get("service_called"),
         "ai_task_entity": latest.get(CONF_AI_TASK_ENTITY),
@@ -963,7 +977,9 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
 
 
 def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
-    """Return advice only when it belongs to the current safe committed plan."""
+    """Return exact or materially equivalent advice for the safe current plan."""
+    if not coordinator.options.get("ai_enabled", False):
+        return None
     plan = coordinator.data
     if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
         return None
@@ -976,7 +992,27 @@ def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[st
             continue
         if item.get("plan_id") == plan.plan_id and item.get("plan_fingerprint") == fingerprint:
             return item
+    latest_accepted = _latest_accepted_ai_recommendation(recommendations)
+    if _ai_recommendation_fingerprint(latest_accepted) == fingerprint:
+        return latest_accepted
     return None
+
+
+def _current_ai_pending(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
+    """Return pending metadata only when it belongs to the safe current plan."""
+    if not coordinator.options.get("ai_enabled", False):
+        return None
+    plan = coordinator.data
+    if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
+        return None
+    fingerprint = _material_plan_fingerprint(plan)
+    if getattr(coordinator, "_ai_advice_pending_fingerprint", None) != fingerprint:
+        return None
+    retry_at = getattr(coordinator, "_ai_advice_retry_at", None)
+    return {
+        "pending_reason": getattr(coordinator, "_ai_advice_pending_reason", None) or "request_in_flight",
+        "retry_at": retry_at.isoformat() if isinstance(retry_at, datetime) else None,
+    }
 
 
 def _confidence_breakdown_state(coordinator: EnergyPlannerCoordinator) -> str:
