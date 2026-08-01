@@ -112,6 +112,7 @@ rules:
         - tests/test_ev_control_entities.py
   config-flow-test-coverage:
     status: done
+    comment: Config and subentry flows cover device mappings and structural constraints; a central schema exclusion with regression coverage keeps native entity-managed settings out of the Options UI.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -298,10 +299,11 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, forecast coverage/stitching/gap fixtures, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin forecast MAE/RMSE and baseline gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, explicit EV opportunistic-charging and earliest-start boundary tests, forecast coverage/stitching/gap fixtures, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin forecast MAE/RMSE and baseline gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
+        - tests/test_ev.py
         - tests/test_executor.py
         - tests/test_services.py
         - tests/test_real_history_fixtures.py
@@ -397,14 +399,18 @@ rules:
       tests:
         - scripts/docker-ha-smoke.sh
   entity-category:
-    status: n/a
-    comment: Exposed entities are primary planner control/status entities rather than diagnostic/configuration-only entities.
+    status: done
+    comment: Adjustable planner and device settings use the Home Assistant config entity category, while primary plan/status entities remain uncategorized.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
         - custom_components/ha_energy_planner/binary_sensor.py
         - custom_components/ha_energy_planner/switch.py
+        - custom_components/ha_energy_planner/number.py
         - custom_components/ha_energy_planner/button.py
+      tests:
+        - tests/test_switch_button.py
+        - tests/test_ev_control_entities.py
   entity-device-class:
     status: done
     comment: The estimated-cost sensor uses Home Assistant's monetary device class and configured currency; remaining planner status/confidence entities have no matching device class.
@@ -425,6 +431,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
+    comment: Planner entities, including the EV opportunistic-charging switch and price-threshold number, use translation keys mirrored across bundled English translations.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json

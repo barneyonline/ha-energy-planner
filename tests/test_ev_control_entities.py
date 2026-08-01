@@ -10,10 +10,14 @@ from custom_components.ha_energy_planner import time as time_module
 from custom_components.ha_energy_planner.const import (
     CONF_DEFAULT_READY_BY,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
 )
-from custom_components.ha_energy_planner.number import EVTargetSOCNumber
+from custom_components.ha_energy_planner.number import (
+    EVOpportunisticChargingPriceThresholdNumber,
+    EVTargetSOCNumber,
+)
 from custom_components.ha_energy_planner.time import EVReadyByTime
 
 
@@ -22,7 +26,9 @@ class FakeCoordinator:
 
     def __init__(self) -> None:
         self.entry = SimpleNamespace(entry_id="entry-1")
+        self.hass = SimpleNamespace(config=SimpleNamespace(currency="AUD"))
         self.target_calls: list[float] = []
+        self.price_threshold_calls: list[float] = []
         self.ready_calls: list[str] = []
 
     @property
@@ -31,6 +37,7 @@ class FakeCoordinator:
             CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 82,
             CONF_EV_MIN_SOC_PERCENT: 30,
             CONF_EV_MAX_SOC_PERCENT: 95,
+            CONF_EV_LOW_PRICE_THRESHOLD: 0.08,
         }
 
     @property
@@ -39,6 +46,9 @@ class FakeCoordinator:
 
     async def async_set_ev_target_soc(self, value: float) -> None:
         self.target_calls.append(value)
+
+    async def async_set_ev_low_price_threshold(self, value: float) -> None:
+        self.price_threshold_calls.append(value)
 
     async def async_set_ready_by(self, value: str) -> None:
         self.ready_calls.append(value)
@@ -64,11 +74,18 @@ def test_native_ev_control_entity_setup_and_values(monkeypatch: object) -> None:
     asyncio.run(time_module.async_setup_entry(None, entry, None))
 
     target = numbers[0]
+    price_threshold = numbers[1]
     ready = times[0]
     assert isinstance(target, EVTargetSOCNumber)
     assert target.native_value == 82
     assert target.native_min_value == 30
     assert target.native_max_value == 95
+    assert isinstance(price_threshold, EVOpportunisticChargingPriceThresholdNumber)
+    assert price_threshold.native_value == 0.08
+    assert price_threshold.native_min_value == -10
+    assert price_threshold.native_max_value == 10
+    assert price_threshold.native_step == 0.01
+    assert price_threshold.native_unit_of_measurement == "AUD/kWh"
     assert isinstance(ready, EVReadyByTime)
     assert ready.native_value.isoformat() == "06:45:00"
 
@@ -76,12 +93,16 @@ def test_native_ev_control_entity_setup_and_values(monkeypatch: object) -> None:
 def test_native_ev_controls_update_coordinator() -> None:
     coordinator = FakeCoordinator()
     target = EVTargetSOCNumber(coordinator)
+    price_threshold = EVOpportunisticChargingPriceThresholdNumber(coordinator)
     ready = EVReadyByTime(coordinator)
     target.async_write_ha_state = lambda: None
+    price_threshold.async_write_ha_state = lambda: None
     ready.async_write_ha_state = lambda: None
 
     asyncio.run(target.async_set_native_value(88))
+    asyncio.run(price_threshold.async_set_native_value(-0.03))
     asyncio.run(ready.async_set_value(ready.native_value.replace(hour=7, minute=15)))
 
     assert coordinator.target_calls == [88]
+    assert coordinator.price_threshold_calls == [-0.03]
     assert coordinator.ready_calls == ["07:15"]

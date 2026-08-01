@@ -292,6 +292,33 @@ def test_options_update_restores_when_direct_update_enables_safe_mode() -> None:
     assert coordinator.executor.reservation_syncs == 1
 
 
+def test_options_update_handles_each_option_snapshot_once() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: True,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_handled_options = {CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True}
+    coordinator._last_control_mode_state = (False, True)
+    coordinator.executor = FakeExecutor()
+    coordinator.async_restore_safe_state = AsyncMock()
+    coordinator.async_request_replan = AsyncMock()
+
+    async def handle_duplicate_update() -> None:
+        await coordinator.async_handle_options_update()
+        await coordinator.async_handle_options_update()
+
+    asyncio.run(handle_duplicate_update())
+
+    assert coordinator.executor.reservation_syncs == 1
+    assert coordinator.executor.reservation_persists == 1
+    coordinator.async_request_replan.assert_awaited_once_with()
+
+
 def test_options_update_surfaces_restore_error_after_safe_option_is_applied() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = FakeEntry(
@@ -2667,6 +2694,9 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     coordinator._refresh_generation = 0
     coordinator._force_next_refresh = False
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_handled_options = {}
+    coordinator._last_control_mode_state = (coordinator.planner_enabled, coordinator.dry_run)
 
     async def request_refresh() -> None:
         refreshes.append("refresh")
@@ -2674,12 +2704,14 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     coordinator.async_request_refresh = request_refresh
     asyncio.run(coordinator.async_set_ready_by("08:10"))
     asyncio.run(coordinator.async_set_ev_target_soc(85))
+    asyncio.run(coordinator.async_set_ev_low_price_threshold(0.07))
     asyncio.run(coordinator.async_manual_ev_charging(True))
     asyncio.run(coordinator.async_manual_ev_charging(False))
 
     assert coordinator.ready_by == "08:10"
     assert updates[0]["default_ready_by"] == "08:10"
     assert updates[1]["ev_fallback_target_soc_percent"] == 85
+    assert updates[2]["ev_low_price_threshold"] == 0.07
     assert [item[0] for item in coordinator.executor.manual_ev_commands] == [True, False]
     assert all(
         item[1] is coordinator._last_decision_context
@@ -2688,7 +2720,7 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     assert all(item[2][CONF_EV_CONNECTED_HELPER] is False for item in coordinator.executor.manual_ev_commands)
     assert coordinator.overrides[0].reason == "manual_stop"
     assert coordinator.store.async_save_overrides.await_count == 2
-    assert refreshes == ["refresh"] * 4
+    assert refreshes == ["refresh"] * 5
 
 
 def test_connected_helper_persists_and_records_trip_state_without_external_entity() -> None:

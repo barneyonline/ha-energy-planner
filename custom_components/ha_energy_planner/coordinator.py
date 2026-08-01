@@ -43,6 +43,7 @@ from .const import (
     CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
+    CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
@@ -189,6 +190,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._boundary_cancel: Callable[[], None] | None = None
         self._planner_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
+        self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
         self.entry_topology_signature: tuple[Any, ...] | None = None
         self._refresh_generation = 0
@@ -636,12 +638,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
         async with self._options_update_lock:
-            self.executor.options = self.options
+            option_state = dict(self.entry.options)
+            if option_state == getattr(self, "_last_handled_options", None):
+                return
+
+            current_options = {**DEFAULT_OPTIONS, **option_state}
+            self.executor.options = current_options
             self.executor.entry_data = self.entry_data
             self.executor.sync_ev_grid_reservation()
             await self.executor.async_persist_ev_grid_reservation()
             previous_enabled, previous_dry_run = self._last_control_mode_state
-            current_mode = (self.planner_enabled, self.dry_run)
+            current_mode = (
+                bool(current_options.get(CONF_PLANNER_ENABLED, False)),
+                bool(current_options.get(CONF_DRY_RUN, True)),
+            )
             self._last_control_mode_state = current_mode
             planner_disabled = previous_enabled and not current_mode[0]
             dry_run_enabled = not previous_dry_run and current_mode[1]
@@ -649,6 +659,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
                 await self.async_restore_safe_state(reason, refresh=False)
             await self.async_request_replan()
+            self._last_handled_options = option_state
 
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Persist the native EV ready-by setting and replan."""
@@ -674,6 +685,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             update_entry(self.entry, options=options)
         self._mark_forced_refresh("ev_target_soc_changed")
         await self.async_request_refresh()
+
+    async def async_set_ev_low_price_threshold(self, threshold: float) -> None:
+        """Persist the opportunistic charging price threshold and replan."""
+        options = self.options
+        options[CONF_EV_LOW_PRICE_THRESHOLD] = float(threshold)
+        config_entries = getattr(self.hass, "config_entries", None)
+        update_entry = getattr(config_entries, "async_update_entry", None)
+        if callable(update_entry):
+            update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
 
     async def async_manual_ev_charging(self, enabled: bool) -> EVCommandResult:
         """Apply a manual charger command through Energy Planner's adapter."""
