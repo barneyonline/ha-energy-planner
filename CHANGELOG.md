@@ -19,6 +19,12 @@
   allocations remain inside the configured window and existing safety gates
   continue to apply.
 
+### Fixed
+
+- Plan fallback notifications are no longer recreated on every refresh when
+  their title, message, and reason codes have not changed. A cleared condition
+  can still notify again if it later recurs.
+
 ### Validation
 
 - Full Docker validation with `100%` statement coverage, plus Ruff, replay,
