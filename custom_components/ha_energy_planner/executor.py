@@ -121,6 +121,7 @@ class Executor:
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
+        self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
 
     async def async_manual_ev_charging(
         self,
@@ -1215,6 +1216,7 @@ class Executor:
             self.options.get(CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED),
             default=True,
         ):
+            self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
             return
         clean_violations = _clean_reason_codes(violations)
@@ -1223,13 +1225,15 @@ class Executor:
         ]
         haeo_issues = _haeo_fallback_issues(plan.input_issues)
         if self._in_notification_grace_period():
+            self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
             return
         if plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN}:
+            self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
             return
         if "input_health_unsafe" in violations:
-            await self._async_create_notification(
+            await self._async_create_plan_fallback_notification(
                 title=self._notification_title("plan unsafe"),
                 message=_plan_fallback_message(
                     plan,
@@ -1239,9 +1243,11 @@ class Executor:
                 notification_id=self._notification_id(_PLAN_UNSAFE_NOTIFICATION_ID),
             )
         else:
-            await self._async_dismiss_notification(self._notification_id(_PLAN_UNSAFE_NOTIFICATION_ID))
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(_PLAN_UNSAFE_NOTIFICATION_ID)
+            )
         if grid_violations:
-            await self._async_create_notification(
+            await self._async_create_plan_fallback_notification(
                 title=self._notification_title("grid limit fallback"),
                 message=_plan_fallback_message(
                     plan,
@@ -1251,9 +1257,11 @@ class Executor:
                 notification_id=self._notification_id(_GRID_LIMIT_NOTIFICATION_ID),
             )
         else:
-            await self._async_dismiss_notification(self._notification_id(_GRID_LIMIT_NOTIFICATION_ID))
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(_GRID_LIMIT_NOTIFICATION_ID)
+            )
         if haeo_issues:
-            await self._async_create_notification(
+            await self._async_create_plan_fallback_notification(
                 title=self._notification_title("HAEO fallback"),
                 message=_plan_fallback_message(
                     plan,
@@ -1266,7 +1274,9 @@ class Executor:
                 notification_id=self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID),
             )
         else:
-            await self._async_dismiss_notification(self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID))
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID)
+            )
 
     def _in_notification_grace_period(self) -> bool:
         """Return whether startup warm-up should suppress fallback notifications."""
@@ -1308,15 +1318,39 @@ class Executor:
             return f"{self.entry_title}: {suffix}"
         return f"Energy Planner {suffix}"
 
-    async def _async_create_notification(self, *, title: str, message: str, notification_id: str) -> None:
+    async def _async_create_plan_fallback_notification(
+        self,
+        *,
+        title: str,
+        message: str,
+        notification_id: str,
+    ) -> None:
+        """Create or update a fallback notification only when its content changes."""
+        signature = (title, message)
+        if self._plan_fallback_notification_signatures.get(notification_id) == signature:
+            return
+        created = await self._async_create_notification(
+            title=title,
+            message=message,
+            notification_id=notification_id,
+        )
+        if created:
+            self._plan_fallback_notification_signatures[notification_id] = signature
+
+    async def _async_dismiss_plan_fallback_notification(self, notification_id: str) -> None:
+        """Dismiss a fallback notification and allow a later recurrence to alert."""
+        self._plan_fallback_notification_signatures.pop(notification_id, None)
+        await self._async_dismiss_notification(notification_id)
+
+    async def _async_create_notification(self, *, title: str, message: str, notification_id: str) -> bool:
         """Create a persistent notification if the service is available."""
         if self.hass is None:
-            return
+            return False
         services = getattr(self.hass, "services", None)
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "create"):
-            return
-        with suppress(Exception):
+            return False
+        try:
             await services.async_call(
                 "persistent_notification",
                 "create",
@@ -1327,6 +1361,9 @@ class Executor:
                 },
                 blocking=False,
             )
+        except Exception:  # noqa: BLE001 - notifications are best-effort Home Assistant I/O.
+            return False
+        return True
 
     async def _async_dismiss_notifications(self, notification_ids: tuple[str, ...]) -> None:
         """Dismiss persistent notifications if the service is available."""

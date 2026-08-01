@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Plan fallback notifications are no longer recreated on every refresh when
+  their title, message, and reason codes have not changed. A cleared condition
+  can still notify again if it later recurs.
+
 ## 0.8.1 - 2026-07-31
 
 ### Fixed

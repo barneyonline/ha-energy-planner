@@ -719,6 +719,79 @@ def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() 
     ]
 
 
+def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -> None:
+    class RecoveringServices(FakeServices):
+        def __init__(self, states: FakeStates) -> None:
+            super().__init__(states)
+            self.available = False
+            self.fail_next_call = False
+
+        def has_service(self, domain: str, service: str) -> bool:
+            return self.available
+
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            if self.fail_next_call and service == "create":
+                self.fail_next_call = False
+                raise RuntimeError("temporary notification failure")
+            await super().async_call(domain, service, data, blocking)
+
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["haeo_response_unsupported"],
+    )
+    hass = FakeHass()
+    hass.services = RecoveringServices(hass.states)
+    executor = Executor(FakeStore(), hass=hass)
+
+    # An unavailable service and a transient call failure must not mark the
+    # notification as delivered; the next refresh should retry it.
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    hass.services.available = True
+    hass.services.fail_next_call = True
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+
+    create_calls = [
+        call
+        for call in hass.services.calls
+        if call[0:2] == ("persistent_notification", "create")
+        and call[2]["notification_id"] == "ha_energy_planner_haeo_fallback"
+    ]
+    assert len(create_calls) == 1
+
+    plan.input_issues = []
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    plan.input_issues = ["haeo_response_unsupported"]
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+
+    create_calls = [
+        call
+        for call in hass.services.calls
+        if call[0:2] == ("persistent_notification", "create")
+        and call[2]["notification_id"] == "ha_energy_planner_haeo_fallback"
+    ]
+    assert len(create_calls) == 2
+
+
 def test_plan_fallback_notification_ignores_successful_haeo_call_reason() -> None:
     now = datetime.now(UTC)
     plan = EnergyPlan(
