@@ -331,6 +331,25 @@ _POLICY_MENU_OPTIONS = (
     POLICY_STEP_PRIORITIES,
 )
 
+# Options configure planner/device structure and operating constraints. Settings
+# with native entities are intentionally omitted so day-to-day control has one
+# Home Assistant surface that can also be automated.
+_ENTITY_MANAGED_OPTION_FIELDS = frozenset(
+    {
+        CONF_DEFAULT_READY_BY,
+        CONF_PLANNER_ENABLED,
+        CONF_DRY_RUN,
+        CONF_AI_ENABLED,
+        CONF_EV_CONTROL_ENABLED,
+        CONF_CLIMATE_CONTROL_ENABLED,
+        CONF_ENPHASE_CONTROL_ENABLED,
+        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+        CONF_EV_KEEP_CHARGER_ON,
+        CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+        CONF_EV_LOW_PRICE_THRESHOLD,
+    }
+)
+
 _POLICY_SECTION_FIELDS = {
     POLICY_STEP_SCHEDULE: (
         CONF_PLANNING_HORIZON_HOURS,
@@ -398,6 +417,11 @@ _POLICY_SECTION_FIELDS = {
         CONF_MIN_ENPHASE_CONFIDENCE,
     ),
     POLICY_STEP_PRIORITIES: _PRIORITY_FORM_FIELDS,
+}
+
+_POLICY_SECTION_FIELDS = {
+    step_id: tuple(field for field in fields if field not in _ENTITY_MANAGED_OPTION_FIELDS)
+    for step_id, fields in _POLICY_SECTION_FIELDS.items()
 }
 
 _POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_MENU_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
@@ -900,6 +924,10 @@ class OptionsFlow(config_entries.OptionsFlow):
                 updated,
             ):
                 errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
+            for field in tuple(errors):
+                if field != "base" and field not in _POLICY_SECTION_FIELDS[step_id]:
+                    errors.setdefault("base", errors[field])
+                    errors.pop(field)
             if not errors:
                 self._async_save_options(_normalize_options_input(updated))
                 return await self.async_step_init()

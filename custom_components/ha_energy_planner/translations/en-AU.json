@@ -323,8 +323,8 @@
           "ev_earliest_start": "Earliest charging start",
           "ev_price_limit_enabled": "Apply maximum import price",
           "ev_max_import_price": "Maximum import price",
-          "ev_low_price_charging_enabled": "Charge immediately at low prices",
-          "ev_low_price_threshold": "Low-price charging threshold",
+          "ev_low_price_charging_enabled": "Enable opportunistic charging",
+          "ev_low_price_threshold": "Opportunistic charging price threshold",
           "ev_keep_charger_on": "Keep charger enabled after target SOC",
           "ev_confirmation_timeout_seconds": "Charging confirmation timeout",
           "ev_confirmation_retries": "Charging confirmation retries",
@@ -346,8 +346,8 @@
           "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
           "ev_price_limit_enabled": "Exclude charging intervals above the maximum import price, except an immediate minimum-SOC recovery interval.",
           "ev_max_import_price": "Highest grid import price allowed for normal scheduled charging.",
-          "ev_low_price_charging_enabled": "Start immediately when the current price is at or below the configured threshold and the EV still needs charge.",
-          "ev_low_price_threshold": "Import price that triggers immediate low-price charging.",
+          "ev_low_price_charging_enabled": "Start opportunistic charging when the current price is at or below the configured threshold and the EV still needs charge, even before the configured earliest charging time.",
+          "ev_low_price_threshold": "Import price that triggers immediate opportunistic charging, including outside the configured charging hours.",
           "ev_keep_charger_on": "Keep the charger enabled after the EV reaches target SOC so vehicle preconditioning can use grid power. Enable only when the vehicle enforces its own target SOC.",
           "ev_confirmation_timeout_seconds": "Seconds to wait for the mapped charging-state entity to confirm each start or stop command. Set to 0 for an immediate check.",
           "ev_confirmation_retries": "Additional bounded command attempts when charging feedback does not confirm the requested state.",
@@ -594,6 +594,9 @@
       "ev_keep_charger_on": {
         "name": "Keep charger on"
       },
+      "ev_opportunistic_charging": {
+        "name": "Opportunistic charging"
+      },
       "climate_control_enabled": {
         "name": "Control enabled"
       },
@@ -604,6 +607,9 @@
     "number": {
       "ev_target_soc": {
         "name": "Target SOC"
+      },
+      "ev_opportunistic_charging_price_threshold": {
+        "name": "Opportunistic charging price threshold"
       }
     },
     "time": {
