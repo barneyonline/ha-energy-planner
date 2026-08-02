@@ -49,7 +49,7 @@ from .const import (
     DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import summarize_stored_trip_history
+from .ev import ev_charging_state, summarize_stored_trip_history
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     forecast_coverage_details,
@@ -559,6 +559,10 @@ class InputManager:
         if not self._valid_state(state):
             return None, f"{config_key}_unavailable"
         value = str(state.state).lower()
+        if config_key == CONF_EV_CHARGING:
+            charging = ev_charging_state(value)
+            if charging is not None:
+                return charging, None
         if value in {
             "on",
             "true",
