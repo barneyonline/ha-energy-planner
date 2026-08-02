@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.8.3 - 2026-08-02
+
+### Fixed
+
+- EV connector feedback now treats `SUSPENDED_EV` and `SUSPENDED_EVSE` as a
+  connected session with no active power delivery. Momentary stop controls are
+  not called when this feedback already proves charging is suspended, avoiding
+  charger API rejections after the vehicle reaches its target SOC.
+- The EV Stop charging button now uses a supported Material Design icon instead
+  of rendering with a blank icon in Home Assistant.
+
+### Validation
+
+- Full Docker validation: `858 passed`, `100%` across `8,962` statements, plus
+  Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
+  smoke checks.
+
 ## 0.8.2 - 2026-08-01
 
 ### Added
