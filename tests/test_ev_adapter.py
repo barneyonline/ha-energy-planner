@@ -683,6 +683,31 @@ def test_ev_stop_does_not_treat_disconnection_as_safe_button_confirmation() -> N
     ]
 
 
+def test_ev_stop_skips_button_when_vehicle_has_suspended_charging() -> None:
+    hass = FakeHass(
+        {
+            "sensor.ev_connector_status": "SUSPENDED_EV",
+            "button.ev_stop": "unknown",
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CHARGING: "sensor.ev_connector_status",
+            CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
+        },
+        confirmation_timeout_seconds=0,
+    )
+
+    result = asyncio.run(adapter.async_set_charging(False))
+
+    assert result.applied is True
+    assert result.reason == "already_in_desired_state"
+    assert result.command_sent is False
+    assert result.safe_state_confirmed is True
+    assert hass.services.calls == []
+
+
 def test_ev_stop_confirms_stateful_control_without_charging_feedback() -> None:
     hass = FakeHass({"switch.ev_charger": "on"})
     adapter = EVSmartChargingAdapter(

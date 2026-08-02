@@ -347,6 +347,13 @@ def test_manual_ev_charging_buttons_use_native_controller() -> None:
     assert coordinator.ev_charging_calls == [True, False]
 
 
+def test_manual_ev_charging_buttons_use_supported_icons() -> None:
+    descriptions = {description.key: description for description in BUTTONS}
+
+    assert descriptions["ev_start_charging"].icon == "mdi:ev-station"
+    assert descriptions["ev_stop_charging"].icon == "mdi:stop-circle-outline"
+
+
 def test_restore_button_raises_translated_error_when_restore_is_incomplete() -> None:
     coordinator = FakeCoordinator()
     coordinator.restore_result = SimpleNamespace(result=OutcomeResult.FAILED, reason="hvac_restore_failed")

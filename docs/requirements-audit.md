@@ -327,7 +327,12 @@ Status as of 2026-07-31.
   The Recorder compactor and current-state paths accept common MINI-like
   connected/disconnected states, connected-not-charging states, and SOC strings
   with percent units or comma decimals. Only compact trip records are kept in
-  `Store`; summaries use max daily SOC consumption for the ready-by target when
+  `Store`. Configured charging feedback also accepts connector-status sensors;
+  `SUSPENDED_EV` and `SUSPENDED_EVSE` are normalized as connected but not
+  actively charging, so momentary stop controls are not called after a vehicle
+  has already suspended power delivery. Disconnection remains insufficient
+  evidence for a safe momentary stop.
+  Summaries use max daily SOC consumption for the ready-by target when
   sufficient. Persisted Recorder import timestamps tolerate malformed or
   timezone-naive older values without raising through planner refresh. Docker
   smoke coverage now validates one Recorder-imported EV trip from Home

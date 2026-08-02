@@ -23,6 +23,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     STATE_UNKNOWN_VALUES,
 )
+from .ev import ev_charging_state, ev_charging_state_proves_safe
 from .models import ActionKind, PlanAction
 
 
@@ -265,6 +266,32 @@ class EVChargerAdapter:
         """Issue a command and confirm the mapped charging feedback state."""
         charging_entity = confirmation_entity or self.entry_data.get(CONF_EV_CHARGING)
         initial_pre_state = self._snapshot()
+        command_domain = entity_id.split(".", 1)[0]
+        if (
+            press_button
+            and command_domain in {"button", "input_button"}
+            and charging_entity
+        ):
+            charging_state = self._state(charging_entity)
+            already_confirmed = (
+                charging_state is not None
+                and _charging_state_matches(charging_state, enabled) is True
+            )
+            feedback_proves_safe = (
+                not enabled
+                and self._charging_feedback_proves_safe(charging_entity)
+            )
+            if already_confirmed and (enabled or feedback_proves_safe):
+                return EVCommandResult(
+                    True,
+                    "already_in_desired_state",
+                    initial_pre_state,
+                    self._snapshot(),
+                    command_sent=False,
+                    safe_state_confirmed=(
+                        feedback_proves_safe if not enabled else None
+                    ),
+                )
         command_sent = False
         for _attempt in range(self.confirmation_retries + 1):
             result = await self._async_call_control(
@@ -366,15 +393,7 @@ class EVChargerAdapter:
         state = self._state(entity_id)
         if state is None:
             return False
-        return str(state.state).strip().lower() in {
-            "off",
-            "false",
-            "0",
-            "idle",
-            "not_charging",
-            "connected_not_charging",
-            "fully_charged",
-        }
+        return ev_charging_state_proves_safe(state.state)
 
     async def _async_confirm_state(self, entity_id: str, enabled: bool, *, control_state: bool = False) -> str:
         """Wait for charging feedback or a stateful control to match the request."""
@@ -829,23 +848,8 @@ def _truthy_state(state: State) -> bool:
 
 def _charging_state_matches(state: State, enabled: bool) -> bool | None:
     """Return whether a charging-feedback state confirms the requested state."""
-    value = str(state.state).strip().lower()
-    if value in {"on", "true", "1", "charging"}:
-        return enabled
-    if value in {
-        "off",
-        "false",
-        "0",
-        "idle",
-        "not_charging",
-        "connected_not_charging",
-        "fully_charged",
-        "disconnected",
-        "unplugged",
-        "not_plugged_in",
-    }:
-        return not enabled
-    return None
+    charging = ev_charging_state(state.state)
+    return None if charging is None else charging is enabled
 
 
 def _control_state_matches(state: State, enabled: bool) -> bool:

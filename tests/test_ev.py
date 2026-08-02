@@ -15,6 +15,8 @@ from custom_components.ha_energy_planner.ev import (
     _state_timestamp,
     allocate_least_cost_charging,
     calculate_ev_target,
+    ev_charging_state,
+    ev_charging_state_proves_safe,
     import_trip_history_from_state_sequences,
     summarize_stored_trip_history,
     summarize_trip_history,
@@ -22,6 +24,18 @@ from custom_components.ha_energy_planner.ev import (
     update_trip_history_from_values,
 )
 from custom_components.ha_energy_planner.models import DecisionSlot
+
+
+def test_ev_charging_state_distinguishes_suspended_power_from_connection() -> None:
+    assert ev_charging_state("Charging") is True
+    assert ev_charging_state("FINISHING") is True
+    assert ev_charging_state("SUSPENDED_EV") is False
+    assert ev_charging_state(" suspended_evse ") is False
+    assert ev_charging_state("AVAILABLE") is False
+    assert ev_charging_state("warming_up") is None
+    assert ev_charging_state_proves_safe("SUSPENDED_EV") is True
+    assert ev_charging_state_proves_safe("disconnected") is False
+    assert ev_charging_state_proves_safe("AVAILABLE") is False
 
 
 def test_ev_summary_uses_max_daily_consumption() -> None:
