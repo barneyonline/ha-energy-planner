@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.8.4 - 2026-08-02
+
+### Fixed
+
+- Native HAEO response and flexible-projection capability gaps no longer raise
+  recurring fallback notifications when the current deterministic plan remains
+  healthy. The capability evidence remains available in plan diagnostics, and
+  genuine HAEO service or solve failures still notify.
+
+### Validation
+
+- Ruff, quality-scale validation, Home Assistant configuration validation,
+  replay and schema checks, and `859` tests at `100%` coverage passed.
+- The Docker smoke test remains blocked by its pre-existing HVAC suppression
+  restore assertion, which is unrelated to the notification filtering change.
+
 ## 0.8.3 - 2026-08-02
 
 ### Fixed
