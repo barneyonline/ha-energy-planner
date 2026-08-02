@@ -719,6 +719,50 @@ def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() 
     ]
 
 
+def test_plan_fallback_notification_ignores_haeo_capability_gaps() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.HEALTHY,
+        mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test",
+        confidence=1.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=[
+            "haeo_response_unsupported",
+            "haeo_flexible_projection_unsupported",
+        ],
+    )
+    hass = FakeHass()
+    executor = Executor(FakeStore(), hass=hass)
+
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+
+    assert hass.services.calls == [
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_plan_unsafe"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_grid_limit_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+    ]
+
+
 def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -> None:
     class RecoveringServices(FakeServices):
         def __init__(self, states: FakeStates) -> None:
@@ -755,7 +799,7 @@ def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["haeo_response_unsupported"],
+        input_issues=["haeo_service_unavailable"],
     )
     hass = FakeHass()
     hass.services = RecoveringServices(hass.states)
@@ -780,7 +824,7 @@ def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -
 
     plan.input_issues = []
     asyncio.run(executor.async_notify_plan_fallback(plan, []))
-    plan.input_issues = ["haeo_response_unsupported"]
+    plan.input_issues = ["haeo_service_unavailable"]
     asyncio.run(executor.async_notify_plan_fallback(plan, []))
 
     create_calls = [

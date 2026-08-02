@@ -1978,10 +1978,16 @@ def _plan_fallback_message(plan: EnergyPlan, summary: str, reason_codes: list[st
 
 
 def _haeo_fallback_issues(issues: list[str]) -> list[str]:
+    non_actionable_capability_gaps = {
+        "haeo_flexible_projection_unsupported",
+        "haeo_response_unsupported",
+    }
     return [
         code
         for code in _clean_reason_codes(issues)
-        if code != "haeo_service_called" and (code.startswith("haeo_") or "haeo" in code)
+        if code not in non_actionable_capability_gaps
+        and code != "haeo_service_called"
+        and (code.startswith("haeo_") or "haeo" in code)
     ]
 
 
