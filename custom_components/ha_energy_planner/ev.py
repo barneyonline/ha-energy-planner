@@ -9,6 +9,70 @@ from typing import Any
 
 MAX_STORED_TRIPS = 120
 
+_EV_ACTIVE_CHARGING_STATES = frozenset(
+    {
+        "on",
+        "true",
+        "1",
+        "charging",
+        "finishing",
+    }
+)
+_EV_INACTIVE_CHARGING_STATES = frozenset(
+    {
+        "off",
+        "false",
+        "0",
+        "idle",
+        "not_charging",
+        "connected_not_charging",
+        "fully_charged",
+        "available",
+        "preparing",
+        "reserved",
+        "unavailable",
+        "faulted",
+        "plugged",
+        "connected",
+        "occupied",
+        "suspended",
+        "suspended_ev",
+        "suspended_evse",
+        "disconnected",
+        "unplugged",
+        "not_plugged_in",
+    }
+)
+_EV_SAFE_CONNECTED_INACTIVE_STATES = frozenset(
+    {
+        "off",
+        "false",
+        "0",
+        "idle",
+        "not_charging",
+        "connected_not_charging",
+        "fully_charged",
+        "suspended",
+        "suspended_ev",
+        "suspended_evse",
+    }
+)
+
+
+def ev_charging_state(value: object) -> bool | None:
+    """Normalize charger feedback into active or inactive power delivery."""
+    normalized = str(value).strip().lower()
+    if normalized in _EV_ACTIVE_CHARGING_STATES:
+        return True
+    if normalized in _EV_INACTIVE_CHARGING_STATES:
+        return False
+    return None
+
+
+def ev_charging_state_proves_safe(value: object) -> bool:
+    """Return whether feedback proves no charging while connection may remain."""
+    return str(value).strip().lower() in _EV_SAFE_CONNECTED_INACTIVE_STATES
+
 
 @dataclass(slots=True)
 class EVTripRecord:

@@ -170,7 +170,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="ev_stop_charging",
         translation_key="ev_stop_charging",
-        icon="mdi:ev-station-off",
+        icon="mdi:stop-circle-outline",
         entity_category=EntityCategory.CONFIG,
         press_fn=_stop_ev_charging,
     ),

@@ -24,6 +24,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
+    CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
@@ -1372,6 +1373,7 @@ def test_input_manager_optional_state_edge_cases() -> None:
                 "sensor.power": FakeState("1000", {"unitOfMeasurement": "W"}),
                 "binary_sensor.no": FakeState("off"),
                 "binary_sensor.unsupported": FakeState("standby"),
+                "sensor.ev_connector_status": FakeState("SUSPENDED_EV"),
                 "select.unavailable": FakeState("unknown"),
                 "climate.unavailable": FakeState("unavailable"),
                 "weather.unavailable": FakeState("unknown"),
@@ -1385,6 +1387,7 @@ def test_input_manager_optional_state_edge_cases() -> None:
             CONF_DAIKIN_POWER: "sensor.power",
             "bool_key": "binary_sensor.no",
             "bad_bool_key": "binary_sensor.unsupported",
+            CONF_EV_CHARGING: "sensor.ev_connector_status",
             "string_key": "select.unavailable",
             "climate_key": "climate.unavailable",
             "weather_key": "weather.unavailable",
@@ -1400,6 +1403,7 @@ def test_input_manager_optional_state_edge_cases() -> None:
     assert manager._optional_numeric_state(CONF_DAIKIN_POWER) == (1.0, None)
     assert manager._optional_bool_state("bool_key") == (False, None)
     assert manager._optional_bool_state("bad_bool_key") == (None, "bad_bool_key_unsupported_state")
+    assert manager._optional_bool_state(CONF_EV_CHARGING) == (False, None)
     assert manager._optional_string_state("missing") == (None, None)
     assert manager._optional_string_state("string_key") == (None, "string_key_unavailable")
     assert manager._optional_climate_state("missing") == (None, None, None)
