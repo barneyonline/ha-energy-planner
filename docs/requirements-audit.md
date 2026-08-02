@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-07-31.
+Status as of 2026-08-02.
 
 ## Covered
 
@@ -175,8 +175,10 @@ Status as of 2026-07-31.
 - Persistent notifications are emitted for restore-safe-state, infeasible EV
   ready-by schedules, unsafe required inputs, grid-limit fallback, and HAEO
   fallback classes, using stable notification IDs and compact redacted reason
-  codes. Identical fallback conditions notify once and are updated only when
-  their content changes. The three plan-fallback notification classes can be
+  codes. Native HAEO response and flexible-projection capability gaps remain
+  diagnostic evidence without producing an actionable fallback notification.
+  Identical fallback conditions notify once and are updated only when their
+  content changes. The three plan-fallback notification classes can be
   disabled as a group; doing so dismisses their stable IDs without changing plan
   health or fail-closed execution. User-provided service reason fields are
   validated as compact reason codes before they can be persisted or shown in
