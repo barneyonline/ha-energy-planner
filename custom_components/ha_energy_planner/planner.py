@@ -14,6 +14,7 @@ from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_USABLE_CAPACITY_KWH,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
@@ -64,9 +65,7 @@ from .thermal_model import (
 )
 
 HVAC_PRECONDITION_PROJECTED_LOAD_KW = 1.0
-THERMAL_SHIFT_MIN_TARGET_DELTA_C = 0.3
 THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR = 0.5
-HVAC_SUPPRESSION_LOOKAHEAD = timedelta(hours=2)
 
 
 class DryRunPlanner:
@@ -88,7 +87,7 @@ class DryRunPlanner:
         device_plans = self._device_plans(context, actions)
         confidence_breakdown = _confidence_breakdown(context, actions)
         decision_audit = _decision_audit(context, actions, self.options)
-        rejected_actions = _rejected_actions(context, actions, self.options, self.thermal_model)
+        rejected_actions = _rejected_actions(context, actions, self.options)
         timeline_card = _timeline_card_rows(device_plans)
 
         summary = "Planner disabled"
@@ -154,12 +153,78 @@ class DryRunPlanner:
 
     def _actions(self, context: DecisionContext, mode: PlannerMode) -> list[PlanAction]:
         """Create conservative immediate candidate actions."""
+        ownership_free_hvac_release_allowed = bool(
+            mode != PlannerMode.DISABLED
+            and not strict_bool(self.options.get(CONF_DRY_RUN), default=True)
+            and strict_bool(self.options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False)
+        )
+        manual_hvac_override_active = any(
+            override.kind == "manual_hvac" and (override.expires_at is None or context.created_at < override.expires_at)
+            for override in getattr(context, "active_overrides", [])
+        )
+        away_off_release_reason = (
+            "manual_hvac_override"
+            if manual_hvac_override_active
+            else "hvac_required_evidence_lost"
+            if context.hvac_control.get("required_evidence_lost")
+            else None
+        )
+        ownership_free_comfort_handoff = bool(
+            ownership_free_hvac_release_allowed
+            and not context.hvac_control
+            and context.occupancy_state == OccupancyState.OCCUPIED
+            and context.current_hvac_temperature_c is not None
+            and context.occupied_temperature_low_c is not None
+            and context.occupied_temperature_high_c is not None
+            and (
+                float(context.current_hvac_temperature_c) <= float(context.occupied_temperature_low_c)
+                or float(context.current_hvac_temperature_c) >= float(context.occupied_temperature_high_c)
+            )
+        )
         if mode not in {PlannerMode.ACTIVE_HEALTHY, PlannerMode.DRY_RUN} or context.input_health != InputHealth.HEALTHY:
+            if (
+                context.hvac_control.get("phase") == "away_off"
+                and context.occupancy_state == OccupancyState.AWAY
+                and away_off_release_reason is None
+            ):
+                return []
+            if context.hvac_control:
+                interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+                return [
+                    self._hvac_release_action(
+                        context,
+                        context.created_at,
+                        context.created_at + interval,
+                        away_off_release_reason or "hvac_required_evidence_lost",
+                    )
+                ]
+            if ownership_free_comfort_handoff:
+                interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+                return [
+                    self._hvac_release_action(
+                        context,
+                        context.created_at,
+                        context.created_at + interval,
+                        "hvac_comfort_handoff",
+                    )
+                ]
             return []
         actions: list[PlanAction] = []
         execute_not_before = context.created_at
         execute_not_after = context.created_at + timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
-        if context.occupancy_state == OccupancyState.AWAY:
+        away_control_active = context.hvac_control.get("phase") == "away_off"
+        if context.occupancy_state == OccupancyState.AWAY and away_control_active and away_off_release_reason is None:
+            pass
+        elif context.occupancy_state == OccupancyState.AWAY and context.hvac_control:
+            actions.append(
+                self._hvac_release_action(
+                    context,
+                    execute_not_before,
+                    execute_not_after,
+                    away_off_release_reason or "hvac_required_evidence_lost",
+                )
+            )
+        elif context.occupancy_state == OccupancyState.AWAY:
             actions.append(
                 PlanAction(
                     action_id=f"{context.plan_id}-hvac-away-off",
@@ -177,11 +242,14 @@ class DryRunPlanner:
                 )
             )
         else:
-            hvac_action = self._hvac_suppression_action(context, execute_not_before, execute_not_after)
-            if hvac_action is None:
-                hvac_action = self._hvac_preconditioning_action(context, execute_not_before, execute_not_after)
-            if hvac_action is not None:
-                actions.append(hvac_action)
+            actions.extend(
+                self._hvac_lifecycle_actions(
+                    context,
+                    execute_not_before,
+                    execute_not_after,
+                    ownership_free_release_allowed=ownership_free_hvac_release_allowed,
+                )
+            )
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         if context.ev_connected is not False and context.current_ev_soc_percent is not None:
             ready_by_text = context.ev_ready_by or str(self.options[CONF_DEFAULT_READY_BY])
@@ -205,10 +273,7 @@ class DryRunPlanner:
                 current_slot is not None
                 and current_slot.import_price is not None
                 and float(current_slot.import_price) <= float(self.options[CONF_EV_LOW_PRICE_THRESHOLD])
-                and (
-                    max_import_price is None
-                    or float(current_slot.import_price) <= max_import_price
-                )
+                and (max_import_price is None or float(current_slot.import_price) <= max_import_price)
             )
             available_charge_hours = max((ready_by - earliest_start).total_seconds() / 3600, 0.0)
             if (
@@ -257,18 +322,12 @@ class DryRunPlanner:
                     slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
             charging_required_now = bool(current_slot and current_slot.valid_at in allocation_by_time)
             keep_charger_on = bool(self.options.get(CONF_EV_KEEP_CHARGER_ON, False))
-            keep_on_target_soc = (
-                float(target_soc)
-                if target_soc is not None
-                else float(target.target_soc_percent)
-            )
+            keep_on_target_soc = float(target_soc) if target_soc is not None else float(target.target_soc_percent)
             keep_on_after_target = bool(
                 keep_charger_on
                 and not context.ev_target_soc_fallback_active
                 and not target.infeasible
-                and ev_min <= keep_on_target_soc <= float(
-                    self.options[CONF_EV_MAX_SOC_PERCENT]
-                )
+                and ev_min <= keep_on_target_soc <= float(self.options[CONF_EV_MAX_SOC_PERCENT])
                 and context.current_ev_soc_percent >= keep_on_target_soc
             )
             manual_ev = next(
@@ -356,7 +415,12 @@ class DryRunPlanner:
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
         if enphase_action is not None:
             actions.append(enphase_action)
-        actions = [action for action in actions if _action_meets_confidence_threshold(action, context, self.options)]
+        actions = [
+            action
+            for action in actions
+            if action.kind == ActionKind.RELEASE_HVAC
+            or _action_meets_confidence_threshold(action, context, self.options)
+        ]
         return sorted(actions, key=lambda action: _action_score(action, context, self.options)["score"], reverse=True)
 
     def _enphase_action(
@@ -415,159 +479,543 @@ class DryRunPlanner:
             )
         return None
 
-    def _hvac_suppression_action(
+    def _hvac_lifecycle_actions(
         self,
         context: DecisionContext,
-        execute_not_before: Any,
-        execute_not_after: Any,
-    ) -> PlanAction | None:
-        if context.occupancy_state != OccupancyState.OCCUPIED:
-            return None
-        if not _comfort_valid(context, float(self.options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT])):
-            return None
-        current_slot = context.slots[0] if context.slots else None
-        current_price = current_slot.import_price if current_slot is not None else None
-        lookahead_end = current_slot.valid_at + HVAC_SUPPRESSION_LOOKAHEAD if current_slot is not None else None
-        future_prices = [
-            slot.import_price
-            for slot in context.slots
-            if current_slot is not None
-            and lookahead_end is not None
-            and current_slot.valid_at < slot.valid_at < lookahead_end
-            and slot.import_price is not None
-        ]
-        if current_price is None or not future_prices:
-            return None
-        future_min = min(future_prices)
-        delta = float(current_price) - float(future_min)
-        threshold = float(self.options[CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA])
-        if delta < threshold:
-            return None
-        return PlanAction(
-            action_id=f"{context.plan_id}-hvac-expensive-period-suppression",
-            plan_id=context.plan_id,
-            execute_not_before=execute_not_before,
-            execute_not_after=execute_not_after,
-            asset=ActionAsset.DAIKIN,
-            kind=ActionKind.SET_HVAC,
-            desired_state={
-                "suppress_automations": True,
-                "current_import_price": round(float(current_price), 4),
-                "future_min_import_price": round(float(future_min), 4),
-            },
-            hard_constraints=["occupied_comfort_within_bounds", "manual_hvac_override_inactive"],
-            reason_codes=["hvac_expensive_period_suppression"],
-            expected_cost_delta=round(delta, 4),
-            confidence=confidence_from_context(context),
-            requires_haeo_plan_id=None,
+        execute_not_before: datetime,
+        execute_not_after: datetime,
+        *,
+        ownership_free_release_allowed: bool,
+    ) -> list[PlanAction]:
+        """Plan precondition, peak-coast, and release lifecycle actions."""
+        active = dict(context.hvac_control or {})
+        now = context.created_at
+        low = context.occupied_temperature_low_c
+        high = context.occupied_temperature_high_c
+        current = context.current_hvac_temperature_c
+        interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        active_override = any(
+            override.kind == "manual_hvac" and (override.expires_at is None or now < override.expires_at)
+            for override in context.active_overrides
         )
+        if active_override:
+            return [self._hvac_release_action(context, now, now + interval, "manual_hvac_override")] if active else []
 
-    def _hvac_preconditioning_action(
-        self,
-        context: DecisionContext,
-        execute_not_before: Any,
-        execute_not_after: Any,
-    ) -> PlanAction | None:
-        if context.occupancy_state != OccupancyState.OCCUPIED:
-            return None
-        if not _comfort_valid(context, float(self.options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT])):
-            return None
+        if active.get("required_evidence_lost"):
+            return [
+                self._hvac_release_action(
+                    context,
+                    now,
+                    now + interval,
+                    "hvac_required_evidence_lost",
+                )
+            ]
 
-        current_price = context.slots[0].import_price if context.slots else None
-        if current_price is None:
+        if low is None or high is None or current is None or context.occupancy_state != OccupancyState.OCCUPIED:
+            return (
+                [self._hvac_release_action(context, now, now + interval, "hvac_required_evidence_lost")]
+                if active
+                else []
+            )
+        if float(current) <= float(low) or float(current) >= float(high):
+            if not active and not ownership_free_release_allowed:
+                return []
+            active_end = _datetime_value(active.get("period_end"))
+            return [
+                self._hvac_release_action(
+                    context,
+                    now,
+                    now + interval,
+                    "hvac_comfort_handoff",
+                    released_until=active_end,
+                )
+            ]
+
+        released_until = _datetime_value(active.get("released_until"))
+        if released_until is not None and now < released_until:
+            return []
+        if released_until is not None and set(active) <= {"released_until"}:
+            active = {}
+
+        if active:
+            period_start = _datetime_value(active.get("period_start"))
+            period_end = _datetime_value(active.get("period_end"))
+            baseline = _finite_number(active.get("baseline_price"))
+            persisted_precondition_delta = _finite_number(active.get("precondition_min_price_delta"))
+            persisted_suppression_delta = _finite_number(active.get("suppression_min_price_delta"))
+            precondition_delta = (
+                float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA])
+                if persisted_precondition_delta is None
+                else persisted_precondition_delta
+            )
+            suppression_delta = (
+                float(self.options[CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA])
+                if persisted_suppression_delta is None
+                else persisted_suppression_delta
+            )
+            if period_start is None or period_end is None or baseline is None or now >= period_end:
+                return [self._hvac_release_action(context, now, now + interval, "hvac_expensive_period_ended")]
+            if now < period_start and not _persisted_hvac_period_qualifies(
+                context,
+                period_start,
+                period_end,
+                baseline,
+                precondition_delta,
+                suppression_delta,
+            ):
+                return [self._hvac_release_action(context, now, now + interval, "hvac_tariff_period_changed")]
+            current_slot = context.slots[0] if context.slots else None
+            if current_slot is None or current_slot.import_price is None:
+                return [self._hvac_release_action(context, now, now + interval, "hvac_tariff_evidence_lost")]
+            if now >= period_start and float(current_slot.import_price) < baseline + suppression_delta:
+                return [self._hvac_release_action(context, now, now + interval, "hvac_expensive_period_ended")]
+            mode = str(active.get("mode") or "")
+            if mode not in {"heat", "cool"}:
+                return [self._hvac_release_action(context, now, now + interval, "hvac_mode_evidence_lost")]
+            if not _tariff_evidence_covers_period(context, period_end, interval):
+                return [self._hvac_release_action(context, now, now + interval, "hvac_tariff_evidence_lost")]
+            precondition_end = _datetime_value(active.get("precondition_end")) or period_start
+            phase = (
+                "peak_coast"
+                if now >= period_start
+                else "pre_peak_coast"
+                if now >= precondition_end
+                else "preconditioning"
+            )
+            target = (
+                float(low if mode == "heat" else high)
+                if phase in {"pre_peak_coast", "peak_coast"}
+                else float(high if mode == "heat" else low)
+            )
+            precondition_target = float(high if mode == "heat" else low)
+            coast_target = float(low if mode == "heat" else high)
+            if phase == "preconditioning":
+                self._project_active_hvac_slots(
+                    context,
+                    phase=phase,
+                    mode=mode,
+                    active_until=precondition_end,
+                    comfort_boundary=coast_target,
+                )
+                self._project_hvac_coast_slots(
+                    context,
+                    mode=mode,
+                    coast_started_at=precondition_end,
+                    active_until=period_end,
+                    starting_temperature=precondition_target,
+                    comfort_boundary=coast_target,
+                )
+            else:
+                self._project_active_hvac_slots(
+                    context,
+                    phase=phase,
+                    mode=mode,
+                    active_until=period_end,
+                    comfort_boundary=coast_target,
+                )
+            common = {
+                "period_start": period_start,
+                "period_end": period_end,
+                "precondition_end": precondition_end,
+                "baseline_price": baseline,
+                "precondition_min_price_delta": precondition_delta,
+                "suppression_min_price_delta": suppression_delta,
+                "precondition_target": _finite_number(active.get("precondition_target")) or precondition_target,
+                "coast_target": _finite_number(active.get("coast_target")) or coast_target,
+            }
+            actions = [
+                self._hvac_control_action(
+                    context,
+                    now,
+                    now + interval,
+                    phase=phase,
+                    mode=mode,
+                    target=target,
+                    **common,
+                )
+            ]
+            if phase == "preconditioning" and precondition_end < period_start:
+                actions.append(
+                    self._hvac_control_action(
+                        context,
+                        precondition_end,
+                        precondition_end + interval,
+                        phase="pre_peak_coast",
+                        mode=mode,
+                        target=coast_target,
+                        **common,
+                    )
+                )
+            if phase in {"preconditioning", "pre_peak_coast"}:
+                actions.append(
+                    self._hvac_control_action(
+                        context,
+                        period_start,
+                        period_start + interval,
+                        phase="peak_coast",
+                        mode=mode,
+                        target=coast_target,
+                        **common,
+                    )
+                )
+            actions.append(
+                self._hvac_release_action(
+                    context,
+                    period_end,
+                    period_end + interval,
+                    "hvac_expensive_period_ended",
+                )
+            )
+            return actions
+
+        candidate = self._next_hvac_period(context)
+        if candidate is None:
+            return []
+        precondition_start = candidate["precondition_start"]
+        precondition_end = candidate["precondition_end"]
+        period_start = candidate["period_start"]
+        period_end = candidate["period_end"]
+        mode = candidate["mode"]
+        precondition_target = float(high if mode == "heat" else low)
+        coast_target = float(low if mode == "heat" else high)
+        common = {
+            "period_start": period_start,
+            "period_end": period_end,
+            "precondition_end": precondition_end,
+            "baseline_price": candidate["baseline_price"],
+            "precondition_min_price_delta": candidate["precondition_min_price_delta"],
+            "suppression_min_price_delta": candidate["suppression_min_price_delta"],
+            "precondition_target": precondition_target,
+            "coast_target": coast_target,
+        }
+        actions = [
+            self._hvac_control_action(
+                context,
+                precondition_start,
+                precondition_start + interval,
+                phase="preconditioning",
+                mode=mode,
+                target=precondition_target,
+                **common,
+            ),
+        ]
+        if precondition_end < period_start:
+            actions.append(
+                self._hvac_control_action(
+                    context,
+                    precondition_end,
+                    precondition_end + interval,
+                    phase="pre_peak_coast",
+                    mode=mode,
+                    target=coast_target,
+                    **common,
+                )
+            )
+        actions.extend(
+            [
+                self._hvac_control_action(
+                    context,
+                    period_start,
+                    period_start + interval,
+                    phase="peak_coast",
+                    mode=mode,
+                    target=coast_target,
+                    **common,
+                ),
+                self._hvac_release_action(
+                    context,
+                    period_end,
+                    period_end + interval,
+                    "hvac_expensive_period_ended",
+                ),
+            ]
+        )
+        return actions
+
+    def _next_hvac_period(self, context: DecisionContext) -> dict[str, Any] | None:
+        """Return the earliest thermally feasible relative-price period."""
+        if len(context.slots) < 2:
             return None
+        low = float(context.occupied_temperature_low_c)
+        high = float(context.occupied_temperature_high_c)
+        current = float(context.current_hvac_temperature_c)
+        interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         lead_minutes = int(self.options[CONF_HVAC_PRECONDITION_LEAD_MINUTES])
         if lead_minutes <= 0:
             return None
-        interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
-        current_valid_at = context.slots[0].valid_at
-        lead_end = current_valid_at + timedelta(minutes=lead_minutes)
-        future_slots = [
-            slot
-            for slot in context.slots
-            if current_valid_at < slot.valid_at <= lead_end and slot.import_price is not None
-        ]
-        if not future_slots:
-            return None
-        future_peak_slot = max(future_slots, key=lambda slot: float(slot.import_price))
-        delta = float(future_peak_slot.import_price) - float(current_price)
-        threshold = float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA])
-        if delta < threshold:
-            return None
-
-        reason_code = "hvac_precondition_before_expensive_period"
-        desired_extra: dict[str, Any] = {}
-        current_temperature = float(context.current_hvac_temperature_c)
-        low = float(context.occupied_temperature_low_c)
-        high = float(context.occupied_temperature_high_c)
-        target: float | None = None
-        mode: str | None = None
-        if current_temperature < low:
-            target = low
-            mode = "heat"
-        elif current_temperature > high:
-            target = high
-            mode = "cool"
-        else:
-            shift = _thermal_shift_target(
-                context,
-                future_peak_slot,
-                interval_minutes,
-                self.thermal_model,
-            )
-            if shift is None:
-                return None
-            target = shift["target_temperature"]
-            mode = shift["hvac_mode"]
-            reason_code = "hvac_thermal_shift_before_expensive_period"
-            desired_extra.update(shift)
-
-        projected_load_kw = thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW)
-        thermal_summary = thermal_model_summary(self.thermal_model)
-        precondition_slots = _precondition_slots(
-            context=context,
-            current_temperature=current_temperature,
-            target_temperature=float(target),
-            mode=str(mode),
-            latest_end=future_peak_slot.valid_at,
-            thermal_model=self.thermal_model,
+        lead_slots = ceil(lead_minutes / interval_minutes)
+        start_delta = max(
+            float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
+            float(self.options[CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA]),
         )
-        for slot in precondition_slots:
-            slot.projected_hvac_load_kw = max(slot.projected_hvac_load_kw, projected_load_kw)
+        suppression_delta = float(self.options[CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA])
+        index = 1
+        while index < len(context.slots):
+            slot = context.slots[index]
+            if slot.import_price is None:
+                index += 1
+                continue
+            window_start = max(0, index - lead_slots)
+            priced_window = [
+                (position, float(context.slots[position].import_price))
+                for position in range(window_start, index)
+                if context.slots[position].import_price is not None
+            ]
+            if not priced_window:
+                index += 1
+                continue
+            baseline = min(price for _position, price in priced_window)
+            if float(slot.import_price) < baseline + start_delta:
+                index += 1
+                continue
+            end_index = index + 1
+            while (
+                end_index < len(context.slots)
+                and context.slots[end_index].import_price is not None
+                and float(context.slots[end_index].import_price) >= baseline + suppression_delta
+            ):
+                end_index += 1
+            mode = _future_hvac_mode(context, slot, current, low, high)
+            if mode is None:
+                index = end_index
+                continue
+            target = high if mode == "heat" else low
+            rate = thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode)
+            available_slots = index - window_start
+            if rate is None or rate <= 0:
+                if available_slots < lead_slots:
+                    index = end_index
+                    continue
+            best_start: int | None = None
+            best_required_slots: int | None = None
+            best_cost: float | None = None
+            passive_drift = _effective_passive_drift_c_per_hour(context, mode, self.thermal_model)
+            for possible_start in range(window_start, index):
+                if rate is None or rate <= 0:
+                    required_slots = lead_slots
+                else:
+                    hours_to_start = max(
+                        (context.slots[possible_start].valid_at - context.created_at).total_seconds() / 3600,
+                        0.0,
+                    )
+                    projected_start_temperature = current
+                    if passive_drift is not None:
+                        projected_start_temperature += passive_drift * hours_to_start
+                    if not low < projected_start_temperature < high:
+                        continue
+                    required_slots = max(
+                        1,
+                        ceil(abs(target - projected_start_temperature) / rate / (interval_minutes / 60)),
+                    )
+                if possible_start + required_slots > index:
+                    continue
+                run = context.slots[possible_start : possible_start + required_slots]
+                if any(item.import_price is None for item in run):
+                    continue
+                completion = possible_start + required_slots
+                coast_hours = (index - completion) * interval_minutes / 60
+                if coast_hours > 0:
+                    drift = _effective_passive_drift_c_per_hour(context, mode, self.thermal_model)
+                    available_coast = _thermal_coast_hours(
+                        mode=mode,
+                        target_temperature=target,
+                        comfort_boundary=low if mode == "heat" else high,
+                        passive_drift_c_per_hour=drift,
+                    )
+                    if available_coast is None or available_coast < coast_hours:
+                        continue
+                cost = sum(float(item.import_price) for item in run)
+                if best_cost is None or cost < best_cost or (cost == best_cost and possible_start > best_start):
+                    best_cost = cost
+                    best_start = possible_start
+                    best_required_slots = required_slots
+            if best_start is None or best_required_slots is None:
+                index = end_index
+                continue
+            required_slots = best_required_slots
+            projected_load = thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW)
+            for projected in context.slots[best_start : best_start + required_slots]:
+                projected.projected_hvac_load_kw = max(projected.projected_hvac_load_kw, projected_load)
+            period_end = (
+                context.slots[end_index].valid_at
+                if end_index < len(context.slots)
+                else context.slots[-1].valid_at + timedelta(minutes=interval_minutes)
+            )
+            self._project_hvac_coast_slots(
+                context,
+                mode=mode,
+                coast_started_at=context.slots[best_start + required_slots].valid_at,
+                active_until=period_end,
+                starting_temperature=target,
+                comfort_boundary=low if mode == "heat" else high,
+            )
+            return {
+                "precondition_start": context.slots[best_start].valid_at,
+                "precondition_end": (
+                    context.slots[best_start + required_slots].valid_at
+                    if best_start + required_slots < len(context.slots)
+                    else context.slots[-1].valid_at + timedelta(minutes=interval_minutes)
+                ),
+                "period_start": slot.valid_at,
+                "period_end": period_end,
+                "baseline_price": round(baseline, 4),
+                "precondition_min_price_delta": float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
+                "suppression_min_price_delta": suppression_delta,
+                "mode": mode,
+            }
+        return None
 
-        desired_extra.update(
-            {
+    def _hvac_control_action(
+        self,
+        context: DecisionContext,
+        start: datetime,
+        end: datetime,
+        *,
+        phase: str,
+        mode: str,
+        target: float,
+        period_start: datetime,
+        period_end: datetime,
+        precondition_end: datetime,
+        baseline_price: float,
+        precondition_min_price_delta: float,
+        suppression_min_price_delta: float,
+        precondition_target: float | None = None,
+        coast_target: float | None = None,
+    ) -> PlanAction:
+        """Build one lifecycle HVAC control action."""
+        thermal_summary = thermal_model_summary(self.thermal_model)
+        return PlanAction(
+            action_id=f"{context.plan_id}-hvac-{phase}",
+            plan_id=context.plan_id,
+            execute_not_before=start,
+            execute_not_after=end,
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.SET_HVAC,
+            desired_state={
+                "power": "on",
+                "hvac_mode": mode,
+                "target_temperature": float(target),
+                "phase": phase,
+                "period_start": period_start,
+                "period_end": period_end,
+                "precondition_end": precondition_end,
+                "baseline_price": baseline_price,
+                "precondition_min_price_delta": precondition_min_price_delta,
+                "suppression_min_price_delta": suppression_min_price_delta,
+                "mode": mode,
+                "precondition_target": precondition_target if precondition_target is not None else target,
+                "coast_target": coast_target if coast_target is not None else target,
+                "suppress_automations": True,
+                "enable_zones": True,
+                "controlled_zones": list(context.climate_zone_entities),
+                "projected_hvac_load_kw": thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW),
                 "thermal_model_enabled": thermal_summary["enabled"],
                 "thermal_model_sample_count": thermal_summary["active_sample_count"],
                 "active_heat_rate_c_per_hour": thermal_summary["active_heat_rate_c_per_hour"],
                 "active_cool_rate_c_per_hour": thermal_summary["active_cool_rate_c_per_hour"],
                 "passive_indoor_drift_c_per_hour": thermal_summary["passive_indoor_drift_c_per_hour"],
-                "precondition_slot_count": len(precondition_slots),
-            }
-        )
-        return PlanAction(
-            action_id=f"{context.plan_id}-hvac-precondition-before-expensive-period",
-            plan_id=context.plan_id,
-            execute_not_before=execute_not_before,
-            execute_not_after=execute_not_after,
-            asset=ActionAsset.DAIKIN,
-            kind=ActionKind.SET_HVAC,
-            desired_state={
-                "hvac_mode": mode,
-                "target_temperature": round(target, 1),
-                "current_temperature": round(current_temperature, 1),
-                "current_import_price": round(float(current_price), 4),
-                "future_peak_import_price": round(float(future_peak_slot.import_price), 4),
-                "projected_hvac_load_kw": projected_load_kw,
-                **desired_extra,
             },
-            hard_constraints=[
-                "occupied_comfort_within_bounds",
-                "manual_hvac_override_inactive",
-                "hvac_min_cycle",
-            ],
-            reason_codes=[reason_code],
-            expected_cost_delta=round(delta, 4),
+            hard_constraints=["occupied_comfort_within_bounds", "manual_hvac_override_inactive", "hvac_min_cycle"],
+            reason_codes=[f"hvac_{phase}"],
+            expected_cost_delta=float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
+            confidence=confidence_from_context(context),
+            requires_haeo_plan_id=None,
+        )
+
+    def _project_active_hvac_slots(
+        self,
+        context: DecisionContext,
+        *,
+        phase: str,
+        mode: str,
+        active_until: datetime,
+        comfort_boundary: float,
+    ) -> None:
+        """Rebuild HVAC load projection from persisted lifecycle ownership."""
+        projected_load = thermal_hvac_load_kw(
+            self.thermal_model,
+            HVAC_PRECONDITION_PROJECTED_LOAD_KW,
+        )
+        if phase == "preconditioning":
+            for slot in context.slots:
+                if slot.valid_at >= active_until:
+                    break
+                slot.projected_hvac_load_kw = max(
+                    slot.projected_hvac_load_kw,
+                    projected_load,
+                )
+            return
+        self._project_hvac_coast_slots(
+            context,
+            mode=mode,
+            coast_started_at=context.created_at,
+            active_until=active_until,
+            starting_temperature=float(context.current_hvac_temperature_c),
+            comfort_boundary=comfort_boundary,
+        )
+
+    def _project_hvac_coast_slots(
+        self,
+        context: DecisionContext,
+        *,
+        mode: str,
+        coast_started_at: datetime,
+        active_until: datetime,
+        starting_temperature: float,
+        comfort_boundary: float,
+    ) -> None:
+        """Project maintenance load after thermal reserve is exhausted."""
+        projected_load = thermal_hvac_load_kw(
+            self.thermal_model,
+            HVAC_PRECONDITION_PROJECTED_LOAD_KW,
+        )
+        coast_hours = _thermal_coast_hours(
+            mode=mode,
+            target_temperature=starting_temperature,
+            comfort_boundary=comfort_boundary,
+            passive_drift_c_per_hour=_effective_passive_drift_c_per_hour(
+                context,
+                mode,
+                self.thermal_model,
+            ),
+        )
+        for slot in context.slots:
+            if slot.valid_at < coast_started_at:
+                continue
+            if slot.valid_at >= active_until:
+                break
+            elapsed_hours = max(
+                (slot.valid_at - coast_started_at).total_seconds() / 3600,
+                0.0,
+            )
+            if coast_hours is None or elapsed_hours >= coast_hours:
+                slot.projected_hvac_load_kw = max(
+                    slot.projected_hvac_load_kw,
+                    projected_load,
+                )
+
+    @staticmethod
+    def _hvac_release_action(
+        context: DecisionContext,
+        start: datetime,
+        end: datetime,
+        reason: str,
+        *,
+        released_until: datetime | None = None,
+    ) -> PlanAction:
+        """Build a safety release action."""
+        return PlanAction(
+            action_id=f"{context.plan_id}-hvac-release",
+            plan_id=context.plan_id,
+            execute_not_before=start,
+            execute_not_after=end,
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.RELEASE_HVAC,
+            desired_state={"release_reason": reason, "released_until": released_until},
+            hard_constraints=[],
+            reason_codes=[reason],
+            expected_cost_delta=0.0,
             confidence=confidence_from_context(context),
             requires_haeo_plan_id=None,
         )
@@ -694,11 +1142,7 @@ def confidence_from_context(context: DecisionContext) -> float:
 def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
     """Return confidence by planning subsystem."""
     base = confidence_from_context(context)
-    issue_text = " ".join(
-        issue
-        for issue in context.input_issues
-        if not issue.startswith("advisory_")
-    )
+    issue_text = " ".join(issue for issue in context.input_issues if not issue.startswith("advisory_"))
     breakdown = {
         "overall": base,
         "tariff": _subsystem_confidence(base, issue_text, ("amber_", "price_")),
@@ -802,7 +1246,7 @@ def _action_score(action: PlanAction, context: DecisionContext, options: Mapping
     weights = _priority_weights(options)
     weighted = {key: round(components.get(key, 0.0) * weight, 4) for key, weight in weights.items()}
     score = round(sum(weighted.values()), 4)
-    return {
+    result = {
         "action_id": action.action_id,
         "device": _asset_label(action.asset),
         "action": _display_text(action.kind),
@@ -813,6 +1257,26 @@ def _action_score(action: PlanAction, context: DecisionContext, options: Mapping
         "estimated_value": action.expected_cost_delta,
         "confidence": action.confidence,
     }
+    if action.asset == ActionAsset.DAIKIN:
+        result["lifecycle"] = {
+            key: action.desired_state[key]
+            for key in (
+                "phase",
+                "period_start",
+                "period_end",
+                "precondition_end",
+                "baseline_price",
+                "precondition_min_price_delta",
+                "suppression_min_price_delta",
+                "mode",
+                "precondition_target",
+                "coast_target",
+                "controlled_zones",
+                "release_reason",
+            )
+            if action.desired_state.get(key) is not None
+        }
+    return result
 
 
 def _score_components(action: PlanAction, context: DecisionContext) -> dict[str, float]:
@@ -828,9 +1292,6 @@ def _score_components(action: PlanAction, context: DecisionContext) -> dict[str,
     }
     if action.asset == ActionAsset.DAIKIN:
         components["comfort"] = 1.0 if "away_hvac_policy" not in action.reason_codes else 0.9
-        if action.desired_state.get("thermal_shift"):
-            components["cost"] = max(components["cost"], 0.5)
-            components["solar_self_consumption"] = 0.3
     if action.asset == ActionAsset.EV:
         required = float(action.desired_state.get("required_charge_percent") or 0.0)
         components["ev_readiness"] = min(required / 30.0, 1.0)
@@ -960,7 +1421,6 @@ def _rejected_actions(
     context: DecisionContext,
     actions: list[PlanAction],
     options: Mapping[str, Any],
-    thermal_model: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     """Return plain-English decisions that were considered but not selected."""
     rejected: list[dict[str, Any]] = []
@@ -968,7 +1428,7 @@ def _rejected_actions(
     if ActionAsset.EV not in assets:
         rejected.append(_rejected_ev_decision(context, options))
     if ActionAsset.DAIKIN not in assets:
-        rejected.append(_rejected_climate_decision(context, options, thermal_model))
+        rejected.append(_rejected_climate_decision(context, options))
     if ActionAsset.ENPHASE not in assets:
         rejected.append(_rejected_enphase_decision(context, options))
     return [item for item in rejected if item]
@@ -991,7 +1451,6 @@ def _rejected_ev_decision(context: DecisionContext, options: Mapping[str, Any]) 
 def _rejected_climate_decision(
     context: DecisionContext,
     options: Mapping[str, Any],
-    thermal_model: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return why climate control was not selected."""
     confidence_reason = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
@@ -1004,17 +1463,9 @@ def _rejected_climate_decision(
     elif not context.slots:
         reason = "Skipped comfort preconditioning because no tariff forecast slots are available."
     else:
-        shift = _thermal_shift_target(
-            context,
-            context.slots[min(len(context.slots) - 1, 1)],
-            int(options[CONF_PLANNING_INTERVAL_MINUTES]),
-            thermal_model,
-        )
         reason = (
-            "Skipped comfort preconditioning because the price difference or comfort coast time "
-            "does not justify running the climate system now."
-            if shift is None
-            else "Skipped comfort preconditioning because another device had higher marginal value."
+            "Skipped comfort preconditioning because no qualifying thermally feasible tariff period "
+            "was found in the configured horizon."
         )
     return {"device": "Climate", "action": "Precondition", "reason": reason}
 
@@ -1077,68 +1528,107 @@ def _time_range(item: Mapping[str, Any]) -> str:
     return f"{start[11:16]}-{end[11:16]}" if len(start) >= 16 and len(end) >= 16 else "Current period"
 
 
-def _thermal_shift_target(
+def _datetime_value(value: Any) -> datetime | None:
+    """Return a timezone-aware lifecycle timestamp when valid."""
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
+
+
+def _finite_number(value: Any) -> float | None:
+    """Return a finite lifecycle scalar."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if isfinite(number) else None
+
+
+def _persisted_hvac_period_qualifies(
     context: DecisionContext,
-    future_peak_slot: Any,
-    interval_minutes: int,
-    thermal_model: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Return a comfort-bounded thermal-shift target for cheap preheat/precool."""
+    period_start: datetime,
+    period_end: datetime,
+    baseline: float,
+    precondition_delta: float,
+    suppression_delta: float,
+) -> bool:
+    """Confirm that a future persisted peak still exists in valid tariff evidence."""
+    if len(context.slots) < 2:
+        return False
+    interval = context.slots[1].valid_at - context.slots[0].valid_at
+    if interval <= timedelta(0):
+        return False
+    period_slots = [
+        slot for slot in context.slots if slot.valid_at < period_end and slot.valid_at + interval > period_start
+    ]
     if (
-        context.current_hvac_temperature_c is None
-        or context.occupied_temperature_low_c is None
-        or context.occupied_temperature_high_c is None
+        not period_slots
+        or not period_slots[0].valid_at <= period_start < period_slots[0].valid_at + interval
+        or any(
+            right.valid_at != left.valid_at + interval
+            for left, right in zip(period_slots, period_slots[1:], strict=False)
+        )
+        or period_slots[-1].valid_at + interval < period_end
     ):
-        return None
-    current_temperature = float(context.current_hvac_temperature_c)
-    low = float(context.occupied_temperature_low_c)
-    high = float(context.occupied_temperature_high_c)
-    if not low <= current_temperature <= high:
-        return None
-    mode = _thermal_shift_mode(context, current_temperature, low, high)
-    if mode is None:
-        return None
-    target = high if mode == "heat" else low
-    boundary = low if mode == "heat" else high
-    if abs(target - current_temperature) < THERMAL_SHIFT_MIN_TARGET_DELTA_C:
-        return None
-    drift = _effective_passive_drift_c_per_hour(context, mode, thermal_model)
-    time_to_peak_hours = max(
-        (future_peak_slot.valid_at - context.created_at).total_seconds() / 3600,
-        interval_minutes / 60,
-    )
-    coast_hours = _thermal_coast_hours(
-        mode=mode,
-        target_temperature=target,
-        comfort_boundary=boundary,
-        passive_drift_c_per_hour=drift,
-    )
-    if coast_hours is not None and coast_hours < time_to_peak_hours:
-        return None
-    return {
-        "hvac_mode": mode,
-        "target_temperature": round(target, 1),
-        "thermal_shift": True,
-        "comfort_coast_boundary": round(boundary, 1),
-        "time_to_expensive_period_hours": round(time_to_peak_hours, 3),
-        "estimated_coast_hours": None if coast_hours is None else round(coast_hours, 3),
-    }
+        return False
+    if period_slots[0].import_price is None or float(period_slots[0].import_price) < baseline + max(
+        precondition_delta,
+        suppression_delta,
+    ):
+        return False
+    if any(
+        slot.import_price is None or float(slot.import_price) < baseline + suppression_delta for slot in period_slots
+    ):
+        return False
+    return True
 
 
-def _thermal_shift_mode(
+def _tariff_evidence_covers_period(
     context: DecisionContext,
+    period_end: datetime,
+    interval: timedelta,
+) -> bool:
+    """Return whether contiguous priced tariff evidence covers the persisted period."""
+    remaining_slots = [slot for slot in context.slots if slot.valid_at < period_end]
+    if not remaining_slots or interval <= timedelta(0):
+        return False
+    if any(slot.import_price is None for slot in remaining_slots):
+        return False
+    if any(
+        right.valid_at != left.valid_at + interval
+        for left, right in zip(remaining_slots, remaining_slots[1:], strict=False)
+    ):
+        return False
+    return remaining_slots[-1].valid_at + interval >= period_end
+
+
+def _future_hvac_mode(
+    context: DecisionContext,
+    peak_slot: Any,
     current_temperature: float,
     low: float,
     high: float,
 ) -> str | None:
-    """Infer whether thermal shifting should preheat or precool."""
+    """Infer heat or cool from peak weather before using current-state fallbacks."""
+    future_outdoor = _finite_number(getattr(peak_slot, "outdoor_temperature_forecast_c", None))
+    if future_outdoor is not None:
+        if future_outdoor < low:
+            return "heat"
+        if future_outdoor > high:
+            return "cool"
     current_mode = str(context.current_hvac_mode or "").lower()
     if current_mode in {"heat", "cool"}:
         return current_mode
-    if context.current_outdoor_temperature_c is not None:
-        if float(context.current_outdoor_temperature_c) < current_temperature - 0.5:
+    current_outdoor = _finite_number(context.current_outdoor_temperature_c)
+    if current_outdoor is not None:
+        if current_outdoor < low:
             return "heat"
-        if float(context.current_outdoor_temperature_c) > current_temperature + 0.5:
+        if current_outdoor > high:
             return "cool"
     midpoint = (low + high) / 2
     if current_temperature < midpoint:
@@ -1185,45 +1675,6 @@ def _thermal_coast_hours(
     return None
 
 
-def _precondition_slot_count(
-    *,
-    current_temperature: float,
-    target_temperature: float,
-    mode: str,
-    interval_minutes: int,
-    max_slots: int,
-    thermal_model: Mapping[str, Any],
-) -> int:
-    """Return how many slots should carry projected HVAC load for preconditioning."""
-    if max_slots <= 0:
-        return 0
-    temperature_delta = abs(target_temperature - current_temperature)
-    rate = thermal_active_temperature_rate_c_per_hour(thermal_model, mode)
-    if rate is None or rate <= 0:
-        return max_slots
-    interval_hours = interval_minutes / 60
-    return min(max(1, ceil((temperature_delta / rate) / interval_hours)), max_slots)
-
-
-def _precondition_slots(
-    *,
-    context: DecisionContext,
-    current_temperature: float,
-    target_temperature: float,
-    mode: str,
-    latest_end: datetime,
-    thermal_model: Mapping[str, Any],
-) -> list[Any]:
-    """Return timestamp-selected slots that carry projected HVAC load."""
-    start = context.slots[0].valid_at if context.slots else context.created_at
-    end = latest_end
-    rate = thermal_active_temperature_rate_c_per_hour(thermal_model, mode)
-    if rate is not None and rate > 0:
-        required = timedelta(hours=abs(target_temperature - current_temperature) / rate)
-        end = min(end, start + required)
-    return [slot for slot in context.slots if start <= slot.valid_at < end]
-
-
 def _device_plan(
     context: DecisionContext,
     interval_minutes: int,
@@ -1265,6 +1716,23 @@ def _climate_plan_summary(context: DecisionContext, actions: list[PlanAction]) -
         "occupied_temperature_high": context.occupied_temperature_high_c,
         "occupancy": str(context.occupancy_state),
     }
+    if context.climate_zone_entities:
+        current["controlled_zones"] = list(context.climate_zone_entities)
+    for key in (
+        "phase",
+        "period_start",
+        "period_end",
+        "precondition_end",
+        "baseline_price",
+        "precondition_min_price_delta",
+        "suppression_min_price_delta",
+        "mode",
+        "precondition_target",
+        "coast_target",
+        "release_reason",
+    ):
+        if context.hvac_control.get(key) is not None:
+            current[key] = context.hvac_control[key]
     next_action = min(actions, key=lambda action: action.execute_not_before) if actions else None
     if next_action is None:
         next_planned = {
@@ -1285,8 +1753,10 @@ def _climate_action_state(action: PlanAction) -> dict[str, Any]:
     """Return compact desired state for a planned climate action."""
     desired = action.desired_state
     state = "set_hvac"
-    if desired.get("suppress_automations"):
-        state = "suppressing_automation"
+    if action.kind == ActionKind.RELEASE_HVAC:
+        state = "released"
+    if desired.get("phase"):
+        state = str(desired["phase"])
     if desired.get("hvac_mode") == "off":
         state = "off"
     result: dict[str, Any] = {
@@ -1296,7 +1766,23 @@ def _climate_action_state(action: PlanAction) -> dict[str, Any]:
         "execute_not_after": action.execute_not_after.isoformat(),
         "reason_codes": action.reason_codes[:4],
     }
-    for key in ("hvac_mode", "target_temperature", "projected_hvac_load_kw", "suppress_automations"):
+    for key in (
+        "hvac_mode",
+        "target_temperature",
+        "projected_hvac_load_kw",
+        "suppress_automations",
+        "phase",
+        "period_start",
+        "period_end",
+        "precondition_end",
+        "baseline_price",
+        "precondition_min_price_delta",
+        "suppression_min_price_delta",
+        "precondition_target",
+        "coast_target",
+        "release_reason",
+        "controlled_zones",
+    ):
         if desired.get(key) is not None:
             result[key] = desired.get(key)
     return result
@@ -1455,18 +1941,35 @@ def _climate_timeline_entry(slot: Any, slot_actions: list[PlanAction], actions: 
     if action is not None:
         desired = action.desired_state
         entry: dict[str, Any] = {
-            "state": "set_hvac",
+            "state": "released" if action.kind == ActionKind.RELEASE_HVAC else "set_hvac",
             "action": str(action.kind),
             "reason_codes": action.reason_codes[:4],
         }
         if desired.get("suppress_automations"):
             entry["state"] = "suppressing_automation"
+        if desired.get("phase"):
+            entry["state"] = str(desired["phase"])
+            entry["phase"] = desired["phase"]
         if desired.get("hvac_mode"):
             entry["hvac_mode"] = desired.get("hvac_mode")
             if desired.get("hvac_mode") == "off":
                 entry["state"] = "off"
         if desired.get("target_temperature") is not None:
             entry["target_temperature"] = desired.get("target_temperature")
+        for key in (
+            "period_start",
+            "period_end",
+            "precondition_end",
+            "baseline_price",
+            "precondition_min_price_delta",
+            "suppression_min_price_delta",
+            "precondition_target",
+            "coast_target",
+            "controlled_zones",
+            "release_reason",
+        ):
+            if desired.get(key) is not None:
+                entry[key] = desired[key]
         if projected_load is not None and projected_load > 0:
             entry["projected_hvac_load_kw"] = round(projected_load, 4)
         return entry

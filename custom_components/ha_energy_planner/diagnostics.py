@@ -7,6 +7,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .entry_data import combined_entry_data
+from .models import to_jsonable
 from .type_defs import EnergyPlannerConfigEntry
 
 REDACT_KEYS = {
@@ -71,6 +72,7 @@ async def async_get_config_entry_diagnostics(
                 "execute_not_after": plan.next_action.execute_not_after.isoformat(),
                 "confidence": plan.next_action.confidence,
                 "reason_codes": plan.next_action.reason_codes,
+                "desired_state": to_jsonable(plan.next_action.desired_state),
             },
             "issues": plan.input_issues[:20],
         },

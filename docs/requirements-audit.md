@@ -164,14 +164,17 @@ Status as of 2026-08-02.
   reservation increases immediately, while an active reservation cannot shrink
   during later start/no-op actions or across an unclean restart and remains
   conservative until a confirmed stop. Cross-entry config validation prevents native or legacy EV
-  charger controls, the same Daikin climate control, climate automation, or
-  Enphase profile actuator from having two planners.
+  charger controls, the same Daikin climate control, climate automation,
+  climate zone, writable manual-override helper, or Enphase profile actuator
+  from having two planners.
 - Legacy global storage is eligible only for the first upgraded unnamed entry
   and is marked consumed after the entry-scoped store exists. Stable persistent
   notification IDs are suffixed with the config-entry ID so one planner cannot
   overwrite or dismiss another planner's alert.
-- Manual Daikin changes create a temporary override, persisted across restart,
-  and planner-owned HVAC changes have a short guard window.
+- Manual Daikin or planner-owned zone changes create a temporary override,
+  persist across restart, and release only HVAC ownership. An externally
+  enabled manual-override helper creates an authoritative indefinite override;
+  helper feedback from integration-created timed overrides is guarded.
 - Persistent notifications are emitted for restore-safe-state, infeasible EV
   ready-by schedules, unsafe required inputs, grid-limit fallback, and HAEO
   fallback classes, using stable notification IDs and compact redacted reason
@@ -343,11 +346,19 @@ Status as of 2026-08-02.
 - Live trip updates preserve Recorder import metadata and successful empty
   imports advance it, so installations without recent trips do not repeat a
   30-day Recorder query on every planner refresh.
-- HVAC active planning is conservative: away mode off, occupied comfort-helper
-  hard bounds, expensive-period automation suppression, bounded occupied
-  preconditioning before near-future expensive periods, and persisted
-  minimum-cycle/rest validation are implemented. Suppression only disables
-  mapped climate automations while occupied comfort is still valid. A compact
+- HVAC active planning is conservative: away mode off is preserved outside a
+  persisted `precondition -> pre_peak_coast -> peak_coast -> release` tariff lifecycle. Every
+  valid tariff slot in the configured 1-48 hour horizon is scanned, with the
+  current 12-hour default unchanged. Relative pre-window baselines, both price
+  deltas persisted at acquisition, contiguous peak boundaries, weather-led heat/cool selection, exact
+  high/low comfort targets, least-cost thermally feasible runs, comfort coast,
+  conservative maintenance load, and tariff-change fail-safe release are
+  implemented. Takeover snapshots configured switch/input-boolean zones,
+  disables mapped automations, enables zones, explicitly turns on the climate
+  entity, and preserves the original snapshot across peak transitions. Release
+  restores zones, enables every automation, retains unresolved ownership for
+  retry, and never restores the prior climate mode or setpoint. Comfort-boundary
+  release is held through the recorded peak end to prevent reacquisition. A compact
   HVAC thermal model records current indoor temperature, optional Daikin power,
   and optional weather temperature samples. Version 2 requires samples at least
   five minutes apart, ignores sensor deltas below effective precision, excludes
@@ -362,6 +373,11 @@ Status as of 2026-08-02.
   smoke coverage validates one active HVAC power sample from Home Assistant
   climate/power entities plus occupied preconditioning, expensive-period
   automation suppression, and restoration through Home Assistant services.
+  Planner, adapter, coordinator, executor, configuration, discovery, service,
+  replay, and diagnostic tests cover full-horizon detection, cold/hot target
+  selection, zone takeover/rollback, helper overrides, comfort handoff, peak
+  continuation, production/pause-blocked safety release, persisted tariff
+  thresholds, and release evidence.
 - Enphase execution, verification, hold, minimum-savings gates, and profile
   action generation are implemented. The planner can set a configured
   arbitrage profile when HAEO battery charge/discharge value, HAEO export
@@ -371,9 +387,10 @@ Status as of 2026-08-02.
   charge/discharge, and battery SOC forecast evidence where available. Direct
   replay or persisted non-finite HAEO evidence is ignored before Enphase value
   calculations so it cannot suppress restore or publish NaN plan values.
-- HVAC automation suppression and Enphase profile commands use bounded,
-  transactional compensation. Any automation or saved profile that cannot be
-  restored remains in ownership for a later restore-safe-state retry.
+- HVAC automation/zone takeover and Enphase profile commands use bounded,
+  transactional compensation. Any automation, zone, or saved profile that
+  cannot be restored remains in ownership for a later refresh or
+  restore-safe-state retry.
 - Only an explicit allowlist of decision inputs can request replanning. AI
   result, integration-owned control, climate automation, and high-frequency
   observed power entities cannot create feedback loops; observation-only

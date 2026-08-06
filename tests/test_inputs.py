@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from custom_components.ha_energy_planner import inputs as inputs_module
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -52,6 +53,18 @@ from custom_components.ha_energy_planner.inputs import (
 )
 from custom_components.ha_energy_planner.models import HAEOStatus, InputHealth, OccupancyState
 from custom_components.ha_energy_planner.planner import DryRunPlanner
+
+
+def test_climate_zone_configuration_normalizes_strings_lists_and_invalid_values() -> None:
+    assert inputs_module._split_entity_values("switch.one, input_boolean.two") == [
+        "switch.one",
+        "input_boolean.two",
+    ]
+    assert inputs_module._split_entity_values(["switch.one", "", "input_boolean.two"]) == [
+        "switch.one",
+        "input_boolean.two",
+    ]
+    assert inputs_module._split_entity_values(None) == []
 
 
 @dataclass(slots=True)

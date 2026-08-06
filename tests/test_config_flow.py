@@ -53,8 +53,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
@@ -199,6 +201,9 @@ def _valid_hass() -> FakeHass:
             "person.cath",
             "automation.heat",
             "automation.cool",
+            "switch.living_zone",
+            "input_boolean.study_zone",
+            "input_boolean.hvac_override",
             "select.enphase_profile",
             "switch.shared_charger",
             "ai_task.extended_openai_ai_task",
@@ -247,6 +252,8 @@ def test_subentry_validation_rejects_household_actuators_owned_by_another_entry(
                 data={
                     CONF_DAIKIN_CLIMATE: "climate.daikin",
                     CONF_CLIMATE_AUTOMATIONS: ["automation.heat"],
+                    CONF_CLIMATE_ZONES: ["switch.living_zone"],
+                    CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.hvac_override",
                 }
             ),
             "enphase": SimpleNamespace(
@@ -264,6 +271,8 @@ def test_subentry_validation_rejects_household_actuators_owned_by_another_entry(
         {
             CONF_DAIKIN_CLIMATE: "climate.daikin",
             CONF_CLIMATE_AUTOMATIONS: ["automation.heat", "automation.cool"],
+            CONF_CLIMATE_ZONES: ["switch.living_zone"],
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.hvac_override",
             CONF_ENPHASE_PROFILE: "select.enphase_profile",
             CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
             CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
@@ -272,6 +281,8 @@ def test_subentry_validation_rejects_household_actuators_owned_by_another_entry(
 
     assert errors[CONF_DAIKIN_CLIMATE] == "household_actuator_in_use"
     assert errors[CONF_CLIMATE_AUTOMATIONS] == "household_actuator_in_use"
+    assert errors[CONF_CLIMATE_ZONES] == "household_actuator_in_use"
+    assert errors[CONF_CLIMATE_MANUAL_OVERRIDE] == "household_actuator_in_use"
     assert errors[CONF_ENPHASE_PROFILE] == "household_actuator_in_use"
 
 
@@ -294,6 +305,30 @@ def test_subentry_validation_allows_current_entry_to_keep_its_actuators() -> Non
             CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
             CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
         },
+    )
+
+    assert errors == {}
+
+
+def test_ev_subentry_allows_its_legacy_aliased_actuator_on_reconfigure() -> None:
+    hass = _valid_hass()
+    current_entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={},
+        options={},
+        subentries={
+            "ev": SimpleNamespace(
+                data={CONF_EV_SMART_CHARGING: "switch.shared_charger"}
+            )
+        },
+    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry])
+
+    errors = _validate_subentry_config(
+        hass,
+        current_entry,
+        {CONF_EV_SMART_CHARGING: "switch.shared_charger"},
+        subentry_type=SUBENTRY_EV,
     )
 
     assert errors == {}
@@ -323,6 +358,41 @@ def test_subentry_validation_rejects_ev_controls_owned_under_another_key() -> No
     )
 
     assert errors[CONF_EV_CHARGER_START] == "household_actuator_in_use"
+
+
+def test_subentry_validation_rejects_cross_role_actuator_collisions() -> None:
+    hass = _valid_hass()
+    current_entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={},
+        subentries={
+            "ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.shared_charger"})
+        },
+    )
+    other_entry = SimpleNamespace(
+        entry_id="entry-other",
+        data={},
+        subentries={
+            "ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.living_zone"})
+        },
+    )
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [current_entry, other_entry]
+    )
+
+    errors = _validate_subentry_config(
+        hass,
+        current_entry,
+        {
+            CONF_CLIMATE_ZONES: ["switch.shared_charger", "switch.living_zone"],
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.hvac_override",
+            CONF_EV_SMART_CHARGING: "input_boolean.hvac_override",
+        },
+    )
+
+    assert errors[CONF_CLIMATE_ZONES] == "household_actuator_in_use"
+    assert errors[CONF_CLIMATE_MANUAL_OVERRIDE] == "household_actuator_in_use"
+    assert errors[CONF_EV_SMART_CHARGING] == "household_actuator_in_use"
 
 
 def test_ev_subentry_rejects_keep_on_without_persistent_control() -> None:
@@ -373,6 +443,11 @@ def test_climate_flow_uses_multi_entity_selector_for_automations() -> None:
 
     assert schema_fields[CONF_CLIMATE_AUTOMATIONS].serialize()["selector"]["entity"] == {
         "domain": ["automation"],
+        "multiple": True,
+        "reorder": False,
+    }
+    assert schema_fields[CONF_CLIMATE_ZONES].serialize()["selector"]["entity"] == {
+        "domain": ["switch", "input_boolean"],
         "multiple": True,
         "reorder": False,
     }

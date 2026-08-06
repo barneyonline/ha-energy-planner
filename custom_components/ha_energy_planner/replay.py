@@ -130,6 +130,8 @@ def _context_from_fixture(data: dict[str, Any]) -> DecisionContext:
         current_hvac_temperature_c=data.get("current_hvac_temperature_c"),
         current_hvac_power_kw=data.get("current_hvac_power_kw"),
         current_outdoor_temperature_c=data.get("current_outdoor_temperature_c"),
+        hvac_control=dict(data.get("hvac_control", {})),
+        climate_zone_entities=list(data.get("climate_zone_entities", [])),
         input_issues=list(data.get("input_issues", [])),
     )
 

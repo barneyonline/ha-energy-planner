@@ -52,6 +52,7 @@ from .const import (
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
+    CONF_CLIMATE_ZONES,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
@@ -254,6 +255,7 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
+        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(["switch", "input_boolean"], multiple=True),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
         vol.Optional(CONF_CLIMATE_MANUAL_OVERRIDE): _entity_selector("input_boolean"),
         vol.Required(CONF_CLIMATE_TARGET_LOW): _entity_selector("input_number"),
@@ -300,6 +302,8 @@ PLANNER_SUBENTRY_TITLES = {
 _HOUSEHOLD_ACTUATOR_KEYS = (
     CONF_DAIKIN_CLIMATE,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_ZONES,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_ENPHASE_PROFILE,
 )
 _EV_ACTUATOR_KEYS = (
@@ -310,8 +314,21 @@ _EV_ACTUATOR_KEYS = (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
 )
+_ACTUATOR_KEYS = (*_HOUSEHOLD_ACTUATOR_KEYS, *_EV_ACTUATOR_KEYS)
+_SUBENTRY_ACTUATOR_KEYS = {
+    SUBENTRY_CLIMATE: frozenset(
+        {
+            CONF_DAIKIN_CLIMATE,
+            CONF_CLIMATE_AUTOMATIONS,
+            CONF_CLIMATE_ZONES,
+            CONF_CLIMATE_MANUAL_OVERRIDE,
+        }
+    ),
+    SUBENTRY_ENPHASE: frozenset({CONF_ENPHASE_PROFILE}),
+    SUBENTRY_EV: frozenset(_EV_ACTUATOR_KEYS),
+}
 
-_MULTI_ENTITY_KEYS = {CONF_CLIMATE_AUTOMATIONS, CONF_PERSON_ENTITIES}
+_MULTI_ENTITY_KEYS = {CONF_CLIMATE_AUTOMATIONS, CONF_CLIMATE_ZONES, CONF_PERSON_ENTITIES}
 
 POLICY_STEP_SCHEDULE = "schedule"
 POLICY_STEP_EV_BATTERY_GRID = "ev_battery_grid"
@@ -1115,7 +1132,12 @@ def _validate_subentry_config(
 ) -> dict[str, str]:
     """Validate one subentry, including cross-entry actuator ownership."""
     errors = _validate_config(hass, user_input)
-    duplicate_errors = _duplicate_household_actuator_errors(hass, entry, user_input)
+    duplicate_errors = _duplicate_household_actuator_errors(
+        hass,
+        entry,
+        user_input,
+        subentry_type=subentry_type,
+    )
     for key, error in duplicate_errors.items():
         errors.setdefault(key, error)
     if subentry_type == SUBENTRY_EV and not _ev_keep_on_control_compatible(
@@ -1130,44 +1152,50 @@ def _duplicate_household_actuator_errors(
     hass: HomeAssistant,
     current_entry: ConfigEntry,
     user_input: dict[str, Any],
+    *,
+    subentry_type: str | None = None,
 ) -> dict[str, str]:
-    """Reject household actuators already owned by another planner entry."""
+    """Reject actuators assigned to more than one planner control."""
+    requested = {
+        key: set(_entity_values(user_input.get(key)))
+        for key in _ACTUATOR_KEYS
+        if user_input.get(key)
+    }
+    errors: dict[str, str] = {}
+    for key, requested_entities in requested.items():
+        other_requested_entities = {
+            entity_id
+            for other_key, entity_ids in requested.items()
+            if other_key != key
+            for entity_id in entity_ids
+        }
+        if requested_entities.intersection(other_requested_entities):
+            errors[key] = "household_actuator_in_use"
+
     config_entries = getattr(hass, "config_entries", None)
     async_entries = getattr(config_entries, "async_entries", None)
     if not callable(async_entries):
-        return {}
+        return errors
     current_entry_id = str(getattr(current_entry, "entry_id", ""))
-    requested = {
-        key: set(_entity_values(user_input.get(key)))
-        for key in _HOUSEHOLD_ACTUATOR_KEYS
-        if user_input.get(key)
-    }
-    requested_ev_controls = {
-        entity_id
-        for key in _EV_ACTUATOR_KEYS
-        for entity_id in _entity_values(user_input.get(key))
-    }
-    errors: dict[str, str] = {}
+    current_subentry_keys = _SUBENTRY_ACTUATOR_KEYS.get(
+        subentry_type,
+        frozenset(key for key in _ACTUATOR_KEYS if key in user_input),
+    )
     for other_entry in async_entries(DOMAIN):
-        if other_entry is current_entry or (
+        is_current_entry = other_entry is current_entry or (
             current_entry_id
             and str(getattr(other_entry, "entry_id", "")) == current_entry_id
-        ):
-            continue
+        )
         other_data = combined_entry_data(other_entry)
-        for key, requested_entities in requested.items():
-            if requested_entities.intersection(_entity_values(other_data.get(key))):
-                errors[key] = "household_actuator_in_use"
-        other_ev_controls = {
+        other_actuator_entities = {
             entity_id
-            for key in _EV_ACTUATOR_KEYS
-            for entity_id in _entity_values(other_data.get(key))
+            for other_key in _ACTUATOR_KEYS
+            if not (is_current_entry and other_key in current_subentry_keys)
+            for entity_id in _entity_values(other_data.get(other_key))
         }
-        conflicting_ev_controls = requested_ev_controls.intersection(other_ev_controls)
-        if conflicting_ev_controls:
-            for key in _EV_ACTUATOR_KEYS:
-                if conflicting_ev_controls.intersection(_entity_values(user_input.get(key))):
-                    errors[key] = "household_actuator_in_use"
+        for key, requested_entities in requested.items():
+            if requested_entities.intersection(other_actuator_entities):
+                errors[key] = "household_actuator_in_use"
     return errors
 
 
@@ -1199,6 +1227,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_DAIKIN_CLIMATE: {"climate"},
     CONF_DAIKIN_POWER: {"sensor"},
     CONF_CLIMATE_AUTOMATIONS: {"automation"},
+    CONF_CLIMATE_ZONES: {"switch", "input_boolean"},
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER: {"input_boolean"},
     CONF_CLIMATE_MANUAL_OVERRIDE: {"input_boolean"},
     CONF_CLIMATE_TARGET_LOW: {"input_number"},

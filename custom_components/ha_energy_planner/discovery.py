@@ -11,6 +11,8 @@ from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
@@ -156,6 +158,13 @@ class CapabilityDiscovery:
         unavailable = [entity_id for entity_id in automations if _state_missing(self.hass, entity_id)]
         if unavailable:
             issues.append("climate_automation_unavailable")
+        zones = _split_entity_values(self.entry_data.get(CONF_CLIMATE_ZONES, ""))
+        unavailable_zones = [entity_id for entity_id in zones if _state_missing(self.hass, entity_id)]
+        if unavailable_zones:
+            issues.append("climate_zone_unavailable")
+        manual_override = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+        if manual_override and _state_missing(self.hass, manual_override):
+            issues.append("climate_manual_override_unavailable")
         return CapabilityEvidence(
             not issues,
             issues,
@@ -163,6 +172,9 @@ class CapabilityDiscovery:
                 "climate_entity": climate,
                 "automation_entities": automations,
                 "unavailable_automations": unavailable,
+                "zone_entities": zones,
+                "unavailable_zones": unavailable_zones,
+                "manual_override_entity": manual_override,
             },
         )
 
