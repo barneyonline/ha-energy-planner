@@ -205,7 +205,7 @@ rules:
         - tests/test_lifecycle.py
   unique-config-entry:
     status: done
-    comment: Multiple EV planners are intentional; each entry requires a unique operator-selected instance name, active EV commands share an atomic household grid-capacity reservation and single-entry over-limit shedding claim, and EV charger plus household climate/Enphase actuators are single-owner across entries.
+    comment: Multiple EV planners are intentional; each entry requires a unique operator-selected instance name, active EV commands share an atomic household grid-capacity reservation and single-entry over-limit shedding claim, and EV charger plus household climate entities, automations, zones, writable override helpers, and Enphase actuators are single-owner across entries.
     references:
       code:
         - custom_components/ha_energy_planner/__init__.py

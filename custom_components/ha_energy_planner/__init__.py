@@ -132,7 +132,14 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
         coordinator = await _require_coordinator(call)
-        await coordinator.async_set_manual_hvac_override(duration, reason)
+        outcome = await coordinator.async_set_manual_hvac_override(duration, reason)
+        if outcome is not None and outcome.result.value == "failed":
+            raise HomeAssistantError(
+                f"The manual HVAC override was set, but climate control could not be fully released: {outcome.reason}",
+                translation_domain=DOMAIN,
+                translation_key="restore_safe_state_failed",
+                translation_placeholders={"reason": outcome.reason},
+            )
 
     async def handle_export_diagnostics(call: ServiceCall) -> dict[str, Any]:
         coordinator = await _require_coordinator(call)

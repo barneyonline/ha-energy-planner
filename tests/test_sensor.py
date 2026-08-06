@@ -1382,6 +1382,8 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
     assert sensor_module._plain_action(profile_action)["requires_haeo_plan"] is True
     assert sensor_module._action_sentence(restore_action) == "Restore Enphase to AI Optimisation."
     assert sensor_module._action_sentence(climate_action) == "Set climate to Off."
+    climate_action.kind = ActionKind.RELEASE_HVAC
+    assert sensor_module._action_sentence(climate_action) == "Release climate control to the configured automations."
     assert sensor_module._action_sentence(start_action) == "Start EV charging"
     assert sensor_module._plain_state_details(
         {

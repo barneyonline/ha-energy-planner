@@ -195,6 +195,7 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
     assert diagnostics["plan"]["estimated_daily_cost"] == 3.25
     assert diagnostics["plan"]["action_count"] == 1
     assert diagnostics["plan"]["next_action"]["action_id"] == "action-1"
+    assert diagnostics["plan"]["next_action"]["desired_state"] == {"target_soc_percent": 80}
     assert diagnostics["haeo"]["plan_id"] == "plan-1"
     assert diagnostics["refresh_performance"] == {
         "refreshes_per_hour": 12.0,

@@ -31,9 +31,11 @@ from .const import (
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
@@ -154,6 +156,8 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_BATTERY_SOC,
         CONF_ENPHASE_PROFILE,
         CONF_DAIKIN_CLIMATE,
+        CONF_CLIMATE_MANUAL_OVERRIDE,
+        CONF_CLIMATE_ZONES,
         CONF_CLIMATE_TARGET_LOW,
         CONF_CLIMATE_TARGET_HIGH,
         CONF_PERSON_ENTITIES,
@@ -174,7 +178,27 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Initialize coordinator."""
         self.entry = entry
         self.store = store
-        self.overrides: list[Override] = _overrides_from_store(store.data, dt_util.utcnow())
+        now = dt_util.utcnow()
+        self.overrides: list[Override] = _overrides_from_store(store.data, now)
+        manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+        manual_override_state = hass.states.get(manual_override_entity) if manual_override_entity else None
+        if (
+            manual_override_state is not None
+            and str(manual_override_state.state).lower() == "on"
+            and not any(override.kind == "manual_hvac" for override in self.overrides)
+            and not _expired_manual_hvac_state(store.data, now)
+        ):
+            # Setup performs its first refresh before listeners are registered.
+            # Seed an externally enabled helper now so that refresh cannot cross
+            # the authoritative manual-override boundary and acquire HVAC.
+            self.overrides.append(
+                Override(
+                    kind="manual_hvac",
+                    source="helper",
+                    expires_at=None,
+                    reason="manual_override_helper_on",
+                )
+            )
         self.ready_by = str(self.options.get(CONF_DEFAULT_READY_BY, "07:00"))
         self.executor = Executor(
             store,
@@ -294,13 +318,23 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self.store.data,
                 event,
                 now,
-                pending_hvac_desired_state=getattr(
-                    getattr(self, "executor", None), "pending_hvac_desired_state", None
-                ),
+                pending_hvac_desired_state=getattr(getattr(self, "executor", None), "pending_hvac_desired_state", None),
             ):
+                return
+            if _is_manual_override_helper_change(entry_data, event):
+                helper_state = str(getattr(event.data.get("new_state"), "state", "")).lower()
+                guard = getattr(self, "_manual_override_helper_guard", None)
+                if isinstance(guard, tuple) and len(guard) == 2 and guard[0] == helper_state and now < guard[1]:
+                    self._manual_override_helper_guard = None
+                    return
+                self._manual_override_helper_guard = None
+                self.hass.async_create_task(self._async_handle_manual_override_helper(helper_state == "on"))
                 return
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
+                return
+            if _is_manual_hvac_zone_change(entry_data, self.store.data, event):
+                self.hass.async_create_task(self._async_handle_manual_hvac_change("climate_zone_changed"))
                 return
             if _is_ev_history_state_change(entry_data, event):
                 self.hass.async_create_task(self._async_record_ev_trip_event())
@@ -309,6 +343,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._schedule_debounced_refresh("state_change")
 
         self._unsub_listeners.append(async_track_state_change_event(self.hass, entity_ids, _handle_state_change))
+        helper_entity = entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+        helper_state = self.hass.states.get(helper_entity) if helper_entity else None
+        helper_value = None if helper_state is None else str(helper_state.state).lower()
+        overrides = list(getattr(self, "overrides", []))
+        helper_override_active = any(
+            override.kind == "manual_hvac" and getattr(override, "source", None) == "helper" for override in overrides
+        )
+        if helper_value == "on" and not any(override.kind == "manual_hvac" for override in overrides):
+            self.hass.async_create_task(self._async_handle_manual_override_helper(True))
+        elif helper_value == "off" and helper_override_active:
+            self.hass.async_create_task(self._async_handle_manual_override_helper(False))
 
     def async_shutdown(self) -> None:
         """Cancel listeners and pending debounced refresh."""
@@ -424,11 +469,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.overrides = active_overrides
         if stored_overrides != to_jsonable(self.overrides):
             await self.store.async_save_overrides(self.overrides)
-        if (
-            not any(override.kind == "manual_hvac" for override in self.overrides)
-            and expired_manual_hvac_state
-        ):
-            await self._async_clear_expired_manual_hvac_state()
+        await self._async_reconcile_expired_manual_hvac_state(expired_manual_hvac_state)
         options = self.planner_options
         entry_data = self.entry_data
         self.executor.options = options
@@ -478,6 +519,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        stored_ownership = self.store.data.get("ownership", {})
+        if isinstance(stored_ownership, dict):
+            context.hvac_control = _hvac_control_from_ownership(stored_ownership)
+        climate_discovery = getattr(discovery, "climate", None)
+        climate_issues = list(getattr(climate_discovery, "issues", []))
+        if context.hvac_control and climate_issues:
+            context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
         thermal_model, thermal_model_changed = update_thermal_model(
             dict(self.store.data.get("thermal_model", {})),
             dict(self.store.data.get("thermal_model", {})).get("last_sample"),
@@ -639,7 +687,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Apply option transitions, restoring ownership when control becomes safe."""
         async with self._options_update_lock:
             option_state = dict(self.entry.options)
-            if option_state == getattr(self, "_last_handled_options", None):
+            previous_option_state = getattr(self, "_last_handled_options", None)
+            if option_state == previous_option_state:
                 return
 
             current_options = {**DEFAULT_OPTIONS, **option_state}
@@ -655,9 +704,36 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_control_mode_state = current_mode
             planner_disabled = previous_enabled and not current_mode[0]
             dry_run_enabled = not previous_dry_run and current_mode[1]
+            climate_control_disabled = bool(
+                isinstance(previous_option_state, dict)
+                and strict_bool(
+                    {**DEFAULT_OPTIONS, **previous_option_state}.get(CONF_CLIMATE_CONTROL_ENABLED),
+                    default=False,
+                )
+                and not strict_bool(
+                    current_options.get(CONF_CLIMATE_CONTROL_ENABLED),
+                    default=False,
+                )
+            )
             if planner_disabled or dry_run_enabled:
                 reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
                 await self.async_restore_safe_state(reason, refresh=False)
+            elif climate_control_disabled:
+                async with self._planner_lock:
+                    ownership = dict(self.store.data.get("ownership", {}))
+                    stored_hvac_control = ownership.get("hvac_control")
+                    hvac_control = dict(stored_hvac_control) if isinstance(stored_hvac_control, dict) else {}
+                    has_hvac_ownership = bool(
+                        hvac_control
+                        or ownership.get("climate_automations")
+                        or ownership.get("planner_takeover_started_at")
+                        or ownership.get("planner_hvac_action_expires_at")
+                    )
+                    if has_hvac_ownership:
+                        hvac_control["required_evidence_lost"] = "climate_control_disabled"
+                        ownership["hvac_control"] = hvac_control
+                        await self.store.async_save_ownership(ownership)
+                        await self.executor.async_release_hvac_control("climate_control_disabled")
             await self.async_request_replan()
             self._last_handled_options = option_state
 
@@ -706,11 +782,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 getattr(self, "_last_decision_context", None),
             )
             if result.applied:
-                self.overrides = [
-                    override
-                    for override in self.overrides
-                    if override.kind != "manual_ev_charging"
-                ]
+                self.overrides = [override for override in self.overrides if override.kind != "manual_ev_charging"]
                 self.overrides.append(
                     Override(
                         kind="manual_ev_charging",
@@ -740,13 +812,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
         """Validate and persist the preconditioning keep-on policy."""
         entry_data = self.entry_data
-        persistent_control = entry_data.get(CONF_EV_CHARGER) or entry_data.get(
-            CONF_EV_SMART_CHARGING
-        )
+        persistent_control = entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)
         if enabled and (
-            not persistent_control
-            or str(persistent_control).split(".", 1)[0]
-            not in {"switch", "input_boolean"}
+            not persistent_control or str(persistent_control).split(".", 1)[0] not in {"switch", "input_boolean"}
         ):
             raise HomeAssistantError(
                 "Keep charger on requires a persistent EV charger switch or input boolean.",
@@ -760,31 +828,138 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             update_entry(self.entry, options=options)
         await self.async_handle_options_update()
 
-    async def async_set_manual_hvac_override(self, duration_minutes: int, reason: str) -> None:
+    async def async_set_manual_hvac_override(
+        self,
+        duration_minutes: int,
+        reason: str,
+        *,
+        source: str = "service",
+        expires: bool = True,
+    ) -> ActionOutcome | None:
         """Set a manual HVAC override."""
-        expires_at = dt_util.utcnow() + timedelta(minutes=duration_minutes)
+        self._mark_forced_refresh("manual_hvac_override")
+        helper_error: Exception | None = None
+        release_outcome = None
+        async with self._planner_lock:
+            expires_at = dt_util.utcnow() + timedelta(minutes=duration_minutes) if expires else None
+            self.overrides = [
+                override
+                for override in self.overrides
+                if not (
+                    override.kind == "manual_hvac"
+                    and (
+                        (source == "helper" and getattr(override, "source", None) == "helper")
+                        or (source != "helper" and getattr(override, "source", None) != "helper")
+                    )
+                )
+            ]
+            self.overrides.append(
+                Override(
+                    kind="manual_hvac",
+                    source=source,
+                    expires_at=expires_at,
+                    reason=reason,
+                )
+            )
+            await self.store.async_save_overrides(self.overrides)
+            ownership = dict(self.store.data.get("ownership", {}))
+            ownership["manual_hvac_override_expires_at"] = (
+                None
+                if any(override.kind == "manual_hvac" and override.expires_at is None for override in self.overrides)
+                else max(
+                    (
+                        override.expires_at
+                        for override in self.overrides
+                        if override.kind == "manual_hvac" and override.expires_at is not None
+                    ),
+                    default=expires_at,
+                )
+            )
+            await self.store.async_save_ownership(ownership)
+            manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+            if manual_override_entity and source != "helper":
+                self._manual_override_helper_guard = ("on", dt_util.utcnow() + timedelta(minutes=2))
+                try:
+                    await self.hass.services.async_call(
+                        "input_boolean",
+                        "turn_on",
+                        {"entity_id": manual_override_entity},
+                        blocking=True,
+                    )
+                except Exception as err:  # noqa: BLE001 - release must still run when helper feedback fails.
+                    self._manual_override_helper_guard = None
+                    helper_error = err
+            release_hvac = getattr(self.executor, "async_release_hvac_control", None)
+            if callable(release_hvac):
+                release_outcome = await release_hvac(reason)
+        await self.async_request_refresh()
+        if helper_error is not None:
+            raise helper_error
+        return release_outcome
+
+    async def _async_reconcile_expired_manual_hvac_state(self, expired: bool) -> None:
+        """Retry helper cleanup while retaining a fail-closed override."""
+        helper_cleanup_override = any(
+            override.kind == "manual_hvac" and override.reason == "manual_hvac_helper_cleanup_failed"
+            for override in self.overrides
+        )
+        if not expired or (
+            any(override.kind == "manual_hvac" for override in self.overrides) and not helper_cleanup_override
+        ):
+            return
+        helper_cleared = await self._async_clear_expired_manual_hvac_state()
+        if helper_cleared:
+            if helper_cleanup_override:
+                self.overrides = [
+                    override
+                    for override in self.overrides
+                    if not (override.kind == "manual_hvac" and override.reason == "manual_hvac_helper_cleanup_failed")
+                ]
+                await self.store.async_save_overrides(self.overrides)
+            return
         self.overrides = [override for override in self.overrides if override.kind != "manual_hvac"]
         self.overrides.append(
             Override(
                 kind="manual_hvac",
-                source="service",
-                expires_at=expires_at,
-                reason=reason,
+                source="helper",
+                expires_at=None,
+                reason="manual_hvac_helper_cleanup_failed",
             )
         )
         await self.store.async_save_overrides(self.overrides)
-        ownership = dict(self.store.data.get("ownership", {}))
-        ownership["manual_hvac_override_expires_at"] = expires_at
-        await self.store.async_save_ownership(ownership)
-        manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
-        if manual_override_entity:
-            await self.hass.services.async_call(
-                "input_boolean",
-                "turn_on",
-                {"entity_id": manual_override_entity},
-                blocking=True,
+
+    async def _async_handle_manual_override_helper(self, enabled: bool) -> None:
+        """Apply an authoritative external manual-override helper change."""
+        if enabled:
+            await self.async_set_manual_hvac_override(
+                0,
+                "manual_override_helper_on",
+                source="helper",
+                expires=False,
             )
-        self._mark_forced_refresh("manual_hvac_override")
+            return
+        async with self._planner_lock:
+            self.overrides = [
+                override
+                for override in self.overrides
+                if not (override.kind == "manual_hvac" and getattr(override, "source", None) == "helper")
+            ]
+            await self.store.async_save_overrides(self.overrides)
+            ownership = dict(self.store.data.get("ownership", {}))
+            remaining_manual_override = next(
+                (override for override in self.overrides if override.kind == "manual_hvac"),
+                None,
+            )
+            if remaining_manual_override is None:
+                ownership.pop("manual_hvac_override_expires_at", None)
+            else:
+                ownership["manual_hvac_override_expires_at"] = getattr(
+                    remaining_manual_override,
+                    "expires_at",
+                    None,
+                )
+            await self.store.async_save_ownership(ownership)
+        self._mark_forced_refresh("manual_hvac_override_cleared")
         await self.async_request_refresh()
 
     async def _async_handle_manual_hvac_change(self, reason: str) -> None:
@@ -845,6 +1020,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             }
         )
         await self._async_save_production(production)
+        async with self._planner_lock:
+            ownership = self.store.data.get("ownership", {})
+            if isinstance(ownership, dict) and (
+                ownership.get("hvac_control")
+                or ownership.get("climate_automations")
+                or ownership.get("planner_takeover_started_at")
+                or ownership.get("planner_hvac_action_expires_at")
+            ):
+                await self.executor.async_release_hvac_control("production_control_disarmed")
         self.async_update_listeners()
 
     async def async_pause_control(self, duration_minutes: int, reason: str, asset: str = "all") -> None:
@@ -907,12 +1091,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         else:
             self.store.data["control_pause"] = to_jsonable(pause)
 
-    async def _async_clear_expired_manual_hvac_state(self) -> None:
+    async def _async_clear_expired_manual_hvac_state(self) -> bool:
         """Clear planner-managed manual HVAC exposure after its timeout."""
         ownership = dict(self.store.data.get("ownership", {}))
         manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override_entity:
             try:
+                self._manual_override_helper_guard = ("off", dt_util.utcnow() + timedelta(minutes=2))
                 await self.hass.services.async_call(
                     "input_boolean",
                     "turn_off",
@@ -920,14 +1105,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     blocking=True,
                 )
             except Exception:  # noqa: BLE001 - helper cleanup must not block planning.
+                self._manual_override_helper_guard = None
                 _LOGGER.warning(
                     "Could not clear expired manual HVAC helper %s",
                     manual_override_entity,
                 )
-                return
+                return False
         if "manual_hvac_override_expires_at" in ownership:
             ownership.pop("manual_hvac_override_expires_at", None)
             await self.store.async_save_ownership(ownership)
+        return True
 
     async def _async_record_dry_run_comparison(self, plan: EnergyPlan) -> None:
         """Record compact dry-run plan versus recent real outcomes context."""
@@ -991,10 +1178,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.store.async_save_plan(plan)
         self.executor.options = options
         self.executor.entry_data = self.entry_data
-        await self.executor.async_evaluate(plan, context)
-        next_action = plan.next_action
+        consumed_action = await self.executor.async_evaluate(plan, context)
+        evaluated_action = consumed_action if consumed_action in plan.actions else plan.next_action
         for action in plan.actions:
-            if action is next_action:
+            if action is evaluated_action:
                 continue
             if getattr(self, "_tearing_down", False):
                 _LOGGER.debug(
@@ -1004,8 +1191,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 break
             if started_generation != self._refresh_generation:
                 _LOGGER.debug(
-                    "Stopping coordinated execution for obsolete plan %s from generation %s; "
-                    "current generation is %s",
+                    "Stopping coordinated execution for obsolete plan %s from generation %s; current generation is %s",
                     plan.plan_id,
                     started_generation,
                     self._refresh_generation,
@@ -1593,6 +1779,57 @@ def _is_manual_hvac_change(
     return True
 
 
+def _is_manual_override_helper_change(entry_data: dict[str, Any], event: Any) -> bool:
+    """Return whether the authoritative override helper changed state."""
+    entity_id = entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+    if not entity_id or event.data.get("entity_id") != entity_id:
+        return False
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    if new_state is None:
+        return False
+    old_value = None if old_state is None else str(old_state.state).lower()
+    new_value = str(new_state.state).lower()
+    return new_value in {"on", "off"} and old_value != new_value
+
+
+def _hvac_control_from_ownership(ownership: dict[str, Any]) -> dict[str, Any]:
+    """Normalize current and legacy HVAC ownership for lifecycle planning."""
+    stored_control = ownership.get("hvac_control")
+    control = dict(stored_control) if isinstance(stored_control, dict) else {}
+    if not control and any(
+        key in ownership
+        for key in (
+            "hvac_control",
+            "climate_automations",
+            "planner_takeover_started_at",
+            "planner_hvac_action_expires_at",
+        )
+    ):
+        control["legacy_ownership"] = True
+    hold_until = ownership.get("hvac_release_hold_until")
+    if hold_until is not None:
+        control.setdefault("released_until", hold_until)
+    return control
+
+
+def _is_manual_hvac_zone_change(
+    entry_data: dict[str, Any],
+    store_data: dict[str, Any],
+    event: Any,
+) -> bool:
+    """Return whether a configured zone changed unexpectedly during takeover."""
+    entity_id = event.data.get("entity_id")
+    if entity_id not in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES)):
+        return False
+    ownership = store_data.get("ownership", {})
+    if not isinstance(ownership, dict) or not ownership.get("hvac_control"):
+        return False
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    return bool(old_state is not None and new_state is not None and old_state.state != new_state.state)
+
+
 def _is_planner_owned_control_feedback(
     entry_data: dict[str, Any],
     store_data: dict[str, Any],
@@ -1606,6 +1843,8 @@ def _is_planner_owned_control_feedback(
     asset = (
         "daikin"
         if entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
+        else "daikin_zone"
+        if entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
         else "enphase"
         if entity_id == entry_data.get(CONF_ENPHASE_PROFILE)
         else None
@@ -1616,9 +1855,25 @@ def _is_planner_owned_control_feedback(
     if new_state is None:
         return False
     if asset == "daikin" and pending_hvac_desired_state is not None:
-        return _matches_hvac_command_feedback(pending_hvac_desired_state, event)
+        # A multi-call climate transaction can publish intermediate states (for
+        # example turn_on restoring the previous mode before set_hvac_mode).
+        # The bounded pending marker identifies the whole transaction as ours;
+        # exact desired-state matching resumes once the transaction completes.
+        return True
+    if asset == "daikin_zone" and pending_hvac_desired_state is not None:
+        restored_zones = pending_hvac_desired_state.get("restore_zones")
+        if isinstance(restored_zones, dict) and entity_id in restored_zones:
+            return str(getattr(new_state, "state", "")).lower() == str(restored_zones[entity_id]).lower()
+        return bool(
+            pending_hvac_desired_state.get("enable_zones") and str(getattr(new_state, "state", "")).lower() == "on"
+        )
     for outcome in reversed(list(store_data.get("execution_audit", []))):
-        if not isinstance(outcome, dict) or outcome.get("result") != "applied" or outcome.get("asset") != asset:
+        expected_asset = "daikin" if asset == "daikin_zone" else asset
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("result") != "applied"
+            or outcome.get("asset") != expected_asset
+        ):
             continue
         attempted_at = _parse_datetime_or_none(outcome.get("attempted_at"))
         if attempted_at is None or not attempted_at <= now < attempted_at + timedelta(minutes=2):
@@ -1629,6 +1884,8 @@ def _is_planner_owned_control_feedback(
         observed = str(getattr(new_state, "state", ""))
         if asset == "enphase":
             return bool(desired.get("profile")) and observed == str(desired["profile"])
+        if asset == "daikin_zone":
+            return bool(desired.get("enable_zones") and observed.lower() == "on")
         return _matches_hvac_command_feedback(desired, event)
     return False
 
@@ -1648,9 +1905,7 @@ def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
         matched_command_change = True
     old_attributes = {} if old_state is None else (getattr(old_state, "attributes", {}) or {})
     attributes = getattr(new_state, "attributes", {}) or {}
-    if any(
-        old_attributes.get(key) != attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS - {"temperature"}
-    ):
+    if any(old_attributes.get(key) != attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS - {"temperature"}):
         return False
     desired_temperature = desired.get("target_temperature")
     temperature_changed = old_state is None or old_attributes.get("temperature") != attributes.get("temperature")
@@ -1794,7 +2049,9 @@ def _overrides_from_store(
             continue
         kind = str(item.get("kind", ""))
         expires_at = _parse_datetime_or_none(item.get("expires_at"))
-        if kind in {"manual_ev_charging", "manual_hvac"} and expires_at is None:
+        if kind == "manual_ev_charging" and expires_at is None:
+            continue
+        if kind == "manual_hvac" and expires_at is None and str(item.get("source", "")) != "helper":
             continue
         if _override_is_expired(expires_at, now):
             continue
@@ -1814,11 +2071,7 @@ def _unexpired_overrides(
     now: datetime,
 ) -> list[Override]:
     """Return runtime overrides that remain active at this refresh."""
-    return [
-        override
-        for override in overrides
-        if not _override_is_expired(override.expires_at, now)
-    ]
+    return [override for override in overrides if not _override_is_expired(override.expires_at, now)]
 
 
 def _expired_manual_hvac_state(
@@ -1828,9 +2081,7 @@ def _expired_manual_hvac_state(
     """Return whether persisted manual HVAC state has reached its timeout."""
     ownership = store_data.get("ownership")
     if isinstance(ownership, dict):
-        ownership_expiry = _parse_datetime_or_none(
-            ownership.get("manual_hvac_override_expires_at")
-        )
+        ownership_expiry = _parse_datetime_or_none(ownership.get("manual_hvac_override_expires_at"))
         if ownership_expiry is not None and _override_is_expired(ownership_expiry, now):
             return True
     overrides = store_data.get("overrides")
@@ -1840,6 +2091,8 @@ def _expired_manual_hvac_state(
         if not isinstance(item, dict) or str(item.get("kind", "")) != "manual_hvac":
             continue
         expires_at = _parse_datetime_or_none(item.get("expires_at"))
+        if expires_at is None and str(item.get("source", "")) == "helper":
+            continue
         if expires_at is None or _override_is_expired(expires_at, now):
             return True
     return False
@@ -1852,8 +2105,6 @@ def _override_is_expired(
     """Compare override timestamps defensively across legacy naive values."""
     if expires_at is None:
         return False
-    normalized_expires_at = (
-        expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=UTC)
-    )
+    normalized_expires_at = expires_at if expires_at.tzinfo is not None else expires_at.replace(tzinfo=UTC)
     normalized_now = now if now.tzinfo is not None else now.replace(tzinfo=UTC)
     return normalized_expires_at <= normalized_now

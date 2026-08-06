@@ -663,6 +663,8 @@ def _action_sentence(action: PlanAction) -> str:
         if target is not None:
             return f"Set climate to {mode} at {target} C."
         return f"Set climate to {mode}."
+    if action.kind == ActionKind.RELEASE_HVAC:
+        return "Release climate control to the configured automations."
     if action.kind == ActionKind.EV_SCHEDULE:
         target = desired.get("target_soc_percent")
         ready_by = desired.get("ready_by")
@@ -678,6 +680,7 @@ def _action_label(action: PlanAction) -> str:
         ActionKind.SET_PROFILE: "Switch Enphase profile",
         ActionKind.RESTORE_AI: "Restore AI profile",
         ActionKind.SET_HVAC: "Change climate state",
+        ActionKind.RELEASE_HVAC: "Release climate control",
         ActionKind.EV_START: "Start EV charging",
         ActionKind.EV_STOP: "Stop EV charging",
         ActionKind.EV_SCHEDULE: "Schedule EV charging",
