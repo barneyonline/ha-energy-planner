@@ -14,6 +14,7 @@ from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
@@ -621,7 +622,7 @@ def _configured_entities(
         control_area = _entity_control_area(key)
         if required_areas is not None and control_area is not None and control_area not in required_areas:
             continue
-        if key.endswith("_entity") or key in {CONF_CLIMATE_AUTOMATIONS, CONF_PERSON_ENTITIES}:
+        if key.endswith("_entity") or key in {CONF_CLIMATE_AUTOMATIONS, CONF_CLIMATE_ZONES, CONF_PERSON_ENTITIES}:
             entity_ids.update(_split_entities(value))
     return sorted(entity_ids)
 

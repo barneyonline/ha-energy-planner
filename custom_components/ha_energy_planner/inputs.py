@@ -21,6 +21,7 @@ from .const import (
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_DAIKIN_POWER,
     CONF_DEFAULT_READY_BY,
@@ -88,6 +89,17 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_BASELINE_LOAD_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
+
+
+def _split_entity_values(value: Any) -> list[str]:
+    """Normalize a single or multi-entity configuration value."""
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return []
+
+
 _LEADING_LOAD_FILL_CONFIDENCE_FACTOR = 0.75
 _MAX_LEADING_LOAD_FILL_MINUTES = 60
 _REQUIRED_FORECAST_CONFIGS = {
@@ -325,6 +337,7 @@ class InputManager:
             occupied_temperature_low_c=comfort_low,
             occupied_temperature_high_c=comfort_high,
             active_overrides=overrides or [],
+            climate_zone_entities=_split_entity_values(self.entry_data.get(CONF_CLIMATE_ZONES)),
             input_issues=issues,
             forecast_confidence=forecast_confidence,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),

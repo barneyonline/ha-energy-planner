@@ -160,6 +160,28 @@ def test_non_response_services_await_coordinator_work() -> None:
     assert hass.created_tasks == []
 
 
+def test_manual_hvac_override_service_reports_release_failure() -> None:
+    coordinator = _coordinator()
+
+    async def failed_override(duration: int, reason: str) -> object:
+        coordinator.awaited.append(("manual_override", (duration, reason)))
+        return SimpleNamespace(result=OutcomeResult.FAILED, reason="hvac_release_failed")
+
+    coordinator.async_set_manual_hvac_override = failed_override
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(
+            hass.services.handlers[(DOMAIN, SERVICE_SET_MANUAL_HVAC_OVERRIDE)](
+                FakeCall({ATTR_DURATION_MINUTES: 15, ATTR_REASON: "test_override"})
+            )
+        )
+
+    assert error.value.translation_key == "restore_safe_state_failed"
+    assert coordinator.awaited == [("manual_override", (15, "test_override"))]
+
+
 def test_set_ev_ready_by_schema_validates_and_normalizes_time() -> None:
     coordinator = _coordinator()
     hass = FakeHass(coordinator)

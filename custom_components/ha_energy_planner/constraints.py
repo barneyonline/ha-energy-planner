@@ -277,7 +277,12 @@ class ConstraintValidator:
                     "HVAC comfort action cannot run while all configured people are away.",
                 )
             )
-        if desired_mode != "off" and _hvac_min_cycle_active(
+        lifecycle_continuation = bool(
+            ownership.planner_takeover_started_at is not None
+            and action.desired_state.get("phase")
+            in {"preconditioning", "pre_peak_coast", "peak_coast"}
+        )
+        if desired_mode != "off" and not lifecycle_continuation and _hvac_min_cycle_active(
             now,
             ownership,
             timedelta(minutes=int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES])),

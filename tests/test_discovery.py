@@ -8,6 +8,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_PROFILE,
@@ -145,6 +147,38 @@ def test_discovery_reports_missing_climate_automation() -> None:
     ).inspect()
     assert report.hvac.supported is False
     assert "climate_automation_unavailable" in report.hvac.issues
+
+
+def test_discovery_reports_missing_climate_zone() -> None:
+    hass = FakeHass({"climate.daikin": "heat"}, set())
+    report = CapabilityDiscovery(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["switch.living_zone"],
+        },
+    ).inspect()
+
+    assert report.hvac.supported is False
+    assert report.hvac.issues == ["climate_zone_unavailable"]
+    assert report.hvac.details["unavailable_zones"] == ["switch.living_zone"]
+
+
+def test_discovery_reports_missing_manual_override_helper() -> None:
+    hass = FakeHass({"climate.daikin": "heat"}, set())
+    report = CapabilityDiscovery(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.hvac_override",
+        },
+    ).inspect()
+
+    assert report.hvac.supported is False
+    assert report.hvac.issues == ["climate_manual_override_unavailable"]
+    assert report.hvac.details["manual_override_entity"] == (
+        "input_boolean.hvac_override"
+    )
 
 
 def test_discovery_honors_configured_enphase_profile_control_service() -> None:

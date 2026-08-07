@@ -30,7 +30,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Energy system overview, planning health, forecast confidence, cost estimate, and execution audit entities
 - Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional grid carbon-intensity forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
 - Native EV smart charging with native or external target-SOC input, ready-by controls, direct charger start/stop with charging-state confirmation, a connected helper, minimum-SOC recovery, preconditioning keep-on policy, price limits, low-price charging, continuous or interval-based schedules, and charge energy estimates
-- Climate plan, current/next climate state, comfort targets, HVAC power modeling, manual override handling, and presence-aware control
+- Climate plan, current/next climate state, comfort targets, full-horizon tariff preconditioning, zone takeover/restoration, HVAC power modeling, manual override handling, and presence-aware control
 - Presence as a separate device, including multi-person occupancy inputs
 - Enphase profile monitoring and planned current/next battery profile state
 - HAEO optimization service integration with deterministic fallback behavior
@@ -49,7 +49,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
 - EV planning with connected state or a native connected helper, SOC, confirmed start/stop commands, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
 - Multiple EVs through separate named planner entries with isolated entities, history, production controls, execution audit, and persisted state
-- Climate planning with current state, next planned state, comfort windows, HVAC power estimation, thermal model replay, comfort coasting, and manual override blocking
+- Climate planning with a persisted `idle -> precondition -> pre-peak coast -> peak coast -> release` lifecycle, exact comfort targets, HVAC power estimation, thermal-model replay, zone control, and manual-override restoration
 - Configurable plan visibility for Climate, Enphase, and EV devices through plan sensors and timeline attributes; the recommended default horizon is 12 hours
 - Forecast confidence breakdown across required inputs so stale, missing, invalid, or low-confidence subsystem data is visible
 - Coverage-aware forecast health and diagnostics: at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe; uncovered slots remain missing instead of repeating the final value
@@ -80,7 +80,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 11. Open the integration page and add the planning areas you want to use:
    - **Energy** for tariffs, solar/load forecasts, battery SOC, weather, and HAEO.
    - **Presence** for person entities used by occupancy-aware planning.
-   - **Climate** for Daikin climate and HVAC power inputs.
+   - **Climate** for Daikin climate, HVAC power, comfort helpers, climate automations, controlled zones, and the optional manual-override helper.
    - **Enphase** for profile monitoring and profile scenario mapping.
    - **AI** for optional local advisory service selection.
    - **EV** for vehicle SOC, connected state, and charge start/stop controls.
@@ -98,7 +98,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.8.4`
+- Current manifest version: `0.8.5`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `service`
 - IoT class: `calculated`
@@ -145,9 +145,21 @@ Manual start/stop buttons create a one-hour override so the immediate replan doe
 
 Existing entries that used the old `ev_smart_charging_*` control keys continue to work during migration. Reconfigure the EV planning area to store the new direct-charger fields. Legacy ready-by helpers remain readable for compatibility, and the external target-SOC input is available to both upgraded and new entries.
 
-### Multiple EVs
+## Climate tariff lifecycle
 
-Create one named Energy Planner integration entry per EV. Each entry has its own EV mapping, native helpers, plan, trip history, production arming, control pause, audit, and storage namespace. Shared read-only household tariff, solar, load, and battery inputs must currently be mapped into each entry. Actuators are single-owner: the same EV persistent/start/stop control, Daikin climate entity, climate automation, or Enphase profile control cannot be assigned to more than one planner entry. EV control validation compares native and legacy fields as one set, so the same entity cannot be hidden under different start/stop mappings. When more than one entry is loaded, integration service calls must include `config_entry_id`; the Home Assistant service UI provides an entry selector.
+When climate control is enabled and the home is occupied inside its nominal comfort range, Energy Planner scans every valid tariff slot in the configured planning horizon. The default horizon remains 12 hours and can be set from 1 to 48 hours; select 24 hours when next-day climate awareness is required. A peak qualifies only when its price clears both configured deltas relative to the cheapest valid tariff in the preconditioning lead window. Consecutive qualifying slots form one persisted expensive period.
+
+Before the earliest feasible period, the planner uses the weather forecast at the peak to select heating or cooling, falling back to current HVAC, outdoor, and indoor evidence only when needed. Heating targets the configured high comfort helper before the peak and coasts at the low helper after the selected run; cooling targets the low helper before the peak and then coasts at the high helper. The learned thermal rate selects the least-cost feasible contiguous run, with the latest run winning equal-cost ties. Without enough learned evidence, the full configured lead window and fallback HVAC load are used. The selected run end is persisted so an early run transitions to pre-peak coasting instead of maintaining the extreme target. The climate timeline exposes future preconditioning, coast, and release phases without executing them early; projected peak load remains zero while the building can coast, then includes conservative maintenance load at the comfort boundary.
+
+Takeover snapshots each configured `switch` or `input_boolean` zone once, disables all configured climate automations, enables every zone, turns on an off climate entity, selects heat or cool, and sets the extreme target. At the peak it retains ownership, keeps zones on and automations disabled, and changes to the opposite comfort boundary. At peak end it restores every zone to its captured state and enables every configured climate automation. The prior climate mode or setpoint is deliberately not restored because the automations resume responsibility. Lifecycle phase, tariff boundary, baseline and acquisition-time price deltas, mode, targets, controlled zones, release reason, and thermal evidence are available in climate plan and timeline attributes, the decision audit, execution audit, and diagnostics.
+
+Reaching either comfort boundary, losing required temperature, tariff, occupancy, or production-control evidence, pausing Daikin control, a manual thermostat or zone change, or an external manual-override helper turning on releases HVAC ownership immediately. Comfort release is latched until that peak ends to prevent repeated takeover. Release is a safety operation: it can restore zones and automations after dry-run is enabled, production is disarmed, climate control is disabled, inputs degrade, or the daily action cap is reached. Partial restoration retains unresolved ownership for later refresh and `restore_safe_state` retries.
+
+The optional `climate_manual_override_entity` is authoritative in both directions. External **on** creates an indefinite persisted override, releases HVAC without changing EV or Enphase ownership, and blocks new takeover until external **off** clears it. Service-created and automatically detected overrides remain timed; integration-originated helper changes are guarded so they do not become indefinite. The service reports a restoration failure while leaving the successfully established override active.
+
+## Multiple EVs
+
+Create one named Energy Planner integration entry per EV. Each entry has its own EV mapping, native helpers, plan, trip history, production arming, control pause, audit, and storage namespace. Shared read-only household tariff, solar, load, and battery inputs must currently be mapped into each entry. Actuators are single-owner: the same EV persistent/start/stop control, Daikin climate entity, climate automation, climate zone, writable manual-override helper, or Enphase profile control cannot be assigned to more than one planner entry. EV control validation compares native and legacy fields as one set, so the same entity cannot be hidden under different start/stop mappings. When more than one entry is loaded, integration service calls must include `config_entry_id`; the Home Assistant service UI provides an entry selector.
 
 Each entry plans independently, but active execution uses one shared in-memory household reservation gate. Scheduled and manual start or keep-on actions require a usable household projection and atomically reserve their projected EV load against the strictest configured grid-import limit among active reservations. A reservation remains held until a stop or safe-state restoration is confirmed. Observed disconnection requests a stop and does not release headroom until the charger control is proven safe, preventing automatic charging on reconnection from racing ahead of the next plan. Before issuing a start, the reservation and original actuator topology are persisted; after an interrupted command, active control must confirm a recovery stop on that original topology before a new start can run, and manual starts are rejected until that recovery completes. The reservation high-watermark is rehydrated before entries execute after restart, so an unclean restart cannot forget a previously higher active charge rate; an explicit confirmed release is persisted as inactive. Runtime option changes can increase an active reserved load immediately, but neither the option update nor a later start/no-op action can reduce it while the charger may still draw the earlier load. Import-limit policy updates apply immediately to single- and multi-EV reservations. When combined reservations no longer fit the strictest household limit, one shared atomic shedding claim selects a single loaded planner entry for the confirmed safety-stop path. Other entries keep their reservations while that claim is active, preventing concurrent evaluations from stopping every EV. A failed claimant retains its uncertain reservation but releases the claim so another loaded, controllable EV can attempt shedding; unloaded claimants are handled the same way. The claim clears when the selected reservation is released so the remaining capacity can be evaluated again. This also prevents concurrent entries from consuming the same projected headroom. Energy Planner still does not perform joint cost optimization across vehicles, so charging priority remains first-safe-action-wins when the combined plans do not fit.
 
@@ -193,14 +205,14 @@ All services accept an optional `config_entry_id`. It may be omitted with one lo
 - `ha_energy_planner.resume_control`: clear the active-control pause.
 - `ha_energy_planner.set_ev_ready_by`: set and persist the native EV ready-by time.
 - `ha_energy_planner.set_ev_target_soc`: set and persist the native EV target SOC.
-- `ha_energy_planner.set_manual_hvac_override`: block planner HVAC control for a bounded manual override window.
+- `ha_energy_planner.set_manual_hvac_override`: create a bounded manual HVAC override and immediately release planner-owned climate automations and zones.
 
 ## Production setup checklist
 
 1. Install Energy Planner and add it from **Devices & services**.
 2. Add planning areas from the integration page.
 3. Map the required source entities and services for the planning areas you want to use.
-4. Review the **EV, battery, and grid** configuration, especially EV minimum/maximum SOC, charge rate, earliest start, continuous charging, charging confirmation timeout/retries, price limits, usable home-battery capacity, efficiency, and max charge/discharge power.
+4. Review the **EV, battery, and grid** configuration, especially EV minimum/maximum SOC, charge rate, earliest start, continuous charging, charging confirmation timeout/retries, price limits, usable home-battery capacity, efficiency, and max charge/discharge power. For climate control, also review the horizon, tariff deltas, lead time, comfort helpers, automations, zones, and manual-override helper.
 5. Set day-to-day behavior through the device entities, including EV Target SOC, Ready by, Keep charger on, Opportunistic charging, and its price threshold.
 6. Review the **Data health** confidence thresholds for tariff, solar, load, climate, EV, and Enphase decisions.
 7. Leave active control disabled and dry-run enabled.
