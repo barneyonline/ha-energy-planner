@@ -18,7 +18,9 @@ from custom_components.ha_energy_planner import coordinator as coordinator_modul
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
@@ -40,7 +42,10 @@ from custom_components.ha_energy_planner.coordinator import (
     _decision_input_fingerprint,
     _expired_manual_hvac_state,
     _float_state_value,
+    _hvac_control_from_ownership,
     _is_manual_hvac_change,
+    _is_manual_hvac_zone_change,
+    _is_manual_override_helper_change,
     _is_material_state_change,
     _is_planner_owned_control_feedback,
     _latest_ai_plan_fingerprint,
@@ -224,20 +229,23 @@ class FakeExecutor:
         self.entry_data = {}
         self.evaluated: list[tuple[EnergyPlan, object]] = []
         self.restored: list[str] = []
+        self.hvac_releases: list[str] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
 
-    async def async_evaluate(self, plan: EnergyPlan, context: object) -> None:
+    async def async_evaluate(self, plan: EnergyPlan, context: object) -> PlanAction | None:
         self.evaluated.append((plan, context))
+        return None
 
     async def async_restore_safe_state(self, reason: str) -> None:
         self.restored.append(reason)
 
+    async def async_release_hvac_control(self, reason: str) -> None:
+        self.hvac_releases.append(reason)
+
     async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
-        self.manual_ev_commands.append(
-            (enabled, context, dict(self.options), dict(self.entry_data))
-        )
+        self.manual_ev_commands.append((enabled, context, dict(self.options), dict(self.entry_data)))
         return SimpleNamespace(applied=True)
 
     def sync_ev_grid_reservation(self) -> None:
@@ -316,6 +324,82 @@ def test_options_update_handles_each_option_snapshot_once() -> None:
 
     assert coordinator.executor.reservation_syncs == 1
     assert coordinator.executor.reservation_persists == 1
+    coordinator.async_request_replan.assert_awaited_once_with()
+
+
+def test_options_update_releases_only_hvac_when_climate_control_is_disabled() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_handled_options = {
+        CONF_PLANNER_ENABLED: True,
+        CONF_DRY_RUN: False,
+        CONF_CLIMATE_CONTROL_ENABLED: True,
+    }
+    coordinator._last_control_mode_state = (True, False)
+    coordinator.executor = FakeExecutor()
+    coordinator.store = FakeStore(
+        {
+            "ownership": {
+                "hvac_control": {"phase": "peak_coast"},
+                "ev_smart_charging_state": "off",
+            }
+        }
+    )
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.async_restore_safe_state = AsyncMock()
+    coordinator.async_request_replan = AsyncMock()
+
+    asyncio.run(coordinator.async_handle_options_update())
+
+    assert coordinator.executor.hvac_releases == ["climate_control_disabled"]
+    assert coordinator.store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "climate_control_disabled"
+    assert coordinator.store.data["ownership"]["ev_smart_charging_state"] == "off"
+    coordinator.async_restore_safe_state.assert_not_awaited()
+    coordinator.async_request_replan.assert_awaited_once_with()
+
+
+def test_options_update_does_not_release_unowned_hvac_when_climate_control_is_disabled() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_handled_options = {
+        CONF_PLANNER_ENABLED: True,
+        CONF_DRY_RUN: False,
+        CONF_CLIMATE_CONTROL_ENABLED: True,
+    }
+    coordinator._last_control_mode_state = (True, False)
+    coordinator.executor = FakeExecutor()
+    coordinator.store = FakeStore(
+        {
+            "ownership": {
+                "ev_smart_charging_state": "off",
+            }
+        }
+    )
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.async_restore_safe_state = AsyncMock()
+    coordinator.async_request_replan = AsyncMock()
+
+    asyncio.run(coordinator.async_handle_options_update())
+
+    assert coordinator.executor.hvac_releases == []
+    assert coordinator.store.data["ownership"] == {"ev_smart_charging_state": "off"}
+    coordinator.async_restore_safe_state.assert_not_awaited()
     coordinator.async_request_replan.assert_awaited_once_with()
 
 
@@ -627,9 +711,7 @@ def test_overrides_restored_only_when_active() -> None:
                 {
                     "kind": "manual_ev_charging",
                     "source": "button",
-                    "expires_at": (
-                        now.replace(tzinfo=None) - timedelta(minutes=5)
-                    ).isoformat(),
+                    "expires_at": (now.replace(tzinfo=None) - timedelta(minutes=5)).isoformat(),
                     "reason": "legacy_naive_expired",
                 },
                 {
@@ -768,6 +850,33 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert "provider may log bounded prompts" in caplog.text
     assert not any(record.levelno >= logging.WARNING for record in caplog.records)
 
+    helper_coordinator = EnergyPlannerCoordinator(
+        FakeHass({"input_boolean.override": "on"}),
+        FakeEntry({CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"}),
+        FakeStore(),
+    )
+    assert helper_coordinator.overrides == [
+        Override(
+            kind="manual_hvac",
+            source="helper",
+            expires_at=None,
+            reason="manual_override_helper_on",
+        )
+    ]
+
+    expired_helper_coordinator = EnergyPlannerCoordinator(
+        FakeHass({"input_boolean.override": "on"}),
+        FakeEntry({CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"}),
+        FakeStore(
+            {
+                "ownership": {
+                    "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+                }
+            }
+        ),
+    )
+    assert expired_helper_coordinator.overrides == []
+
     coordinator.entry.options["planner_enabled"] = "true"
     coordinator.entry.options["dry_run"] = "false"
     assert coordinator.planner_enabled is False
@@ -867,6 +976,109 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     assert coordinator._refresh_generation == 1
     assert coordinator._debounce_cancel is not None
     assert len(scheduled) >= 2
+
+
+def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monkeypatch: object) -> None:
+    callbacks: list[object] = []
+
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: (lambda: None),
+    )
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass({"input_boolean.override": "off", "switch.zone": "on"})
+    coordinator.entry = FakeEntry(
+        {
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
+            CONF_CLIMATE_ZONES: ["switch.zone"],
+        },
+        {CONF_PLANNING_INTERVAL_MINUTES: 5},
+    )
+    coordinator.store = FakeStore({"ownership": {"hvac_control": {"phase": "peak_coast"}}})
+    coordinator.executor = FakeExecutor()
+    coordinator.overrides = []
+    coordinator._boundary_cancel = None
+    coordinator._debounce_cancel = None
+    coordinator._unsub_listeners = []
+    coordinator._refresh_generation = 0
+
+    coordinator.async_start_listeners()
+    callback = callbacks[0]
+    callback(FakeEvent("input_boolean.override", "off", "on"))
+    coordinator._manual_override_helper_guard = ("off", datetime.now(UTC) + timedelta(minutes=1))
+    callback(FakeEvent("input_boolean.override", "on", "off"))
+    assert coordinator._manual_override_helper_guard is None
+    callback(FakeEvent("switch.zone", "on", "off"))
+
+    assert len(coordinator.hass.created_tasks) == 2
+
+    startup = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    startup.hass = FakeHass({"input_boolean.override": "on"})
+    startup.entry = coordinator.entry
+    startup.store = FakeStore({"ownership": {}})
+    startup.executor = FakeExecutor()
+    startup.overrides = []
+    startup._boundary_cancel = None
+    startup._debounce_cancel = None
+    startup._unsub_listeners = []
+    startup._refresh_generation = 0
+    startup.async_start_listeners()
+    assert len(startup.hass.created_tasks) == 1
+
+    startup_off = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    startup_off.hass = FakeHass({"input_boolean.override": "off"})
+    startup_off.entry = coordinator.entry
+    startup_off.store = FakeStore({"ownership": {}})
+    startup_off.executor = FakeExecutor()
+    startup_off.overrides = [
+        Override(
+            kind="manual_hvac",
+            source="helper",
+            expires_at=None,
+            reason="manual_override_helper_on",
+        )
+    ]
+    startup_off._boundary_cancel = None
+    startup_off._debounce_cancel = None
+    startup_off._unsub_listeners = []
+    startup_off._refresh_generation = 0
+    startup_off._async_handle_manual_override_helper = AsyncMock()
+    startup_off.async_start_listeners()
+    assert len(startup_off.hass.created_tasks) == 1
+    startup_off._async_handle_manual_override_helper.assert_called_once_with(False)
+
+
+def test_manual_override_and_zone_change_helpers_cover_invalid_events() -> None:
+    entry_data = {
+        CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
+        CONF_CLIMATE_ZONES: ["switch.zone"],
+    }
+    missing_new = FakeEvent("input_boolean.override", "off", "on")
+    missing_new.data["new_state"] = None
+    assert not _is_manual_override_helper_change(entry_data, missing_new)
+
+    initial_on = FakeEvent("input_boolean.override", "off", "on")
+    initial_on.data["old_state"] = None
+    assert _is_manual_override_helper_change(entry_data, initial_on)
+    assert not _is_manual_override_helper_change(entry_data, FakeEvent("input_boolean.override", "on", "on"))
+
+    zone_event = FakeEvent("switch.zone", "on", "off")
+    assert not _is_manual_hvac_zone_change(entry_data, {"ownership": {}}, zone_event)
+    assert _is_manual_hvac_zone_change(
+        entry_data,
+        {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+        zone_event,
+    )
+    zone_event.data["new_state"] = None
+    assert not _is_manual_hvac_zone_change(
+        entry_data,
+        {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+        zone_event,
+    )
 
 
 def test_obsolete_planner_result_does_not_save_or_execute() -> None:
@@ -977,6 +1189,46 @@ def test_current_plan_evaluates_each_coordinated_action() -> None:
     coordinator = _coordinator_for_commit(None, current_generation=3)
 
     result = asyncio.run(coordinator._async_commit_plan_if_current(3, plan, context, {"planner_enabled": True}))
+
+    assert result is plan
+    assert coordinator.executor.evaluated == [
+        (plan, context),
+        (replace(plan, actions=[ev_action]), context),
+    ]
+
+
+def test_current_plan_skips_safety_action_consumed_ahead_of_next_action() -> None:
+    plan = _plan("current-with-release")
+    now = plan.created_at
+    ev_action = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
+    release_action = PlanAction(
+        action_id="hvac-release",
+        plan_id=plan.plan_id,
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.RELEASE_HVAC,
+        desired_state={"release_reason": "comfort"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+        requires_haeo_plan_id=None,
+    )
+    plan.actions = [ev_action, release_action]
+    context = object()
+    coordinator = _coordinator_for_commit(None, current_generation=3)
+
+    class SafetySelectingExecutor(FakeExecutor):
+        async def async_evaluate(self, evaluated_plan: EnergyPlan, evaluated_context: object) -> PlanAction | None:
+            await super().async_evaluate(evaluated_plan, evaluated_context)
+            return release_action if len(evaluated_plan.actions) > 1 else None
+
+    coordinator.executor = SafetySelectingExecutor()
+
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(3, plan, context, {"planner_enabled": True})
+    )
 
     assert result is plan
     assert coordinator.executor.evaluated == [
@@ -1367,8 +1619,39 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
     enphase_event = FakeEvent("select.enphase", "AI Optimisation", "Full Backup")
     entry_data = {
         "daikin_climate_entity": "climate.daikin",
+        "climate_zone_entities": ["switch.zone"],
         "enphase_profile_entity": "select.enphase",
     }
+
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent("switch.zone", "on", "off"),
+        now,
+        pending_hvac_desired_state={"restore_zones": {"switch.zone": "off"}},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent("switch.zone", "off", "on"),
+        now,
+        pending_hvac_desired_state={"enable_zones": True},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {"enable_zones": True},
+                }
+            ]
+        },
+        FakeEvent("switch.zone", "off", "on"),
+        now,
+    )
 
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -1397,6 +1680,21 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         ),
         now,
         pending_hvac_desired_state={"target_temperature": 21},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "off",
+            "cool",
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+        },
     )
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -1942,6 +2240,18 @@ def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> N
         )
         is True
     )
+    assert (
+        _expired_manual_hvac_state(
+            {
+                "overrides": [
+                    {"kind": "manual_hvac", "source": "helper", "expires_at": None},
+                    {"kind": "manual_hvac", "source": "service", "expires_at": None},
+                ]
+            },
+            now,
+        )
+        is True
+    )
 
 
 def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: object) -> None:
@@ -1970,7 +2280,10 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
             pass
 
         def inspect(self) -> SimpleNamespace:
-            return SimpleNamespace(as_dict=lambda: {"ok": True})
+            return SimpleNamespace(
+                as_dict=lambda: {"ok": True},
+                climate=SimpleNamespace(issues=["climate_zone_unavailable"]),
+            )
 
     class FakeInputManager:
         forecast_training_slots = [{"slot": 1}]
@@ -2163,6 +2476,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
             ],
             "ownership": {
                 "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+                "hvac_release_hold_until": now + timedelta(hours=1),
             },
         }
     )
@@ -2179,6 +2493,9 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     coordinator._refresh_generation = 0
 
     result = asyncio.run(coordinator._async_update_data_locked())
+
+    assert context.hvac_control["released_until"] == now + timedelta(hours=1)
+    assert context.hvac_control["required_evidence_lost"] == "climate_zone_unavailable"
 
     assert result.plan_id == "plan-refresh"
     assert result.summary == "{'flexible': True}"
@@ -2205,7 +2522,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
     assert coordinator.overrides == []
     assert coordinator.store.data["overrides"] == []
-    assert coordinator.store.data["ownership"] == {}
+    assert coordinator.store.data["ownership"] == {"hvac_release_hold_until": now + timedelta(hours=1)}
     assert coordinator.hass.services.calls == [
         (
             "input_boolean",
@@ -2622,9 +2939,7 @@ def test_manual_ev_and_restore_commands_share_planner_serialization_lock() -> No
         await manual_task
 
         await coordinator._planner_lock.acquire()
-        restore_task = asyncio.create_task(
-            coordinator.async_restore_safe_state("serialized_restore")
-        )
+        restore_task = asyncio.create_task(coordinator.async_restore_safe_state("serialized_restore"))
         await asyncio.sleep(0)
         assert coordinator.executor.restored == []
         coordinator._planner_lock.release()
@@ -2713,10 +3028,7 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     assert updates[1]["ev_fallback_target_soc_percent"] == 85
     assert updates[2]["ev_low_price_threshold"] == 0.07
     assert [item[0] for item in coordinator.executor.manual_ev_commands] == [True, False]
-    assert all(
-        item[1] is coordinator._last_decision_context
-        for item in coordinator.executor.manual_ev_commands
-    )
+    assert all(item[1] is coordinator._last_decision_context for item in coordinator.executor.manual_ev_commands)
     assert all(item[2][CONF_EV_CONNECTED_HELPER] is False for item in coordinator.executor.manual_ev_commands)
     assert coordinator.overrides[0].reason == "manual_stop"
     assert coordinator.store.async_save_overrides.await_count == 2
@@ -2754,6 +3066,13 @@ def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -
         SimpleNamespace(kind="other", reason="kept"),
     ]
 
+    async def release_while_serialized(reason: str) -> None:
+        assert coordinator._planner_lock.locked()
+        assert coordinator._refresh_generation == 1
+        coordinator.executor.hvac_releases.append(reason)
+
+    coordinator.executor.async_release_hvac_control = release_while_serialized
+
     asyncio.run(coordinator.async_set_manual_hvac_override(15, "user_change"))
 
     assert [override.kind for override in coordinator.overrides] == ["other", "manual_hvac"]
@@ -2768,8 +3087,135 @@ def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -
             True,
         )
     ]
+    assert coordinator.executor.hvac_releases == ["user_change"]
     assert coordinator.refresh_requested == 1
     assert coordinator._refresh_generation == 1
+
+
+def test_manual_hvac_override_releases_control_when_helper_service_fails() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+
+    async def fail_helper(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("helper unavailable")
+
+    coordinator.hass.services.async_call = fail_helper
+
+    with pytest.raises(RuntimeError, match="helper unavailable"):
+        asyncio.run(coordinator.async_set_manual_hvac_override(15, "user_change"))
+
+    assert coordinator.overrides[-1].reason == "user_change"
+    assert coordinator.executor.hvac_releases == ["user_change"]
+    assert coordinator.refresh_requested == 1
+    assert coordinator._manual_override_helper_guard is None
+
+
+def test_authoritative_manual_override_helper_latches_until_turned_off() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+
+    asyncio.run(coordinator._async_handle_manual_override_helper(True))
+
+    assert coordinator.overrides[0].source == "helper"
+    assert coordinator.overrides[0].expires_at is None
+    assert coordinator.executor.hvac_releases == ["manual_override_helper_on"]
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] is None
+
+    coordinator.store.data["ownership"]["ev_smart_charging_state"] = "off"
+    original_save_overrides = coordinator.store.async_save_overrides
+    original_save_ownership = coordinator.store.async_save_ownership
+
+    async def save_overrides_while_serialized(overrides: list[Override]) -> None:
+        assert coordinator._planner_lock.locked()
+        await original_save_overrides(overrides)
+
+    async def save_ownership_while_serialized(ownership: dict[str, object]) -> None:
+        assert coordinator._planner_lock.locked()
+        await original_save_ownership(ownership)
+
+    coordinator.store.async_save_overrides = save_overrides_while_serialized
+    coordinator.store.async_save_ownership = save_ownership_while_serialized
+    asyncio.run(coordinator._async_handle_manual_override_helper(False))
+
+    assert coordinator.overrides == []
+    assert "manual_hvac_override_expires_at" not in coordinator.store.data["ownership"]
+    assert coordinator.store.data["ownership"]["ev_smart_charging_state"] == "off"
+    assert coordinator.refresh_requested == 2
+
+
+def test_manual_override_helper_off_preserves_timed_override() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+    expires_at = datetime.now(UTC) + timedelta(minutes=30)
+    coordinator.overrides = [
+        Override(
+            kind="manual_hvac",
+            source="service",
+            expires_at=expires_at,
+            reason="timed_service_override",
+        )
+    ]
+    coordinator.store.data["ownership"] = {
+        "manual_hvac_override_expires_at": expires_at,
+    }
+
+    asyncio.run(coordinator._async_handle_manual_override_helper(False))
+
+    assert coordinator.overrides[0].source == "service"
+    assert coordinator.overrides[0].expires_at == expires_at
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] == expires_at
+
+
+def test_detected_manual_override_does_not_replace_authoritative_helper() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+    helper_override = Override(
+        kind="manual_hvac",
+        source="helper",
+        expires_at=None,
+        reason="manual_override_helper_on",
+    )
+    coordinator.overrides = [helper_override]
+
+    asyncio.run(
+        coordinator.async_set_manual_hvac_override(
+            15,
+            "daikin_state_changed",
+        )
+    )
+
+    assert coordinator.overrides[0] == helper_override
+    assert coordinator.overrides[1].source == "service"
+    assert coordinator.overrides[1].expires_at is not None
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] is None
+
+    asyncio.run(coordinator._async_handle_manual_override_helper(False))
+
+    assert len(coordinator.overrides) == 1
+    assert coordinator.overrides[0].source == "service"
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] == (
+        coordinator.overrides[0].expires_at
+    )
+
+
+def test_hvac_control_from_ownership_normalizes_legacy_records() -> None:
+    started_at = datetime.now(UTC) - timedelta(minutes=10)
+    assert _hvac_control_from_ownership(
+        {
+            "climate_automations": {"automation.hvac": "on"},
+            "planner_takeover_started_at": started_at,
+        }
+    ) == {"legacy_ownership": True}
+    assert _hvac_control_from_ownership(
+        {
+            "hvac_control": {"phase": "peak_coast"},
+            "hvac_release_hold_until": started_at,
+        }
+    ) == {"phase": "peak_coast", "released_until": started_at}
 
 
 def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> None:
@@ -2788,6 +3234,28 @@ def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> N
     asyncio.run(coordinator._async_clear_expired_manual_hvac_state())
 
     assert "manual_hvac_override_expires_at" in coordinator.store.data["ownership"]
+    assert coordinator._manual_override_helper_guard is None
+
+
+def test_expired_manual_hvac_cleanup_keeps_override_until_helper_turns_off() -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._async_clear_expired_manual_hvac_state = AsyncMock(return_value=False)
+
+    asyncio.run(coordinator._async_reconcile_expired_manual_hvac_state(True))
+
+    assert coordinator.overrides == [
+        Override(
+            kind="manual_hvac",
+            source="helper",
+            expires_at=None,
+            reason="manual_hvac_helper_cleanup_failed",
+        )
+    ]
+
+    coordinator._async_clear_expired_manual_hvac_state = AsyncMock(return_value=True)
+    asyncio.run(coordinator._async_reconcile_expired_manual_hvac_state(True))
+
+    assert coordinator.overrides == []
 
 
 def test_manual_hvac_change_handler_uses_configured_duration() -> None:
@@ -2822,7 +3290,12 @@ def test_record_ev_trip_event_saves_when_values_change() -> None:
 
 
 def test_production_control_runtime_methods_update_store_and_refresh() -> None:
-    coordinator = _coordinator_for_runtime_services(store_data={"production": {"dry_run_ready_cycles": 3}})
+    coordinator = _coordinator_for_runtime_services(
+        store_data={
+            "production": {"dry_run_ready_cycles": 3},
+            "ownership": {"hvac_control": {"phase": "peak_coast"}},
+        }
+    )
 
     asyncio.run(coordinator.async_arm_production_control("operator_ack"))
     asyncio.run(coordinator.async_disarm_production_control("operator_stop"))
@@ -2833,6 +3306,7 @@ def test_production_control_runtime_methods_update_store_and_refresh() -> None:
     assert coordinator.store.production_saves[0]["armed_reason"] == "operator_ack"
     assert coordinator.store.production_saves[1]["armed"] is False
     assert coordinator.store.production_saves[1]["disarmed_reason"] == "operator_stop"
+    assert coordinator.executor.hvac_releases == ["production_control_disarmed"]
     assert coordinator.store.control_pause_saves[0]["assets"] == ["ev"]
     assert coordinator.store.control_pause_saves[0]["reason"] == "maintenance"
     assert coordinator.store.control_pause_saves[1]["active"] is False

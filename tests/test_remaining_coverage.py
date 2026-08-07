@@ -67,7 +67,6 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.ownership import EnphaseProfileGuard, OwnershipState
-from custom_components.ha_energy_planner.planner import DryRunPlanner
 from custom_components.ha_energy_planner.preflight import (
     _audit_report,
     _bounded_join,
@@ -224,9 +223,7 @@ def test_current_plan_report_defensive_and_status_branches() -> None:
         input_issues=[],
         created_at=now,
     )
-    assert _current_plan_report(
-        malformed_horizon, now=now, last_refresh_metadata=refresh
-    )["adequate_coverage"] is False
+    assert _current_plan_report(malformed_horizon, now=now, last_refresh_metadata=refresh)["adequate_coverage"] is False
     stale_status = SimpleNamespace(
         **{
             **malformed_horizon.__dict__,
@@ -599,38 +596,6 @@ def test_remaining_setup_services_without_entries() -> None:
         assert error.value.translation_key == "no_config_entry"
 
 
-def test_remaining_planner_guard_branches() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5, "hvac_precondition_lead_minutes": 0})
-    context = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, None, 0.05, 0, 1), DecisionSlot(now + timedelta(minutes=5), 0.5, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.AWAY,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-    )
-    start = now
-    end = now + timedelta(minutes=5)
-
-    assert planner._hvac_suppression_action(context, start, end) is None
-    assert planner._hvac_preconditioning_action(context, start, end) is None
-    context.occupancy_state = OccupancyState.OCCUPIED
-    assert planner._hvac_preconditioning_action(context, start, end) is None
-    context.current_hvac_temperature_c = 22
-    context.occupied_temperature_low_c = 20
-    context.occupied_temperature_high_c = 24
-    assert planner._hvac_preconditioning_action(context, start, end) is None
-    context.slots[0].import_price = 0.1
-    assert planner._hvac_preconditioning_action(context, start, end) is None
-
-    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5, "hvac_precondition_lead_minutes": 10})
-    context.current_hvac_temperature_c = 22
-    assert planner._hvac_preconditioning_action(context, start, end) is None
-
-
 def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
     assert _invalid_response_reason({1: "bad"}) == "ai_response_unsupported_fields"
     assert _parse_response({"response": {"data": '{"confidence": 0.5}'}}) == {"confidence": 0.5}
@@ -819,8 +784,8 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
             {"daikin_climate_entity": "climate.daikin", "climate_automation_entities": "automation.hvac"},
         ).async_execute(suppress_action)
     )
-    assert suppress_result.reason == "hvac_automation_rollback_failed"
-    assert suppress_result.saved_automation_states == {"automation.hvac": "on"}
+    assert suppress_result.reason == "hvac_automation_service_failed"
+    assert suppress_result.saved_automation_states == {}
     state = SimpleNamespace(state="cool", attributes={"target_temp_low": 20, "target_temp_high": "bad"})
     from custom_components.ha_energy_planner.hvac_adapter import _already_in_desired_state
 
@@ -906,64 +871,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert _attribute_value({"Camel Key": "value"}, "camel_key") == "value"
     assert _attribute_value({"Camel Key": "value"}, "camel key") == "value"
     assert _attribute_value({"direct": "value"}, "direct") == "value"
-    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5, "hvac_precondition_lead_minutes": 10})
-    ctx = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-        current_hvac_temperature_c=17,
-        occupied_temperature_low_c=20,
-        occupied_temperature_high_c=24,
-    )
-    assert planner._hvac_preconditioning_action(ctx, now, now + timedelta(minutes=5)) is None
-    ctx2 = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-        current_hvac_temperature_c=22,
-        occupied_temperature_low_c=20,
-        occupied_temperature_high_c=24,
-    )
-    assert planner._hvac_suppression_action(ctx2, now, now + timedelta(minutes=5)) is None
-    ctx3 = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-        current_hvac_temperature_c=17,
-        occupied_temperature_low_c=20,
-        occupied_temperature_high_c=24,
-    )
-    assert planner._hvac_preconditioning_action(ctx3, now, now + timedelta(minutes=5)) is None
-    ctx4 = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.1, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-        current_hvac_temperature_c=22,
-        occupied_temperature_low_c=20,
-        occupied_temperature_high_c=24,
-    )
-    assert planner._hvac_preconditioning_action(ctx4, now, now + timedelta(minutes=5)) is None
-
     # Subentry no-consolidation early return.
     entry = SimpleNamespace(
         subentries={

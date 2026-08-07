@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -294,13 +294,9 @@ def test_executor_keep_on_ignores_unavailable_separate_start_control() -> None:
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
-    assert hass.services.calls == [
-        ("switch", "turn_on", {"entity_id": "switch.ev_control"})
-    ]
+    assert hass.services.calls == [("switch", "turn_on", {"entity_id": "switch.ev_control"})]
     assert store.data["outcomes"][0].result == "applied"
-    assert store.data["outcomes"][0].reason == (
-        "ev_charger_enabled_for_preconditioning"
-    )
+    assert store.data["outcomes"][0].reason == ("ev_charger_enabled_for_preconditioning")
 
 
 def test_executor_keep_on_rejects_invalid_persistent_controls() -> None:
@@ -1942,7 +1938,15 @@ def test_executor_records_mode_rejections_without_hass() -> None:
         now + timedelta(minutes=1),
         ActionAsset.EV,
         ActionKind.EV_START,
-        {},
+        {
+            "phase": "preconditioning",
+            "period_start": now + timedelta(minutes=30),
+            "period_end": now + timedelta(hours=2),
+            "baseline_price": 0.10,
+            "mode": "heat",
+            "precondition_target": 23.0,
+            "coast_target": 19.0,
+        },
         [],
         [],
         None,
@@ -1998,7 +2002,13 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+            return {"automation.hvac": "on"}, {"switch.zone": "off"}
+
         async def async_execute(self, action: PlanAction) -> object:
+            assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+            assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
+            assert store.flush_count >= 1
             return type(
                 "Result",
                 (),
@@ -2008,6 +2018,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
                     "pre_state": {"climate.daikin": "off"},
                     "post_state": {"climate.daikin": "heat"},
                     "saved_automation_states": {"automation.hvac": "on"},
+                    "saved_zone_states": {"switch.zone": "off"},
                 },
             )()
 
@@ -2020,7 +2031,16 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
         now + timedelta(minutes=1),
         ActionAsset.DAIKIN,
         ActionKind.SET_HVAC,
-        {},
+        {
+            "phase": "preconditioning",
+            "period_start": now + timedelta(minutes=30),
+            "period_end": now + timedelta(hours=2),
+            "baseline_price": 0.2,
+            "mode": "heat",
+            "precondition_target": 23.0,
+            "coast_target": 19.0,
+            "enable_zones": True,
+        },
         [],
         [],
         None,
@@ -2054,15 +2074,557 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
 
     assert store.data["outcomes"][0].result == "applied"
     assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+    assert store.data["ownership"]["hvac_control"]["phase"] == "preconditioning"
+    assert store.data["ownership"]["hvac_control"]["coast_target"] == 19.0
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
     assert "planner_hvac_action_expires_at" in store.data["ownership"]
+    assert store.flush_count == 1
+
+    takeover_started_at = store.data["ownership"]["planner_takeover_started_at"]
+    peak_action = replace(
+        action,
+        action_id="hvac-peak",
+        desired_state={**action.desired_state, "phase": "peak_coast", "coast_target": 19.0},
+    )
+    asyncio.run(executor.async_evaluate(replace(plan, actions=[peak_action])))
+
+    assert store.data["ownership"]["planner_takeover_started_at"] == takeover_started_at
+    assert store.flush_count == 2
+
+
+def test_executor_marks_away_off_without_taking_zone_ownership(
+    monkeypatch: object,
+) -> None:
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+            return {"automation.hvac": "on"}, {"switch.zone": "off"}
+
+        async def async_execute(self, action: PlanAction) -> object:
+            assert action.desired_state == {"hvac_mode": "off"}
+            return SimpleNamespace(
+                applied=True,
+                reason="hvac_action_applied",
+                pre_state={"climate.daikin": "heat", "switch.zone": "off"},
+                post_state={"climate.daikin": "off", "switch.zone": "off"},
+                saved_automation_states={"automation.hvac": "on"},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-away",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"hvac_mode": "off"},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "heat"}),
+        entry_data={"daikin_climate_entity": "climate.daikin"},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True},
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan))
+
+    away_control = store.data["ownership"]["hvac_control"]
+    assert away_control["zone_states"] == {}
+    assert away_control["phase"] == "away_off"
+    assert isinstance(away_control["started_at"], datetime)
+
+
+def test_persisted_preconditioning_reaches_no_change_check_after_limits(
+    monkeypatch: object,
+) -> None:
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+            return {"automation.hvac": "off"}, {"switch.zone": "on"}
+
+        async def async_execute(self, action: PlanAction) -> object:
+            return SimpleNamespace(
+                applied=True,
+                reason="already_in_desired_hvac_state",
+                pre_state={"climate.daikin": "heat"},
+                post_state={"climate.daikin": "heat"},
+                saved_automation_states={"automation.hvac": "off"},
+                saved_zone_states={"switch.zone": "on"},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-preconditioning",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "phase": "preconditioning",
+            "hvac_mode": "heat",
+            "target_temperature": 23.0,
+            "precondition_min_price_delta": 0.20,
+            "suppression_min_price_delta": 0.15,
+            "enable_zones": True,
+            "suppress_automations": True,
+        },
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_CLIMATE_CONTROL_ENABLED: True,
+        CONF_COMMAND_RATE_LIMIT_SECONDS: 3600,
+        CONF_MAX_DAILY_CLIMATE_ACTIONS: 1,
+    }
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "phase": "preconditioning",
+            "zone_states": {"switch.zone": "off"},
+        },
+        "planner_takeover_started_at": now - timedelta(minutes=1),
+    }
+    store.data["command_rate_limits"] = {"daikin:set_hvac": now}
+    store.data["execution_audit"] = [
+        {
+            "asset": "daikin",
+            "attempted_at": now,
+            "result": "applied",
+        }
+    ]
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "heat"}),
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options=options,
+    )
+    _arm_store(store, executor)
+    context = _context(now)
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+
+    asyncio.run(executor.async_evaluate(plan, context))
+
+    assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+    assert store.data["outcomes"][-1].reason == "already_in_desired_hvac_state"
+    assert store.data["ownership"]["hvac_control"]["precondition_min_price_delta"] == 0.20
+    assert store.data["ownership"]["hvac_control"]["suppression_min_price_delta"] == 0.15
+
+
+def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
+    monkeypatch: object,
+) -> None:
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+            return {"automation.hvac": "on"}, {"switch.zone": "off"}
+
+        async def async_execute(self, action: PlanAction) -> object:
+            assert "hvac_control" in store.data["ownership"]
+            return SimpleNamespace(
+                applied=False,
+                reason="hvac_control_service_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+                rollback_succeeded=True,
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"phase": "preconditioning", "mode": "heat", "target_temperature": 23.0},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    store.data["ownership"] = {"enphase_profile": "AI Optimisation"}
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "off"}),
+        entry_data={"daikin_climate_entity": "climate.daikin"},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True},
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan))
+
+    assert store.data["ownership"] == {"enphase_profile": "AI Optimisation"}
+    assert store.data["outcomes"][0].reason == "hvac_control_service_failed"
+
+
+def test_hvac_specific_release_restores_zones_without_touching_other_assets(monkeypatch: object) -> None:
+    restored: list[tuple[dict[str, str], dict[str, str]]] = []
+
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, str],
+        ) -> object:
+            restored.append((dict(automations), dict(zones)))
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={"switch.zone": "on"},
+                post_state={"switch.zone": "off"},
+                saved_automation_states={},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {"zone_states": {"switch.zone": "off"}, "phase": "peak_coast"},
+        "ev_smart_charging_state": {"switch.ev": "off"},
+        "enphase_profile": "AI Optimisation",
+        "manual_hvac_override_expires_at": None,
+    }
+
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_release_hvac_control("manual"))
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [({"automation.hvac": "on"}, {"switch.zone": "off"})]
+    assert store.data["ownership"] == {
+        "ev_smart_charging_state": {"switch.ev": "off"},
+        "enphase_profile": "AI Optimisation",
+        "manual_hvac_override_expires_at": None,
+    }
+
+
+def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-release",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.RELEASE_HVAC,
+        {"release_reason": "comfort", "released_until": now + timedelta(hours=1)},
+        [],
+        [],
+        0.0,
+        1.0,
+        None,
+    )
+    competing_action = PlanAction(
+        "ev-start",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.EV,
+        ActionKind.EV_START,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "unsafe",
+        InputHealth.UNSAFE,
+        PlannerMode.DRY_RUN,
+        "test",
+        0.0,
+        None,
+        [competing_action, action],
+        [],
+    )
+    executor = Executor(FakeStore())
+    releases: list[tuple[str, str, object]] = []
+
+    async def release(reason: str, *, plan_id: str, action: object) -> object:
+        releases.append((reason, plan_id, action))
+        return SimpleNamespace()
+
+    executor.async_release_hvac_control = release
+
+    consumed_action = asyncio.run(executor.async_evaluate(plan))
+
+    assert releases == [("comfort", "plan-1", action)]
+    assert consumed_action is action
+
+
+def test_blocked_owned_hvac_continuation_releases_before_competing_action() -> None:
+    now = datetime.now(UTC)
+    competing_action = PlanAction(
+        "ev-start",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.EV,
+        ActionKind.EV_START,
+        {},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    continuation = PlanAction(
+        "hvac-peak",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"phase": "peak_coast", "hvac_mode": "heat", "target_temperature": 19.0},
+        [],
+        [],
+        None,
+        1.0,
+        None,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [competing_action, continuation],
+        [],
+    )
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": {"phase": "preconditioning"}}
+    executor = Executor(
+        store,
+        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+    )
+    releases: list[tuple[str, str]] = []
+
+    async def release(reason: str, *, plan_id: str) -> object:
+        releases.append((reason, plan_id))
+        return SimpleNamespace()
+
+    executor.async_release_hvac_control = release
+
+    consumed_action = asyncio.run(executor.async_evaluate(plan))
+
+    assert releases == [("hvac_continuation_blocked_production_gate_not_armed", "plan-1")]
+    assert consumed_action is continuation
+    assert store.data["outcomes"] == []
+
+
+def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypatch: object) -> None:
+    empty = FakeStore()
+    empty_release = asyncio.run(Executor(empty).async_release_hvac_control("empty"))
+    assert empty_release.result == OutcomeResult.SKIPPED
+    assert empty_release.reason == "already_released_hvac_control"
+    assert (
+        _daily_action_cap_reason(
+            ActionAsset.DAIKIN,
+            {CONF_MAX_DAILY_CLIMATE_ACTIONS: 1},
+            [
+                {
+                    "asset": empty_release.asset,
+                    "kind": empty_release.kind,
+                    "attempted_at": empty_release.attempted_at,
+                    "result": empty_release.result,
+                }
+            ],
+            empty_release.attempted_at,
+        )
+        is None
+    )
+
+    class RaisingAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, states: dict[str, str]) -> object:
+            raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingAdapter)
+    failed_store = FakeStore()
+    failed_store.data["ownership"] = {"climate_automations": {"automation.hvac": "on"}}
+    failed = asyncio.run(Executor(failed_store, hass=FakeHass()).async_release_hvac_control("manual"))
+    assert failed.result == OutcomeResult.FAILED
+    assert failed_store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+    assert failed_store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "hvac_release_failed"
+
+    class PartialAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, automations: dict[str, str], zones: dict[str, str]) -> object:
+            return SimpleNamespace(
+                applied=False,
+                rollback_succeeded=False,
+                reason="hvac_release_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={"automation.hvac": "on"},
+                saved_zone_states={"switch.zone": "off"},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", PartialAdapter)
+    partial_store = FakeStore()
+    partial_store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {"zone_states": {"switch.zone": "off"}},
+    }
+    failed_hold_until = datetime.now(UTC) + timedelta(hours=1)
+    partial_action = SimpleNamespace(
+        action_id="partial-release",
+        desired_state={"released_until": failed_hold_until},
+    )
+    partial = asyncio.run(
+        Executor(partial_store, hass=FakeHass()).async_release_hvac_control(
+            "comfort",
+            action=partial_action,
+        )
+    )
+    assert partial.result == OutcomeResult.FAILED
+    assert partial_store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
+    assert partial_store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "hvac_release_failed"
+    assert partial_store.data["ownership"]["hvac_release_hold_until"] == failed_hold_until
+
+    class SuccessfulAdapter(PartialAdapter):
+        async def async_restore(self, automations: dict[str, str], zones: dict[str, str]) -> object:
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", SuccessfulAdapter)
+    retried = asyncio.run(Executor(partial_store, hass=FakeHass()).async_release_hvac_control("retry"))
+    assert retried.result == OutcomeResult.RESTORED
+    assert partial_store.data["ownership"] == {"hvac_release_hold_until": failed_hold_until}
+
+    held_store = FakeStore()
+    held_store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {"zone_states": {"switch.zone": "off"}},
+    }
+    hold_until = datetime.now(UTC) + timedelta(hours=1)
+    release_action = SimpleNamespace(
+        action_id="release",
+        desired_state={"released_until": hold_until},
+    )
+    held = asyncio.run(
+        Executor(held_store, hass=FakeHass()).async_release_hvac_control("comfort", action=release_action)
+    )
+    assert held.result == OutcomeResult.RESTORED
+    assert held_store.data["ownership"] == {"hvac_release_hold_until": hold_until}
 
 
 def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: object) -> None:
-    restored_states: list[dict[str, str]] = []
+    restored_states: list[tuple[dict[str, str], dict[str, str]]] = []
 
     class TransactionalDaikinAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+            return (
+                {
+                    "automation.hvac": "on",
+                    "automation.already_restored": "on",
+                },
+                {
+                    "switch.zone": "off",
+                    "switch.already_restored": "off",
+                },
+            )
 
         async def async_execute(self, action: PlanAction) -> object:
             return SimpleNamespace(
@@ -2071,13 +2633,15 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
                 pre_state={"automation.hvac": "on"},
                 post_state={"automation.hvac": "off"},
                 saved_automation_states={"automation.hvac": "on"},
+                saved_zone_states={"switch.zone": "off"},
                 rollback_succeeded=False,
             )
 
-        async def async_restore(self, states: dict[str, str]) -> object:
-            restored_states.append(dict(states))
+        async def async_restore(self, states: dict[str, str], zones: dict[str, str]) -> object:
+            restored_states.append((dict(states), dict(zones)))
             return SimpleNamespace(
                 applied=True,
+                rollback_succeeded=True,
                 reason="hvac_automation_state_restored",
                 pre_state={"automation.hvac": "off"},
                 post_state={"automation.hvac": "on"},
@@ -2125,10 +2689,78 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
     assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+    assert store.data["ownership"]["hvac_control"] == {
+        "zone_states": {"switch.zone": "off"},
+        "required_evidence_lost": "hvac_acquisition_rollback_failed",
+    }
     outcome = asyncio.run(executor.async_restore_safe_state("retry"))
     assert outcome.result == OutcomeResult.RESTORED
-    assert restored_states == [{"automation.hvac": "on"}]
+    assert restored_states == [({"automation.hvac": "on"}, {"switch.zone": "off"})]
     assert store.data["ownership"] == {}
+
+
+def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
+    monkeypatch: object,
+) -> None:
+    class PartialDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            states: dict[str, str],
+            zones: dict[str, str],
+        ) -> object:
+            assert states == {
+                "automation.restored": "on",
+                "automation.failed": "on",
+            }
+            assert zones == {
+                "switch.restored": "off",
+                "switch.failed": "off",
+            }
+            return SimpleNamespace(
+                applied=False,
+                rollback_succeeded=False,
+                reason="hvac_release_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={"automation.failed": "on"},
+                saved_zone_states={"switch.failed": "off"},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", PartialDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {
+            "automation.restored": "on",
+            "automation.failed": "on",
+        },
+        "hvac_control": {
+            "phase": "peak_coast",
+            "zone_states": {
+                "switch.restored": "off",
+                "switch.failed": "off",
+            },
+        },
+        "planner_takeover_started_at": "2026-01-01T00:00:00+00:00",
+        "planner_hvac_action_expires_at": "2026-01-01T00:02:00+00:00",
+    }
+    executor = Executor(store, hass=FakeHass())
+
+    outcome = asyncio.run(executor.async_restore_safe_state("retry"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.failed": "on"},
+        "hvac_control": {
+            "phase": "peak_coast",
+            "zone_states": {"switch.failed": "off"},
+            "required_evidence_lost": "hvac_release_failed",
+        },
+        "planner_takeover_started_at": "2026-01-01T00:00:00+00:00",
+        "planner_hvac_action_expires_at": "2026-01-01T00:02:00+00:00",
+    }
 
 
 def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object) -> None:
@@ -2450,18 +3082,13 @@ def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None
     outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
 
     assert outcome.result == OutcomeResult.FAILED
-    assert outcome.reason == (
-        "entry_unload:ev_stop_not_confirmed:enphase_ai_profile_not_configured"
-    )
+    assert outcome.reason == ("entry_unload:ev_stop_not_confirmed:enphase_ai_profile_not_configured")
     assert hass.services.calls[0] == (
         "button",
         "press",
         {"entity_id": "button.old_stop"},
     )
-    assert all(
-        call[2].get("entity_id") != "switch.new_charger"
-        for call in hass.services.calls
-    )
+    assert all(call[2].get("entity_id") != "switch.new_charger" for call in hass.services.calls)
     retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
     assert retained["retain_when_unloaded"] is True
     assert store.data["ev_grid_reservation"]["active"] is True
@@ -2515,10 +3142,7 @@ def test_executor_restore_uses_owned_ev_control_topology_after_reconfigure() -> 
         "turn_off",
         {"entity_id": "input_boolean.old_stop"},
     )
-    assert all(
-        call[2].get("entity_id") != "input_boolean.new_stop"
-        for call in hass.services.calls
-    )
+    assert all(call[2].get("entity_id") != "input_boolean.new_stop" for call in hass.services.calls)
     assert hass.states.values["input_boolean.new_stop"] == "on"
 
 
@@ -2598,6 +3222,10 @@ def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypa
     assert store.data["ownership"] == {
         "climate_automations": {"automation.hvac": "on"},
         "enphase_profile": "AI Optimisation",
+        "hvac_control": {
+            "zone_states": {},
+            "required_evidence_lost": "hvac_release_failed",
+        },
     }
 
 
@@ -2617,7 +3245,13 @@ def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: obje
 
     assert outcome.result == "failed"
     assert "hvac_restore_exception" in outcome.reason
-    assert store.data["ownership"] == {"climate_automations": {"automation.hvac": "on"}}
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {},
+            "required_evidence_lost": "hvac_release_failed",
+        },
+    }
 
 
 def test_executor_notification_helpers_skip_when_unavailable() -> None:
@@ -2831,9 +3465,7 @@ def test_manual_ev_commands_share_capacity_and_release_it_on_stop() -> None:
 
     started_a = asyncio.run(executor_a.async_manual_ev_charging(True, context_a))
     blocked_b = asyncio.run(executor_b.async_manual_ev_charging(True, context_b))
-    assert store_a.data["ownership"]["ev_smart_charging_command_entity_id"] == (
-        "input_boolean.ev_a_charger"
-    )
+    assert store_a.data["ownership"]["ev_smart_charging_command_entity_id"] == ("input_boolean.ev_a_charger")
 
     stopped_a = asyncio.run(executor_a.async_manual_ev_charging(False, None))
     started_b = asyncio.run(executor_b.async_manual_ev_charging(True, context_b))
@@ -2910,9 +3542,7 @@ def test_manual_ev_start_is_safety_stopped_while_planner_is_disabled_and_dry_run
     asyncio.run(executor.async_evaluate(inactive_plan, inactive_context))
 
     assert hass.states.values["input_boolean.ev_charger"] == "on"
-    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
-        "ev-a"
-    }
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
 
     hass.states.values["binary_sensor.ev_connected"] = "off"
     inactive_context.ev_connected = False
@@ -2922,10 +3552,7 @@ def test_manual_ev_start_is_safety_stopped_while_planner_is_disabled_and_dry_run
     assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
     assert store.data["ownership"] == {}
     assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
-    assert (
-        store.data["outcomes"][-1].desired_state["charging_reason"]
-        == "ev_disconnected_safety_stop"
-    )
+    assert store.data["outcomes"][-1].desired_state["charging_reason"] == "ev_disconnected_safety_stop"
 
 
 def test_manual_ev_stop_uses_owned_topology_after_reconfigure() -> None:
@@ -2969,9 +3596,7 @@ def test_manual_ev_stop_uses_owned_topology_after_reconfigure() -> None:
     result = asyncio.run(executor.async_manual_ev_charging(False, None))
 
     assert result.applied is True
-    assert hass.services.calls == [
-        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
-    ]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.old_charger"})]
     assert hass.states.values["switch.old_charger"] == "off"
     assert hass.states.values["switch.new_charger"] == "on"
     assert store.data["ownership"] == {}
@@ -3145,9 +3770,7 @@ def test_manual_ev_start_rejects_control_without_safe_stop_path() -> None:
     hass = FakeHass({"button.ev_control": "unknown"})
     hass.data = {}
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     executor = Executor(
@@ -3166,10 +3789,13 @@ def test_manual_ev_start_rejects_control_without_safe_stop_path() -> None:
     assert result.applied is False
     assert result.reason == "ev_stop_control_unsupported"
     assert hass.services.calls == []
-    assert hass.data.get("ha_energy_planner", {}).get(
-        "ev_grid_reservations",
-        {},
-    ) == {}
+    assert (
+        hass.data.get("ha_energy_planner", {}).get(
+            "ev_grid_reservations",
+            {},
+        )
+        == {}
+    )
     assert store.data["ownership"] == {}
     assert store.data["outcomes"][-1].result == OutcomeResult.REJECTED
 
@@ -3225,9 +3851,7 @@ def test_manual_ev_start_adopts_and_restores_already_active_charger() -> None:
     )
     hass.data = {}
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     executor = Executor(
@@ -3253,9 +3877,7 @@ def test_manual_ev_start_adopts_and_restores_already_active_charger() -> None:
         CONF_EV_CHARGER: "on",
         CONF_EV_CONNECTED: "on",
     }
-    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
-        "ev-a"
-    }
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
     assert hass.services.calls == []
 
     restored = asyncio.run(executor.async_restore_safe_state("entry_unload"))
@@ -3408,9 +4030,7 @@ def test_manual_ev_rolled_back_start_clears_provisional_recovery_state(
     hass = FakeHass({"switch.ev_charger": "off"})
     hass.data = {}
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     executor = Executor(
@@ -3774,17 +4394,13 @@ def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> 
         }
     }
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {CONF_EV_CHARGER: "on"},
         "ev_smart_charging_command_entity_id": "switch.ev_charger",
-        "ev_smart_charging_control_topology": {
-            CONF_EV_CHARGER: "switch.ev_charger"
-        },
+        "ev_smart_charging_control_topology": {CONF_EV_CHARGER: "switch.ev_charger"},
     }
     options = {
         **DEFAULT_OPTIONS,
@@ -3838,13 +4454,9 @@ def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> 
     calls_after_stop = list(hass.services.calls)
     asyncio.run(executor.async_restore_safe_state("entry_unload"))
 
-    assert calls_after_stop == [
-        ("switch", "turn_off", {"entity_id": "switch.ev_charger"})
-    ]
+    assert calls_after_stop == [("switch", "turn_off", {"entity_id": "switch.ev_charger"})]
     assert not any(
-        domain == "switch"
-        and service == "turn_on"
-        and data.get("entity_id") == "switch.ev_charger"
+        domain == "switch" and service == "turn_on" and data.get("entity_id") == "switch.ev_charger"
         for domain, service, data in hass.services.calls
     )
     assert hass.states.values["switch.ev_charger"] == "off"
@@ -3894,15 +4506,9 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
         "reserved_at": now.isoformat(),
     }
     hass = FakeHass()
-    hass.data = {
-        "ha_energy_planner": {
-            "ev_grid_reservations": {"ev-a": reservation}
-        }
-    }
+    hass.data = {"ha_energy_planner": {"ev_grid_reservations": {"ev-a": reservation}}}
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     ownership = {
@@ -3958,9 +4564,7 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
     assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
     assert store.data["outcomes"][-1].reason == "ev_stop_not_confirmed"
     assert store.data["ownership"] == ownership
-    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"][
-        "retain_when_unloaded"
-    ] is True
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]["retain_when_unloaded"] is True
 
 
 def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
@@ -4267,8 +4871,7 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
     }
     hass.config_entries = SimpleNamespace(
         async_entries=lambda domain: [
-            SimpleNamespace(entry_id=entry_id, runtime_data=object())
-            for entry_id in ("ev-a", "ev-b")
+            SimpleNamespace(entry_id=entry_id, runtime_data=object()) for entry_id in ("ev-a", "ev-b")
         ]
     )
     store = FakeStore()
@@ -4323,10 +4926,7 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
     context_b.slots[0].baseline_load_forecast_kw = 0.0
     context_b.slots[0].pv_forecast_kw = 0.0
     context_b.slots[0].projected_ev_load_kw = 3.0
-    assert (
-        executor_b._ev_reservation_safety_issue(context_b)
-        == "multi_ev_grid_import_limit_exceeded"
-    )
+    assert executor_b._ev_reservation_safety_issue(context_b) == "multi_ev_grid_import_limit_exceeded"
     assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-b"
 
 
@@ -4350,9 +4950,7 @@ def test_disconnected_ev_retains_capacity_when_button_stop_is_unconfirmed() -> N
         }
     }
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     ownership = {
@@ -4427,9 +5025,7 @@ def test_compensated_owned_safety_stop_clears_ownership_and_capacity() -> None:
         }
     }
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     store.data["ownership"] = {
@@ -4534,9 +5130,7 @@ def test_owned_safety_stop_uses_persisted_topology_after_reconfigure() -> None:
 
     asyncio.run(executor.async_evaluate(plan, context))
 
-    assert hass.services.calls == [
-        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
-    ]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.old_charger"})]
     assert hass.states.values["switch.old_charger"] == "off"
     assert hass.states.values["switch.new_charger"] == "on"
     assert store.data["ownership"] == {}
@@ -4562,9 +5156,7 @@ def test_recovered_reservation_stops_provisional_topology_before_new_start() -> 
         },
     }
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     store = FakeStore()
     # This is the durable state possible after a service command is accepted
@@ -4625,9 +5217,7 @@ def test_recovered_reservation_stops_provisional_topology_before_new_start() -> 
     context.ev_connected = True
     context.slots[0].projected_ev_load_kw = 7.0
 
-    manual_start = asyncio.run(
-        executor.async_manual_ev_charging(True, context)
-    )
+    manual_start = asyncio.run(executor.async_manual_ev_charging(True, context))
 
     assert manual_start.applied is False
     assert manual_start.reason == "ev_recovery_stop_required"
@@ -4635,17 +5225,12 @@ def test_recovered_reservation_stops_provisional_topology_before_new_start() -> 
 
     asyncio.run(executor.async_evaluate(plan, context))
 
-    assert hass.services.calls == [
-        ("switch", "turn_off", {"entity_id": "switch.old_charger"})
-    ]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.old_charger"})]
     assert hass.states.values["switch.old_charger"] == "off"
     assert hass.states.values["switch.new_charger"] == "off"
     assert store.data["ownership"] == {}
     assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
-    assert (
-        store.data["outcomes"][-1].desired_state["charging_reason"]
-        == "ev_recovered_reservation_safety_stop"
-    )
+    assert store.data["outcomes"][-1].desired_state["charging_reason"] == "ev_recovered_reservation_safety_stop"
     assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
     assert store.data["outcomes"][-1].service_target == "switch.old_charger"
 
@@ -4677,8 +5262,7 @@ def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
     }
     hass.config_entries = SimpleNamespace(
         async_entries=lambda domain: [
-            SimpleNamespace(entry_id=entry_id, runtime_data=object())
-            for entry_id in ("ev-a", "ev-b")
+            SimpleNamespace(entry_id=entry_id, runtime_data=object()) for entry_id in ("ev-a", "ev-b")
         ]
     )
     store = FakeStore()
@@ -4754,9 +5338,7 @@ def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
             {"entity_id": "input_boolean.ev_a_stop"},
         )
     ]
-    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
-        "ev-b"
-    }
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-b"}
     assert store.data["ownership"] == {}
     assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
     assert (
@@ -4788,8 +5370,7 @@ def test_multi_ev_limit_conflict_claims_only_one_shedding_entry() -> None:
     }
     hass.config_entries = SimpleNamespace(
         async_entries=lambda domain: [
-            SimpleNamespace(entry_id=entry_id, runtime_data=object())
-            for entry_id in ("ev-a", "ev-b")
+            SimpleNamespace(entry_id=entry_id, runtime_data=object()) for entry_id in ("ev-a", "ev-b")
         ]
     )
     executor_a = Executor(FakeStore(), hass=hass, entry_id="ev-a")
@@ -4804,10 +5385,7 @@ def test_multi_ev_limit_conflict_claims_only_one_shedding_entry() -> None:
     context_b.slots[0].projected_ev_load_kw = 3.0
 
     assert executor_a._ev_grid_shedding_claim() is None
-    assert (
-        executor_a._ev_reservation_safety_issue(context_a)
-        == "multi_ev_grid_import_limit_exceeded"
-    )
+    assert executor_a._ev_reservation_safety_issue(context_a) == "multi_ev_grid_import_limit_exceeded"
     assert executor_b._ev_reservation_safety_issue(context_b) is None
     assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-a"
 
@@ -4851,10 +5429,7 @@ def test_loaded_ev_can_replace_unloaded_retained_shedding_claim() -> None:
     context.slots[0].projected_ev_load_kw = 3.0
 
     assert executor._ev_grid_shedding_claim() is None
-    assert (
-        executor._ev_reservation_safety_issue(context)
-        == "multi_ev_grid_import_limit_exceeded"
-    )
+    assert executor._ev_reservation_safety_issue(context) == "multi_ev_grid_import_limit_exceeded"
     assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-b"
 
 
@@ -4873,9 +5448,7 @@ def test_single_ev_reservation_detects_tightened_import_limit() -> None:
         },
     }
     hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [
-            SimpleNamespace(entry_id="ev-a", runtime_data=object())
-        ]
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
     )
     executor = Executor(FakeStore(), hass=hass, entry_id="ev-a")
     context = _context(now)
@@ -4885,10 +5458,7 @@ def test_single_ev_reservation_detects_tightened_import_limit() -> None:
     # still owns the persisted 11 kW high-watermark until a confirmed stop.
     context.slots[0].projected_ev_load_kw = 3.0
 
-    assert (
-        executor._ev_reservation_safety_issue(context)
-        == "grid_import_limit_exceeded"
-    )
+    assert executor._ev_reservation_safety_issue(context) == "grid_import_limit_exceeded"
     assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-a"
 
 
@@ -4903,8 +5473,7 @@ def test_ev_reservation_safety_issue_ignores_incomplete_or_safe_evidence() -> No
     hass.data = {"ha_energy_planner": {"ev_grid_reservations": {}}}
     hass.config_entries = SimpleNamespace(
         async_entries=lambda domain: [
-            SimpleNamespace(entry_id=entry_id, runtime_data=object())
-            for entry_id in ("ev-a", "ev-b")
+            SimpleNamespace(entry_id=entry_id, runtime_data=object()) for entry_id in ("ev-a", "ev-b")
         ]
     )
     executor.hass = hass
@@ -5188,9 +5757,7 @@ def test_ev_grid_reservation_defensive_branches() -> None:
 
     executor.store.data["ownership"] = []
     assert executor._owned_ev_control_topology() is None
-    executor.store.data["ownership"] = {
-        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"}
-    }
+    executor.store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
     assert (
         asyncio.run(
             executor._async_save_provisional_ev_ownership(
@@ -5201,6 +5768,4 @@ def test_ev_grid_reservation_defensive_branches() -> None:
         is False
     )
     asyncio.run(executor._async_clear_provisional_ev_ownership())
-    assert executor.store.data["ownership"] == {
-        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"}
-    }
+    assert executor.store.data["ownership"] == {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}

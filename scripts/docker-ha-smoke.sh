@@ -314,6 +314,8 @@ input_boolean:
     name: Climate change from scheduler
   fake_heater:
     name: Fake heater
+  fake_climate_zone:
+    name: Fake climate zone
   ev_connected:
     name: EV connected
     initial: true
@@ -405,7 +407,7 @@ template:
         attributes:
           unitOfMeasurement: "c/kWh"
           confidence: "{{ 0.94 }}"
-          detailedForecast: "{{ ([{'perKwh': ((states('input_number.import_price') | float) * 100) | round(3)}, {'perKwh': 31}, {'perKwh': 32}, {'perKwh': 33}, {'perKwh': 34}, {'perKwh': 35}, {'perKwh': 36}, {'perKwh': 37}, {'perKwh': 38}, {'perKwh': 39}, {'perKwh': 40}, {'perKwh': 41}] * 24) }}"
+          detailedForecast: "{{ ([{'perKwh': ((states('input_number.import_price') | float) * 100) | round(3)}, {'perKwh': 11}, {'perKwh': 12}, {'perKwh': 13}, {'perKwh': 14}, {'perKwh': -5}, {'perKwh': 60}, {'perKwh': 61}, {'perKwh': 62}, {'perKwh': 63}, {'perKwh': 64}, {'perKwh': 65}] * 24) }}"
       - name: Smoke export price forecast
         state: "{{ states('input_number.export_price') }}"
         attributes:
@@ -492,7 +494,7 @@ automation:
       - action: input_number.set_value
         data:
           entity_id: input_number.fake_indoor_temperature
-          value: 17.5
+          value: 21
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -508,19 +510,34 @@ automation:
         data:
           entity_id: input_number.fake_indoor_temperature
           value: 21
+      - action: input_boolean.turn_on
+        data:
+          entity_id: input_boolean.climate_change_from_scheduler
+      - action: climate.set_hvac_mode
+        data:
+          entity_id: climate.fake_daikin
+          hvac_mode: heat
+      - delay: "00:00:01"
+      - action: input_boolean.turn_off
+        data:
+          entity_id: input_boolean.climate_change_from_scheduler
       - action: automation.turn_on
         data:
           entity_id: automation.fake_climate_conflict
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
-          value: 0.60
+          value: 0.10
       - delay: "00:00:02"
       - action: ha_energy_planner.replan
       - delay: "00:00:07"
-      - action: ha_energy_planner.restore_safe_state
+      - action: input_boolean.turn_on
         data:
-          reason: docker_smoke_hvac_suppression_restore
+          entity_id: input_boolean.climate_manual_override
+      - delay: "00:00:03"
+      - action: input_boolean.turn_off
+        data:
+          entity_id: input_boolean.climate_manual_override
       - delay: "00:00:02"
       - action: input_number.set_value
         data:
@@ -902,6 +919,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "daikin_climate_entity": "climate.fake_daikin",
               "daikin_power_entity": "input_number.daikin_power",
               "climate_automation_entities": "automation.fake_climate_conflict",
+              "climate_zone_entities": ["input_boolean.fake_climate_zone"],
               "climate_change_from_scheduler_entity": "input_boolean.climate_change_from_scheduler",
               "climate_manual_override_entity": "input_boolean.climate_manual_override",
               "climate_target_low_entity": "input_number.climate_target_low",
@@ -975,7 +993,7 @@ cat > "$TMP_DIR/.storage/ha_energy_planner_state" <<'JSON'
       "armed_reason": "docker_smoke",
       "acknowledged_at": "2026-06-27T00:00:00+00:00",
       "dry_run_ready_cycles": 3,
-      "dry_run_evidence_fingerprint": "6c768c3429a8be31c1608b726aead98caa622fa68d5b90176bf9b130f1bc5132"
+      "dry_run_evidence_fingerprint": "1ce23c3a8e3ebf98310ff5b9f6cca57396f8dfe8e1f4bf47ec446e35e9ff820b"
     }
   }
 }
@@ -1203,7 +1221,7 @@ if baseline_training != [1.2, 1.4, 1.6, 1.8]:
     raise SystemExit(f"Forecast snapshot did not use HA template load forecast attributes: {baseline_training}")
 if not any(
     len(snapshot.get("preview", [])) >= 4
-    and [slot.get("import_price") for slot in snapshot["preview"][:4]][1:] == [0.31, 0.32, 0.33]
+    and [slot.get("import_price") for slot in snapshot["preview"][:4]][1:] == [0.11, 0.12, 0.13]
     and [slot.get("export_price") for slot in snapshot["preview"][:4]][1:] == [0.09, 0.10, 0.11]
     for snapshot in snapshots
 ):
@@ -1269,7 +1287,6 @@ restore_outcomes = [
 ]
 if not restore_outcomes:
     raise SystemExit("restore_safe_state service did not persist the smoke outcome")
-all_restore_outcomes = [item for item in outcomes if item.get("action_id") == "restore_safe_state"]
 if not any(
     item.get("result") == "restored"
     and "ev_saved_state_safe_stop" in item.get("reason", "")
@@ -1281,8 +1298,12 @@ if not any(
         "restore_safe_state did not confirm stopped EV charging and neutralize the start helper: "
         f"{restore_outcomes}"
     )
-if not any("hvac_automation_state_restored" in item.get("reason", "") for item in all_restore_outcomes):
-    raise SystemExit("restore_safe_state did not restore the mapped climate automation state")
+if not any(
+    "hvac_control_released" in item.get("reason", "")
+    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
+    for item in outcomes
+):
+    raise SystemExit("HVAC safety release did not restore the mapped climate automation state")
 if not any(
     (
         "enphase_profile_applied" in item.get("reason", "")
@@ -1296,43 +1317,64 @@ if store_data.get("ownership"):
     raise SystemExit(f"restore_safe_state did not clear planner ownership: {store_data.get('ownership')}")
 if not any(
     item.get("result") == "applied"
-    and str(item.get("action_id", "")).endswith("-hvac-expensive-period-suppression")
-    and item.get("reason") == "hvac_automations_suppressed"
-    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "off"
-    for item in outcomes
-):
-    raise SystemExit("Active-mode HVAC expensive-period suppression did not disable the mapped automation")
-suppression_restore_outcomes = [
-    item
-    for item in outcomes
-    if item.get("action_id") == "restore_safe_state" and "docker_smoke_hvac_suppression_restore" in item.get("reason", "")
-]
-if not any(
-    "hvac_automation_state_restored" in item.get("reason", "")
-    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
-    for item in suppression_restore_outcomes
-):
-    raise SystemExit("HVAC suppression restore did not re-enable the mapped automation")
-if not any(
-    item.get("result") == "applied"
-    and str(item.get("action_id", "")).endswith("-hvac-precondition-before-expensive-period")
+    and str(item.get("action_id", "")).endswith("-hvac-preconditioning")
     and item.get("reason") == "hvac_action_applied"
+    and item.get("desired_state", {}).get("phase") == "preconditioning"
+    and item.get("desired_state", {}).get("hvac_mode") == "heat"
+    and item.get("desired_state", {}).get("target_temperature") == 24.0
     and item.get("post_state", {}).get("daikin_climate_entity") == "heat"
     and item.get("post_state", {}).get("automation.fake_climate_conflict") == "off"
+    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "on"
     for item in outcomes
 ):
-    raise SystemExit("Active-mode HVAC preconditioning did not control the climate entity and suppress automation")
-precondition_restore_outcomes = [
-    item
-    for item in outcomes
-    if item.get("action_id") == "restore_safe_state" and "docker_smoke_hvac_precondition_restore" in item.get("reason", "")
+    raise SystemExit(
+        "Heating lifecycle takeover did not control climate, automation, and zone state: "
+        f"{[item for item in outcomes if item.get('asset') == 'daikin']}"
+    )
+precondition_restore_index = next(
+    (
+        index
+        for index, item in enumerate(outcomes)
+        if item.get("action_id") == "restore_safe_state"
+        and "docker_smoke_hvac_precondition_restore" in item.get("reason", "")
+    ),
+    None,
+)
+if precondition_restore_index is None:
+    raise SystemExit("Heating lifecycle restore service did not persist an outcome")
+heating_takeover_indices = [
+    index
+    for index, item in enumerate(outcomes)
+    if item.get("result") == "applied"
+    and str(item.get("action_id", "")).endswith("-hvac-preconditioning")
+    and item.get("desired_state", {}).get("hvac_mode") == "heat"
+    and item.get("desired_state", {}).get("target_temperature") == 24.0
+    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "off"
+    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "on"
 ]
-if not any(
-    "hvac_automation_state_restored" in item.get("reason", "")
+first_takeover_index = next(
+    (index for index in heating_takeover_indices if index < precondition_restore_index),
+    None,
+)
+if first_takeover_index is None or not any(
+    first_takeover_index < index <= precondition_restore_index
+    and "hvac_control_released" in item.get("reason", "")
     and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
-    for item in precondition_restore_outcomes
+    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "off"
+    for index, item in enumerate(outcomes)
 ):
-    raise SystemExit("HVAC precondition restore did not re-enable the mapped automation")
+    raise SystemExit("Heating lifecycle restore did not restore the mapped automation and zone")
+if not any(index > precondition_restore_index for index in heating_takeover_indices):
+    raise SystemExit("Second heating lifecycle takeover did not reacquire automation and zone ownership")
+if not any(
+    item.get("action_id") == "release_hvac_control"
+    and item.get("result") == "restored"
+    and item.get("desired_state", {}).get("release_reason") == "manual_override_helper_on"
+    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
+    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "off"
+    for item in outcomes
+):
+    raise SystemExit("External manual-override helper did not release only HVAC automation and zone ownership")
 if not any(
     item.get("result") == "applied"
     and str(item.get("action_id", "")).endswith("-hvac-away-off")

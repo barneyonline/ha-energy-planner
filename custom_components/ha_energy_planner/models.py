@@ -57,6 +57,7 @@ class ActionKind(StrEnum):
     SET_PROFILE = "set_profile"
     RESTORE_AI = "restore_ai"
     SET_HVAC = "set_hvac"
+    RELEASE_HVAC = "release_hvac"
     EV_START = "ev_start"
     EV_STOP = "ev_stop"
     EV_SCHEDULE = "ev_schedule"
@@ -159,6 +160,8 @@ class DecisionContext:
     occupied_temperature_low_c: float | None = None
     occupied_temperature_high_c: float | None = None
     active_overrides: list[Override] = field(default_factory=list)
+    hvac_control: dict[str, Any] = field(default_factory=dict)
+    climate_zone_entities: list[str] = field(default_factory=list)
     input_issues: list[str] = field(default_factory=list)
     forecast_confidence: float = 1.0
     local_timezone: str = "UTC"

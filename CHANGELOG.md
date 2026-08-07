@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+## 0.8.5 - 2026-08-08
+
+### Added
+
+- Climate tariff control now follows a persisted precondition, peak-coast, and
+  release lifecycle across the configured planning horizon. Heating can
+  precondition to the high comfort target and cooling to the low target before
+  an expensive period, then coast at the opposite comfort boundary.
+- Configured climate zones are enabled during takeover and restored to their
+  original states when control is released. An off climate entity is explicitly
+  turned on before its operating mode and target are applied.
+- Climate plan, timeline, audit, and diagnostics output now expose tariff-period
+  boundaries, lifecycle phase, selected mode and targets, controlled zones, and
+  thermal-feasibility evidence.
+
+### Safety
+
+- The manual-override helper is authoritative in both directions. Activating it
+  immediately releases HVAC ownership, restores zones, and enables configured
+  climate automations without affecting EV or Enphase ownership.
+- Comfort-boundary breaches, missing lifecycle evidence, tariff changes, and
+  peak completion release climate control safely and prevent repeated takeover
+  during the same expensive period.
+- Safety releases remain available after production disarm, dry-run enablement,
+  degraded input health, climate-control disablement, or action-cap exhaustion.
+
+### Validation
+
+- The full Docker validation gate passes with `921` tests and `100%` coverage,
+  plus Ruff, quality-scale, replay, schema, history, Home Assistant configuration,
+  and Docker smoke checks.
+
 ## 0.8.4 - 2026-08-02
 
 ### Fixed
