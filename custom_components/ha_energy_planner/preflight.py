@@ -23,7 +23,6 @@ from .const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING,
@@ -54,15 +53,23 @@ _EVIDENCE_OPTION_EXCLUSIONS = {
     "ai_timeout_seconds",
     CONF_DRY_RUN,
     CONF_PLANNER_ENABLED,
-    CONF_EV_CONNECTED_HELPER,
+    CONF_EV_CONTROL_ENABLED,
+    CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    "ev_connected_helper",
 }
 _EVIDENCE_ENTRY_EXCLUSIONS = {CONF_AI_ADVISOR_SERVICE, "ai_task_entity"}
 
 
-def build_preflight_report(hass: HomeAssistant, coordinator: Any) -> dict[str, Any]:
+def build_preflight_report(
+    hass: HomeAssistant,
+    coordinator: Any,
+    *,
+    options_override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return a redacted readiness report without calling device services."""
     entry_data = combined_entry_data(coordinator.entry)
-    options = coordinator.options
+    options = coordinator.options if options_override is None else {**coordinator.options, **options_override}
     control_areas = _control_area_report(entry_data, options)
     discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
     _apply_ev_keep_on_preflight(discovery, entry_data, options)
@@ -521,12 +528,13 @@ def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[st
     for current_key, legacy_key in aliases.items():
         if not entry_data.get(current_key) and entry_data.get(legacy_key):
             entry_data[current_key] = entry_data[legacy_key]
-    normalized_options = {**options, CONF_PLANNER_ENABLED: True}
-    control_areas = _control_area_report(entry_data, normalized_options)
-    required = list(control_areas["required"])
+    control_areas = _control_area_report(entry_data, options)
+    configured = list(control_areas["configured"])
     payload = {
-        "required": required,
-        "details": {area: control_areas["details"][area] for area in required},
+        # Runtime participation switches narrow or widen the currently active
+        # surface but do not change the reviewed device mappings and policies.
+        "configured_control_areas": configured,
+        "details": {area: {"configured": True} for area in configured},
         "entry_data": {key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS},
         "options": {key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS},
     }

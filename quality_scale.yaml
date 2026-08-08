@@ -400,7 +400,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: Adjustable device settings use the Home Assistant config entity category, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
+    comment: The three device control selectors and remaining adjustable day-to-day device settings use the Home Assistant config entity category, while fallback Target SOC is central configuration and the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -422,7 +422,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Automatic control is the sole activation switch.
+    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Automatic control remains the sole master activation switch and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -431,7 +431,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, the sole Automatic control switch, and day-to-day EV controls, use translation keys mirrored across bundled English translations.
+    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, Automatic control, the three device control selectors, and the remaining day-to-day EV controls, use translation keys mirrored across bundled English translations.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json

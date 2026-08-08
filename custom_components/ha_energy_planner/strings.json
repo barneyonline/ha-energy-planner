@@ -413,6 +413,18 @@
     "active_control_not_ready": {
       "message": "Automatic control is not ready: {reason}"
     },
+    "active_control_no_device_selected": {
+      "message": "Turn on at least one Climate control, EV control, or Enphase control switch before enabling Automatic control."
+    },
+    "device_control_not_configured": {
+      "message": "Configure this device area before turning on its control switch."
+    },
+    "device_control_not_ready": {
+      "message": "This device control is not ready: {reason}"
+    },
+    "device_control_restore_failed": {
+      "message": "The device could not be restored safely, so its control switch remains on. Check the Energy Planner notification and retry."
+    },
     "ai_advice_not_ready": {
       "message": "AI troubleshooting is not ready: {reason}"
     }
@@ -440,8 +452,14 @@
       "active_control": {
         "name": "Automatic control"
       },
-      "ev_connected_helper": {
-        "name": "EV connected helper"
+      "climate_control": {
+        "name": "Climate control"
+      },
+      "ev_control": {
+        "name": "EV control"
+      },
+      "enphase_control": {
+        "name": "Enphase control"
       },
       "ev_keep_charger_on": {
         "name": "Keep charger on"
@@ -451,9 +469,6 @@
       }
     },
     "number": {
-      "ev_target_soc": {
-        "name": "Target SOC"
-      },
       "ev_opportunistic_charging_price_threshold": {
         "name": "Opportunistic charging price threshold"
       }
@@ -490,12 +505,6 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
-      },
-      "ev_start_charging": {
-        "name": "Start charging"
-      },
-      "ev_stop_charging": {
-        "name": "Stop charging"
       }
     }
   }

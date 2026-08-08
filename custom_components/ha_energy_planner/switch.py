@@ -11,7 +11,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    CONF_EV_CONNECTED_HELPER,
+    CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     DOMAIN,
@@ -41,11 +43,27 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         active_control=True,
     ),
     PlannerSwitchDescription(
-        key="ev_connected_helper",
-        translation_key="ev_connected_helper",
-        icon="mdi:ev-plug-type2",
+        key="climate_control",
+        translation_key="climate_control",
+        icon="mdi:thermostat-auto",
         entity_category=EntityCategory.CONFIG,
-        option_key=CONF_EV_CONNECTED_HELPER,
+        option_key=CONF_CLIMATE_CONTROL_ENABLED,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="ev_control",
+        translation_key="ev_control",
+        icon="mdi:ev-station",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_EV_CONTROL_ENABLED,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="enphase_control",
+        translation_key="enphase_control",
+        icon="mdi:home-battery-outline",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_ENPHASE_CONTROL_ENABLED,
         default=False,
     ),
     PlannerSwitchDescription(
@@ -73,6 +91,7 @@ _RETIRED_CONTROL_SWITCH_KEYS = (
     "ev_control_enabled",
     "climate_control_enabled",
     "enphase_control_enabled",
+    "ev_connected_helper",
 )
 
 
@@ -139,12 +158,16 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
     async def _async_set_option(self, value: bool) -> None:
         option_key = self.entity_description.option_key
         assert option_key is not None
-        if option_key == CONF_EV_CONNECTED_HELPER:
-            await self.coordinator.async_set_ev_connected_helper(value)
-            self.async_write_ha_state()
-            return
         if option_key == CONF_EV_KEEP_CHARGER_ON:
             await self.coordinator.async_set_ev_keep_charger_on(value)
+            self.async_write_ha_state()
+            return
+        if option_key in {
+            CONF_CLIMATE_CONTROL_ENABLED,
+            CONF_EV_CONTROL_ENABLED,
+            CONF_ENPHASE_CONTROL_ENABLED,
+        }:
+            await self.coordinator.async_set_device_control(option_key, value)
             self.async_write_ha_state()
             return
         options = self.coordinator.options
