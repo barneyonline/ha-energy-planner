@@ -11,6 +11,9 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
+    CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     DOMAIN,
@@ -38,6 +41,30 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         option_key=None,
         default=False,
         active_control=True,
+    ),
+    PlannerSwitchDescription(
+        key="climate_control",
+        translation_key="climate_control",
+        icon="mdi:thermostat-auto",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_CLIMATE_CONTROL_ENABLED,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="ev_control",
+        translation_key="ev_control",
+        icon="mdi:ev-station",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_EV_CONTROL_ENABLED,
+        default=False,
+    ),
+    PlannerSwitchDescription(
+        key="enphase_control",
+        translation_key="enphase_control",
+        icon="mdi:home-battery-outline",
+        entity_category=EntityCategory.CONFIG,
+        option_key=CONF_ENPHASE_CONTROL_ENABLED,
+        default=False,
     ),
     PlannerSwitchDescription(
         key="ev_keep_charger_on",
@@ -133,6 +160,14 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
         assert option_key is not None
         if option_key == CONF_EV_KEEP_CHARGER_ON:
             await self.coordinator.async_set_ev_keep_charger_on(value)
+            self.async_write_ha_state()
+            return
+        if option_key in {
+            CONF_CLIMATE_CONTROL_ENABLED,
+            CONF_EV_CONTROL_ENABLED,
+            CONF_ENPHASE_CONTROL_ENABLED,
+        }:
+            await self.coordinator.async_set_device_control(option_key, value)
             self.async_write_ha_state()
             return
         options = self.coordinator.options

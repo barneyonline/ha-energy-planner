@@ -440,6 +440,15 @@
       "active_control": {
         "name": "Automatic control"
       },
+      "climate_control": {
+        "name": "Climate control"
+      },
+      "ev_control": {
+        "name": "EV control"
+      },
+      "enphase_control": {
+        "name": "Enphase control"
+      },
       "ev_keep_charger_on": {
         "name": "Keep charger on"
       },

@@ -14,7 +14,10 @@ from custom_components.ha_energy_planner import switch as switch_module
 from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
 from custom_components.ha_energy_planner.const import (
     CONF_AI_TASK_ENTITY,
+    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DRY_RUN,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_PLANNER_ENABLED,
@@ -67,6 +70,7 @@ class FakeCoordinator:
         self.ai_advice_requests = 0
         self.entry_data: dict[str, object] = {}
         self.active_control_calls: list[bool] = []
+        self.device_control_calls: list[tuple[str, bool]] = []
         self.active_control_value = False
         self.last_update_success = True
         self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
@@ -90,6 +94,12 @@ class FakeCoordinator:
     async def async_set_active_control(self, enabled: bool) -> None:
         self.active_control_calls.append(enabled)
         self.active_control_value = enabled
+
+    async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
+        self.device_control_calls.append((option_key, enabled))
+        options = self.options
+        options[option_key] = enabled
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
 
     async def async_request_replan(self) -> None:
         self.replan_count += 1
@@ -151,10 +161,10 @@ def test_automatic_control_switch_uses_combined_coordinator_path() -> None:
     assert switch.write_count == 2
 
 
-def test_automatic_control_is_the_only_activation_switch() -> None:
+def test_switches_expose_one_master_and_three_device_controls() -> None:
     keys = {description.key for description in SWITCHES}
 
-    assert "active_control" in keys
+    assert {"active_control", "climate_control", "ev_control", "enphase_control"} <= keys
     assert keys.isdisjoint(
         {
             "enabled",
@@ -165,6 +175,31 @@ def test_automatic_control_is_the_only_activation_switch() -> None:
             "enphase_control_enabled",
         }
     )
+
+
+@pytest.mark.parametrize(
+    ("switch_key", "option_key"),
+    [
+        ("climate_control", CONF_CLIMATE_CONTROL_ENABLED),
+        ("ev_control", CONF_EV_CONTROL_ENABLED),
+        ("enphase_control", CONF_ENPHASE_CONTROL_ENABLED),
+    ],
+)
+def test_device_control_switches_use_guarded_coordinator_path(switch_key: str, option_key: str) -> None:
+    coordinator = FakeCoordinator({option_key: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in SWITCHES if description.key == switch_key),
+        write_count=0,
+    )
+    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
+    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
+
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+
+    assert coordinator.device_control_calls == [(option_key, True)]
+    assert coordinator.entry.options[option_key] is True
+    assert switch.write_count == 1
 
 
 def test_non_activation_switches_still_use_their_own_options() -> None:

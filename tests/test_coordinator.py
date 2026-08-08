@@ -3275,7 +3275,7 @@ def test_production_control_runtime_methods_update_store_and_refresh() -> None:
     assert coordinator._pending_refresh_trigger == "control_resumed"
 
 
-def test_combined_active_control_enables_configured_areas_and_arms(monkeypatch: object) -> None:
+def test_combined_active_control_respects_selected_areas_and_arms(monkeypatch: object) -> None:
     class ConfigEntries:
         def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
             entry.options = options
@@ -3286,7 +3286,13 @@ def test_combined_active_control_enables_configured_areas_and_arms(monkeypatch: 
             CONF_EV_CHARGER: "switch.ev",
             CONF_ENPHASE_PROFILE: "select.profile",
         },
-        options={CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True},
+        options={
+            CONF_PLANNER_ENABLED: False,
+            CONF_DRY_RUN: True,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
     )
     coordinator.hass.config_entries = ConfigEntries()
     coordinator._options_update_lock = asyncio.Lock()
@@ -3302,7 +3308,7 @@ def test_combined_active_control_enables_configured_areas_and_arms(monkeypatch: 
     assert coordinator.entry.options[CONF_PLANNER_ENABLED] is True
     assert coordinator.entry.options[CONF_DRY_RUN] is False
     assert coordinator.entry.options[CONF_EV_CONTROL_ENABLED] is True
-    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is True
+    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is False
     assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is True
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.store.data["production"]["armed_reason"] == "automatic_control_enabled"
@@ -3316,7 +3322,11 @@ def test_combined_active_control_stays_in_review_until_evidence_is_ready(monkeyp
 
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_DAIKIN_CLIMATE: "climate.home"},
-        options={CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True},
+        options={
+            CONF_PLANNER_ENABLED: False,
+            CONF_DRY_RUN: True,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+        },
     )
     coordinator.hass.config_entries = ConfigEntries()
     coordinator._options_update_lock = asyncio.Lock()
@@ -3340,6 +3350,83 @@ def test_combined_active_control_stays_in_review_until_evidence_is_ready(monkeyp
     assert coordinator.entry.options[CONF_DRY_RUN] is True
     assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is True
     assert coordinator.store.data.get("production", {}).get("armed") is not True
+
+
+def test_combined_active_control_requires_a_selected_device(monkeypatch: object) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (False, True)
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "safe_to_activate_now": True,
+            "production": {
+                "device_controls": {"ev": False, "climate": False, "enphase": False},
+            },
+        },
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_active_control(True))
+
+    assert error.value.translation_placeholders["reason"] == (
+        "turn on at least one Climate control, EV control, or Enphase control switch"
+    )
+    assert coordinator.entry.options[CONF_DRY_RUN] is True
+    assert coordinator.store.data.get("production", {}).get("armed") is not True
+
+
+def test_device_control_change_while_active_returns_to_review_mode() -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, False)
+
+    asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, False))
+
+    assert coordinator.entry.options[CONF_EV_CONTROL_ENABLED] is False
+    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is True
+    assert coordinator.entry.options[CONF_DRY_RUN] is True
+    assert coordinator.store.data["production"]["armed"] is False
+    assert coordinator.executor.restored == ["dry_run_enabled"]
+
+
+def test_device_control_rejects_unknown_option() -> None:
+    coordinator = _coordinator_for_runtime_services()
+
+    with pytest.raises(ValueError, match="Unsupported device control option"):
+        asyncio.run(coordinator.async_set_device_control("unknown", True))
+
+
+def test_device_control_unchanged_is_a_noop() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_EV_CONTROL_ENABLED: True},
+    )
+
+    asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, True))
+
+    assert coordinator.refresh_requested == 0
+    assert coordinator.store.production_saves == []
 
 
 def test_combined_active_control_off_restores_review_mode_and_disarms() -> None:
@@ -3378,6 +3465,9 @@ def test_combined_active_control_is_a_noop_when_already_active() -> None:
 
 
 def test_combined_active_control_reports_blocking_or_current_plan_reason() -> None:
+    no_devices = _active_control_not_ready_reason(
+        {"production": {"device_controls": {"ev": False, "climate": False, "enphase": False}}}
+    )
     blocking = _active_control_not_ready_reason(
         {
             "production": {"dry_run_ready_cycles": 3, "dry_run_evidence_complete": True},
@@ -3392,6 +3482,7 @@ def test_combined_active_control_reports_blocking_or_current_plan_reason() -> No
         }
     )
 
+    assert no_devices == "turn on at least one Climate control, EV control, or Enphase control switch"
     assert blocking == "A mapped entity is unavailable."
     assert fallback == "a safety check failed"
 
