@@ -35,7 +35,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 - Enphase profile monitoring and planned profile control
 - HAEO optimization service integration with deterministic fallback behavior
 - Optional on-demand AI explanation and troubleshooting
-- One **Automatic control** switch, with guarded arming, preflight, pause/resume, and safe-state restore behind it
+- One guarded **Automatic control** master switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
 
 ## Key features
 
@@ -125,7 +125,7 @@ Required Amber, PV, and baseline-load inputs must expose forecast series; a nume
 
 ## Native EV smart charging
 
-Energy Planner no longer requires the separate EV Smart Charging integration. Open **Configure -> Inputs · EV** and map the vehicle SOC and charging-state entities, plus either one charger switch or separate start/stop controls. Map a vehicle connected-state entity when one is available; without one, connection remains unknown rather than being replaced by a manual helper. Configure the fallback Target SOC in **Configure -> EV, battery and grid**. Energy Planner exposes **Ready by**, **Keep charger on**, **Opportunistic charging**, and **Opportunistic charging price threshold** entities for day-to-day policy changes.
+Energy Planner no longer requires the separate EV Smart Charging integration. Open **Configure -> Inputs · EV** and map the vehicle SOC and charging-state entities, plus either one charger switch or separate start/stop controls. Map a vehicle connected-state entity when one is available; without one, connection remains unknown rather than being replaced by a manual helper. Configure the fallback Target SOC in **Configure -> EV, battery and grid**. Energy Planner exposes **EV control**, **Ready by**, **Keep charger on**, **Opportunistic charging**, and **Opportunistic charging price threshold** entities for day-to-day policy changes.
 
 The central **Configure** page contains both connected-input sections and planner-policy sections, such as charge rate, SOC bounds, battery characteristics, grid limits, and confirmation behavior. The integration creates one Energy Planner device and places every entity on it, so status, controls, and troubleshooting are visible together. Day-to-day controls and adjustable device settings remain Home Assistant entities so they can be used in dashboards and automations. Entity-managed settings are intentionally omitted from the settings forms.
 
@@ -165,17 +165,22 @@ For Solcast, configure **Forecast Today** as the primary PV forecast and optiona
 
 Energy Planner is built around conservative production controls:
 
-- The **Automatic control** switch is the normal activation surface. Turning it
-  on includes every configured controllable area, runs preflight, arms the
+- **Climate control**, **EV control**, and **Enphase control** select which
+  mapped devices may participate. The **Automatic control** switch is the
+  master activation surface. Turning it on respects that selection, runs preflight, arms the
   production gate, and leaves review-only mode only when the current plan and
   recorded dry-run evidence are safe. Turning it off restores planner-owned
   state, disarms production control, and keeps planning in review-only mode.
+- Changing any device control switch while Automatic control is on first
+  restores planner-owned state and returns the whole integration to review mode.
+  This keeps the reviewed control contract and the visible armed state aligned.
 - On a new setup, the first activation attempt may remain in review-only mode
   while three healthy plans are recorded. The translated error reports progress;
   review the plan and turn **Automatic control** on again when Production
   readiness reports that evidence is complete.
-- The old planner, dry-run, and per-device activation switches have been
-  removed. Automatic control is the only activation switch.
+- The old planner, dry-run, and legacy `*_control_enabled` entities remain
+  removed. The three current device switches are clean control-area selectors;
+  **Automatic control** is still the only switch that arms device commands.
 - Active control requires mapped inputs for each enabled control area, healthy modular preflight status, production arming, and dry-run review. Unconfigured or disabled device areas do not block a partial installation.
 - Preflight reports historical `dry_run_evidence_complete` separately from `safe_to_activate_now`. Dry-run evidence is bound to the current control-area/entity/policy fingerprint but intentionally survives switching from dry-run to active mode, changing advisory-only AI settings, and changing the per-run EV ready-by time. Current activation additionally requires a recent successfully refreshed healthy plan, non-zero confidence, at least eight usable priced hours (or the whole configured horizon when shorter), and no active control pause. Execution independently rechecks the evidence fingerprint, bounded evidence count, and strict armed state and fails closed after a contract change or corrupt/missing production state.
 - The executor revalidates hard constraints immediately before every device service call.
@@ -222,11 +227,11 @@ All services accept an optional `config_entry_id`. It may be omitted with one lo
 2. Add planning areas from the integration page.
 3. Map the required source entities and services for the planning areas you want to use.
 4. Review the **EV, battery, and grid** configuration, especially EV minimum/maximum SOC, charge rate, earliest start, continuous charging, charging confirmation timeout/retries, price limits, usable home-battery capacity, efficiency, and max charge/discharge power. For climate control, also review the horizon, tariff deltas, lead time, comfort helpers, automations, zones, and manual-override helper.
-5. Set fallback Target SOC under **EV, battery and grid**. Set day-to-day behavior through the remaining device entities: Ready by, Keep charger on, Opportunistic charging, and its price threshold.
+5. Set fallback Target SOC under **EV, battery and grid**. Turn on the **Climate control**, **EV control**, and/or **Enphase control** switches for the mapped devices you want Energy Planner to manage. Set other day-to-day behavior through Ready by, Keep charger on, Opportunistic charging, and its price threshold.
 6. Review **Current state** to confirm the mapped climate, EV, and Enphase entities are the ones you expect.
 7. Review **Next actions** and the **Plan** calendar while **Automatic control** is off. Expand the action attributes to see why each action was selected and which constraints were applied. Fix missing,
    unavailable, stale, invalid, or low-confidence inputs.
-8. When the plan matches your expectations, turn **Automatic control** on. The
+8. When the plan matches your expectations and the required device control switches are on, turn **Automatic control** on. The
    integration performs preflight, production arming, and the active-mode
    transition together. If more evidence is needed, the switch stays off; review
    the **Armed** attributes for the readiness reason and try again after more

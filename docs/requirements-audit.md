@@ -26,12 +26,15 @@ Status as of 2026-08-09.
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
   sections; the former Add device/config-subentry surface is removed. Existing
   subentry mappings are folded into the main config entry during setup.
-- The Automatic control entity is the sole activation switch and combines
-  configured-area enablement, preflight, production arming, and active/review
-  transitions. The former planner, dry-run, and per-device activation switches
-  are removed. Runtime option updates request replanning without reloading the
-  config entry, and Docker smoke coverage exercises switches and buttons through
-  Home Assistant Core service calls.
+- Automatic control is the sole master activation switch and combines preflight,
+  production arming, and active/review transitions. Separate Climate control,
+  EV control, and Enphase control switches select the participating areas. A
+  selection change while armed restores safe state and returns to review mode
+  before changing the evidence contract. The former planner, dry-run, and legacy
+  `*_control_enabled` switch entities remain removed. Runtime option updates
+  request replanning without reloading the config entry, and Docker smoke
+  coverage exercises switches and buttons through Home Assistant Core service
+  calls.
 - Config flow validation checks mapped entity IDs, expected domains, compatible
   units where exposed, entity availability, and configured service availability
   without issuing commands. The user must provide mapped people/entities rather
@@ -273,7 +276,7 @@ Status as of 2026-08-09.
   `check_config`, and the smoke test in one repeatable sequence. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Current state/Next actions/Plan calendar surface,
-  Automatic control, device registry registration, persisted active plan, HAEO run
+  Automatic control and its three device selectors, device registry registration, persisted active plan, HAEO run
   metadata including parsed camelCase grid-charge and export/discharge evidence
   counts from a response-capable Home Assistant service, discovery storage,
   forecast snapshot training slots sourced from Home Assistant template-sensor
@@ -505,6 +508,10 @@ Status as of 2026-08-09.
   device. It also exposes a native opportunistic-charging switch and import-price threshold
   number; both persist the corresponding planner option and request an immediate
   replan.
+- Climate, EV, and Enphase each expose a translated device control switch on the
+  same Energy Planner device. Automatic control remains the guarded master arm;
+  changing a device selection while armed restores safe state and returns to
+  review mode before the control contract changes.
 - All integration services accept an optional `config_entry_id`. A single
   loaded runtime remains backward compatible, while multiple runtimes reject
   ambiguous calls and route explicitly targeted calls to the selected entry.

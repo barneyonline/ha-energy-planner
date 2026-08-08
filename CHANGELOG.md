@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Added individual **Climate control**, **EV control**, and **Enphase control**
+  switches. **Automatic control** remains the master arm switch and now respects
+  the selected device switches instead of enabling every configured area.
+  Changing device participation while armed safely returns the whole planner to
+  review mode before applying the new control contract.
 - Removed the manual EV start/stop buttons, Target SOC number entity, and EV
   connected helper. The fallback Target SOC is now configured in the central
   **EV, battery and grid** section, while live connection state comes only from

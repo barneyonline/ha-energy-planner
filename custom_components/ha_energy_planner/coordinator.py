@@ -41,8 +41,6 @@ from .const import (
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
@@ -50,8 +48,6 @@ from .const import (
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
@@ -135,29 +131,14 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
 )
 
 
-def _configured_control_options(entry_data: dict[str, Any]) -> dict[str, bool]:
-    """Return control toggles for device areas that have writable mappings."""
-    ev_configured = any(
-        bool(str(entry_data.get(key, "") or "").strip())
-        for key in (
-            CONF_EV_CHARGER,
-            CONF_EV_CHARGER_START,
-            CONF_EV_CHARGER_STOP,
-            CONF_EV_SMART_CHARGING,
-            CONF_EV_SMART_CHARGING_START,
-            CONF_EV_SMART_CHARGING_STOP,
-        )
-    )
-    return {
-        CONF_EV_CONTROL_ENABLED: ev_configured,
-        CONF_CLIMATE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
-        CONF_ENPHASE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
-    }
-
-
 def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
     """Return one actionable reason that the combined activation was rejected."""
     production = dict(report.get("production", {}))
+    device_controls = production.get("device_controls")
+    if isinstance(device_controls, dict) and device_controls and not any(
+        bool(value) for value in device_controls.values()
+    ):
+        return "turn on at least one Climate control, EV control, or Enphase control switch"
     ready_cycles = parse_production_state(production).dry_run_ready_cycles
     if not production.get("dry_run_evidence_complete"):
         return (
@@ -1044,13 +1025,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.async_disarm_production_control("automatic_control_disabled")
             return
 
-        options.update(_configured_control_options(self.entry_data))
         options[CONF_DRY_RUN] = True
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
 
         report = build_preflight_report(self.hass, self)
-        if not report.get("safe_to_activate_now"):
+        device_control_selected = any(
+            strict_bool(self.options.get(key), default=False)
+            for key in (
+                CONF_EV_CONTROL_ENABLED,
+                CONF_CLIMATE_CONTROL_ENABLED,
+                CONF_ENPHASE_CONTROL_ENABLED,
+            )
+        )
+        if not device_control_selected or not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
                 f"Automatic control is not ready: {reason}",
@@ -1062,6 +1050,29 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_arm_production_control("automatic_control_enabled")
         options = self.options
         options[CONF_DRY_RUN] = False
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
+
+    async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
+        """Select one device area, returning to review mode before a contract change."""
+        allowed_keys = {
+            CONF_EV_CONTROL_ENABLED,
+            CONF_CLIMATE_CONTROL_ENABLED,
+            CONF_ENPHASE_CONTROL_ENABLED,
+        }
+        if option_key not in allowed_keys:
+            raise ValueError(f"Unsupported device control option: {option_key}")
+        if strict_bool(self.options.get(option_key), default=False) is enabled:
+            return
+
+        # Device participation changes the reviewed production contract. Restore
+        # all planner-owned state before changing it so no device can continue
+        # under evidence collected for a different set of controls.
+        if self.active_control:
+            await self.async_set_active_control(False)
+
+        options = self.options
+        options[option_key] = enabled
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
 
