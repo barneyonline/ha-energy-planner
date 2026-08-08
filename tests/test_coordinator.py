@@ -30,7 +30,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_READY_BY,
@@ -3011,32 +3010,10 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     assert updates[2]["ev_low_price_threshold"] == 0.07
     assert [item[0] for item in coordinator.executor.manual_ev_commands] == [True, False]
     assert all(item[1] is coordinator._last_decision_context for item in coordinator.executor.manual_ev_commands)
-    assert all(item[2][CONF_EV_CONNECTED_HELPER] is False for item in coordinator.executor.manual_ev_commands)
+    assert all("ev_connected_helper" not in item[2] for item in coordinator.executor.manual_ev_commands)
     assert coordinator.overrides[0].reason == "manual_stop"
     assert coordinator.store.async_save_overrides.await_count == 2
     assert refreshes == ["refresh"] * 5
-
-
-def test_connected_helper_persists_and_records_trip_state_without_external_entity() -> None:
-    updates: list[dict[str, object]] = []
-    hass = FakeHass({"sensor.ev_soc": "50"})
-
-    def update_entry(entry: FakeEntry, *, options: dict[str, object]) -> None:
-        entry.options = options
-        updates.append(options)
-
-    hass.config_entries = SimpleNamespace(async_update_entry=update_entry)
-    coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_EV_SOC: "sensor.ev_soc"},
-        options={CONF_EV_CONNECTED_HELPER: True},
-        hass=hass,
-    )
-
-    asyncio.run(coordinator.async_set_ev_connected_helper(False))
-
-    assert updates[-1][CONF_EV_CONNECTED_HELPER] is False
-    assert coordinator.store.data["trip_history"]["active_trip"]["start_soc_percent"] == 50
-    assert coordinator.refresh_requested == 1
 
 
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:

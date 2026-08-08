@@ -27,7 +27,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
@@ -744,12 +743,11 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     assert fallback_plan.confidence_breakdown["ev"] == 1.0
 
 
-def test_input_manager_uses_connected_helper_only_without_external_entity() -> None:
+def test_input_manager_leaves_connection_unknown_without_external_entity() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planning_horizon_hours": 1,
         "planning_interval_minutes": 15,
-        CONF_EV_CONNECTED_HELPER: False,
     }
     entry_data = {
         CONF_AMBER_IMPORT_PRICE: "sensor.import",
@@ -768,15 +766,9 @@ def test_input_manager_uses_connected_helper_only_without_external_entity() -> N
         }
     )
 
-    disconnected = InputManager(hass, entry_data, options).build_context()
-    connected = InputManager(
-        hass,
-        entry_data,
-        {**options, CONF_EV_CONNECTED_HELPER: True},
-    ).build_context()
+    context = InputManager(hass, entry_data, options).build_context()
 
-    assert disconnected.ev_connected is False
-    assert connected.ev_connected is True
+    assert context.ev_connected is None
 
 
 def test_input_manager_ev_helper_state_edge_cases() -> None:

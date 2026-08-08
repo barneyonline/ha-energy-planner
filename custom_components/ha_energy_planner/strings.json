@@ -440,9 +440,6 @@
       "active_control": {
         "name": "Automatic control"
       },
-      "ev_connected_helper": {
-        "name": "EV connected helper"
-      },
       "ev_keep_charger_on": {
         "name": "Keep charger on"
       },
@@ -451,9 +448,6 @@
       }
     },
     "number": {
-      "ev_target_soc": {
-        "name": "Target SOC"
-      },
       "ev_opportunistic_charging_price_threshold": {
         "name": "Opportunistic charging price threshold"
       }
@@ -490,12 +484,6 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
-      },
-      "ev_start_charging": {
-        "name": "Start charging"
-      },
-      "ev_stop_charging": {
-        "name": "Stop charging"
       }
     }
   }

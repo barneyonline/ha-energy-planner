@@ -246,7 +246,8 @@ def test_local_ai_advisor_accepts_valid_json_response() -> None:
     assert result.accepted["affected_item"] == "pv_forecast_entity"
     assert result.accepted["next_step"] == "Map an entity with a timestamped PV forecast."
     assert "contract" in hass.services.calls[0][2]["instructions"]
-    assert "Return exactly one JSON object" in hass.services.calls[0][2]["instructions"]
+    assert "Fill only fields allowed by the response contract" in hass.services.calls[0][2]["instructions"]
+    assert hass.services.calls[0][2]["structure"]["outcome"]["required"] is True
     assert hass.services.calls[0][2]["entity_id"] == "ai_task.extended_openai_ai_task"
 
 
@@ -298,7 +299,7 @@ def test_local_ai_advisor_accepts_ai_task_data_response() -> None:
     service_data = hass.services.calls[0][2]
     assert service_data["task_name"] == "Energy Planner explain or troubleshoot"
     assert service_data["entity_id"] == "ai_task.extended_openai_ai_task"
-    assert "structure" not in service_data
+    assert service_data["structure"]["summary"]["required"] is True
     assert "contract" in hass.services.calls[0][2]["instructions"]
 
 
@@ -572,6 +573,9 @@ def test_build_instructions_supports_structured_prompt() -> None:
     assert "Return exactly one JSON object" not in instructions
     assert "Planner mode DISABLED is a control setting" in instructions
     assert "not an input-health problem" in instructions
+
+    plain_instructions = _build_instructions(_context(), _plan(), structured=False)
+    assert "Return exactly one JSON object" in plain_instructions
 
 
 def test_ai_prompt_minimizes_household_state_detail() -> None:

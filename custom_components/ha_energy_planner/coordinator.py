@@ -44,7 +44,6 @@ from .const import (
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
     CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
@@ -833,19 +832,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_request_refresh()
         return result
 
-    async def async_set_ev_connected_helper(self, connected: bool) -> None:
-        """Persist the native connected helper and refresh EV history and planning."""
-        options = self.options
-        options[CONF_EV_CONNECTED_HELPER] = connected
-        config_entries = getattr(self.hass, "config_entries", None)
-        update_entry = getattr(config_entries, "async_update_entry", None)
-        if callable(update_entry):
-            update_entry(self.entry, options=options)
-        if not self.entry_data.get(CONF_EV_CONNECTED):
-            await self._async_record_ev_trip_event()
-        self._mark_forced_refresh("ev_connected_helper_changed")
-        await self.async_request_refresh()
-
     async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
         """Validate and persist the preconditioning keep-on policy."""
         entry_data = self.entry_data
@@ -1010,8 +996,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Record compact EV trip history from current connection/SOC states."""
         entry_data = self.entry_data
         connected = _bool_state_value(self.hass, entry_data.get(CONF_EV_CONNECTED))
-        if connected is None and not entry_data.get(CONF_EV_CONNECTED):
-            connected = bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
         soc_percent = _float_state_value(self.hass, entry_data.get(CONF_EV_SOC))
         updated, changed = update_trip_history_from_values(
             dict(self.store.data.get("trip_history", {})),

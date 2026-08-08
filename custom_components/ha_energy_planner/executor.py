@@ -24,8 +24,6 @@ from .const import (
     CONF_EV_CHARGING,
     CONF_EV_CONFIRMATION_RETRIES,
     CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
-    CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
@@ -235,11 +233,6 @@ class Executor:
             ev_entry_data,
             confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
             confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
-            connected_override=(
-                bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
-                if not ev_entry_data.get(CONF_EV_CONNECTED)
-                else None
-            ),
         ).async_set_charging(enabled)
         if not enabled:
             result = _normalized_ev_stop_result(
@@ -569,11 +562,6 @@ class Executor:
                 ev_entry_data,
                 confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                 confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
-                connected_override=(
-                    bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
-                    if not ev_entry_data.get(CONF_EV_CONNECTED)
-                    else None
-                ),
             ).async_execute(action)
             no_change = result.reason == "already_in_desired_state"
             safe_stop_confirmed = _ev_result_proves_safe(result)

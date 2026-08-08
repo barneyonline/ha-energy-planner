@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-08-02.
+Status as of 2026-08-09.
 
 ## Covered
 
@@ -19,7 +19,8 @@ Status as of 2026-08-02.
 - The user-facing status surface is limited to **Armed**, **Current state**,
   **Next actions**, and the read-only **Plan** calendar. Armed is tied to
   persisted production state; Current state publishes actual configured entity
-  snapshots and ownership; upcoming actions expose bounded decision evidence.
+  snapshots and ownership; Next actions mirrors the combined per-area state
+  summary and exposes bounded decision evidence in attributes.
 - The integration creates one Energy Planner device and attaches every entity to
   it. Connected inputs and policy are configured on one central **Configure**
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
@@ -37,9 +38,10 @@ Status as of 2026-08-02.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Settings backed by native entities are centrally excluded from the settings
-  schemas, keeping configuration and day-to-day control on distinct surfaces
-  without deleting existing stored values during upgrade.
+  Settings backed by remaining native entities are centrally excluded from the
+  settings schemas. Fallback Target SOC is configured centrally; the retired
+  Target SOC number, manual EV start/stop buttons, and connected helper are
+  removed from the entity registry during setup.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, HAEO, forecast, bounded action, AI, ownership, override, and outcome
   records.
@@ -62,6 +64,11 @@ Status as of 2026-08-02.
   validation and persisted with the HAEO run metadata. Service failures,
   including legacy no-`return_response` fallback failures, are reported as
   failed HAEO solves instead of raising through planner refresh.
+  EV and Enphase actions carry an HAEO dependency only when their grid-safety
+  or arbitrage decision actually used current HAEO evidence; deterministic
+  fallback actions remain executable while the existing action validator still
+  fails closed for genuinely HAEO-derived actions whose evidence is no longer
+  ready.
 - HAEO response parsing accepts flat slot lists, timestamp-keyed schedules,
   nested grid/battery evidence, and camelCase live-export keys with W-to-kW
   normalization; parsed battery charge/discharge evidence is covered through
@@ -194,7 +201,7 @@ Status as of 2026-08-02.
   fields are compacted and redacted before they can be shown.
 - Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
-- AI explanation and troubleshooting is on-demand, minimized, JSON-only, and
+- AI explanation and troubleshooting is on-demand, minimized, structured, and
   whitelisted. Automatic background calls and the AI Enabled entity are removed.
   The primary **Explain or troubleshoot** button accepts only **No action
   needed** or one complete action anchored to a current planner issue/rejection
@@ -202,7 +209,9 @@ Status as of 2026-08-02.
   next step, expected benefit, and verification. Generic tuning suggestions are
   rejected, and AI cannot call services, change settings, or bypass hard
   constraints. The result and pending state are published in **Next actions**
-  attributes instead of a separate status entity. The integration warns that provider
+  attributes instead of a separate status entity. Home Assistant's AI Task
+  structured-output schema is supplied to the provider, and rejected results
+  remain visible across equivalent plan refreshes. The integration warns that provider
   integrations may independently log bounded prompts. Docker smoke coverage
   exercises a response-capable local AI advisor service through Home Assistant
   Core and verifies accepted bounded advice in Store recommendations.

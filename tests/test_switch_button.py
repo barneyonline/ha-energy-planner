@@ -15,7 +15,6 @@ from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
 from custom_components.ha_energy_planner.const import (
     CONF_AI_TASK_ENTITY,
     CONF_DRY_RUN,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_PLANNER_ENABLED,
@@ -64,8 +63,6 @@ class FakeCoordinator:
         self.disarm_calls: list[str] = []
         self.pause_calls: list[tuple[int, str, str]] = []
         self.resume_calls: list[str] = []
-        self.ev_charging_calls: list[bool] = []
-        self.ev_connected_helper_calls: list[bool] = []
         self.ev_keep_on_calls: list[bool] = []
         self.ai_advice_requests = 0
         self.entry_data: dict[str, object] = {}
@@ -73,7 +70,6 @@ class FakeCoordinator:
         self.active_control_value = False
         self.last_update_success = True
         self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
-        self.ev_charging_result = SimpleNamespace(applied=True, reason="applied")
         self.last_control_mode = (
             bool(self.options[CONF_PLANNER_ENABLED]),
             bool(self.options[CONF_DRY_RUN]),
@@ -129,16 +125,6 @@ class FakeCoordinator:
 
     async def async_resume_control(self, reason: str) -> None:
         self.resume_calls.append(reason)
-
-    async def async_manual_ev_charging(self, enabled: bool) -> Any:
-        self.ev_charging_calls.append(enabled)
-        return self.ev_charging_result
-
-    async def async_set_ev_connected_helper(self, connected: bool) -> None:
-        self.ev_connected_helper_calls.append(connected)
-        options = self.options
-        options[CONF_EV_CONNECTED_HELPER] = connected
-        self.hass.config_entries.async_update_entry(self.entry, options=options)
 
     async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
         self.ev_keep_on_calls.append(enabled)
@@ -236,26 +222,8 @@ def test_switch_setup_and_constructor(monkeypatch: object) -> None:
         "switch.entry-1_ev_control_enabled",
         "switch.entry-1_climate_control_enabled",
         "switch.entry-1_enphase_control_enabled",
+        "switch.entry-1_ev_connected_helper",
     ]
-
-
-def test_connected_helper_switch_uses_coordinator_trip_history_path() -> None:
-    coordinator = FakeCoordinator({CONF_EV_CONNECTED_HELPER: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description for description in SWITCHES if description.option_key == CONF_EV_CONNECTED_HELPER
-        ),
-        write_count=0,
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
-
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.ev_connected_helper_calls == [True]
-    assert coordinator.entry.options[CONF_EV_CONNECTED_HELPER] is True
-    assert switch.write_count == 1
 
 
 def test_opportunistic_charging_switch_persists_and_replans() -> None:
@@ -306,19 +274,29 @@ def test_keep_on_switch_uses_coordinator_validation_path() -> None:
 
 def test_button_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator()
-    entry = SimpleNamespace(runtime_data=coordinator)
+    entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator)
     added: list[object] = []
+    removed: list[str] = []
+
+    class FakeRegistry:
+        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> str:
+            return f"button.{unique_id}"
+
+        def async_remove(self, entity_id: str) -> None:
+            removed.append(entity_id)
 
     def fake_add_planner_entities(entry_arg: object, add_entities: object, entities: object) -> None:
         added.extend(entities)
 
     monkeypatch.setattr(button_module, "async_add_planner_entities", fake_add_planner_entities)
+    monkeypatch.setattr(button_module.er, "async_get", lambda hass: FakeRegistry())
 
     asyncio.run(button_module.async_setup_entry(None, entry, None))
     button = PlannerButton(coordinator, next(description for description in BUTTONS if description.key == "replan"))
 
     assert len(added) == len(BUTTONS)
     assert button.unique_id == "entry-1_replan"
+    assert removed == ["button.entry-1_ev_start_charging", "button.entry-1_ev_stop_charging"]
 
 
 def test_replan_button_requests_replan() -> None:
@@ -363,28 +341,11 @@ def test_restore_button_restores_safe_state() -> None:
     assert coordinator.replan_count == 0
 
 
-def test_manual_ev_charging_buttons_use_native_controller() -> None:
-    coordinator = FakeCoordinator()
-    start = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(description for description in BUTTONS if description.key == "ev_start_charging"),
-    )
-    stop = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(description for description in BUTTONS if description.key == "ev_stop_charging"),
-    )
-
-    asyncio.run(PlannerButton.async_press(start))
-    asyncio.run(PlannerButton.async_press(stop))
-
-    assert coordinator.ev_charging_calls == [True, False]
-
-
-def test_manual_ev_charging_buttons_use_supported_icons() -> None:
+def test_removed_manual_ev_buttons_are_not_exposed() -> None:
     descriptions = {description.key: description for description in BUTTONS}
 
-    assert descriptions["ev_start_charging"].icon == "mdi:ev-station"
-    assert descriptions["ev_stop_charging"].icon == "mdi:stop-circle-outline"
+    assert "ev_start_charging" not in descriptions
+    assert "ev_stop_charging" not in descriptions
     assert descriptions["request_ai_advice"].icon == "mdi:comment-question-outline"
 
 
@@ -401,22 +362,6 @@ def test_restore_button_raises_translated_error_when_restore_is_incomplete() -> 
 
     assert error.value.translation_domain == "ha_energy_planner"
     assert error.value.translation_key == "restore_safe_state_failed"
-
-
-def test_manual_ev_charging_button_raises_translated_error_when_command_fails() -> None:
-    coordinator = FakeCoordinator()
-    coordinator.ev_charging_result = SimpleNamespace(applied=False, reason="charger_unavailable")
-    button = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(description for description in BUTTONS if description.key == "ev_start_charging"),
-    )
-
-    with pytest.raises(HomeAssistantError) as error:
-        asyncio.run(PlannerButton.async_press(button))
-
-    assert error.value.translation_domain == "ha_energy_planner"
-    assert error.value.translation_key == "manual_ev_control_failed"
-    assert error.value.translation_placeholders == {"reason": "charger_unavailable"}
 
 
 def test_preflight_button_creates_notification(monkeypatch: object) -> None:

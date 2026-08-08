@@ -71,7 +71,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
@@ -932,13 +931,13 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
             CONF_EV_CONTROL_ENABLED,
             CONF_CLIMATE_CONTROL_ENABLED,
             CONF_ENPHASE_CONTROL_ENABLED,
-            CONF_EV_CONNECTED_HELPER,
-            CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
             CONF_EV_KEEP_CHARGER_ON,
             CONF_EV_LOW_PRICE_CHARGING_ENABLED,
             CONF_EV_LOW_PRICE_THRESHOLD,
         }
     )
+
+    assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT in schema_keys
 
 
 def test_options_flow_saves_all_sections_together_and_preserves_options() -> None:

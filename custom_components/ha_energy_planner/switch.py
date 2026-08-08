@@ -11,7 +11,6 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     DOMAIN,
@@ -41,14 +40,6 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         active_control=True,
     ),
     PlannerSwitchDescription(
-        key="ev_connected_helper",
-        translation_key="ev_connected_helper",
-        icon="mdi:ev-plug-type2",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_EV_CONNECTED_HELPER,
-        default=False,
-    ),
-    PlannerSwitchDescription(
         key="ev_keep_charger_on",
         translation_key="ev_keep_charger_on",
         icon="mdi:car-defrost-front",
@@ -73,6 +64,7 @@ _RETIRED_CONTROL_SWITCH_KEYS = (
     "ev_control_enabled",
     "climate_control_enabled",
     "enphase_control_enabled",
+    "ev_connected_helper",
 )
 
 
@@ -139,10 +131,6 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
     async def _async_set_option(self, value: bool) -> None:
         option_key = self.entity_description.option_key
         assert option_key is not None
-        if option_key == CONF_EV_CONNECTED_HELPER:
-            await self.coordinator.async_set_ev_connected_helper(value)
-            self.async_write_ha_state()
-            return
         if option_key == CONF_EV_KEEP_CHARGER_ON:
             await self.coordinator.async_set_ev_keep_charger_on(value)
             self.async_write_ha_state()
