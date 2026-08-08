@@ -400,7 +400,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: Adjustable device settings use the Home Assistant config entity category, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
+    comment: The remaining adjustable day-to-day device settings use the Home Assistant config entity category, while fallback Target SOC is central configuration and the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -431,7 +431,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, the sole Automatic control switch, and day-to-day EV controls, use translation keys mirrored across bundled English translations.
+    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, the sole Automatic control switch, and the remaining day-to-day EV controls, use translation keys mirrored across bundled English translations.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json

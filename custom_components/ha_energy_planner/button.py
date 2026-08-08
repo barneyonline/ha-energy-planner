@@ -10,6 +10,7 @@ from homeassistant.components.button import ButtonEntity, ButtonEntityDescriptio
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -99,26 +100,6 @@ async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_resume_control("button_pressed")
 
 
-async def _start_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
-    await _manual_ev_charging(coordinator, True)
-
-
-async def _stop_ev_charging(coordinator: EnergyPlannerCoordinator) -> None:
-    await _manual_ev_charging(coordinator, False)
-
-
-async def _manual_ev_charging(coordinator: EnergyPlannerCoordinator, enabled: bool) -> None:
-    """Apply a manual EV command and surface adapter rejection to the user."""
-    result = await coordinator.async_manual_ev_charging(enabled)
-    if not result.applied:
-        raise HomeAssistantError(
-            f"Energy Planner could not change EV charging: {result.reason}",
-            translation_domain=DOMAIN,
-            translation_key="manual_ev_control_failed",
-            translation_placeholders={"reason": result.reason},
-        )
-
-
 BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="replan",
@@ -189,21 +170,9 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         entity_registry_enabled_default=False,
         press_fn=_resume,
     ),
-    PlannerButtonDescription(
-        key="ev_start_charging",
-        translation_key="ev_start_charging",
-        icon="mdi:ev-station",
-        entity_category=EntityCategory.CONFIG,
-        press_fn=_start_ev_charging,
-    ),
-    PlannerButtonDescription(
-        key="ev_stop_charging",
-        translation_key="ev_stop_charging",
-        icon="mdi:stop-circle-outline",
-        entity_category=EntityCategory.CONFIG,
-        press_fn=_stop_ev_charging,
-    ),
 )
+
+_RETIRED_BUTTON_KEYS = ("ev_start_charging", "ev_stop_charging")
 
 
 async def async_setup_entry(
@@ -213,9 +182,19 @@ async def async_setup_entry(
 ) -> None:
     """Set up buttons."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
+    _remove_retired_buttons(hass, entry)
     async_add_planner_entities(
         entry, async_add_entities, (PlannerButton(coordinator, description) for description in BUTTONS)
     )
+
+
+def _remove_retired_buttons(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Remove retired manual EV command buttons from the entity registry."""
+    registry = er.async_get(hass)
+    for key in _RETIRED_BUTTON_KEYS:
+        entity_id = registry.async_get_entity_id("button", DOMAIN, f"{entry.entry_id}_{key}")
+        if entity_id is not None:
+            registry.async_remove(entity_id)
 
 
 class PlannerButton(EnergyPlannerEntity, ButtonEntity):

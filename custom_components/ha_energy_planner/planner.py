@@ -52,6 +52,7 @@ from .models import (
     DecisionContext,
     EnergyPlan,
     FlexibleLoadProjection,
+    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -409,7 +410,7 @@ class DryRunPlanner:
                     reason_codes=[charging_reason, target.reason, schedule.reason],
                     expected_cost_delta=None,
                     confidence=confidence_from_context(context),
-                    requires_haeo_plan_id=context.plan_id,
+                    requires_haeo_plan_id=_haeo_grid_dependency_plan_id(context),
                 )
             )
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
@@ -454,7 +455,12 @@ class DryRunPlanner:
                 reason_codes=[f"enphase_{arbitrage['source']}_above_threshold"],
                 expected_cost_delta=round(value, 4),
                 confidence=confidence_from_context(context),
-                requires_haeo_plan_id=context.plan_id,
+                requires_haeo_plan_id=(
+                    context.plan_id
+                    if context.haeo_status == HAEOStatus.READY
+                    and str(arbitrage["source"]).startswith("haeo_")
+                    else None
+                ),
             )
         if value < min_savings and ai_profile and current_profile and current_profile != ai_profile:
             return PlanAction(
@@ -2141,22 +2147,23 @@ def _arbitrage_value(
     interval_minutes: int,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    battery_arbitrage = _haeo_battery_arbitrage(context, interval_minutes, options)
-    if battery_arbitrage is not None:
-        return {
-            "value": battery_arbitrage["value"],
-            "source": "haeo_battery_arbitrage_value",
-            "direction": battery_arbitrage["direction"],
-            "details": battery_arbitrage.get("details", {}),
-        }
-    haeo_export_value = _haeo_export_value(context, interval_minutes)
-    if haeo_export_value is not None:
-        return {
-            "value": haeo_export_value,
-            "source": "haeo_export_value",
-            "direction": "consume",
-            "details": {"source": "haeo_grid_export_forecast_kw"},
-        }
+    if context.haeo_status == HAEOStatus.READY:
+        battery_arbitrage = _haeo_battery_arbitrage(context, interval_minutes, options)
+        if battery_arbitrage is not None:
+            return {
+                "value": battery_arbitrage["value"],
+                "source": "haeo_battery_arbitrage_value",
+                "direction": battery_arbitrage["direction"],
+                "details": battery_arbitrage.get("details", {}),
+            }
+        haeo_export_value = _haeo_export_value(context, interval_minutes)
+        if haeo_export_value is not None:
+            return {
+                "value": haeo_export_value,
+                "source": "haeo_export_value",
+                "direction": "consume",
+                "details": {"source": "haeo_grid_export_forecast_kw"},
+            }
     forecast_export = _forecast_solar_export_value(context, interval_minutes, options)
     if forecast_export is not None:
         return {
@@ -2171,6 +2178,19 @@ def _arbitrage_value(
         "direction": "consume",
         "details": _marginal_budget_summary(context, options or {}),
     }
+
+
+def _haeo_grid_dependency_plan_id(context: DecisionContext) -> str | None:
+    """Return the plan ID only when grid safety uses current HAEO evidence."""
+    if context.haeo_status != HAEOStatus.READY:
+        return None
+    for slot in context.slots:
+        if (
+            _positive_or_none(slot.haeo_grid_import_forecast_kw) is not None
+            or _positive_or_none(slot.haeo_grid_export_forecast_kw) is not None
+        ):
+            return context.plan_id
+    return None
 
 
 def _haeo_battery_arbitrage(

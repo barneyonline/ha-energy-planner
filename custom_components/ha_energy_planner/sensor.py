@@ -39,7 +39,6 @@ from .const import (
 from .coordinator import (
     EnergyPlannerCoordinator,
     _ai_recommendation_fingerprint,
-    _latest_accepted_ai_recommendation,
     _material_plan_fingerprint,
 )
 from .entity import EnergyPlannerEntity, async_add_planner_entities
@@ -316,7 +315,7 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         key="next_actions",
         translation_key="next_actions",
         icon="mdi:timeline-clock-outline",
-        value_fn=lambda coordinator: _next_actions_state(coordinator.data),
+        value_fn=lambda coordinator: _next_actions_state(coordinator),
         attrs_fn=lambda coordinator: _next_actions_attrs(coordinator),
     ),
 )
@@ -505,13 +504,29 @@ def _asset_owned(store_data: dict[str, Any], asset: ActionAsset) -> bool:
     return bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
 
 
-def _next_actions_state(plan: EnergyPlan | None) -> str:
-    """Return the next controlled action and remaining action count."""
-    actions = _ordered_actions(plan)
-    if not actions:
-        return "None"
-    suffix = f" (+{len(actions) - 1})" if len(actions) > 1 else ""
-    return f"{_action_label(actions[0])}{suffix}"
+def _next_actions_state(coordinator: EnergyPlannerCoordinator) -> str:
+    """Return the next planned state for every configured controlled asset."""
+    plan = coordinator.data
+    if plan is None:
+        return "Unknown"
+    asset_by_name = {_asset_name(asset): asset for asset in ActionAsset}
+    summaries = [
+        f"{group['asset']}: {_next_asset_summary(plan, asset_by_name[group['asset']])}"
+        for group in _controlled_state_groups(coordinator)
+        if group["asset"] in asset_by_name
+    ]
+    if not summaries:
+        return "No controls configured"
+    return " | ".join(summaries)[:255]
+
+
+def _next_asset_summary(plan: EnergyPlan, asset: ActionAsset) -> str:
+    """Return a useful next state even when a legacy device plan lacks a label."""
+    state = _asset_next_state(plan, asset)
+    if state not in {"Unknown", "Idle"}:
+        return state
+    action = next((item for item in _ordered_actions(plan) if item.asset == asset), None)
+    return "No planned change" if action is None else _action_label(action)
 
 
 def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
@@ -1237,9 +1252,9 @@ def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[st
             continue
         if item.get("plan_id") == plan.plan_id and item.get("plan_fingerprint") == fingerprint:
             return item
-    latest_accepted = _latest_accepted_ai_recommendation(recommendations)
-    if _ai_recommendation_fingerprint(latest_accepted) == fingerprint:
-        return latest_accepted
+    latest = recommendations[-1] if recommendations else None
+    if _ai_recommendation_fingerprint(latest) == fingerprint:
+        return latest if isinstance(latest, dict) else None
     return None
 
 

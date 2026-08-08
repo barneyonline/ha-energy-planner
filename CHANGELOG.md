@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Changed
+
+- Removed the manual EV start/stop buttons, Target SOC number entity, and EV
+  connected helper. The fallback Target SOC is now configured in the central
+  **EV, battery and grid** section, while live connection state comes only from
+  an optionally mapped vehicle or charger entity.
+- **Next actions** now summarizes the next state of every configured controlled
+  area in its state value, matching the combined **Current state** presentation.
+
+### Fixed
+
+- Deterministic EV and Enphase fallback actions are no longer incorrectly
+  marked as HAEO-dependent when current HAEO grid evidence was not used. Stale
+  HAEO arbitrage evidence is ignored, while genuinely HAEO-derived actions keep
+  the existing fail-closed execution gate.
+- **Explain or troubleshoot** now requests Home Assistant AI Task structured
+  output and keeps rejected results visible across materially equivalent plan
+  refreshes instead of silently returning an empty result.
+
 ## 0.9.0 - 2026-08-08
 
 ### Changed

@@ -435,7 +435,7 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert plan.actions[0].desired_state["target_soc_percent"] == 70.0
     assert plan.actions[0].desired_state["charging_required_now"] is True
     assert plan.actions[0].desired_state["continuous_charging"] is True
-    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
+    assert plan.actions[0].requires_haeo_plan_id is None
     assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0, 0.0]
     assert plan.device_plans["ev"]["total_estimated_energy_kwh"] == 1.0
     timeline = plan.device_plans["ev"]["timeline"]
@@ -1296,7 +1296,7 @@ def test_active_plan_sets_enphase_arbitrage_profile_when_forecast_solar_export_v
     assert plan.actions[0].expected_cost_delta == 0.27
     assert plan.actions[0].desired_state["arbitrage_details"]["accepted_surplus_kwh"] == 1.5
     assert plan.actions[0].desired_state["arbitrage_details"]["battery_round_trip_efficiency"] == 0.9
-    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
+    assert plan.actions[0].requires_haeo_plan_id is None
     assert plan.device_plans["enphase"]["current_state"] == {
         "state": "AI Optimisation",
         "profile": "AI Optimisation",
@@ -2917,6 +2917,7 @@ def test_active_plan_prefers_haeo_export_value_for_enphase_arbitrage() -> None:
     assert plan.actions[0].desired_state["arbitrage_source"] == "haeo_export_value"
     assert plan.actions[0].desired_state["arbitrage_direction"] == "consume"
     assert plan.actions[0].expected_cost_delta == 0.575
+    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
 
 
 def test_active_plan_prefers_haeo_battery_arbitrage_value_for_enphase() -> None:
@@ -2961,6 +2962,56 @@ def test_active_plan_prefers_haeo_battery_arbitrage_value_for_enphase() -> None:
     assert plan.actions[0].desired_state["arbitrage_source"] == "haeo_battery_arbitrage_value"
     assert plan.actions[0].desired_state["arbitrage_direction"] == "charge"
     assert plan.actions[0].expected_cost_delta == 0.3
+    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
+
+
+def test_active_ev_plan_requires_haeo_only_when_current_grid_evidence_is_used() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    context = _context()
+    context.slots[0].haeo_grid_import_forecast_kw = 1.0
+    context.slots[0].haeo_grid_export_forecast_kw = 0.0
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.requires_haeo_plan_id == context.plan_id
+
+    context.haeo_status = HAEOStatus.STALE
+    fallback_plan = DryRunPlanner(options).create_plan(context)
+    fallback_action = next(action for action in fallback_plan.actions if action.asset == ActionAsset.EV)
+    assert fallback_action.requires_haeo_plan_id is None
+
+
+def test_stale_haeo_arbitrage_evidence_falls_back_to_deterministic_forecast() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "enphase_minimum_savings": 0.25,
+        "planning_interval_minutes": 30,
+    }
+    context = _context()
+    context.haeo_status = HAEOStatus.STALE
+    context.current_enphase_profile = "AI Optimisation"
+    context.enphase_ai_profile = "AI Optimisation"
+    context.enphase_self_consumption_profile = "Self-Consumption"
+    context.current_ev_soc_percent = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=import_price,
+            export_price=0.20,
+            pv_forecast_kw=pv_forecast_kw,
+            baseline_load_forecast_kw=2.0,
+            haeo_grid_export_forecast_kw=10.0,
+        )
+        for offset, import_price, pv_forecast_kw in [(0, 0.05, 4.0), (30, 0.15, 3.0)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.actions[0].desired_state["arbitrage_source"] == "forecast_solar_export_value"
+    assert plan.actions[0].requires_haeo_plan_id is None
 
 
 def test_enphase_arbitrage_ignores_non_finite_direct_haeo_evidence() -> None:

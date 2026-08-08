@@ -31,7 +31,6 @@ from .const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
@@ -205,7 +204,7 @@ class InputManager:
         if self.entry_data.get(CONF_EV_CONNECTED):
             ev_connected, ev_connected_issue = self._optional_bool_state(CONF_EV_CONNECTED)
         else:
-            ev_connected = bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
+            ev_connected = None
             ev_connected_issue = None
         ev_charging, ev_charging_issue = self._optional_bool_state(CONF_EV_CHARGING)
         ev_target_soc_fallback_active = False
