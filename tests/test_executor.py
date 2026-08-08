@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -3063,6 +3065,64 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
             "confirmation_retries": 4,
         }
     ]
+
+
+def test_executor_restore_device_control_restores_only_selected_asset(monkeypatch: object) -> None:
+    restored: list[dict[str, Any]] = []
+
+    class FakeEVAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any], **kwargs: Any) -> None:
+            pass
+
+        async def async_restore(self, state: dict[str, Any]) -> object:
+            restored.append(state)
+            return SimpleNamespace(
+                applied=True,
+                reason="ev_restored",
+                pre_state={"switch.ev": "on"},
+                post_state={"switch.ev": "off"},
+            )
+
+    class UnexpectedAdapter:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise AssertionError("An unrelated device adapter was constructed")
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FakeEVAdapter)
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", UnexpectedAdapter)
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", UnexpectedAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "ev_smart_charging_state": {"switch.ev": "on"},
+        "climate_automations": {"automation.hvac": "off"},
+        "hvac_control": {"phase": "preconditioning"},
+        "enphase_profile": "AI Optimisation",
+        "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
+    }
+    hass = FakeHass()
+    executor = Executor(store, hass=hass)
+
+    outcome = asyncio.run(executor.async_restore_device_control("ev", "ev_control_disabled"))
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [{"switch.ev": "on"}]
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "off"},
+        "hvac_control": {"phase": "preconditioning"},
+        "enphase_profile": "AI Optimisation",
+        "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
+    }
+    assert hass.services.calls[-1] == (
+        "persistent_notification",
+        "dismiss",
+        {"notification_id": "ha_energy_planner_restore_safe_state_ev"},
+    )
+
+
+def test_executor_restore_device_control_rejects_unknown_asset() -> None:
+    executor = Executor(FakeStore(), hass=FakeHass())
+
+    with pytest.raises(ValueError, match="Unsupported device control asset"):
+        asyncio.run(executor.async_restore_device_control("unknown", "test"))
 
 
 def test_executor_restore_safe_state_retains_ownership_without_hass() -> None:

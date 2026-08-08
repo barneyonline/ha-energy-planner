@@ -36,7 +36,7 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
 from custom_components.ha_energy_planner.models import EnergyPlan, InputHealth, OutcomeResult, PlannerMode
-from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
 
 
 @dataclass(slots=True)
@@ -616,7 +616,7 @@ def test_run_preflight_rejects_stale_or_unconfirmed_plan() -> None:
     assert failed["current_plan"]["last_refresh_succeeded"] is False
 
 
-def test_run_preflight_rejects_active_pause_and_changed_control_contract() -> None:
+def test_run_preflight_rejects_pause_but_preserves_evidence_across_device_selection() -> None:
     coordinator = _coordinator()
     coordinator.store.data["control_pause"] = {
         "active": True,
@@ -630,9 +630,24 @@ def test_run_preflight_rejects_active_pause_and_changed_control_contract() -> No
 
     assert paused["safe_to_activate_now"] is False
     assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is False
-    assert changed["production"]["dry_run_evidence_complete"] is False
+    assert changed["production"]["dry_run_evidence_complete"] is True
+    assert changed["production"]["dry_run_evidence_fingerprint_matches"] is True
+    assert changed["safe_to_activate_now"] is True
     checks = {item["check"]: item for item in changed["checks"]}
     assert checks["production_gate_ready"]["deprecated_alias_for"] == "dry_run_evidence_complete"
+
+
+def test_preflight_options_override_does_not_mutate_entry_options() -> None:
+    coordinator = _coordinator()
+
+    report = build_preflight_report(
+        FakeHass(coordinator),
+        coordinator,
+        options_override={"climate_control_enabled": False},
+    )
+
+    assert report["production"]["device_controls"]["climate"] is False
+    assert coordinator.entry.options["climate_control_enabled"] is True
 
 
 def test_run_preflight_fails_closed_for_missing_and_malformed_production_state() -> None:
@@ -706,6 +721,9 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
             **options,
             "planner_enabled": False,
             "dry_run": False,
+            "ev_control_enabled": False,
+            "climate_control_enabled": True,
+            "enphase_control_enabled": True,
             "ai_enabled": True,
             "ai_timeout_seconds": 30,
             "default_ready_by": "23:45",

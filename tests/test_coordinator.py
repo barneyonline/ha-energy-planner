@@ -73,6 +73,7 @@ from custom_components.ha_energy_planner.models import (
     HAEOStatus,
     InputHealth,
     OccupancyState,
+    OutcomeResult,
     Override,
     PlanAction,
     PlannerMode,
@@ -234,6 +235,8 @@ class FakeExecutor:
         self.entry_data = {}
         self.evaluated: list[tuple[EnergyPlan, object]] = []
         self.restored: list[str] = []
+        self.device_restores: list[tuple[str, str]] = []
+        self.device_restore_result = SimpleNamespace(result=OutcomeResult.RESTORED)
         self.hvac_releases: list[str] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
@@ -245,6 +248,10 @@ class FakeExecutor:
 
     async def async_restore_safe_state(self, reason: str) -> None:
         self.restored.append(reason)
+
+    async def async_restore_device_control(self, asset: str, reason: str) -> object:
+        self.device_restores.append((asset, reason))
+        return self.device_restore_result
 
     async def async_release_hvac_control(self, reason: str) -> None:
         self.hvac_releases.append(reason)
@@ -3377,24 +3384,40 @@ def test_combined_active_control_requires_a_selected_device(monkeypatch: object)
     with pytest.raises(HomeAssistantError) as error:
         asyncio.run(coordinator.async_set_active_control(True))
 
-    assert error.value.translation_placeholders["reason"] == (
-        "turn on at least one Climate control, EV control, or Enphase control switch"
-    )
+    assert error.value.translation_key == "active_control_no_device_selected"
     assert coordinator.entry.options[CONF_DRY_RUN] is True
     assert coordinator.store.data.get("production", {}).get("armed") is not True
 
 
-def test_device_control_change_while_active_returns_to_review_mode() -> None:
+@pytest.mark.parametrize(
+    ("option_key", "executor_asset", "reason"),
+    [
+        (CONF_EV_CONTROL_ENABLED, "ev", "ev_control_disabled"),
+        (CONF_CLIMATE_CONTROL_ENABLED, "daikin", "hvac_control_disabled"),
+        (CONF_ENPHASE_CONTROL_ENABLED, "enphase", "enphase_control_disabled"),
+    ],
+)
+def test_device_control_disable_while_active_restores_only_selected_asset(
+    option_key: str,
+    executor_asset: str,
+    reason: str,
+) -> None:
     class ConfigEntries:
         def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
             entry.options = options
 
     coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_DAIKIN_CLIMATE: "climate.home",
+            CONF_ENPHASE_PROFILE: "select.profile",
+        },
         options={
             CONF_PLANNER_ENABLED: True,
             CONF_DRY_RUN: False,
             CONF_EV_CONTROL_ENABLED: True,
             CONF_CLIMATE_CONTROL_ENABLED: True,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
         },
         store_data={"production": {"armed": True}},
     )
@@ -3402,13 +3425,194 @@ def test_device_control_change_while_active_returns_to_review_mode() -> None:
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._last_control_mode_state = (True, False)
 
-    asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, False))
+    asyncio.run(coordinator.async_set_device_control(option_key, False))
 
+    assert coordinator.entry.options[option_key] is False
+    assert sum(
+        bool(coordinator.entry.options[key])
+        for key in (
+            CONF_EV_CONTROL_ENABLED,
+            CONF_CLIMATE_CONTROL_ENABLED,
+            CONF_ENPHASE_CONTROL_ENABLED,
+        )
+    ) == 2
+    assert coordinator.entry.options[CONF_DRY_RUN] is False
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.executor.device_restores == [(executor_asset, reason)]
+    assert coordinator.executor.restored == []
+    assert coordinator.active_control is True
+
+
+def test_device_control_restore_failure_keeps_switch_on_and_master_armed() -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_ENPHASE_PROFILE: "select.profile"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, False)
+    coordinator.executor.device_restore_result = SimpleNamespace(result=OutcomeResult.FAILED)
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
+
+    assert error.value.translation_key == "device_control_restore_failed"
+    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is True
+    assert coordinator.entry.options[CONF_DRY_RUN] is False
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.executor.device_restores == [("enphase", "enphase_control_disabled")]
+    assert coordinator.refresh_requested == 0
+
+
+def test_device_control_disable_retries_restore_while_master_is_off() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_ENPHASE_PROFILE: "select.profile"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: True,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
+        store_data={"production": {"armed": False}},
+    )
+    coordinator.executor.device_restore_result = SimpleNamespace(result=OutcomeResult.FAILED)
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
+
+    assert error.value.translation_key == "device_control_restore_failed"
+    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is True
+    assert coordinator.executor.device_restores == [("enphase", "enphase_control_disabled")]
+    assert coordinator.refresh_requested == 0
+
+
+def test_concurrent_device_control_changes_preserve_every_selector() -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_DAIKIN_CLIMATE: "climate.home",
+            CONF_ENPHASE_PROFILE: "select.profile",
+        },
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: True,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, True)
+    restores: list[tuple[str, str]] = []
+
+    async def restore_after_yield(asset: str, reason: str) -> object:
+        await asyncio.sleep(0)
+        restores.append((asset, reason))
+        return SimpleNamespace(result=OutcomeResult.RESTORED)
+
+    coordinator.executor.async_restore_device_control = restore_after_yield
+
+    async def disable_all() -> None:
+        await asyncio.gather(
+            coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, False),
+            coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, False),
+            coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False),
+        )
+
+    asyncio.run(disable_all())
+
+    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is False
     assert coordinator.entry.options[CONF_EV_CONTROL_ENABLED] is False
+    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is False
+    assert {asset for asset, _reason in restores} == {"daikin", "ev", "enphase"}
+
+
+def test_device_control_enable_while_active_preflights_without_disarming(monkeypatch: object) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_DAIKIN_CLIMATE: "climate.home"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, False)
+    reports: list[dict[str, object]] = []
+
+    def preflight(hass: object, coordinator_arg: object, *, options_override: dict[str, object]) -> dict[str, object]:
+        reports.append(options_override)
+        return {"safe_to_activate_now": True}
+
+    monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
+
+    asyncio.run(coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, True))
+
+    assert reports[0][CONF_CLIMATE_CONTROL_ENABLED] is True
     assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is True
-    assert coordinator.entry.options[CONF_DRY_RUN] is True
-    assert coordinator.store.data["production"]["armed"] is False
-    assert coordinator.executor.restored == ["dry_run_enabled"]
+    assert coordinator.entry.options[CONF_DRY_RUN] is False
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.executor.device_restores == []
+    assert coordinator.active_control is True
+
+
+def test_device_control_enable_while_active_rejects_failed_preflight(monkeypatch: object) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_DAIKIN_CLIMATE: "climate.home"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": False,
+            "production": {"dry_run_ready_cycles": 2, "dry_run_evidence_complete": False},
+        },
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, True))
+
+    assert error.value.translation_key == "device_control_not_ready"
+    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is False
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.refresh_requested == 0
+
+
+def test_device_control_cannot_enable_unconfigured_area() -> None:
+    coordinator = _coordinator_for_runtime_services()
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, True))
+
+    assert error.value.translation_key == "device_control_not_configured"
+    assert coordinator.entry.options.get(CONF_EV_CONTROL_ENABLED) is None
 
 
 def test_device_control_rejects_unknown_option() -> None:
@@ -3465,9 +3669,6 @@ def test_combined_active_control_is_a_noop_when_already_active() -> None:
 
 
 def test_combined_active_control_reports_blocking_or_current_plan_reason() -> None:
-    no_devices = _active_control_not_ready_reason(
-        {"production": {"device_controls": {"ev": False, "climate": False, "enphase": False}}}
-    )
     blocking = _active_control_not_ready_reason(
         {
             "production": {"dry_run_ready_cycles": 3, "dry_run_evidence_complete": True},
@@ -3482,7 +3683,6 @@ def test_combined_active_control_reports_blocking_or_current_plan_reason() -> No
         }
     )
 
-    assert no_devices == "turn on at least one Climate control, EV control, or Enphase control switch"
     assert blocking == "A mapped entity is unavailable."
     assert fallback == "a safety check failed"
 
@@ -3688,6 +3888,7 @@ def _coordinator_for_restore() -> EnergyPlannerCoordinator:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.executor = FakeExecutor()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._device_control_lock = asyncio.Lock()
     coordinator._refresh_generation = 0
     coordinator.refresh_requested = 0
 
@@ -3711,6 +3912,7 @@ def _coordinator_for_runtime_services(
     coordinator.store = FakeStore(store_data or {})
     coordinator.executor = FakeExecutor()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._device_control_lock = asyncio.Lock()
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0

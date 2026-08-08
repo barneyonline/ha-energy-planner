@@ -1011,6 +1011,21 @@ class Executor:
 
     async def async_restore_safe_state(self, reason: str) -> ActionOutcome:
         """Restore planner ownership state and notify the user."""
+        return await self._async_restore_safe_state(reason, assets=None)
+
+    async def async_restore_device_control(self, asset: str, reason: str) -> ActionOutcome:
+        """Restore planner ownership for exactly one device control area."""
+        if asset not in {"ev", "daikin", "enphase"}:
+            raise ValueError(f"Unsupported device control asset: {asset}")
+        return await self._async_restore_safe_state(reason, assets={asset})
+
+    async def _async_restore_safe_state(
+        self,
+        reason: str,
+        *,
+        assets: set[str] | None,
+    ) -> ActionOutcome:
+        """Restore all planner ownership or the selected device control areas."""
         now = dt_util.utcnow()
         ownership = dict(self.store.data.get("ownership", {}))
         remaining_ownership = dict(ownership)
@@ -1030,15 +1045,20 @@ class Executor:
         hvac_state = dict(ownership.get("climate_automations", {}))
         hvac_zone_state = dict(hvac_control.get("zone_states", {}))
         enphase_owned = bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
+        restore_ev = assets is None or "ev" in assets
+        restore_hvac = assets is None or "daikin" in assets
+        restore_enphase = assets is None or "enphase" in assets
         restore_requested = bool(
-            ev_state or has_ev_reservation or hvac_state or hvac_zone_state or hvac_control or enphase_owned
+            (restore_ev and (ev_state or has_ev_reservation))
+            or (restore_hvac and (hvac_state or hvac_zone_state or hvac_control))
+            or (restore_enphase and enphase_owned)
         )
 
         if restore_requested and self.hass is None:
             restore_failed = True
             reasons.append("home_assistant_unavailable")
         elif self.hass is not None:
-            if ev_state or has_ev_reservation:
+            if restore_ev and (ev_state or has_ev_reservation):
                 try:
                     ev_adapter = EVSmartChargingAdapter(
                         self.hass,
@@ -1081,7 +1101,7 @@ class Executor:
                         restore_failed = True
                         self._retain_ev_grid_reservation_when_unloaded()
 
-            if hvac_state or hvac_zone_state or hvac_control:
+            if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
                 try:
                     adapter = DaikinHVACAdapter(self.hass, self.entry_data)
                     self.pending_hvac_desired_state = {"restore_zones": hvac_zone_state}
@@ -1127,39 +1147,40 @@ class Executor:
                         retained_hvac_control["required_evidence_lost"] = "hvac_release_failed"
                         remaining_ownership["hvac_control"] = retained_hvac_control
 
-            # Restore a recorded Enphase profile first; otherwise keep the
-            # existing best-effort return to the configured AI profile.
-            try:
-                enphase_adapter = EnphaseProfileAdapter(self.hass, self.entry_data)
-                saved_enphase_profile = ownership.get("enphase_profile")
-                restore_profile = getattr(enphase_adapter, "async_restore_profile", None)
-                if isinstance(saved_enphase_profile, str) and callable(restore_profile):
-                    enphase_result = await restore_profile(saved_enphase_profile)
-                else:
-                    enphase_result = await enphase_adapter.async_restore_ai()
-            except Exception:  # noqa: BLE001 - restoration must preserve retry state.
-                restore_failed = True
-                reasons.append("enphase_restore_exception")
-            else:
-                results.append(enphase_result)
-                reasons.append(enphase_result.reason)
-                if enphase_result.applied:
-                    remaining_ownership.pop("enphase_profile", None)
-                    remaining_ownership.pop("enphase_profile_changed_at", None)
-                elif enphase_owned or "not_configured" not in enphase_result.reason:
+            if restore_enphase and (assets is None or enphase_owned):
+                # Restore a recorded Enphase profile first; a full safe-state
+                # restore retains the existing best-effort configured fallback.
+                try:
+                    enphase_adapter = EnphaseProfileAdapter(self.hass, self.entry_data)
+                    saved_enphase_profile = ownership.get("enphase_profile")
+                    restore_profile = getattr(enphase_adapter, "async_restore_profile", None)
+                    if isinstance(saved_enphase_profile, str) and callable(restore_profile):
+                        enphase_result = await restore_profile(saved_enphase_profile)
+                    else:
+                        enphase_result = await enphase_adapter.async_restore_ai()
+                except Exception:  # noqa: BLE001 - restoration must preserve retry state.
                     restore_failed = True
+                    reasons.append("enphase_restore_exception")
+                else:
+                    results.append(enphase_result)
+                    reasons.append(enphase_result.reason)
+                    if enphase_result.applied:
+                        remaining_ownership.pop("enphase_profile", None)
+                        remaining_ownership.pop("enphase_profile_changed_at", None)
+                    elif enphase_owned or "not_configured" not in enphase_result.reason:
+                        restore_failed = True
 
         # Ownership metadata that cannot represent a pending device restore can
         # always be released. Device baselines above are retained until their
         # corresponding adapter confirms restoration.
-        if not hvac_state and not hvac_zone_state and not hvac_control:
+        if restore_hvac and not hvac_state and not hvac_zone_state and not hvac_control:
             for key in (
                 "planner_takeover_started_at",
                 "planner_hvac_action_expires_at",
                 "manual_hvac_override_expires_at",
             ):
                 remaining_ownership.pop(key, None)
-        if not ev_state and not has_ev_reservation:
+        if restore_ev and not ev_state and not has_ev_reservation:
             remaining_ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
             remaining_ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
 
@@ -1189,7 +1210,8 @@ class Executor:
             service_target="restore_safe_state",
         )
         await self.store.async_add_outcome(outcome)
-        await self._async_notify_restore(outcome)
+        notification_scope = None if assets is None else next(iter(assets))
+        await self._async_notify_restore(outcome, scope=notification_scope)
         return outcome
 
     def _action_outcome(
@@ -1442,9 +1464,12 @@ class Executor:
         """Return whether startup warm-up should suppress fallback notifications."""
         return self.notification_grace_until is not None and dt_util.utcnow() < self.notification_grace_until
 
-    async def _async_notify_restore(self, outcome: ActionOutcome) -> None:
+    async def _async_notify_restore(self, outcome: ActionOutcome, *, scope: str | None = None) -> None:
         """Notify only when a safe-state restore requires user attention."""
-        notification_id = self._notification_id("ha_energy_planner_restore_safe_state")
+        notification_key = "ha_energy_planner_restore_safe_state"
+        if scope is not None:
+            notification_key = f"{notification_key}_{scope}"
+        notification_id = self._notification_id(notification_key)
         if outcome.result != OutcomeResult.FAILED:
             await self._async_dismiss_plan_fallback_notification(notification_id)
             return
