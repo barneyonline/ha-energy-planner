@@ -171,9 +171,10 @@ Energy Planner is built around conservative production controls:
   production gate, and leaves review-only mode only when the current plan and
   recorded dry-run evidence are safe. Turning it off restores planner-owned
   state, disarms production control, and keeps planning in review-only mode.
-- Changing any device control switch while Automatic control is on first
-  restores planner-owned state and returns the whole integration to review mode.
-  This keeps the reviewed control contract and the visible armed state aligned.
+- Turning off a device control switch while Automatic control is on restores
+  only that device; the other selected areas remain armed. If restoration fails,
+  the switch stays on and Home Assistant reports an actionable error. Turning on
+  another device while armed runs preflight before that device may participate.
 - On a new setup, the first activation attempt may remain in review-only mode
   while three healthy plans are recorded. The translated error reports progress;
   review the plan and turn **Automatic control** on again when Production
@@ -182,7 +183,7 @@ Energy Planner is built around conservative production controls:
   removed. The three current device switches are clean control-area selectors;
   **Automatic control** is still the only switch that arms device commands.
 - Active control requires mapped inputs for each enabled control area, healthy modular preflight status, production arming, and dry-run review. Unconfigured or disabled device areas do not block a partial installation.
-- Preflight reports historical `dry_run_evidence_complete` separately from `safe_to_activate_now`. Dry-run evidence is bound to the current control-area/entity/policy fingerprint but intentionally survives switching from dry-run to active mode, changing advisory-only AI settings, and changing the per-run EV ready-by time. Current activation additionally requires a recent successfully refreshed healthy plan, non-zero confidence, at least eight usable priced hours (or the whole configured horizon when shorter), and no active control pause. Execution independently rechecks the evidence fingerprint, bounded evidence count, and strict armed state and fails closed after a contract change or corrupt/missing production state.
+- Preflight reports historical `dry_run_evidence_complete` separately from `safe_to_activate_now`. Dry-run evidence is bound to configured device mappings and decision/control policy, but runtime device participation switches do not invalidate evidence for unaffected devices. It also intentionally survives switching from dry-run to active mode, changing advisory-only AI settings, and changing the per-run EV ready-by time. Current activation additionally requires a recent successfully refreshed healthy plan, non-zero confidence, at least eight usable priced hours (or the whole configured horizon when shorter), and no active control pause. Execution independently rechecks the evidence fingerprint, bounded evidence count, and strict armed state and fails closed after a contract change or corrupt/missing production state.
 - The executor revalidates hard constraints immediately before every device service call.
 - Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
 - Persistent notifications are created once per distinct actionable condition and updated only when their content changes. Broken required mappings, failed restoration, infeasible EV readiness, and grid hard-limit conflicts can notify. Stale data, routine plan changes, successful operations, and safe HAEO fallback remain visible in status or diagnostics without notifying. Actionable plan alerts can be disabled under **AI and safety** without changing fail-closed execution.

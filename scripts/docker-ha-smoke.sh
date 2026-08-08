@@ -348,6 +348,15 @@ input_text:
   planner_automatic_control_seen:
     name: Planner automatic control seen
     initial: unknown
+  planner_climate_control_off_seen:
+    name: Planner climate control off seen
+    initial: unknown
+  planner_ev_control_off_seen:
+    name: Planner EV control off seen
+    initial: unknown
+  planner_enphase_control_off_seen:
+    name: Planner Enphase control off seen
+    initial: unknown
   planner_restore_notification_seen:
     name: Planner restore notification seen
     initial: unknown
@@ -730,6 +739,30 @@ automation:
         data:
           entity_id: switch.energy_planner_automatic_control
       - delay: "00:00:02"
+      - action: switch.turn_off
+        target:
+          entity_id:
+            - switch.energy_planner_climate_control
+            - switch.energy_planner_ev_control
+            - switch.energy_planner_enphase_control
+      - action: input_text.set_value
+        data:
+          entity_id: input_text.planner_climate_control_off_seen
+          value: "{{ states('switch.energy_planner_climate_control') }}"
+      - action: input_text.set_value
+        data:
+          entity_id: input_text.planner_ev_control_off_seen
+          value: "{{ states('switch.energy_planner_ev_control') }}"
+      - action: input_text.set_value
+        data:
+          entity_id: input_text.planner_enphase_control_off_seen
+          value: "{{ states('switch.energy_planner_enphase_control') }}"
+      - action: switch.turn_on
+        target:
+          entity_id:
+            - switch.energy_planner_climate_control
+            - switch.energy_planner_ev_control
+            - switch.energy_planner_enphase_control
       - action: ha_energy_planner.resume_control
         data:
           reason: docker_smoke_automatic_control
@@ -958,7 +991,7 @@ cat > "$TMP_DIR/.storage/ha_energy_planner_state" <<'JSON'
       "armed_reason": "docker_smoke",
       "acknowledged_at": "2026-06-27T00:00:00+00:00",
       "dry_run_ready_cycles": 3,
-      "dry_run_evidence_fingerprint": "1ce23c3a8e3ebf98310ff5b9f6cca57396f8dfe8e1f4bf47ec446e35e9ff820b"
+      "dry_run_evidence_fingerprint": "c74a578a975db5ffc6fbedc262b7df605c30c83df8e1d651a8ae0ae66d9c77d2"
     }
   }
 }
@@ -1426,6 +1459,9 @@ def restored_entity_state(entity_id: str) -> str | None:
 expected_helper_states = {
     "input_text.planner_armed_seen": "on",
     "input_text.planner_automatic_control_seen": "on",
+    "input_text.planner_climate_control_off_seen": "off",
+    "input_text.planner_ev_control_off_seen": "off",
+    "input_text.planner_enphase_control_off_seen": "off",
     "input_text.diagnostics_data_token_seen": "**REDACTED**",
     "input_text.diagnostics_data_address_seen": "**REDACTED**",
     "input_text.diagnostics_option_token_seen": "**REDACTED**",

@@ -81,12 +81,13 @@ from .models import (
     HAEOSolvePhase,
     HAEOStatus,
     InputHealth,
+    OutcomeResult,
     Override,
     PlannerMode,
     to_jsonable,
 )
 from .planner import DryRunPlanner
-from .preflight import build_preflight_report, production_evidence_fingerprint
+from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
@@ -134,11 +135,6 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
 def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
     """Return one actionable reason that the combined activation was rejected."""
     production = dict(report.get("production", {}))
-    device_controls = production.get("device_controls")
-    if isinstance(device_controls, dict) and device_controls and not any(
-        bool(value) for value in device_controls.values()
-    ):
-        return "turn on at least one Climate control, EV control, or Enphase control switch"
     ready_cycles = parse_production_state(production).dry_run_ready_cycles
     if not production.get("dry_run_evidence_complete"):
         return (
@@ -234,6 +230,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._boundary_cancel: Callable[[], None] | None = None
         self._planner_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
+        self._device_control_lock = asyncio.Lock()
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
         self.entry_topology_signature: tuple[Any, ...] | None = None
@@ -1029,7 +1026,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
 
-        report = build_preflight_report(self.hass, self)
         device_control_selected = any(
             strict_bool(self.options.get(key), default=False)
             for key in (
@@ -1038,7 +1034,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 CONF_ENPHASE_CONTROL_ENABLED,
             )
         )
-        if not device_control_selected or not report.get("safe_to_activate_now"):
+        if not device_control_selected:
+            raise HomeAssistantError(
+                "Automatic control requires at least one selected device control area",
+                translation_domain=DOMAIN,
+                translation_key="active_control_no_device_selected",
+            )
+
+        report = build_preflight_report(self.hass, self)
+        if not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
                 f"Automatic control is not ready: {reason}",
@@ -1054,26 +1058,57 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_handle_options_update()
 
     async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
-        """Select one device area, returning to review mode before a contract change."""
-        allowed_keys = {
-            CONF_EV_CONTROL_ENABLED,
-            CONF_CLIMATE_CONTROL_ENABLED,
-            CONF_ENPHASE_CONTROL_ENABLED,
+        """Enable or safely restore exactly one device control area."""
+        async with self._device_control_lock:
+            await self._async_set_device_control(option_key, enabled)
+
+    async def _async_set_device_control(self, option_key: str, enabled: bool) -> None:
+        """Apply one serialized device control transition."""
+        control_areas = {
+            CONF_EV_CONTROL_ENABLED: ("ev", "ev"),
+            CONF_CLIMATE_CONTROL_ENABLED: ("hvac", "daikin"),
+            CONF_ENPHASE_CONTROL_ENABLED: ("enphase", "enphase"),
         }
-        if option_key not in allowed_keys:
+        if option_key not in control_areas:
             raise ValueError(f"Unsupported device control option: {option_key}")
         if strict_bool(self.options.get(option_key), default=False) is enabled:
             return
 
-        # Device participation changes the reviewed production contract. Restore
-        # all planner-owned state before changing it so no device can continue
-        # under evidence collected for a different set of controls.
-        if self.active_control:
-            await self.async_set_active_control(False)
+        area, executor_asset = control_areas[option_key]
+        proposed_options = {**self.options, option_key: enabled}
+        area_report = _control_area_report(self.entry_data, proposed_options)
+        if enabled and not area_report["details"][area]["configured"]:
+            raise HomeAssistantError(
+                "The selected device control area is not configured",
+                translation_domain=DOMAIN,
+                translation_key="device_control_not_configured",
+            )
 
-        options = self.options
-        options[option_key] = enabled
-        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        if self.active_control and enabled:
+            report = build_preflight_report(self.hass, self, options_override=proposed_options)
+            if not report.get("safe_to_activate_now"):
+                reason = _active_control_not_ready_reason(report)
+                raise HomeAssistantError(
+                    f"Device control is not ready: {reason}",
+                    translation_domain=DOMAIN,
+                    translation_key="device_control_not_ready",
+                    translation_placeholders={"reason": reason},
+                )
+
+        if not enabled:
+            async with self._planner_lock:
+                outcome = await self.executor.async_restore_device_control(
+                    executor_asset,
+                    f"{area}_control_disabled",
+                )
+            if outcome.result == OutcomeResult.FAILED:
+                raise HomeAssistantError(
+                    "The selected device could not be restored, so its control switch remains on",
+                    translation_domain=DOMAIN,
+                    translation_key="device_control_restore_failed",
+                )
+
+        self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
         await self.async_handle_options_update()
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:

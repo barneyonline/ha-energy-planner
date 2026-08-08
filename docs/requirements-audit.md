@@ -29,8 +29,9 @@ Status as of 2026-08-09.
 - Automatic control is the sole master activation switch and combines preflight,
   production arming, and active/review transitions. Separate Climate control,
   EV control, and Enphase control switches select the participating areas. A
-  selection change while armed restores safe state and returns to review mode
-  before changing the evidence contract. The former planner, dry-run, and legacy
+  device-off transition while armed restores only that asset and fails without
+  changing the selector if restoration is incomplete; device-on transitions pass
+  preflight before execution while unaffected controls remain armed. The former planner, dry-run, and legacy
   `*_control_enabled` switch entities remain removed. Runtime option updates
   request replanning without reloading the config entry, and Docker smoke
   coverage exercises switches and buttons through Home Assistant Core service
@@ -510,8 +511,9 @@ Status as of 2026-08-09.
   replan.
 - Climate, EV, and Enphase each expose a translated device control switch on the
   same Energy Planner device. Automatic control remains the guarded master arm;
-  changing a device selection while armed restores safe state and returns to
-  review mode before the control contract changes.
+  disabling a device restores only that asset, failed restoration leaves the
+  selector unchanged, and enabling an area while armed passes preflight without
+  disarming unaffected controls.
 - All integration services accept an optional `config_entry_id`. A single
   loaded runtime remains backward compatible, while multiple runtimes reject
   ambiguous calls and route explicitly targeted calls to the selected entry.
