@@ -12,8 +12,6 @@ import pytest
 from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.ha_energy_planner import (
-    _async_remove_legacy_device,
-    _planner_entity_key,
     _validate_ready_by_time,
     _validate_reason_code,
     async_setup,
@@ -43,7 +41,7 @@ from custom_components.ha_energy_planner.diagnostics import (
 )
 from custom_components.ha_energy_planner.discovery import CapabilityEvidence, DiscoveryReport
 from custom_components.ha_energy_planner.discovery import _split_entity_values as discovery_split_entities
-from custom_components.ha_energy_planner.entity import planner_device_key_for_entity
+from custom_components.ha_energy_planner.entity import planner_device_identifier
 from custom_components.ha_energy_planner.ev import update_trip_history_from_values
 from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter, _time_parts
 from custom_components.ha_energy_planner.executor import Executor, _profile_control_service_for_target
@@ -84,7 +82,7 @@ from custom_components.ha_energy_planner.subentry_migration import (
     SUBENTRY_CLIMATE,
     SUBENTRY_ENERGY,
     SUBENTRY_ENPHASE,
-    async_consolidate_subentries,
+    async_migrate_subentries_to_entry_data,
     grouped_subentry_data,
 )
 from custom_components.ha_energy_planner.system_health import system_health_info
@@ -135,11 +133,7 @@ def test_remaining_validation_and_small_helpers(monkeypatch: pytest.MonkeyPatch)
         _validate_reason_code("bad reason!")
     assert _validate_ready_by_time("7:05:30") == "07:05"
     assert _validate_reason_code("manual_service_call") == "manual_service_call"
-    assert (
-        _planner_entity_key("entry", SimpleNamespace(unique_id="", entity_id="sensor.ha_energy_planner_plan_status"))
-        == "plan_status"
-    )
-    assert planner_device_key_for_entity("unknown_entity") == "system"
+    assert planner_device_identifier("entry") == (DOMAIN, "entry")
     assert _time_parts("bad") is None
     assert _time_parts("aa:bb") is None
     assert _time_parts("2026-06-27T07:30:00+10:00") == (7, 30)
@@ -508,7 +502,7 @@ def test_remaining_subentry_migration_branches() -> None:
         ),
         "ignore": SimpleNamespace(subentry_id="ignore", subentry_type="unknown", data={"x": 1}),
     }
-    entry = SimpleNamespace(subentries=subentries)
+    entry = SimpleNamespace(data={"instance_name": "Energy Planner"}, subentries=subentries)
     grouped = grouped_subentry_data(entry)
 
     assert grouped["energy"]["amber_import_price_entity"] == "sensor.price"
@@ -518,27 +512,21 @@ def test_remaining_subentry_migration_branches() -> None:
 
     class ConfigEntries:
         def __init__(self) -> None:
-            self.added: list[Any] = []
-            self.updated: list[Any] = []
+            self.entry_data: dict[str, Any] = {}
             self.removed: list[str] = []
 
-        def async_add_subentry(self, entry: Any, subentry: Any) -> bool:
-            self.added.append(subentry)
-            entry.subentries[subentry.subentry_id] = subentry
-            return True
-
-        def async_update_subentry(self, entry: Any, subentry: Any, *, title: str, data: dict[str, Any]) -> bool:
-            self.updated.append((subentry.subentry_type, title, data))
-            return True
+        def async_update_entry(self, entry: Any, *, data: dict[str, Any]) -> None:
+            self.entry_data = data
 
         def async_remove_subentry(self, entry: Any, subentry_id: str) -> bool:
             self.removed.append(subentry_id)
             return True
 
     hass = SimpleNamespace(config_entries=ConfigEntries())
-    assert async_consolidate_subentries(hass, entry) is True
-    assert hass.config_entries.added
-    assert "optimizer-old" in hass.config_entries.removed
+    assert async_migrate_subentries_to_entry_data(hass, entry) is True
+    assert hass.config_entries.entry_data["weather_entity"] == "weather.home"
+    assert hass.config_entries.entry_data["x"] == 1
+    assert hass.config_entries.removed == list(subentries)
 
 
 def test_remaining_system_health_and_registry_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -549,28 +537,7 @@ def test_remaining_system_health_and_registry_helpers(monkeypatch: pytest.Monkey
     )
     assert info["configured_entries"] == 0
 
-    entry = SimpleNamespace(subentries={"energy": SimpleNamespace(subentry_type="energy", subentry_id="energy-id")})
-    from custom_components.ha_energy_planner.entity import planner_config_subentry_id
-
-    assert planner_config_subentry_id(entry, "missing") is None
-
-    entity = SimpleNamespace(platform=DOMAIN, device_id="legacy", entity_id="sensor.x", unique_id="uid")
-    ent_reg = SimpleNamespace(
-        entities={"sensor.x": entity},
-        async_update_entity=lambda entity_id, **kwargs: setattr(entity, "device_id", kwargs["device_id"]),
-    )
-    dev = SimpleNamespace(id="legacy")
-    removed: list[str] = []
-    dev_reg = SimpleNamespace(
-        async_get_device=lambda identifiers: dev, async_remove_device=lambda device_id: removed.append(device_id)
-    )
-    monkeypatch.setattr("homeassistant.helpers.entity_registry.async_get", lambda hass: ent_reg)
-    monkeypatch.setattr("homeassistant.helpers.device_registry.async_get", lambda hass: dev_reg)
-
-    _async_remove_legacy_device(SimpleNamespace(), SimpleNamespace(entry_id="entry"))
-
-    assert entity.device_id is None
-    assert removed == ["legacy"]
+    assert planner_device_identifier("entry") == (DOMAIN, "entry")
 
 
 def test_remaining_setup_services_without_entries() -> None:
@@ -600,7 +567,8 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
     assert _invalid_response_reason({1: "bad"}) == "ai_response_unsupported_fields"
     assert _parse_response({"response": {"data": '{"confidence": 0.5}'}}) == {"confidence": 0.5}
     assert _parse_response({"response": "bad json"}) is None
-    assert _parse_response({"confidence": 0.5}) == {"confidence": 0.5}
+    no_action = {"outcome": "no_action_needed", "summary": "No action."}
+    assert _parse_response(no_action) == no_action
     assert _parse_response(123) is None
     assert _preview_summary([]) == {}
     assert _preview_summary(
@@ -701,12 +669,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     )
     asyncio.run(async_setup(hass, {}))
     assert asyncio.run(hass.services.handlers["export_diagnostics"](SimpleNamespace(data={}))) == {"entry_id": "entry"}
-
-    dev_reg = SimpleNamespace(async_get_device=lambda identifiers: None)
-    ent_reg = SimpleNamespace(entities={})
-    monkeypatch.setattr("homeassistant.helpers.entity_registry.async_get", lambda hass: ent_reg)
-    monkeypatch.setattr("homeassistant.helpers.device_registry.async_get", lambda hass: dev_reg)
-    _async_remove_legacy_device(SimpleNamespace(), SimpleNamespace(entry_id="entry"))
 
     # Forecast defensive branches.
     assert _parse_item("bad", value_keys=("value",), value_kind="price") is None
@@ -871,15 +833,10 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert _attribute_value({"Camel Key": "value"}, "camel_key") == "value"
     assert _attribute_value({"Camel Key": "value"}, "camel key") == "value"
     assert _attribute_value({"direct": "value"}, "direct") == "value"
-    # Subentry no-consolidation early return.
-    entry = SimpleNamespace(
-        subentries={
-            "system": SimpleNamespace(subentry_id="system", subentry_type="system", data={}),
-            "presence": SimpleNamespace(subentry_id="presence", subentry_type="presence", data={}),
-        }
-    )
-    hass2 = SimpleNamespace(config_entries=SimpleNamespace(async_add_subentry=lambda entry, subentry: False))
-    assert async_consolidate_subentries(hass2, entry) is False
+    # No legacy Add device sections means there is nothing to migrate.
+    entry = SimpleNamespace(data={}, subentries={})
+    hass2 = SimpleNamespace(config_entries=SimpleNamespace())
+    assert async_migrate_subentries_to_entry_data(hass2, entry) is False
 
     assert (
         EVSmartChargingAdapter(SimpleNamespace(states=States({}), services=Services()), {})._entity_value_matches(
@@ -992,10 +949,10 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
     monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", Store)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", Coordinator)
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.subentry_migration.async_consolidate_subentries", lambda hass, entry: False
+        "custom_components.ha_energy_planner.subentry_migration.async_migrate_subentries_to_entry_data",
+        lambda hass, entry: False,
     )
-    monkeypatch.setattr("custom_components.ha_energy_planner._async_remove_legacy_device", lambda hass, entry: None)
-    monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_devices", lambda hass, entry: None)
+    monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda hass, entry: None)
     updates: list[dict[str, Any]] = []
     hass = SimpleNamespace(
         config_entries=SimpleNamespace(

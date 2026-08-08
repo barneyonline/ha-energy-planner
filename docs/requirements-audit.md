@@ -16,34 +16,43 @@ Status as of 2026-08-02.
   falls back to safe list/dict defaults while preserving unknown metadata, and
   malformed persisted execution timestamps are ignored instead of raising
   through safety-gate evaluation.
-- The takeover-active binary sensor is tied to persisted planner ownership
-  state rather than merely reporting candidate actions in the current plan.
-- Planner enable, dry-run, AI-enable, replan, and restore-safe-state entity
-  controls have direct regression coverage for option updates and coordinator
-  calls. Runtime option updates request replanning without reloading the config
-  entry. Docker smoke coverage exercises the planner-enabled, AI-enabled, and
-  dry-run switch entities plus the replan and restore-safe-state button entities
-  through Home Assistant Core service calls.
+- The user-facing status surface is limited to **Armed**, **Current state**,
+  **Next actions**, and the read-only **Plan** calendar. Armed is tied to
+  persisted production state; Current state publishes actual configured entity
+  snapshots and ownership; upcoming actions expose bounded decision evidence.
+- The integration creates one Energy Planner device and attaches every entity to
+  it. Connected inputs and policy are configured on one central **Configure**
+  page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
+  sections; the former Add device/config-subentry surface is removed. Existing
+  subentry mappings are folded into the main config entry during setup.
+- The Automatic control entity is the sole activation switch and combines
+  configured-area enablement, preflight, production arming, and active/review
+  transitions. The former planner, dry-run, and per-device activation switches
+  are removed. Runtime option updates request replanning without reloading the
+  config entry, and Docker smoke coverage exercises switches and buttons through
+  Home Assistant Core service calls.
 - Config flow validation checks mapped entity IDs, expected domains, compatible
   units where exposed, entity availability, and configured service availability
   without issuing commands. The user must provide mapped people/entities rather
   than receiving environment-specific person defaults in production Python.
-  Options flow validation enforces coherent device constraints and supported
+  Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Settings backed by native entities are centrally excluded from the Options
-  schema, keeping configuration and day-to-day control on distinct surfaces
+  Settings backed by native entities are centrally excluded from the settings
+  schemas, keeping configuration and day-to-day control on distinct surfaces
   without deleting existing stored values during upgrade.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, HAEO, forecast, bounded action, AI, ownership, override, and outcome
   records.
-- Published plan-status, next-action, and dry-run comparison sensor attributes
-  are compact, JSON-friendly, and bounded so enum/datetime values are
-  serialized and nested audit evidence cannot exceed Recorder's state-attribute
-  limit. Full bounded dry-run evidence remains available through diagnostics.
-- Forecast confidence is calculated from source confidence metadata where
-  exposed, uses a conservative lower confidence for point-sensor forecast
-  fallback, and caps the published plan/action confidence without weakening
-  fail-closed health checks.
+- Published current-state and next-actions attributes are compact, JSON-friendly,
+  and bounded so enum/datetime values are serialized and nested action evidence
+  cannot exceed Recorder's state-attribute limit. Full bounded dry-run,
+  forecast-health, and execution evidence remains available through diagnostics.
+- Forecast safety weighting is calculated from source metadata where exposed
+  and uses a conservative lower weight for point-sensor fallback. The weight
+  remains internal to fail-closed control gates; user-facing attributes instead
+  identify the limiting source, affected entities, temporal coverage, and
+  corrective action so a fixed fallback weight is not presented as a measured
+  probability.
 - Weather forecast attributes and current weather state are normalized into
   outdoor temperature values for the decision context, with canonical attribute
   matching and Fahrenheit-to-Celsius conversion for common weather schemas.
@@ -175,22 +184,25 @@ Status as of 2026-08-02.
   persist across restart, and release only HVAC ownership. An externally
   enabled manual-override helper creates an authoritative indefinite override;
   helper feedback from integration-created timed overrides is guarded.
-- Persistent notifications are emitted for restore-safe-state, infeasible EV
-  ready-by schedules, unsafe required inputs, grid-limit fallback, and HAEO
-  fallback classes, using stable notification IDs and compact redacted reason
-  codes. Native HAEO response and flexible-projection capability gaps remain
-  diagnostic evidence without producing an actionable fallback notification.
-  Identical fallback conditions notify once and are updated only when their
-  content changes. The three plan-fallback notification classes can be
-  disabled as a group; doing so dismisses their stable IDs without changing plan
-  health or fail-closed execution. User-provided service reason fields are
-  validated as compact reason codes before they can be persisted or shown in
-  notifications.
+- Persistent notifications are limited to conditions that normally require
+  user action: broken required mappings/capabilities, failed safe-state
+  restoration, infeasible EV readiness, and configured grid hard-limit
+  conflicts. Successful restore/preflight operations, routine changes, stale
+  data, and safe HAEO fallback remain silent. Stable IDs and content signatures
+  deduplicate repeated alerts; the actionable plan-alert group can be disabled
+  without changing plan health or fail-closed execution. User-provided reason
+  fields are compacted and redacted before they can be shown.
 - Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
-- Local AI advice is disabled by default, minimized, JSON-only, whitelisted,
-  and advisory. Unsupported response fields are rejected, so it cannot call
-  services or change hard constraints. The integration warns that provider
+- AI explanation and troubleshooting is on-demand, minimized, JSON-only, and
+  whitelisted. Automatic background calls and the AI Enabled entity are removed.
+  The primary **Explain or troubleshoot** button accepts only **No action
+  needed** or one complete action anchored to a current planner issue/rejection
+  target, including the affected configured entity or setting, problem, exact
+  next step, expected benefit, and verification. Generic tuning suggestions are
+  rejected, and AI cannot call services, change settings, or bypass hard
+  constraints. The result and pending state are published in **Next actions**
+  attributes instead of a separate status entity. The integration warns that provider
   integrations may independently log bounded prompts. Docker smoke coverage
   exercises a response-capable local AI advisor service through Home Assistant
   Core and verifies accepted bounded advice in Store recommendations.
@@ -251,8 +263,8 @@ Status as of 2026-08-02.
   pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant
   `check_config`, and the smoke test in one repeatable sequence. The smoke test
   now verifies coordinator refresh, entity
-  registry entries, published plan-status/data-health/takeover/dry-run entity
-  states, device registry registration, persisted active plan, HAEO run
+  registry entries, the Armed/Current state/Next actions/Plan calendar surface,
+  Automatic control, device registry registration, persisted active plan, HAEO run
   metadata including parsed camelCase grid-charge and export/discharge evidence
   counts from a response-capable Home Assistant service, discovery storage,
   forecast snapshot training slots sourced from Home Assistant template-sensor
@@ -280,11 +292,11 @@ Status as of 2026-08-02.
   `input_select`, an active-mode Enphase restore-to-AI profile action when
   arbitrage value drops below threshold, active-mode Enphase command-cooldown
   rejection for a repeated arbitrage opportunity, final safe-state restoration,
-  replan and restore button execution through Home Assistant Core, restore-safe-state
-  persistent notification service emission through Home Assistant Core,
-  enabled/dry-run/AI-enabled switch execution through Home Assistant Core,
-  accepted bounded local-AI advice from a response-capable Home Assistant
-  service, and verifies the
+  replan and restore execution through Home Assistant Core, confirmation that a
+  successful restore does not emit a persistent notification,
+  migration away from the enabled/dry-run/AI-enabled switches, an on-demand
+  no-action AI explanation from a response-capable Home Assistant service, and
+  verifies the
   `export_diagnostics` response payload plus token/address redaction through
   an HA automation `response_variable`.
   Restore-safe-state validation includes live EV helper restoration, mapped HVAC
@@ -358,7 +370,11 @@ Status as of 2026-08-02.
   entity, and preserves the original snapshot across peak transitions. Release
   restores zones, enables every automation, retains unresolved ownership for
   retry, and never restores the prior climate mode or setpoint. Comfort-boundary
-  release is held through the recorded peak end to prevent reacquisition. A compact
+  release of planner-owned control is held through the recorded peak end to
+  prevent reacquisition. An unowned comfort-boundary state still scans future
+  tariff evidence so a pre-peak takeover is not lost while existing automations
+  remain responsible. Planned action attributes use explicit Home Assistant-local
+  dates and times. A compact
   HVAC thermal model records current indoor temperature, optional Daikin power,
   and optional weather temperature samples. Version 2 requires samples at least
   five minutes apart, ignores sensor deltas below effective precision, excludes
@@ -422,12 +438,14 @@ Status as of 2026-08-02.
   `dry_run` reason. Plan-wide violations remain on plan health instead of being
   copied to unrelated action rejections, including neutral Enphase restores,
   and materially identical audit/comparison records are coalesced with first/
-  last occurrence evidence. AI advice is skipped for unsafe or zero-confidence
-  plans and reused only while a bounded action, forecast preview, issue, and
-  cost signature remains unchanged. Provider work runs as a cancellable
-  single-flight task after plan commit, so advisory latency cannot hold the
-  coordinator refresh lock. Final publication is serialized with plan commits,
-  and sensors expose advice only when its material fingerprint matches the
+  last occurrence evidence. AI explanation is refused for unsafe or
+  zero-confidence plans and reused only while a bounded action, forecast
+  preview, issue, and cost signature remains unchanged. Provider work runs as a
+  cancellable single-flight task only after a button press, so provider latency
+  cannot hold the coordinator refresh lock. Plan commits never initiate or
+  retry provider work; they only cancel an in-flight result when its evidence
+  becomes obsolete. Final publication is serialized with plan commits, and
+  sensors expose the result only when its material fingerprint matches the
   current safe plan. Accepted advice remains visible across regenerated plan IDs
   with an equivalent material signature. Changed plans show bounded pending
   metadata while provider work is in flight or rate-limited, and a single
@@ -474,8 +492,8 @@ Status as of 2026-08-02.
 - The `set_ev_ready_by` service validates local time input, normalizes accepted
   values to `HH:MM`, persists the native setting, and queues planner work. The
   `set_ev_target_soc` service validates and persists a percentage target. Native
-  time/number entities expose the same controls on the EV device. The EV device
-  also exposes a native opportunistic-charging switch and import-price threshold
+  time/number entities expose the same controls on the single Energy Planner
+  device. It also exposes a native opportunistic-charging switch and import-price threshold
   number; both persist the corresponding planner option and request an immediate
   replan.
 - All integration services accept an optional `config_entry_id`. A single
@@ -506,10 +524,8 @@ Status as of 2026-08-02.
   skipped/coalesced counts, phase durations, and the usable optimization
   horizon, while remaining compatible with older coordinators.
 - Multi-entry system health is deterministic, reports aggregate worst-case
-  health, and includes bounded per-entry summaries. The takeover diagnostic also
-  reflects reservation-only and provisional EV recovery state.
-- Estimated-cost telemetry reports the usable priced horizon and uses Home
-  Assistant's configured currency with the monetary sensor device class.
+  health, and includes bounded per-entry summaries. Ownership diagnostics also
+  reflect reservation-only and provisional EV recovery state.
 - Home Assistant validation is covered by Docker smoke coverage, Home Assistant
   `check_config`, unit tests, replay fixtures, live-schema fixtures, and
   real-history replay fixtures. The optional

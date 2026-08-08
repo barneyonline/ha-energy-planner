@@ -7,18 +7,14 @@ from dataclasses import dataclass
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
-    CONF_AI_ENABLED,
-    CONF_CLIMATE_CONTROL_ENABLED,
-    CONF_DRY_RUN,
-    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONNECTED_HELPER,
-    CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
-    CONF_PLANNER_ENABLED,
+    DOMAIN,
 )
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
@@ -29,43 +25,20 @@ from .type_defs import EnergyPlannerConfigEntry
 class PlannerSwitchDescription(SwitchEntityDescription):
     """Switch description."""
 
-    option_key: str
+    option_key: str | None
     default: bool
+    active_control: bool = False
     reload_required: bool = False
 
 
 SWITCHES: tuple[PlannerSwitchDescription, ...] = (
     PlannerSwitchDescription(
-        key="enabled",
-        translation_key="enabled",
-        icon="mdi:power",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_PLANNER_ENABLED,
+        key="active_control",
+        translation_key="active_control",
+        icon="mdi:home-automation",
+        option_key=None,
         default=False,
-    ),
-    PlannerSwitchDescription(
-        key="dry_run",
-        translation_key="dry_run",
-        icon="mdi:test-tube",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_DRY_RUN,
-        default=True,
-    ),
-    PlannerSwitchDescription(
-        key="ai_enabled",
-        translation_key="ai_enabled",
-        icon="mdi:robot",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_AI_ENABLED,
-        default=False,
-    ),
-    PlannerSwitchDescription(
-        key="ev_control_enabled",
-        translation_key="ev_control_enabled",
-        icon="mdi:ev-station",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_EV_CONTROL_ENABLED,
-        default=False,
+        active_control=True,
     ),
     PlannerSwitchDescription(
         key="ev_connected_helper",
@@ -91,22 +64,15 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         option_key=CONF_EV_LOW_PRICE_CHARGING_ENABLED,
         default=False,
     ),
-    PlannerSwitchDescription(
-        key="climate_control_enabled",
-        translation_key="climate_control_enabled",
-        icon="mdi:thermostat-auto",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_CLIMATE_CONTROL_ENABLED,
-        default=False,
-    ),
-    PlannerSwitchDescription(
-        key="enphase_control_enabled",
-        translation_key="enphase_control_enabled",
-        icon="mdi:home-battery-outline",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_ENPHASE_CONTROL_ENABLED,
-        default=False,
-    ),
+)
+
+_RETIRED_CONTROL_SWITCH_KEYS = (
+    "enabled",
+    "dry_run",
+    "ai_enabled",
+    "ev_control_enabled",
+    "climate_control_enabled",
+    "enphase_control_enabled",
 )
 
 
@@ -117,9 +83,19 @@ async def async_setup_entry(
 ) -> None:
     """Set up switches."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
+    _remove_retired_control_switches(hass, entry)
     async_add_planner_entities(
         entry, async_add_entities, (PlannerSwitch(coordinator, description) for description in SWITCHES)
     )
+
+
+def _remove_retired_control_switches(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Remove obsolete activation switches from the entity registry on upgrade."""
+    registry = er.async_get(hass)
+    for key in _RETIRED_CONTROL_SWITCH_KEYS:
+        entity_id = registry.async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_{key}")
+        if entity_id is not None:
+            registry.async_remove(entity_id)
 
 
 class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
@@ -139,18 +115,30 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
     @property
     def is_on(self) -> bool:
         """Return switch state."""
+        if self.entity_description.active_control:
+            return bool(self.coordinator.active_control)
+        assert self.entity_description.option_key is not None
         return bool(self.coordinator.options.get(self.entity_description.option_key, self.entity_description.default))
 
     async def async_turn_on(self, **kwargs: object) -> None:
         """Turn switch on."""
+        if self.entity_description.active_control:
+            await self.coordinator.async_set_active_control(True)
+            self.async_write_ha_state()
+            return
         await self._async_set_option(True)
 
     async def async_turn_off(self, **kwargs: object) -> None:
         """Turn switch off."""
+        if self.entity_description.active_control:
+            await self.coordinator.async_set_active_control(False)
+            self.async_write_ha_state()
+            return
         await self._async_set_option(False)
 
     async def _async_set_option(self, value: bool) -> None:
         option_key = self.entity_description.option_key
+        assert option_key is not None
         if option_key == CONF_EV_CONNECTED_HELPER:
             await self.coordinator.async_set_ev_connected_helper(value)
             self.async_write_ha_state()

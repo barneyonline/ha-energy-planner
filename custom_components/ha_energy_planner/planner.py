@@ -517,9 +517,8 @@ class DryRunPlanner:
                 if active
                 else []
             )
-        if float(current) <= float(low) or float(current) >= float(high):
-            if not active and not ownership_free_release_allowed:
-                return []
+        comfort_boundary_breached = float(current) <= float(low) or float(current) >= float(high)
+        if comfort_boundary_breached and active:
             active_end = _datetime_value(active.get("period_end"))
             return [
                 self._hvac_release_action(
@@ -670,6 +669,15 @@ class DryRunPlanner:
 
         candidate = self._next_hvac_period(context)
         if candidate is None:
+            if comfort_boundary_breached and ownership_free_release_allowed:
+                return [
+                    self._hvac_release_action(
+                        context,
+                        now,
+                        now + interval,
+                        "hvac_comfort_handoff",
+                    )
+                ]
             return []
         precondition_start = candidate["precondition_start"]
         precondition_end = candidate["precondition_end"]
@@ -801,7 +809,9 @@ class DryRunPlanner:
                     projected_start_temperature = current
                     if passive_drift is not None:
                         projected_start_temperature += passive_drift * hours_to_start
-                    if not low < projected_start_temperature < high:
+                    if mode == "heat" and projected_start_temperature >= high:
+                        continue
+                    if mode == "cool" and projected_start_temperature <= low:
                         continue
                     required_slots = max(
                         1,

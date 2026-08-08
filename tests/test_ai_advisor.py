@@ -16,6 +16,8 @@ from custom_components.ha_energy_planner.ai_advisor import (
     _loads,
     _parse_response,
     _preview_summary,
+    _rejected_action_evidence,
+    _rejected_reason_codes,
     ai_rejection_detail,
     validate_ai_response,
 )
@@ -35,35 +37,37 @@ from custom_components.ha_energy_planner.models import (
 )
 
 
-def test_ai_response_is_clamped_and_trimmed() -> None:
+def test_ai_response_accepts_complete_evidence_anchored_action_and_trims_text() -> None:
     result = validate_ai_response(
         {
-            "alerts": ["a", "b", "c", "d", "e", "f"],
-            "suggested_precondition_lead_minutes": 999,
-            "suggested_forecast_buffer_percent": -5,
-            "suggested_takeover_savings_threshold": 99,
-            "confidence": 2,
-            "reasoning_summary": "x" * 600,
+            "outcome": "action_required",
+            "summary": " x " * 300,
+            "affected_item": "pv_forecast_entity",
+            "problem": "Only a point value is available.",
+            "next_step": "Map a forecast-capable PV entity.",
+            "expected_benefit": "The planner can evaluate the full horizon.",
+            "verification": "Confirm forecast coverage appears in Next actions.",
         },
-        takeover_bounds=(0.0, 1.0),
+        allowed_targets={"pv_forecast_entity"},
     )
-    assert result["alerts"] == ["a", "b", "c", "d", "e"]
-    assert result["suggested_precondition_lead_minutes"] == 120
-    assert result["suggested_forecast_buffer_percent"] == 0
-    assert result["suggested_takeover_savings_threshold"] == 1.0
-    assert result["confidence"] == 1.0
-    assert len(result["reasoning_summary"]) == 500
+    assert result["outcome"] == "action_required"
+    assert result["affected_item"] == "pv_forecast_entity"
+    assert result["next_step"] == "Map a forecast-capable PV entity."
+    assert len(result["summary"]) == 500
 
 
-def test_ai_response_accepts_structured_alert_text() -> None:
+def test_ai_response_accepts_no_action_needed_without_suggestion_fields() -> None:
     result = validate_ai_response(
         {
-            "alerts": "PV forecast confidence is low\nBattery reserve is tight",
-            "reasoning_summary": "Inputs look plausible.",
+            "outcome": "no_action_needed",
+            "summary": "The current plan is healthy and no user action is needed.",
         }
     )
 
-    assert result["alerts"] == ["PV forecast confidence is low", "Battery reserve is tight"]
+    assert result == {
+        "outcome": "no_action_needed",
+        "summary": "The current plan is healthy and no user action is needed.",
+    }
 
 
 def test_ai_response_rejects_unsupported_or_forbidden_fields() -> None:
@@ -79,18 +83,19 @@ def test_ai_response_rejects_unsupported_or_forbidden_fields() -> None:
     assert validate_ai_response({"reasoning_summary": "ok", "extra_note": "unsupported"}) == {}
 
 
-def test_ai_response_rejects_boolean_and_non_finite_numeric_advice() -> None:
-    result = validate_ai_response(
-        {
-            "suggested_precondition_lead_minutes": True,
-            "suggested_forecast_buffer_percent": float("nan"),
-            "suggested_takeover_savings_threshold": float("inf"),
-            "confidence": float("-inf"),
-            "reasoning_summary": "Finite text remains usable.",
-        }
-    )
-
-    assert result == {"reasoning_summary": "Finite text remains usable."}
+def test_ai_response_rejects_incomplete_actions_and_unanchored_targets() -> None:
+    response = {
+        "outcome": "action_required",
+        "summary": "Fix PV input.",
+        "affected_item": "pv_forecast_entity",
+        "problem": "No usable forecast.",
+        "next_step": "Map a forecast.",
+        "expected_benefit": "Planning works.",
+        "verification": "Check coverage.",
+    }
+    assert validate_ai_response(response, allowed_targets=set()) == {}
+    assert validate_ai_response({**response, "verification": ""}, allowed_targets={"pv_forecast_entity"}) == {}
+    assert validate_ai_response({"outcome": "no_action_needed", "summary": " "}) == {}
 
 
 class FakeServices:
@@ -214,16 +219,19 @@ def test_local_ai_advisor_accepts_valid_json_response() -> None:
     response = {
         "response": json.dumps(
             {
-                "alerts": ["PV forecast confidence is low"],
-                "suggested_precondition_lead_minutes": 30,
-                "suggested_forecast_buffer_percent": 10,
-                "suggested_takeover_savings_threshold": 0.5,
-                "reasoning_summary": "Inputs look plausible.",
-                "confidence": 0.74,
+                "outcome": "action_required",
+                "summary": "The PV input cannot support horizon planning.",
+                "affected_item": "pv_forecast_entity",
+                "problem": "Only a current point is available.",
+                "next_step": "Map an entity with a timestamped PV forecast.",
+                "expected_benefit": "Solar-aware actions can use the planning horizon.",
+                "verification": "Confirm PV coverage is shown in Next actions.",
             }
         )
     }
     hass = FakeHass(response, entity_ids=["ai_task.extended_openai_ai_task"])
+    plan = _plan()
+    plan.input_issues = ["pv_forecast_entity_unavailable"]
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
@@ -232,11 +240,11 @@ def test_local_ai_advisor_accepts_valid_json_response() -> None:
                 CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
             DEFAULT_OPTIONS,
-        ).async_get_advice(_context(), _plan())
+        ).async_get_advice(_context(), plan)
     )
     assert result.status == "accepted"
-    assert result.accepted["suggested_precondition_lead_minutes"] == 30
-    assert result.accepted["suggested_takeover_savings_threshold"] == 0.5
+    assert result.accepted["affected_item"] == "pv_forecast_entity"
+    assert result.accepted["next_step"] == "Map an entity with a timestamped PV forecast."
     assert "contract" in hass.services.calls[0][2]["instructions"]
     assert "Return exactly one JSON object" in hass.services.calls[0][2]["instructions"]
     assert hass.services.calls[0][2]["entity_id"] == "ai_task.extended_openai_ai_task"
@@ -268,9 +276,8 @@ def test_local_ai_advisor_accepts_ai_task_data_response() -> None:
     response = {
         "conversation_id": "conv-1",
         "data": {
-            "alerts": ["Battery reserve is tight"],
-            "reasoning_summary": "Keep reserve buffer.",
-            "confidence": 0.66,
+            "outcome": "no_action_needed",
+            "summary": "The current plan already respects the battery reserve.",
         },
     }
     hass = FakeHass(response, entity_ids=["ai_task.extended_openai_ai_task"])
@@ -286,10 +293,10 @@ def test_local_ai_advisor_accepts_ai_task_data_response() -> None:
     )
 
     assert result.status == "accepted"
-    assert result.accepted["alerts"] == ["Battery reserve is tight"]
+    assert result.accepted["outcome"] == "no_action_needed"
     assert hass.services.calls[0][0:2] == ("ai_task", "generate_data")
     service_data = hass.services.calls[0][2]
-    assert service_data["task_name"] == "Energy Planner advice"
+    assert service_data["task_name"] == "Energy Planner explain or troubleshoot"
     assert service_data["entity_id"] == "ai_task.extended_openai_ai_task"
     assert "structure" not in service_data
     assert "contract" in hass.services.calls[0][2]["instructions"]
@@ -340,8 +347,8 @@ def test_local_ai_advisor_rejects_forbidden_fields() -> None:
     assert result.rejected_detail == {
         "reason": "ai_response_forbidden_fields",
         "message": (
-            "The AI response included fields that Energy Planner will not accept because AI advice cannot command "
-            "devices or change hard constraints."
+                "The AI response included fields that Energy Planner will not accept because AI troubleshooting "
+                "cannot command devices or change hard constraints."
         ),
         "fields": ["hard_constraint_changes"],
     }
@@ -373,7 +380,7 @@ def test_local_ai_advisor_rejection_detail_lists_unsupported_fields() -> None:
 
     assert result.status == "rejected"
     assert result.rejected_reason == "ai_response_unsupported_fields"
-    assert result.rejected_detail["fields"] == ["extra_note"]
+    assert result.rejected_detail["fields"] == ["extra_note", "reasoning_summary"]
 
 
 def test_local_ai_advisor_skips_unavailable_service() -> None:
@@ -432,8 +439,8 @@ def test_local_ai_advisor_supports_service_call_without_return_response() -> Non
         {
             "response": json.dumps(
                 {
-                    "reasoning_summary": "Fallback call shape worked.",
-                    "confidence": 0.7,
+                    "outcome": "no_action_needed",
+                    "summary": "Fallback call shape worked.",
                 }
             )
         },
@@ -453,7 +460,7 @@ def test_local_ai_advisor_supports_service_call_without_return_response() -> Non
     )
 
     assert result.status == "accepted"
-    assert result.accepted["reasoning_summary"] == "Fallback call shape worked."
+    assert result.accepted["summary"] == "Fallback call shape worked."
 
 
 def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: object) -> None:
@@ -491,7 +498,7 @@ def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: objec
 
     assert timed_out.rejected_reason == "ai_timeout"
     assert failed.rejected_reason == "ai_service_failed:RuntimeError"
-    assert failed.rejected_detail["message"] == "The AI advisor service failed with RuntimeError."
+    assert failed.rejected_detail["message"] == "The AI troubleshooting provider failed with RuntimeError."
 
 
 def test_local_ai_advisor_rejects_valid_json_with_no_supported_fields() -> None:
@@ -509,12 +516,16 @@ def test_local_ai_advisor_rejects_valid_json_with_no_supported_fields() -> None:
     )
 
     assert result.status == "rejected"
-    assert result.rejected_reason == "ai_response_no_accepted_fields"
+    assert result.rejected_reason == "ai_response_not_actionable"
 
 
-def test_local_ai_advisor_skips_disabled_healthy_plan_without_provider_call() -> None:
+def test_local_ai_advisor_can_explain_a_review_only_plan_on_demand() -> None:
     hass = FakeHass(
-        {"response": json.dumps({"reasoning_summary": "Energy planner is disabled and OK.", "confidence": 0.7})},
+        {
+            "response": json.dumps(
+                {"outcome": "no_action_needed", "summary": "The review-only plan needs no user action."}
+            )
+        },
         entity_ids=["ai_task.extended_openai_ai_task"],
     )
     plan = _plan()
@@ -531,11 +542,11 @@ def test_local_ai_advisor_skips_disabled_healthy_plan_without_provider_call() ->
         ).async_get_advice(_context(), plan)
     )
 
-    assert result.status == "skipped"
-    assert result.accepted == {}
-    assert result.rejected_reason == "ai_skipped_planner_disabled"
-    assert result.service_called is None
-    assert hass.services.calls == []
+    assert result.status == "accepted"
+    assert result.accepted["outcome"] == "no_action_needed"
+    assert result.rejected_reason is None
+    assert result.service_called == "ai_task.generate_data"
+    assert len(hass.services.calls) == 1
 
 
 def test_invalid_response_detail_handles_non_string_keys() -> None:
@@ -550,17 +561,17 @@ def test_invalid_response_detail_handles_non_string_keys() -> None:
 def test_ai_rejection_detail_uses_generic_message_for_unknown_reason() -> None:
     assert ai_rejection_detail("new_reason") == {
         "reason": "new_reason",
-        "message": "The AI advice was rejected by Energy Planner.",
+        "message": "The AI troubleshooting result was rejected by Energy Planner.",
     }
 
 
 def test_build_instructions_supports_structured_prompt() -> None:
     instructions = _build_instructions(_context(), _plan(), structured=True)
 
-    assert "Fill only useful structured fields" in instructions
+    assert "Fill only fields allowed by the response contract" in instructions
     assert "Return exactly one JSON object" not in instructions
     assert "Planner mode DISABLED is a control setting" in instructions
-    assert "not an input health reason, advice reason, or OK outcome" in instructions
+    assert "not an input-health problem" in instructions
 
 
 def test_ai_prompt_minimizes_household_state_detail() -> None:
@@ -574,13 +585,15 @@ def test_ai_prompt_minimizes_household_state_detail() -> None:
 
 
 def test_parse_response_supports_common_nested_shapes() -> None:
-    assert _parse_response({"data": '{"confidence":0.4}'}) == {"confidence": 0.4}
-    assert _parse_response({"response": {"text": '{"confidence":0.5}'}}) == {"confidence": 0.5}
-    assert _parse_response({"confidence": 0.6}) == {"confidence": 0.6}
-    assert _parse_response('{"confidence":0.7}') == {"confidence": 0.7}
-    assert _parse_response({"speech": {"speech": '{"confidence":0.8}'}}) == {"confidence": 0.8}
-    assert _parse_response({"speech": {"plain": {"speech": '{"confidence":0.85}'}}}) == {"confidence": 0.85}
-    assert _parse_response({"message": '{"confidence":0.9}'}) == {"confidence": 0.9}
+    payload = {"outcome": "no_action_needed", "summary": "No action."}
+    encoded = json.dumps(payload)
+    assert _parse_response({"data": encoded}) == payload
+    assert _parse_response({"response": {"text": encoded}}) == payload
+    assert _parse_response(payload) == payload
+    assert _parse_response(encoded) == payload
+    assert _parse_response({"speech": {"speech": encoded}}) == payload
+    assert _parse_response({"speech": {"plain": {"speech": encoded}}}) == payload
+    assert _parse_response({"message": encoded}) == payload
 
 
 def test_loads_extracts_fenced_and_embedded_json() -> None:
@@ -627,3 +640,34 @@ def test_preview_summary_reports_ranges_and_occupancy() -> None:
         "battery_floor_percent": [10.0, 10.0],
         "occupied": ["away", "home"],
     }
+
+
+def test_ai_rejection_evidence_helpers_ignore_bad_rows_and_bound_shapes() -> None:
+    plan = _plan()
+    plan.rejected_actions = [
+        "invalid",
+        {
+            "asset": "ev",
+            "reason": "ev_infeasible_ready_by",
+            "reason_codes": ["ready_by_window_too_short"],
+            "hard_constraints": ["grid_import_limit"],
+            "evidence": "required_hours_missing",
+            "desired_state": {"ignored": True},
+        },
+    ]
+
+    assert _rejected_reason_codes(plan) == [
+        "ev_infeasible_ready_by",
+        "ready_by_window_too_short",
+        "grid_import_limit",
+        "required_hours_missing",
+    ]
+    assert _rejected_action_evidence(plan) == [
+        {
+            "asset": "ev",
+            "reason": "ev_infeasible_ready_by",
+            "reason_codes": ["ready_by_window_too_short"],
+            "hard_constraints": ["grid_import_limit"],
+            "evidence": "required_hours_missing",
+        }
+    ]

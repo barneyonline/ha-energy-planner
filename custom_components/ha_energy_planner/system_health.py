@@ -10,6 +10,15 @@ from homeassistant.core import HomeAssistant, callback
 from .const import DOMAIN
 from .models import InputHealth
 
+_INPUT_SECTION_PREFIXES = (
+    ("amber_", "pv_", "baseline_load_", "battery_soc_", "carbon_intensity_"),
+    ("daikin_", "weather_", "climate_"),
+    ("person_",),
+    ("enphase_",),
+    ("ai_",),
+    ("ev_",),
+)
+
 
 @callback
 def async_register(
@@ -81,6 +90,7 @@ def _entry_health_summary(entry: Any) -> dict[str, Any]:
     store_data = dict(coordinator.store.data)
     refresh_metrics = getattr(coordinator, "refresh_metrics", None)
     refresh_metrics = dict(refresh_metrics) if isinstance(refresh_metrics, dict) else {}
+    entry_data = dict(getattr(entry, "data", {}))
     return {
         "planner_enabled": bool(coordinator.options.get("planner_enabled", False)),
         "dry_run": bool(coordinator.options.get("dry_run", True)),
@@ -88,7 +98,10 @@ def _entry_health_summary(entry: Any) -> dict[str, Any]:
         "plan_status": None if plan is None else plan.status,
         "plan_mode": None if plan is None else str(plan.mode),
         "plan_health": None if plan is None else str(plan.health),
-        "configured_input_groups": len(getattr(entry, "subentries", {})),
+        "configured_input_sections": sum(
+            any(value and key.startswith(prefixes) for key, value in entry_data.items())
+            for prefixes in _INPUT_SECTION_PREFIXES
+        ),
         "latest_haeo_status": _latest_status(store_data.get("haeo_runs")),
         "last_refresh_duration_ms": (getattr(coordinator, "last_refresh_metadata", None) or {}).get(
             "duration_ms"

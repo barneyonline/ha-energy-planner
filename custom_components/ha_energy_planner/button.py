@@ -27,6 +27,7 @@ class PlannerButtonDescription(ButtonEntityDescription):
     """Button description."""
 
     press_fn: Callable[[EnergyPlannerCoordinator], Awaitable[None]]
+    available_fn: Callable[[EnergyPlannerCoordinator], bool] = lambda coordinator: True
 
 
 async def _replan(coordinator: EnergyPlannerCoordinator) -> None:
@@ -44,20 +45,35 @@ async def _restore(coordinator: EnergyPlannerCoordinator) -> None:
         )
 
 
+async def _request_ai_advice(coordinator: EnergyPlannerCoordinator) -> None:
+    await coordinator.async_request_ai_advice()
+
+
+def _ai_advice_available(coordinator: EnergyPlannerCoordinator) -> bool:
+    return bool(str(coordinator.entry_data.get("ai_task_entity", "") or "").strip())
+
+
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
     report = build_preflight_report(coordinator.hass, coordinator)
     entry = coordinator.entry
     title = getattr(entry, "title", None) or "Energy Planner"
     entry_id = getattr(entry, "entry_id", None)
+    notification_id = f"{_PREFLIGHT_NOTIFICATION_ID}_{entry_id}" if entry_id else _PREFLIGHT_NOTIFICATION_ID
+    if report.get("active_control_ready"):
+        await coordinator.hass.services.async_call(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": notification_id},
+            blocking=False,
+        )
+        return
     await coordinator.hass.services.async_call(
         "persistent_notification",
         "create",
         {
             "title": f"{title}: preflight passed" if report.get("ok") else f"{title}: preflight failed",
             "message": _preflight_notification_message(report),
-            "notification_id": (
-                f"{_PREFLIGHT_NOTIFICATION_ID}_{entry_id}" if entry_id else _PREFLIGHT_NOTIFICATION_ID
-            ),
+            "notification_id": notification_id,
         },
         blocking=False,
     )
@@ -109,6 +125,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         translation_key="replan",
         icon="mdi:refresh",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_replan,
     ),
     PlannerButtonDescription(
@@ -119,10 +136,18 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         press_fn=_restore,
     ),
     PlannerButtonDescription(
+        key="request_ai_advice",
+        translation_key="request_ai_advice",
+        icon="mdi:comment-question-outline",
+        press_fn=_request_ai_advice,
+        available_fn=_ai_advice_available,
+    ),
+    PlannerButtonDescription(
         key="run_preflight",
         translation_key="run_preflight",
         icon="mdi:clipboard-check-outline",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_run_preflight,
     ),
     PlannerButtonDescription(
@@ -130,6 +155,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         translation_key="arm_production_control",
         icon="mdi:shield-check",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_arm,
     ),
     PlannerButtonDescription(
@@ -137,6 +163,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         translation_key="disarm_production_control",
         icon="mdi:shield-off",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_disarm,
     ),
     PlannerButtonDescription(
@@ -151,6 +178,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         translation_key="pause_control_4h",
         icon="mdi:pause-octagon-outline",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_pause_four_hours,
     ),
     PlannerButtonDescription(
@@ -158,6 +186,7 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         translation_key="resume_control",
         icon="mdi:play-circle-outline",
         entity_category=EntityCategory.CONFIG,
+        entity_registry_enabled_default=False,
         press_fn=_resume,
     ),
     PlannerButtonDescription(
@@ -206,6 +235,11 @@ class PlannerButton(EnergyPlannerEntity, ButtonEntity):
     async def async_press(self) -> None:
         """Handle button press."""
         await self.entity_description.press_fn(self.coordinator)
+
+    @property
+    def available(self) -> bool:
+        """Return whether this button can currently be used."""
+        return super().available and self.entity_description.available_fn(self.coordinator)
 
 
 def _preflight_notification_message(report: dict[str, Any]) -> str:

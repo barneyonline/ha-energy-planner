@@ -5,31 +5,46 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
-from math import isfinite
 from typing import Any
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
     CONF_AI_TIMEOUT_SECONDS,
-    CONF_ENPHASE_MIN_SAVINGS,
 )
-from .models import DecisionContext, EnergyPlan, InputHealth, PlannerMode
+from .models import DecisionContext, EnergyPlan
 
-ALLOWED_ADJUSTMENTS = {
-    "suggested_precondition_lead_minutes": (0, 120),
-    "suggested_forecast_buffer_percent": (0, 30),
+AI_ACTION_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "amber_import_price_entity": ("Import price input", ("amber_import_price", "import_price")),
+    "amber_export_price_entity": ("Export price input", ("amber_export_price", "export_price")),
+    "pv_forecast_entity": ("PV forecast input", ("pv_forecast", "solar_forecast")),
+    "baseline_load_forecast_entity": ("Baseline load forecast input", ("baseline_load", "load_forecast")),
+    "weather_entity": ("Weather input", ("weather_", "outdoor_temperature")),
+    "battery_soc_entity": ("Battery SOC input", ("battery_soc", "battery_floor")),
+    "ev_soc_entity": ("EV SOC input", ("ev_soc",)),
+    "ev_connected_entity": ("EV connected input", ("ev_connected", "ev_not_connected")),
+    "ev_charging_entity": ("EV charging-state input", ("ev_charging",)),
+    "ev_charger_entity": ("EV charger control", ("ev_charger", "charger_control")),
+    "ev_ready_by": ("EV Ready by", ("ready_by", "ev_infeasible")),
+    "ev_target_soc": ("EV Target SOC", ("target_soc",)),
+    "daikin_climate_entity": ("Climate control", ("daikin_", "climate_")),
+    "climate_comfort": ("Climate comfort settings", ("comfort", "occupancy_", "person_")),
+    "enphase_profile_entity": ("Enphase profile control", ("enphase_", "battery_profile")),
+    "haeo_optimize_service": ("HAEO optimization service", ("haeo_",)),
+    "automatic_control": ("Automatic control", ("production_", "control_", "planner_")),
 }
 
 ALLOWED_RESPONSE_FIELDS = frozenset(
     {
-        "alerts",
-        "confidence",
-        "reasoning_summary",
-        "suggested_takeover_savings_threshold",
-        *ALLOWED_ADJUSTMENTS.keys(),
+        "outcome",
+        "summary",
+        "affected_item",
+        "problem",
+        "next_step",
+        "expected_benefit",
+        "verification",
     }
 )
 
@@ -64,19 +79,19 @@ FORBIDDEN_RESPONSE_FIELDS = frozenset(
 REJECTION_MESSAGES = {
     "ai_response_not_json": "The AI service did not return a JSON object.",
     "ai_response_forbidden_fields": (
-        "The AI response included fields that Energy Planner will not accept because AI advice cannot command "
+        "The AI response included fields that Energy Planner will not accept because AI troubleshooting cannot command "
         "devices or change hard constraints."
     ),
-    "ai_response_unsupported_fields": "The AI response included fields outside the supported advice contract.",
-    "ai_response_no_accepted_fields": "The AI response was valid JSON but did not include any supported advice fields.",
-    "ai_service_not_configured": "No AI advisor service is configured.",
-    "ai_service_unavailable": "The configured AI advisor service is not currently available in Home Assistant.",
-    "ai_provider_not_ready": "The configured AI provider entity is not ready yet.",
-    "ai_timeout": "The AI advisor service did not respond before the configured timeout.",
-    "ai_skipped_planner_disabled": (
-        "AI advice was skipped because Energy Planner is disabled and the current inputs are healthy. "
-        "Disabled mode is a control setting, not an advice outcome."
+    "ai_response_unsupported_fields": "The AI response included fields outside the troubleshooting contract.",
+    "ai_response_not_actionable": (
+        "The AI response did not identify a complete action tied to current planner evidence."
     ),
+    "ai_service_not_configured": "No AI troubleshooting provider is configured.",
+    "ai_service_unavailable": (
+        "The configured AI troubleshooting provider is not currently available in Home Assistant."
+    ),
+    "ai_provider_not_ready": "The configured AI provider entity is not ready yet.",
+    "ai_timeout": "The AI troubleshooting provider did not respond before the configured timeout.",
 }
 
 
@@ -102,10 +117,8 @@ class LocalAIAdvisor:
         self.options = options
 
     async def async_get_advice(self, context: DecisionContext, plan: EnergyPlan) -> AIAdviceResult:
-        """Return bounded local AI advice, or a skipped/rejected result."""
+        """Return a bounded explanation, or a skipped/rejected result."""
         service_name, entry_data = _resolve_ai_service(self.hass, self.entry_data)
-        if plan.mode == PlannerMode.DISABLED and plan.health == InputHealth.HEALTHY and not plan.input_issues:
-            return _with_provider(_rejected_result("skipped", "ai_skipped_planner_disabled", None), entry_data)
         if not service_name:
             return _with_provider(_rejected_result("skipped", "ai_service_not_configured", None), entry_data)
         domain, service = service_name.split(".", 1)
@@ -137,7 +150,7 @@ class LocalAIAdvisor:
                     "rejected",
                     f"ai_service_failed:{err.__class__.__name__}",
                     service_name,
-                    message=f"The AI advisor service failed with {err.__class__.__name__}.",
+                    message=f"The AI troubleshooting provider failed with {err.__class__.__name__}.",
                 ),
                 entry_data,
             )
@@ -156,10 +169,10 @@ class LocalAIAdvisor:
                 ),
                 entry_data,
             )
-        accepted = validate_ai_response(parsed, takeover_bounds=_takeover_bounds(self.options))
+        accepted = validate_ai_response(parsed, allowed_targets=_actionable_targets(plan))
         if not accepted:
             return _with_provider(
-                _rejected_result("rejected", "ai_response_no_accepted_fields", service_name), entry_data
+                _rejected_result("rejected", "ai_response_not_actionable", service_name), entry_data
             )
         return _with_provider(AIAdviceResult("accepted", accepted, None, service_name), entry_data)
 
@@ -167,42 +180,49 @@ class LocalAIAdvisor:
 def validate_ai_response(
     response: Mapping[str, Any],
     *,
-    takeover_bounds: tuple[float, float] | None = None,
+    allowed_targets: Collection[str] | None = None,
 ) -> dict[str, Any]:
-    """Validate and clamp a local AI response.
+    """Validate a bounded explain-or-troubleshoot response.
 
-    Only whitelisted soft-policy suggestions are accepted. Unsupported or
-    forbidden top-level fields reject the whole response.
+    Action-required results must be complete and tied to evidence-derived
+    targets from the current deterministic plan. Generic tuning suggestions are
+    not part of the contract.
     """
     if _invalid_response_reason(response):
         return {}
-    accepted: dict[str, Any] = {}
-    alerts = response.get("alerts")
-    if isinstance(alerts, list):
-        accepted["alerts"] = [str(item)[:160] for item in alerts[:5]]
-    elif isinstance(alerts, str):
-        accepted["alerts"] = [item[:160] for item in _split_alerts(alerts)[:5]]
-    for key, bounds in ALLOWED_ADJUSTMENTS.items():
-        value = response.get(key)
-        if _finite_number(value):
-            low, high = bounds
-            accepted[key] = min(max(value, low), high)
-    takeover_value = response.get("suggested_takeover_savings_threshold")
-    if _finite_number(takeover_value):
-        low, high = takeover_bounds or (0.0, 10.0)
-        accepted["suggested_takeover_savings_threshold"] = min(max(float(takeover_value), low), high)
-    confidence = response.get("confidence")
-    if _finite_number(confidence):
-        accepted["confidence"] = min(max(float(confidence), 0.0), 1.0)
-    summary = response.get("reasoning_summary")
-    if isinstance(summary, str):
-        accepted["reasoning_summary"] = summary[:500]
-    return accepted
+    outcome = response.get("outcome")
+    summary = _bounded_text(response.get("summary"), 500)
+    if outcome == "no_action_needed" and summary:
+        return {"outcome": outcome, "summary": summary}
+    if outcome != "action_required" or not summary:
+        return {}
+    target = response.get("affected_item")
+    valid_targets = set(AI_ACTION_TARGETS if allowed_targets is None else allowed_targets)
+    if not isinstance(target, str) or target not in valid_targets:
+        return {}
+    required = {
+        "problem": 300,
+        "next_step": 500,
+        "expected_benefit": 300,
+        "verification": 400,
+    }
+    details = {key: _bounded_text(response.get(key), limit) for key, limit in required.items()}
+    if any(not value for value in details.values()):
+        return {}
+    return {
+        "outcome": outcome,
+        "summary": summary,
+        "affected_item": target,
+        **details,
+    }
 
 
-def _finite_number(value: Any) -> bool:
-    """Return whether a value is a real finite number, excluding JSON booleans."""
-    return not isinstance(value, bool) and isinstance(value, int | float) and isfinite(float(value))
+def _bounded_text(value: Any, limit: int) -> str | None:
+    """Return trimmed non-empty text within the response contract limit."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text[:limit] if text else None
 
 
 def _invalid_response_reason(response: Mapping[str, Any]) -> str | None:
@@ -252,7 +272,7 @@ def ai_rejection_detail(reason: str) -> dict[str, Any]:
     """Return a stable rejection detail payload for entity attributes."""
     return {
         "reason": reason,
-        "message": REJECTION_MESSAGES.get(reason, "The AI advice was rejected by Energy Planner."),
+        "message": REJECTION_MESSAGES.get(reason, "The AI troubleshooting result was rejected by Energy Planner."),
     }
 
 
@@ -261,12 +281,13 @@ def _build_prompt(context: DecisionContext, plan: EnergyPlan) -> str:
     payload = {
         "contract": {
             "allowed": [
-                "alerts",
-                "suggested_precondition_lead_minutes",
-                "suggested_forecast_buffer_percent",
-                "suggested_takeover_savings_threshold",
-                "reasoning_summary",
-                "confidence",
+                "outcome",
+                "summary",
+                "affected_item",
+                "problem",
+                "next_step",
+                "expected_benefit",
+                "verification",
             ],
             "forbidden": ["device_service_calls", "hard_constraint_changes", "credentials", "location_history"],
         },
@@ -277,6 +298,18 @@ def _build_prompt(context: DecisionContext, plan: EnergyPlan) -> str:
             "confidence": plan.confidence,
             "estimated_daily_cost": plan.estimated_daily_cost,
             "issues": plan.input_issues[:6],
+            "actionable_targets": _actionable_target_evidence(plan),
+            "planned_actions": [
+                {
+                    "asset": str(action.asset),
+                    "kind": str(action.kind),
+                    "reason_codes": action.reason_codes[:5],
+                    "constraints": action.hard_constraints[:5],
+                }
+                for action in plan.actions[:6]
+            ],
+            "rejected_actions": _rejected_action_evidence(plan),
+            "decision_summary": str(plan.decision_audit.get("summary") or "")[:500],
             "forecast": _preview_summary(plan.preview),
         },
         "context": {
@@ -306,17 +339,20 @@ def _battery_soc_band(value: Any) -> str:
 def _build_instructions(context: DecisionContext, plan: EnergyPlan, *, structured: bool) -> str:
     """Build model instructions for provider calls."""
     task = (
-        "Advise Energy Planner from this JSON. No tools, device commands, service calls, hard-constraint changes, "
-        "credentials, entity IDs, or location history. Planner mode DISABLED is a control setting, not an input "
-        "health reason, advice reason, or OK outcome. Do not justify no advice from disabled mode; base advice only "
-        "on input health, listed issues, confidence, forecast, and safe soft-policy suggestions. "
+        "Explain or troubleshoot this Energy Planner plan. Do not provide general optimization tips. No tools, "
+        "device commands, service calls, setting changes, hard-constraint changes, credentials, entity IDs, or "
+        "location history. Use outcome action_required only when one actionable_targets item is directly supported "
+        "by the supplied issue or rejection evidence. For action_required, return that target ID as affected_item "
+        "and provide a specific problem, exact user next_step, expected_benefit, and verification. If there is no "
+        "material user action, use outcome no_action_needed and a short summary, omitting all action fields. Planner "
+        "mode DISABLED is a control setting, not an input-health problem or a reason for either outcome. "
     )
     if structured:
-        task += "Fill only useful structured fields; use null or empty text when no advice is needed.\n"
+        task += "Fill only fields allowed by the response contract.\n"
     else:
         task += (
-            "Return exactly one JSON object using only alerts, suggested_precondition_lead_minutes, "
-            "suggested_forecast_buffer_percent, suggested_takeover_savings_threshold, reasoning_summary, confidence.\n"
+            "Return exactly one JSON object using only outcome, summary, affected_item, problem, next_step, "
+            "expected_benefit, verification.\n"
         )
     return f"{task}{_build_prompt(context, plan)}"
 
@@ -330,7 +366,7 @@ def _service_payload(
     """Return service data for the configured AI provider type."""
     prompt = _build_instructions(context, plan, structured=False)
     payload = {
-        "task_name": "Energy Planner advice",
+        "task_name": "Energy Planner explain or troubleshoot",
         "instructions": prompt,
         "entity_id": entry_data.get(CONF_AI_TASK_ENTITY),
     }
@@ -471,16 +507,73 @@ def _extract_response_text(response: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _split_alerts(value: str) -> list[str]:
-    """Return compact alert strings from structured text output."""
-    alerts: list[str] = []
-    for part in re.split(r"[\n;]+", value):
-        alert = part.strip(" -\t")
-        if alert:
-            alerts.append(alert)
-    return alerts
+def _actionable_targets(plan: EnergyPlan) -> set[str]:
+    """Return target IDs supported by current issue or rejection evidence."""
+    evidence = _plan_problem_evidence(plan)
+    return {
+        target
+        for target, (_label, markers) in AI_ACTION_TARGETS.items()
+        if any(marker in evidence for marker in markers)
+    }
 
 
-def _takeover_bounds(options: Mapping[str, Any]) -> tuple[float, float]:
-    configured = float(options.get(CONF_ENPHASE_MIN_SAVINGS, 0.25))
-    return (0.0, max(10.0, configured))
+def _actionable_target_evidence(plan: EnergyPlan) -> list[dict[str, Any]]:
+    """Return bounded target names and matching evidence for the prompt."""
+    evidence_items = [str(item) for item in plan.input_issues]
+    evidence_items.extend(_rejected_reason_codes(plan))
+    rows: list[dict[str, Any]] = []
+    for target in sorted(_actionable_targets(plan)):
+        label, markers = AI_ACTION_TARGETS[target]
+        matches = [item for item in evidence_items if any(marker in item for marker in markers)]
+        rows.append({"id": target, "name": label, "evidence": matches[:6]})
+    return rows[:12]
+
+
+def _plan_problem_evidence(plan: EnergyPlan) -> str:
+    """Return normalized bounded evidence used only to select allowed targets."""
+    items = [str(item) for item in plan.input_issues]
+    items.extend(_rejected_reason_codes(plan))
+    return " ".join(items)[:6000]
+
+
+def _rejected_reason_codes(plan: EnergyPlan) -> list[str]:
+    """Return bounded rejection reason and evidence codes."""
+    codes: list[str] = []
+    for item in plan.rejected_actions[:12]:
+        if not isinstance(item, Mapping):
+            continue
+        for key in ("reason", "reason_codes", "hard_constraints", "evidence"):
+            value = item.get(key)
+            if isinstance(value, list):
+                codes.extend(str(part) for part in value[:6])
+            elif value is not None:
+                codes.append(str(value))
+    return codes[:40]
+
+
+def _rejected_action_evidence(plan: EnergyPlan) -> list[dict[str, Any]]:
+    """Return compact rejected-action evidence without raw desired state."""
+    result: list[dict[str, Any]] = []
+    for item in plan.rejected_actions[:8]:
+        if not isinstance(item, Mapping):
+            continue
+        result.append(
+            {
+                key: item.get(key)
+                for key in ("asset", "device", "reason", "reason_codes", "hard_constraints", "evidence")
+                if item.get(key) is not None
+            }
+        )
+    return result
+
+
+def ai_target_detail(
+    target: str,
+    entry_data: Mapping[str, Any],
+    options: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Resolve a validated target to the exact configured entity or setting."""
+    label = AI_ACTION_TARGETS.get(target, (target.replace("_", " ").title(), ()))[0]
+    configured = entry_data.get(target, options.get(target))
+    detail = {"key": target, "name": label, "configured_value": configured}
+    return {key: value for key, value in detail.items() if value not in (None, "", [], {})}

@@ -70,10 +70,12 @@ from .storage import PlannerStore
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
 _HAEO_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
+_EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
 _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _PLAN_UNSAFE_NOTIFICATION_ID,
     _GRID_LIMIT_NOTIFICATION_ID,
     _HAEO_FALLBACK_NOTIFICATION_ID,
+    _EV_INFEASIBLE_NOTIFICATION_ID,
 )
 PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
 ACTION_BACKOFF_DURATION = timedelta(minutes=10)
@@ -1405,7 +1407,7 @@ class Executor:
         grid_violations = [
             code for code in clean_violations if code in {"grid_import_limit_exceeded", "grid_export_limit_exceeded"}
         ]
-        haeo_issues = _haeo_fallback_issues(plan.input_issues)
+        actionable_input_issues = _actionable_input_issues(plan.input_issues)
         if self._in_notification_grace_period():
             self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
@@ -1414,13 +1416,13 @@ class Executor:
             self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
             return
-        if "input_health_unsafe" in violations:
+        if "input_health_unsafe" in violations and actionable_input_issues:
             await self._async_create_plan_fallback_notification(
-                title=self._notification_title("plan unsafe"),
+                title=self._notification_title("configuration needs attention"),
                 message=_plan_fallback_message(
                     plan,
-                    "Required inputs are stale, missing, or invalid. Device control remains blocked.",
-                    clean_violations,
+                    "Automatic control is blocked because required configuration or mapped entities need attention.",
+                    actionable_input_issues,
                 ),
                 notification_id=self._notification_id(_PLAN_UNSAFE_NOTIFICATION_ID),
             )
@@ -1438,46 +1440,44 @@ class Executor:
             )
         else:
             await self._async_dismiss_plan_fallback_notification(self._notification_id(_GRID_LIMIT_NOTIFICATION_ID))
-        if haeo_issues:
-            await self._async_create_plan_fallback_notification(
-                title=self._notification_title("HAEO fallback"),
-                message=_plan_fallback_message(
-                    plan,
-                    (
-                        "HAEO did not return a healthy optimization result. "
-                        "The deterministic fallback remains constrained."
-                    ),
-                    haeo_issues,
-                ),
-                notification_id=self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID),
+        # HAEO fallback is safe and self-recovering. Clear notifications from
+        # earlier versions instead of asking the user to intervene.
+        await self._async_dismiss_plan_fallback_notification(self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID))
+        if not any(
+            action.asset == ActionAsset.EV and action.desired_state.get("infeasible") for action in plan.actions
+        ):
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID)
             )
-        else:
-            await self._async_dismiss_plan_fallback_notification(self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID))
 
     def _in_notification_grace_period(self) -> bool:
         """Return whether startup warm-up should suppress fallback notifications."""
         return self.notification_grace_until is not None and dt_util.utcnow() < self.notification_grace_until
 
     async def _async_notify_restore(self, outcome: ActionOutcome) -> None:
-        """Create a persistent notification for failsafe/manual restore."""
-        await self._async_create_notification(
-            title=self._notification_title("restored safe state"),
+        """Notify only when a safe-state restore requires user attention."""
+        notification_id = self._notification_id("ha_energy_planner_restore_safe_state")
+        if outcome.result != OutcomeResult.FAILED:
+            await self._async_dismiss_plan_fallback_notification(notification_id)
+            return
+        await self._async_create_plan_fallback_notification(
+            title=self._notification_title("safe-state restore failed"),
             message=_restore_notification_message(outcome.reason),
-            notification_id=self._notification_id("ha_energy_planner_restore_safe_state"),
+            notification_id=notification_id,
         )
 
     async def _async_notify_ev_infeasible(self, action: Any) -> None:
         """Create a persistent notification for infeasible EV ready-by plans."""
         if action.asset != ActionAsset.EV or not action.desired_state.get("infeasible"):
             return
-        await self._async_create_notification(
+        await self._async_create_plan_fallback_notification(
             title=self._notification_title("EV target infeasible"),
             message=(
                 "The EV cannot reach the requested ready-by target with the current "
                 f"schedule. Planned target: {action.desired_state.get('target_soc_percent')}%. "
                 f"Ready by: {action.desired_state.get('ready_by', 'not configured')}."
             ),
-            notification_id=self._notification_id(f"ha_energy_planner_ev_infeasible_{action.plan_id}"),
+            notification_id=self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID),
         )
 
     def _notification_id(self, base: str) -> str:
@@ -2122,12 +2122,12 @@ def _profile_control_service_for_target(entry_data: dict[str, Any], profile_enti
 
 
 def _restore_notification_message(reason: str) -> str:
-    """Return a compact, redacted restore notification message."""
+    """Return a compact, redacted actionable restore-failure message."""
     clean = " ".join(str(reason).replace("\n", " ").split())
     if len(clean) > 500:
         clean = f"{clean[:497]}..."
     return (
-        "Planner-owned EV, Enphase, and Daikin controls were restored where supported. "
+        "Some planner-owned controls could not be restored. Check the mapped devices and retry. "
         f"Reason: {clean or 'not specified'}."
     )
 
@@ -2135,24 +2135,20 @@ def _restore_notification_message(reason: str) -> str:
 def _plan_fallback_message(plan: EnergyPlan, summary: str, reason_codes: list[str]) -> str:
     """Return a compact, redacted plan fallback notification message."""
     codes = ", ".join(reason_codes[:8]) or "not specified"
-    return (
-        f"{summary} Plan status: {plan.status}. Mode: {plan.mode}. "
-        f"Reason codes: {_truncate_notification_text(codes, 300)}."
+    return f"{summary} Reason codes: {_truncate_notification_text(codes, 300)}."
+
+
+def _actionable_input_issues(issues: list[str]) -> list[str]:
+    """Return configuration/capability issues that normally require user action."""
+    actionable_markers = (
+        "_not_configured",
+        "_invalid",
+        "_unsupported",
+        "_unavailable",
+        "unexpected_domain",
+        "unknown_unit",
     )
-
-
-def _haeo_fallback_issues(issues: list[str]) -> list[str]:
-    non_actionable_capability_gaps = {
-        "haeo_flexible_projection_unsupported",
-        "haeo_response_unsupported",
-    }
-    return [
-        code
-        for code in _clean_reason_codes(issues)
-        if code not in non_actionable_capability_gaps
-        and code != "haeo_service_called"
-        and (code.startswith("haeo_") or "haeo" in code)
-    ]
+    return [code for code in _clean_reason_codes(issues) if any(marker in code for marker in actionable_markers)]
 
 
 def _clean_reason_codes(codes: list[str]) -> list[str]:

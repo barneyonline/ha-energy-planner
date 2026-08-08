@@ -10,17 +10,31 @@ from typing import Any
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .ai_advisor import ai_rejection_detail
+from .ai_advisor import ai_rejection_detail, ai_target_detail
 from .const import (
     CONF_AI_TASK_ENTITY,
+    CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_CLIMATE_ZONES,
+    CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_PROFILE,
+    CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
+    CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_SMART_CHARGING,
+    CONF_EV_SMART_CHARGING_START,
+    CONF_EV_SMART_CHARGING_STOP,
+    CONF_EV_SOC,
     CONF_PERSON_ENTITIES,
+    DOMAIN,
 )
 from .coordinator import (
     EnergyPlannerCoordinator,
@@ -48,7 +62,7 @@ class PlannerSensorDescription(SensorEntityDescription):
     attrs_fn: Callable[[EnergyPlannerCoordinator], dict[str, Any]] = lambda coordinator: {}
 
 
-SENSORS: tuple[PlannerSensorDescription, ...] = (
+LEGACY_SENSOR_DESCRIPTIONS: tuple[PlannerSensorDescription, ...] = (
     PlannerSensorDescription(
         key="next_action",
         translation_key="next_action",
@@ -290,6 +304,23 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
     ),
 )
 
+SENSORS: tuple[PlannerSensorDescription, ...] = (
+    PlannerSensorDescription(
+        key="current_state",
+        translation_key="system_current_state",
+        icon="mdi:home-lightning-bolt-outline",
+        value_fn=lambda coordinator: _controlled_state_summary(coordinator),
+        attrs_fn=lambda coordinator: _controlled_state_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="next_actions",
+        translation_key="next_actions",
+        icon="mdi:timeline-clock-outline",
+        value_fn=lambda coordinator: _next_actions_state(coordinator.data),
+        attrs_fn=lambda coordinator: _next_actions_attrs(coordinator),
+    ),
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -298,9 +329,19 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensors."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
+    _remove_retired_sensors(hass, entry)
     async_add_planner_entities(
         entry, async_add_entities, (PlannerSensor(coordinator, description) for description in SENSORS)
     )
+
+
+def _remove_retired_sensors(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Remove the former fragmented status sensors from the entity registry."""
+    registry = er.async_get(hass)
+    for description in LEGACY_SENSOR_DESCRIPTIONS:
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_{description.key}")
+        if entity_id is not None:
+            registry.async_remove(entity_id)
 
 
 class PlannerSensor(EnergyPlannerEntity, SensorEntity):
@@ -336,6 +377,196 @@ class PlannerSensor(EnergyPlannerEntity, SensorEntity):
         return self.entity_description.attrs_fn(self.coordinator)
 
 
+def _controlled_state_summary(coordinator: EnergyPlannerCoordinator) -> str:
+    """Return one concise state covering every configured controlled asset."""
+    groups = _controlled_state_groups(coordinator)
+    if not groups:
+        return "No controls configured"
+    return " | ".join(f"{group['asset']}: {group['state']}" for group in groups)[:255]
+
+
+def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return actual entity snapshots grouped by controlled asset."""
+    plan = coordinator.data
+    attrs = {
+        "plan_id": None if plan is None else plan.plan_id,
+        "plan_created_at": None if plan is None else plan.created_at.isoformat(),
+        "mode": "Unknown" if plan is None else _display_state(plan.mode),
+        "health": "Unknown" if plan is None else _display_state(plan.health),
+        "controlled_assets": _controlled_state_groups(coordinator),
+    }
+    return {key: value for key, value in attrs.items() if value is not None}
+
+
+def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict[str, Any]]:
+    """Return current state and live entities for each configured actuator group."""
+    entry_data = dict(coordinator.entry_data)
+    plan = coordinator.data
+    groups: list[dict[str, Any]] = []
+    configured: tuple[tuple[ActionAsset, list[tuple[str, Any]]], ...] = (
+        (
+            ActionAsset.DAIKIN,
+            [
+                ("climate", entry_data.get(CONF_DAIKIN_CLIMATE)),
+                ("zone", entry_data.get(CONF_CLIMATE_ZONES)),
+                ("automation", entry_data.get(CONF_CLIMATE_AUTOMATIONS)),
+            ],
+        ),
+        (
+            ActionAsset.EV,
+            [
+                ("charger", entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)),
+                (
+                    "start command",
+                    entry_data.get(CONF_EV_CHARGER_START) or entry_data.get(CONF_EV_SMART_CHARGING_START),
+                ),
+                ("stop command", entry_data.get(CONF_EV_CHARGER_STOP) or entry_data.get(CONF_EV_SMART_CHARGING_STOP)),
+                ("charging feedback", entry_data.get(CONF_EV_CHARGING)),
+                ("connection feedback", entry_data.get(CONF_EV_CONNECTED)),
+                ("state of charge", entry_data.get(CONF_EV_SOC)),
+            ],
+        ),
+        (ActionAsset.ENPHASE, [("profile", entry_data.get(CONF_ENPHASE_PROFILE))]),
+    )
+    for asset, configured_entities in configured:
+        entity_rows = [
+            _live_entity_snapshot(coordinator, entity_id, role)
+            for role, value in configured_entities
+            for entity_id in _entity_id_values(value)
+        ]
+        actuator_roles = {"climate", "charger", "start command", "stop command", "profile"}
+        if not any(row["role"] in actuator_roles for row in entity_rows):
+            continue
+        if asset == ActionAsset.EV:
+            state = _ev_current_charge_state(coordinator)
+        else:
+            state = _asset_current_state(plan, asset)
+        groups.append(
+            {
+                "asset": _asset_name(asset),
+                "state": state,
+                "entities": entity_rows[:16],
+                "planner_owns_control": _asset_owned(coordinator.store.data, asset),
+            }
+        )
+    return groups
+
+
+def _entity_id_values(value: Any) -> list[str]:
+    """Return normalized entity IDs from scalar or multi-entity configuration."""
+    values = value if isinstance(value, (list, tuple, set)) else str(value or "").split(",")
+    return [str(item).strip() for item in values if str(item).strip()]
+
+
+def _live_entity_snapshot(
+    coordinator: EnergyPlannerCoordinator,
+    entity_id: str,
+    role: str,
+) -> dict[str, Any]:
+    """Return a compact actual Home Assistant state snapshot."""
+    states = getattr(getattr(coordinator, "hass", None), "states", None)
+    state = states.get(entity_id) if states is not None else None
+    attributes = dict(getattr(state, "attributes", {}) or {})
+    details = {
+        key: attributes[key]
+        for key in (
+            "current_temperature",
+            "temperature",
+            "target_temp_low",
+            "target_temp_high",
+            "hvac_action",
+            "unit_of_measurement",
+        )
+        if attributes.get(key) is not None
+    }
+    return {
+        "entity_id": entity_id,
+        "name": attributes.get("friendly_name", entity_id),
+        "role": role,
+        "state": "missing" if state is None else str(state.state),
+        "details": _bounded_json(details),
+    }
+
+
+def _asset_owned(store_data: dict[str, Any], asset: ActionAsset) -> bool:
+    """Return whether persisted ownership currently belongs to one asset."""
+    ownership = dict(store_data.get("ownership", {}))
+    if asset == ActionAsset.DAIKIN:
+        return bool(
+            ownership.get("hvac_control")
+            or ownership.get("climate_automations")
+            or ownership.get("planner_takeover_started_at")
+        )
+    if asset == ActionAsset.EV:
+        reservation = store_data.get("ev_grid_reservation", {})
+        return bool(
+            ownership.get("ev_smart_charging_state") or (isinstance(reservation, dict) and reservation.get("active"))
+        )
+    return bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
+
+
+def _next_actions_state(plan: EnergyPlan | None) -> str:
+    """Return the next controlled action and remaining action count."""
+    actions = _ordered_actions(plan)
+    if not actions:
+        return "None"
+    suffix = f" (+{len(actions) - 1})" if len(actions) > 1 else ""
+    return f"{_action_label(actions[0])}{suffix}"
+
+
+def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return ordered actions with the evidence used to determine each one."""
+    plan = coordinator.data
+    if plan is None:
+        return {"actions": []}
+    audit = dict(plan.decision_audit or {})
+    accepted = _accepted_decisions(plan)
+    actions = [_action_with_determination(action, accepted, audit) for action in _ordered_actions(plan)[:12]]
+    return {
+        "plan_id": plan.plan_id,
+        "plan_created_at": plan.created_at.isoformat(),
+        "mode": _display_state(plan.mode),
+        "health": _display_state(plan.health),
+        "data_quality": _decision_data_quality_attrs(coordinator),
+        "decision_summary": audit.get("summary"),
+        "policy_order": _bounded_json(audit.get("policy_order", [])),
+        "marginal_budget": _bounded_json(audit.get("marginal_budget", {})),
+        "action_count": len(plan.actions),
+        "actions": actions,
+        "ai_explanation": _ai_advice_attrs(coordinator),
+    }
+
+
+def _ordered_actions(plan: EnergyPlan | None) -> list[PlanAction]:
+    """Return plan actions in execution order."""
+    return [] if plan is None else sorted(plan.actions, key=lambda action: action.execute_not_before)
+
+
+def _action_with_determination(
+    action: PlanAction,
+    accepted: list[dict[str, Any]],
+    audit: dict[str, Any],
+) -> dict[str, Any]:
+    """Return one action with user-readable decision evidence."""
+    accepted_row = next((item for item in accepted if item.get("action_id") == action.action_id), {})
+    return {
+        "action_id": action.action_id,
+        "asset": _asset_name(action.asset),
+        "kind": str(action.kind),
+        "start": action.execute_not_before.isoformat(),
+        "end": action.execute_not_after.isoformat(),
+        **_plain_action(action),
+        "determination": {
+            "reason_codes": list(action.reason_codes),
+            "reasons": [_plain_reason(reason) for reason in action.reason_codes],
+            "hard_constraints": list(action.hard_constraints),
+            "constraints": [_plain_reason(constraint) for constraint in action.hard_constraints],
+            "accepted_decision": _bounded_json(accepted_row),
+            "policy_order": _bounded_json(audit.get("policy_order", [])),
+        },
+    }
+
+
 def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Expose compact, bounded forecast learning and uncertainty telemetry."""
     model = coordinator.store.data.get("forecast_calibration", {})
@@ -350,9 +581,7 @@ def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         if not isinstance(buckets, dict):
             buckets = {}
         enabled = [
-            (lead, bucket)
-            for lead, bucket in buckets.items()
-            if isinstance(bucket, dict) and bucket.get("enabled")
+            (lead, bucket) for lead, bucket in buckets.items() if isinstance(bucket, dict) and bucket.get("enabled")
         ]
         uncertainty_enabled = [
             (lead, bucket)
@@ -377,8 +606,7 @@ def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         }
     return {
         "calibration_enabled": any(
-            item["enabled_lead_buckets"] or item["uncertainty_enabled_lead_buckets"]
-            for item in fields.values()
+            item["enabled_lead_buckets"] or item["uncertainty_enabled_lead_buckets"] for item in fields.values()
         ),
         "fields": fields,
     }
@@ -625,7 +853,6 @@ def _plain_action(action: PlanAction) -> dict[str, Any]:
         "constraints": [_plain_reason(item) for item in action.hard_constraints[:8]],
         "desired_state": _plain_state_details(action.desired_state),
         "estimated_value": action.expected_cost_delta,
-        "confidence": None if action.confidence is None else f"{round(action.confidence * 100, 1)}%",
         "requires_haeo_plan": bool(action.requires_haeo_plan_id),
     }
     return {key: value for key, value in attrs.items() if value not in (None, [], {})}
@@ -642,7 +869,7 @@ def _plain_state_details(state: dict[str, Any]) -> dict[str, Any]:
         elif key in {"state", "action", "hvac_mode", "arbitrage_direction", "arbitrage_source"}:
             details[_plain_key(key)] = _display_state(value)
         elif key in {"start", "end", "execute_not_before", "execute_not_after"}:
-            details[_plain_key(key)] = _time_label(value) or value
+            details[_plain_key(key)] = _date_time_label(value) or value
         elif key == "allocated_slots" and isinstance(value, list):
             details["Charging windows"] = len(value)
         else:
@@ -690,9 +917,14 @@ def _action_label(action: PlanAction) -> str:
 
 def _action_window(action: PlanAction) -> str:
     """Return a concise action execution window."""
-    start = _time_label(action.execute_not_before)
-    end = _time_label(action.execute_not_after)
-    return f"{start}-{end}" if start and end else "Next planning window"
+    start = _local_datetime(action.execute_not_before)
+    end = _local_datetime(action.execute_not_after)
+    if start is None or end is None:
+        return "Next planning window"
+    start_label = _date_time_label(start)
+    if start.date() == end.date():
+        return f"{start_label}-{end:%H:%M}"
+    return f"{start_label}-{_date_time_label(end)}"
 
 
 def _asset_current_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
@@ -926,25 +1158,28 @@ def _presence_preview_value(plan: EnergyPlan) -> str:
 
 
 def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
-    """Return concise state for the latest AI advice run."""
+    """Return concise state for the latest AI explain/troubleshoot run."""
     latest = _current_ai_recommendation(coordinator)
     if latest is not None:
-        status = latest.get("status")
-        return _display_state(status or "unknown")
-    if not coordinator.options.get("ai_enabled", False):
-        return "Disabled"
+        accepted = latest.get("accepted")
+        if isinstance(accepted, dict) and accepted.get("outcome"):
+            return _display_state(accepted["outcome"])
+        return "No actionable result"
+    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
+        return "Not configured"
     if _current_ai_pending(coordinator) is not None:
         return "Pending"
     return "No response"
 
 
 def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return the latest bounded AI response details."""
+    """Return the latest bounded explain-or-troubleshoot result."""
+    available = bool(str(coordinator.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip())
     current = _current_ai_recommendation(coordinator)
     if current is None:
         attributes: dict[str, Any] = {
-            "enabled": bool(coordinator.options.get("ai_enabled", False)),
-            "latest": None,
+            "available": available,
+            "result": None,
         }
         pending = _current_ai_pending(coordinator)
         if pending is not None:
@@ -960,8 +1195,8 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         rejected_detail = ai_rejection_detail(rejected_reason) if isinstance(rejected_reason, str) else {}
     current_plan_id = getattr(getattr(coordinator, "data", None), "plan_id", None)
     source_plan_id = latest.get("plan_id")
-    return {
-        "enabled": bool(coordinator.options.get("ai_enabled", False)),
+    result: dict[str, Any] = {
+        "available": available,
         "created_at": latest.get("created_at"),
         "plan_id": source_plan_id,
         "reused_for_current_plan": bool(source_plan_id and source_plan_id != current_plan_id),
@@ -970,18 +1205,25 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "ai_task_entity": latest.get(CONF_AI_TASK_ENTITY),
         "rejected_reason": latest.get("rejected_reason"),
         "rejected_detail": _bounded_json(rejected_detail),
-        "alerts": accepted.get("alerts", []),
-        "reasoning_summary": accepted.get("reasoning_summary"),
-        "confidence": accepted.get("confidence"),
-        "suggested_precondition_lead_minutes": accepted.get("suggested_precondition_lead_minutes"),
-        "suggested_forecast_buffer_percent": accepted.get("suggested_forecast_buffer_percent"),
-        "suggested_takeover_savings_threshold": accepted.get("suggested_takeover_savings_threshold"),
+        "outcome": accepted.get("outcome"),
+        "summary": accepted.get("summary"),
     }
+    if accepted.get("outcome") == "action_required" and isinstance(accepted.get("affected_item"), str):
+        result["recommended_action"] = {
+            "affected_item": ai_target_detail(
+                accepted["affected_item"], coordinator.entry_data, coordinator.options
+            ),
+            "problem": accepted.get("problem"),
+            "next_step": accepted.get("next_step"),
+            "expected_benefit": accepted.get("expected_benefit"),
+            "verification": accepted.get("verification"),
+        }
+    return result
 
 
 def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
     """Return exact or materially equivalent advice for the safe current plan."""
-    if not coordinator.options.get("ai_enabled", False):
+    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
         return None
     plan = coordinator.data
     if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
@@ -1003,7 +1245,7 @@ def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[st
 
 def _current_ai_pending(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
     """Return pending metadata only when it belongs to the safe current plan."""
-    if not coordinator.options.get("ai_enabled", False):
+    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
         return None
     plan = coordinator.data
     if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
@@ -1011,25 +1253,111 @@ def _current_ai_pending(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     fingerprint = _material_plan_fingerprint(plan)
     if getattr(coordinator, "_ai_advice_pending_fingerprint", None) != fingerprint:
         return None
-    retry_at = getattr(coordinator, "_ai_advice_retry_at", None)
     return {
         "pending_reason": getattr(coordinator, "_ai_advice_pending_reason", None) or "request_in_flight",
-        "retry_at": retry_at.isoformat() if isinstance(retry_at, datetime) else None,
     }
 
 
 def _confidence_breakdown_state(coordinator: EnergyPlannerCoordinator) -> str:
-    """Return compact confidence state."""
+    """Return a categorical data-quality state for the retiring entity."""
     if coordinator.data is None:
         return "Unknown"
-    return f"{round(coordinator.data.confidence * 100, 1)}%"
+    return str(_decision_data_quality_attrs(coordinator).get("status", "Unknown"))
 
 
 def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return confidence calculation, component status, and improvement guidance."""
+    """Return the categorical data-quality evidence used by the current plan."""
+    return _decision_data_quality_attrs(coordinator)
+
+
+def _decision_data_quality_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Explain material input limitations without exposing internal safety weights."""
     if coordinator.data is None:
         return {}
-    issues = list(coordinator.data.input_issues)
+    issue_codes = [
+        issue for issue in coordinator.data.input_issues if not str(issue).startswith("advisory_")
+    ][:12]
+    sources = _confidence_sources(coordinator)
+    numeric_sources = [
+        source for source in sources if isinstance(source.get("confidence"), int | float)
+    ]
+    weakest_score = min((float(source["confidence"]) for source in numeric_sources), default=1.0)
+    limiting_sources = [
+        _limiting_source_evidence(coordinator, source)
+        for source in numeric_sources
+        if weakest_score < 1.0 and float(source["confidence"]) == weakest_score
+    ][:8]
+
+    if str(coordinator.data.health) == InputHealth.UNSAFE or coordinator.data.confidence <= 0:
+        status = "Unsafe inputs"
+        summary = "Inputs are not safe enough for automatic control."
+    elif issue_codes:
+        status = "Input issue"
+        summary = f"{len(issue_codes)} input issue{'s are' if len(issue_codes) != 1 else ' is'} limiting this plan."
+    elif limiting_sources:
+        status = "Fallback data"
+        names = ", ".join(str(source["input"]) for source in limiting_sources[:3])
+        suffix = " and other inputs" if len(limiting_sources) > 3 else ""
+        verb = "uses" if len(limiting_sources) == 1 else "use"
+        summary = f"{names}{suffix} {verb} the weakest data source in this plan."
+    elif coordinator.data.confidence < 1.0:
+        status = "Limited data"
+        summary = "Plan data quality is reduced, but no specific limiting source was recorded."
+    else:
+        status = "Good"
+        summary = "No material input-quality limitation affected this plan."
+
+    return {
+        "plan_id": coordinator.data.plan_id,
+        "status": status,
+        "summary": summary,
+        "limiting_inputs": limiting_sources,
+        "input_issues": [
+            {"code": str(issue), "description": _plain_reason(str(issue))} for issue in issue_codes
+        ],
+        "improvement_actions": _confidence_improvement_actions(
+            coordinator.data.confidence,
+            _confidence_health_score(coordinator.data.health),
+            _forecast_source_confidence(coordinator),
+            sources,
+            _confidence_issue_groups(issue_codes),
+        ),
+    }
+
+
+def _limiting_source_evidence(
+    coordinator: EnergyPlannerCoordinator,
+    source: dict[str, Any],
+) -> dict[str, Any]:
+    """Return useful evidence for an input that limits the plan."""
+    coverage = next(
+        (
+            item
+            for item in _forecast_coverage_sources(coordinator)
+            if item.get("entity_id") == source.get("entity_id")
+        ),
+        {},
+    )
+    evidence = {
+        "input": source.get("input"),
+        "entity_id": source.get("entity_id"),
+        "source": source.get("source"),
+        "reason": source.get("reason"),
+        "coverage": _coverage_summary(coverage, coordinator.data.horizon_hours),
+    }
+    return {key: value for key, value in evidence.items() if value not in (None, "", {})}
+
+
+def _coverage_summary(coverage: dict[str, Any], horizon_hours: float) -> str | None:
+    """Return a short forecast coverage explanation."""
+    covered = coverage.get("covered_hours")
+    if not isinstance(covered, int | float):
+        return None
+    return f"{float(covered):g} of {float(horizon_hours):g} planning hours available"
+
+
+def _confidence_issue_groups(issues: list[str]) -> dict[str, Any]:
+    """Group input issues for existing improvement guidance."""
     groups = {
         "price": ("amber_import_price_", "amber_export_price_"),
         "pv": ("pv_forecast_",),
@@ -1040,42 +1368,9 @@ def _confidence_breakdown_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "occupancy": ("person_", "occupancy_"),
         "haeo": ("haeo_",),
     }
-    breakdown: dict[str, Any] = {}
-    for name, prefixes in groups.items():
-        matching = [issue for issue in issues if any(issue.startswith(prefix) for prefix in prefixes)]
-        breakdown[name] = {
-            "status": "degraded" if matching else "healthy",
-            "issues": matching[:8],
-        }
-    health_score = _confidence_health_score(coordinator.data.health)
-    forecast_confidence = _forecast_source_confidence(coordinator)
-    calculation = {
-        "formula": "overall = min(input_health_score, forecast_source_confidence)",
-        "overall": coordinator.data.confidence,
-        "overall_percent": round(coordinator.data.confidence * 100, 1),
-        "input_health_score": health_score,
-        "input_health_percent": round(health_score * 100, 1),
-        "forecast_source_confidence": forecast_confidence,
-        "forecast_source_percent": None if forecast_confidence is None else round(forecast_confidence * 100, 1),
-        "limiting_factor": _confidence_limiting_factor(coordinator.data.confidence, health_score, forecast_confidence),
-    }
-    sources = _confidence_sources(coordinator)
     return {
-        "plan_id": coordinator.data.plan_id,
-        "overall_confidence": coordinator.data.confidence,
-        "calculation": calculation,
-        "subsystems": _bounded_json(coordinator.data.confidence_breakdown or {}),
-        "health": str(coordinator.data.health),
-        "breakdown": breakdown,
-        "source_confidence": sources,
-        "forecast_coverage": _forecast_coverage_sources(coordinator),
-        "improvement_actions": _confidence_improvement_actions(
-            coordinator.data.confidence,
-            health_score,
-            forecast_confidence,
-            sources,
-            breakdown,
-        ),
+        name: {"issues": [issue for issue in issues if any(issue.startswith(prefix) for prefix in prefixes)][:8]}
+        for name, prefixes in groups.items()
     }
 
 
@@ -1247,7 +1542,10 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
             "Forecast series coverage is shorter than the displayed planning horizon; coverage thresholds limit health."
         )
     if source_kind == "point_value_repeated":
-        return "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
+        return (
+            "Only a current point value was found, so it is repeated across the planning horizon with a "
+            "conservative fallback weight."
+        )
     if source_kind == "point_value_only":
         return (
             "Only a current point value was found; required forecast coverage is unavailable and planning fails closed."
@@ -1608,15 +1906,35 @@ def _plain_key(value: Any) -> str:
 
 def _time_label(value: Any) -> str | None:
     """Return a readable local time label for an ISO timestamp or datetime."""
+    parsed = _local_datetime(value)
+    if parsed is not None:
+        return parsed.strftime("%H:%M")
+    return value if isinstance(value, str) and value else None
+
+
+def _date_time_label(value: Any) -> str | None:
+    """Return an explicit local date and time for a planned action."""
+    parsed = _local_datetime(value)
+    if parsed is None:
+        return value if isinstance(value, str) and value else None
+    return f"{parsed:%a} {parsed.day} {parsed:%b}, {parsed:%H:%M}"
+
+
+def _local_datetime(value: Any) -> datetime | None:
+    """Return a datetime converted to Home Assistant's configured timezone."""
+    parsed: datetime
     if isinstance(value, datetime):
-        return value.strftime("%H:%M")
-    if not isinstance(value, str) or not value:
+        parsed = value
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
         return None
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        return value
-    return parsed.strftime("%H:%M")
+    if parsed.tzinfo is None:
+        return parsed
+    return dt_util.as_local(parsed)
 
 
 def _display_state(value: Any) -> str:

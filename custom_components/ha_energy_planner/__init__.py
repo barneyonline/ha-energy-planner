@@ -43,16 +43,7 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
-_DUPLICATE_ENTITY_ID_MIGRATIONS = {
-    "sensor.ai_ai_advice": "sensor.ai_advice",
-    "switch.ai_ai_enabled": "switch.ai_enabled",
-    "sensor.climate_climate_plan": "sensor.climate_plan",
-    "switch.climate_climate_control_enabled": "switch.climate_control_enabled",
-    "sensor.enphase_enphase_plan": "sensor.enphase_plan",
-    "switch.enphase_enphase_control_enabled": "switch.enphase_control_enabled",
-    "sensor.ev_ev_charging_plan": "sensor.ev_charging_plan",
-    "switch.ev_ev_control_enabled": "switch.ev_control_enabled",
-}
+_DUPLICATE_ENTITY_ID_MIGRATIONS = {"switch.ai_ai_enabled": "switch.ai_enabled"}
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -306,13 +297,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     """Set up Energy Planner from a config entry."""
     from .coordinator import EnergyPlannerCoordinator
     from .storage import PlannerStore
-    from .subentry_migration import async_consolidate_subentries
+    from .subentry_migration import async_migrate_subentries_to_entry_data
 
     if not entry.options:
         hass.config_entries.async_update_entry(entry, options=DEFAULT_OPTIONS)
     if getattr(entry, "title", None) == LEGACY_INTEGRATION_NAME:
         hass.config_entries.async_update_entry(entry, title=INTEGRATION_NAME)
-    async_consolidate_subentries(hass, entry)
+    async_migrate_subentries_to_entry_data(hass, entry)
     domain_entries = hass.config_entries.async_entries(DOMAIN)
     legacy_store_entry_id = _legacy_store_owner_entry_id(domain_entries)
     store = PlannerStore(
@@ -329,8 +320,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        _async_remove_legacy_device(hass, entry)
-        _async_sync_planner_devices(hass, entry)
+        _async_sync_planner_device(hass, entry)
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
         entry.async_on_unload(coordinator.async_shutdown)
     except Exception:
@@ -509,102 +499,38 @@ def _freeze_config_value(value: Any) -> Any:
     return value
 
 
-def _async_remove_legacy_device(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Remove the old main-entry planner device so entities remain ungrouped."""
+def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Create one planner device, link every entity, and remove old group devices."""
     from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers import entity_registry as er
 
-    ent_reg = er.async_get(hass)
-    dev_reg = dr.async_get(hass)
-    device = dev_reg.async_get_device(identifiers={(DOMAIN, entry.entry_id)})
-    if device is None:
-        return
-    for entity in list(ent_reg.entities.values()):
-        if entity.platform == DOMAIN and entity.device_id == device.id:
-            ent_reg.async_update_entity(entity.entity_id, device_id=None)
-    dev_reg.async_remove_device(device.id)
-
-
-def _async_sync_planner_devices(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Create planner group devices and link existing entities to them."""
-    from homeassistant.helpers import device_registry as dr
-    from homeassistant.helpers import entity_registry as er
-
-    from .entity import (
-        DEVICE_AI,
-        DEVICE_CLIMATE,
-        DEVICE_ENERGY,
-        DEVICE_ENPHASE,
-        DEVICE_EV,
-        DEVICE_MODELS,
-        DEVICE_NAMES,
-        DEVICE_PRESENCE,
-        DEVICE_SYSTEM,
-        OPTIONAL_DEVICE_KEYS,
-        planner_device_configured,
-        planner_device_identifier,
-        planner_device_key_for_entity,
-    )
+    from .entity import planner_device_identifier
 
     ent_reg = er.async_get(hass)
     dev_reg = dr.async_get(hass)
     _async_migrate_duplicate_entity_ids(ent_reg)
-    subentries_by_type = {subentry.subentry_type: subentry for subentry in getattr(entry, "subentries", {}).values()}
-    device_subentry_ids = {
-        DEVICE_SYSTEM: getattr(subentries_by_type.get(DEVICE_SYSTEM), "subentry_id", None),
-        DEVICE_ENERGY: getattr(subentries_by_type.get(DEVICE_ENERGY), "subentry_id", None),
-        DEVICE_CLIMATE: getattr(subentries_by_type.get(DEVICE_CLIMATE), "subentry_id", None),
-        DEVICE_PRESENCE: getattr(subentries_by_type.get(DEVICE_PRESENCE), "subentry_id", None),
-        DEVICE_ENPHASE: getattr(subentries_by_type.get(DEVICE_ENPHASE), "subentry_id", None),
-        DEVICE_AI: getattr(subentries_by_type.get(DEVICE_AI), "subentry_id", None),
-        DEVICE_EV: getattr(subentries_by_type.get(DEVICE_EV), "subentry_id", None),
-    }
-    devices = {}
-    for device_key in (
-        DEVICE_SYSTEM,
-        DEVICE_ENERGY,
-        DEVICE_CLIMATE,
-        DEVICE_PRESENCE,
-        DEVICE_ENPHASE,
-        DEVICE_AI,
-        DEVICE_EV,
-    ):
-        if device_key in OPTIONAL_DEVICE_KEYS and device_subentry_ids[device_key] is None:
-            continue
-        devices[device_key] = dev_reg.async_get_or_create(
-            config_entry_id=entry.entry_id,
-            config_subentry_id=device_subentry_ids[device_key],
-            identifiers={planner_device_identifier(entry.entry_id, device_key)},
-            manufacturer=INTEGRATION_NAME,
-            model=DEVICE_MODELS[device_key],
-            name=DEVICE_NAMES[device_key],
-        )
-        if device_subentry_ids[device_key] is not None:
-            dev_reg.async_update_device(
-                devices[device_key].id,
-                remove_config_entry_id=entry.entry_id,
-                remove_config_subentry_id=None,
-            )
+    device = dev_reg.async_get_or_create(
+        config_entry_id=entry.entry_id,
+        identifiers={planner_device_identifier(entry.entry_id)},
+        manufacturer=INTEGRATION_NAME,
+        model=INTEGRATION_NAME,
+        name=str(getattr(entry, "title", "") or INTEGRATION_NAME),
+    )
 
     for entity in list(ent_reg.entities.values()):
         if entity.platform != DOMAIN or getattr(entity, "config_entry_id", None) != entry.entry_id:
             continue
-        entity_key = _planner_entity_key(entry.entry_id, entity)
-        device_key = planner_device_key_for_entity(entity_key)
-        if not planner_device_configured(entry, device_key):
-            continue
-        device = devices[device_key]
-        config_subentry_id = device_subentry_ids[device_key]
-        if entity.device_id != device.id or getattr(entity, "config_subentry_id", None) != config_subentry_id:
+        if entity.device_id != device.id or getattr(entity, "config_subentry_id", None) is not None:
             ent_reg.async_update_entity(
                 entity.entity_id,
                 device_id=device.id,
-                config_subentry_id=config_subentry_id,
+                config_subentry_id=None,
             )
 
-    old_device = dev_reg.async_get_device(identifiers={(DOMAIN, f"{entry.entry_id}_controls")})
-    if old_device is not None:
-        dev_reg.async_remove_device(old_device.id)
+    for old_suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls"):
+        old_device = dev_reg.async_get_device(identifiers={(DOMAIN, f"{entry.entry_id}_{old_suffix}")})
+        if old_device is not None and old_device.id != device.id:
+            dev_reg.async_remove_device(old_device.id)
 
 
 def _async_migrate_duplicate_entity_ids(ent_reg: Any) -> None:
@@ -618,13 +544,6 @@ def _async_migrate_duplicate_entity_ids(ent_reg: Any) -> None:
         ent_reg.async_update_entity(old_entity_id, new_entity_id=new_entity_id)
 
 
-def _planner_entity_key(entry_id: str, entity: Any) -> str:
-    """Return the integration entity key from a registry entry."""
-    unique_id = str(getattr(entity, "unique_id", "") or "")
-    prefix = f"{entry_id}_"
-    if unique_id.startswith(prefix):
-        return unique_id.removeprefix(prefix)
-    return str(getattr(entity, "entity_id", "")).split(".")[-1].removeprefix("ha_energy_planner_")
 
 
 def _validate_ready_by_time(value: Any) -> str:

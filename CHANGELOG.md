@@ -2,6 +2,64 @@
 
 ## Unreleased
 
+## 0.9.0 - 2026-08-08
+
+### Changed
+
+- Replaced repetitive user-facing confidence percentages with categorical data
+  quality evidence. **Next actions** and calendar events now identify the weakest
+  forecast source, affected entities, available coverage, and corrective action;
+  the conservative numeric weight remains internal to safety gates.
+- Consolidated the integration into one Energy Planner device containing every
+  entity. Removed the Add device/config-subentry UI and moved Energy, Climate,
+  Presence, Enphase, AI, and EV mappings into separate sections of the central
+  **Configure** page. Existing mappings are migrated into the main config entry.
+- Replaced generic AI advice with an on-demand **Explain or troubleshoot**
+  button. Automatic background calls and the AI Enabled switch are removed. AI
+  output is accepted only when it either says no action is needed or supplies a
+  complete user action tied to current planner evidence: the affected entity or
+  setting, problem, exact next step, expected benefit, and verification.
+- Reduced persistent notifications to problems that normally require user
+  action. Routine plan/configuration changes, successful safe-state restores,
+  successful preflight checks, and safe HAEO fallback no longer notify. Repeated
+  infeasible-EV and restore-failure alerts are deduplicated with stable IDs.
+- Replaced the fragmented plan, health, forecast, cost, takeover, per-device
+  state, and audit sensors with **Armed**, **Current state**, and **Next actions**.
+  Existing registry entries for the retired status entities are removed during
+  setup; this is intentionally a clean break without compatibility aliases.
+- Added a read-only **Plan** calendar containing the upcoming controlled actions.
+  Calendar descriptions and **Next actions** attributes explain the accepted
+  decision, reasons, constraints, desired state, data quality, priority order,
+  and constrained energy budget used to determine each action.
+- Added one **Automatic control** switch that enables configured control areas,
+  runs preflight, arms production control, and enters active mode as one guarded
+  operation. Turning it off restores safe state and returns to review-only mode.
+- Removed the old planner, dry-run, EV-control, climate-control,
+  Enphase-control, and AI Enabled switches. **Automatic control** is now the only
+  activation switch; obsolete registry entries are removed during setup.
+
+### Fixed
+
+- Climate planning now continues evaluating forecast price rises when an
+  unowned HVAC is at or beyond a comfort boundary. This allows preconditioning
+  to be scheduled before the expensive period while preserving the immediate
+  safety release when Energy Planner already owns climate control.
+- Planned action windows now include an explicit date and use Home Assistant's
+  configured local timezone, so tomorrow's preconditioning cannot appear to be
+  a current or UTC-timed action.
+
+### Safety
+
+- The combined activation refuses to bypass the existing dry-run evidence,
+  current-plan, availability, capability, or pause checks. An early activation
+  attempt safely starts review planning and reports healthy-plan progress.
+
+### Validation
+
+- The full Docker validation gate passes with `931` tests and `100%` coverage,
+  plus Ruff, quality-scale, replay, schema, history, Home Assistant configuration,
+  and Docker smoke checks.
+
 ## 0.8.5 - 2026-08-08
 
 ### Added
