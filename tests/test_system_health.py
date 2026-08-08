@@ -56,7 +56,7 @@ def test_system_health_reports_loaded_planner_state() -> None:
     )
     entry = SimpleNamespace(
         runtime_data=coordinator,
-        subentries={"energy": object(), "climate": object()},
+        data={"amber_import_price_entity": "sensor.price", "daikin_climate_entity": "climate.home"},
     )
     hass = SimpleNamespace(config_entries=FakeConfigEntries([entry]))
 
@@ -71,7 +71,7 @@ def test_system_health_reports_loaded_planner_state() -> None:
         "plan_status": "current",
         "plan_mode": "DRY_RUN",
         "plan_health": "healthy",
-        "configured_input_groups": 2,
+        "configured_input_sections": 2,
         "latest_haeo_status": "ready",
         "last_refresh_duration_ms": 15.0,
         "refreshes_per_hour": 12,

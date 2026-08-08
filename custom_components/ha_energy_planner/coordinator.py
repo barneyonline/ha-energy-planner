@@ -23,7 +23,6 @@ from homeassistant.util import dt as dt_util
 from .ai_advisor import AIAdviceResult, LocalAIAdvisor
 from .const import (
     AI_ADVICE_MIN_INTERVAL_SECONDS,
-    CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -39,15 +38,21 @@ from .const import (
     CONF_DAIKIN_CLIMATE,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
+    CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
+    CONF_EV_CHARGER_START,
+    CONF_EV_CHARGER_STOP,
     CONF_EV_CONNECTED,
     CONF_EV_CONNECTED_HELPER,
+    CONF_EV_CONTROL_ENABLED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
+    CONF_EV_SMART_CHARGING_START,
+    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
@@ -86,7 +91,7 @@ from .models import (
     to_jsonable,
 )
 from .planner import DryRunPlanner
-from .preflight import production_evidence_fingerprint
+from .preflight import build_preflight_report, production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
@@ -129,6 +134,41 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
         "resolution_minutes",
     }
 )
+
+
+def _configured_control_options(entry_data: dict[str, Any]) -> dict[str, bool]:
+    """Return control toggles for device areas that have writable mappings."""
+    ev_configured = any(
+        bool(str(entry_data.get(key, "") or "").strip())
+        for key in (
+            CONF_EV_CHARGER,
+            CONF_EV_CHARGER_START,
+            CONF_EV_CHARGER_STOP,
+            CONF_EV_SMART_CHARGING,
+            CONF_EV_SMART_CHARGING_START,
+            CONF_EV_SMART_CHARGING_STOP,
+        )
+    )
+    return {
+        CONF_EV_CONTROL_ENABLED: ev_configured,
+        CONF_CLIMATE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
+        CONF_ENPHASE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
+    }
+
+
+def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
+    """Return one actionable reason that the combined activation was rejected."""
+    production = dict(report.get("production", {}))
+    ready_cycles = parse_production_state(production).dry_run_ready_cycles
+    if not production.get("dry_run_evidence_complete"):
+        return (
+            f"review mode has recorded {ready_cycles}/{DRY_RUN_READY_CYCLES_REQUIRED} healthy plans; "
+            "wait for the readiness sensor, review the plan, then turn Automatic control on again"
+        )
+    for check in report.get("checks", []):
+        if check.get("blocking") and not check.get("ok"):
+            return str(check.get("message") or "a safety check failed")
+    return str(report.get("current_plan", {}).get("message") or "a safety check failed")
 
 _HVAC_CONTROL_ATTRIBUTE_KEYS = frozenset(
     {
@@ -236,19 +276,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._haeo_adapter: HAEOAdapter | None = None
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._ai_advice_fingerprint: str | None = None
-        self._ai_advice_retry_cancel: Callable[[], None] | None = None
-        self._ai_advice_retry_fingerprint: str | None = None
-        self._ai_advice_retry_at: datetime | None = None
         self._ai_advice_pending_fingerprint: str | None = None
         self._ai_advice_pending_reason: str | None = None
         self._ai_current_plan_fingerprint: str | None = None
         self._ai_current_plan_safe = False
         self.last_refresh_metadata: dict[str, Any] = {}
-        if bool(self.options.get(CONF_AI_ENABLED, False)):
-            _LOGGER.info(
-                "AI advice is enabled; the selected provider may log bounded prompts independently. "
-                "Review the provider logger configuration"
-            )
         super().__init__(
             hass,
             logger=_LOGGER,
@@ -280,6 +312,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     def dry_run(self) -> bool:
         """Return dry-run option state."""
         return strict_bool(self.options.get(CONF_DRY_RUN), default=True)
+
+    @property
+    def active_control(self) -> bool:
+        """Return whether automatic device control is fully active."""
+        production = parse_production_state(self.store.data.get("production"))
+        return self.planner_enabled and not self.dry_run and production.armed
 
     @property
     def refresh_metrics(self) -> dict[str, Any]:
@@ -370,7 +408,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if ai_task is not None and not ai_task.done():
             ai_task.cancel()
         self._ai_advice_task = None
-        self._cancel_ai_advice_retry()
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
 
@@ -657,7 +694,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         }
         if started_generation == self._refresh_generation:
             self._last_decision_fingerprint = decision_fingerprint
-            self._schedule_ai_advice(context, plan, entry_data, options)
+            self._sync_ai_request_to_plan(plan)
         return result
 
     def _get_haeo_adapter(self, entry_data: dict[str, Any]) -> HAEOAdapter:
@@ -1009,6 +1046,41 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self._async_save_production(production)
         self.async_update_listeners()
 
+    async def async_set_active_control(self, enabled: bool) -> None:
+        """Enable or safely return from automatic device control as one operation."""
+        if enabled and self.active_control:
+            return
+
+        options = self.options
+        options[CONF_PLANNER_ENABLED] = True
+        if not enabled:
+            options[CONF_DRY_RUN] = True
+            self.hass.config_entries.async_update_entry(self.entry, options=options)
+            await self.async_handle_options_update()
+            await self.async_disarm_production_control("automatic_control_disabled")
+            return
+
+        options.update(_configured_control_options(self.entry_data))
+        options[CONF_DRY_RUN] = True
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
+
+        report = build_preflight_report(self.hass, self)
+        if not report.get("safe_to_activate_now"):
+            reason = _active_control_not_ready_reason(report)
+            raise HomeAssistantError(
+                f"Automatic control is not ready: {reason}",
+                translation_domain=DOMAIN,
+                translation_key="active_control_not_ready",
+                translation_placeholders={"reason": reason},
+            )
+
+        await self.async_arm_production_control("automatic_control_enabled")
+        options = self.options
+        options[CONF_DRY_RUN] = False
+        self.hass.config_entries.async_update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
+
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
         """Disarm production control."""
         production = parse_production_state(self.store.data.get("production")).raw
@@ -1210,8 +1282,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         plan: EnergyPlan,
         entry_data: dict[str, Any],
         options: dict[str, Any],
+        *,
+        force_current_plan: bool = False,
     ) -> tuple[AIAdviceResult, bool]:
-        """Return AI advice only for safe, materially changed plans."""
+        """Return AI troubleshooting only for safe, materially changed plans."""
         if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
             return (
                 AIAdviceResult(
@@ -1220,14 +1294,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     rejected_reason="ai_skipped_unsafe_plan",
                     rejected_detail={
                         "reason": "ai_skipped_unsafe_plan",
-                        "message": "AI advice was skipped because the plan is unsafe or has zero confidence.",
+                        "message": "AI troubleshooting was skipped because the plan is unsafe or has zero confidence.",
                     },
                     service_called=None,
                 ),
                 False,
             )
         plan_fingerprint = _material_plan_fingerprint(plan)
-        if _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == plan_fingerprint:
+        if (
+            not force_current_plan
+            and _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == plan_fingerprint
+        ):
             return (
                 AIAdviceResult(
                     status="skipped",
@@ -1235,7 +1312,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     rejected_reason="ai_plan_unchanged",
                     rejected_detail={
                         "reason": "ai_plan_unchanged",
-                        "message": "AI advice was reused because the material plan has not changed.",
+                        "message": "AI troubleshooting was reused because the material plan has not changed.",
                     },
                     service_called=None,
                 ),
@@ -1257,7 +1334,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         rejected_detail={
                             "reason": "ai_rate_limited",
                             "message": (
-                                "AI advice was skipped because the last provider call was less than 5 minutes ago."
+                                "AI troubleshooting was skipped because the last provider call was less than "
+                                "5 minutes ago."
                             ),
                             "retry_after_seconds": remaining_seconds,
                             "last_called_at": last_called_at.isoformat(),
@@ -1272,51 +1350,79 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         result.rejected_detail.setdefault("plan_fingerprint", plan_fingerprint)
         return result, True
 
-    @callback
-    def _schedule_ai_advice(
-        self,
-        context: Any,
-        plan: EnergyPlan,
-        entry_data: dict[str, Any],
-        options: dict[str, Any],
-    ) -> None:
-        """Schedule advisory work after plan commit with one in-flight call."""
-        if (
-            not bool(options.get(CONF_AI_ENABLED, False))
-            or plan.health == InputHealth.UNSAFE
-            or plan.status == "unsafe"
-            or plan.confidence <= 0
-        ):
-            self._ai_current_plan_safe = False
-            self._ai_current_plan_fingerprint = None
-            self._cancel_ai_advice_retry()
-            current = getattr(self, "_ai_advice_task", None)
-            if current is not None and not current.done():
-                current.cancel()
-            return
+    async def async_request_ai_advice(self) -> None:
+        """Schedule a fresh bounded explanation for the current safe plan."""
+        if not str(self.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip():
+            raise HomeAssistantError(
+                "AI troubleshooting is not ready: no AI Task entity is configured.",
+                translation_domain=DOMAIN,
+                translation_key="ai_advice_not_ready",
+                translation_placeholders={"reason": "No AI Task entity is configured."},
+            )
+        plan = self.data
+        context = getattr(self, "_last_decision_context", None)
+        if plan is None or context is None:
+            raise HomeAssistantError(
+                "AI troubleshooting is not ready: no current plan is available.",
+                translation_domain=DOMAIN,
+                translation_key="ai_advice_not_ready",
+                translation_placeholders={"reason": "No current plan is available."},
+            )
+        if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
+            raise HomeAssistantError(
+                "AI troubleshooting is not ready: the current plan is unsafe.",
+                translation_domain=DOMAIN,
+                translation_key="ai_advice_not_ready",
+                translation_placeholders={"reason": "The current plan is unsafe or has zero confidence."},
+            )
+        now = dt_util.utcnow()
+        last_called_at = _latest_ai_service_call_at(self.store.data.get("ai_recommendations"))
+        if last_called_at is not None:
+            remaining = AI_ADVICE_MIN_INTERVAL_SECONDS - (now - last_called_at).total_seconds()
+            if remaining > 0:
+                seconds = max(ceil(remaining), 1)
+                raise HomeAssistantError(
+                    f"AI troubleshooting is rate limited for another {seconds} seconds.",
+                    translation_domain=DOMAIN,
+                    translation_key="ai_advice_not_ready",
+                    translation_placeholders={"reason": f"Try again in {seconds} seconds."},
+                )
         fingerprint = _material_plan_fingerprint(plan)
-        self._ai_current_plan_safe = True
-        self._ai_current_plan_fingerprint = fingerprint
-        if _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == fingerprint:
-            self._cancel_ai_advice_retry()
-            return
-        retry_cancel = getattr(self, "_ai_advice_retry_cancel", None)
-        if retry_cancel is not None:
-            if getattr(self, "_ai_advice_retry_fingerprint", None) == fingerprint:
-                self._set_ai_advice_pending(fingerprint, "ai_rate_limited")
-                return
-            self._cancel_ai_advice_retry()
         current = getattr(self, "_ai_advice_task", None)
         if current is not None and not current.done():
-            if getattr(self, "_ai_advice_fingerprint", None) == fingerprint:
-                self._set_ai_advice_pending(fingerprint, "request_in_flight")
-                return
-            current.cancel()
+            self._set_ai_advice_pending(fingerprint, "request_in_flight")
+            return
+        self._ai_current_plan_safe = True
+        self._ai_current_plan_fingerprint = fingerprint
         self._ai_advice_fingerprint = fingerprint
         self._set_ai_advice_pending(fingerprint, "request_in_flight")
+        request_context = replace(context, created_at=now)
         self._ai_advice_task = self.hass.async_create_task(
-            self._async_run_ai_advice(context, plan, entry_data, options, fingerprint)
+            self._async_run_ai_advice(
+                request_context,
+                plan,
+                self.entry_data,
+                self.options,
+                fingerprint,
+                force_current_plan=True,
+            )
         )
+        self.async_update_listeners()
+
+    @callback
+    def _sync_ai_request_to_plan(self, plan: EnergyPlan) -> None:
+        """Cancel an in-flight explanation if its deterministic plan is obsolete."""
+        safe = plan.health != InputHealth.UNSAFE and plan.status != "unsafe" and plan.confidence > 0
+        fingerprint = _material_plan_fingerprint(plan) if safe else None
+        self._ai_current_plan_safe = safe
+        self._ai_current_plan_fingerprint = fingerprint
+        current = getattr(self, "_ai_advice_task", None)
+        if current is None or current.done():
+            return
+        if not safe or getattr(self, "_ai_advice_fingerprint", None) != fingerprint:
+            current.cancel()
+            self._clear_ai_advice_pending()
+            self.async_update_listeners()
 
     async def _async_run_ai_advice(
         self,
@@ -1325,23 +1431,26 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         entry_data: dict[str, Any],
         options: dict[str, Any],
         fingerprint: str,
+        *,
+        force_current_plan: bool = False,
     ) -> None:
-        """Persist one bounded background advisory result and notify entities."""
+        """Persist one bounded button-triggered troubleshooting result."""
         started = perf_counter()
         try:
-            ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
+            if force_current_plan:
+                ai_result, should_store = await self._async_get_throttled_ai_advice(
+                    context,
+                    plan,
+                    entry_data,
+                    options,
+                    force_current_plan=True,
+                )
+            else:
+                ai_result, should_store = await self._async_get_throttled_ai_advice(
+                    context, plan, entry_data, options
+                )
             if not should_store:
-                if (
-                    ai_result.rejected_reason == "ai_rate_limited"
-                    and self._ai_advice_fingerprint == fingerprint
-                    and self._ai_current_plan_safe
-                    and self._ai_current_plan_fingerprint == fingerprint
-                ):
-                    retry_after = ai_result.rejected_detail.get("retry_after_seconds")
-                    delay_seconds = float(retry_after) if isinstance(retry_after, int | float) else 1.0
-                    self._schedule_ai_advice_retry(fingerprint, delay_seconds)
-                else:
-                    self._clear_ai_advice_pending(fingerprint)
+                self._clear_ai_advice_pending(fingerprint)
                 self.async_update_listeners()
                 return
             if (
@@ -1380,7 +1489,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
                     },
                 )
-            self._cancel_ai_advice_retry(clear_pending=False)
             self._clear_ai_advice_pending(fingerprint)
             self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
             self.async_update_listeners()
@@ -1390,7 +1498,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         except Exception:  # noqa: BLE001 - advice must never fail the planner task.
             self._clear_ai_advice_pending(fingerprint)
             self.async_update_listeners()
-            _LOGGER.exception("Background AI advice failed")
+            _LOGGER.exception("AI troubleshooting failed")
         finally:
             if getattr(self, "_ai_advice_task", None) is asyncio.current_task():
                 self._ai_advice_task = None
@@ -1409,54 +1517,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return
         self._ai_advice_pending_fingerprint = None
         self._ai_advice_pending_reason = None
-
-    @callback
-    def _cancel_ai_advice_retry(self, *, clear_pending: bool = True) -> None:
-        """Cancel a delayed AI retry and clear its bounded metadata."""
-        cancel = getattr(self, "_ai_advice_retry_cancel", None)
-        if cancel is not None:
-            cancel()
-        self._ai_advice_retry_cancel = None
-        self._ai_advice_retry_fingerprint = None
-        self._ai_advice_retry_at = None
-        if clear_pending:
-            self._clear_ai_advice_pending()
-
-    @callback
-    def _schedule_ai_advice_retry(self, fingerprint: str, delay_seconds: float) -> None:
-        """Retry rate-limited advice once the provider call window opens."""
-        self._cancel_ai_advice_retry(clear_pending=False)
-        delay = max(float(delay_seconds), 1.0)
-        self._ai_advice_retry_fingerprint = fingerprint
-        self._ai_advice_retry_at = dt_util.utcnow() + timedelta(seconds=delay)
-        self._set_ai_advice_pending(fingerprint, "ai_rate_limited")
-
-        @callback
-        def _retry(now: Any) -> None:
-            self._ai_advice_retry_cancel = None
-            self._ai_advice_retry_fingerprint = None
-            self._ai_advice_retry_at = None
-            plan = getattr(self, "data", None)
-            context = getattr(self, "_last_decision_context", None)
-            if (
-                getattr(self, "_tearing_down", False)
-                or not self._ai_current_plan_safe
-                or self._ai_current_plan_fingerprint != fingerprint
-                or plan is None
-                or context is None
-                or _material_plan_fingerprint(plan) != fingerprint
-            ):
-                self._clear_ai_advice_pending(fingerprint)
-                self.async_update_listeners()
-                return
-            try:
-                retry_context = replace(context, created_at=dt_util.utcnow())
-            except TypeError:
-                retry_context = context
-            self._schedule_ai_advice(retry_context, plan, self.entry_data, self.options)
-            self.async_update_listeners()
-
-        self._ai_advice_retry_cancel = async_call_later(self.hass, delay, _retry)
 
     def _non_manual_refresh_delay(self) -> float:
         """Return delay needed to enforce the safe non-manual refresh cadence."""

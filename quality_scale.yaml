@@ -112,7 +112,7 @@ rules:
         - tests/test_ev_control_entities.py
   config-flow-test-coverage:
     status: done
-    comment: Config and subentry flows cover device mappings and structural constraints; a central schema exclusion with regression coverage keeps native entity-managed settings out of the Options UI.
+    comment: The central Configure flow covers all input mappings and policy constraints; schema exclusions keep native entity-managed settings out of the forms, and regression coverage verifies that Add device subentry flows are not exposed.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -344,7 +344,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   discovery:
     status: n/a
-    comment: The integration does not discover devices or services; users explicitly map existing Home Assistant entities and services through config subentries.
+    comment: The integration does not discover devices or services; users explicitly map existing Home Assistant entities and services through the central Configure input sections.
     references:
       code:
         - custom_components/ha_energy_planner/discovery.py
@@ -391,7 +391,7 @@ rules:
         - ha-energy-planner-spec.md
   dynamic-devices:
     status: n/a
-    comment: Energy Planner exposes a fixed set of configured planner-area helper devices and has no discovered device inventory that can appear dynamically.
+    comment: Energy Planner exposes one fixed service device per config entry and has no discovered device inventory that can appear dynamically.
     references:
       code:
         - custom_components/ha_energy_planner/entity.py
@@ -400,7 +400,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: Adjustable planner and device settings use the Home Assistant config entity category, while primary plan/status entities remain uncategorized.
+    comment: Adjustable device settings use the Home Assistant config entity category, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -413,7 +413,7 @@ rules:
         - tests/test_ev_control_entities.py
   entity-device-class:
     status: done
-    comment: The estimated-cost sensor uses Home Assistant's monetary device class and configured currency; remaining planner status/confidence entities have no matching device class.
+    comment: Armed uses the running device class; the consolidated text status sensors and read-only action calendar have no applicable device class.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -421,8 +421,8 @@ rules:
       tests:
         - tests/test_sensor.py
   entity-disabled-by-default:
-    status: n/a
-    comment: The integration exposes only core planner status/control entities; no noisy diagnostic entities are created by default.
+    status: done
+    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Automatic control is the sole activation switch.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -431,7 +431,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including the EV opportunistic-charging switch and price-threshold number, use translation keys mirrored across bundled English translations.
+    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, the sole Automatic control switch, and day-to-day EV controls, use translation keys mirrored across bundled English translations.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json
@@ -460,7 +460,7 @@ rules:
         - custom_components/ha_energy_planner/strings.json
   reconfiguration-flow:
     status: done
-    comment: Each planning-area config subentry supports Home Assistant's native reconfigure flow, with runtime topology rebuilt after mapping changes.
+    comment: Every input mapping and policy section is editable from the integration's central Configure flow, with runtime topology rebuilt after mapping changes.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py

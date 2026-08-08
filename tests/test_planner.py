@@ -1527,7 +1527,7 @@ def test_disabled_climate_control_only_releases_persisted_ownership() -> None:
     }
 
 
-def test_active_plan_releases_instead_of_preconditioning_outside_comfort_bound() -> None:
+def test_active_plan_preconditions_from_comfort_boundary_before_price_rise() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -1538,7 +1538,7 @@ def test_active_plan_releases_instead_of_preconditioning_outside_comfort_bound()
     }
     context = _context()
     context.current_ev_soc_percent = None
-    context.current_hvac_temperature_c = 17.5
+    context.current_hvac_temperature_c = 18.0
     context.occupied_temperature_low_c = 18
     context.occupied_temperature_high_c = 24
     context.slots = [
@@ -1549,14 +1549,73 @@ def test_active_plan_releases_instead_of_preconditioning_outside_comfort_bound()
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
         )
-        for offset, price in [(0, 0.10), (5, 0.12), (10, 0.15), (15, 0.45)]
+        for offset, price in [
+            (0, 0.10),
+            (5, 0.12),
+            (10, 0.15),
+            (15, 0.14),
+            (20, 0.13),
+            (25, 0.11),
+            (30, 0.45),
+        ]
     ]
 
     plan = DryRunPlanner(options).create_plan(context)
 
     assert plan.actions[0].asset == ActionAsset.DAIKIN
-    assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
-    assert plan.actions[0].desired_state["release_reason"] == "hvac_comfort_handoff"
+    assert plan.actions[0].kind == ActionKind.SET_HVAC
+    assert plan.actions[0].desired_state["phase"] == "preconditioning"
+    assert plan.actions[0].desired_state["hvac_mode"] == "heat"
+    assert plan.actions[0].desired_state["target_temperature"] == 24.0
+    assert plan.actions[0].execute_not_before == context.created_at
+    assert plan.actions[1].desired_state["phase"] == "peak_coast"
+
+
+def test_active_plan_does_not_precondition_further_past_mode_target_boundary() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+    }
+    thermal_model = {
+        "enabled": True,
+        "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 6.0},
+        "active_cool_rate_c_per_hour": {"sample_count": 3, "average": 6.0},
+    }
+    for mode, current in (("heat", 24.0), ("cool", 18.0)):
+        context = _context()
+        context.current_ev_soc_percent = None
+        context.current_hvac_mode = mode
+        context.current_hvac_temperature_c = current
+        context.occupied_temperature_low_c = 18.0
+        context.occupied_temperature_high_c = 24.0
+        context.slots = [
+            DecisionSlot(
+                valid_at=context.created_at + timedelta(minutes=offset),
+                import_price=price,
+                export_price=0.05,
+                pv_forecast_kw=1.0,
+                baseline_load_forecast_kw=2.0,
+            )
+            for offset, price in [
+                (0, 0.10),
+                (5, 0.12),
+                (10, 0.15),
+                (15, 0.14),
+                (20, 0.13),
+                (25, 0.11),
+                (30, 0.45),
+            ]
+        ]
+
+        plan = DryRunPlanner(options, thermal_model=thermal_model).create_plan(context)
+
+        assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
+        assert plan.actions[0].desired_state["release_reason"] == "hvac_comfort_handoff"
 
 
 def test_active_plan_uses_thermal_model_for_hvac_precondition_projection() -> None:

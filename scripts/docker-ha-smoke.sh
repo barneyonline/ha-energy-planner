@@ -140,16 +140,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
 
     async def ai_advice(call: ServiceCall) -> dict:
-        """Return bounded local-AI-style JSON advice for smoke validation."""
+        """Return a bounded no-action explanation for smoke validation."""
         return {
             "response": json.dumps(
                 {
-                    "alerts": ["Smoke advisor observed bounded plan metadata"],
-                    "suggested_precondition_lead_minutes": 45,
-                    "suggested_forecast_buffer_percent": 12,
-                    "suggested_takeover_savings_threshold": 0.33,
-                    "reasoning_summary": "Smoke advisor response stayed within the allowed contract.",
-                    "confidence": 0.77,
+                    "outcome": "no_action_needed",
+                    "summary": "The smoke plan has no material user action.",
                 }
             )
         }
@@ -337,26 +333,20 @@ input_datetime:
     initial: "06:00"
 
 input_text:
-  planner_plan_status_seen:
-    name: Planner plan status seen
+  planner_current_state_seen:
+    name: Planner current state seen
     initial: unknown
-  planner_data_healthy_seen:
-    name: Planner data healthy seen
+  planner_next_actions_seen:
+    name: Planner next actions seen
     initial: unknown
-  planner_takeover_active_seen:
-    name: Planner takeover active seen
+  planner_armed_seen:
+    name: Planner armed seen
     initial: unknown
-  planner_dry_run_seen:
-    name: Planner dry run seen
+  planner_calendar_seen:
+    name: Planner calendar seen
     initial: unknown
-  planner_enabled_seen:
-    name: Planner enabled seen
-    initial: unknown
-  planner_ai_enabled_seen:
-    name: Planner AI enabled seen
-    initial: unknown
-  planner_replan_button_seen:
-    name: Planner replan button seen
+  planner_automatic_control_seen:
+    name: Planner automatic control seen
     initial: unknown
   planner_restore_notification_seen:
     name: Planner restore notification seen
@@ -661,19 +651,12 @@ automation:
       - delay: "00:00:01"
       - action: button.press
         data:
-          entity_id: button.ev_start_charging
+          entity_id: button.energy_planner_start_charging
       - delay: "00:00:02"
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_restore
       - delay: "00:00:03"
-      - action: switch.turn_off
-        data:
-          entity_id: switch.climate_control_enabled
-      - delay: "00:00:02"
-      - action: switch.turn_on
-        data:
-          entity_id: switch.climate_control_enabled
       - action: input_number.set_value
         data:
           entity_id: input_number.ev_soc
@@ -743,58 +726,48 @@ automation:
       - action: fake_haeo.seed_enphase_command_rate_limit
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
-      - action: switch.turn_on
-        data:
-          entity_id: switch.system_dry_run
-      - delay: "00:00:02"
       - action: button.press
         data:
-          entity_id: button.system_restore_safe_state
+          entity_id: button.energy_planner_restore_safe_state
       - delay: "00:00:02"
       - action: switch.turn_off
         data:
-          entity_id: switch.system_enabled
+          entity_id: switch.energy_planner_automatic_control
       - delay: "00:00:02"
+      - action: ha_energy_planner.resume_control
+        data:
+          reason: docker_smoke_automatic_control
+      - delay: "00:00:01"
       - action: switch.turn_on
         data:
-          entity_id: switch.system_enabled
-      - delay: "00:00:02"
-      - action: switch.turn_on
-        data:
-          entity_id: switch.ai_enabled
+          entity_id: switch.energy_planner_automatic_control
       - delay: "00:00:02"
       - action: button.press
         data:
-          entity_id: button.system_replan
+          entity_id: button.energy_planner_explain_or_troubleshoot
+      - delay: "00:00:05"
+      - action: ha_energy_planner.replan
       - delay: "00:00:05"
       - action: input_text.set_value
         data:
-          entity_id: input_text.planner_plan_status_seen
-          value: "{{ states('sensor.system_plan_status') }}"
+          entity_id: input_text.planner_current_state_seen
+          value: "{{ states('sensor.energy_planner_current_state') }}"
       - action: input_text.set_value
         data:
-          entity_id: input_text.planner_data_healthy_seen
-          value: "{{ states('binary_sensor.system_data_problem') }}"
+          entity_id: input_text.planner_next_actions_seen
+          value: "{{ states('sensor.energy_planner_next_actions') }}"
       - action: input_text.set_value
         data:
-          entity_id: input_text.planner_takeover_active_seen
-          value: "{{ states('binary_sensor.system_takeover_active') }}"
+          entity_id: input_text.planner_armed_seen
+          value: "{{ states('binary_sensor.energy_planner_armed') }}"
       - action: input_text.set_value
         data:
-          entity_id: input_text.planner_dry_run_seen
-          value: "{{ states('switch.system_dry_run') }}"
+          entity_id: input_text.planner_calendar_seen
+          value: "{{ states('calendar.energy_planner_plan') }}"
       - action: input_text.set_value
         data:
-          entity_id: input_text.planner_enabled_seen
-          value: "{{ states('switch.system_enabled') }}"
-      - action: input_text.set_value
-        data:
-          entity_id: input_text.planner_ai_enabled_seen
-          value: "{{ states('switch.ai_enabled') }}"
-      - action: input_text.set_value
-        data:
-          entity_id: input_text.planner_replan_button_seen
-          value: "{{ states('button.system_replan') }}"
+          entity_id: input_text.planner_automatic_control_seen
+          value: "{{ states('switch.energy_planner_automatic_control') }}"
       - action: ha_energy_planner.export_diagnostics
         response_variable: hep_diagnostics
       - action: input_text.set_value
@@ -815,7 +788,7 @@ automation:
           value: "{{ 1 if hep_diagnostics.plan is defined else 0 }}"
       - action: button.press
         data:
-          entity_id: button.ev_stop_charging
+          entity_id: button.energy_planner_stop_charging
 
 logger:
   default: warning
@@ -866,7 +839,6 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           "ev_control_enabled": true,
           "climate_control_enabled": true,
           "enphase_control_enabled": true,
-          "ai_enabled": false,
           "price_freshness_minutes": 30,
           "forecast_freshness_minutes": 120,
           "material_change_threshold_percent": 5.0,
@@ -1049,21 +1021,17 @@ entities = {
     if entry.get("platform") == "ha_energy_planner"
 }
 expected_entities = {
-    "sensor.system_next_action",
-    "sensor.system_plan_status",
-    "sensor.energy_estimated_plan_cost",
-    "sensor.energy_forecast_confidence",
-    "binary_sensor.system_data_problem",
-    "binary_sensor.system_takeover_active",
-    "switch.system_enabled",
-    "switch.system_dry_run",
-    "switch.ai_enabled",
-    "switch.ev_opportunistic_charging",
-    "number.ev_opportunistic_charging_price_threshold",
-    "button.system_replan",
-    "button.system_restore_safe_state",
-    "button.ev_start_charging",
-    "button.ev_stop_charging",
+    "sensor.energy_planner_current_state",
+    "sensor.energy_planner_next_actions",
+    "binary_sensor.energy_planner_armed",
+    "calendar.energy_planner_plan",
+    "switch.energy_planner_automatic_control",
+    "button.energy_planner_explain_or_troubleshoot",
+    "switch.energy_planner_opportunistic_charging",
+    "number.energy_planner_opportunistic_charging_price_threshold",
+    "button.energy_planner_restore_safe_state",
+    "button.energy_planner_start_charging",
+    "button.energy_planner_stop_charging",
 }
 missing = expected_entities - entities
 if missing:
@@ -1077,16 +1045,20 @@ device_identifiers = {
     if identifier and identifier[0] == "ha_energy_planner"
 }
 expected_device_identifiers = {
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_system"),
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_energy"),
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_climate"),
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_enphase"),
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_ai"),
-    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000_ev"),
+    ("ha_energy_planner", "01KW3HATESTENERGYPLANNER000"),
 }
-missing_devices = expected_device_identifiers - device_identifiers
-if missing_devices:
-    raise SystemExit(f"Missing HA Energy Planner device registry entries: {sorted(missing_devices)}")
+if device_identifiers != expected_device_identifiers:
+    raise SystemExit(
+        "Energy Planner did not expose exactly one device: "
+        f"expected={sorted(expected_device_identifiers)} actual={sorted(device_identifiers)}"
+    )
+
+config_entries = load_storage("core.config_entries")["data"]["entries"]
+planner_entry = next(entry for entry in config_entries if entry.get("domain") == "ha_energy_planner")
+if planner_entry.get("subentries"):
+    raise SystemExit(f"Legacy Add device subentries were not removed: {planner_entry['subentries']}")
+if planner_entry.get("data", {}).get("ai_task_entity") != "ai_task.smoke_advisor":
+    raise SystemExit("Legacy subentry mappings were not migrated into central settings")
 
 planner_store = load_storage("ha_energy_planner_state_01KW3HATESTENERGYPLANNER000")
 store_data = planner_store["data"]
@@ -1095,8 +1067,8 @@ if not active_plan or active_plan.get("horizon_hours") != 24 or active_plan.get(
     raise SystemExit("Planner Store did not persist a valid active 24h/5m plan")
 if active_plan.get("mode") not in {"DISABLED", "DRY_RUN", "ACTIVE_HEALTHY", "ACTIVE_DEGRADED"}:
     raise SystemExit(f"Unexpected persisted planner mode: {active_plan.get('mode')}")
-if active_plan.get("mode") != "DRY_RUN":
-    raise SystemExit(f"Dry-run switch entity did not produce a DRY_RUN active plan: {active_plan.get('mode')}")
+if active_plan.get("mode") not in {"ACTIVE_HEALTHY", "ACTIVE_DEGRADED"}:
+    raise SystemExit(f"Automatic control did not produce an active plan: {active_plan.get('mode')}")
 if not store_data.get("haeo_runs"):
     raise SystemExit("Planner Store did not persist HAEO run metadata")
 haeo_evidence_counts = [
@@ -1143,32 +1115,23 @@ if not any(
     recommendation.get("status") == "accepted"
     and recommendation.get("service_called") == "ai_task.generate_data"
     and recommendation.get("ai_task_entity") == "ai_task.smoke_advisor"
-    and recommendation.get("accepted", {}).get("suggested_precondition_lead_minutes") == 45
-    and recommendation.get("accepted", {}).get("suggested_forecast_buffer_percent") == 12
-    and recommendation.get("accepted", {}).get("suggested_takeover_savings_threshold") == 0.33
-    and recommendation.get("accepted", {}).get("confidence") == 0.77
+    and recommendation.get("accepted", {}).get("outcome") == "no_action_needed"
+    and recommendation.get("accepted", {}).get("summary") == "The smoke plan has no material user action."
     for recommendation in ai_recommendations
 ):
-    raise SystemExit(f"Planner Store did not persist accepted bounded local AI advice: {ai_recommendations}")
+    raise SystemExit(f"Planner Store did not persist accepted AI explanation: {ai_recommendations}")
 snapshots = store_data.get("forecast_snapshots", [])
 if not snapshots:
     raise SystemExit("Planner Store did not persist forecast snapshots")
 latest_snapshot = snapshots[-1]
 if not any(
     (snapshot.get("ai") or {}).get("status") == "accepted"
-    and (snapshot.get("ai") or {}).get("accepted_fields") == [
-        "alerts",
-        "confidence",
-        "reasoning_summary",
-        "suggested_forecast_buffer_percent",
-        "suggested_precondition_lead_minutes",
-        "suggested_takeover_savings_threshold",
-    ]
+    and (snapshot.get("ai") or {}).get("accepted_fields") == ["outcome", "summary"]
     and (snapshot.get("ai") or {}).get("service_called") == "ai_task.generate_data"
     and (snapshot.get("ai") or {}).get("ai_task_entity") == "ai_task.smoke_advisor"
     for snapshot in snapshots
 ):
-    raise SystemExit("Forecast snapshots did not persist bounded local AI advice metadata")
+    raise SystemExit("Forecast snapshots did not persist bounded AI explanation metadata")
 snapshot_actions = [
     action
     for snapshot in snapshots
@@ -1469,15 +1432,8 @@ def restored_entity_state(entity_id: str) -> str | None:
 
 
 expected_helper_states = {
-    "input_text.planner_plan_status_seen": "Current",
-    "input_text.planner_data_healthy_seen": "off",
-    "input_text.planner_takeover_active_seen": "off",
-    "input_text.planner_dry_run_seen": "on",
-    "input_text.planner_enabled_seen": "on",
-    "input_text.planner_ai_enabled_seen": "on",
-    "input_text.planner_restore_notification_seen": (
-        "ha_energy_planner_restore_safe_state_01KW3HATESTENERGYPLANNER000"
-    ),
+    "input_text.planner_armed_seen": "on",
+    "input_text.planner_automatic_control_seen": "on",
     "input_text.diagnostics_data_token_seen": "**REDACTED**",
     "input_text.diagnostics_data_address_seen": "**REDACTED**",
     "input_text.diagnostics_option_token_seen": "**REDACTED**",
@@ -1489,9 +1445,17 @@ for entity_id, expected_state in expected_helper_states.items():
             f"Unexpected captured HA Energy Planner entity state for {entity_id}: "
             f"{actual_state!r} != {expected_state!r}"
         )
-replan_button_state = restored_entity_state("input_text.planner_replan_button_seen")
-if replan_button_state in {None, "unknown", "unavailable"}:
-    raise SystemExit(f"Replan button entity was not pressed through Home Assistant Core: {replan_button_state!r}")
+restore_notification_state = restored_entity_state("input_text.planner_restore_notification_seen")
+if restore_notification_state == "ha_energy_planner_restore_safe_state_01KW3HATESTENERGYPLANNER000":
+    raise SystemExit("A successful safe-state restore unexpectedly created a persistent notification")
+for entity_id in (
+    "input_text.planner_current_state_seen",
+    "input_text.planner_next_actions_seen",
+    "input_text.planner_calendar_seen",
+):
+    captured_state = restored_entity_state(entity_id)
+    if captured_state in {None, "unknown", "unavailable"}:
+        raise SystemExit(f"Consolidated status entity was unavailable: {entity_id}={captured_state!r}")
 diagnostics_response_state = next(
     (
         item.get("state", {}).get("state")

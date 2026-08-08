@@ -6,91 +6,45 @@ from types import SimpleNamespace
 
 from custom_components.ha_energy_planner.const import DOMAIN
 from custom_components.ha_energy_planner.entity import (
-    DEVICE_AI,
-    DEVICE_CLIMATE,
-    DEVICE_ENERGY,
-    DEVICE_ENPHASE,
-    DEVICE_EV,
-    DEVICE_SYSTEM,
     EnergyPlannerEntity,
     async_add_planner_entities,
-    planner_config_subentry_id,
-    planner_device_configured,
-    planner_device_key_for_entity,
+    planner_device_identifier,
 )
 
 
-def test_planner_entity_defaults_to_system_device() -> None:
-    coordinator = SimpleNamespace(entry=SimpleNamespace(entry_id="entry-1"))
+def test_planner_entity_uses_single_named_device() -> None:
+    coordinator = SimpleNamespace(
+        entry=SimpleNamespace(entry_id="entry-1", title="House Energy Planner")
+    )
 
     entity = EnergyPlannerEntity(coordinator, "plan_status")
 
     assert entity.unique_id == "entry-1_plan_status"
-    assert entity.device_info["identifiers"] == {(DOMAIN, f"entry-1_{DEVICE_SYSTEM}")}
-    assert entity.device_info["name"] == "System"
-    assert entity.device_info["model"] == "System"
+    assert entity.device_info["identifiers"] == {(DOMAIN, "entry-1")}
+    assert entity.device_info["name"] == "House Energy Planner"
+    assert entity.device_info["model"] == "Energy Planner"
+    assert planner_device_identifier("entry-1") == (DOMAIN, "entry-1")
 
 
-def test_planner_entity_can_target_group_device() -> None:
-    coordinator = SimpleNamespace(entry=SimpleNamespace(entry_id="entry-1"))
-
-    entity = EnergyPlannerEntity(coordinator, "ai_enabled", DEVICE_AI)
-
-    assert entity.unique_id == "entry-1_ai_enabled"
-    assert entity.device_info["identifiers"] == {(DOMAIN, f"entry-1_{DEVICE_AI}")}
-    assert entity.device_info["name"] == "AI"
-    assert entity.device_info["model"] == "AI"
-
-
-def test_control_switches_target_optional_devices() -> None:
-    assert planner_device_key_for_entity("ev_control_enabled") == DEVICE_EV
-    assert planner_device_key_for_entity("ev_opportunistic_charging") == DEVICE_EV
-    assert planner_device_key_for_entity("ev_opportunistic_charging_price_threshold") == DEVICE_EV
-    assert planner_device_key_for_entity("climate_control_enabled") == DEVICE_CLIMATE
-    assert planner_device_key_for_entity("enphase_control_enabled") == DEVICE_ENPHASE
-
-
-def test_add_planner_entities_groups_by_matching_subentry() -> None:
-    entry = SimpleNamespace(
-        subentries={
-            "system": SimpleNamespace(subentry_type=DEVICE_SYSTEM, subentry_id="system-subentry"),
-            "ai": SimpleNamespace(subentry_type=DEVICE_AI, subentry_id="ai-subentry"),
-        }
+def test_planner_entity_ignores_legacy_group_hint() -> None:
+    coordinator = SimpleNamespace(
+        entry=SimpleNamespace(entry_id="entry-1", title="Energy Planner")
     )
-    system_entity = SimpleNamespace(planner_device_key=DEVICE_SYSTEM)
-    ai_entity = SimpleNamespace(planner_device_key=DEVICE_AI)
-    calls: list[tuple[list[object], str | None]] = []
+
+    entity = EnergyPlannerEntity(coordinator, "ai_enabled", "ai")
+
+    assert entity.device_info["identifiers"] == {(DOMAIN, "entry-1")}
+    assert entity.device_info["name"] == "Energy Planner"
+
+
+def test_add_planner_entities_adds_every_entity_to_main_entry() -> None:
+    entities = [object(), object()]
+    calls: list[list[object]] = []
 
     async_add_planner_entities(
-        entry,
-        lambda entities, *, config_subentry_id: calls.append((entities, config_subentry_id)),
-        [system_entity, ai_entity],
+        SimpleNamespace(),
+        lambda added: calls.append(added),
+        entities,
     )
 
-    assert planner_config_subentry_id(entry, DEVICE_AI) == "ai-subentry"
-    assert calls == [
-        ([system_entity], "system-subentry"),
-        ([ai_entity], "ai-subentry"),
-    ]
-
-
-def test_add_planner_entities_skips_optional_devices_without_subentry() -> None:
-    entry = SimpleNamespace(
-        subentries={
-            "system": SimpleNamespace(subentry_type=DEVICE_SYSTEM, subentry_id="system-subentry"),
-        }
-    )
-    system_entity = SimpleNamespace(planner_device_key=DEVICE_SYSTEM)
-    energy_entity = SimpleNamespace(planner_device_key=DEVICE_ENERGY)
-    calls: list[tuple[list[object], str | None]] = []
-
-    assert planner_device_configured(entry, DEVICE_SYSTEM) is True
-    assert planner_device_configured(entry, DEVICE_ENERGY) is False
-
-    async_add_planner_entities(
-        entry,
-        lambda entities, *, config_subentry_id: calls.append((entities, config_subentry_id)),
-        [system_entity, energy_entity],
-    )
-
-    assert calls == [([system_entity], "system-subentry")]
+    assert calls == [entities]

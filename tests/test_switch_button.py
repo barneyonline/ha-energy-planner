@@ -13,7 +13,7 @@ from custom_components.ha_energy_planner import button as button_module
 from custom_components.ha_energy_planner import switch as switch_module
 from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
 from custom_components.ha_energy_planner.const import (
-    CONF_AI_ENABLED,
+    CONF_AI_TASK_ENTITY,
     CONF_DRY_RUN,
     CONF_EV_CONNECTED_HELPER,
     CONF_EV_KEEP_CHARGER_ON,
@@ -67,6 +67,11 @@ class FakeCoordinator:
         self.ev_charging_calls: list[bool] = []
         self.ev_connected_helper_calls: list[bool] = []
         self.ev_keep_on_calls: list[bool] = []
+        self.ai_advice_requests = 0
+        self.entry_data: dict[str, object] = {}
+        self.active_control_calls: list[bool] = []
+        self.active_control_value = False
+        self.last_update_success = True
         self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
         self.ev_charging_result = SimpleNamespace(applied=True, reason="applied")
         self.last_control_mode = (
@@ -79,12 +84,22 @@ class FakeCoordinator:
         return {
             CONF_PLANNER_ENABLED: False,
             CONF_DRY_RUN: True,
-            CONF_AI_ENABLED: False,
             **dict(self.entry.options),
         }
 
+    @property
+    def active_control(self) -> bool:
+        return self.active_control_value
+
+    async def async_set_active_control(self, enabled: bool) -> None:
+        self.active_control_calls.append(enabled)
+        self.active_control_value = enabled
+
     async def async_request_replan(self) -> None:
         self.replan_count += 1
+
+    async def async_request_ai_advice(self) -> None:
+        self.ai_advice_requests += 1
 
     async def async_handle_options_update(self) -> None:
         previous_enabled, previous_dry_run = self.last_control_mode
@@ -132,60 +147,96 @@ class FakeCoordinator:
         self.hass.config_entries.async_update_entry(self.entry, options=options)
 
 
-def test_switch_updates_config_entry_option_and_replans() -> None:
-    coordinator = FakeCoordinator({CONF_DRY_RUN: True})
+def test_automatic_control_switch_uses_combined_coordinator_path() -> None:
+    coordinator = FakeCoordinator()
     switch = SimpleNamespace(
         coordinator=coordinator,
-        entity_description=next(description for description in SWITCHES if description.option_key == CONF_DRY_RUN),
+        entity_description=next(description for description in SWITCHES if description.key == "active_control"),
+        write_count=0,
+    )
+    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
+
+    assert PlannerSwitch.is_on.fget(switch) is False
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
+    assert PlannerSwitch.is_on.fget(switch) is True
+    asyncio.run(PlannerSwitch.async_turn_off(switch))
+
+    assert coordinator.active_control_calls == [True, False]
+    assert switch.write_count == 2
+
+
+def test_automatic_control_is_the_only_activation_switch() -> None:
+    keys = {description.key for description in SWITCHES}
+
+    assert "active_control" in keys
+    assert keys.isdisjoint(
+        {
+            "enabled",
+            "dry_run",
+            "ai_enabled",
+            "ev_control_enabled",
+            "climate_control_enabled",
+            "enphase_control_enabled",
+        }
+    )
+
+
+def test_non_activation_switches_still_use_their_own_options() -> None:
+    coordinator = FakeCoordinator({CONF_EV_LOW_PRICE_CHARGING_ENABLED: False})
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(
+            description for description in SWITCHES if description.key == "ev_opportunistic_charging"
+        ),
         write_count=0,
     )
     switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
     switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
 
-    assert PlannerSwitch.is_on.fget(switch) is True
-
+    assert PlannerSwitch.is_on.fget(switch) is False
+    asyncio.run(PlannerSwitch.async_turn_on(switch))
     asyncio.run(PlannerSwitch.async_turn_off(switch))
 
-    assert coordinator.entry.options[CONF_DRY_RUN] is False
-    assert coordinator.hass.config_entries.updated[-1][1][CONF_DRY_RUN] is False
-    assert coordinator.replan_count == 1
-    assert switch.write_count == 1
-    assert PlannerSwitch.is_on.fget(switch) is False
+    assert coordinator.entry.options[CONF_EV_LOW_PRICE_CHARGING_ENABLED] is False
+    assert coordinator.replan_count == 2
+    assert switch.write_count == 2
 
 
 def test_switch_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator({CONF_DRY_RUN: True})
-    entry = SimpleNamespace(runtime_data=coordinator)
+    entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator)
     added: list[object] = []
+    removed: list[str] = []
+
+    class FakeRegistry:
+        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> str:
+            return f"switch.{unique_id}"
+
+        def async_remove(self, entity_id: str) -> None:
+            removed.append(entity_id)
 
     def fake_add_planner_entities(entry_arg: object, add_entities: object, entities: object) -> None:
         added.extend(entities)
 
     monkeypatch.setattr(switch_module, "async_add_planner_entities", fake_add_planner_entities)
+    monkeypatch.setattr(switch_module.er, "async_get", lambda hass: FakeRegistry())
 
-    asyncio.run(switch_module.async_setup_entry(None, entry, None))
-    switch = PlannerSwitch(coordinator, next(description for description in SWITCHES if description.key == "dry_run"))
+    asyncio.run(switch_module.async_setup_entry(SimpleNamespace(), entry, None))
+    switch = PlannerSwitch(
+        coordinator,
+        next(description for description in SWITCHES if description.key == "active_control"),
+    )
 
     assert len(added) == len(SWITCHES)
-    assert switch.is_on is True
-
-
-def test_switch_preserves_other_options_when_updated() -> None:
-    coordinator = FakeCoordinator({CONF_DRY_RUN: True, CONF_AI_ENABLED: True})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description for description in SWITCHES if description.option_key == CONF_PLANNER_ENABLED
-        ),
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: None
-
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.entry.options[CONF_PLANNER_ENABLED] is True
-    assert coordinator.entry.options[CONF_DRY_RUN] is True
-    assert coordinator.entry.options[CONF_AI_ENABLED] is True
+    assert switch.is_on is False
+    assert removed == [
+        "switch.entry-1_enabled",
+        "switch.entry-1_dry_run",
+        "switch.entry-1_ai_enabled",
+        "switch.entry-1_ev_control_enabled",
+        "switch.entry-1_climate_control_enabled",
+        "switch.entry-1_enphase_control_enabled",
+    ]
 
 
 def test_connected_helper_switch_uses_coordinator_trip_history_path() -> None:
@@ -253,40 +304,6 @@ def test_keep_on_switch_uses_coordinator_validation_path() -> None:
     assert switch.write_count == 1
 
 
-def test_disabling_planner_restores_owned_state_before_replan() -> None:
-    coordinator = FakeCoordinator({CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description for description in SWITCHES if description.option_key == CONF_PLANNER_ENABLED
-        ),
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: None
-
-    asyncio.run(PlannerSwitch.async_turn_off(switch))
-
-    assert coordinator.entry.options[CONF_PLANNER_ENABLED] is False
-    assert coordinator.restore_calls == [("planner_disabled", False)]
-    assert coordinator.replan_count == 1
-
-
-def test_enabling_dry_run_restores_owned_state_before_replan() -> None:
-    coordinator = FakeCoordinator({CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(description for description in SWITCHES if description.option_key == CONF_DRY_RUN),
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: None
-
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.entry.options[CONF_DRY_RUN] is True
-    assert coordinator.restore_calls == [("dry_run_enabled", False)]
-    assert coordinator.replan_count == 1
-
-
 def test_button_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator()
     entry = SimpleNamespace(runtime_data=coordinator)
@@ -315,6 +332,22 @@ def test_replan_button_requests_replan() -> None:
 
     assert coordinator.replan_count == 1
     assert coordinator.restore_calls == []
+
+
+def test_request_ai_advice_button_uses_current_planner_advisory() -> None:
+    coordinator = FakeCoordinator()
+    description = next(description for description in BUTTONS if description.key == "request_ai_advice")
+    button = SimpleNamespace(coordinator=coordinator, entity_description=description)
+
+    assert description.available_fn(coordinator) is False
+    coordinator.entry_data[CONF_AI_TASK_ENTITY] = "ai_task.local"
+    assert description.available_fn(coordinator) is True
+    entity = PlannerButton(coordinator, description)
+    assert entity.available is True
+
+    asyncio.run(PlannerButton.async_press(button))
+
+    assert coordinator.ai_advice_requests == 1
 
 
 def test_restore_button_restores_safe_state() -> None:
@@ -352,6 +385,7 @@ def test_manual_ev_charging_buttons_use_supported_icons() -> None:
 
     assert descriptions["ev_start_charging"].icon == "mdi:ev-station"
     assert descriptions["ev_stop_charging"].icon == "mdi:stop-circle-outline"
+    assert descriptions["request_ai_advice"].icon == "mdi:comment-question-outline"
 
 
 def test_restore_button_raises_translated_error_when_restore_is_incomplete() -> None:
@@ -436,6 +470,30 @@ def test_preflight_notification_message_reports_success() -> None:
         )
         == "Active control is ready.\n\nAll preflight checks passed."
     )
+
+
+def test_successful_preflight_dismisses_old_alert_without_notifying(monkeypatch: object) -> None:
+    coordinator = FakeCoordinator()
+    button = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "run_preflight"),
+    )
+    monkeypatch.setattr(
+        button_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"ok": True, "active_control_ready": True, "checks": []},
+    )
+
+    asyncio.run(PlannerButton.async_press(button))
+
+    assert coordinator.hass.services.calls == [
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_preflight_entry-1"},
+            False,
+        )
+    ]
 
 
 def test_production_control_buttons_call_coordinator() -> None:

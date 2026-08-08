@@ -13,12 +13,16 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
-from .const import EV_RESERVATION_EXTERNAL_BASELINE
+from .const import DOMAIN, EV_RESERVATION_EXTERNAL_BASELINE
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import InputHealth
+from .preflight import _control_area_report, production_evidence_fingerprint
+from .safety import DRY_RUN_READY_CYCLES_REQUIRED, control_pause_reason, parse_production_state
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -27,9 +31,10 @@ class PlannerBinarySensorDescription(BinarySensorEntityDescription):
     """Binary sensor description."""
 
     value_fn: Callable[[EnergyPlannerCoordinator], bool]
+    attrs_fn: Callable[[EnergyPlannerCoordinator], dict[str, Any]] = lambda coordinator: {}
 
 
-BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
+LEGACY_BINARY_SENSOR_DESCRIPTIONS: tuple[PlannerBinarySensorDescription, ...] = (
     PlannerBinarySensorDescription(
         key="data_healthy",
         translation_key="data_healthy",
@@ -45,6 +50,17 @@ BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
         device_class=BinarySensorDeviceClass.RUNNING,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda coordinator: _planner_ownership_active(coordinator.store.data),
+    ),
+)
+
+BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
+    PlannerBinarySensorDescription(
+        key="armed",
+        translation_key="armed",
+        icon="mdi:shield-check-outline",
+        device_class=BinarySensorDeviceClass.RUNNING,
+        value_fn=lambda coordinator: parse_production_state(coordinator.store.data.get("production")).armed,
+        attrs_fn=lambda coordinator: _armed_attrs(coordinator),
     ),
 )
 
@@ -83,11 +99,56 @@ async def async_setup_entry(
 ) -> None:
     """Set up binary sensors."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
+    _remove_retired_binary_sensors(hass, entry)
     async_add_planner_entities(
         entry,
         async_add_entities,
         (PlannerBinarySensor(coordinator, description) for description in BINARY_SENSORS),
     )
+
+
+def _remove_retired_binary_sensors(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Remove fragmented binary status entities from the entity registry."""
+    registry = er.async_get(hass)
+    for description in LEGACY_BINARY_SENSOR_DESCRIPTIONS:
+        entity_id = registry.async_get_entity_id("binary_sensor", DOMAIN, f"{entry.entry_id}_{description.key}")
+        if entity_id is not None:
+            registry.async_remove(entity_id)
+
+
+def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return the complete but compact automatic-control gate state."""
+    production = parse_production_state(coordinator.store.data.get("production"))
+    pause_reason = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow())
+    control_areas = _control_area_report(dict(coordinator.entry_data), coordinator.options)
+    evidence_matches = production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
+        dict(coordinator.entry_data), coordinator.options
+    )
+    evidence_complete = (
+        production.dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
+        and bool(control_areas["required"])
+        and evidence_matches
+    )
+    if pause_reason:
+        reason = pause_reason
+    elif coordinator.dry_run:
+        reason = "review_mode"
+    elif not production.armed:
+        reason = "safety_gate_not_armed"
+    else:
+        reason = "armed"
+    return {
+        "armed": production.armed,
+        "automatic_control": coordinator.active_control,
+        "mode": "active" if coordinator.active_control else "review",
+        "reason": reason,
+        "control_paused": pause_reason is not None,
+        "required_control_areas": list(control_areas["required"]),
+        "dry_run_ready_cycles": production.dry_run_ready_cycles,
+        "dry_run_cycles_required": DRY_RUN_READY_CYCLES_REQUIRED,
+        "dry_run_evidence_complete": evidence_complete,
+        "dry_run_evidence_matches_configuration": evidence_matches,
+    }
 
 
 class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
@@ -108,3 +169,8 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
     def is_on(self) -> bool:
         """Return binary sensor state."""
         return self.entity_description.value_fn(self.coordinator)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return binary sensor attributes."""
+        return self.entity_description.attrs_fn(self.coordinator)

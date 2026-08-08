@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from types import MappingProxyType
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry, ConfigSubentry
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 SUBENTRY_SYSTEM = "system"
@@ -15,26 +14,6 @@ SUBENTRY_PRESENCE = "presence"
 SUBENTRY_ENPHASE = "enphase"
 SUBENTRY_AI = "ai"
 SUBENTRY_EV = "ev"
-
-_TARGET_TITLES = {
-    SUBENTRY_SYSTEM: "System",
-    SUBENTRY_ENERGY: "Energy",
-    SUBENTRY_CLIMATE: "Climate",
-    SUBENTRY_PRESENCE: "Presence",
-    SUBENTRY_ENPHASE: "Enphase",
-    SUBENTRY_AI: "AI",
-    SUBENTRY_EV: "EV",
-}
-
-_TARGET_IDS = {
-    SUBENTRY_SYSTEM: "haep_system",
-    SUBENTRY_ENERGY: "haep_energy",
-    SUBENTRY_CLIMATE: "haep_climate",
-    SUBENTRY_PRESENCE: "haep_presence",
-    SUBENTRY_ENPHASE: "haep_enphase",
-    SUBENTRY_AI: "haep_ai",
-    SUBENTRY_EV: "haep_ev",
-}
 
 _LEGACY_TO_TARGET = {
     "energy": SUBENTRY_ENERGY,
@@ -58,11 +37,6 @@ _ENPHASE_DEFAULTS = {
     "enphase_ai_profile": "AI Optimisation",
     "enphase_self_consumption_profile": "Self-Consumption",
     "enphase_full_backup_profile": "Full Backup",
-}
-_MOVED_KEYS_BY_TARGET = {
-    SUBENTRY_ENERGY: _CLIMATE_KEYS_FROM_ENERGY,
-    SUBENTRY_CLIMATE: _PRESENCE_KEYS,
-    SUBENTRY_ENPHASE: _AI_KEYS,
 }
 
 
@@ -107,72 +81,20 @@ def grouped_subentry_data(entry: ConfigEntry) -> dict[str, dict[str, Any]]:
     return {target: data for target, data in grouped.items() if data}
 
 
-def needs_subentry_consolidation(entry: ConfigEntry) -> bool:
-    """Return whether the entry still has legacy split subentries."""
-    return any(
-        subentry.subentry_type not in _TARGET_TITLES
-        or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key in subentry.data for key in _AI_KEYS))
-        or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key in subentry.data for key in _ENPHASE_REMOVED_KEYS))
-        or (subentry.subentry_type == SUBENTRY_ENPHASE and any(key not in subentry.data for key in _ENPHASE_DEFAULTS))
-        or (
-            subentry.subentry_type == SUBENTRY_ENERGY and any(key in subentry.data for key in _CLIMATE_KEYS_FROM_ENERGY)
-        )
-        or (subentry.subentry_type == SUBENTRY_CLIMATE and any(key in subentry.data for key in _PRESENCE_KEYS))
-        for subentry in getattr(entry, "subentries", {}).values()
-        if subentry.subentry_type in _LEGACY_TO_TARGET
-    )
+def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Move every legacy Add device section into the main config entry."""
+    subentries = list(getattr(entry, "subentries", {}).values())
+    if not subentries:
+        return False
 
+    data = dict(entry.data)
+    for section_data in grouped_subentry_data(entry).values():
+        data.update(section_data)
+    for subentry in subentries:
+        if subentry.subentry_type not in _LEGACY_TO_TARGET:
+            data.update(dict(subentry.data))
 
-def async_consolidate_subentries(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Fold legacy split subentries into the consolidated group layout."""
-    existing_by_type = {
-        subentry.subentry_type: subentry
-        for subentry in getattr(entry, "subentries", {}).values()
-        if subentry.subentry_type in _TARGET_TITLES
-    }
-    changed = False
-    if SUBENTRY_SYSTEM not in existing_by_type:
-        subentry = ConfigSubentry(
-            data=MappingProxyType({}),
-            subentry_id=_TARGET_IDS[SUBENTRY_SYSTEM],
-            subentry_type=SUBENTRY_SYSTEM,
-            title=_TARGET_TITLES[SUBENTRY_SYSTEM],
-            unique_id=None,
-        )
-        changed |= hass.config_entries.async_add_subentry(entry, subentry)
-        existing_by_type[SUBENTRY_SYSTEM] = subentry
-
-    if not needs_subentry_consolidation(entry):
-        return changed
-
-    grouped = grouped_subentry_data(entry)
-    for target, data in grouped.items():
-        if target in existing_by_type:
-            changed |= hass.config_entries.async_update_subentry(
-                entry,
-                existing_by_type[target],
-                title=_TARGET_TITLES[target],
-                data=data,
-            )
-        else:
-            changed |= hass.config_entries.async_add_subentry(
-                entry,
-                ConfigSubentry(
-                    data=MappingProxyType(data),
-                    subentry_id=_TARGET_IDS[target],
-                    subentry_type=target,
-                    title=_TARGET_TITLES[target],
-                    unique_id=None,
-                ),
-            )
-
-    for subentry in list(getattr(entry, "subentries", {}).values()):
-        if subentry.subentry_type in _LEGACY_TO_TARGET and subentry.subentry_type not in _TARGET_TITLES:
-            changed |= hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
-            continue
-
-        moved_keys = _MOVED_KEYS_BY_TARGET.get(subentry.subentry_type, set())
-        if moved_keys and any(key in subentry.data for key in moved_keys) and subentry.subentry_type not in grouped:
-            changed |= hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
-
-    return changed
+    hass.config_entries.async_update_entry(entry, data=data)
+    for subentry in subentries:
+        hass.config_entries.async_remove_subentry(entry, subentry.subentry_id)
+    return True

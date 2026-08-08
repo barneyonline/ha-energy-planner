@@ -7,6 +7,7 @@ import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
@@ -18,7 +19,7 @@ from custom_components.ha_energy_planner.models import (
     PlanAction,
     PlannerMode,
 )
-from custom_components.ha_energy_planner.sensor import SENSORS, PlannerSensor
+from custom_components.ha_energy_planner.sensor import LEGACY_SENSOR_DESCRIPTIONS, SENSORS, PlannerSensor
 
 
 def test_sensors_expose_safe_empty_values_without_plan() -> None:
@@ -27,40 +28,153 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     attrs = {description.key: description.attrs_fn(coordinator) for description in SENSORS}
 
     assert values == {
-        "next_action": "None",
-        "plan_status": "Unknown",
-        "estimated_daily_cost": None,
-        "forecast_confidence": None,
-        "confidence_breakdown": "Unknown",
-        "decision_audit": "Unknown",
-        "rejected_actions": "Unknown",
-        "upcoming_timeline": "Unknown",
-        "production_readiness": "Not Ready",
-        "control_block_reason": "Production Gate Not Armed",
-        "execution_audit": "No Activity",
-        "dry_run_comparison": "No Dry Run",
-        "support_bundle_summary": "No Plan",
-        "ai_advice": "Disabled",
-        "climate_plan": "Unknown",
-        "climate_decision": "Unknown",
-        "climate_current_state": "Unknown",
-        "climate_next_state": "Unknown",
-        "presence_state": "Unknown",
-        "enphase_plan": "Unknown",
-        "enphase_decision": "Unknown",
-        "enphase_current_state": "Unknown",
-        "enphase_next_state": "Unknown",
-        "ev_charging_plan": "Unknown",
-        "ev_decision": "Unknown",
-        "ev_current_state": "Unknown",
-        "ev_next_state": "Unknown",
-        "ev_current_charge_state": "Unknown",
-        "ev_next_charge_state": "Unknown",
+        "current_state": "No controls configured",
+        "next_actions": "None",
     }
-    assert attrs["next_action"] == {}
-    assert attrs["plan_status"] == {}
-    assert attrs["ai_advice"] == {"enabled": False, "latest": None}
-    assert attrs["presence_state"] == {"person_entities": []}
+    assert attrs["current_state"] == {
+        "mode": "Unknown",
+        "health": "Unknown",
+        "controlled_assets": [],
+    }
+    assert attrs["next_actions"] == {"actions": []}
+
+
+def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> None:
+    """Keep non-entity diagnostic formatters safe while their registry IDs retire."""
+    coordinator = _coordinator(None)
+
+    assert sensor_module._plan_status_attrs(coordinator) == {}
+    assert sensor_module._asset_plan_state(None, ActionAsset.EV) == "Unknown"
+    assert sensor_module._decision_audit_state(None) == "Unknown"
+    assert sensor_module._decision_audit_attrs(None) == {}
+    assert sensor_module._rejected_actions_state(None) == "Unknown"
+    assert sensor_module._rejected_actions_attrs(None) == {}
+    assert sensor_module._upcoming_timeline_state(None) == "Unknown"
+    assert sensor_module._upcoming_timeline_attrs(None) == {}
+    assert sensor_module._device_decision_state(None, ActionAsset.EV) == "Unknown"
+    assert sensor_module._device_decision_attrs(None, ActionAsset.EV) == {}
+    assert sensor_module._asset_plan_attrs(None, ActionAsset.EV) == {}
+    assert sensor_module._asset_current_state(None, ActionAsset.EV) == "Unknown"
+    assert sensor_module._asset_next_state(None, ActionAsset.EV) == "Unknown"
+    assert sensor_module._asset_state_attrs(None, ActionAsset.EV, "current") == {}
+    assert sensor_module._ev_next_charge_state(None) == "Unknown"
+    assert sensor_module._ev_charge_state_attrs(coordinator, "current") == {
+        "configured_charging_entity": None,
+        "live_state": None,
+    }
+    assert sensor_module._presence_state(None) == "Unknown"
+    assert sensor_module._confidence_breakdown_state(coordinator) == "Unknown"
+    assert sensor_module._confidence_breakdown_attrs(coordinator) == {}
+    assert sensor_module._execution_audit_state(coordinator) == "No Activity"
+    assert sensor_module._dry_run_comparison_state(coordinator) == "No Dry Run"
+    assert sensor_module._support_bundle_state(coordinator) == "No Plan"
+
+
+def test_consolidated_ownership_covers_enphase_and_disabled_control_reason() -> None:
+    assert sensor_module._asset_owned(
+        {"ownership": {"enphase_profile_changed_at": "2026-08-08T00:00:00+00:00"}},
+        ActionAsset.ENPHASE,
+    ) is True
+    coordinator = _coordinator(
+        _plan(),
+        options={
+            "ev_control_enabled": False,
+            "climate_control_enabled": True,
+            "enphase_control_enabled": True,
+        },
+    )
+    assert "ev_control_disabled" in sensor_module._control_block_attrs(coordinator)["reasons"]
+
+
+def test_consolidated_status_entities_show_live_state_and_action_determination() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    climate_action = PlanAction(
+        action_id="climate-1",
+        plan_id="plan-1",
+        execute_not_before=now + timedelta(hours=1),
+        execute_not_after=now + timedelta(hours=1, minutes=5),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={"hvac_mode": "heat", "target_temperature": 21},
+        hard_constraints=["occupied_comfort"],
+        reason_codes=["precondition_before_peak"],
+        expected_cost_delta=0.42,
+        confidence=0.9,
+        requires_haeo_plan_id=None,
+    )
+    ev_action = replace(
+        climate_action,
+        action_id="ev-1",
+        execute_not_before=now + timedelta(hours=2),
+        execute_not_after=now + timedelta(hours=2, minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={"charge_kw": 7},
+        reason_codes=["ev_soc_below_target"],
+    )
+    plan = _plan(
+        actions=[ev_action, climate_action],
+        device_plans={
+            "climate": {"current_state_label": "Heat (19 C)"},
+            "ev": {"current_state_label": "Connected, not charging"},
+        },
+    )
+    plan.decision_audit = {
+        "summary": "Climate preconditioning won the lowest-cost feasible slot.",
+        "policy_order": ["cost", "comfort", "ev_readiness"],
+        "marginal_budget": {"forecast_surplus_kwh": 2.0},
+        "accepted": [
+            {
+                "action_id": "climate-1",
+                "device": "Climate",
+                "score": 0.9,
+                "reason": "lower pre-peak price",
+            }
+        ],
+    }
+    states = {
+        "climate.home": SimpleNamespace(
+            state="heat",
+            attributes={
+                "friendly_name": "Home climate",
+                "current_temperature": 19,
+                "temperature": 19,
+                "hvac_action": "heating",
+            },
+        ),
+        "switch.ev": SimpleNamespace(state="off", attributes={"friendly_name": "EV charger"}),
+        "binary_sensor.ev_charging": SimpleNamespace(state="off", attributes={}),
+        "sensor.ev_soc": SimpleNamespace(state="53", attributes={"unit_of_measurement": "%"}),
+    }
+    coordinator = _coordinator(
+        plan,
+        entry_data={
+            "daikin_climate_entity": "climate.home",
+            "ev_charger_entity": "switch.ev",
+            "ev_charging_entity": "binary_sensor.ev_charging",
+            "ev_soc_entity": "sensor.ev_soc",
+        },
+        hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
+        store_data={"ownership": {"hvac_control": {"phase": "precondition"}}},
+    )
+    current = next(item for item in SENSORS if item.key == "current_state")
+    next_actions = next(item for item in SENSORS if item.key == "next_actions")
+
+    assert current.value_fn(coordinator) == "Climate: Heat (19 C) | EV: Not Charging"
+    current_attrs = current.attrs_fn(coordinator)
+    assert current_attrs["controlled_assets"][0]["planner_owns_control"] is True
+    assert current_attrs["controlled_assets"][0]["entities"][0]["details"]["current_temperature"] == 19
+    assert current_attrs["controlled_assets"][1]["entities"][0]["state"] == "off"
+
+    assert next_actions.value_fn(coordinator) == "Change climate state (+1)"
+    action_attrs = next_actions.attrs_fn(coordinator)
+    assert [action["action_id"] for action in action_attrs["actions"]] == ["climate-1", "ev-1"]
+    assert action_attrs["actions"][0]["determination"]["accepted_decision"]["score"] == 0.9
+    assert action_attrs["actions"][0]["desired_state"]["Target temperature C"] == 21
+    assert action_attrs["policy_order"] == ["cost", "comfort", "ev_readiness"]
+    assert action_attrs["ai_explanation"] == {"available": False, "result": None}
+    assert "plan_confidence" not in action_attrs
+    assert "confidence" not in action_attrs["actions"][0]
 
 
 def test_operational_summary_sensors_expose_production_audit_and_support_context() -> None:
@@ -112,15 +226,19 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
         },
     )
 
-    confidence = next(item for item in SENSORS if item.key == "confidence_breakdown")
-    production = next(item for item in SENSORS if item.key == "production_readiness")
-    block = next(item for item in SENSORS if item.key == "control_block_reason")
-    audit = next(item for item in SENSORS if item.key == "execution_audit")
-    comparison = next(item for item in SENSORS if item.key == "dry_run_comparison")
-    support = next(item for item in SENSORS if item.key == "support_bundle_summary")
+    confidence = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "confidence_breakdown")
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+    block = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "control_block_reason")
+    audit = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "execution_audit")
+    comparison = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "dry_run_comparison")
+    support = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "support_bundle_summary")
 
-    assert confidence.value_fn(coordinator) == "87.5%"
-    assert confidence.attrs_fn(coordinator)["breakdown"]["pv"]["status"] == "degraded"
+    assert confidence.value_fn(coordinator) == "Unsafe inputs"
+    assert confidence.attrs_fn(coordinator)["status"] == "Unsafe inputs"
+    assert confidence.attrs_fn(coordinator)["input_issues"][0] == {
+        "code": "pv_forecast_entity_unavailable",
+        "description": "PV Forecast Entity Unavailable",
+    }
     assert production.value_fn(coordinator) == "Armed - Blocked"
     assert production.attrs_fn(coordinator)["ready_to_arm"] is True
     assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is True
@@ -136,7 +254,7 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert comparison.value_fn(coordinator) == "2 Planned"
     assert comparison.attrs_fn(coordinator)["latest"]["plan_id"] == "plan-1"
     assert support.value_fn(coordinator) == "Needs Review"
-    assert support.attrs_fn(coordinator)["latest_ai"] == {"enabled": True, "latest": None}
+    assert support.attrs_fn(coordinator)["latest_ai"] == {"available": False, "result": None}
 
 
 def test_dry_run_comparison_attributes_stay_below_recorder_limit() -> None:
@@ -164,7 +282,7 @@ def test_dry_run_comparison_attributes_stay_below_recorder_limit() -> None:
         for day in range(1, 7)
     ]
     coordinator = _coordinator(_plan(), store_data={"dry_run_comparisons": comparisons})
-    comparison = next(item for item in SENSORS if item.key == "dry_run_comparison")
+    comparison = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "dry_run_comparison")
 
     attrs = comparison.attrs_fn(coordinator)
 
@@ -211,21 +329,46 @@ def test_decision_audit_sensors_expose_accepted_rejected_and_timeline_rows() -> 
     ]
     coordinator = _coordinator(plan)
 
-    assert next(item for item in SENSORS if item.key == "decision_audit").value_fn(coordinator) == "1 Accepted"
-    assert next(item for item in SENSORS if item.key == "rejected_actions").value_fn(coordinator) == "1 Rejected"
-    assert next(item for item in SENSORS if item.key == "upcoming_timeline").value_fn(coordinator) == "1 Upcoming"
-    assert next(item for item in SENSORS if item.key == "ev_decision").value_fn(coordinator) == "Accepted"
-    assert next(item for item in SENSORS if item.key == "enphase_decision").value_fn(coordinator) == "Rejected"
-    ev_attrs = next(item for item in SENSORS if item.key == "ev_decision").attrs_fn(coordinator)
-    timeline_attrs = next(item for item in SENSORS if item.key == "upcoming_timeline").attrs_fn(coordinator)
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "decision_audit").value_fn(coordinator)
+        == "1 Accepted"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "rejected_actions").value_fn(coordinator)
+        == "1 Rejected"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "upcoming_timeline").value_fn(coordinator)
+        == "1 Upcoming"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_decision").value_fn(coordinator)
+        == "Accepted"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_decision").value_fn(coordinator)
+        == "Rejected"
+    )
+    ev_attrs = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_decision").attrs_fn(coordinator)
+    timeline_attrs = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "upcoming_timeline").attrs_fn(
+        coordinator
+    )
     assert ev_attrs["summary"] == "EV action was selected because the EV needs charge before its ready-by time."
     assert timeline_attrs["rows"][0]["estimated_kwh"] == 3.5
 
     empty_plan = _plan()
     empty_coordinator = _coordinator(empty_plan)
-    assert next(item for item in SENSORS if item.key == "decision_audit").attrs_fn(empty_coordinator)["accepted"] == []
     assert (
-        next(item for item in SENSORS if item.key == "rejected_actions").attrs_fn(empty_coordinator)["rejected"] == []
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "decision_audit").attrs_fn(empty_coordinator)[
+            "accepted"
+        ]
+        == []
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "rejected_actions").attrs_fn(empty_coordinator)[
+            "rejected"
+        ]
+        == []
     )
     assert (
         sensor_module._device_decision_summary(ActionAsset.DAIKIN, None, {"device": "Climate"})
@@ -237,7 +380,7 @@ def test_decision_audit_sensors_expose_accepted_rejected_and_timeline_rows() -> 
     )
 
 
-def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
+def test_data_quality_explains_the_limiting_source_without_percentages() -> None:
     plan = _plan()
     plan.confidence = 0.7
     coordinator = _coordinator(
@@ -287,44 +430,49 @@ def test_confidence_breakdown_explains_score_and_improvement_actions() -> None:
             ]
         },
     )
-    confidence = next(item for item in SENSORS if item.key == "confidence_breakdown")
+    confidence = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "confidence_breakdown")
 
     attrs = confidence.attrs_fn(coordinator)
 
-    assert attrs["calculation"] == {
-        "formula": "overall = min(input_health_score, forecast_source_confidence)",
-        "overall": 0.7,
-        "overall_percent": 70.0,
-        "input_health_score": 1.0,
-        "input_health_percent": 100.0,
-        "forecast_source_confidence": 0.7,
-        "forecast_source_percent": 70.0,
-        "limiting_factor": "forecast_sources",
-    }
-    assert attrs["source_confidence"][0]["reason"] == (
-        "Only a current point value was found, so it is repeated across the planning horizon at 70% confidence."
-    )
+    assert attrs["status"] == "Fallback data"
+    assert attrs["summary"] == "PV forecast uses the weakest data source in this plan."
+    assert attrs["limiting_inputs"] == [
+        {
+            "input": "PV forecast",
+            "entity_id": "sensor.pv",
+            "source": "Point Value Repeated",
+            "reason": "Only a current point value was found, so it is repeated across the planning horizon with "
+            "a conservative fallback weight.",
+            "coverage": "12 of 24 planning hours available",
+        }
+    ]
+    assert "overall_confidence" not in attrs
+    assert "calculation" not in attrs
+    assert "source_confidence" not in attrs
     assert attrs["improvement_actions"] == [
         "Replace PV forecast (sensor.pv) with an entity that exposes forecast data for the planning horizon, "
         "or add source confidence metadata."
     ]
-    assert attrs["forecast_coverage"] == [
-        {
-            "config_key": "pv_forecast_entity",
-            "entity_id": "sensor.pv",
-            "classification": "healthy",
-            "first_timestamp": "2026-07-12T00:00:00+00:00",
-            "last_timestamp": "2026-07-12T11:55:00+00:00",
-            "covered_hours": 12.0,
-            "continuous_hours": 12.0,
-            "longest_continuous_hours": 12.0,
-            "leading_missing_slots": 0,
-            "trailing_missing_slots": 144,
-            "internal_missing_slots": 0,
-            "leading_gap_filled_slots": 0,
-            "leading_gap_filled_hours": 0.0,
-        }
-    ]
+    assert attrs["input_issues"] == []
+
+
+def test_data_quality_reports_input_issues_good_data_and_missing_coverage() -> None:
+    issue_plan = _plan(input_issues=["weather_entity_unavailable"])
+    issue_attrs = sensor_module._decision_data_quality_attrs(_coordinator(issue_plan))
+    assert issue_attrs["status"] == "Input issue"
+    assert issue_attrs["summary"] == "1 input issue is limiting this plan."
+
+    issue_plan.input_issues.append("pv_forecast_entity_stale")
+    assert sensor_module._decision_data_quality_attrs(_coordinator(issue_plan))["summary"] == (
+        "2 input issues are limiting this plan."
+    )
+
+    good_plan = _plan()
+    good_plan.confidence = 1.0
+    good_attrs = sensor_module._decision_data_quality_attrs(_coordinator(good_plan))
+    assert good_attrs["status"] == "Good"
+    assert good_attrs["summary"] == "No material input-quality limitation affected this plan."
+    assert sensor_module._coverage_summary({}, 24) is None
 
 
 def test_confidence_helper_edge_cases_are_readable() -> None:
@@ -359,6 +507,7 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
     assert sensor_module._confidence_limiting_factor(1.0, 1.0, None) == "unknown"
     assert sensor_module._confidence_limiting_factor(0.65, 0.65, 0.65) == "input_health_and_forecast_sources"
     assert sensor_module._confidence_limiting_factor(0.65, 0.65, 0.9) == "input_health"
+    assert sensor_module._confidence_limiting_factor(0.7, 1.0, 0.7) == "forecast_sources"
     assert sensor_module._confidence_limiting_factor(0.8, 0.9, 0.7) == "unknown"
     assert sensor_module._confidence_source_reason({"source": "invalid_state"}) == (
         "The entity state could not be converted into usable forecast data."
@@ -397,26 +546,26 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
 def test_operational_summary_sensors_handle_edge_shapes() -> None:
     ready = _coordinator(
         _plan(),
-            options={
+        options={
             "ev_control_enabled": True,
             "climate_control_enabled": True,
-                "enphase_control_enabled": True,
-            },
-            entry_data={
-                "ev_smart_charging_start_entity": "button.ev_start",
-                "daikin_climate_entity": "climate.home",
-                "enphase_profile_entity": "select.enphase_profile",
-            },
+            "enphase_control_enabled": True,
+        },
+        entry_data={
+            "ev_smart_charging_start_entity": "button.ev_start",
+            "daikin_climate_entity": "climate.home",
+            "enphase_profile_entity": "select.enphase_profile",
+        },
         store_data={
             "production": {"dry_run_ready_cycles": 3},
             "execution_audit": ["invalid"],
             "dry_run_comparisons": ["invalid"],
         },
     )
-    production = next(item for item in SENSORS if item.key == "production_readiness")
-    audit = next(item for item in SENSORS if item.key == "execution_audit")
-    comparison = next(item for item in SENSORS if item.key == "dry_run_comparison")
-    support = next(item for item in SENSORS if item.key == "support_bundle_summary")
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+    audit = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "execution_audit")
+    comparison = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "dry_run_comparison")
+    support = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "support_bundle_summary")
 
     assert production.value_fn(ready) == "Evidence Complete"
     assert audit.value_fn(ready) == "Unknown"
@@ -443,7 +592,7 @@ def test_production_readiness_supports_ev_only_installation() -> None:
         entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
         store_data={"production": {"dry_run_ready_cycles": 3}},
     )
-    production = next(item for item in SENSORS if item.key == "production_readiness")
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
 
     assert production.value_fn(coordinator) == "Evidence Complete"
     assert production.attrs_fn(coordinator)["required_control_areas"] == ["ev"]
@@ -460,12 +609,12 @@ def test_production_readiness_blocks_armed_mismatched_contract() -> None:
         store_data={"production": {"armed": True, "dry_run_ready_cycles": 3}},
     )
     coordinator.entry_data["ev_smart_charging_start_entity"] = "button.ev_replaced"
-    production = next(item for item in SENSORS if item.key == "production_readiness")
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
 
     assert production.value_fn(coordinator) == "Armed - Blocked"
     assert production.attrs_fn(coordinator)["dry_run_evidence_fingerprint_matches"] is False
     assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is False
-    block = next(item for item in SENSORS if item.key == "control_block_reason")
+    block = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "control_block_reason")
     assert "production_evidence_contract_changed" in block.attrs_fn(coordinator)["reasons"]
 
 
@@ -475,8 +624,8 @@ def test_production_sensors_fail_closed_for_missing_and_malformed_state() -> Non
         options={"ev_control_enabled": True},
         entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
     )
-    production = next(item for item in SENSORS if item.key == "production_readiness")
-    block = next(item for item in SENSORS if item.key == "control_block_reason")
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+    block = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "control_block_reason")
 
     for value in (
         None,
@@ -506,24 +655,34 @@ def test_production_sensors_fail_closed_for_missing_and_malformed_state() -> Non
 
 def test_sensor_platform_setup_groups_planner_sensors(monkeypatch: object) -> None:
     coordinator = _coordinator(_plan())
-    entry = SimpleNamespace(runtime_data=coordinator)
+    entry = SimpleNamespace(entry_id="test_entry", runtime_data=coordinator)
     added: list[tuple[object, object, object]] = []
+    removed: list[str] = []
+
+    class FakeRegistry:
+        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> str:
+            return f"sensor.{unique_id}"
+
+        def async_remove(self, entity_id: str) -> None:
+            removed.append(entity_id)
 
     def fake_add_planner_entities(entry_arg: object, add_entities: object, entities: object) -> None:
         added.append((entry_arg, add_entities, list(entities)))
 
     monkeypatch.setattr(sensor_module, "async_add_planner_entities", fake_add_planner_entities)
+    monkeypatch.setattr(sensor_module.er, "async_get", lambda hass: FakeRegistry())
 
-    asyncio.run(sensor_module.async_setup_entry(None, entry, "add_entities"))
+    asyncio.run(sensor_module.async_setup_entry(SimpleNamespace(), entry, "add_entities"))
 
     assert added[0][0] is entry
     assert added[0][1] == "add_entities"
     assert len(added[0][2]) == len(SENSORS)
+    assert len(removed) == len(LEGACY_SENSOR_DESCRIPTIONS)
 
 
 def test_planner_sensor_delegates_value_and_attributes() -> None:
     coordinator = _coordinator(_plan())
-    description = next(item for item in SENSORS if item.key == "plan_status")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "plan_status")
     sensor = PlannerSensor(coordinator, description)
 
     assert sensor.native_value == "Current"
@@ -535,7 +694,7 @@ def test_estimated_cost_sensor_uses_home_assistant_currency_and_horizon() -> Non
     plan = _plan()
     plan.estimated_cost_horizon_hours = 6.5
     coordinator = _coordinator(plan, hass=SimpleNamespace(config=SimpleNamespace(currency="NZD")))
-    description = next(item for item in SENSORS if item.key == "estimated_daily_cost")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "estimated_daily_cost")
     sensor = PlannerSensor(coordinator, description)
 
     assert sensor.native_unit_of_measurement == "NZD"
@@ -564,7 +723,7 @@ def test_forecast_confidence_exposes_compact_calibration_uncertainty() -> None:
             }
         },
     )
-    description = next(item for item in SENSORS if item.key == "forecast_confidence")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "forecast_confidence")
 
     attrs = description.attrs_fn(coordinator)
 
@@ -615,7 +774,7 @@ def test_plan_status_attributes_are_json_friendly_and_bounded() -> None:
         input_issues=[f"issue_{index}" for index in range(30)],
     )
     coordinator = _coordinator(plan)
-    description = next(item for item in SENSORS if item.key == "plan_status")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "plan_status")
 
     attrs = description.attrs_fn(coordinator)
 
@@ -644,7 +803,7 @@ def test_next_action_sensor_exposes_plain_english_action() -> None:
     )
     plan = _plan(actions=[action])
     coordinator = _coordinator(plan)
-    description = next(item for item in SENSORS if item.key == "next_action")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "next_action")
 
     attrs = description.attrs_fn(coordinator)
 
@@ -652,12 +811,11 @@ def test_next_action_sensor_exposes_plain_english_action() -> None:
     assert attrs == {
         "action": "Schedule EV charging",
         "decision": "Schedule EV charging to 80%.",
-        "when": "00:00-00:05",
+        "when": "Sat 27 Jun, 00:00-00:05",
         "why": "Charging was placed in the cheapest slots before the ready-by time.",
         "constraints": ["EV Bounds"],
         "desired_state": {"Target SOC percent": 80},
         "estimated_value": -0.25,
-        "confidence": "80.0%",
         "requires_haeo_plan": False,
     }
 
@@ -695,8 +853,8 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
     plan = _plan(actions=[climate_action, ev_action])
     coordinator = _coordinator(plan, store_data={"trip_history": {"records": [{"soc": 10}, {"soc": 20}]}})
 
-    climate = next(item for item in SENSORS if item.key == "climate_plan")
-    ev = next(item for item in SENSORS if item.key == "ev_charging_plan")
+    climate = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_plan")
+    ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
 
     assert climate.value_fn(coordinator) == "Change climate state"
     climate_attrs = climate.attrs_fn(coordinator)
@@ -725,9 +883,9 @@ def test_asset_plan_sensors_filter_issues_to_device() -> None:
         ]
     )
     coordinator = _coordinator(plan)
-    ev = next(item for item in SENSORS if item.key == "ev_charging_plan")
-    climate = next(item for item in SENSORS if item.key == "climate_plan")
-    enphase = next(item for item in SENSORS if item.key == "enphase_plan")
+    ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
+    climate = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_plan")
+    enphase = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_plan")
 
     assert ev.attrs_fn(coordinator)["issues"] == [
         "Amber Import Price Entity Unavailable",
@@ -780,7 +938,7 @@ def test_asset_plan_sensors_expose_device_timeline() -> None:
         }
     )
     coordinator = _coordinator(plan)
-    climate = next(item for item in SENSORS if item.key == "climate_plan")
+    climate = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_plan")
 
     attrs = climate.attrs_fn(coordinator)
 
@@ -834,16 +992,28 @@ def test_asset_state_sensors_expose_current_and_next_labels() -> None:
     coordinator = _coordinator(plan)
 
     assert (
-        next(item for item in SENSORS if item.key == "climate_current_state").value_fn(coordinator) == "Heat (21.5 C)"
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_current_state").value_fn(coordinator)
+        == "Heat (21.5 C)"
     )
-    assert next(item for item in SENSORS if item.key == "climate_next_state").value_fn(coordinator) == "Off"
-    assert next(item for item in SENSORS if item.key == "enphase_current_state").value_fn(coordinator) == "Idle"
     assert (
-        next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator)
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_next_state").value_fn(coordinator)
+        == "Off"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_current_state").value_fn(coordinator)
+        == "Idle"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_next_state").value_fn(coordinator)
         == "Charge Battery (2.5 kW)"
     )
-    assert next(item for item in SENSORS if item.key == "ev_current_state").value_fn(coordinator) == "Charging to 80%"
-    assert next(item for item in SENSORS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_current_state").value_fn(coordinator)
+        == "Charging to 80%"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
+    )
 
 
 def test_asset_state_sensors_fall_back_to_timeline_labels() -> None:
@@ -871,13 +1041,21 @@ def test_asset_state_sensors_fall_back_to_timeline_labels() -> None:
     )
     coordinator = _coordinator(plan)
 
-    assert next(item for item in SENSORS if item.key == "climate_current_state").value_fn(coordinator) == "Unknown"
-    assert next(item for item in SENSORS if item.key == "enphase_current_state").value_fn(coordinator) == "Unknown"
     assert (
-        next(item for item in SENSORS if item.key == "enphase_next_state").value_fn(coordinator)
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_current_state").value_fn(coordinator)
+        == "Unknown"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_current_state").value_fn(coordinator)
+        == "Unknown"
+    )
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "enphase_next_state").value_fn(coordinator)
         == "Consume Battery (1.25 kW)"
     )
-    assert next(item for item in SENSORS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
+    assert (
+        next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_next_state").value_fn(coordinator) == "Idle"
+    )
 
 
 def test_asset_state_attributes_prefer_explicit_current_and_next_state() -> None:
@@ -891,8 +1069,8 @@ def test_asset_state_attributes_prefer_explicit_current_and_next_state() -> None
         }
     )
     coordinator = _coordinator(plan)
-    current = next(item for item in SENSORS if item.key == "climate_current_state")
-    next_state = next(item for item in SENSORS if item.key == "climate_next_state")
+    current = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_current_state")
+    next_state = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_next_state")
 
     assert current.attrs_fn(coordinator)["details"] == {"State": "Cool", "Climate mode": "Cool"}
     assert next_state.attrs_fn(coordinator)["details"]["Target temperature C"] == 23
@@ -920,8 +1098,8 @@ def test_ev_charge_state_sensors_expose_live_and_planned_charge_state() -> None:
         entry_data={"ev_charging_entity": "binary_sensor.ev_charging"},
         hass=_hass_with_states({"binary_sensor.ev_charging": "off"}),
     )
-    current_charge = next(item for item in SENSORS if item.key == "ev_current_charge_state")
-    next_charge = next(item for item in SENSORS if item.key == "ev_next_charge_state")
+    current_charge = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_current_charge_state")
+    next_charge = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_next_charge_state")
 
     assert current_charge.value_fn(coordinator) == "Not Charging"
     assert current_charge.attrs_fn(coordinator)["live_state"] == "off"
@@ -939,8 +1117,8 @@ def test_ev_charge_state_sensors_handle_live_and_plan_fallbacks() -> None:
             }
         }
     )
-    current = next(item for item in SENSORS if item.key == "ev_current_charge_state")
-    next_charge = next(item for item in SENSORS if item.key == "ev_next_charge_state")
+    current = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_current_charge_state")
+    next_charge = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_next_charge_state")
 
     assert current.value_fn(_coordinator(None, entry_data={"ev_charging_entity": "binary_sensor.missing"})) == "Unknown"
     assert (
@@ -975,7 +1153,7 @@ def test_ev_plan_attributes_include_trip_history_summary() -> None:
         _plan(),
         store_data={"trip_history": {"summary": {"observed_days": 3, "daily_soc": [10, 20]}}},
     )
-    ev = next(item for item in SENSORS if item.key == "ev_charging_plan")
+    ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
 
     assert ev.attrs_fn(coordinator)["trip_history_summary"] == {"observed_days": 3, "daily_soc": [10, 20]}
 
@@ -985,7 +1163,7 @@ def test_presence_sensor_exposes_inferred_occupancy_context() -> None:
         _plan(preview=[{"start": "2026-06-27T00:00:00+00:00", "occupied": "away"}]),
         entry_data={"person_entities": ["person.james", "person.cath"]},
     )
-    presence = next(item for item in SENSORS if item.key == "presence_state")
+    presence = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "presence_state")
 
     attrs = presence.attrs_fn(coordinator)
 
@@ -1000,7 +1178,7 @@ def test_presence_sensor_handles_list_and_unknown_preview() -> None:
         _plan(preview=[{"occupied": ""}, "invalid"]),
         entry_data={"person_entities": ["person.james"]},
     )
-    presence = next(item for item in SENSORS if item.key == "presence_state")
+    presence = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "presence_state")
 
     assert presence.value_fn(coordinator) == "Unknown"
     assert presence.attrs_fn(coordinator)["person_entities"] == ["person.james"]
@@ -1009,7 +1187,7 @@ def test_presence_sensor_handles_list_and_unknown_preview() -> None:
 def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
     coordinator = _coordinator(
         _plan(),
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.extended_openai_ai_task", "pv_forecast_entity": "sensor.pv"},
         store_data={
             "ai_recommendations": [
                 {
@@ -1021,25 +1199,38 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
                     "ai_task_entity": "ai_task.extended_openai_ai_task",
                     "rejected_reason": None,
                     "accepted": {
-                        "alerts": ["PV forecast confidence is low"],
-                        "reasoning_summary": "Use extra forecast buffer.",
-                        "confidence": 0.74,
-                        "suggested_forecast_buffer_percent": 12,
+                        "outcome": "action_required",
+                        "summary": "The PV input needs attention.",
+                        "affected_item": "pv_forecast_entity",
+                        "problem": "Only a current point is available.",
+                        "next_step": "Map a timestamped PV forecast.",
+                        "expected_benefit": "Solar-aware planning can use the full horizon.",
+                        "verification": "Check forecast coverage in Next actions.",
                     },
                 }
             ]
         },
     )
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     attrs = description.attrs_fn(coordinator)
 
-    assert description.value_fn(coordinator) == "Accepted"
-    assert attrs["enabled"] is True
+    assert description.value_fn(coordinator) == "Action Required"
+    assert attrs["available"] is True
     assert attrs["ai_task_entity"] == "ai_task.extended_openai_ai_task"
-    assert attrs["alerts"] == ["PV forecast confidence is low"]
-    assert attrs["reasoning_summary"] == "Use extra forecast buffer."
-    assert attrs["suggested_forecast_buffer_percent"] == 12
+    assert attrs["outcome"] == "action_required"
+    assert attrs["summary"] == "The PV input needs attention."
+    assert attrs["recommended_action"] == {
+        "affected_item": {
+            "key": "pv_forecast_entity",
+            "name": "PV forecast input",
+            "configured_value": "sensor.pv",
+        },
+        "problem": "Only a current point is available.",
+        "next_step": "Map a timestamped PV forecast.",
+        "expected_benefit": "Solar-aware planning can use the full horizon.",
+        "verification": "Check forecast coverage in Next actions.",
+    }
 
 
 def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> None:
@@ -1047,7 +1238,7 @@ def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> 
     current = replace(previous, plan_id="plan-2")
     coordinator = _coordinator(
         current,
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={
             "ai_recommendations": [
                 {
@@ -1055,20 +1246,20 @@ def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> 
                     "plan_id": previous.plan_id,
                     "plan_fingerprint": _material_plan_fingerprint(previous),
                     "status": "accepted",
-                    "accepted": {"reasoning_summary": "Still applicable."},
+                    "accepted": {"outcome": "no_action_needed", "summary": "Still applicable."},
                 }
             ]
         },
     )
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     attrs = description.attrs_fn(coordinator)
 
-    assert description.value_fn(coordinator) == "Accepted"
+    assert description.value_fn(coordinator) == "No Action Needed"
     assert attrs["plan_id"] == "plan-1"
     assert "current_plan_id" not in attrs
     assert attrs["reused_for_current_plan"] is True
-    assert attrs["reasoning_summary"] == "Still applicable."
+    assert attrs["summary"] == "Still applicable."
 
 
 def test_ai_advice_sensor_reuses_latest_legacy_nested_fingerprint() -> None:
@@ -1076,49 +1267,47 @@ def test_ai_advice_sensor_reuses_latest_legacy_nested_fingerprint() -> None:
     current = replace(previous, plan_id="plan-2")
     coordinator = _coordinator(
         current,
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={
             "ai_recommendations": [
                 {
                     "plan_id": previous.plan_id,
                     "status": "accepted",
                     "rejected_detail": {"plan_fingerprint": _material_plan_fingerprint(previous)},
-                    "accepted": {"reasoning_summary": "Legacy advice remains applicable."},
+                    "accepted": {"outcome": "no_action_needed", "summary": "Legacy result remains applicable."},
                 }
             ]
         },
     )
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
-    assert description.value_fn(coordinator) == "Accepted"
-    assert description.attrs_fn(coordinator)["reasoning_summary"] == "Legacy advice remains applicable."
+    assert description.value_fn(coordinator) == "No Action Needed"
+    assert description.attrs_fn(coordinator)["summary"] == "Legacy result remains applicable."
 
 
-def test_ai_advice_sensor_hides_cached_and_pending_advice_when_disabled() -> None:
+def test_ai_advice_sensor_hides_cached_and_pending_results_without_provider() -> None:
     previous = _plan()
     current = replace(previous, plan_id="plan-2")
     fingerprint = _material_plan_fingerprint(current)
     coordinator = _coordinator(
         current,
-        options={"ai_enabled": False},
         store_data={
             "ai_recommendations": [
                 {
                     "plan_id": previous.plan_id,
                     "plan_fingerprint": fingerprint,
                     "status": "accepted",
-                    "accepted": {"reasoning_summary": "Should be hidden."},
+                    "accepted": {"outcome": "no_action_needed", "summary": "Should be hidden."},
                 }
             ]
         },
     )
     coordinator._ai_advice_pending_fingerprint = fingerprint
     coordinator._ai_advice_pending_reason = "ai_rate_limited"
-    coordinator._ai_advice_retry_at = datetime(2026, 6, 27, 0, 5, tzinfo=UTC)
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
-    assert description.value_fn(coordinator) == "Disabled"
-    assert description.attrs_fn(coordinator) == {"enabled": False, "latest": None}
+    assert description.value_fn(coordinator) == "Not configured"
+    assert description.attrs_fn(coordinator) == {"available": False, "result": None}
 
 
 def test_ai_advice_sensor_does_not_reuse_older_matching_response() -> None:
@@ -1128,47 +1317,44 @@ def test_ai_advice_sensor_does_not_reuse_older_matching_response() -> None:
     current_fingerprint = _material_plan_fingerprint(current)
     coordinator = _coordinator(
         current,
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={
             "ai_recommendations": [
                 {
                     "plan_id": older.plan_id,
                     "plan_fingerprint": _material_plan_fingerprint(older),
                     "status": "accepted",
-                    "accepted": {"reasoning_summary": "Old A advice."},
+                    "accepted": {"outcome": "no_action_needed", "summary": "Old A result."},
                 },
                 {
                     "plan_id": latest.plan_id,
                     "plan_fingerprint": _material_plan_fingerprint(latest),
                     "status": "accepted",
-                    "accepted": {"reasoning_summary": "Latest B advice."},
+                    "accepted": {"outcome": "no_action_needed", "summary": "Latest B result."},
                 },
             ]
         },
     )
     coordinator._ai_advice_pending_fingerprint = current_fingerprint
     coordinator._ai_advice_pending_reason = "request_in_flight"
-    coordinator._ai_advice_retry_at = None
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     assert description.value_fn(coordinator) == "Pending"
-    assert description.attrs_fn(coordinator)["latest"] is None
+    assert description.attrs_fn(coordinator)["result"] is None
 
 
 def test_ai_advice_sensor_reports_pending_for_current_plan() -> None:
     plan = _plan()
-    coordinator = _coordinator(plan, options={"ai_enabled": True})
+    coordinator = _coordinator(plan, entry_data={"ai_task_entity": "ai_task.provider"})
     coordinator._ai_advice_pending_fingerprint = _material_plan_fingerprint(plan)
     coordinator._ai_advice_pending_reason = "ai_rate_limited"
-    coordinator._ai_advice_retry_at = datetime(2026, 6, 27, 0, 5, tzinfo=UTC)
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     assert description.value_fn(coordinator) == "Pending"
     assert description.attrs_fn(coordinator) == {
-        "enabled": True,
-        "latest": None,
+        "available": True,
+        "result": None,
         "pending_reason": "ai_rate_limited",
-        "retry_at": "2026-06-27T00:05:00+00:00",
     }
 
     coordinator._ai_advice_pending_fingerprint = "stale"
@@ -1176,14 +1362,14 @@ def test_ai_advice_sensor_reports_pending_for_current_plan() -> None:
 
 
 def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads() -> None:
-    no_response = _coordinator(_plan(), options={"ai_enabled": True})
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    no_response = _coordinator(_plan(), entry_data={"ai_task_entity": "ai_task.provider"})
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     assert description.value_fn(no_response) == "No response"
 
     coordinator = _coordinator(
         _plan(),
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={
             "ai_recommendations": [
                 {
@@ -1199,22 +1385,24 @@ def test_ai_advice_sensor_handles_enabled_without_response_and_non_dict_payloads
     )
     attrs = description.attrs_fn(coordinator)
 
-    assert description.value_fn(coordinator) == "Unknown"
-    assert attrs["alerts"] == []
+    assert description.value_fn(coordinator) == "No actionable result"
+    assert attrs["outcome"] is None
     assert attrs["rejected_detail"] == {}
 
     malformed = _coordinator(
-        _plan(), options={"ai_enabled": True}, store_data={"ai_recommendations": ["bad"]}
+        _plan(),
+        entry_data={"ai_task_entity": "ai_task.provider"},
+        store_data={"ai_recommendations": ["bad"]},
     )
     assert description.value_fn(malformed) == "No response"
     malformed.store.data["ai_recommendations"] = "bad"
-    assert description.attrs_fn(malformed)["latest"] is None
+    assert description.attrs_fn(malformed)["result"] is None
 
 
 def test_ai_advice_sensor_exposes_rejection_detail() -> None:
     coordinator = _coordinator(
         _plan(),
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.extended_openai_ai_task"},
         store_data={
             "ai_recommendations": [
                 {
@@ -1235,11 +1423,11 @@ def test_ai_advice_sensor_exposes_rejection_detail() -> None:
             ]
         },
     )
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     attrs = description.attrs_fn(coordinator)
 
-    assert description.value_fn(coordinator) == "Rejected"
+    assert description.value_fn(coordinator) == "No actionable result"
     assert attrs["service_called"] == "ai_task.generate_data"
     assert attrs["ai_task_entity"] == "ai_task.extended_openai_ai_task"
     assert attrs["rejected_reason"] == "ai_response_forbidden_fields"
@@ -1250,7 +1438,7 @@ def test_ai_advice_sensor_exposes_rejection_detail() -> None:
 def test_ai_advice_sensor_hides_legacy_history_without_plan_fingerprint() -> None:
     coordinator = _coordinator(
         _plan(),
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={
             "ai_recommendations": [
                 {
@@ -1262,12 +1450,12 @@ def test_ai_advice_sensor_hides_legacy_history_without_plan_fingerprint() -> Non
             ]
         },
     )
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     attrs = description.attrs_fn(coordinator)
 
     assert description.value_fn(coordinator) == "No response"
-    assert attrs == {"enabled": True, "latest": None}
+    assert attrs == {"available": True, "result": None}
 
 
 def test_ai_advice_sensor_hides_stale_or_unsafe_plan_advice() -> None:
@@ -1276,13 +1464,13 @@ def test_ai_advice_sensor_hides_stale_or_unsafe_plan_advice() -> None:
         "plan_id": plan.plan_id,
         "plan_fingerprint": _material_plan_fingerprint(plan),
         "status": "accepted",
-        "accepted": {"reasoning_summary": "stale"},
+        "accepted": {"outcome": "no_action_needed", "summary": "stale"},
     }
-    description = next(item for item in SENSORS if item.key == "ai_advice")
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
     changed = _plan(preview=[{"import_price": 0.4}])
     changed_coordinator = _coordinator(
         changed,
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={"ai_recommendations": [recommendation]},
     )
     unsafe = _plan()
@@ -1290,12 +1478,12 @@ def test_ai_advice_sensor_hides_stale_or_unsafe_plan_advice() -> None:
     unsafe.status = "unsafe"
     unsafe_coordinator = _coordinator(
         unsafe,
-        options={"ai_enabled": True},
+        entry_data={"ai_task_entity": "ai_task.provider"},
         store_data={"ai_recommendations": [recommendation]},
     )
 
     assert description.value_fn(changed_coordinator) == "No response"
-    assert description.attrs_fn(unsafe_coordinator)["latest"] is None
+    assert description.attrs_fn(unsafe_coordinator)["result"] is None
 
 
 def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
@@ -1399,7 +1587,7 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
             "Heating or cooling now because electricity is cheap and the home can coast through a later "
             "expensive period."
         ],
-        "Start": "00:00",
+        "Start": "Sat 27 Jun, 00:00",
         "Bad Time": "not-a-time",
     }
     assert sensor_module._reason_summary("away_hvac_policy") == "Nobody is home, so climate control can be reduced."
@@ -1417,6 +1605,40 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         "a": {"b": {"c": {"d": "<truncated>"}}}
     }
     assert sensor_module._bounded_json(list(range(13)))[-1] == {"truncated_count": 1}
+
+
+def test_planned_action_windows_show_explicit_home_assistant_local_date(monkeypatch: object) -> None:
+    monkeypatch.setattr(
+        sensor_module.dt_util,
+        "as_local",
+        lambda value: value.astimezone(ZoneInfo("Australia/Melbourne")),
+    )
+    start = datetime(2026, 8, 8, 5, 30, tzinfo=UTC)
+    action = PlanAction(
+        action_id="climate-precondition",
+        plan_id="plan-1",
+        execute_not_before=start,
+        execute_not_after=start + timedelta(minutes=30),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={"phase": "preconditioning", "hvac_mode": "heat", "target_temperature": 24},
+        hard_constraints=[],
+        reason_codes=["hvac_thermal_shift_before_expensive_period"],
+        expected_cost_delta=0.2,
+        confidence=0.7,
+        requires_haeo_plan_id=None,
+    )
+
+    assert sensor_module._action_window(action) == "Sat 8 Aug, 15:30-16:00"
+    assert sensor_module._time_label(start.isoformat()) == "15:30"
+    assert sensor_module._plain_state_details({"execute_not_before": start})["Start"] == "Sat 8 Aug, 15:30"
+    action.execute_not_before = datetime(2026, 8, 8, 13, 50, tzinfo=UTC)
+    action.execute_not_after = datetime(2026, 8, 8, 14, 10, tzinfo=UTC)
+    assert sensor_module._action_window(action) == "Sat 8 Aug, 23:50-Sun 9 Aug, 00:10"
+    action.execute_not_before = None
+    assert sensor_module._action_window(action) == "Next planning window"
+    assert sensor_module._date_time_label("not-a-time") == "not-a-time"
+    assert sensor_module._local_datetime(datetime(2026, 8, 8, 15, 30)) == datetime(2026, 8, 8, 15, 30)
 
 
 def test_sensor_configured_state_and_presence_helpers_cover_fallbacks() -> None:

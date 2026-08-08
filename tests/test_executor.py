@@ -382,7 +382,7 @@ def test_executor_keep_on_rejects_invalid_persistent_controls() -> None:
         assert store.data["outcomes"][0].reason == expected_reason
 
 
-def test_restore_safe_state_notification_remains_enabled_when_plan_alerts_are_disabled() -> None:
+def test_successful_restore_safe_state_dismisses_old_alert_without_notifying() -> None:
     store = FakeStore()
     hass = FakeHass()
     executor = Executor(
@@ -398,12 +398,29 @@ def test_restore_safe_state_notification_remains_enabled_when_plan_alerts_are_di
     assert hass.services.calls == [
         (
             "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_restore_safe_state"},
+        )
+    ]
+
+
+def test_failed_restore_notification_is_actionable_and_deduplicated() -> None:
+    hass = FakeHass()
+    executor = Executor(FakeStore(), hass=hass)
+    outcome = SimpleNamespace(result=OutcomeResult.FAILED, reason="hvac_restore_failed")
+
+    asyncio.run(executor._async_notify_restore(outcome))
+    asyncio.run(executor._async_notify_restore(outcome))
+
+    assert hass.services.calls == [
+        (
+            "persistent_notification",
             "create",
             {
-                "title": "Energy Planner restored safe state",
+                "title": "Energy Planner safe-state restore failed",
                 "message": (
-                    "Planner-owned EV, Enphase, and Daikin controls were restored where supported. "
-                    "Reason: test_restore_reason:enphase_ai_profile_not_configured."
+                    "Some planner-owned controls could not be restored. Check the mapped devices and retry. "
+                    "Reason: hvac_restore_failed."
                 ),
                 "notification_id": "ha_energy_planner_restore_safe_state",
             },
@@ -487,11 +504,20 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
                     "The EV cannot reach the requested ready-by target with the current schedule. "
                     "Planned target: 65%. Ready by: 07:00."
                 ),
-                "notification_id": "ha_energy_planner_ev_infeasible_plan-1",
+                "notification_id": "ha_energy_planner_ev_infeasible",
             },
         )
     ]
     assert store.data["outcomes"][0].result == "rejected"
+    asyncio.run(executor._async_notify_ev_infeasible(action))
+    assert len(hass.services.calls) == 1
+    plan.actions = []
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    assert hass.services.calls[-1] == (
+        "persistent_notification",
+        "dismiss",
+        {"notification_id": "ha_energy_planner_ev_infeasible"},
+    )
 
 
 def test_notification_ids_and_titles_are_isolated_per_config_entry() -> None:
@@ -523,7 +549,7 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["input_health_unsafe", "grid_import_limit_exceeded"],
+        input_issues=["daikin_climate_unavailable", "grid_import_limit_exceeded"],
     )
     store = FakeStore()
     hass = FakeHass()
@@ -541,11 +567,10 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
             "persistent_notification",
             "create",
             {
-                "title": "Energy Planner plan unsafe",
+                "title": "Energy Planner configuration needs attention",
                 "message": (
-                    "Required inputs are stale, missing, or invalid. Device control remains blocked. "
-                    "Plan status: unsafe. Mode: ACTIVE_DEGRADED. "
-                    "Reason codes: input_health_unsafe, grid_import_limit_exceeded."
+                    "Automatic control is blocked because required configuration or mapped entities "
+                    "need attention. Reason codes: daikin_climate_unavailable."
                 ),
                 "notification_id": "ha_energy_planner_plan_unsafe",
             },
@@ -557,7 +582,6 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
                 "title": "Energy Planner grid limit fallback",
                 "message": (
                     "The current plan would exceed a configured grid import/export hard limit. "
-                    "Plan status: unsafe. Mode: ACTIVE_DEGRADED. "
                     "Reason codes: grid_import_limit_exceeded."
                 ),
                 "notification_id": "ha_energy_planner_grid_limit_fallback",
@@ -567,6 +591,11 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
     ]
 
@@ -609,6 +638,11 @@ def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
     ]
 
@@ -661,10 +695,15 @@ def test_plan_fallback_notifications_can_be_disabled() -> None:
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
+        ),
     ]
 
 
-def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() -> None:
+def test_plan_fallback_notification_suppresses_safe_haeo_fallback() -> None:
     now = datetime.now(UTC)
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -700,19 +739,39 @@ def test_plan_fallback_notification_reports_haeo_issue_without_plan_violation() 
         ),
         (
             "persistent_notification",
-            "create",
-            {
-                "title": "Energy Planner HAEO fallback",
-                "message": (
-                    "HAEO did not return a healthy optimization result. "
-                    "The deterministic fallback remains constrained. "
-                    "Plan status: current. Mode: ACTIVE_HEALTHY. "
-                    "Reason codes: haeo_service_unavailable."
-                ),
-                "notification_id": "ha_energy_planner_haeo_fallback",
-            },
+            "dismiss",
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
     ]
+
+
+def test_plan_fallback_notification_ignores_self_recovering_stale_input() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="test",
+        confidence=0.0,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["amber_import_price_stale"],
+    )
+    hass = FakeHass()
+
+    asyncio.run(Executor(FakeStore(), hass=hass).async_notify_plan_fallback(plan, ["input_health_unsafe"]))
+
+    assert all(call[1] == "dismiss" for call in hass.services.calls)
 
 
 def test_plan_fallback_notification_ignores_haeo_capability_gaps() -> None:
@@ -756,10 +815,15 @@ def test_plan_fallback_notification_ignores_haeo_capability_gaps() -> None:
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
+        ),
     ]
 
 
-def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -> None:
+def test_actionable_notification_is_not_recreated_until_condition_changes() -> None:
     class RecoveringServices(FakeServices):
         def __init__(self, states: FakeStates) -> None:
             super().__init__(states)
@@ -787,15 +851,15 @@ def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -
         created_at=now,
         horizon_hours=24,
         interval_minutes=5,
-        status="current",
-        health=InputHealth.HEALTHY,
-        mode=PlannerMode.ACTIVE_HEALTHY,
+        status="unsafe",
+        health=InputHealth.UNSAFE,
+        mode=PlannerMode.ACTIVE_DEGRADED,
         summary="test",
         confidence=1.0,
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["haeo_service_unavailable"],
+        input_issues=["daikin_climate_unavailable"],
     )
     hass = FakeHass()
     hass.services = RecoveringServices(hass.states)
@@ -803,31 +867,32 @@ def test_plan_fallback_notification_is_not_recreated_until_condition_changes() -
 
     # An unavailable service and a transient call failure must not mark the
     # notification as delivered; the next refresh should retry it.
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    violations = ["input_health_unsafe"]
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
     hass.services.available = True
     hass.services.fail_next_call = True
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
 
     create_calls = [
         call
         for call in hass.services.calls
         if call[0:2] == ("persistent_notification", "create")
-        and call[2]["notification_id"] == "ha_energy_planner_haeo_fallback"
+        and call[2]["notification_id"] == "ha_energy_planner_plan_unsafe"
     ]
     assert len(create_calls) == 1
 
     plan.input_issues = []
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-    plan.input_issues = ["haeo_service_unavailable"]
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
+    plan.input_issues = ["daikin_climate_unavailable"]
+    asyncio.run(executor.async_notify_plan_fallback(plan, violations))
 
     create_calls = [
         call
         for call in hass.services.calls
         if call[0:2] == ("persistent_notification", "create")
-        and call[2]["notification_id"] == "ha_energy_planner_haeo_fallback"
+        and call[2]["notification_id"] == "ha_energy_planner_plan_unsafe"
     ]
     assert len(create_calls) == 2
 
@@ -855,11 +920,18 @@ def test_plan_fallback_notification_ignores_successful_haeo_call_reason() -> Non
 
     asyncio.run(executor.async_notify_plan_fallback(plan, []))
 
-    assert hass.services.calls[-1] == (
-        "persistent_notification",
-        "dismiss",
-        {"notification_id": "ha_energy_planner_haeo_fallback"},
-    )
+    assert hass.services.calls[-2:] == [
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
+        ),
+    ]
 
 
 def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> None:
@@ -900,6 +972,11 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
     ]
 

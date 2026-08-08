@@ -13,6 +13,12 @@ from unittest.mock import AsyncMock, Mock
 import voluptuous as vol
 
 from custom_components.ha_energy_planner.config_flow import (
+    INPUT_STEP_AI,
+    INPUT_STEP_CLIMATE,
+    INPUT_STEP_ENERGY,
+    INPUT_STEP_ENPHASE,
+    INPUT_STEP_EV,
+    INPUT_STEP_PRESENCE,
     PLANNER_SUBENTRY_SCHEMAS,
     POLICY_STEP_AI_SAFETY,
     POLICY_STEP_CLIMATE,
@@ -23,14 +29,8 @@ from custom_components.ha_energy_planner.config_flow import (
     POLICY_STEP_SCHEDULE,
     STEP_USER_DATA_SCHEMA,
     SUBENTRY_EV,
-    AISubentryFlow,
-    ClimateSubentryFlow,
     ConfigFlow,
-    EnergySubentryFlow,
-    EnphaseSubentryFlow,
-    EVSubentryFlow,
     OptionsFlow,
-    _enphase_profile_options,
     _entity_values,
     _form_suggested_values,
     _normalize_ai_config,
@@ -102,7 +102,7 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.entry_data import combined_entry_data
 from custom_components.ha_energy_planner.subentry_migration import (
-    async_consolidate_subentries,
+    async_migrate_subentries_to_entry_data,
     grouped_subentry_data,
 )
 
@@ -156,6 +156,7 @@ class FakeConfigEntries:
         self.added: list[Any] = []
         self.removed: list[str] = []
         self.updated: list[tuple[Any, dict[str, Any]]] = []
+        self.entry_updates: list[tuple[Any, dict[str, Any]]] = []
 
     def async_add_subentry(self, entry: Any, subentry: Any) -> bool:
         self.added.append(subentry)
@@ -168,6 +169,9 @@ class FakeConfigEntries:
     def async_update_subentry(self, entry: Any, subentry: Any, **changes: Any) -> bool:
         self.updated.append((subentry, changes))
         return True
+
+    def async_update_entry(self, entry: Any, **changes: Any) -> None:
+        self.entry_updates.append((entry, changes))
 
 
 def _valid_input(overrides: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -220,6 +224,33 @@ def _valid_hass() -> FakeHass:
             },
         },
     )
+
+
+def _settings_submission(
+    flow: OptionsFlow,
+    *,
+    input_sections: dict[str, dict[str, Any]] | None = None,
+    policy_overrides: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return a complete central-settings submission using schema defaults."""
+    policy_steps = {
+        POLICY_STEP_SCHEDULE,
+        POLICY_STEP_EV_BATTERY_GRID,
+        POLICY_STEP_CLIMATE,
+        POLICY_STEP_ENPHASE,
+        POLICY_STEP_AI_SAFETY,
+        POLICY_STEP_DATA_HEALTH,
+        POLICY_STEP_PRIORITIES,
+    }
+    submission: dict[str, dict[str, Any]] = {}
+    for marker, validator in flow._settings_schema().schema.items():
+        key = str(getattr(marker, "schema", marker))
+        if key in policy_steps:
+            submission[key] = validator({})
+    submission.update(input_sections or {})
+    for step_id, values in (policy_overrides or {}).items():
+        submission[step_id].update(values)
+    return submission
 
 
 def test_validate_config_accepts_available_entities_and_services() -> None:
@@ -573,104 +604,6 @@ def test_enphase_profile_defaults_match_planner_roles() -> None:
     assert defaults[CONF_ENPHASE_FULL_BACKUP_PROFILE] == "Full Backup"
 
 
-def test_enphase_flow_uses_profile_entity_options_for_profile_roles() -> None:
-    entry = SimpleNamespace(subentries={})
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-    flow.async_create_entry = Mock(return_value={"type": "create_entry"})
-
-    profile_step = asyncio.run(flow.async_step_user({CONF_ENPHASE_PROFILE: "select.enphase_profile"}))
-
-    assert profile_step["type"] == "form"
-    assert profile_step["step_id"] == "profiles"
-    profile_fields = {
-        getattr(key, "schema", key): selector for key, selector in profile_step["data_schema"].schema.items()
-    }
-    restore_selector = profile_fields[CONF_ENPHASE_AI_PROFILE].serialize()["selector"]["select"]
-    assert restore_selector["options"][:3] == ["Self-Consumption", "AI Optimisation", "Full Backup"]
-
-    result = asyncio.run(
-        flow.async_step_profiles(
-            {
-                CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
-                CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
-                CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
-            }
-        )
-    )
-
-    assert result == {"type": "create_entry"}
-    flow.async_create_entry.assert_called_once_with(
-        title="Enphase",
-        data={
-            CONF_ENPHASE_PROFILE: "select.enphase_profile",
-            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
-            CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
-            CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
-        },
-    )
-
-
-def test_enphase_reconfigure_opens_profile_role_selection_when_entity_exists() -> None:
-    existing = SimpleNamespace(
-        subentry_type="enphase",
-        data={
-            CONF_ENPHASE_PROFILE: "select.enphase_profile",
-            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
-            CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
-            CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
-        },
-    )
-    entry = SimpleNamespace(subentries={"enphase": existing})
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(return_value=existing)
-
-    result = asyncio.run(flow.async_step_reconfigure())
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "profiles"
-    profile_fields = {getattr(key, "schema", key): selector for key, selector in result["data_schema"].schema.items()}
-    assert set(profile_fields) == {
-        CONF_ENPHASE_AI_PROFILE,
-        CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
-        CONF_ENPHASE_FULL_BACKUP_PROFILE,
-    }
-    restore_selector = profile_fields[CONF_ENPHASE_AI_PROFILE].serialize()["selector"]["select"]
-    assert restore_selector["options"][:3] == ["Self-Consumption", "AI Optimisation", "Full Backup"]
-
-
-def test_enphase_reconfigure_without_existing_profile_opens_entity_form() -> None:
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
-    result = asyncio.run(flow.async_step_reconfigure())
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "user"
-
-
-def test_enphase_profile_entity_form_prefills_current_selection() -> None:
-    existing = SimpleNamespace(
-        subentry_type="enphase",
-        data={CONF_ENPHASE_PROFILE: "select.enphase_profile"},
-    )
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={"enphase": existing}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
-    result = asyncio.run(flow._async_step_profile_entity(None))
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "user"
-
-
 def test_ev_charger_controls_accept_switches_buttons_and_input_buttons() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
     schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
@@ -770,19 +703,25 @@ def test_config_flow_fields_have_readable_translation_labels() -> None:
         assert "_" not in labels[key]
 
 
-def test_subentry_fields_have_readable_translation_labels() -> None:
+def test_central_input_sections_have_readable_translation_labels() -> None:
     strings = _strings()
+    step_by_type = {
+        "energy": INPUT_STEP_ENERGY,
+        "climate": INPUT_STEP_CLIMATE,
+        "presence": INPUT_STEP_PRESENCE,
+        "enphase": INPUT_STEP_ENPHASE,
+        "ai": INPUT_STEP_AI,
+        "ev": INPUT_STEP_EV,
+    }
 
-    for subentry_type, schema in PLANNER_SUBENTRY_SCHEMAS.items():
-        subentry_strings = strings["config_subentries"][subentry_type]
-        labels = subentry_strings["step"]["user"]["data"]
-        descriptions = subentry_strings["step"]["user"]["data_description"]
+    for input_type, schema in PLANNER_SUBENTRY_SCHEMAS.items():
+        section = strings["options"]["step"]["init"]["sections"][step_by_type[input_type]]
+        labels = section["data"]
+        descriptions = section["data_description"]
         schema_keys = {str(getattr(key, "schema", key)) for key in schema.schema}
 
-        assert subentry_strings["flow_title"]
-        assert subentry_strings["entry_type"]
-        assert subentry_strings["initiate_flow"]["user"]
-        assert subentry_strings["initiate_flow"]["reconfigure"]
+        assert section["name"]
+        assert section["description"]
         assert schema_keys <= labels.keys()
         assert schema_keys <= descriptions.keys()
         for key in schema_keys:
@@ -790,19 +729,21 @@ def test_subentry_fields_have_readable_translation_labels() -> None:
             assert "_" not in labels[key]
 
 
-def test_english_locale_files_include_subentry_button_labels() -> None:
+def test_english_locale_files_include_central_input_section_labels() -> None:
     integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
-    expected_subentry_types = set(PLANNER_SUBENTRY_SCHEMAS)
+    expected_steps = {
+        INPUT_STEP_ENERGY,
+        INPUT_STEP_CLIMATE,
+        INPUT_STEP_PRESENCE,
+        INPUT_STEP_ENPHASE,
+        INPUT_STEP_AI,
+        INPUT_STEP_EV,
+    }
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        subentries = translations["config_subentries"]
-
-        assert expected_subentry_types <= subentries.keys()
-        for subentry_type in expected_subentry_types:
-            initiate_flow = subentries[subentry_type]["initiate_flow"]
-            assert initiate_flow["user"], f"{translations_path.name} missing {subentry_type} user label"
-            assert initiate_flow["reconfigure"], f"{translations_path.name} missing {subentry_type} reconfigure label"
+        assert "config_subentries" not in translations
+        assert expected_steps <= translations["options"]["step"]["init"]["sections"].keys()
 
 
 def test_english_locale_files_translate_reconfigure_success() -> None:
@@ -812,7 +753,6 @@ def test_english_locale_files_translate_reconfigure_success() -> None:
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
 
         assert translations["config"]["abort"]["reconfigure_successful"] == "Reconfigure Successful"
-        assert translations["config_subentries"]["ai"]["abort"]["reconfigure_successful"] == "Reconfigure Successful"
 
 
 def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
@@ -820,7 +760,9 @@ def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["config_subentries"]["energy"]["step"]["user"]["data_description"][CONF_PV_FORECAST]
+        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_ENERGY][
+            "data_description"
+        ][CONF_PV_FORECAST]
 
         assert "Forecast Today" in description
         assert "Peak Forecast Today" in description
@@ -832,7 +774,9 @@ def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["config_subentries"]["climate"]["step"]["user"]["data_description"][CONF_WEATHER]
+        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE][
+            "data_description"
+        ][CONF_WEATHER]
 
         assert "Bureau of Meteorology" in description
         assert "Hourly" in description
@@ -844,7 +788,9 @@ def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        label = translations["options"]["step"]["ev_battery_grid"]["data"][CONF_EV_CHARGE_RATE_KW]
+        label = translations["options"]["step"]["init"]["sections"]["ev_battery_grid"]["data"][
+            CONF_EV_CHARGE_RATE_KW
+        ]
 
         assert label == "EV charge rate (kW)"
 
@@ -853,9 +799,9 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
     strings = _strings()
     labels: dict[str, str] = {}
     descriptions: dict[str, str] = {}
-    for step in strings["options"]["step"].values():
-        labels.update(step.get("data", {}))
-        descriptions.update(step.get("data_description", {}))
+    for section_strings in strings["options"]["step"]["init"]["sections"].values():
+        labels.update(section_strings.get("data", {}))
+        descriptions.update(section_strings.get("data_description", {}))
     schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
 
     assert schema_keys <= labels.keys()
@@ -870,8 +816,9 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
 def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
     expected_heading = "Enable plan fallback notifications"
     expected_description = (
-        "Shows persistent notifications when required inputs are unsafe, a grid limit is exceeded, or HAEO falls "
-        "back. Turning this off dismisses those notifications without weakening safety checks."
+        "Shows persistent notifications only for problems that normally require user action, such as broken "
+        "required mappings or a configured grid hard limit. Routine changes, successful recovery, and safe HAEO "
+        "fallback do not notify."
     )
 
     integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
@@ -882,18 +829,26 @@ def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
         integration_dir / "translations" / "en-GB.json",
     ):
         strings = json.loads(path.read_text(encoding="utf-8"))
-        section = strings["options"]["step"][POLICY_STEP_AI_SAFETY]
+        section = strings["options"]["step"]["init"]["sections"][POLICY_STEP_AI_SAFETY]
         assert section["data"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_heading
         assert section["data_description"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_description
 
 
-def test_options_flow_init_shows_policy_section_menu() -> None:
+def test_options_flow_init_shows_one_collapsible_settings_form() -> None:
     flow = OptionsFlow(SimpleNamespace(options={}))
 
     result = asyncio.run(flow.async_step_init())
 
-    assert result["type"] == "menu"
-    assert tuple(result["menu_options"]) == (
+    assert result["type"] == "form"
+    assert result["step_id"] == "init"
+    assert result["last_step"] is True
+    assert tuple(str(getattr(key, "schema", key)) for key in result["data_schema"].schema) == (
+        INPUT_STEP_ENERGY,
+        INPUT_STEP_CLIMATE,
+        INPUT_STEP_PRESENCE,
+        INPUT_STEP_ENPHASE,
+        INPUT_STEP_AI,
+        INPUT_STEP_EV,
         POLICY_STEP_SCHEDULE,
         POLICY_STEP_EV_BATTERY_GRID,
         POLICY_STEP_CLIMATE,
@@ -947,30 +902,19 @@ def test_config_flow_rejects_blank_planner_name() -> None:
     assert flow.async_show_form.call_args.kwargs["errors"] == {CONF_INSTANCE_NAME: "instance_name_required"}
 
 
-def test_config_flow_reports_options_and_subentry_flow_types() -> None:
+def test_config_flow_reports_options_without_add_device_subentry_flows() -> None:
     options_flow = ConfigFlow.async_get_options_flow(SimpleNamespace(options={}))
-    supported = ConfigFlow.async_get_supported_subentry_types(SimpleNamespace())
 
     assert isinstance(options_flow, OptionsFlow)
-    assert supported["energy"] is EnergySubentryFlow
-    assert supported["climate"] is ClimateSubentryFlow
-    assert supported["ev"] is EVSubentryFlow
+    assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {}
 
 
-def test_options_flow_all_policy_section_steps_show_forms() -> None:
+def test_options_flow_contains_all_input_and_policy_sections() -> None:
     flow = OptionsFlow(SimpleNamespace(options={}))
+    schema = flow._settings_schema()
 
-    for method_name, step_id in [
-        ("async_step_ev_battery_grid", POLICY_STEP_EV_BATTERY_GRID),
-        ("async_step_climate", POLICY_STEP_CLIMATE),
-        ("async_step_enphase", POLICY_STEP_ENPHASE),
-        ("async_step_ai_safety", POLICY_STEP_AI_SAFETY),
-        ("async_step_data_health", POLICY_STEP_DATA_HEALTH),
-        ("async_step_priorities", POLICY_STEP_PRIORITIES),
-    ]:
-        result = asyncio.run(getattr(flow, method_name)())
-        assert result["type"] == "form"
-        assert result["step_id"] == step_id
+    assert len(schema.schema) == 13
+    assert all(validator.options["collapsed"] is True for validator in schema.schema.values())
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
@@ -997,74 +941,81 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
     )
 
 
-def test_options_flow_section_update_preserves_other_options() -> None:
-    updates: list[dict[str, Any]] = []
-    flow = OptionsFlow(
-        SimpleNamespace(
-            options={
-                CONF_EV_MIN_SOC_PERCENT: 55,
-                CONF_PRIORITY_WEIGHTS: "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon",
-            }
-        )
+def test_options_flow_saves_all_sections_together_and_preserves_options() -> None:
+    entry = SimpleNamespace(
+        data={CONF_INSTANCE_NAME: "Energy Planner"},
+        options={
+            CONF_EV_MIN_SOC_PERCENT: 55,
+            CONF_PRIORITY_WEIGHTS: "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon",
+        },
     )
+    updates: list[dict[str, Any]] = []
+    flow = OptionsFlow(entry)
     flow.hass = SimpleNamespace(
         config_entries=SimpleNamespace(
-            async_update_entry=lambda entry, **kwargs: updates.append(kwargs),
+            async_update_entry=lambda entry_arg, **kwargs: updates.append(kwargs),
         )
     )
-
-    result = asyncio.run(
-        flow.async_step_schedule(
-            {
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_SCHEDULE: {
                 CONF_PLANNING_HORIZON_HOURS: 36,
                 CONF_PLANNING_INTERVAL_MINUTES: 10,
-                CONF_DEFAULT_READY_BY: "08:30",
             }
-        )
+        },
     )
 
-    assert result["type"] == "menu"
-    assert result["step_id"] == "init"
-    assert updates == [{"options": flow._options}]
-    assert flow._options[CONF_PLANNING_HORIZON_HOURS] == 36
-    assert flow._options[CONF_EV_MIN_SOC_PERCENT] == 55
-    assert flow._options[CONF_PRIORITY_WEIGHTS] == (
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "create_entry"
+    assert updates == [{"data": {CONF_INSTANCE_NAME: "Energy Planner"}}]
+    assert result["data"][CONF_PLANNING_HORIZON_HOURS] == 36
+    assert result["data"][CONF_EV_MIN_SOC_PERCENT] == 55
+    assert result["data"][CONF_PRIORITY_WEIGHTS] == (
         "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon"
     )
 
 
-def test_options_flow_uses_saved_values_after_returning_to_menu() -> None:
-    flow = OptionsFlow(SimpleNamespace(options={CONF_EV_MIN_SOC_PERCENT: 55}))
-
-    asyncio.run(
-        flow.async_step_schedule(
-            {
+def test_options_flow_sections_prefill_saved_policy_values() -> None:
+    flow = OptionsFlow(
+        SimpleNamespace(
+            data={},
+            options={
                 CONF_PLANNING_HORIZON_HOURS: 36,
                 CONF_PLANNING_INTERVAL_MINUTES: 10,
-                CONF_DEFAULT_READY_BY: "08:30",
-            }
+            },
         )
     )
+    schema = flow._settings_schema()
+    schedule = next(
+        validator
+        for marker, validator in schema.schema.items()
+        if str(getattr(marker, "schema", marker)) == POLICY_STEP_SCHEDULE
+    )
+    fields = {
+        str(getattr(marker, "schema", marker)): marker
+        for marker in schedule.schema.schema
+    }
 
-    result = asyncio.run(flow.async_step_schedule())
-    schema_fields = {str(getattr(key, "schema", key)): key for key in result["data_schema"].schema}
-
-    assert result["type"] == "form"
-    assert schema_fields[CONF_PLANNING_HORIZON_HOURS].default() == 36
+    assert fields[CONF_PLANNING_HORIZON_HOURS].default() == 36
+    assert fields[CONF_PLANNING_INTERVAL_MINUTES].default() == 10
 
 
 def test_options_flow_section_validation_returns_form_errors() -> None:
-    flow = OptionsFlow(SimpleNamespace(options={}))
-
-    result = asyncio.run(
-        flow.async_step_ev_battery_grid(
-            {
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_EV_BATTERY_GRID: {
                 CONF_EV_MIN_SOC_PERCENT: 95,
                 CONF_EV_MAX_SOC_PERCENT: 80,
-                CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90,
             }
-        )
+        },
     )
+
+    result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "form"
     assert result["errors"]["base"] == "ev_min_above_max"
@@ -1075,18 +1026,20 @@ def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> 
         SimpleNamespace(
             data={},
             options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90},
-            subentries={},
         )
     )
-
-    result = asyncio.run(
-        flow.async_step_ev_battery_grid(
-            {
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_EV_BATTERY_GRID: {
                 CONF_EV_MIN_SOC_PERCENT: 40,
                 CONF_EV_MAX_SOC_PERCENT: 80,
             }
-        )
+        },
     )
+
+    result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "ev_fallback_outside_bounds"}
@@ -1095,22 +1048,22 @@ def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> 
 def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     flow = OptionsFlow(
         SimpleNamespace(
-            data={},
-            options={},
-            subentries={
-                "ev": SimpleNamespace(
-                    data={
-                        CONF_EV_SMART_CHARGING_START: "button.ev_start",
-                        CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
-                    }
-                )
+            data={
+                CONF_EV_SMART_CHARGING_START: "button.ev_start",
+                CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
             },
+            options={},
         )
     )
-
-    result = asyncio.run(
-        flow.async_step_ev_battery_grid({CONF_EV_KEEP_CHARGER_ON: True})
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: True}
+        },
     )
+
+    result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "ev_keep_on_requires_persistent_control"}
@@ -1187,24 +1140,24 @@ def test_combined_entry_data_merges_subentries_after_hub_data() -> None:
     }
 
 
-def test_subentry_user_step_updates_existing_group_instead_of_creating_duplicate() -> None:
-    existing = SimpleNamespace(
-        subentry_type="energy",
+def test_central_energy_settings_updates_main_entry_data() -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
         data={
-            CONF_AMBER_IMPORT_PRICE: "sensor.old_import",
-            CONF_AMBER_EXPORT_PRICE: "sensor.old_export",
-            CONF_PV_FORECAST: "sensor.old_pv_forecast",
-            CONF_BASELINE_LOAD_FORECAST: "sensor.old_baseline_load",
-            CONF_BATTERY_SOC: "sensor.old_battery_soc",
+            CONF_INSTANCE_NAME: "Energy Planner",
+            CONF_AI_TASK_ENTITY: "ai_task.old",
         },
+        options={},
+        subentries={},
     )
-    entry = SimpleNamespace(subentries={"energy": existing})
-    flow = EnergySubentryFlow()
+    updates: list[dict[str, Any]] = []
+    flow = OptionsFlow(entry)
     flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-    flow.async_update_and_abort = Mock(return_value={"type": "abort", "reason": "reconfigure_successful"})
-    user_input = {
+    flow.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [entry],
+        async_update_entry=lambda entry_arg, **changes: updates.append(changes),
+    )
+    energy = {
         CONF_AMBER_IMPORT_PRICE: "sensor.import_price",
         CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
         CONF_PV_FORECAST: "sensor.pv_forecast",
@@ -1212,180 +1165,176 @@ def test_subentry_user_step_updates_existing_group_instead_of_creating_duplicate
         CONF_BATTERY_SOC: "sensor.battery_soc",
     }
 
-    result = asyncio.run(flow.async_step_user(user_input))
-
-    assert result == {"type": "abort", "reason": "reconfigure_successful"}
-    flow.async_update_and_abort.assert_called_once_with(
-        entry,
-        existing,
-        title="Energy",
-        data=user_input,
-    )
-
-
-def test_subentry_user_step_prefills_existing_group_when_opened() -> None:
-    existing = SimpleNamespace(
-        subentry_type="energy",
-        data={
-            CONF_AMBER_IMPORT_PRICE: "sensor.import_price",
-            CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
-            CONF_PV_FORECAST: "sensor.pv_forecast",
-            CONF_BASELINE_LOAD_FORECAST: "sensor.baseline_load",
-            CONF_BATTERY_SOC: "sensor.battery_soc",
-        },
-    )
-    flow = EnergySubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={"energy": existing}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
-    result = asyncio.run(flow.async_step_user())
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "user"
-
-
-def test_subentry_user_step_returns_errors_for_invalid_input() -> None:
-    flow = EnergySubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
     result = asyncio.run(
-        flow.async_step_user(
-            {
-                CONF_AMBER_IMPORT_PRICE: "input_number.import_price",
-                CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
-                CONF_PV_FORECAST: "sensor.pv_forecast",
-                CONF_BASELINE_LOAD_FORECAST: "sensor.baseline_load",
-                CONF_BATTERY_SOC: "sensor.battery_soc",
-            }
+        flow.async_step_init(
+            _settings_submission(
+                flow,
+                input_sections={INPUT_STEP_ENERGY: energy},
+            )
         )
     )
 
-    assert result["type"] == "form"
-    assert result["errors"][CONF_AMBER_IMPORT_PRICE] == "invalid_entity_domain"
+    assert result["type"] == "create_entry"
+    assert updates == [
+        {
+            "data": {
+                CONF_INSTANCE_NAME: "Energy Planner",
+                CONF_AI_TASK_ENTITY: "ai_task.old",
+                **energy,
+            }
+        }
+    ]
 
 
-def test_subentry_reconfigure_step_updates_active_subentry() -> None:
-    existing = SimpleNamespace(
-        subentry_type="energy",
-        data={
-            CONF_AMBER_IMPORT_PRICE: "sensor.old_import",
-            CONF_AMBER_EXPORT_PRICE: "sensor.old_export",
-            CONF_PV_FORECAST: "sensor.old_pv_forecast",
-            CONF_BASELINE_LOAD_FORECAST: "sensor.old_baseline_load",
-            CONF_BATTERY_SOC: "sensor.old_battery_soc",
-        },
+def test_central_input_settings_prefill_and_validate_sections() -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={CONF_AMBER_IMPORT_PRICE: "sensor.import_price"},
+        options={},
+        subentries={},
     )
-    entry = SimpleNamespace(subentries={"energy": existing})
-    flow = EnergySubentryFlow()
+    flow = OptionsFlow(entry)
     flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(return_value=existing)
-    flow.async_update_and_abort = Mock(return_value={"type": "abort", "reason": "reconfigure_successful"})
-    user_input = {
-        CONF_AMBER_IMPORT_PRICE: "sensor.import_price",
-        CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
-        CONF_PV_FORECAST: "sensor.pv_forecast",
-        CONF_BASELINE_LOAD_FORECAST: "sensor.baseline_load",
-        CONF_BATTERY_SOC: "sensor.battery_soc",
+    flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+    form = asyncio.run(flow.async_step_init())
+    energy_section = next(
+        validator
+        for marker, validator in form["data_schema"].schema.items()
+        if str(getattr(marker, "schema", marker)) == INPUT_STEP_ENERGY
+    )
+    fields = {
+        str(getattr(marker, "schema", marker)): marker
+        for marker in energy_section.schema.schema
     }
 
-    result = asyncio.run(flow.async_step_reconfigure(user_input))
-
-    assert result == {"type": "abort", "reason": "reconfigure_successful"}
-    flow.async_update_and_abort.assert_called_once_with(
-        entry,
-        existing,
-        title="Energy",
-        data=user_input,
-    )
-
-
-def test_enphase_user_step_with_existing_profile_opens_profiles() -> None:
-    existing = SimpleNamespace(
-        subentry_type="enphase",
-        data={CONF_ENPHASE_PROFILE: "select.enphase_profile"},
-    )
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={"enphase": existing}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
-    result = asyncio.run(flow.async_step_user())
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "profiles"
-
-
-def test_enphase_profiles_step_without_profile_returns_entity_form() -> None:
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-
-    result = asyncio.run(flow.async_step_profiles())
-
-    assert result["type"] == "form"
-    assert result["step_id"] == "user"
-
-
-def test_enphase_profiles_step_updates_existing_subentry() -> None:
-    existing = SimpleNamespace(
-        subentry_type="enphase",
-        data={CONF_ENPHASE_PROFILE: "select.enphase_profile"},
-    )
-    flow = EnphaseSubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={"enphase": existing}))
-    flow._get_reconfigure_subentry = Mock(return_value=existing)
-    flow.async_update_and_abort = Mock(return_value={"type": "abort"})
-
-    result = asyncio.run(
-        flow.async_step_profiles(
-            {
-                CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
-                CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
-                CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
-            }
+    invalid = asyncio.run(
+        flow.async_step_init(
+            _settings_submission(
+                flow,
+                input_sections={
+                    INPUT_STEP_ENERGY: {
+                        CONF_AMBER_IMPORT_PRICE: "input_number.import_price",
+                        CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
+                        CONF_PV_FORECAST: "sensor.pv_forecast",
+                        CONF_BASELINE_LOAD_FORECAST: "sensor.baseline_load",
+                        CONF_BATTERY_SOC: "sensor.battery_soc",
+                    }
+                },
+            )
         )
     )
 
-    assert result == {"type": "abort"}
-    flow.async_update_and_abort.assert_called_once()
+    assert fields[CONF_AMBER_IMPORT_PRICE].description["suggested_value"] == "sensor.import_price"
+    assert invalid["errors"]["base"] == "invalid_entity_domain"
 
 
-def test_enphase_profile_entity_step_returns_validation_errors() -> None:
-    flow = EnphaseSubentryFlow()
+def test_central_settings_reject_cross_section_actuator_collisions() -> None:
+    entry = SimpleNamespace(entry_id="entry-current", data={}, options={}, subentries={})
+    flow = OptionsFlow(entry)
     flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=SimpleNamespace(subentries={}))
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
+    flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+    submission = _settings_submission(
+        flow,
+        input_sections={
+            INPUT_STEP_CLIMATE: {
+                CONF_DAIKIN_CLIMATE: "climate.daikin",
+                CONF_CLIMATE_ZONES: ["switch.shared_charger"],
+                CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+                CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+            },
+            INPUT_STEP_EV: {CONF_EV_CHARGER: "switch.shared_charger"},
+        },
+    )
 
-    result = asyncio.run(flow.async_step_user({CONF_ENPHASE_PROFILE: "sensor.not_select"}))
+    result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "form"
-    assert result["errors"][CONF_ENPHASE_PROFILE] == "invalid_entity_domain"
+    assert result["errors"] == {"base": "household_actuator_in_use"}
 
 
-def test_ai_subentry_stores_selected_ai_task_entity_with_generate_data_service() -> None:
-    entry = SimpleNamespace(subentries={})
-    flow = AISubentryFlow()
-    flow.hass = _valid_hass()
-    flow._get_entry = Mock(return_value=entry)
-    flow._get_reconfigure_subentry = Mock(side_effect=ValueError)
-    flow.async_create_entry = Mock(return_value={"type": "create_entry"})
-
-    result = asyncio.run(flow.async_step_user({CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task"}))
-
-    assert result == {"type": "create_entry"}
-    flow.async_create_entry.assert_called_once_with(
-        title="AI",
+def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
         data={
-            CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
+            CONF_INSTANCE_NAME: "Energy Planner",
+            CONF_AI_TASK_ENTITY: "ai_task.old",
             CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
         },
+        options={},
+        subentries={},
     )
+    updates: list[dict[str, Any]] = []
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [entry],
+        async_update_entry=lambda entry_arg, **changes: updates.append(changes),
+    )
+    ai_marker = next(
+        marker
+        for marker in flow._settings_schema().schema
+        if str(getattr(marker, "schema", marker)) == INPUT_STEP_AI
+    )
+    assert ai_marker.default() == {CONF_AI_TASK_ENTITY: "ai_task.old"}
+
+    result = asyncio.run(
+        flow.async_step_init(
+            _settings_submission(
+                flow,
+                input_sections={
+                    INPUT_STEP_AI: {
+                        CONF_AI_TASK_ENTITY: " ai_task.extended_openai_ai_task "
+                    }
+                },
+            )
+        )
+    )
+    assert result["type"] == "create_entry"
+    assert updates[-1]["data"][CONF_AI_TASK_ENTITY] == "ai_task.extended_openai_ai_task"
+    assert updates[-1]["data"][CONF_AI_ADVISOR_SERVICE] == "ai_task.generate_data"
+
+    clear_entry = SimpleNamespace(
+        entry_id="entry-current",
+        data=updates[-1]["data"],
+        options=result["data"],
+        subentries={},
+    )
+    clear_flow = OptionsFlow(clear_entry)
+    clear_flow.hass = _valid_hass()
+    clear_flow.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [clear_entry],
+        async_update_entry=lambda entry_arg, **changes: updates.append(changes),
+    )
+    asyncio.run(
+        clear_flow.async_step_init(
+            _settings_submission(
+                clear_flow,
+                input_sections={INPUT_STEP_AI: {}},
+            )
+        )
+    )
+    assert CONF_AI_TASK_ENTITY not in updates[-1]["data"]
+    assert updates[-1]["data"][CONF_AI_ADVISOR_SERVICE] == ""
+
+
+def test_central_input_sections_are_optional_collapsible_groups() -> None:
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    schema = flow._settings_schema()
+    fields = {
+        str(getattr(marker, "schema", marker)): marker
+        for marker in schema.schema
+    }
+
+    for step_id in (
+        INPUT_STEP_ENERGY,
+        INPUT_STEP_CLIMATE,
+        INPUT_STEP_PRESENCE,
+        INPUT_STEP_ENPHASE,
+        INPUT_STEP_AI,
+        INPUT_STEP_EV,
+    ):
+        assert isinstance(fields[step_id], vol.Optional)
+        assert schema.schema[fields[step_id]].options["collapsed"] is True
 
 
 def test_ai_subentry_normalizes_task_and_ignores_legacy_agent_selection() -> None:
@@ -1469,9 +1418,10 @@ def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
     }
 
 
-def test_migration_removes_source_group_when_all_fields_moved() -> None:
+def test_migration_moves_all_subentry_settings_into_main_entry() -> None:
     hass = SimpleNamespace(config_entries=FakeConfigEntries())
     entry = SimpleNamespace(
+        data={CONF_INSTANCE_NAME: "Energy Planner"},
         subentries={
             "energy": SimpleNamespace(
                 subentry_id="energy",
@@ -1481,9 +1431,19 @@ def test_migration_removes_source_group_when_all_fields_moved() -> None:
         },
     )
 
-    assert async_consolidate_subentries(hass, entry) is True
+    assert async_migrate_subentries_to_entry_data(hass, entry) is True
 
-    assert [subentry.subentry_type for subentry in hass.config_entries.added] == ["system", "climate"]
+    assert hass.config_entries.entry_updates == [
+        (
+            entry,
+            {
+                "data": {
+                    CONF_INSTANCE_NAME: "Energy Planner",
+                    CONF_WEATHER: "weather.home",
+                }
+            },
+        )
+    ]
     assert hass.config_entries.removed == ["energy"]
 
 
@@ -1583,10 +1543,6 @@ def test_validate_config_rejects_invalid_service_name() -> None:
     )
 
     assert errors[CONF_HAEO_OPTIMIZE_SERVICE] == "invalid_service_name"
-
-
-def test_enphase_profile_options_are_empty_when_entity_missing() -> None:
-    assert _enphase_profile_options(FakeHass(set(), set()), "select.missing") == []
 
 
 def test_validate_config_rejects_empty_service_domain_or_service() -> None:

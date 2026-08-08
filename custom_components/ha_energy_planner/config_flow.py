@@ -6,14 +6,9 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import (
-    ConfigEntry,
-    ConfigSubentry,
-    ConfigSubentryFlow,
-    SubentryFlowResult,
-    UnknownSubEntry,
-)
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.data_entry_flow import SectionConfig, section
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.selector import (
     BooleanSelector,
@@ -32,7 +27,6 @@ from voluptuous import Invalid
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
-    CONF_AI_ENABLED,
     CONF_AI_TASK_ENTITY,
     CONF_AI_TIMEOUT_SECONDS,
     CONF_AMBER_EXPORT_PRICE,
@@ -237,12 +231,6 @@ ENPHASE_DATA_SCHEMA = vol.Schema(
     }
 )
 
-ENPHASE_ENTITY_SCHEMA = vol.Schema(
-    {
-        vol.Required(CONF_ENPHASE_PROFILE): _entity_selector(["select", "input_select"]),
-    }
-)
-
 AI_DATA_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_AI_TASK_ENTITY): _entity_selector("ai_task"),
@@ -290,13 +278,20 @@ PLANNER_SUBENTRY_SCHEMAS: dict[str, vol.Schema] = {
     SUBENTRY_EV: EV_DATA_SCHEMA,
 }
 
-PLANNER_SUBENTRY_TITLES = {
-    SUBENTRY_ENERGY: "Energy",
-    SUBENTRY_CLIMATE: "Climate",
-    SUBENTRY_PRESENCE: "Presence",
-    SUBENTRY_ENPHASE: "Enphase",
-    SUBENTRY_AI: "AI",
-    SUBENTRY_EV: "EV",
+INPUT_STEP_ENERGY = "energy_inputs"
+INPUT_STEP_CLIMATE = "climate_inputs"
+INPUT_STEP_PRESENCE = "presence_inputs"
+INPUT_STEP_ENPHASE = "enphase_inputs"
+INPUT_STEP_AI = "ai_inputs"
+INPUT_STEP_EV = "ev_inputs"
+
+_INPUT_SECTION_TYPES = {
+    INPUT_STEP_ENERGY: SUBENTRY_ENERGY,
+    INPUT_STEP_CLIMATE: SUBENTRY_CLIMATE,
+    INPUT_STEP_PRESENCE: SUBENTRY_PRESENCE,
+    INPUT_STEP_ENPHASE: SUBENTRY_ENPHASE,
+    INPUT_STEP_AI: SUBENTRY_AI,
+    INPUT_STEP_EV: SUBENTRY_EV,
 }
 
 _HOUSEHOLD_ACTUATOR_KEYS = (
@@ -338,7 +333,7 @@ POLICY_STEP_AI_SAFETY = "ai_safety"
 POLICY_STEP_DATA_HEALTH = "data_health"
 POLICY_STEP_PRIORITIES = "priorities"
 
-_POLICY_MENU_OPTIONS = (
+_POLICY_SECTION_OPTIONS = (
     POLICY_STEP_SCHEDULE,
     POLICY_STEP_EV_BATTERY_GRID,
     POLICY_STEP_CLIMATE,
@@ -356,7 +351,6 @@ _ENTITY_MANAGED_OPTION_FIELDS = frozenset(
         CONF_DEFAULT_READY_BY,
         CONF_PLANNER_ENABLED,
         CONF_DRY_RUN,
-        CONF_AI_ENABLED,
         CONF_EV_CONTROL_ENABLED,
         CONF_CLIMATE_CONTROL_ENABLED,
         CONF_ENPHASE_CONTROL_ENABLED,
@@ -411,7 +405,6 @@ _POLICY_SECTION_FIELDS = {
     POLICY_STEP_AI_SAFETY: (
         CONF_PLANNER_ENABLED,
         CONF_DRY_RUN,
-        CONF_AI_ENABLED,
         CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
         CONF_EV_CONTROL_ENABLED,
         CONF_CLIMATE_CONTROL_ENABLED,
@@ -441,7 +434,7 @@ _POLICY_SECTION_FIELDS = {
     for step_id, fields in _POLICY_SECTION_FIELDS.items()
 }
 
-_POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_MENU_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
+_POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_SECTION_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
 
 
 def _options_schema(options: dict[str, Any]) -> vol.Schema:
@@ -561,7 +554,6 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_PLANNER_ENABLED: BooleanSelector(),
         CONF_DRY_RUN: BooleanSelector(),
-        CONF_AI_ENABLED: BooleanSelector(),
         CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: BooleanSelector(),
         CONF_EV_CONTROL_ENABLED: BooleanSelector(),
         CONF_CLIMATE_CONTROL_ENABLED: BooleanSelector(),
@@ -656,312 +648,114 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Return options flow."""
         return OptionsFlow(config_entry)
 
-    @classmethod
-    @callback
-    def async_get_supported_subentry_types(
-        cls,
-        config_entry: ConfigEntry,
-    ) -> dict[str, type[ConfigSubentryFlow]]:
-        """Return planner input subentry flows supported by this integration."""
-        return {
-            SUBENTRY_ENERGY: EnergySubentryFlow,
-            SUBENTRY_CLIMATE: ClimateSubentryFlow,
-            SUBENTRY_PRESENCE: PresenceSubentryFlow,
-            SUBENTRY_ENPHASE: EnphaseSubentryFlow,
-            SUBENTRY_AI: AISubentryFlow,
-            SUBENTRY_EV: EVSubentryFlow,
-        }
-
-
-class PlannerSubentryFlow(ConfigSubentryFlow):
-    """Base flow for a single planner input group."""
-
-    subentry_type: str
-    data_schema: vol.Schema
-    title: str
-
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle creating or configuring an input group."""
-        return await self._async_step_configure(user_input)
-
-    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle editing an input group."""
-        return await self._async_step_configure(user_input)
-
-    async def _async_step_configure(self, user_input: dict[str, Any] | None) -> SubentryFlowResult:
-        """Show and validate the group form."""
-        errors: dict[str, str] = {}
-        entry = self._get_entry()
-        subentry = self._get_active_subentry() or self._existing_subentry(entry)
-        if user_input is not None:
-            errors = _validate_subentry_config(
-                self.hass,
-                entry,
-                user_input,
-                subentry_type=self.subentry_type,
-            )
-            if not errors:
-                if subentry is not None:
-                    return self.async_update_and_abort(entry, subentry, title=self.title, data=user_input)
-                return self.async_create_entry(title=self.title, data=user_input)
-
-        schema = self.data_schema
-        if user_input is None and subentry is not None:
-            schema = self.add_suggested_values_to_schema(schema, _form_suggested_values(dict(subentry.data)))
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
-
-    def _existing_subentry(self, entry: ConfigEntry) -> ConfigSubentry | None:
-        """Return an existing subentry for this single-instance group."""
-        for subentry in entry.subentries.values():
-            if subentry.subentry_type == self.subentry_type:
-                return subentry
-        return None
-
-    def _get_active_subentry(self) -> ConfigSubentry | None:
-        """Return the subentry being reconfigured, if any."""
-        try:
-            return self._get_reconfigure_subentry()
-        except (ValueError, UnknownSubEntry):
-            return None
-
-
-class EnergySubentryFlow(PlannerSubentryFlow):
-    """Configure price, forecast, and battery inputs."""
-
-    subentry_type = SUBENTRY_ENERGY
-    data_schema = ENERGY_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_ENERGY]
-
-
-class ClimateSubentryFlow(PlannerSubentryFlow):
-    """Configure climate inputs."""
-
-    subentry_type = SUBENTRY_CLIMATE
-    data_schema = CLIMATE_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_CLIMATE]
-
-
-class PresenceSubentryFlow(PlannerSubentryFlow):
-    """Configure presence inputs."""
-
-    subentry_type = SUBENTRY_PRESENCE
-    data_schema = PRESENCE_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_PRESENCE]
-
-
-class EnphaseSubentryFlow(PlannerSubentryFlow):
-    """Configure Enphase inputs."""
-
-    subentry_type = SUBENTRY_ENPHASE
-    data_schema = ENPHASE_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_ENPHASE]
-
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle choosing the Enphase system profile entity."""
-        if user_input is None and self._has_existing_profile_entity():
-            return await self.async_step_profiles()
-        return await self._async_step_profile_entity(user_input)
-
-    async def async_step_reconfigure(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle editing the Enphase system profile entity."""
-        if user_input is None and self._has_existing_profile_entity():
-            return await self.async_step_profiles()
-        return await self._async_step_profile_entity(user_input)
-
-    async def async_step_profiles(self, user_input: dict[str, Any] | None = None) -> SubentryFlowResult:
-        """Handle choosing profile names from the selected profile entity."""
-        return await self._async_step_profiles(user_input)
-
-    async def _async_step_profile_entity(self, user_input: dict[str, Any] | None) -> SubentryFlowResult:
-        """Show and validate the Enphase profile entity form."""
-        errors: dict[str, str] = {}
-        entry = self._get_entry()
-        subentry = self._get_active_subentry() or self._existing_subentry(entry)
-        current = dict(getattr(subentry, "data", {}) or {})
-        if user_input is not None:
-            errors = _validate_subentry_config(
-                self.hass,
-                entry,
-                user_input,
-                subentry_type=self.subentry_type,
-            )
-            if not errors:
-                self._enphase_pending_data = {
-                    **current,
-                    CONF_ENPHASE_PROFILE: user_input[CONF_ENPHASE_PROFILE],
-                }
-                return await self.async_step_profiles()
-
-        schema = ENPHASE_ENTITY_SCHEMA
-        if user_input is None and current:
-            schema = self.add_suggested_values_to_schema(schema, _form_suggested_values(current))
-        return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
-
-    async def _async_step_profiles(self, user_input: dict[str, Any] | None) -> SubentryFlowResult:
-        """Show and validate profile role selections."""
-        entry = self._get_entry()
-        subentry = self._get_active_subentry() or self._existing_subentry(entry)
-        current = dict(getattr(subentry, "data", {}) or {})
-        base = dict(getattr(self, "_enphase_pending_data", None) or current)
-        if not base.get(CONF_ENPHASE_PROFILE):
-            return await self._async_step_profile_entity(None)
-
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            data = {**base, **user_input}
-            errors = _validate_subentry_config(
-                self.hass,
-                entry,
-                data,
-                subentry_type=self.subentry_type,
-            )
-            if not errors:
-                if subentry is not None:
-                    return self.async_update_and_abort(entry, subentry, title=self.title, data=data)
-                return self.async_create_entry(title=self.title, data=data)
-
-        suggested = {**current, **base}
-        schema = self.add_suggested_values_to_schema(
-            _enphase_profiles_schema(self.hass, suggested),
-            _form_suggested_values(suggested),
-        )
-        return self.async_show_form(step_id="profiles", data_schema=schema, errors=errors)
-
-    def _has_existing_profile_entity(self) -> bool:
-        """Return whether the current Enphase subentry already has a profile entity."""
-        entry = self._get_entry()
-        subentry = self._get_active_subentry() or self._existing_subentry(entry)
-        return bool(subentry and dict(getattr(subentry, "data", {}) or {}).get(CONF_ENPHASE_PROFILE))
-
-
-class AISubentryFlow(PlannerSubentryFlow):
-    """Configure local AI advisor inputs."""
-
-    subentry_type = SUBENTRY_AI
-    data_schema = AI_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_AI]
-
-    async def _async_step_configure(self, user_input: dict[str, Any] | None) -> SubentryFlowResult:
-        """Show and validate the AI agent form."""
-        if user_input is not None:
-            user_input = _normalize_ai_config(user_input)
-        return await super()._async_step_configure(user_input)
-
-
-class EVSubentryFlow(PlannerSubentryFlow):
-    """Configure EV inputs."""
-
-    subentry_type = SUBENTRY_EV
-    data_schema = EV_DATA_SCHEMA
-    title = PLANNER_SUBENTRY_TITLES[SUBENTRY_EV]
-
-
 class OptionsFlow(config_entries.OptionsFlow):
-    """Handle options."""
+    """Handle central Energy Planner settings."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
+        self._data = dict(getattr(config_entry, "data", {}))
         self._options = dict(config_entry.options)
 
     async def async_step_init(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
-        """Show the policy section menu."""
-        return self.async_show_menu(step_id="init", menu_options=_POLICY_MENU_OPTIONS)
-
-    async def async_step_schedule(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage scheduling policy."""
-        return await self._async_step_policy_section(POLICY_STEP_SCHEDULE, user_input)
-
-    async def async_step_ev_battery_grid(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage EV, battery, and grid policy."""
-        return await self._async_step_policy_section(POLICY_STEP_EV_BATTERY_GRID, user_input)
-
-    async def async_step_climate(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage climate policy."""
-        return await self._async_step_policy_section(POLICY_STEP_CLIMATE, user_input)
-
-    async def async_step_enphase(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage Enphase policy."""
-        return await self._async_step_policy_section(POLICY_STEP_ENPHASE, user_input)
-
-    async def async_step_ai_safety(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage AI and safety policy."""
-        return await self._async_step_policy_section(POLICY_STEP_AI_SAFETY, user_input)
-
-    async def async_step_data_health(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage data health policy."""
-        return await self._async_step_policy_section(POLICY_STEP_DATA_HEALTH, user_input)
-
-    async def async_step_priorities(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage planning priority policy."""
-        return await self._async_step_policy_section(POLICY_STEP_PRIORITIES, user_input)
-
-    async def _async_step_policy_section(
-        self,
-        step_id: str,
-        user_input: dict[str, Any] | None,
-    ) -> config_entries.ConfigFlowResult:
-        """Manage one policy section."""
+        """Show every input and policy group on one sectioned settings page."""
         errors: dict[str, str] = {}
-        options = {**DEFAULT_OPTIONS, **self._options}
         if user_input is not None:
-            updated = {**options, **user_input}
-            errors = _validate_options(updated)
-            entry_data = (
-                combined_entry_data(self._config_entry)
-                if hasattr(self._config_entry, "data")
-                else {}
+            updated_data = dict(self._data)
+            updated_options = {**DEFAULT_OPTIONS, **self._options}
+            for step_id, input_type in _INPUT_SECTION_TYPES.items():
+                if step_id not in user_input:
+                    continue
+                data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
+                section_fields = _schema_field_names(data_schema)
+                if input_type == SUBENTRY_AI:
+                    section_fields.add(CONF_AI_ADVISOR_SERVICE)
+                submitted = dict(user_input[step_id])
+                if input_type == SUBENTRY_AI:
+                    submitted = _normalize_ai_config(submitted)
+                section_errors = _validate_subentry_config(
+                    self.hass,
+                    self._config_entry,
+                    submitted,
+                    subentry_type=input_type,
+                )
+                if section_errors:
+                    errors.setdefault("base", next(iter(section_errors.values())))
+                    continue
+                updated_data = {
+                    key: value
+                    for key, value in updated_data.items()
+                    if key not in section_fields
+                }
+                updated_data.update(submitted)
+
+            duplicate_errors = _duplicate_household_actuator_errors(
+                self.hass,
+                self._config_entry,
+                updated_data,
             )
-            if step_id == POLICY_STEP_EV_BATTERY_GRID and not _ev_keep_on_control_compatible(
-                entry_data,
-                updated,
-            ):
-                errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
-            for field in tuple(errors):
-                if field != "base" and field not in _POLICY_SECTION_FIELDS[step_id]:
-                    errors.setdefault("base", errors[field])
-                    errors.pop(field)
+            if duplicate_errors:
+                errors.setdefault("base", next(iter(duplicate_errors.values())))
+
+            for step_id in _POLICY_SECTION_OPTIONS:
+                submitted_options = user_input.get(step_id)
+                if isinstance(submitted_options, dict):
+                    updated_options.update(submitted_options)
+            option_errors = _validate_options(updated_options)
+            if not _ev_keep_on_control_compatible(updated_data, updated_options):
+                option_errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
+            if option_errors:
+                errors.setdefault("base", next(iter(option_errors.values())))
+
             if not errors:
-                self._async_save_options(_normalize_options_input(updated))
-                return await self.async_step_init()
+                self._async_save_entry_data(updated_data)
+                self._options = _normalize_options_input(updated_options)
+                return self.async_create_entry(title="", data=self._options)
+
         return self.async_show_form(
-            step_id=step_id,
-            data_schema=_options_section_schema(options, _POLICY_SECTION_FIELDS[step_id]),
+            step_id="init",
+            data_schema=self._settings_schema(),
             errors=errors,
+            last_step=True,
         )
 
-    def _async_save_options(self, options: dict[str, Any]) -> None:
-        """Persist options without ending the policy menu flow."""
-        self._options = dict(options)
+    def _settings_schema(self) -> vol.Schema:
+        """Return one form with collapsible sections for all settings."""
+        schema: dict[Any, Any] = {}
+        for step_id, input_type in _INPUT_SECTION_TYPES.items():
+            data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
+            schema_fields = _schema_field_names(data_schema)
+            current = {
+                key: value
+                for key, value in self._data.items()
+                if key in schema_fields
+            }
+            nested = self.add_suggested_values_to_schema(
+                data_schema,
+                _form_suggested_values(current),
+            )
+            marker: Any = vol.Optional(step_id, default=current) if current else vol.Optional(step_id)
+            schema[marker] = section(nested, SectionConfig(collapsed=True))
+
+        options = {**DEFAULT_OPTIONS, **self._options}
+        for step_id in _POLICY_SECTION_OPTIONS:
+            schema[vol.Required(step_id)] = section(
+                _options_section_schema(options, _POLICY_SECTION_FIELDS[step_id]),
+                SectionConfig(collapsed=True),
+            )
+        return vol.Schema(schema)
+
+    def _async_save_entry_data(self, data: dict[str, Any]) -> None:
+        """Persist central input settings with the completed options form."""
+        self._data = dict(data)
         hass = getattr(self, "hass", None)
         config_entries_manager = getattr(hass, "config_entries", None)
         async_update_entry = getattr(config_entries_manager, "async_update_entry", None)
         if callable(async_update_entry):
-            async_update_entry(self._config_entry, options=self._options)
+            async_update_entry(self._config_entry, data=self._data)
 
 
 def _form_suggested_values(data: dict[str, Any]) -> dict[str, Any]:
@@ -973,71 +767,9 @@ def _form_suggested_values(data: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def _enphase_profiles_schema(hass: HomeAssistant, data: dict[str, Any]) -> vol.Schema:
-    """Return a profile-role schema using options from the selected profile entity."""
-    profile_options = _enphase_profile_options(hass, str(data.get(CONF_ENPHASE_PROFILE, "") or ""))
-    return vol.Schema(
-        {
-            vol.Required(
-                CONF_ENPHASE_AI_PROFILE,
-                default=data.get(CONF_ENPHASE_AI_PROFILE, DEFAULT_ENPHASE_AI_PROFILE),
-            ): _profile_select_selector(profile_options, data.get(CONF_ENPHASE_AI_PROFILE), DEFAULT_ENPHASE_AI_PROFILE),
-            vol.Required(
-                CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
-                default=data.get(CONF_ENPHASE_SELF_CONSUMPTION_PROFILE, DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE),
-            ): _profile_select_selector(
-                profile_options,
-                data.get(CONF_ENPHASE_SELF_CONSUMPTION_PROFILE),
-                DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE,
-            ),
-            vol.Required(
-                CONF_ENPHASE_FULL_BACKUP_PROFILE,
-                default=data.get(CONF_ENPHASE_FULL_BACKUP_PROFILE, DEFAULT_ENPHASE_FULL_BACKUP_PROFILE),
-            ): _profile_select_selector(
-                profile_options,
-                data.get(CONF_ENPHASE_FULL_BACKUP_PROFILE),
-                DEFAULT_ENPHASE_FULL_BACKUP_PROFILE,
-            ),
-        }
-    )
-
-
-def _profile_select_selector(options: list[str], configured: Any, default: str) -> SelectSelector:
-    """Return a profile selector with entity-provided options plus current values."""
-    choices = _dedupe_text_values([*options, configured, default])
-    return SelectSelector(
-        SelectSelectorConfig(
-            options=choices,
-            mode=SelectSelectorMode.DROPDOWN,
-            custom_value=True,
-            sort=False,
-        )
-    )
-
-
-def _enphase_profile_options(hass: HomeAssistant, entity_id: str) -> list[str]:
-    """Return profile names advertised by a select/input_select entity."""
-    state = hass.states.get(entity_id) if entity_id else None
-    if state is None:
-        return []
-    attributes = getattr(state, "attributes", {}) or {}
-    options = attributes.get("options")
-    values = list(options) if isinstance(options, list) else []
-    values.append(getattr(state, "state", None))
-    return _dedupe_text_values(values)
-
-
-def _dedupe_text_values(values: list[Any]) -> list[str]:
-    """Return non-empty strings with order preserved."""
-    choices: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        text = str(value or "").strip()
-        if not text or text in seen:
-            continue
-        seen.add(text)
-        choices.append(text)
-    return choices
+def _schema_field_names(schema: vol.Schema) -> set[str]:
+    """Return field names declared by a voluptuous form schema."""
+    return {str(getattr(field, "schema", field)) for field in schema.schema}
 
 
 def _normalize_ai_config(user_input: dict[str, Any]) -> dict[str, Any]:
