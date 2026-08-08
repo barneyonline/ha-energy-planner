@@ -29,7 +29,7 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
 
     assert values == {
         "current_state": "No controls configured",
-        "next_actions": "None",
+        "next_actions": "Unknown",
     }
     assert attrs["current_state"] == {
         "mode": "Unknown",
@@ -37,6 +37,11 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "controlled_assets": [],
     }
     assert attrs["next_actions"] == {"actions": []}
+
+    coordinator.data = _plan()
+    assert next(item for item in SENSORS if item.key == "next_actions").value_fn(coordinator) == (
+        "No controls configured"
+    )
 
 
 def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> None:
@@ -115,7 +120,10 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     plan = _plan(
         actions=[ev_action, climate_action],
         device_plans={
-            "climate": {"current_state_label": "Heat (19 C)"},
+            "climate": {
+                "current_state_label": "Heat (19 C)",
+                "next_planned_state_label": "Preconditioning: Heat to 21 C",
+            },
             "ev": {"current_state_label": "Connected, not charging"},
         },
     )
@@ -166,7 +174,9 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert current_attrs["controlled_assets"][0]["entities"][0]["details"]["current_temperature"] == 19
     assert current_attrs["controlled_assets"][1]["entities"][0]["state"] == "off"
 
-    assert next_actions.value_fn(coordinator) == "Change climate state (+1)"
+    assert next_actions.value_fn(coordinator) == (
+        "Climate: Preconditioning: Heat to 21 C | EV: Start EV charging"
+    )
     action_attrs = next_actions.attrs_fn(coordinator)
     assert [action["action_id"] for action in action_attrs["actions"]] == ["climate-1", "ev-1"]
     assert action_attrs["actions"][0]["determination"]["accepted_decision"]["score"] == 0.9
@@ -1260,6 +1270,37 @@ def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> 
     assert "current_plan_id" not in attrs
     assert attrs["reused_for_current_plan"] is True
     assert attrs["summary"] == "Still applicable."
+
+
+def test_ai_advice_sensor_keeps_rejection_visible_for_equivalent_new_plan() -> None:
+    previous = _plan()
+    current = replace(previous, plan_id="plan-2")
+    coordinator = _coordinator(
+        current,
+        entry_data={"ai_task_entity": "ai_task.provider"},
+        store_data={
+            "ai_recommendations": [
+                {
+                    "plan_id": previous.plan_id,
+                    "plan_fingerprint": _material_plan_fingerprint(previous),
+                    "status": "rejected",
+                    "accepted": {},
+                    "rejected_reason": "ai_response_not_actionable",
+                    "rejected_detail": {
+                        "reason": "ai_response_not_actionable",
+                        "message": "The provider did not return a complete actionable result.",
+                    },
+                }
+            ]
+        },
+    )
+    description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
+
+    attrs = description.attrs_fn(coordinator)
+
+    assert description.value_fn(coordinator) == "No actionable result"
+    assert attrs["reused_for_current_plan"] is True
+    assert attrs["rejected_reason"] == "ai_response_not_actionable"
 
 
 def test_ai_advice_sensor_reuses_latest_legacy_nested_fingerprint() -> None:

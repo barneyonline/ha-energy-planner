@@ -364,13 +364,51 @@ def _service_payload(
     plan: EnergyPlan,
 ) -> dict[str, Any]:
     """Return service data for the configured AI provider type."""
-    prompt = _build_instructions(context, plan, structured=False)
+    prompt = _build_instructions(context, plan, structured=True)
     payload = {
         "task_name": "Energy Planner explain or troubleshoot",
         "instructions": prompt,
         "entity_id": entry_data.get(CONF_AI_TASK_ENTITY),
+        "structure": _response_structure(),
     }
     return {key: value for key, value in payload.items() if value}
+
+
+def _response_structure() -> dict[str, Any]:
+    """Return the Home Assistant AI Task structured-output contract."""
+    text_selector = {"text": {"multiline": True}}
+    return {
+        "outcome": {
+            "description": "Use no_action_needed or action_required.",
+            "required": True,
+            "selector": {"select": {"options": ["no_action_needed", "action_required"]}},
+        },
+        "summary": {
+            "description": "A concise explanation of the result.",
+            "required": True,
+            "selector": text_selector,
+        },
+        "affected_item": {
+            "description": "For action_required, the exact actionable target ID supplied in the instructions.",
+            "selector": text_selector,
+        },
+        "problem": {
+            "description": "For action_required, the evidence-backed problem.",
+            "selector": text_selector,
+        },
+        "next_step": {
+            "description": "For action_required, the exact user action to take.",
+            "selector": text_selector,
+        },
+        "expected_benefit": {
+            "description": "For action_required, the expected result of the action.",
+            "selector": text_selector,
+        },
+        "verification": {
+            "description": "For action_required, how the user can verify the fix.",
+            "selector": text_selector,
+        },
+    }
 
 
 def _resolve_ai_service(hass: Any, entry_data: Mapping[str, Any]) -> tuple[str, Mapping[str, Any]]:

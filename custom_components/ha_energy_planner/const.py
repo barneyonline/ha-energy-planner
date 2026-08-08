@@ -37,7 +37,6 @@ CONF_PERSON_ENTITIES = "person_entities"
 CONF_EV_SOC = "ev_soc_entity"
 CONF_EV_CHARGING = "ev_charging_entity"
 CONF_EV_CONNECTED = "ev_connected_entity"
-CONF_EV_CONNECTED_HELPER = "ev_connected_helper"
 CONF_EV_KEEP_CHARGER_ON = "ev_keep_charger_on"
 # Native charger controls. The EV Smart Charging keys below remain readable
 # for upgrades, but are no longer exposed by the config flow.
@@ -132,7 +131,6 @@ DEFAULT_OPTIONS = {
     CONF_EV_MAX_IMPORT_PRICE: 1.0,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED: False,
     CONF_EV_LOW_PRICE_THRESHOLD: 0.0,
-    CONF_EV_CONNECTED_HELPER: False,
     CONF_EV_KEEP_CHARGER_ON: False,
     CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 30,
     CONF_EV_CONFIRMATION_RETRIES: 1,

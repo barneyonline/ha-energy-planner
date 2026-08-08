@@ -41,18 +41,13 @@ from .const import (
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CONNECTED,
-    CONF_EV_CONNECTED_HELPER,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
@@ -86,12 +81,13 @@ from .models import (
     HAEOSolvePhase,
     HAEOStatus,
     InputHealth,
+    OutcomeResult,
     Override,
     PlannerMode,
     to_jsonable,
 )
 from .planner import DryRunPlanner
-from .preflight import build_preflight_report, production_evidence_fingerprint
+from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
 from .recorder_import import async_import_ev_trip_history_from_recorder
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
@@ -134,26 +130,6 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
         "resolution_minutes",
     }
 )
-
-
-def _configured_control_options(entry_data: dict[str, Any]) -> dict[str, bool]:
-    """Return control toggles for device areas that have writable mappings."""
-    ev_configured = any(
-        bool(str(entry_data.get(key, "") or "").strip())
-        for key in (
-            CONF_EV_CHARGER,
-            CONF_EV_CHARGER_START,
-            CONF_EV_CHARGER_STOP,
-            CONF_EV_SMART_CHARGING,
-            CONF_EV_SMART_CHARGING_START,
-            CONF_EV_SMART_CHARGING_STOP,
-        )
-    )
-    return {
-        CONF_EV_CONTROL_ENABLED: ev_configured,
-        CONF_CLIMATE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
-        CONF_ENPHASE_CONTROL_ENABLED: bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
-    }
 
 
 def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
@@ -254,6 +230,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._boundary_cancel: Callable[[], None] | None = None
         self._planner_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
+        self._device_control_lock = asyncio.Lock()
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
         self.entry_topology_signature: tuple[Any, ...] | None = None
@@ -833,19 +810,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_request_refresh()
         return result
 
-    async def async_set_ev_connected_helper(self, connected: bool) -> None:
-        """Persist the native connected helper and refresh EV history and planning."""
-        options = self.options
-        options[CONF_EV_CONNECTED_HELPER] = connected
-        config_entries = getattr(self.hass, "config_entries", None)
-        update_entry = getattr(config_entries, "async_update_entry", None)
-        if callable(update_entry):
-            update_entry(self.entry, options=options)
-        if not self.entry_data.get(CONF_EV_CONNECTED):
-            await self._async_record_ev_trip_event()
-        self._mark_forced_refresh("ev_connected_helper_changed")
-        await self.async_request_refresh()
-
     async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
         """Validate and persist the preconditioning keep-on policy."""
         entry_data = self.entry_data
@@ -1010,8 +974,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Record compact EV trip history from current connection/SOC states."""
         entry_data = self.entry_data
         connected = _bool_state_value(self.hass, entry_data.get(CONF_EV_CONNECTED))
-        if connected is None and not entry_data.get(CONF_EV_CONNECTED):
-            connected = bool(self.options.get(CONF_EV_CONNECTED_HELPER, False))
         soc_percent = _float_state_value(self.hass, entry_data.get(CONF_EV_SOC))
         updated, changed = update_trip_history_from_values(
             dict(self.store.data.get("trip_history", {})),
@@ -1060,10 +1022,24 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.async_disarm_production_control("automatic_control_disabled")
             return
 
-        options.update(_configured_control_options(self.entry_data))
         options[CONF_DRY_RUN] = True
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
+
+        device_control_selected = any(
+            strict_bool(self.options.get(key), default=False)
+            for key in (
+                CONF_EV_CONTROL_ENABLED,
+                CONF_CLIMATE_CONTROL_ENABLED,
+                CONF_ENPHASE_CONTROL_ENABLED,
+            )
+        )
+        if not device_control_selected:
+            raise HomeAssistantError(
+                "Automatic control requires at least one selected device control area",
+                translation_domain=DOMAIN,
+                translation_key="active_control_no_device_selected",
+            )
 
         report = build_preflight_report(self.hass, self)
         if not report.get("safe_to_activate_now"):
@@ -1079,6 +1055,60 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.options
         options[CONF_DRY_RUN] = False
         self.hass.config_entries.async_update_entry(self.entry, options=options)
+        await self.async_handle_options_update()
+
+    async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
+        """Enable or safely restore exactly one device control area."""
+        async with self._device_control_lock:
+            await self._async_set_device_control(option_key, enabled)
+
+    async def _async_set_device_control(self, option_key: str, enabled: bool) -> None:
+        """Apply one serialized device control transition."""
+        control_areas = {
+            CONF_EV_CONTROL_ENABLED: ("ev", "ev"),
+            CONF_CLIMATE_CONTROL_ENABLED: ("hvac", "daikin"),
+            CONF_ENPHASE_CONTROL_ENABLED: ("enphase", "enphase"),
+        }
+        if option_key not in control_areas:
+            raise ValueError(f"Unsupported device control option: {option_key}")
+        if strict_bool(self.options.get(option_key), default=False) is enabled:
+            return
+
+        area, executor_asset = control_areas[option_key]
+        proposed_options = {**self.options, option_key: enabled}
+        area_report = _control_area_report(self.entry_data, proposed_options)
+        if enabled and not area_report["details"][area]["configured"]:
+            raise HomeAssistantError(
+                "The selected device control area is not configured",
+                translation_domain=DOMAIN,
+                translation_key="device_control_not_configured",
+            )
+
+        if self.active_control and enabled:
+            report = build_preflight_report(self.hass, self, options_override=proposed_options)
+            if not report.get("safe_to_activate_now"):
+                reason = _active_control_not_ready_reason(report)
+                raise HomeAssistantError(
+                    f"Device control is not ready: {reason}",
+                    translation_domain=DOMAIN,
+                    translation_key="device_control_not_ready",
+                    translation_placeholders={"reason": reason},
+                )
+
+        if not enabled:
+            async with self._planner_lock:
+                outcome = await self.executor.async_restore_device_control(
+                    executor_asset,
+                    f"{area}_control_disabled",
+                )
+            if outcome.result == OutcomeResult.FAILED:
+                raise HomeAssistantError(
+                    "The selected device could not be restored, so its control switch remains on",
+                    translation_domain=DOMAIN,
+                    translation_key="device_control_restore_failed",
+                )
+
+        self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
         await self.async_handle_options_update()
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
