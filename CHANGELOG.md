@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- A mapped household-load entity that has not yet been restored during Home
+  Assistant startup no longer records a failed training attempt or starts the
+  six-hour retry backoff. Energy Planner remains fail-closed and retries on the
+  next refresh after the source appears.
+
 ## 0.9.2 - 2026-08-09
 
 ### Changed

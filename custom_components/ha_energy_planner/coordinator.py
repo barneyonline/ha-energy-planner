@@ -50,6 +50,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
+    CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_PERSON_ENTITIES,
@@ -87,13 +88,25 @@ from .models import (
 )
 from .planner import DryRunPlanner
 from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
-from .recorder_import import async_import_ev_trip_history_from_recorder, async_update_builtin_load_forecast
+from .recorder_import import (
+    async_import_ev_trip_history_from_recorder,
+    async_update_builtin_load_forecast,
+    load_forecast_source_available,
+)
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
 from .type_defs import EnergyPlannerConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
+
+_LOAD_FORECAST_TRAINING_DEFERRED_REASONS = frozenset(
+    {
+        "load_forecast_household_load_not_configured",
+        "load_forecast_household_load_unavailable",
+        "load_forecast_training_recent",
+    }
+)
 
 _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
     {
@@ -129,6 +142,11 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
         "resolution_minutes",
     }
 )
+
+
+def _updated_load_forecast_training_attempted(previously_attempted: bool, reason: str) -> bool:
+    """Keep the startup attempt pending while training is deferred."""
+    return previously_attempted or reason not in _LOAD_FORECAST_TRAINING_DEFERRED_REASONS
 
 
 def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
@@ -319,6 +337,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._tearing_down = False
         self._schedule_next_boundary_refresh()
         entry_data = self.entry_data
+        self._start_load_forecast_source_listener(entry_data)
         entity_ids = _configured_entity_ids(entry_data)
         if not entity_ids:
             return
@@ -369,6 +388,45 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         elif helper_value == "off" and helper_override_active:
             self.hass.async_create_task(self._async_handle_manual_override_helper(False))
 
+    def _start_load_forecast_source_listener(self, entry_data: dict[str, Any]) -> None:
+        """Retry startup training once when the mapped load source appears."""
+        if getattr(self, "_load_forecast_training_attempted", False):
+            return
+        load_entity = str(entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
+        if not load_entity:
+            return
+
+        active = True
+        unsubscribe: Callable[[], None] | None = None
+
+        @callback
+        def _retry_if_available(state: Any) -> None:
+            nonlocal active, unsubscribe
+            if not active or not load_forecast_source_available(state):
+                return
+            active = False
+            if unsubscribe is not None:
+                current_unsubscribe = unsubscribe
+                unsubscribe = None
+                if current_unsubscribe in self._unsub_listeners:
+                    self._unsub_listeners.remove(current_unsubscribe)
+                current_unsubscribe()
+            self._schedule_debounced_refresh(
+                "load_forecast_source_available",
+                debounce_seconds=0,
+                force=True,
+            )
+
+        @callback
+        def _handle_source_change(event: Any) -> None:
+            _retry_if_available(event.data.get("new_state"))
+
+        unsubscribe = async_track_state_change_event(self.hass, [load_entity], _handle_source_change)
+        self._unsub_listeners.append(unsubscribe)
+        # Close the setup race where the source appears after the first refresh
+        # but before this state-change listener is registered.
+        _retry_if_available(self.hass.states.get(load_entity))
+
     def async_shutdown(self) -> None:
         """Cancel listeners and pending debounced refresh."""
         # A refresh task may already be queued even after its timer/listener is
@@ -393,9 +451,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         trigger: str = "state_change",
         *,
         debounce_seconds: float = DEBOUNCE_SECONDS,
+        force: bool = False,
     ) -> None:
         """Coalesce repeated input changes into one coordinator refresh."""
-        self._mark_replan_requested()
+        self._mark_replan_requested(force=force)
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._increment_refresh_counter("coalesced")
@@ -526,7 +585,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 force=not getattr(self, "_load_forecast_training_attempted", False),
             )
         )
-        self._load_forecast_training_attempted = True
+        self._load_forecast_training_attempted = _updated_load_forecast_training_attempted(
+            getattr(self, "_load_forecast_training_attempted", False),
+            load_forecast_reason,
+        )
         if load_forecast_changed:
             await self.store.async_save_builtin_load_forecast(load_forecast_model)
         manager = InputManager(
