@@ -28,7 +28,7 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Supported device categories
 
 - Four user-facing status entities: **Armed**, **Current state**, **Next actions**, and the **Plan** calendar
-- Energy inputs for import/export tariffs, PV forecasts, baseline load forecasts, optional grid carbon-intensity forecasts, optional measured PV/load power for forecast validation, weather, and battery state of charge
+- Energy inputs for import/export tariffs, external PV forecasts, a measured whole-home power sensor, optional grid carbon-intensity and weather forecasts, optional measured PV power for forecast validation, and battery state of charge
 - Native EV smart charging with native or external target-SOC input, ready-by controls, direct charger start/stop with charging-state confirmation, a connected helper, minimum-SOC recovery, preconditioning keep-on policy, price limits, low-price charging, continuous or interval-based schedules, and charge energy estimates
 - Climate comfort targets, full-horizon tariff preconditioning, zone takeover/restoration, HVAC power modeling, manual override handling, and presence-aware control
 - Presence as a separate device, including multi-person occupancy inputs
@@ -40,12 +40,12 @@ Local-first Home Assistant integration for planning and safely coordinating hous
 ## Key features
 
 - Guided setup with no required inputs on initial install; configure Energy, Climate, Presence, Enphase, AI, and EV inputs in sections on one central settings page
-- Forecast calibration is opt-in through separate observed PV and household-load power sensors; validated lead-time models learn expected values plus conservative PV/load uncertainty bounds, and forecast entities are never treated as ground truth
+- PV forecast calibration is opt-in through a separate observed PV power sensor. Household load is forecast locally from Recorder history using the required measured whole-home power sensor; forecast entities are never treated as measured load
 - A compact system view: **Armed** reports whether commands may run, **Current state** shows every live controlled area, **Next actions** shows every area's next state in the same combined format and explains upcoming decisions in attributes, and **Plan** exposes those actions as calendar events
 - Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
 - Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
 - Battery-aware decisions using configured usable capacity, reserve floor, round-trip efficiency, maximum charge power, and maximum discharge power
-- HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, per-slot baseline/flexible evidence provenance, and bounded fallback planning when HAEO is unavailable, unhealthy, or unable to return planning evidence
+- Optional HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, per-slot baseline/flexible evidence provenance, and bounded deterministic planning when HAEO is absent, unavailable, unhealthy, or unable to return planning evidence
 - Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
 - EV planning with connected state or a native connected helper, SOC, confirmed start/stop commands, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
 - Multiple EVs through separate named planner entries with isolated entities, history, production controls, execution audit, and persisted state
@@ -109,10 +109,10 @@ Energy Planner does not authenticate directly with vendor cloud APIs. It reads e
 Energy Planner can be useful with different source integrations, but the current implementation is built around these common inputs:
 
 - Amber Electric price sensors for import/export tariffs from the Home Assistant core [Amber Electric integration](https://github.com/home-assistant/core/tree/dev/homeassistant/components/amberelectric) or [hass-energy/amber-express](https://github.com/hass-energy/amber-express).
-- Solar production forecast sensors from [BJReplay/ha-solcast-solar](https://github.com/BJReplay/ha-solcast-solar), [hass-energy/hafo](https://github.com/hass-energy/hafo), or another forecast integration that exposes Home Assistant sensor data.
-- Baseline load forecast sensors from [hass-energy/hafo](https://github.com/hass-energy/hafo) or another forecast source that exposes household load forecast data.
+- Solar production forecast sensors from [BJReplay/ha-solcast-solar](https://github.com/BJReplay/ha-solcast-solar) or another forecast integration that exposes Home Assistant sensor data.
+- A whole-home instantaneous power sensor in W, kW, or MW, with Home Assistant Recorder enabled. Energy Planner builds its household-load forecast locally; HAFO is not required.
 - Weather inputs from [bremor/bureau_of_meteorology](https://github.com/bremor/bureau_of_meteorology) or another Home Assistant weather provider.
-- HAEO optimization through [hass-energy/haeo](https://github.com/hass-energy/haeo), using the response-capable `haeo.optimize` service.
+- Optional HAEO optimization through [hass-energy/haeo](https://github.com/hass-energy/haeo), using the response-capable `haeo.optimize` service. HAEO is an enhancement, not a prerequisite for deterministic actions.
 - Enphase profile monitoring and control through [barneyonline/ha-enphase-energy](https://github.com/barneyonline/ha-enphase-energy) or another integration that exposes the system profile as a selectable entity.
 - A charger or vehicle integration that exposes a writable charging switch, or separate start/stop buttons. Energy Planner performs the smart-charging optimization itself.
 - BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
@@ -121,7 +121,15 @@ Energy Planner can be useful with different source integrations, but the current
 
 For Amber-backed planning, start with the 12-hour default. Energy Planner reports each source's first and last timestamps, covered and continuous hours, and leading, internal, and trailing gaps. A degraded 8-to-under-12-hour window remains visible but does not produce eligible device actions under the existing healthy-input action gate.
 
-Required Amber, PV, and baseline-load inputs must expose forecast series; a numeric current value is retained only for the current slot and cannot satisfy forecast coverage.
+Required Amber and PV inputs must expose forecast series; a numeric current value is retained only for the current slot and cannot satisfy forecast coverage. Household load instead requires a normal measured whole-home power sensor.
+
+## Built-in household load forecast
+
+Energy Planner trains a deterministic local model from up to 28 days of Recorder history. It converts measured power to time-weighted 15-minute local-time buckets, excludes known EV charging, subtracts time-aligned measured HVAC power when configured, and learns robust weekday/weekend clock-time profiles. The planner uses both an expected load and a conservative upper bound.
+
+The model needs at least seven complete days, 80% valid coverage, two leakage-free holdout origins with at least 144 aligned samples, accuracy no more than 10% worse than previous-day persistence, and at least 90% upper-bound coverage. Models are **ready** through 24 hours, **degraded** from 24 to 72 hours, and **stale** after 72 hours. Learning and stale/failed models remain visible in **Current state**, **Next actions**, the **Plan** calendar, diagnostics, and dry-run plans, but forecast-dependent active commands fail closed. Learning is silent; a broken mapping, missing Recorder, or a model that remains unusable requires user action and can notify once.
+
+Training runs at startup, after the measured source changes, and at most every six hours. A retraining candidate that fails quality gates does not replace the last valid aggregate; that model ages through degraded to stale while the failed validation remains visible. Only aggregate profiles, validation metrics, source/version identity, and timestamps are stored—never raw Recorder history. Changing the measured source or forecast contract invalidates production review evidence and requires new review cycles and re-arming; routine retraining does not.
 
 ## Native EV smart charging
 
@@ -159,7 +167,7 @@ Create one named Energy Planner integration entry per EV. Each entry has its own
 
 Each entry plans independently, but active execution uses one shared in-memory household reservation gate. Scheduled start and keep-on actions require a usable household projection and atomically reserve their projected EV load against the strictest configured grid-import limit among active reservations. A reservation remains held until a stop or safe-state restoration is confirmed. Observed disconnection requests a stop and does not release headroom until the charger control is proven safe, preventing automatic charging on reconnection from racing ahead of the next plan. Before issuing a start, the reservation and original actuator topology are persisted; after an interrupted command, active control must confirm a recovery stop on that original topology before a new start can run. The reservation high-watermark is rehydrated before entries execute after restart, so an unclean restart cannot forget a previously higher active charge rate; an explicit confirmed release is persisted as inactive. Runtime option changes can increase an active reserved load immediately, but neither the option update nor a later start/no-op action can reduce it while the charger may still draw the earlier load. Import-limit policy updates apply immediately to single- and multi-EV reservations. When combined reservations no longer fit the strictest household limit, one shared atomic shedding claim selects a single loaded planner entry for the confirmed safety-stop path. Other entries keep their reservations while that claim is active, preventing concurrent evaluations from stopping every EV. A failed claimant retains its uncertain reservation but releases the claim so another loaded, controllable EV can attempt shedding; unloaded claimants are handled the same way. The claim clears when the selected reservation is released so the remaining capacity can be evaluated again. This also prevents concurrent entries from consuming the same projected headroom. Energy Planner still does not perform joint cost optimization across vehicles, so charging priority remains first-safe-action-wins when the combined plans do not fit.
 
-For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Secondary values must have timezone-aware timestamps and are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. Until per-slot provenance is retained, secondary PV slots are deliberately excluded from forecast calibration. A baseline-load forecast may conservatively fill up to one hour of missing leading slots from its current numeric state; this is reported explicitly and reduces source confidence.
+For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Secondary values must have timezone-aware timestamps and are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. Until per-slot provenance is retained, secondary PV slots are deliberately excluded from forecast calibration.
 
 ## Safety model
 
@@ -226,12 +234,11 @@ All services accept an optional `config_entry_id`. It may be omitted with one lo
 
 1. Install Energy Planner and add it from **Devices & services**.
 2. Add planning areas from the integration page.
-3. Map the required source entities and services for the planning areas you want to use.
+3. Map the required Amber tariff forecasts, external PV forecast, measured whole-home power sensor, battery SOC, and the device inputs for the planning areas you want to use. Confirm Recorder is enabled.
 4. Review the **EV, battery, and grid** configuration, especially EV minimum/maximum SOC, charge rate, earliest start, continuous charging, charging confirmation timeout/retries, price limits, usable home-battery capacity, efficiency, and max charge/discharge power. For climate control, also review the horizon, tariff deltas, lead time, comfort helpers, automations, zones, and manual-override helper.
 5. Set fallback Target SOC under **EV, battery and grid**. Turn on the **Climate control**, **EV control**, and/or **Enphase control** switches for the mapped devices you want Energy Planner to manage. Set other day-to-day behavior through Ready by, Keep charger on, Opportunistic charging, and its price threshold.
 6. Review **Current state** to confirm the mapped climate, EV, and Enphase entities are the ones you expect.
-7. Review **Next actions** and the **Plan** calendar while **Automatic control** is off. Expand the action attributes to see why each action was selected and which constraints were applied. Fix missing,
-   unavailable, stale, invalid, or low-confidence inputs.
+7. Review **Next actions** and the **Plan** calendar while **Automatic control** is off. Expand the action attributes to see why each action was selected and which constraints were applied. Wait for the built-in load model to become ready, then fix any missing, unavailable, stale, or invalid inputs.
 8. When the plan matches your expectations and the required device control switches are on, turn **Automatic control** on. The
    integration performs preflight, production arming, and the active-mode
    transition together. If more evidence is needed, the switch stays off; review
@@ -273,7 +280,7 @@ This runs:
 - Replay fixtures
 - Live-schema fixture validation
 - Real-history fixture validation
-- Rolling-origin PV/load forecast accuracy gates with MAE/RMSE by lead-time bucket and persistence-baseline comparison
+- Rolling-origin external-PV calibration gates plus built-in household-load holdout, persistence-MAE, conservative-coverage, resampling, and DST tests
 - Home Assistant `check_config`
 - Docker smoke test against a real Home Assistant container, unless `HEP_SKIP_HA_SMOKE=1` is set
 
@@ -309,9 +316,7 @@ HOME_ASSISTANT_TOKEN=... \
 HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
 HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
 HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
-HEP_BASELINE_LOAD_ENTITY=sensor.baseline_load_forecast \
 HEP_PV_ACTUAL_ENTITY=sensor.pv_power \
-HEP_LOAD_FORECAST_ENTITY=sensor.baseline_load_forecast \
 HEP_LOAD_ACTUAL_ENTITY=sensor.household_load_power \
 HEP_WEATHER_ENTITY=weather.home \
 HEP_HAEO_SERVICE=haeo.optimize \

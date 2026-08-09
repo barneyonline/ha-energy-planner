@@ -42,6 +42,7 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.executor import (
     Executor,
+    _actionable_input_issues,
     _clean_reason_codes,
     _daily_action_cap_reason,
     _device_control_disabled_reason,
@@ -67,6 +68,18 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+
+def test_only_actionable_load_forecast_failures_request_notifications() -> None:
+    assert _actionable_input_issues(["household_load_entity_forecast_learning"]) == []
+    assert _actionable_input_issues(["household_load_entity_forecast_degraded"]) == []
+    assert _actionable_input_issues(["household_load_entity_forecast_failed"]) == [
+        "household_load_entity_forecast_failed"
+    ]
+    assert _actionable_input_issues(["haeo_service_not_configured"]) == []
+    assert _actionable_input_issues(["household_load_entity_forecast_stale"]) == [
+        "household_load_entity_forecast_stale"
+    ]
 
 
 class FakeStore:

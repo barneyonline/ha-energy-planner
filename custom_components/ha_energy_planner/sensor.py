@@ -394,6 +394,9 @@ def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         "health": "Unknown" if plan is None else _display_state(plan.health),
         "controlled_assets": _controlled_state_groups(coordinator),
     }
+    load_forecast = _built_in_load_forecast_attrs(coordinator)
+    if load_forecast:
+        attrs["load_forecast"] = load_forecast
     return {key: value for key, value in attrs.items() if value is not None}
 
 
@@ -537,6 +540,11 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     audit = dict(plan.decision_audit or {})
     accepted = _accepted_decisions(plan)
     actions = [_action_with_determination(action, accepted, audit) for action in _ordered_actions(plan)[:12]]
+    load_forecast = _built_in_load_forecast_attrs(coordinator)
+    for action in actions:
+        determination = action.get("determination")
+        if isinstance(determination, dict):
+            determination["load_forecast"] = load_forecast
     return {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
@@ -546,6 +554,7 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "decision_summary": audit.get("summary"),
         "policy_order": _bounded_json(audit.get("policy_order", [])),
         "marginal_budget": _bounded_json(audit.get("marginal_budget", {})),
+        "load_forecast": load_forecast,
         "action_count": len(plan.actions),
         "actions": actions,
         "ai_explanation": _ai_advice_attrs(coordinator),
@@ -588,7 +597,7 @@ def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
     if not isinstance(model, dict):
         return {"calibration_enabled": False, "fields": {}}
     fields: dict[str, Any] = {}
-    for field in ("pv_forecast_kw", "baseline_load_forecast_kw"):
+    for field in ("pv_forecast_kw",):
         field_model = model.get(field, {})
         if not isinstance(field_model, dict):
             continue
@@ -1461,6 +1470,38 @@ def _forecast_coverage_sources(coordinator: EnergyPlannerCoordinator) -> list[di
     ]
 
 
+def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return bounded built-in model evidence without exposing stored profiles."""
+    latest = _latest_forecast_snapshot(coordinator)
+    value = latest.get("built_in_load_forecast") if isinstance(latest, dict) else None
+    if not isinstance(value, dict):
+        value = {}
+    keys = (
+        "source",
+        "status",
+        "model_version",
+        "contract_version",
+        "trained_at",
+        "last_attempt_at",
+        "unusable_since",
+        "model_age_hours",
+        "history_started_on",
+        "history_ended_on",
+        "history_days",
+        "complete_days",
+        "history_coverage",
+        "forecast_coverage",
+        "recent_correction_factor",
+        "first_expected_kw",
+        "first_upper_kw",
+        "quality_failures",
+        "validation",
+        "cleaning",
+        "update_reason",
+    )
+    return {key: _bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
+
+
 def _latest_forecast_snapshot(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the most recent forecast snapshot for the current plan where possible."""
     snapshots = coordinator.store.data.get("forecast_snapshots", [])
@@ -1534,7 +1575,7 @@ def _confidence_source_label(source: dict[str, Any]) -> str:
         "amber_export_price_entity": "Amber export price",
         "pv_forecast_entity": "PV forecast",
         "pv_forecast_secondary_entity": "Second PV forecast",
-        "baseline_load_forecast_entity": "Baseline load forecast",
+        "household_load_entity": "Built-in household load forecast",
         "weather_entity": "Weather forecast",
     }
     config_key = str(source.get("config_key", "unknown"))
@@ -1548,14 +1589,12 @@ def _confidence_source_reason(source: dict[str, Any]) -> str:
         return "Forecast series found; confidence comes from entity metadata when present, otherwise 100%."
     if source_kind == "forecast_series_stitched":
         return "Timestamped forecast series were stitched, with the primary source taking precedence on overlap."
-    if source_kind == "forecast_series_leading_fill":
-        return (
-            "A short leading load gap was conservatively filled from the current numeric state at reduced confidence."
-        )
     if source_kind == "forecast_series_partial":
         return (
             "Forecast series coverage is shorter than the displayed planning horizon; coverage thresholds limit health."
         )
+    if source_kind == "built_in_recorder_history":
+        return "A local deterministic forecast learned from measured household load in Home Assistant Recorder."
     if source_kind == "point_value_repeated":
         return (
             "Only a current point value was found, so it is repeated across the planning horizon with a "

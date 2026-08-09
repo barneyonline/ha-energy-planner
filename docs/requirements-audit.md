@@ -222,8 +222,8 @@ Status as of 2026-08-09.
 - Replay fixtures cover stale inputs, battery floor rejection, EV infeasible
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, and Enphase holds.
-- Executable live-schema fixtures cover representative Amber price, PV/HAFO,
-  baseline-load, weather, timestamp-keyed nested HAEO, and list-based nested
+- Executable live-schema fixtures cover representative Amber price, external
+  PV, historical external-load parser compatibility, weather, timestamp-keyed nested HAEO, and list-based nested
   HAEO response payload shapes through `scripts/validate-live-schema-fixture.py`,
   so sanitized real Home Assistant exports can be validated outside pytest.
   `scripts/export-real-live-schema.sh` wraps the required real export set, and
@@ -260,11 +260,9 @@ Status as of 2026-08-09.
   stitching across midnight and daylight-saving changes. Secondary series must
   expose timezone-aware timestamps; untimestamped and naive timestamps are
   diagnosed and rejected, and secondary slots are excluded from calibration
-  until per-slot issue-time provenance is retained. Required Amber, PV, and
-  load point values cannot satisfy forecast coverage. Short baseline-load
-  leading gaps are filled from the current numeric state for at most one hour,
-  with explicit diagnostic evidence and reduced confidence; long or internal
-  gaps remain missing and fail closed.
+  until per-slot issue-time provenance is retained. Required Amber and PV point
+  values cannot satisfy forecast coverage. Household load uses the built-in
+  Recorder model and never accepts a legacy forecast entity as measured input.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
   enforces all real validation profiles in one command so full real-system
   evidence cannot accidentally skip live-schema, HAEO value, or Recorder
@@ -280,12 +278,11 @@ Status as of 2026-08-09.
   Automatic control and its three device selectors, device registry registration, persisted active plan, HAEO run
   metadata including parsed camelCase grid-charge and export/discharge evidence
   counts from a response-capable Home Assistant service, discovery storage,
-  forecast snapshot training slots sourced from Home Assistant template-sensor
-  forecast attributes using canonical live-style key variants and W-to-kW
-  normalization, Amber cent/kWh forecast attributes reflected in compact plan
+  forecast snapshot training slots sourced from Home Assistant PV template
+  attributes and the persisted built-in household-load model, Amber cent/kWh forecast attributes reflected in compact plan
   previews, weather camelCase forecast attributes reflected in compact plan previews,
-  forecast calibration state updated from time-aligned, dedicated observed-power
-  entities, HVAC thermal-model state updated from Home Assistant climate and
+  PV forecast calibration updated from a time-aligned observed-power entity,
+  built-in load health/evidence stored without raw history, HVAC thermal-model state updated from Home Assistant climate and
   power entity samples, Recorder import metadata, and a compact EV trip
   imported from Home Assistant Recorder state history. It also verifies
   bounded forecast-snapshot action metadata for the active EV schedule with
@@ -321,16 +318,16 @@ Status as of 2026-08-09.
 - Forecast normalization parses common forecast/list attributes, nested
   prediction wrappers, timestamp-keyed forecast maps, canonical camelCase key
   variants, item-level units, and state-level units for Amber import/export,
-  PV, and baseline-load entities, including cent-to-dollar price and W/kW/MW
-  power normalization, plus weather forecast temperature attributes, with
+  external PV entities and measured household load, including cent-to-dollar
+  price and W/kW/MW power normalization, plus weather forecast temperature attributes, with
   point-sensor fallback. Optional point-sensor power inputs used for forecast
   calibration and the HVAC thermal model use the same W/kW/MW normalization.
   HAEO evidence applies the same W/kW/MW normalization and canonical key
   matching before grid-limit or arbitrage calculations. Representative
-  integration-specific Amber, PV/HAFO, weather, and HAEO schemas are covered by
+  integration-specific Amber, external PV, weather, and optional HAEO schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
-- Compact PV and baseline-load forecast calibration is implemented. It records
-  due forecasts only when a separately configured measured-power observation is
+- Compact external-PV forecast calibration is implemented. It records due PV
+  forecasts only when a separately configured measured-power observation is
   timestamp-aligned, deduplicates forecast targets and lead-time buckets, and
   retains a bounded sample window with diverse forecast horizons. Independent
   robust bounded factors are trained per 30-minute lead-time bucket and enabled
@@ -338,7 +335,39 @@ Status as of 2026-08-09.
   observations and time; near-term evidence cannot alter day-ahead slots.
   Forecast entities are never used as
   actuals, overdue slots are not paired to a current reading, and non-finite
-  persisted factors and sample values are ignored.
+  persisted factors and sample values are ignored. Obsolete external-load
+  calibration is discarded.
+- Built-in household-load forecasting is implemented in
+  `custom_components/ha_energy_planner/load_forecast.py` and trained through
+  `recorder_import.py`. Up to 28 days of Recorder state changes are converted
+  into time-weighted 15-minute local buckets. Known EV-charging intervals are
+  excluded, aligned HVAC power is subtracted and clamped at zero, and unknown
+  cleaning intervals are not admitted as clean observations. Robust clock-time
+  medians are blended with weekday/weekend evidence using `n / (n + 3)`.
+  Expected and conservative profiles require three observations per bucket;
+  only gaps of at most 30 minutes are interpolated. A bounded recent-load
+  correction fades to neutral over two hours, and UTC planning slots are mapped
+  through timezone-aware local timestamps for DST folds and gaps.
+- Readiness requires seven complete days, 80% valid historical coverage, two
+  leakage-free holdout origins with at least 144 aligned samples, MAE no more
+  than 10% worse than previous-day persistence, and at least 90% conservative
+  coverage. Ready models are healthy through 24 hours, degraded through 72
+  hours, and stale afterward. Learning remains silent; missing mapping,
+  unavailable Recorder after a model becomes unsafe, failed quality gates, and
+  learning that remains unusable for 72 hours are actionable. Training occurs
+  at startup, after source changes, and no more than every six hours, with
+  failed-attempt backoff. Only aggregate profiles, validation metrics, source
+  and contract identity, and timestamps are persisted.
+- Config-entry version 2 migrates only the legacy measured-load mapping to
+  `household_load_entity`; a legacy forecast-only mapping is removed and active
+  control remains fail-closed until a real measured sensor is selected. The
+  production evidence fingerprint includes the measured mapping and built-in
+  forecast contract version, but excludes routine model values and retraining
+  timestamps. Relevant evidence is exposed through the existing Current state,
+  Next actions, calendar, diagnostics, and support surfaces without adding an
+  entity. Tests cover normalization, cleaning, quality gates, correction,
+  resampling, DST, age/source/corruption recovery, migration, Recorder failure,
+  persistence, notifications, and operation without HAEO or HAFO.
 - Runtime calibration snapshots retain dense near-term targets plus bounded,
   stratified targets through the complete planning horizon. Enabled lead-time
   models expose p10/p90-style bounded factors; conservative flexibility and

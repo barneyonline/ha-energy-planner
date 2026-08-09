@@ -4,6 +4,15 @@
 
 ### Changed
 
+- Replaced the required external baseline-load forecast with a built-in,
+  deterministic household-load forecast trained from up to 28 days of Home
+  Assistant Recorder history. Energy setup now requires a measured whole-home
+  power sensor and keeps the external PV forecast. The model exposes expected
+  and conservative load evidence through the existing status and calendar
+  surfaces, handles weekday/weekend patterns and DST, and fails closed for
+  active commands while learning, stale, or failed. HAFO is no longer required;
+  HAEO remains optional. Existing measured-load mappings migrate automatically,
+  while forecast-only legacy entries require the user to select a real sensor.
 - Added individual **Climate control**, **EV control**, and **Enphase control**
   switches. **Automatic control** remains the master arm switch and now respects
   the selected device switches instead of enabling every configured area.

@@ -2158,10 +2158,16 @@ def _actionable_input_issues(issues: list[str]) -> list[str]:
         "_invalid",
         "_unsupported",
         "_unavailable",
+        "_forecast_failed",
+        "_forecast_stale",
         "unexpected_domain",
         "unknown_unit",
     )
-    return [code for code in _clean_reason_codes(issues) if any(marker in code for marker in actionable_markers)]
+    return [
+        code
+        for code in _clean_reason_codes(issues)
+        if not code.startswith("haeo_") and any(marker in code for marker in actionable_markers)
+    ]
 
 
 def _clean_reason_codes(codes: list[str]) -> list[str]:

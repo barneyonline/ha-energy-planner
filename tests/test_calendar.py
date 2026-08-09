@@ -33,6 +33,17 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
         reason_codes=["precondition_before_peak"],
     )
     coordinator = _coordinator(_plan([second, first]))
+    coordinator.store.data["forecast_snapshots"] = [
+        {
+            "plan_id": "plan-1",
+            "built_in_load_forecast": {
+                "source": "built_in_recorder_history",
+                "status": "ready",
+                "first_expected_kw": 1.2,
+                "first_upper_kw": 1.5,
+            },
+        }
+    ]
     entity = EnergyPlannerCalendar(coordinator)
 
     assert entity.event is not None
@@ -42,6 +53,7 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     assert "Confidence:" not in (entity.event.description or "")
     assert "Data quality:" in (entity.event.description or "")
     assert "Constraints:" in (entity.event.description or "")
+    assert "Load forecast: ready; expected 1.2 kW; conservative 1.5 kW." in (entity.event.description or "")
 
     events = asyncio.run(
         entity.async_get_events(

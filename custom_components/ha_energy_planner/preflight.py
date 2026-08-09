@@ -30,11 +30,13 @@ from .const import (
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
+    CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
+from .load_forecast import FORECAST_CONTRACT_VERSION
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
@@ -76,6 +78,7 @@ def build_preflight_report(
     entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
+    recorder_required = bool(entry_data.get(CONF_HOUSEHOLD_LOAD))
     safety = _safety_report(options)
     now = dt_util.utcnow()
     evidence_fingerprint = production_evidence_fingerprint(entry_data, options)
@@ -98,6 +101,7 @@ def build_preflight_report(
         *entity_report["unavailable"],
         *service_report["missing"],
         *service_report["unavailable"],
+        *(["recorder"] if recorder_required and not recorder["available"] else []),
     ]
     checks = [
         {
@@ -139,7 +143,7 @@ def build_preflight_report(
         {
             "check": "recorder_available",
             "ok": recorder["available"],
-            "blocking": False,
+            "blocking": recorder_required,
             "message": "Recorder is available for history imports."
             if recorder["available"]
             else "Recorder is not detected.",
@@ -536,6 +540,7 @@ def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[st
         "configured_control_areas": configured,
         "details": {area: {"configured": True} for area in configured},
         "entry_data": {key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS},
+        "load_forecast_contract_version": FORECAST_CONTRACT_VERSION,
         "options": {key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS},
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)

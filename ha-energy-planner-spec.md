@@ -2,12 +2,18 @@
 
 > **v0.6 native EV uplift:** Energy Planner now owns EV smart-charging optimization and directly controls a configured charger switch or start/stop controls. Native Target SOC and Ready by entities supersede the v1 dependency on EV Smart Charging. Legacy keys remain readable only for migration. Where the historical v1 text below refers to EV Smart Charging, the v0.6 implementation and requirement evidence in `docs/requirements-audit.md` take precedence.
 
+> **Built-in load forecast uplift:** Energy Planner now requires a measured
+> whole-home power sensor and trains its household-load forecast locally from
+> Home Assistant Recorder history. HAFO is not required. HAEO is optional and
+> only actions that consume HAEO evidence depend on it. This current contract
+> and `docs/requirements-audit.md` take precedence over historical HAFO/required
+> HAEO language below.
+
 ## 1. Purpose
 
 `ha-energy-planner` is a Home Assistant custom integration that coordinates
-home energy decisions. It uses HAEO as the deterministic optimizer for energy
-flows, and adds the planning and execution logic that HAEO intentionally does
-not provide:
+home energy decisions. It has a deterministic local planner and can optionally
+consume HAEO energy-flow evidence when available:
 
 - EV charging requirements and execution through the existing EV Smart
   Charging integration.
@@ -39,11 +45,12 @@ them without changing the core plan, safety, or audit contracts.
 
 - A rolling 24-hour plan at five-minute resolution.
 - Replanning every five minutes and when material input changes occur.
-- Amber import and export prices, PV forecast, baseline-load forecast, weather,
+- Amber import and export prices, external PV forecast, measured whole-home
+  power with a built-in Recorder-backed load forecast, optional weather,
   occupancy, device state, and vehicle state.
 - Configurable, hard constraints for battery reserve, EV SOC, EV ready-by time,
   and occupied HVAC comfort.
-- Cost-minimizing grid/battery planning through HAEO.
+- Cost-minimizing deterministic planning with optional HAEO enhancement.
 - Automatic control, subject to hard constraints, freshness checks, and manual
   override rules.
 - Local AI advice within a deterministic policy envelope.
@@ -55,8 +62,7 @@ them without changing the core plan, safety, or audit contracts.
   Enphase integration exposes only profiles/modes. The integration uses every
   verified control that is available, but never assumes an undocumented
   command exists.
-- Replacing HAEO, Amber, HAFO, solar forecasting, Enphase, Daikin, or EV Smart
-  Charging.
+- Replacing Amber, solar forecasting, Enphase, or Daikin.
 - Cloud LLM use, LLM-controlled device services, or free-form AI changes to
   hard constraints.
 - A separate database or Home Assistant App/add-on. A future App is an
@@ -88,8 +94,9 @@ them without changing the core plan, safety, or audit contracts.
 The integration shall:
 
 1. Build a normalized five-minute decision context for the next 24 hours.
-2. Obtain a HAEO baseline plan from prices, PV, load forecasts, grid limits,
-   battery state, and configured battery limits.
+2. Build a deterministic baseline plan from prices, external PV, the built-in
+   load forecast, grid limits, battery state, and configured battery limits;
+   enrich it with HAEO evidence when available.
 3. Build hard constraints from user options and current state.
 4. Schedule EV charging to meet forecast driving needs by the active
    `ready_by` deadline at the lowest feasible cost.
@@ -122,9 +129,9 @@ The integration shall:
 
 ```mermaid
 flowchart LR
-  S["Home Assistant Inputs\nAmber, PV, HAFO, weather, Enphase, Daikin, EV, presence"] --> N["Input Normalizer\nunits, freshness, confidence"]
+  S["Home Assistant Inputs\nAmber, PV, measured load, Recorder, weather, devices"] --> N["Input Normalizer and built-in load forecast"]
   N --> C["Decision Context\n24 h x 5 min"]
-  C --> H1["HAEO Baseline Solve"]
+  C --> H1["Optional HAEO Baseline Solve"]
   H1 --> P["Flexible-Load Planner\nEV + HVAC + Enphase profile intent"]
   C --> P
   A["Local AI Advisor\nstructured advice only"] --> P
@@ -141,7 +148,7 @@ flowchart LR
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
 | Source integrations | Expose current state and forecasts. | Make cross-device decisions. |
-| HAEO | Optimize grid, solar, battery, and forecast load energy flows. | Fetch forecasts, infer intent, or control devices. |
+| HAEO (optional) | Enhance grid, solar, battery, and forecast-load evidence. | Fetch forecasts, infer intent, or control devices. |
 | `ha-energy-planner` | Compose inputs, create EV/HVAC/profile plan, validate and execute it. | Depend on HAEO private implementation internals. |
 | Home Assistant automations | Continue normal HVAC scheduling outside planner takeover. | Override active planner ownership without the agreed handoff. |
 | Local AI advisor | Produce bounded recommendations and explanations. | Call services, modify hard constraints, or replace the deterministic planner. |
@@ -149,8 +156,8 @@ flowchart LR
 ### 5.2 Two-pass planning loop
 
 1. Normalize forecast and current-state inputs.
-2. Call or wait for HAEO to solve the baseline system.
-3. Use HAEO forecast output with EV and HVAC constraints to create candidate
+2. Build the deterministic baseline and optionally request a HAEO solve.
+3. Use available deterministic and HAEO evidence with EV and HVAC constraints to create candidate
    flexible-load actions.
 4. Convert candidate actions into projected flexible-load power forecasts.
 5. Run HAEO a second time with projected flexible demand included.
@@ -170,7 +177,7 @@ entity IDs change. The following current entities are expected starting points.
 | Amber | `sensor.amber_express_home_general_price` | Import price and forecast. |
 | Amber | `sensor.amber_express_home_feed_in_price` | Export price and forecast. |
 | Amber | `binary_sensor.amber_express_home_price_spike` | Price-spike input and diagnostic signal. |
-| HAEO | `haeo.optimize` service and HAEO forecast sensors | Baseline and second-pass energy-flow plan. |
+| HAEO (optional) | `haeo.optimize` service and HAEO forecast sensors | Baseline and second-pass energy-flow enhancement. |
 | HAEO | Grid, battery, solar, load, and price forecast entities | Forecast exchange and validation. |
 | Enphase | Enphase battery SOC, grid, PV, consumption, and system profile entities | Current energy state and profile control verification. |
 | Daikin | `climate.daikinap02966` | Direct HVAC mode and target control. |
@@ -351,11 +358,18 @@ preview in entity attributes.
 
 ### 9.1 Baseline load and PV
 
-- Use HAFO and the existing solar forecast as primary forecasts.
-- Record forecast-versus-actual error per time slot.
-- Apply a bounded calibration factor only after replay tests demonstrate an
-  improvement over the source forecast.
-- Keep controllable EV and HVAC consumption out of baseline load.
+- Keep an external solar forecast as the required PV input and calibrate it
+  only against a separately measured PV sensor.
+- Train household load locally from up to 28 days of Recorder history for a
+  required measured whole-home W/kW/MW sensor.
+- Convert history to time-weighted 15-minute local-time buckets, exclude known
+  EV charging, and subtract aligned measured HVAC power when configured.
+- Use robust clock-time medians blended with weekday/weekend history, a
+  conservative empirical/residual upper bound, bounded recent correction, and
+  timezone-aware resampling.
+- Require the documented history, coverage, leakage-free holdout,
+  persistence-MAE, and upper-coverage gates before active control can consume
+  the model. Persist aggregate model evidence only, never raw history.
 
 ### 9.2 EV scheduling
 
@@ -789,7 +803,8 @@ tasks that must complete before the relevant execution milestone:
 4. Identify the local Home Assistant conversation/model agent and whether it
    can reliably return structured JSON.
 5. Verify MINI trip-history availability and establish the fallback SOC option.
-6. Confirm forecast attribute formats and units for Amber, PV, HAFO, and HAEO.
+6. Confirm forecast attribute formats and units for Amber, external PV, the
+   measured household-load sensor, and optional HAEO evidence.
 
 ## 19. First Build Definition
 

@@ -8,7 +8,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import custom_components.ha_energy_planner.recorder_import as recorder_import
-from custom_components.ha_energy_planner.const import CONF_EV_CONNECTED, CONF_EV_SOC
+from custom_components.ha_energy_planner.const import (
+    CONF_DAIKIN_POWER,
+    CONF_EV_CHARGING,
+    CONF_EV_CONNECTED,
+    CONF_EV_SOC,
+    CONF_HOUSEHOLD_LOAD,
+)
 
 
 class FakeHass:
@@ -20,6 +26,24 @@ class FakeHass:
     async def async_add_executor_job(self, fn: Any, *args: Any) -> Any:
         self.generic_executor_calls += 1
         return fn(*args)
+
+
+class FakeStates:
+    """Minimal state machine."""
+
+    def __init__(self, states: dict[str, Any]) -> None:
+        self._states = states
+
+    def get(self, entity_id: str | None) -> Any:
+        return self._states.get(str(entity_id))
+
+
+class ForecastHass(FakeHass):
+    """Fake Home Assistant with mapped current power states."""
+
+    def __init__(self, states: dict[str, Any]) -> None:
+        super().__init__()
+        self.states = FakeStates(states)
 
 
 class FakeRecorderInstance:
@@ -40,6 +64,257 @@ class RecorderState:
         self.state = state
         self.last_changed = timestamp
         self.last_updated = timestamp
+
+
+class CurrentState:
+    """Minimal current state with units."""
+
+    def __init__(self, state: str, unit: str = "kW") -> None:
+        self.state = state
+        self.attributes = {"unit_of_measurement": unit}
+
+
+def test_builtin_load_forecast_requires_mapping_and_current_state() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+
+    missing, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({}), {}, {"existing": True}, now=now, timezone="UTC"
+        )
+    )
+    unavailable, unavailable_changed, unavailable_reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            {"existing": True},
+            now=now,
+            timezone="UTC",
+        )
+    )
+
+    assert missing == {"existing": True}
+    assert changed is False
+    assert reason == "load_forecast_household_load_not_configured"
+    assert unavailable["existing"] is True
+    assert unavailable_changed is True
+    assert unavailable["last_attempt_at"] == now.isoformat()
+    assert unavailable_reason == "load_forecast_household_load_unavailable"
+
+
+def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_only_model(
+    monkeypatch: Any,
+) -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    loaded = {
+        "load": [RecorderState("2", now - timedelta(days=1))],
+        "ev_charging": [RecorderState("off", now - timedelta(days=1))],
+        "hvac_power": [RecorderState("0.5", now - timedelta(days=1))],
+    }
+    loader_calls: list[tuple[Any, ...]] = []
+
+    def fake_load(*args: Any) -> dict[str, list[Any]]:
+        loader_calls.append(args)
+        return loaded
+
+    def fake_build(states: list[Any], **kwargs: Any) -> dict[str, Any]:
+        assert states is loaded["load"]
+        assert kwargs["ev_charging_states"] is loaded["ev_charging"]
+        assert kwargs["hvac_power_states"] is loaded["hvac_power"]
+        assert kwargs["load_unit"] == "W"
+        assert kwargs["hvac_power_unit"] == "kW"
+        return {
+            "model_version": 1,
+            "source_entity_id": "sensor.house_load",
+            "trained_at": now.isoformat(),
+            "status": "ready",
+        }
+
+    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
+    monkeypatch.setattr(recorder_import, "build_load_forecast_model", fake_build)
+    hass = ForecastHass(
+        {
+            "sensor.house_load": CurrentState("2000", "W"),
+            "sensor.hvac_power": CurrentState("0.5", "kW"),
+        }
+    )
+
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            hass,
+            {
+                CONF_HOUSEHOLD_LOAD: "sensor.house_load",
+                CONF_EV_CHARGING: "sensor.ev_charging",
+                CONF_DAIKIN_POWER: "sensor.hvac_power",
+            },
+            {},
+            now=now,
+            timezone="Australia/Melbourne",
+        )
+    )
+
+    assert changed is True
+    assert reason == "load_forecast_ready"
+    assert model["status"] == "ready"
+    assert "load" not in model
+    assert loader_calls[0][1:4] == (
+        "sensor.house_load",
+        "sensor.ev_charging",
+        "sensor.hvac_power",
+    )
+
+
+def test_builtin_load_forecast_retains_last_model_on_recorder_error(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {"model_version": 1, "source_entity_id": "sensor.house_load", "trained_at": "bad"}
+
+    def fail(*args: Any) -> dict[str, list[Any]]:
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fail)
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+        )
+    )
+
+    assert model is not existing
+    assert model["source_entity_id"] == existing["source_entity_id"]
+    assert model["last_attempt_at"] == now.isoformat()
+    assert changed is True
+    assert reason == "load_forecast_recorder_unavailable:RuntimeError"
+    assert (
+        recorder_import.training_due(model, now=now + timedelta(hours=1), source_entity_id="sensor.house_load")
+        is False
+    )
+
+
+def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {
+        "model_version": 1,
+        "source_entity_id": "sensor.house_load",
+        "trained_at": now.isoformat(),
+        "last_attempt_at": now.isoformat(),
+        "last_attempt_source_entity_id": "sensor.house_load",
+        "last_attempt_timezone": "UTC",
+        "timezone": "UTC",
+    }
+    calls = 0
+
+    def fake_load(*args: Any) -> dict[str, list[Any]]:
+        nonlocal calls
+        calls += 1
+        return {"load": [], "ev_charging": [], "hvac_power": []}
+
+    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
+    skipped = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+        )
+    )
+    forced = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+            force=True,
+        )
+    )
+
+    assert skipped == (existing, False, "load_forecast_training_recent")
+    assert calls == 1
+    assert forced[0]["status"] == "learning"
+
+
+def test_household_forecast_history_loader_uses_recorder_state_changes(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    state = RecorderState("1", now - timedelta(hours=1))
+    calls: list[dict[str, Any]] = []
+
+    def state_changes(*args: Any, **kwargs: Any) -> dict[str, list[RecorderState]]:
+        calls.append(kwargs)
+        return {kwargs["entity_id"]: [state]}
+
+    monkeypatch.setattr(
+        recorder_import,
+        "import_module",
+        lambda name: types.SimpleNamespace(state_changes_during_period=state_changes),
+    )
+
+    histories = recorder_import._load_household_forecast_states(
+        object(),
+        "sensor.house_load",
+        None,
+        None,
+        now - timedelta(days=1),
+        now,
+    )
+
+    assert histories == {"load": [state], "ev_charging": [], "hvac_power": []}
+    assert calls == [
+        {
+            "entity_id": "sensor.house_load",
+            "no_attributes": True,
+            "include_start_time_state": True,
+            "significant_changes_only": False,
+        }
+    ]
+
+
+def test_retraining_quality_failure_retains_last_ready_aggregate(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {
+        "model_version": 1,
+        "contract_version": 1,
+        "status": "ready",
+        "quality_ready": True,
+        "source_entity_id": "sensor.house_load",
+        "timezone": "UTC",
+        "trained_at": (now - timedelta(hours=12)).isoformat(),
+        "profiles": {"retained": True},
+    }
+    monkeypatch.setattr(
+        recorder_import,
+        "_load_household_forecast_states",
+        lambda *args: {"load": [], "ev_charging": [], "hvac_power": []},
+    )
+    monkeypatch.setattr(
+        recorder_import,
+        "build_load_forecast_model",
+        lambda *args, **kwargs: {
+            "status": "failed",
+            "quality_failures": ["forecast_accuracy_below_persistence_gate"],
+            "validation": {"mae_kw": 2.0},
+        },
+    )
+
+    retained, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+            force=True,
+        )
+    )
+
+    assert changed is True
+    assert reason == "load_forecast_retraining_failed_retained"
+    assert retained["trained_at"] == existing["trained_at"]
+    assert retained["profiles"] == {"retained": True}
+    assert retained["last_training_status"] == "failed"
+    assert retained["last_training_validation"] == {"mae_kw": 2.0}
 
 
 def test_recorder_import_skips_when_recent() -> None:
