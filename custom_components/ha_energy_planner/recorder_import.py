@@ -17,7 +17,9 @@ from .const import (
 )
 from .ev import import_trip_history_from_state_sequences
 from .load_forecast import (
+    FORECAST_CONTRACT_VERSION,
     HISTORY_LOOKBACK,
+    MODEL_VERSION,
     build_load_forecast_model_from_buckets,
     clean_load_history_buckets,
     training_due,
@@ -52,12 +54,29 @@ async def async_update_builtin_load_forecast(
         return model, False, "load_forecast_household_load_not_configured"
     if not force and not training_due(model, now=now, source_entity_id=load_entity, timezone=timezone):
         return model, False, "load_forecast_training_recent"
+    model_contract_current = (
+        model.get("model_version") == MODEL_VERSION
+        and model.get("contract_version") == FORECAST_CONTRACT_VERSION
+    )
     attempted = {
         **model,
         "last_attempt_at": now.isoformat(),
         "last_attempt_source_entity_id": load_entity,
         "last_attempt_timezone": timezone,
     }
+    if not model_contract_current:
+        attempted.update(
+            {
+                "model_version": MODEL_VERSION,
+                "contract_version": FORECAST_CONTRACT_VERSION,
+                "status": "failed",
+                "quality_ready": False,
+                "quality_failures": ["training_pending"],
+                "source_entity_id": load_entity,
+                "timezone": timezone,
+                "profiles": {},
+            }
+        )
     load_state = hass.states.get(load_entity)
     if load_state is None:
         return attempted, attempted != model, "load_forecast_household_load_unavailable"
@@ -80,6 +99,7 @@ async def async_update_builtin_load_forecast(
         )
         if (
             updated.get("status") != "ready"
+            and model_contract_current
             and model.get("quality_ready") is True
             and model.get("source_entity_id") == load_entity
             and model.get("timezone") == timezone
@@ -118,6 +138,8 @@ async def async_update_builtin_load_forecast(
                 "last_training_validation": {},
             }
         )
+        if not model_contract_current:
+            attempted["quality_failures"] = [failure]
         if not (
             model.get("quality_ready") is True
             and model.get("source_entity_id") == load_entity

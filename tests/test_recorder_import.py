@@ -15,7 +15,11 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
 )
-from custom_components.ha_energy_planner.load_forecast import build_load_forecast_model
+from custom_components.ha_energy_planner.load_forecast import (
+    FORECAST_CONTRACT_VERSION,
+    MODEL_VERSION,
+    build_load_forecast_model,
+)
 
 
 class FakeHass:
@@ -171,6 +175,10 @@ def test_builtin_load_forecast_retains_last_model_on_recorder_error(monkeypatch:
     assert model["last_attempt_at"] == now.isoformat()
     assert model["last_training_status"] == "failed"
     assert model["last_training_quality_failures"] == ["recorder_unavailable"]
+    assert model["model_version"] == MODEL_VERSION
+    assert model["contract_version"] == FORECAST_CONTRACT_VERSION
+    assert model["status"] == "failed"
+    assert model["profiles"] == {}
     assert changed is True
     assert reason == "load_forecast_recorder_unavailable:LoadForecastRecorderError"
     assert (
@@ -227,7 +235,8 @@ def test_builtin_load_forecast_delays_internal_training_error(monkeypatch: Any) 
 def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     existing = {
-        "model_version": 1,
+        "model_version": MODEL_VERSION,
+        "contract_version": FORECAST_CONTRACT_VERSION,
         "source_entity_id": "sensor.house_load",
         "trained_at": now.isoformat(),
         "last_attempt_at": now.isoformat(),
@@ -322,8 +331,8 @@ def test_household_forecast_history_loader_uses_recorder_state_changes(monkeypat
 def test_retraining_quality_failure_retains_last_ready_aggregate(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     existing = {
-        "model_version": 1,
-        "contract_version": 1,
+        "model_version": MODEL_VERSION,
+        "contract_version": FORECAST_CONTRACT_VERSION,
         "status": "ready",
         "quality_ready": True,
         "source_entity_id": "sensor.house_load",

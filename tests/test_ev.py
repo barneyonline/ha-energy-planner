@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.ev import (
+    MIN_EV_TRIP_HISTORY_DAYS,
     EVTripRecord,
     _best_continuous_slots,
     _charge_cost_components,
@@ -49,8 +50,15 @@ def test_ev_summary_uses_max_daily_consumption() -> None:
         ]
     )
     assert summary.history_sufficient is True
+    assert MIN_EV_TRIP_HISTORY_DAYS == 3
     assert summary.max_daily_soc_percent == 15
     assert summary.average_daily_soc_percent == 11
+    assert summarize_trip_history(
+        [
+            EVTripRecord(base, base + timedelta(minutes=20), 80, 72),
+            EVTripRecord(base + timedelta(days=1), base + timedelta(days=1, hours=1), 80, 70),
+        ]
+    ).history_sufficient is False
 
 
 def test_ev_target_clamps_and_marks_infeasible() -> None:

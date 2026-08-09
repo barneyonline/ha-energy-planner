@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.2 - 2026-08-09
+
+### Changed
+
+- Reduced the built-in household-load readiness minimum from seven to three
+  complete days while retaining two leakage-free validation origins, the
+  persistence comparison, and conservative-bound coverage gate. Production
+  profiles still require three clean observations per clock bucket. The load
+  forecast contract is version 2, so upgrading retrains the model and requires
+  fresh review evidence before automatic control can be re-armed.
+- Made the existing three-observed-day EV trip-history minimum explicit. Until
+  that history is available, EV planning continues to use the configured
+  fallback Target SOC.
+
 ## 0.9.1 - 2026-08-09
 
 ### Changed

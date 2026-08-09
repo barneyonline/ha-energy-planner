@@ -132,7 +132,7 @@ def test_model_trains_ready_and_forecasts_expected_and_upper_load() -> None:
     assert model["model_version"] == MODEL_VERSION
     assert model["contract_version"] == FORECAST_CONTRACT_VERSION
     assert model["status"] == "ready"
-    assert model["complete_days"] >= 7
+    assert model["complete_days"] >= 3
     assert model["validation"]["origin_count"] == 2
     assert model["validation"]["sample_count"] >= 144
     assert model["validation"]["upper_coverage"] >= 0.9
@@ -238,10 +238,17 @@ def test_history_cleaning_drops_unknown_ev_and_hvac_intervals() -> None:
     assert buckets == [(start + timedelta(minutes=15), 2.0)]
 
 
-def test_short_or_gappy_history_remains_learning() -> None:
+def test_three_complete_days_can_train_while_short_or_gappy_history_remains_learning() -> None:
     now = datetime(2026, 6, 27, 12, tzinfo=UTC)
-    short = build_load_forecast_model(
+    three_day = build_load_forecast_model(
         _history(now, days=4),
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+    short = build_load_forecast_model(
+        _history(now, days=3),
         now=now,
         timezone="UTC",
         source_entity_id="sensor.house_load",
@@ -264,6 +271,12 @@ def test_short_or_gappy_history_remains_learning() -> None:
         load_unit="kW",
     )
 
+    assert three_day["complete_days"] == 3
+    assert three_day["status"] == "ready"
+    assert three_day["validation"]["origin_count"] == 2
+    assert three_day["validation"]["sample_count"] == 192
+    assert three_day["validation"]["positive_residual_p90_kw"] >= 0
+    assert short["complete_days"] == 2
     assert short["status"] == "learning"
     assert "insufficient_complete_days" in short["quality_failures"]
     assert gappy["status"] in {"learning", "failed"}
@@ -458,6 +471,11 @@ def test_model_age_transitions_and_source_or_shape_mismatch_fail_closed() -> Non
     assert training_due(model, now=now + timedelta(hours=5), source_entity_id="sensor.house_load") is False
     assert training_due(model, now=now + timedelta(hours=6), source_entity_id="sensor.house_load") is True
     assert training_due(model, now=now, source_entity_id="sensor.replacement") is True
+    assert training_due(
+        {**model, "contract_version": FORECAST_CONTRACT_VERSION - 1},
+        now=now,
+        source_entity_id="sensor.house_load",
+    ) is True
     assert training_due(None, now=now, source_entity_id="sensor.house_load") is True
     assert load_forecast_model_status({}, now=now) == ("failed", 0.0)
     attempted = {
@@ -599,11 +617,11 @@ def test_validation_skips_unaligned_origins_and_reports_quality_failures() -> No
     gapped_origin = _rolling_validation(
         [
             _HistoricalDay(date(2026, 6, day), "weekday", {0: 1.0})
-            for day in (1, 2, 3, 5)
+            for day in (1, 3, 5)
         ]
     )
     failures = _quality_failures(
-        complete_days=7,
+        complete_days=3,
         history_coverage=1.0,
         validation={
             "origin_count": 2,
@@ -619,6 +637,30 @@ def test_validation_skips_unaligned_origins_and_reports_quality_failures() -> No
     assert gapped_origin["origin_count"] == 0
     assert "forecast_accuracy_below_persistence_gate" in failures
     assert "conservative_bound_coverage_below_gate" in failures
+
+
+def test_validation_uses_partial_previous_days_without_training_on_them() -> None:
+    full_values = {index: 1.0 for index in range(BUCKETS_PER_DAY)}
+    partial_values = {index: 1.0 for index in range(80)}
+    complete = [
+        _HistoricalDay(date(2026, 6, day), "weekday", dict(full_values))
+        for day in (1, 3, 5)
+    ]
+    all_days = [
+        complete[0],
+        _HistoricalDay(date(2026, 6, 2), "weekday", partial_values),
+        complete[1],
+        _HistoricalDay(date(2026, 6, 4), "weekday", partial_values),
+        complete[2],
+    ]
+
+    validation = _rolling_validation(complete, comparison_days=all_days)
+
+    assert validation["origin_count"] == 2
+    assert validation["sample_count"] == 160
+    assert validation["mae_kw"] == 0
+    assert validation["persistence_mae_kw"] == 0
+    assert validation["upper_coverage"] == 1
 
 
 def test_zero_expected_profile_disables_recent_correction() -> None:

@@ -11,16 +11,17 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MODEL_VERSION = 1
-FORECAST_CONTRACT_VERSION = 1
+FORECAST_CONTRACT_VERSION = 2
 HISTORY_LOOKBACK = timedelta(days=28)
 TRAIN_INTERVAL = timedelta(hours=6)
 HEALTHY_MODEL_AGE = timedelta(hours=24)
 STALE_MODEL_AGE = timedelta(hours=72)
 BUCKET_MINUTES = 15
 BUCKETS_PER_DAY = 24 * 60 // BUCKET_MINUTES
-MIN_COMPLETE_DAYS = 7
+MIN_COMPLETE_DAYS = 3
 MIN_DAY_COVERAGE = 0.80
 MIN_BUCKET_SAMPLES = 3
+MIN_VALIDATION_TRAINING_DAYS = 1
 HOLDOUT_ORIGINS = 2
 MIN_HOLDOUT_SAMPLES = 144
 MAX_BASELINE_MAE_RATIO = 1.10
@@ -171,8 +172,8 @@ def build_load_forecast_model_from_buckets(
         if eligible_day_count
         else 0.0
     )
-    validation = _rolling_validation(complete_days)
-    uncertainty_buffer = _leave_one_out_buffer(complete_days)
+    validation = _rolling_validation(complete_days, comparison_days=all_days)
+    uncertainty_buffer = float(validation.get("positive_residual_p90_kw") or 0.0)
     profiles = {
         day_type: _profile_for_day_type(complete_days, day_type, uncertainty_buffer)
         for day_type in ("weekday", "weekend")
@@ -323,18 +324,19 @@ def training_due(
     if not isinstance(model, dict):
         return True
     now_utc = _as_utc(now)
+    if (
+        model.get("model_version") != MODEL_VERSION
+        or model.get("contract_version") != FORECAST_CONTRACT_VERSION
+        or model.get("source_entity_id") != source_entity_id
+        or (timezone is not None and model.get("timezone") != timezone)
+    ):
+        return True
     attempted_source = model.get("last_attempt_source_entity_id")
     attempted_timezone = model.get("last_attempt_timezone", model.get("timezone"))
     last_attempt = _parse_datetime(model.get("last_attempt_at"))
     attempt_matches = attempted_source == source_entity_id and (timezone is None or attempted_timezone == timezone)
     if attempt_matches and last_attempt is not None:
         return last_attempt > now_utc + timedelta(minutes=5) or now_utc >= last_attempt + TRAIN_INTERVAL
-    if (
-        model.get("model_version") != MODEL_VERSION
-        or model.get("source_entity_id") != source_entity_id
-        or (timezone is not None and model.get("timezone") != timezone)
-    ):
-        return True
     trained_at = _parse_datetime(model.get("trained_at"))
     return trained_at is None or trained_at > now_utc + timedelta(minutes=5) or now_utc >= trained_at + TRAIN_INTERVAL
 
@@ -492,13 +494,15 @@ def _profile_for_day_type(
     days: list[_HistoricalDay],
     day_type: str,
     uncertainty_buffer: float,
+    *,
+    minimum_samples: int = MIN_BUCKET_SAMPLES,
 ) -> dict[str, list[float | None]]:
     expected: list[float | None] = []
     upper: list[float | None] = []
     for index in range(BUCKETS_PER_DAY):
         global_values = [day.values[index] for day in days if index in day.values]
         class_values = [day.values[index] for day in days if day.day_type == day_type and index in day.values]
-        if len(global_values) < MIN_BUCKET_SAMPLES:
+        if len(global_values) < minimum_samples:
             expected.append(None)
             upper.append(None)
             continue
@@ -514,23 +518,36 @@ def _profile_for_day_type(
     return {"expected": expected, "upper": upper}
 
 
-def _rolling_validation(days: list[_HistoricalDay]) -> dict[str, Any]:
+def _rolling_validation(
+    days: list[_HistoricalDay],
+    *,
+    comparison_days: list[_HistoricalDay] | None = None,
+) -> dict[str, Any]:
     errors: list[float] = []
     squared_errors: list[float] = []
     baseline_errors: list[float] = []
+    positive_residuals: list[float] = []
     upper_hits = 0
     samples = 0
     origins = 0
-    by_date = {day.local_date: day for day in days}
+    by_date = {
+        day.local_date: day
+        for day in (comparison_days if comparison_days is not None else days)
+    }
     for holdout in days[-HOLDOUT_ORIGINS:]:
         prior = [day for day in days if day.local_date < holdout.local_date]
-        if len(prior) < MIN_BUCKET_SAMPLES:
+        if len(prior) < MIN_VALIDATION_TRAINING_DAYS:
             continue
         previous = by_date.get(holdout.local_date - timedelta(days=1))
         if previous is None:
             continue
-        buffer = _leave_one_out_buffer(prior)
-        profile = _profile_for_day_type(prior, holdout.day_type, buffer)
+        buffer = _leave_one_out_buffer(prior, minimum_samples=MIN_VALIDATION_TRAINING_DAYS)
+        profile = _profile_for_day_type(
+            prior,
+            holdout.day_type,
+            buffer,
+            minimum_samples=MIN_VALIDATION_TRAINING_DAYS,
+        )
         origin_samples = 0
         for index, actual in holdout.values.items():
             expected = profile["expected"][index]
@@ -540,6 +557,7 @@ def _rolling_validation(days: list[_HistoricalDay]) -> dict[str, Any]:
                 continue
             error = abs(actual - expected)
             errors.append(error)
+            positive_residuals.append(max(actual - expected, 0.0))
             squared_errors.append(error**2)
             baseline_errors.append(abs(actual - baseline))
             upper_hits += int(actual <= upper)
@@ -557,16 +575,26 @@ def _rolling_validation(days: list[_HistoricalDay]) -> dict[str, Any]:
         "rmse_kw": round(rmse, 6) if rmse is not None else None,
         "persistence_mae_kw": round(baseline_mae, 6) if baseline_mae is not None else None,
         "upper_coverage": round(upper_hits / samples, 6) if samples else None,
+        "positive_residual_p90_kw": round(_percentile(positive_residuals, 0.90), 6),
     }
 
 
-def _leave_one_out_buffer(days: list[_HistoricalDay]) -> float:
+def _leave_one_out_buffer(
+    days: list[_HistoricalDay],
+    *,
+    minimum_samples: int = MIN_BUCKET_SAMPLES,
+) -> float:
     residuals: list[float] = []
     for target in days:
         training = [day for day in days if day.local_date != target.local_date]
-        if len(training) < MIN_BUCKET_SAMPLES:
+        if len(training) < minimum_samples:
             continue
-        profile = _profile_for_day_type(training, target.day_type, 0.0)
+        profile = _profile_for_day_type(
+            training,
+            target.day_type,
+            0.0,
+            minimum_samples=minimum_samples,
+        )
         for index, actual in target.values.items():
             expected = profile["expected"][index]
             if expected is not None:
