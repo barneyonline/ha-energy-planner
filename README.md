@@ -38,7 +38,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, HAEO, and AI are optional. HAFO is not required. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.1.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.2.
 
 ## Installation
 
@@ -84,7 +84,7 @@ Energy Planner trains from up to 28 days of Recorder history. It removes known E
 
 The model requires:
 
-- Seven complete local-time days
+- Three complete local-time days
 - At least 80% overall valid coverage
 - Two holdout origins with at least 144 aligned samples
 - Accuracy no more than 10% worse than previous-day persistence
@@ -121,7 +121,7 @@ Mapped EV start and stop controls are planner actuators. Energy Planner does not
 
 ## Planning behavior
 
-EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
+EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. After three observed trip days it can derive a conservative target from local history; until then it uses the configured fallback Target SOC. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
 Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs.
 
