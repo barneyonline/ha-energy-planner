@@ -1024,7 +1024,7 @@ expected = [1.2] * 96
 upper = [1.5] * 96
 payload["data"]["built_in_load_forecast"] = {
     "model_version": 1,
-    "contract_version": 1,
+    "contract_version": 2,
     "status": "ready",
     "quality_ready": True,
     "quality_failures": [],
