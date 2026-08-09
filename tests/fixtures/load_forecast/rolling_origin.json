@@ -1,0 +1,16 @@
+{
+  "name": "weekday_weekend_rolling_origin",
+  "timezone": "UTC",
+  "history_days": 14,
+  "base_kw": 1.0,
+  "evening_peak_kw": 0.6,
+  "weekend_increment_kw": 0.2,
+  "alternating_day_increment_kw": 0.2,
+  "expected": {
+    "status": "ready",
+    "minimum_holdout_origins": 2,
+    "minimum_aligned_samples": 144,
+    "maximum_mae_ratio_to_persistence": 1.1,
+    "minimum_upper_coverage": 0.9
+  }
+}

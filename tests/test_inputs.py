@@ -13,8 +13,6 @@ from custom_components.ha_energy_planner import inputs as inputs_module
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
-    CONF_BASELINE_LOAD_FORECAST,
-    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
@@ -31,6 +29,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
+    CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PV_FORECAST,
     CONF_PV_FORECAST_SECONDARY,
@@ -39,19 +38,27 @@ from custom_components.ha_energy_planner.const import (
     DEFAULT_OPTIONS,
 )
 from custom_components.ha_energy_planner.inputs import (
-    InputManager,
+    InputManager as _RawInputManager,
+)
+from custom_components.ha_energy_planner.inputs import (
     _attribute_value,
     _combined_confidence,
     _finite_float_or_none,
     _forecast_source_issued_at,
     _forecast_training_indices,
+    _leading_present_slots,
     _percent_float_or_none,
     _ready_by_time_or_none,
     _series_value,
     _state_confidence,
 )
+from custom_components.ha_energy_planner.load_forecast import BUCKETS_PER_DAY, FORECAST_CONTRACT_VERSION, MODEL_VERSION
 from custom_components.ha_energy_planner.models import HAEOStatus, InputHealth, OccupancyState
 from custom_components.ha_energy_planner.planner import DryRunPlanner
+
+# Existing normalization scenarios use this local name for the load slot; the
+# public entity contract is now the measured whole-home sensor.
+CONF_BASELINE_LOAD_FORECAST = CONF_HOUSEHOLD_LOAD
 
 
 def test_climate_zone_configuration_normalizes_strings_lists_and_invalid_values() -> None:
@@ -91,6 +98,234 @@ class FakeHass:
     def __init__(self, values: dict[str, FakeState], time_zone: str = "UTC") -> None:
         self.states = FakeStates(values)
         self.config = SimpleNamespace(time_zone=time_zone)
+
+
+def _constant_load_model(
+    entity_id: str,
+    value: float,
+    trained_at: datetime,
+    *,
+    status: str = "ready",
+    timezone: str = "UTC",
+) -> dict[str, Any]:
+    profile = [value] * BUCKETS_PER_DAY
+    return {
+        "model_version": MODEL_VERSION,
+        "contract_version": FORECAST_CONTRACT_VERSION,
+        "status": status,
+        "quality_ready": status == "ready",
+        "quality_failures": [] if status == "ready" else ["insufficient_complete_days"],
+        "source_entity_id": entity_id,
+        "timezone": timezone,
+        "trained_at": trained_at.isoformat(),
+        "history_days": 10,
+        "complete_days": 9,
+        "history_coverage": 1.0,
+        "validation": {
+            "origin_count": 2,
+            "sample_count": 192,
+            "mae_kw": 0.0,
+            "rmse_kw": 0.0,
+            "persistence_mae_kw": 0.0,
+            "upper_coverage": 1.0,
+        },
+        "cleaning": {},
+        "profiles": {
+            "weekday": {"expected": profile, "upper": profile},
+            "weekend": {"expected": profile, "upper": profile},
+        },
+    }
+
+
+def InputManager(
+    hass: FakeHass,
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+    **kwargs: Any,
+) -> _RawInputManager:
+    """Return an input manager with a ready built-in model unless a test overrides it."""
+    entity_id = entry_data.get(CONF_HOUSEHOLD_LOAD)
+    state = hass.states.get(entity_id) if entity_id else None
+    if "load_forecast_model" not in kwargs and state is not None:
+        state.attributes.setdefault("unit_of_measurement", "kW")
+        unit = str(state.attributes.get("unit_of_measurement", "kW"))
+        value = inputs_module.normalize_power_kw(state.state, unit)
+        if value is not None:
+            now = inputs_module.dt_util.utcnow()
+            kwargs["load_forecast_model"] = _constant_load_model(
+                entity_id,
+                value,
+                now,
+                timezone=hass.config.time_zone,
+            )
+    return _RawInputManager(hass, entry_data, options, **kwargs)
+
+
+def test_builtin_load_controls_without_haeo_or_external_load_forecast(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: now)
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_HOUSEHOLD_LOAD: "sensor.house",
+        CONF_BATTERY_SOC: "sensor.battery",
+        CONF_PERSON_ENTITIES: "person.home",
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.2", {"forecast": [0.2] * 4}, now),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}, now),
+            "sensor.pv": FakeState("1", {"forecast": [1.0] * 4}, now),
+            "sensor.house": FakeState("1500", {"unit_of_measurement": "W"}, now),
+            "sensor.battery": FakeState("50", last_updated=now),
+            "person.home": FakeState("home", last_updated=now),
+        }
+    )
+
+    ready = _RawInputManager(
+        hass,
+        entry_data,
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.5, now),
+    ).build_context()
+    degraded = _RawInputManager(
+        hass,
+        entry_data,
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.5, now - timedelta(hours=25)),
+    ).build_context()
+    learning = _RawInputManager(
+        hass,
+        entry_data,
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.5, now, status="learning"),
+    ).build_context()
+    stale = _RawInputManager(
+        hass,
+        entry_data,
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.5, now - timedelta(hours=73)),
+    ).build_context()
+
+    assert ready.input_health == InputHealth.HEALTHY
+    assert ready.haeo_status == HAEOStatus.READY
+    assert ready.slots[0].baseline_load_forecast_kw == 1.5
+    assert ready.slots[0].baseline_load_forecast_upper_kw == 1.5
+    assert degraded.input_health == InputHealth.HEALTHY
+    assert "advisory_household_load_entity_forecast_degraded" in degraded.input_issues
+    assert learning.input_health == InputHealth.UNSAFE
+    assert stale.input_health == InputHealth.UNSAFE
+
+
+def test_builtin_load_mapping_and_recorder_failures_are_explicit(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: now)
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    missing = _RawInputManager(FakeHass({}), {}, options)
+    unavailable = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("unavailable")}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+    )
+    invalid = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kWh"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+    )
+    retained_while_unavailable = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("unavailable")}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    stale_model = _constant_load_model("sensor.house", 1.0, now - timedelta(hours=73))
+    recorder_failed = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=stale_model,
+        load_forecast_update_reason="load_forecast_recorder_unavailable:RuntimeError",
+    )
+    fresh_failed_model = _constant_load_model("sensor.house", 1.0, now, status="failed")
+    fresh_failed_model["unusable_since"] = (now - timedelta(hours=1)).isoformat()
+    prolonged_failed_model = {**fresh_failed_model, "unusable_since": (now - timedelta(hours=73)).isoformat()}
+    fresh_failed = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=fresh_failed_model,
+    )
+    prolonged_failed = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=prolonged_failed_model,
+    )
+    history_limited = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=fresh_failed_model,
+        load_forecast_update_reason="load_forecast_history_limit_exceeded:LoadForecastHistoryLimitError",
+    )
+
+    assert missing._built_in_load_series(now, 1, 15)[1] == "household_load_entity_not_configured"
+    assert unavailable._built_in_load_series(now, 1, 15)[1] == "household_load_entity_unavailable"
+    assert invalid._built_in_load_series(now, 1, 15)[1] == "household_load_entity_non_numeric"
+    retained_values, retained_issue = retained_while_unavailable._built_in_load_series(now, 1, 15)
+    assert retained_values == [1.0] * 4
+    assert retained_issue == "household_load_entity_unavailable"
+    assert retained_while_unavailable.load_forecast_details["status"] == "ready"
+    assert recorder_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_recorder_unavailable"
+    assert fresh_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_forecast_unusable"
+    assert prolonged_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_forecast_failed"
+    assert history_limited._built_in_load_series(now, 1, 15)[1] == "household_load_entity_history_limit_exceeded"
+    assert _leading_present_slots([1.0, None, 2.0]) == 1
+
+    unclean_recent = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState("2", {"unit_of_measurement": "kW"}),
+                "sensor.ev": FakeState("unavailable"),
+                "sensor.hvac": FakeState("unavailable"),
+            }
+        ),
+        {
+            CONF_HOUSEHOLD_LOAD: "sensor.house",
+            CONF_EV_CHARGING: "sensor.ev",
+            CONF_DAIKIN_POWER: "sensor.hvac",
+        },
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    unclean_recent._built_in_load_series(now, 1, 15)
+    assert unclean_recent.load_forecast_details["recent_correction_factor"] == 1.0
+
+    normalized_hvac = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState("2", {"unit_of_measurement": "kW"}),
+                "sensor.hvac": FakeState("1500", {"unit_of_measurement": "W"}),
+            }
+        ),
+        {
+            CONF_HOUSEHOLD_LOAD: "sensor.house",
+            CONF_DAIKIN_POWER: "sensor.hvac",
+        },
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    normalized_hvac._built_in_load_series(now, 1, 15)
+    assert normalized_hvac.load_forecast_details["recent_correction_factor"] == 0.75
+
+
+def test_forecast_source_issue_time_parses_string_attribute() -> None:
+    fallback = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    state = FakeState("1", {"issued_at": "2026-06-27T10:00:00+00:00"}, fallback)
+
+    assert _forecast_source_issued_at(state, fallback) == datetime(2026, 6, 27, 10, tzinfo=UTC)
 
 
 def _forecast_state(now: datetime, hours: int, value_key: str, value: float) -> FakeState:
@@ -256,9 +491,8 @@ def test_input_manager_uses_forecast_attributes_for_slot_values() -> None:
     assert [slot.pv_forecast_kw for slot in context.slots] == [0.5, 1.0, None, None]
     assert context.input_health == InputHealth.UNSAFE
     assert "pv_forecast_entity_incomplete_horizon" in context.input_issues
-    assert context.forecast_confidence == 0.175
-    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.2, None, None, None]
-    assert "baseline_load_forecast_entity_incomplete_horizon" in context.input_issues
+    assert context.forecast_confidence == 0.5
+    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.2, 1.2, 1.2, 1.2]
     assert context.current_enphase_profile == "AI Optimisation"
     assert context.enphase_ai_profile == "AI Optimisation"
     assert context.enphase_self_consumption_profile == "Self-Consumption"
@@ -347,7 +581,6 @@ def test_required_forecast_under_eight_hours_remains_unsafe() -> None:
         (CONF_AMBER_IMPORT_PRICE, ("price", "value"), "price"),
         (CONF_AMBER_EXPORT_PRICE, ("price", "value"), "price"),
         (CONF_PV_FORECAST, ("power", "value"), "power"),
-        (CONF_BASELINE_LOAD_FORECAST, ("load_kw", "value"), "power"),
     ],
 )
 def test_required_point_values_do_not_bypass_forecast_coverage(
@@ -616,73 +849,6 @@ def test_unusable_secondary_pv_is_diagnosed_without_penalizing_healthy_primary(
     assert manager.forecast_coverage_details[0]["classification"] == status
 
 
-def test_short_baseline_leading_gap_is_filled_from_current_state() -> None:
-    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
-    state = FakeState(
-        "2.5",
-        {
-            "unit_of_measurement": "kW",
-            "forecast": [
-                {"period_start": "2026-07-12T00:45:00+00:00", "load_kw": 3.0},
-                {"period_start": "2026-07-12T01:00:00+00:00", "load_kw": 3.5},
-            ],
-        },
-    )
-    manager = InputManager(
-        FakeHass({"sensor.load": state}),
-        {CONF_BASELINE_LOAD_FORECAST: "sensor.load"},
-        {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15},
-    )
-
-    series, issue = manager._required_series(
-        CONF_BASELINE_LOAD_FORECAST,
-        ("load_kw", "value"),
-        "power",
-        now,
-        1,
-        15,
-    )
-
-    assert issue is None
-    assert series == [2.5, 2.5, 2.5, 3.0]
-    assert manager._raw_forecast_series["baseline_load_forecast_kw"] == [None, None, None, 3.0]
-    assert manager.forecast_confidence_details[-1]["source"] == "forecast_series_leading_fill"
-    details = manager.forecast_coverage_details[-1]
-    assert details["leading_gap_filled_slots"] == 3
-    assert details["leading_gap_filled_hours"] == 0.75
-    assert manager.forecast_confidence_details[-1]["confidence"] == 0.75
-
-
-def test_long_baseline_leading_gap_is_not_filled() -> None:
-    now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
-    state = FakeState(
-        "2.5",
-        {
-            "unit_of_measurement": "kW",
-            "forecast_interval_minutes": 15,
-            "forecast": [{"period_start": "2026-07-12T01:15:00+00:00", "load_kw": 3.0}],
-        },
-    )
-    manager = InputManager(
-        FakeHass({"sensor.load": state}),
-        {CONF_BASELINE_LOAD_FORECAST: "sensor.load"},
-        {**DEFAULT_OPTIONS, "planning_horizon_hours": 2, "planning_interval_minutes": 15},
-    )
-
-    series, issue = manager._required_series(
-        CONF_BASELINE_LOAD_FORECAST,
-        ("load_kw", "value"),
-        "power",
-        now,
-        2,
-        15,
-    )
-
-    assert series[:5] == [None] * 5
-    assert issue == "baseline_load_forecast_entity_incomplete_horizon"
-    assert manager.forecast_coverage_details[-1]["leading_gap_filled_slots"] == 0
-
-
 def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -916,7 +1082,6 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
         CONF_PV_FORECAST: "sensor.pv",
         CONF_BASELINE_LOAD_FORECAST: "sensor.load",
         CONF_PV_OBSERVED: "sensor.pv_observed",
-        CONF_BASELINE_LOAD_OBSERVED: "sensor.load_observed",
         CONF_BATTERY_SOC: "sensor.battery",
         CONF_DAIKIN_POWER: "sensor.daikin_power",
         CONF_PERSON_ENTITIES: "person.james",
@@ -928,7 +1093,6 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
             "sensor.pv": FakeState("0.002", {"unitOfMeasurement": "MW"}),
             "sensor.load": FakeState("1500", {"unitOfMeasurement": "W"}),
             "sensor.pv_observed": FakeState("0.002", {"unitOfMeasurement": "MW"}),
-            "sensor.load_observed": FakeState("1500", {"unitOfMeasurement": "W"}),
             "sensor.battery": FakeState("55"),
             "sensor.daikin_power": FakeState("1700", {"unitOfMeasurement": "W"}),
             "person.james": FakeState("home"),
@@ -942,7 +1106,6 @@ def test_input_manager_normalizes_optional_power_point_sensors() -> None:
     assert manager.thermal_sample(context)["hvac_power_kw"] == 1.7
     observations = manager.current_forecast_observations()
     assert observations["pv_forecast_kw"]["value"] == 2.0  # type: ignore[index]
-    assert observations["baseline_load_forecast_kw"]["value"] == 1.5  # type: ignore[index]
 
 
 def test_input_manager_accepts_mini_like_ev_connected_state() -> None:
@@ -1089,9 +1252,9 @@ def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() 
     context = manager.build_context()
 
     assert [slot.pv_forecast_kw for slot in context.slots] == [1.2, 2.4, None, None]
-    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [1.6, 2.4, None, None]
+    assert [slot.baseline_load_forecast_kw for slot in context.slots] == [2.0, 2.0, 2.0, 2.0]
     assert [slot.pv_forecast_lower_kw for slot in context.slots] == [0.7, 1.4, None, None]
-    assert [slot.baseline_load_forecast_upper_kw for slot in context.slots] == [2.6, 3.9, None, None]
+    assert [slot.baseline_load_forecast_upper_kw for slot in context.slots] == [2.0, 2.0, 2.0, 2.0]
     assert context.input_health == InputHealth.UNSAFE
     assert all(slot["pv_forecast_kw_issued_at"] <= slot["valid_at"] for slot in manager.forecast_training_slots)
     assert all(
@@ -1104,25 +1267,18 @@ def test_forecast_observations_use_dedicated_measured_entities_with_timestamps()
     observed_at = datetime(2026, 6, 27, 1, 2, 3, tzinfo=UTC)
     entry_data = {
         CONF_PV_FORECAST: "sensor.pv_forecast",
-        CONF_BASELINE_LOAD_FORECAST: "sensor.load_forecast",
         CONF_PV_OBSERVED: "sensor.pv_power",
-        CONF_BASELINE_LOAD_OBSERVED: "sensor.house_power",
     }
     hass = FakeHass(
         {
             "sensor.pv_forecast": FakeState("99", last_updated=observed_at),
-            "sensor.load_forecast": FakeState("88", last_updated=observed_at),
             "sensor.pv_power": FakeState("1200", {"unit_of_measurement": "W"}, observed_at),
-            "sensor.house_power": FakeState("2.5", {"unit_of_measurement": "kW"}, observed_at),
         }
     )
 
     observations = InputManager(hass, entry_data, DEFAULT_OPTIONS).current_forecast_observations()
 
-    assert observations == {
-        "pv_forecast_kw": {"value": 1.2, "observed_at": observed_at},
-        "baseline_load_forecast_kw": {"value": 2.5, "observed_at": observed_at},
-    }
+    assert observations == {"pv_forecast_kw": {"value": 1.2, "observed_at": observed_at}}
 
 
 def test_forecast_observations_do_not_fall_back_to_forecast_entities() -> None:
@@ -1134,12 +1290,10 @@ def test_forecast_observations_do_not_fall_back_to_forecast_entities() -> None:
     )
     entry_data = {
         CONF_PV_FORECAST: "sensor.pv_forecast",
-        CONF_BASELINE_LOAD_FORECAST: "sensor.load_forecast",
     }
 
     assert InputManager(hass, entry_data, DEFAULT_OPTIONS).current_forecast_observations() == {
         "pv_forecast_kw": None,
-        "baseline_load_forecast_kw": None,
     }
 
 
@@ -1147,13 +1301,12 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
     first_now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     second_now = first_now + timedelta(minutes=5)
     pv_issued = first_now - timedelta(hours=2)
-    load_issued = first_now - timedelta(hours=3)
     options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 5}
     entry_data = {
         CONF_AMBER_IMPORT_PRICE: "sensor.import",
         CONF_AMBER_EXPORT_PRICE: "sensor.export",
         CONF_PV_FORECAST: "sensor.pv",
-        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_HOUSEHOLD_LOAD: "sensor.load",
         CONF_BATTERY_SOC: "sensor.battery",
     }
     values = [1.0] * 12
@@ -1162,11 +1315,7 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
             "sensor.import": FakeState("0.2", {"forecast": [0.2] * 12}, first_now),
             "sensor.export": FakeState("0.05", {"forecast": [0.05] * 12}, first_now),
             "sensor.pv": FakeState("1", {"forecast": values}, pv_issued),
-            "sensor.load": FakeState(
-                "1",
-                {"forecast": values, "forecastGeneratedAt": load_issued.isoformat()},
-                first_now,
-            ),
+            "sensor.load": FakeState("1", {"unit_of_measurement": "kW"}, first_now),
             "sensor.battery": FakeState("50", last_updated=first_now),
         }
     )
@@ -1174,7 +1323,7 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
     first = InputManager(hass, entry_data, options)
     first.build_context()
     monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: second_now)
-    second = InputManager(hass, entry_data, options)
+    second = InputManager(hass, entry_data, options, load_forecast_model=first.load_forecast_model)
     second.build_context()
 
     second_by_time = {slot["valid_at"]: slot for slot in second.forecast_training_slots}
@@ -1182,11 +1331,8 @@ def test_training_slots_keep_per_source_issue_times_across_refreshes(monkeypatch
     second_common = second_by_time[first_common["valid_at"]]
     assert first_common["valid_at"] == second_common["valid_at"]
     assert first_common["pv_forecast_kw_issued_at"] == second_common["pv_forecast_kw_issued_at"] == pv_issued
-    assert (
-        first_common["baseline_load_forecast_kw_issued_at"]
-        == second_common["baseline_load_forecast_kw_issued_at"]
-        == load_issued
-    )
+    assert first_common["baseline_load_forecast_kw_issued_at"] == first_now
+    assert second_common["baseline_load_forecast_kw_issued_at"] == first_now
 
 
 def test_forecast_training_indices_span_full_horizon_sparsely() -> None:
@@ -1295,8 +1441,8 @@ def test_input_manager_combines_forecast_confidence_metadata() -> None:
         {
             "config_key": CONF_BASELINE_LOAD_FORECAST,
             "entity_id": "sensor.load",
-            "source": "forecast_series",
-            "confidence": 0.77,
+            "source": "built_in_recorder_history",
+            "confidence": 1.0,
         },
         {
             "config_key": CONF_WEATHER,
@@ -1503,7 +1649,7 @@ def test_input_manager_does_not_mark_timestamped_future_forecast_stale() -> None
     issues = manager._freshness_issues(now)
 
     assert "pv_forecast_entity_stale" not in issues
-    assert "baseline_load_forecast_entity_stale" in issues
+    assert "household_load_entity_stale" in issues
 
 
 def test_input_manager_state_cache_and_small_helpers() -> None:
@@ -1524,5 +1670,5 @@ def test_input_manager_state_cache_and_small_helpers() -> None:
     assert _state_confidence(FakeState("0", {"confidence": "bad"}), default=0.5) == 0.5
     assert _state_confidence(FakeState("0", {"confidence_percent": 150}), default=0.5) == 1.0
     assert _combined_confidence([]) == 1.0
-    assert InputManager._health_from_issues(["weather_entity_unavailable"]) == InputHealth.DEGRADED
-    assert InputManager._health_from_issues([]) == InputHealth.HEALTHY
+    assert _RawInputManager._health_from_issues(["weather_entity_unavailable"]) == InputHealth.DEGRADED
+    assert _RawInputManager._health_from_issues([]) == InputHealth.HEALTHY

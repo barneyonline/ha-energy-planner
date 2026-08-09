@@ -38,6 +38,19 @@ _ENPHASE_DEFAULTS = {
     "enphase_self_consumption_profile": "Self-Consumption",
     "enphase_full_backup_profile": "Full Backup",
 }
+_LEGACY_LOAD_FORECAST = "baseline_load_forecast_entity"
+_LEGACY_LOAD_OBSERVED = "baseline_load_observed_entity"
+_HOUSEHOLD_LOAD = "household_load_entity"
+
+
+def _migrate_load_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Retain only an explicitly measured legacy load as built-in model input."""
+    migrated = dict(data)
+    if not migrated.get(_HOUSEHOLD_LOAD) and migrated.get(_LEGACY_LOAD_OBSERVED):
+        migrated[_HOUSEHOLD_LOAD] = migrated[_LEGACY_LOAD_OBSERVED]
+    migrated.pop(_LEGACY_LOAD_FORECAST, None)
+    migrated.pop(_LEGACY_LOAD_OBSERVED, None)
+    return migrated
 
 
 def grouped_subentry_data(entry: ConfigEntry) -> dict[str, dict[str, Any]]:
@@ -47,7 +60,7 @@ def grouped_subentry_data(entry: ConfigEntry) -> dict[str, dict[str, Any]]:
         target = _LEGACY_TO_TARGET.get(subentry.subentry_type)
         if target is None:
             continue
-        data = dict(subentry.data)
+        data = _migrate_load_keys(dict(subentry.data))
         if subentry.subentry_type == SUBENTRY_ENERGY:
             climate_data = {key: value for key, value in data.items() if key in _CLIMATE_KEYS_FROM_ENERGY}
             energy_data = {key: value for key, value in data.items() if key not in _CLIMATE_KEYS_FROM_ENERGY}
@@ -87,12 +100,12 @@ def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: ConfigEnt
     if not subentries:
         return False
 
-    data = dict(entry.data)
+    data = _migrate_load_keys(dict(entry.data))
     for section_data in grouped_subentry_data(entry).values():
         data.update(section_data)
     for subentry in subentries:
         if subentry.subentry_type not in _LEGACY_TO_TARGET:
-            data.update(dict(subentry.data))
+            data.update(_migrate_load_keys(dict(subentry.data)))
 
     hass.config_entries.async_update_entry(entry, data=data)
     for subentry in subentries:

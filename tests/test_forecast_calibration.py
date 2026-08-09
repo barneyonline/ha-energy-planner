@@ -97,13 +97,13 @@ def test_update_matches_small_timestamp_skew_and_deduplicates_lead_bucket() -> N
                 {
                     "issued_at": now - timedelta(minutes=65),
                     "valid_at": now - timedelta(minutes=5),
-                    "baseline_load_forecast_kw": 1.0,
+                    "pv_forecast_kw": 1.0,
                 }
             ]
         }
     ] * 2
     actual = {
-        "baseline_load_forecast_kw": {
+        "pv_forecast_kw": {
             "value": 2.0,
             "observed_at": now - timedelta(minutes=4, seconds=15),
         }
@@ -114,8 +114,8 @@ def test_update_matches_small_timestamp_skew_and_deduplicates_lead_bucket() -> N
 
     assert changed is True
     assert changed_again is False
-    assert model["baseline_load_forecast_kw"]["sample_count"] == 1
-    assert model["baseline_load_forecast_kw"]["raw_sample_count"] == 1
+    assert model["pv_forecast_kw"]["sample_count"] == 1
+    assert model["pv_forecast_kw"]["raw_sample_count"] == 1
 
 
 def test_field_issue_time_prevents_refresh_origins_creating_lead_samples() -> None:
@@ -412,7 +412,7 @@ def test_forecast_calibration_resets_legacy_and_million_scale_counters() -> None
     )
     contaminated, contaminated_changed = update_forecast_calibration(
         {
-            "baseline_load_forecast_kw": {
+            "pv_forecast_kw": {
                 "model_version": 3,
                 "sample_count": 2_000_000,
                 "raw_sample_count": 2_000_000,

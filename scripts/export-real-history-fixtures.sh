@@ -34,14 +34,12 @@ required_vars=(
   HEP_DAIKIN_POWER_ENTITY
   HEP_PV_FORECAST_ENTITY
   HEP_PV_ACTUAL_ENTITY
-  HEP_LOAD_FORECAST_ENTITY
-  HEP_LOAD_ACTUAL_ENTITY
 )
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   printf 'Would export real history fixtures to %s\n' "$OUT_DIR"
   printf 'Required environment variables: %s\n' "${required_vars[*]}"
-  printf 'Optional environment variables: HEP_HISTORY_START HEP_HISTORY_END HEP_HISTORY_DAYS HEP_OUTDOOR_TEMPERATURE_ENTITY HEP_THERMAL_INDOOR_ATTRIBUTE HEP_OUTDOOR_TEMPERATURE_ATTRIBUTE HEP_PV_FORECAST_ATTRIBUTE HEP_LOAD_FORECAST_ATTRIBUTE HEP_FORECAST_INTERVAL_MINUTES HEP_FORECAST_HORIZON_HOURS HEP_REDACT_KEYS\n'
+  printf 'Optional environment variables: HEP_HISTORY_START HEP_HISTORY_END HEP_HISTORY_DAYS HEP_OUTDOOR_TEMPERATURE_ENTITY HEP_THERMAL_INDOOR_ATTRIBUTE HEP_OUTDOOR_TEMPERATURE_ATTRIBUTE HEP_PV_FORECAST_ATTRIBUTE HEP_FORECAST_INTERVAL_MINUTES HEP_FORECAST_HORIZON_HOURS HEP_REDACT_KEYS\n'
   exit 0
 fi
 
@@ -115,19 +113,6 @@ run python3 scripts/export-real-history-fixture.py \
   --actual-entity "$HEP_PV_ACTUAL_ENTITY" \
   --forecast-attribute "${HEP_PV_FORECAST_ATTRIBUTE:-forecast}" \
   --value-keys pv_forecast_kw,pv_estimate,estimate,power,watts,value \
-  --interval-minutes "$forecast_interval" \
-  --horizon-hours "$forecast_horizon"
-
-run python3 scripts/export-real-history-fixture.py \
-  --out "$OUT_DIR/real_load_forecast_accuracy.json" \
-  --validate \
-  "${redact_args[@]}" \
-  forecast-accuracy \
-  --name real_load_forecast_accuracy \
-  --forecast-entity "$HEP_LOAD_FORECAST_ENTITY" \
-  --actual-entity "$HEP_LOAD_ACTUAL_ENTITY" \
-  --forecast-attribute "${HEP_LOAD_FORECAST_ATTRIBUTE:-forecast}" \
-  --value-keys baseline_load_forecast_kw,load_kw,load,power,watts,value \
   --interval-minutes "$forecast_interval" \
   --horizon-hours "$forecast_horizon"
 

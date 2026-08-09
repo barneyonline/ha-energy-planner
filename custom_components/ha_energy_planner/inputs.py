@@ -15,8 +15,6 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
-    CONF_BASELINE_LOAD_FORECAST,
-    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_TARGET_HIGH,
@@ -36,6 +34,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_FORECAST_FRESHNESS_MINUTES,
+    CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
@@ -59,20 +58,18 @@ from .forecasts import (
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
 )
+from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DecisionContext, DecisionSlot, HAEOStatus, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
-    CONF_BASELINE_LOAD_FORECAST: "baseline_load_forecast_kw",
 }
 _OBSERVATION_FIELDS_BY_CONFIG = {
     CONF_PV_OBSERVED: "pv_forecast_kw",
-    CONF_BASELINE_LOAD_OBSERVED: "baseline_load_forecast_kw",
 }
 _FORECAST_VALUE_KEYS_BY_CONFIG = {
     CONF_PV_FORECAST: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
     CONF_PV_FORECAST_SECONDARY: ("pv_forecast_kw", "pv_estimate", "estimate", "power", "watts", "value"),
-    CONF_BASELINE_LOAD_FORECAST: ("baseline_load_forecast_kw", "load_kw", "load", "power", "watts", "value"),
     CONF_CARBON_INTENSITY_FORECAST: (
         "carbon_intensity_g_per_kwh",
         "carbon_intensity",
@@ -83,9 +80,8 @@ _FORECAST_VALUE_KEYS_BY_CONFIG = {
 _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_DAIKIN_POWER: ("power", "power"),
     CONF_PV_FORECAST: ("power", "power"),
-    CONF_BASELINE_LOAD_FORECAST: ("power", "power"),
+    CONF_HOUSEHOLD_LOAD: ("power", "power"),
     CONF_PV_OBSERVED: ("power", "power"),
-    CONF_BASELINE_LOAD_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
 
@@ -99,13 +95,10 @@ def _split_entity_values(value: Any) -> list[str]:
     return []
 
 
-_LEADING_LOAD_FILL_CONFIDENCE_FACTOR = 0.75
-_MAX_LEADING_LOAD_FILL_MINUTES = 60
 _REQUIRED_FORECAST_CONFIGS = {
     CONF_AMBER_IMPORT_PRICE,
     CONF_AMBER_EXPORT_PRICE,
     CONF_PV_FORECAST,
-    CONF_BASELINE_LOAD_FORECAST,
 }
 
 
@@ -119,6 +112,8 @@ class InputManager:
         options: Mapping[str, Any],
         trip_history: Mapping[str, Any] | None = None,
         forecast_calibration: Mapping[str, Any] | None = None,
+        load_forecast_model: Mapping[str, Any] | None = None,
+        load_forecast_update_reason: str | None = None,
     ) -> None:
         """Initialize input manager."""
         self.hass = hass
@@ -126,6 +121,9 @@ class InputManager:
         self.options = options
         self.trip_history = dict(trip_history or {})
         self.forecast_calibration = dict(forecast_calibration or {})
+        self.load_forecast_model = dict(load_forecast_model or {})
+        self.load_forecast_update_reason = load_forecast_update_reason
+        self.load_forecast_details: dict[str, Any] = {}
         self.forecast_training_slots: list[dict[str, Any]] = []
         self.forecast_confidence_details: list[dict[str, Any]] = []
         self.forecast_coverage_details: list[dict[str, Any]] = []
@@ -168,10 +166,7 @@ class InputManager:
             interval,
             secondary_config_key=CONF_PV_FORECAST_SECONDARY,
         )
-        baseline_loads, load_issue = self._required_series(
-            CONF_BASELINE_LOAD_FORECAST,
-            _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_BASELINE_LOAD_FORECAST],
-            "power",
+        baseline_loads, load_issue = self._built_in_load_series(
             now,
             horizon,
             interval,
@@ -422,36 +417,15 @@ class InputManager:
         if forecast:
             primary_forecast = source_forecasts[0]
             raw_forecast = list(primary_forecast or [None] * slot_count)
-            leading_fill_slots = 0
-            if config_key == CONF_BASELINE_LOAD_FORECAST:
-                current_value = _finite_float_or_none(state.state)
-                if current_value is not None:
-                    attributes = getattr(state, "attributes", {}) or {}
-                    unit = str(_attribute_value(attributes, "unit_of_measurement", "unit") or "")
-                    current_value = normalize_scalar_value(
-                        current_value,
-                        value_kind=value_kind,
-                        value_key=value_keys[0],
-                        unit=unit,
-                    )
-                    leading_fill_slots = _fill_bounded_leading_gap(
-                        forecast,
-                        current_value,
-                        max_slots=max(int(_MAX_LEADING_LOAD_FILL_MINUTES / interval), 1),
-                    )
             coverage = forecast_coverage_ratio(forecast)
             coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval)
-            confidence_factor = _LEADING_LOAD_FILL_CONFIDENCE_FACTOR if leading_fill_slots else 1.0
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
-                * coverage
-                * confidence_factor,
+                * coverage,
                 config_key=config_key,
                 entity_id=",".join(item[1] for item in source_states),
                 source=(
-                    "forecast_series_leading_fill"
-                    if leading_fill_slots
-                    else "forecast_series_stitched"
+                    "forecast_series_stitched"
                     if len(forecasts) > 1
                     else "forecast_series"
                     if coverage == 1.0
@@ -460,8 +434,6 @@ class InputManager:
                 details={
                     **coverage_details,
                     "source_count": len(forecasts),
-                    "leading_gap_filled_slots": leading_fill_slots,
-                    "leading_gap_filled_hours": round(leading_fill_slots * interval / 60, 4),
                 },
             )
             padded = list(forecast[:slot_count])
@@ -531,6 +503,119 @@ class InputManager:
             source="point_value_repeated",
         )
         return [value] * slot_count, None
+
+    def _built_in_load_series(
+        self,
+        now: datetime,
+        horizon: int,
+        interval: int,
+    ) -> tuple[list[float | None], str | None]:
+        """Return the Recorder-trained household baseline load forecast."""
+        slot_count = int(horizon * 60 / interval)
+        entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
+        if not entity_id:
+            return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_not_configured"
+        state = self._state(entity_id)
+        source_issue: str | None = None
+        current_load: float | None = None
+        if not self._valid_state(state):
+            source_issue = f"{CONF_HOUSEHOLD_LOAD}_unavailable"
+        else:
+            attributes = getattr(state, "attributes", {}) or {}
+            current_load = normalize_power_kw(
+                getattr(state, "state", None),
+                str(_attribute_value(attributes, "unit_of_measurement", "unit") or ""),
+            )
+            if current_load is None:
+                source_issue = f"{CONF_HOUSEHOLD_LOAD}_non_numeric"
+        current_ev_charging, _ev_issue = self._optional_bool_state(CONF_EV_CHARGING)
+        hvac_entity_id = self.entry_data.get(CONF_DAIKIN_POWER)
+        hvac_state = self._state(hvac_entity_id) if hvac_entity_id else None
+        hvac_attributes = getattr(hvac_state, "attributes", {}) or {}
+        current_hvac_power = (
+            normalize_power_kw(
+                getattr(hvac_state, "state", None),
+                str(_attribute_value(hvac_attributes, "unit_of_measurement", "unit") or ""),
+            )
+            if self._valid_state(hvac_state)
+            else None
+        )
+        recent_load_is_clean = not (
+            self.entry_data.get(CONF_EV_CHARGING) and current_ev_charging is None
+        ) and not (
+            self.entry_data.get(CONF_DAIKIN_POWER) and current_hvac_power is None
+        )
+        clean_current_load = (
+            max(current_load - (current_hvac_power or 0.0), 0.0)
+            if current_load is not None
+            else None
+        )
+        result = load_forecast_from_model(
+            self.load_forecast_model,
+            now=now,
+            timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
+            horizon_hours=horizon,
+            interval_minutes=interval,
+            source_entity_id=entity_id,
+            current_load_kw=clean_current_load if recent_load_is_clean else None,
+            current_ev_charging=current_ev_charging,
+        )
+        self.load_forecast_details = {
+            **result.details,
+            "update_reason": self.load_forecast_update_reason,
+        }
+        confidence = 0.0 if source_issue else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
+        coverage_details = {
+            **result.details,
+            "classification": source_issue or ("healthy" if result.status == "ready" else result.status),
+            "covered_hours": round(
+                sum(value is not None for value in result.expected_kw) * interval / 60,
+                4,
+            ),
+            "continuous_hours": round(
+                _leading_present_slots(result.expected_kw) * interval / 60,
+                4,
+            ),
+        }
+        self._record_forecast_confidence(
+            confidence,
+            config_key=CONF_HOUSEHOLD_LOAD,
+            entity_id=entity_id,
+            source="built_in_recorder_history",
+            details=coverage_details,
+        )
+        self._raw_forecast_series["baseline_load_forecast_kw"] = list(result.expected_kw)
+        self._conservative_forecast_series["baseline_load_forecast_kw"] = list(result.upper_kw)
+        trained_at = dt_util.parse_datetime(str(result.details.get("trained_at") or ""))
+        if trained_at is not None:
+            self._forecast_source_issued_at["baseline_load_forecast_kw"] = dt_util.as_utc(trained_at)
+        issue = {
+            "ready": None,
+            "degraded": f"advisory_{CONF_HOUSEHOLD_LOAD}_forecast_degraded",
+            "learning": f"{CONF_HOUSEHOLD_LOAD}_forecast_learning",
+            "stale": f"{CONF_HOUSEHOLD_LOAD}_forecast_stale",
+            "failed": f"{CONF_HOUSEHOLD_LOAD}_forecast_unusable",
+        }.get(result.status, f"{CONF_HOUSEHOLD_LOAD}_forecast_failed")
+        unusable_since = dt_util.parse_datetime(str(result.details.get("unusable_since") or ""))
+        if (
+            result.status == "failed"
+            and unusable_since is not None
+            and now - dt_util.as_utc(unusable_since) >= STALE_MODEL_AGE
+        ):
+            issue = f"{CONF_HOUSEHOLD_LOAD}_forecast_failed"
+        if (
+            result.status in {"stale", "failed"}
+            and isinstance(self.load_forecast_update_reason, str)
+            and "recorder_unavailable" in self.load_forecast_update_reason
+        ):
+            issue = f"{CONF_HOUSEHOLD_LOAD}_recorder_unavailable"
+        elif (
+            result.status in {"stale", "failed"}
+            and isinstance(self.load_forecast_update_reason, str)
+            and "history_limit_exceeded" in self.load_forecast_update_reason
+        ):
+            issue = f"{CONF_HOUSEHOLD_LOAD}_history_limit_exceeded"
+        return result.expected_kw, source_issue or issue
 
     def _optional_series(
         self,
@@ -718,7 +803,6 @@ class InputManager:
                 issues.append(f"{key}_stale")
         for key in (
             CONF_PV_FORECAST,
-            CONF_BASELINE_LOAD_FORECAST,
             CONF_CARBON_INTENSITY_FORECAST,
         ):
             entity_id = self.entry_data.get(key)
@@ -733,6 +817,10 @@ class InputManager:
                 )
             ):
                 issues.append(f"{key}_stale")
+        load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)
+        load_state = self._state(load_entity) if load_entity else None
+        if load_state and now - load_state.last_updated > forecast_timeout:
+            issues.append(f"{CONF_HOUSEHOLD_LOAD}_stale")
         return issues
 
     def current_forecast_observations(self) -> dict[str, dict[str, Any] | None]:
@@ -795,13 +883,16 @@ class InputManager:
         blocking_issues = [
             issue for issue in issues if not issue.startswith("advisory_")
         ]
-        required_fragments = ("import_price", "export_price", "pv_forecast", "baseline_load", "battery_soc")
+        required_fragments = ("import_price", "export_price", "pv_forecast", "household_load", "battery_soc")
         required_issues = [
             issue
             for issue in blocking_issues
             if any(fragment in issue for fragment in required_fragments)
         ]
-        if any(not issue.endswith("_forecast_coverage_degraded") for issue in required_issues):
+        if any(
+            not issue.endswith(("_forecast_coverage_degraded", "_forecast_degraded"))
+            for issue in required_issues
+        ):
             return InputHealth.UNSAFE
         if blocking_issues:
             return InputHealth.DEGRADED
@@ -845,6 +936,16 @@ def _series_value(series: list[float | None], index: int) -> float | None:
     return series[-1]
 
 
+def _leading_present_slots(series: list[float | None]) -> int:
+    """Return continuous present slots from the start of a forecast."""
+    count = 0
+    for value in series:
+        if value is None:
+            break
+        count += 1
+    return count
+
+
 def _stitch_forecast_series(
     forecasts: list[list[float | None]],
     slot_count: int,
@@ -859,21 +960,6 @@ def _stitch_forecast_series(
             )
         )
     return stitched
-
-
-def _fill_bounded_leading_gap(
-    forecast: list[float | None],
-    current_value: float,
-    *,
-    max_slots: int,
-) -> int:
-    """Fill a short leading load gap without masking internal or long gaps."""
-    first_present = next((index for index, value in enumerate(forecast) if value is not None), None)
-    if first_present is None or first_present == 0 or first_present > max_slots:
-        return 0
-    for index in range(first_present):
-        forecast[index] = current_value
-    return first_present
 
 
 def _retain_uncalibrated_secondary_slots(

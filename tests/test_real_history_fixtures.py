@@ -51,7 +51,6 @@ def test_real_history_profile_reports_missing_fixture_names() -> None:
 
     assert validator._profile_missing_names("ha-energy-planner-history-v1-real", _fixtures()) == [
         "real_daikin_thermal_history",
-        "real_load_forecast_accuracy",
         "real_mini_trip_history",
         "real_pv_forecast_accuracy",
     ]
@@ -80,11 +79,6 @@ def test_real_history_profile_accepts_required_source_entities() -> None:
             "kind": "forecast_accuracy",
             "name": "real_pv_forecast_accuracy",
             "source_entity_ids": {"forecast": "sensor.pv_forecast", "actual": "sensor.pv_power"},
-        },
-        {
-            "kind": "forecast_accuracy",
-            "name": "real_load_forecast_accuracy",
-            "source_entity_ids": {"forecast": "sensor.load_forecast", "actual": "sensor.load_power"},
         },
     ]
 

@@ -26,7 +26,6 @@ from .const import (
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
-    CONF_BASELINE_LOAD_FORECAST,
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -88,7 +87,7 @@ from .models import (
 )
 from .planner import DryRunPlanner
 from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
-from .recorder_import import async_import_ev_trip_history_from_recorder
+from .recorder_import import async_import_ev_trip_history_from_recorder, async_update_builtin_load_forecast
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
@@ -167,7 +166,6 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_AMBER_IMPORT_PRICE,
         CONF_AMBER_EXPORT_PRICE,
         CONF_PV_FORECAST,
-        CONF_BASELINE_LOAD_FORECAST,
         CONF_CARBON_INTENSITY_FORECAST,
         CONF_BATTERY_SOC,
         CONF_ENPHASE_PROFILE,
@@ -241,6 +239,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_decision_context: DecisionContext | None = None
         self._tearing_down = False
         self._force_next_refresh = False
+        self._load_forecast_training_attempted = False
         self._refresh_counters: dict[str, int] = {
             "requested": 0,
             "completed": 0,
@@ -516,12 +515,28 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         if trip_import_changed:
             await self.store.async_save_trip_history(trip_history)
+        load_forecast_model = dict(self.store.data.get("built_in_load_forecast", {}))
+        load_forecast_model, load_forecast_changed, load_forecast_reason = (
+            await async_update_builtin_load_forecast(
+                self.hass,
+                entry_data,
+                load_forecast_model,
+                now=dt_util.utcnow(),
+                timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
+                force=not getattr(self, "_load_forecast_training_attempted", False),
+            )
+        )
+        self._load_forecast_training_attempted = True
+        if load_forecast_changed:
+            await self.store.async_save_builtin_load_forecast(load_forecast_model)
         manager = InputManager(
             self.hass,
             entry_data,
             options,
             trip_history=trip_history,
             forecast_calibration=dict(self.store.data.get("forecast_calibration", {})),
+            load_forecast_model=load_forecast_model,
+            load_forecast_update_reason=load_forecast_reason,
         )
         forecast_calibration, calibration_changed = update_forecast_calibration(
             dict(self.store.data.get("forecast_calibration", {})),
@@ -642,10 +657,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "forecast_training_slots": manager.forecast_training_slots,
                 "forecast_calibration": {
                     "pv_forecast_kw": _calibration_summary(forecast_calibration, "pv_forecast_kw"),
-                    "baseline_load_forecast_kw": _calibration_summary(
-                        forecast_calibration, "baseline_load_forecast_kw"
-                    ),
                 },
+                "built_in_load_forecast": dict(getattr(manager, "load_forecast_details", {})),
+                "action_load_forecasts": _snapshot_action_load_forecasts(plan, context),
                 "confidence": {
                     "overall": plan.confidence,
                     "forecast_source_confidence": getattr(context, "forecast_confidence", plan.confidence),
@@ -696,6 +710,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Request immediate refresh."""
         self._mark_forced_refresh("manual_replan")
         await self.async_request_refresh()
+
+    async def async_reconcile_production_evidence_contract(self) -> bool:
+        """Restore and disarm when the reviewed production contract changed."""
+        production = parse_production_state(self.store.data.get("production"))
+        if not production.armed or production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
+            self.entry_data,
+            self.options,
+        ):
+            return False
+        await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+        await self.async_disarm_production_control("production_evidence_contract_changed")
+        return True
 
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
@@ -1796,6 +1822,35 @@ def _haeo_capability_metadata(adapter: Any) -> dict[str, Any]:
 def _snapshot_actions(plan: EnergyPlan) -> list[dict[str, Any]]:
     """Return bounded action metadata for forecast/audit snapshots."""
     return [_snapshot_action(action) for action in plan.actions[:8]]
+
+
+def _snapshot_action_load_forecasts(
+    plan: EnergyPlan,
+    context: DecisionContext,
+) -> list[dict[str, Any]]:
+    """Return compact load evidence aligned to each planned action."""
+    if not context.slots:
+        return []
+    slots = sorted(context.slots, key=lambda slot: slot.valid_at)
+    rows: list[dict[str, Any]] = []
+    for action in plan.actions[:20]:
+        slot = next(
+            (
+                candidate
+                for candidate in reversed(slots)
+                if candidate.valid_at <= action.execute_not_before
+            ),
+            slots[0],
+        )
+        rows.append(
+            {
+                "action_id": action.action_id,
+                "valid_at": slot.valid_at,
+                "expected_kw": slot.baseline_load_forecast_kw,
+                "conservative_kw": slot.baseline_load_forecast_upper_kw,
+            }
+        )
+    return rows
 
 
 def _snapshot_action(action: Any) -> dict[str, Any]:

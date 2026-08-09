@@ -1,9 +1,18 @@
 # Changelog
 
-## Unreleased
+## 0.9.1 - 2026-08-09
 
 ### Changed
 
+- Replaced the required external baseline-load forecast with a built-in,
+  deterministic household-load forecast trained from up to 28 days of Home
+  Assistant Recorder history. Energy setup now requires a measured whole-home
+  power sensor and keeps the external PV forecast. The model exposes expected
+  and conservative load evidence through the existing status and calendar
+  surfaces, handles weekday/weekend patterns and DST, and fails closed for
+  active commands while learning, stale, or failed. HAFO is no longer required;
+  HAEO remains optional. Existing measured-load mappings migrate automatically,
+  while forecast-only legacy entries require the user to select a real sensor.
 - Added individual **Climate control**, **EV control**, and **Enphase control**
   switches. **Automatic control** remains the master arm switch and now respects
   the selected device switches instead of enabling every configured area.
@@ -22,6 +31,26 @@
 
 ### Fixed
 
+- Household-load conservative bounds now protect HAEO-free grid-import checks,
+  15-minute profiles are time-weighted into every configured planning interval,
+  and live HVAC subtraction normalizes W/kW/MW before clamping at zero. Calendar
+  and Next actions evidence is aligned to each action time, and only fully
+  observed days satisfy the seven-complete-day readiness gate.
+- Conservative load/PV uncertainty now remains part of the grid-import safety
+  check when optional HAEO grid evidence is present. Recorder training queries
+  adaptive UTC-aligned chunks with a per-entity cardinality limit, exposes retained
+  failed-training evidence and source identity, and notifies for model-quality
+  failure only after the model has remained unusable for 72 hours.
+- Built-in models aged 24–72 hours remain visibly degraded and reduce load
+  confidence, but no longer trip the integration-wide unsafe-input command gate;
+  learning, stale, and failed models continue to block active commands.
+- Recorder power states are normalized using their historical W/kW/MW unit
+  attributes, preventing source unit changes from reinterpreting older readings.
+- A household-load mapping or forecast-contract change now restores safe state
+  and explicitly disarms production control before new dry-run review cycles,
+  so the Armed entity cannot remain misleadingly on while commands are blocked.
+- Core real-evidence export and Docker smoke validation no longer require an
+  external household-load forecast or a configured HAEO service.
 - Deterministic EV and Enphase fallback actions are no longer incorrectly
   marked as HAEO-dependent when current HAEO grid evidence was not used. Stale
   HAEO arbitrage evidence is ignored, while genuinely HAEO-derived actions keep

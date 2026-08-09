@@ -14,8 +14,11 @@ from .const import (
     ATTR_READY_BY,
     ATTR_REASON,
     ATTR_TARGET_SOC,
+    CONF_BASELINE_LOAD_FORECAST,
+    CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
+    CONF_HOUSEHOLD_LOAD,
     CONF_INSTANCE_NAME,
     DEFAULT_OPTIONS,
     DOMAIN,
@@ -44,6 +47,19 @@ if TYPE_CHECKING:
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _DUPLICATE_ENTITY_ID_MIGRATIONS = {"switch.ai_ai_enabled": "switch.ai_enabled"}
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
+    """Migrate measured-load configuration without trusting forecast entities."""
+    if getattr(entry, "version", 1) > 2:
+        return False
+    data = dict(entry.data)
+    if not data.get(CONF_HOUSEHOLD_LOAD) and data.get(CONF_BASELINE_LOAD_OBSERVED):
+        data[CONF_HOUSEHOLD_LOAD] = data[CONF_BASELINE_LOAD_OBSERVED]
+    data.pop(CONF_BASELINE_LOAD_FORECAST, None)
+    data.pop(CONF_BASELINE_LOAD_OBSERVED, None)
+    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    return True
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -317,6 +333,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
     try:
+        await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
