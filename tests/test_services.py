@@ -21,6 +21,7 @@ from custom_components.ha_energy_planner.const import (
     ATTR_TARGET_SOC,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_HOUSEHOLD_LOAD,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
     SERVICE_DISARM_PRODUCTION_CONTROL,
@@ -650,6 +651,23 @@ def test_preflight_options_override_does_not_mutate_entry_options() -> None:
     assert coordinator.entry.options["climate_control_enabled"] is True
 
 
+def test_preflight_blocks_active_readiness_when_recorder_is_missing_for_load_model() -> None:
+    coordinator = _coordinator()
+    hass = FakeHass(coordinator)
+    hass.config.components = set()
+
+    report = build_preflight_report(hass, coordinator)
+
+    recorder_check = {item["check"]: item for item in report["checks"]}["recorder_available"]
+    assert recorder_check == {
+        "check": "recorder_available",
+        "ok": False,
+        "blocking": True,
+        "message": "Recorder is not detected.",
+    }
+    assert report["active_control_ready"] is False
+
+
 def test_run_preflight_fails_closed_for_missing_and_malformed_production_state() -> None:
     coordinator = _coordinator()
     coordinator.store.data.pop("production")
@@ -734,6 +752,15 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
 
     assert active == original
     assert changed_policy != original
+
+
+def test_production_evidence_changes_with_household_load_mapping() -> None:
+    options = {"ev_control_enabled": False}
+
+    first = production_evidence_fingerprint({CONF_HOUSEHOLD_LOAD: "sensor.house_a"}, options)
+    second = production_evidence_fingerprint({CONF_HOUSEHOLD_LOAD: "sensor.house_b"}, options)
+
+    assert first != second
 
 
 def test_export_support_bundle_returns_preflight_and_diagnostics() -> None:
@@ -837,7 +864,7 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
                 "amber_import_price_entity": "sensor.import_price",
                 "amber_export_price_entity": "sensor.export_price",
                 "pv_forecast_entity": "sensor.pv_forecast",
-                "baseline_load_forecast_entity": "sensor.baseline_load",
+                CONF_HOUSEHOLD_LOAD: "sensor.baseline_load",
                 "battery_soc_entity": "sensor.battery_soc",
                 "enphase_profile_entity": "select.enphase_profile",
                 "enphase_profile_control_service": "select.select_option",

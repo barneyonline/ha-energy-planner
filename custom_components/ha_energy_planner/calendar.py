@@ -13,7 +13,13 @@ from homeassistant.util import dt as dt_util
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import PlanAction
-from .sensor import _action_sentence, _asset_name, _decision_data_quality_attrs, _plain_action
+from .sensor import (
+    _action_sentence,
+    _asset_name,
+    _built_in_load_forecast_attrs,
+    _decision_data_quality_attrs,
+    _plain_action,
+)
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -80,6 +86,14 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
     desired_state = details.get("desired_state")
     if desired_state:
         description_lines.append(f"Desired state: {_compact_mapping(desired_state)}")
+    load_forecast = _built_in_load_forecast_attrs(coordinator)
+    if load_forecast:
+        description_lines.append(
+            "Load forecast: "
+            f"{load_forecast.get('status', 'unknown')}; "
+            f"expected {load_forecast.get('first_expected_kw', 'unknown')} kW; "
+            f"conservative {load_forecast.get('first_upper_kw', 'unknown')} kW."
+        )
     return CalendarEvent(
         start=action.execute_not_before,
         end=action.execute_not_after,

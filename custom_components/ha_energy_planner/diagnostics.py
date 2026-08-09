@@ -154,9 +154,17 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         "production": store_data.get("production", {}),
         "control_pause": store_data.get("control_pause", {}),
         "forecast_calibration": store_data.get("forecast_calibration", {}),
+        "built_in_load_forecast": _load_forecast_summary(store_data.get("built_in_load_forecast", {})),
         "thermal_model": store_data.get("thermal_model", {}),
         "trip_history": _trip_history_summary(store_data.get("trip_history", {})),
     }
+
+
+def _load_forecast_summary(value: Any) -> dict[str, Any]:
+    """Return model health without large per-slot profiles."""
+    if not isinstance(value, dict):
+        return {}
+    return {key: item for key, item in value.items() if key != "profiles"}
 
 
 def _trip_history_summary(value: Any) -> dict[str, Any]:

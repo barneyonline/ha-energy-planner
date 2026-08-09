@@ -163,6 +163,7 @@ class FakeStore:
         self.discovery: list[dict[str, object]] = []
         self.trip_history: list[dict[str, object]] = []
         self.forecast_calibrations: list[dict[str, object]] = []
+        self.load_forecasts: list[dict[str, object]] = []
         self.thermal_models: list[dict[str, object]] = []
         self.haeo_runs: list[dict[str, object]] = []
         self.ai_recommendations: list[dict[str, object]] = []
@@ -191,6 +192,10 @@ class FakeStore:
     async def async_save_forecast_calibration(self, calibration: dict[str, object]) -> None:
         self.forecast_calibrations.append(calibration)
         self.data["forecast_calibration"] = calibration
+
+    async def async_save_builtin_load_forecast(self, model: dict[str, object]) -> None:
+        self.load_forecasts.append(model)
+        self.data["built_in_load_forecast"] = model
 
     async def async_save_thermal_model(self, thermal_model: dict[str, object]) -> None:
         self.thermal_models.append(thermal_model)
@@ -2385,6 +2390,9 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     ) -> tuple[dict[str, object], bool, str]:
         return {"records": [{"soc": 80}]}, True, "imported"
 
+    async def fake_update_load_forecast(*args: object, **kwargs: object) -> tuple[dict[str, object], bool, str]:
+        return {"status": "learning", "source_entity_id": "sensor.house"}, True, "load_forecast_learning"
+
     async def fake_ai_advice(
         self: EnergyPlannerCoordinator,
         built_context: object,
@@ -2410,6 +2418,10 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder",
         fake_import_trip_history,
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_update_builtin_load_forecast",
+        fake_update_load_forecast,
     )
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.InputManager", FakeInputManager)
     monkeypatch.setattr(
@@ -2497,6 +2509,7 @@ def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: o
     assert coordinator.store.discovery == [{"ok": True}]
     assert coordinator.store.trip_history == [{"records": [{"soc": 80}]}]
     assert coordinator.store.forecast_calibrations == [{"pv_forecast_kw": {"enabled": True}}]
+    assert coordinator.store.load_forecasts == [{"status": "learning", "source_entity_id": "sensor.house"}]
     assert coordinator.store.thermal_models == [{"last_sample": {"sampled_at": now}, "enabled": True}]
     assert coordinator.store.haeo_runs[0]["flexible_projection_count"] == 1
     assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == HAEOStatus.READY

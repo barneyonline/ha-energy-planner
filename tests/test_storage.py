@@ -144,6 +144,7 @@ def test_store_load_fills_missing_schema_defaults(monkeypatch: object) -> None:
     assert store.data["outcomes"] == []
     assert store.data["forecast_snapshots"] == []
     assert store.data["command_rate_limits"] == {}
+    assert store.data["built_in_load_forecast"] == {}
     assert store.data["active_plan"] is None
     assert store.data["execution_audit"] == []
 
@@ -156,6 +157,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
         "forecast_snapshots": {"bad": "shape"},
         "ownership": None,
         "trip_history": [],
+        "built_in_load_forecast": [],
         "future_metadata": {"kept": True},
     }
 
@@ -167,7 +169,27 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
     assert store.data["forecast_snapshots"] == []
     assert store.data["ownership"] == {}
     assert store.data["trip_history"] == {}
+    assert store.data["built_in_load_forecast"] == {}
     assert store.data["future_metadata"] == {"kept": True}
+
+
+def test_store_persists_compact_builtin_load_model_only_when_changed(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    FakeStore.saved = None
+    FakeStore.save_count = 0
+    store = PlannerStore(object())
+    model = {
+        "model_version": 1,
+        "source_entity_id": "sensor.house_load",
+        "profiles": {"weekday": {"expected": [1.0]}},
+    }
+
+    asyncio.run(store.async_save_builtin_load_forecast(model))
+    asyncio.run(store.async_save_builtin_load_forecast(model))
+
+    assert store.data["built_in_load_forecast"] == model
+    assert FakeStore.save_count == 1
 
 
 def test_store_add_outcome_updates_bounded_execution_audit(monkeypatch: object) -> None:

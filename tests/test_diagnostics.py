@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from custom_components.ha_energy_planner.diagnostics import async_get_config_entry_diagnostics
+from custom_components.ha_energy_planner.diagnostics import _load_forecast_summary, async_get_config_entry_diagnostics
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -168,6 +168,11 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
                     "outcomes": [{"action_id": f"old-{index}"} for index in range(12)],
                     "forecast_snapshots": [{}, {}],
                     "ai_recommendations": [{}],
+                    "built_in_load_forecast": {
+                        "status": "ready",
+                        "source_entity_id": "sensor.house_load",
+                        "profiles": {"weekday": [1.0]},
+                    },
                 }
             ),
             last_refresh_metadata={"duration_ms": 25.0},
@@ -208,5 +213,10 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
     assert diagnostics["store"]["haeo_run_count"] == 2
     assert diagnostics["store"]["forecast_snapshot_count"] == 2
     assert diagnostics["store"]["ai_recommendation_count"] == 1
+    assert diagnostics["store"]["built_in_load_forecast"] == {
+        "status": "ready",
+        "source_entity_id": "sensor.house_load",
+    }
     assert len(diagnostics["recent_outcomes"]) == 10
     assert diagnostics["recent_outcomes"][0]["action_id"] == "old-2"
+    assert _load_forecast_summary([]) == {}
