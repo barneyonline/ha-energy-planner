@@ -96,15 +96,6 @@ Training runs at startup, after a source change, and at most every six hours. Re
 
 Changing the load mapping disarms production control and requires fresh review cycles. Routine retraining does not.
 
-## HAEO and HAFO
-
-Neither integration is required:
-
-- HAFO household-load forecasts are replaced by Energy Planner's Recorder-backed model.
-- HAEO is an optional evidence source. Deterministic planning remains available without it.
-
-Before removing HAFO, replace any Energy Planner mapping that points to a HAFO-owned entity. Restart Home Assistant after uninstalling HAEO or HAFO if their entities or services remain registered, then recheck **Next actions** and preflight.
-
 ## Controls and status
 
 | Entity | Purpose |
