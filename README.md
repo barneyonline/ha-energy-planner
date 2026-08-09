@@ -2,345 +2,181 @@
   <img src=".github/assets/icon.svg" alt="Energy Planner icon" width="96" height="96">
 </p>
 
-# Energy Planner - Home Assistant Custom Integration
+# Energy Planner
 
 > [!IMPORTANT]
-> Energy Planner is in active development and is not ready for production use. Do not rely on it for real device control, billing decisions, or unattended energy automation yet.
+> Energy Planner is in active development. Do not rely on it as the only protection for equipment, billing, comfort, or vehicle readiness.
 
-<!-- Badges -->
 [![Release](https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&sort=semver)](https://github.com/barneyonline/ha-energy-planner/releases)
-[![Stars](https://img.shields.io/github/stars/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/stargazers)
+[![CI](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/ci.yml?branch=main&label=ci)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/ci.yml)
 [![License](https://img.shields.io/github/license/barneyonline/ha-energy-planner)](LICENSE)
 
-[![CI](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/ci.yml?branch=main&label=ci)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/ci.yml)
-[![Codecov](https://codecov.io/gh/barneyonline/ha-energy-planner/graph/badge.svg)](https://codecov.io/gh/barneyonline/ha-energy-planner)
-[![Hassfest](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/hassfest.yml?branch=main&label=hassfest)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/hassfest.yml)
-[![Codespell](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/codespell.yml?branch=main&label=codespell)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/codespell.yml)
+Energy Planner is a local-first Home Assistant custom integration for coordinating energy prices, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles.
 
-[![Quality target](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fbarneyonline%2Fha-energy-planner%2Fmain%2Fcustom_components%2Fha_energy_planner%2Fmanifest.json&query=%24.quality_scale&label=quality%20target&cacheSeconds=3600)](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
-[![Install](https://img.shields.io/badge/install-manual-blue)](#installation)
+## What it provides
 
-[![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
-![Development Status](https://img.shields.io/badge/development-active-success?style=flat-square)
+- One Energy Planner device containing all status, controls, and troubleshooting entities
+- One central **Configure** page with sections for Energy, Climate, Presence, Enphase, AI, and EV inputs
+- **Armed**, **Current state**, **Next actions**, and **Plan** calendar entities
+- A guarded **Automatic control** switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
+- A built-in household-load forecast trained from Home Assistant Recorder
+- Native EV scheduling and tariff-aware climate preconditioning
+- Optional Enphase profile control, HAEO evidence, and on-demand AI troubleshooting
+- Notifications only for problems that normally require user action
 
-Local-first Home Assistant integration for planning and safely coordinating household energy decisions across tariffs, solar forecasts, battery state, EV charging, climate comfort, Enphase profiles, HAEO optimization, and optional AI-assisted troubleshooting.
+## Requirements
 
-## Supported device categories
+Energy Planner reads existing Home Assistant entities and calls Home Assistant services. It does not connect directly to vendor clouds.
 
-- Four user-facing status entities: **Armed**, **Current state**, **Next actions**, and the **Plan** calendar
-- Energy inputs for import/export tariffs, external PV forecasts, a measured whole-home power sensor, optional grid carbon-intensity and weather forecasts, optional measured PV power for forecast validation, and battery state of charge
-- Native EV smart charging with native or external target-SOC input, ready-by controls, direct charger start/stop with charging-state confirmation, a connected helper, minimum-SOC recovery, preconditioning keep-on policy, price limits, low-price charging, continuous or interval-based schedules, and charge energy estimates
-- Climate comfort targets, full-horizon tariff preconditioning, zone takeover/restoration, HVAC power modeling, manual override handling, and presence-aware control
-- Presence as a separate device, including multi-person occupancy inputs
-- Enphase profile monitoring and planned profile control
-- HAEO optimization service integration with deterministic fallback behavior
-- Optional on-demand AI explanation and troubleshooting
-- One guarded **Automatic control** master switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
+For full planning, configure:
 
-## Key features
+- Import and export tariff forecast sensors, commonly Amber Electric
+- An external PV forecast, commonly Solcast Forecast Today and optionally Forecast Tomorrow
+- A measured whole-home instantaneous consumption sensor in W, kW, or MW
+- Home Assistant Recorder
+- Battery state of charge and the entities for each device you want to control
 
-- Guided setup with no required inputs on initial install; configure Energy, Climate, Presence, Enphase, AI, and EV inputs in sections on one central settings page
-- PV forecast calibration is opt-in through a separate observed PV power sensor. Household load is forecast locally from Recorder history using the required measured whole-home power sensor; forecast entities are never treated as measured load
-- A compact system view: **Armed** reports whether commands may run, **Current state** shows every live controlled area, **Next actions** shows every area's next state in the same combined format and explains upcoming decisions in attributes, and **Plan** exposes those actions as calendar events
-- Deterministic planner that evaluates price, solar, load, battery reserve, EV readiness, comfort, carbon, and configured priority order
-- Marginal-value scoring across devices so forecast surplus, battery capacity, EV readiness, and climate comfort are compared against the same constrained energy budget
-- Battery-aware decisions using configured usable capacity, reserve floor, round-trip efficiency, maximum charge power, and maximum discharge power
-- Optional HAEO service support with capability detection, short-lived equivalent-input caching, solve/refresh latency telemetry, per-slot baseline/flexible evidence provenance, and bounded deterministic planning when HAEO is absent, unavailable, unhealthy, or unable to return planning evidence
-- Enphase profile scenario mapping for restore, battery self-consumption, and battery charging behavior
-- EV planning with connected state or a native connected helper, SOC, confirmed start/stop commands, daily trip-history replay, timezone/DST-safe ready-by deadlines, estimated charging kWh, and cost/solar/carbon-aware scheduling
-- Multiple EVs through separate named planner entries with isolated entities, history, production controls, execution audit, and persisted state
-- Climate planning with a persisted `idle -> precondition -> pre-peak coast -> peak coast -> release` lifecycle, exact comfort targets, HVAC power estimation, thermal-model replay, zone control, and manual-override restoration
-- Upcoming controlled actions are ordered in one bounded sensor and one calendar. Attributes include an explicit Home Assistant-local date/time, the accepted decision, reasons, constraints, desired state, policy order, constrained energy budget, and the specific input evidence that determined each action
-- User-facing data quality is categorical: it identifies the weakest input source, affected entities, forecast coverage, and corrective action instead of repeating the planner's internal safety weight as a confidence percentage. Detailed forecast health, rejected decisions, execution audit, and dry-run evidence remain available through diagnostics and support bundles
-- Persistent notifications are reserved for conditions that normally require user action, such as broken required mappings, failed safe-state restoration, infeasible EV readiness, or a configured grid hard-limit conflict. Routine plan changes, successful recovery, and safe HAEO fallback remain silent
-- The **Explain or troubleshoot** button runs the configured AI Task provider only on demand using Home Assistant's structured-output contract. It accepts either **No action needed** or one complete action tied to current planner evidence: affected entity/setting, problem, exact next step, expected benefit, and verification
-- Generic alerts, confidence scores, and tuning suggestions are rejected. AI cannot call services, change settings, control devices, or bypass hard constraints; its bounded result appears under `ai_explanation` in **Next actions**
-- Execution audit and support bundle services for production review without reading Home Assistant storage files directly; repeated identical skipped dry-run outcomes are coalesced with occurrence counts, while applied/failed safety events remain distinct
-- Explicit decision-input replan listeners, observation-only sampling for high-frequency power sensors, a one-minute non-manual refresh floor, epoch-aligned scheduling for every supported interval, unchanged-input short-circuiting, and refresh trigger/phase/counter telemetry
-- Home Assistant diagnostics, system health, modular repair/preflight evidence for partial installations, native currency/device-class semantics, entity translations, and icons for all exposed entities
-- Dockerized validation gate covering compile and Ruff checks, pytest with 100% coverage, fixture replay, live-schema validation, Home Assistant `check_config`, and an optional Home Assistant smoke test
+Weather, carbon intensity, measured PV power, HAEO, and AI are optional. HAFO is not required. An external solar forecast is still required.
+
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.1.
 
 ## Installation
 
-Energy Planner is currently installed as a custom integration. It is not in the default HACS catalog, but you can add this repository to HACS manually.
-
 ### HACS custom repository
 
-1. Open Home Assistant.
-2. Go to **HACS -> Integrations**.
-3. Open the three-dot menu and select **Custom repositories**.
-4. Add `https://github.com/barneyonline/ha-energy-planner` as an **Integration** repository.
-5. Search for **Energy Planner** in HACS.
-6. Select **Download**.
-7. Restart Home Assistant.
-8. Go to **Settings -> Devices & services -> Add integration**.
-9. Search for **Energy Planner**.
-10. Add the integration. Initial setup does not require any mapped entities.
-11. Select **Configure** on the Energy Planner integration. All mappings and
-    policy are managed from this one settings page, with separate **Energy**,
-    **Presence**, **Climate**, **Enphase**, **AI troubleshooting**, and **EV** input
-    sections.
+1. Open **HACS → Integrations**.
+2. Select **Custom repositories** from the three-dot menu.
+3. Add `https://github.com/barneyonline/ha-energy-planner` as an Integration repository.
+4. Download **Energy Planner** and restart Home Assistant.
+5. Open **Settings → Devices & services → Add integration** and add **Energy Planner**.
+6. Open **Configure** on the integration to map inputs and review policy.
 
-### Manual file copy
+### Manual installation
 
-1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
+1. Copy `custom_components/ha_energy_planner` into Home Assistant's `custom_components` directory.
 2. Restart Home Assistant.
-3. Go to **Settings -> Devices & services -> Add integration**.
-4. Search for **Energy Planner**.
-5. Add the integration. Initial setup does not require any mapped entities.
-6. Select **Configure** and map the input sections you want to use.
+3. Add **Energy Planner** from **Settings → Devices & services**.
 
-## Compatibility
+## Initial configuration
 
-- Integration domain: `ha_energy_planner`
-- Integration display name: `Energy Planner`
-- Current manifest version: `0.9.1`
-- Minimum Home Assistant version: `2026.6.0`
-- Integration type: `service`
-- IoT class: `calculated`
-- Project quality-scale target: `gold` (custom integrations remain in Home Assistant's Custom tier)
-- Python: `3.14+`
-- Home Assistant setup: custom integration installed under `custom_components`
+1. Map tariff forecasts, external PV forecasts, household load, battery SOC, and the device inputs you intend to use.
+2. Confirm Recorder is enabled and retains the household-load sensor.
+3. Review EV, battery, grid, climate, and confirmation settings.
+4. Enable the individual device-control switches for the devices Energy Planner may manage.
+5. Leave **Automatic control** off while reviewing **Current state**, **Next actions**, and the **Plan** calendar.
+6. Wait for the built-in load model to become ready and resolve any unsafe inputs.
+7. Turn on **Automatic control**. It activates only after preflight and review evidence pass.
 
-Energy Planner does not authenticate directly with vendor cloud APIs. It reads existing Home Assistant entities and calls configured Home Assistant services. Vendor-specific behavior depends on the entities and services exposed by the integrations already installed in your Home Assistant instance.
+If activation is not safe, the switch remains off and ordinary device commands are not issued.
 
-## Recommended companion integrations
+## Household-load forecast
 
-Energy Planner can be useful with different source integrations, but the current implementation is built around these common inputs:
+Choose a sensor that reports gross household demand. Do not use:
 
-- Amber Electric price sensors for import/export tariffs from the Home Assistant core [Amber Electric integration](https://github.com/home-assistant/core/tree/dev/homeassistant/components/amberelectric) or [hass-energy/amber-express](https://github.com/hass-energy/amber-express).
-- Solar production forecast sensors from [BJReplay/ha-solcast-solar](https://github.com/BJReplay/ha-solcast-solar) or another forecast integration that exposes Home Assistant sensor data.
-- A whole-home instantaneous power sensor in W, kW, or MW, with Home Assistant Recorder enabled. Energy Planner builds its household-load forecast locally; HAFO is not required.
-- Weather inputs from [bremor/bureau_of_meteorology](https://github.com/bremor/bureau_of_meteorology) or another Home Assistant weather provider.
-- Optional HAEO optimization through [hass-energy/haeo](https://github.com/hass-energy/haeo), using the response-capable `haeo.optimize` service. HAEO is an enhancement, not a prerequisite for deterministic actions.
-- Enphase profile monitoring and control through [barneyonline/ha-enphase-energy](https://github.com/barneyonline/ha-enphase-energy) or another integration that exposes the system profile as a selectable entity.
-- A charger or vehicle integration that exposes a writable charging switch, or separate start/stop buttons. Energy Planner performs the smart-charging optimization itself.
-- BMW/vehicle connected-state and SOC entities from [kvanbiesen/bmw-cardata-ha](https://github.com/kvanbiesen/bmw-cardata-ha) or equivalent vehicle integrations.
-- Daikin climate and HVAC power entities from Home Assistant climate/sensor integrations.
-- Optional on-demand explanation and troubleshooting from an AI Task provider such as [jekalmin/extended_openai_conversation](https://github.com/jekalmin/extended_openai_conversation), when it exposes an `ai_task` entity.
+- Solar production or an energy total in kWh
+- A forecast sensor
+- Signed net grid flow that becomes negative while exporting
+- A cloud-derived value with large transient negative readings
 
-For Amber-backed planning, start with the 12-hour default. Energy Planner reports each source's first and last timestamps, covered and continuous hours, and leading, internal, and trailing gaps. A degraded 8-to-under-12-hour window remains visible but does not produce eligible device actions under the existing healthy-input action gate.
+Negative and unavailable readings are treated as missing, not clamped to zero. A grouped sensor can be used, but it represents only its included circuits and may underestimate unmonitored load.
 
-Required Amber and PV inputs must expose forecast series; a numeric current value is retained only for the current slot and cannot satisfy forecast coverage. Household load instead requires a normal measured whole-home power sensor.
+Energy Planner trains from up to 28 days of Recorder history. It removes known EV-charging intervals, subtracts measured HVAC power when available, and builds expected and conservative load profiles.
 
-## Built-in household load forecast
+The model requires:
 
-Energy Planner trains a deterministic local model from up to 28 days of Recorder history. It queries bounded UTC-aligned chunks—starting at seven days for sparse histories and shrinking to one day when state density requires it—with a per-entity state limit. Each power state is normalized using its historical W/kW/MW unit before the chunk is immediately compacted into cleaned 15-minute buckets, so source unit changes are safe and the complete raw history is never retained in memory or storage. It excludes known EV charging, subtracts time-aligned measured HVAC power when configured, and learns robust weekday/weekend clock-time profiles. The planner uses both an expected load and a conservative upper bound, including when optional HAEO grid evidence is available.
+- Seven complete local-time days
+- At least 80% overall valid coverage
+- Two holdout origins with at least 144 aligned samples
+- Accuracy no more than 10% worse than previous-day persistence
+- At least 90% conservative-bound coverage
 
-The model needs at least seven complete days, 80% valid coverage, two leakage-free holdout origins with at least 144 aligned samples, accuracy no more than 10% worse than previous-day persistence, and at least 90% upper-bound coverage. Models are **ready** through 24 hours, **degraded** from 24 to 72 hours, and **stale** after 72 hours. Learning and stale/failed models remain visible in **Current state**, **Next actions**, the **Plan** calendar, diagnostics, and dry-run plans, but forecast-dependent active commands fail closed. Learning is silent; a broken mapping, missing Recorder, or a model that remains unusable requires user action and can notify once.
+**History days** means Recorder data exists for those dates. **Complete days** is stricter: every 15-minute bucket must have enough valid cleaned data. EV charging, negative readings, unavailable states, or missing HVAC alignment can therefore produce nine history days but only three complete days.
 
-Training runs at startup, after the measured source changes, and at most every six hours. A retraining candidate that fails quality gates does not replace the last valid aggregate; that model ages through degraded to stale while the failed validation remains visible. Initial model-quality failures remain silent while automatic control stays blocked; they become actionable only after 72 hours of continuous unusability. Missing mappings, unavailable Recorder, and history exceeding the safe query bound remain immediately actionable. Only aggregate profiles, validation metrics, source/version identity, and timestamps are stored—never raw Recorder history. Changing the measured source or forecast contract restores safe state, explicitly disarms production control, and requires new review cycles and re-arming; routine retraining does not.
+Training runs at startup, after a source change, and at most every six hours. Replanning cannot create missing history. While the status is `learning`, plans remain visible but forecast-dependent active commands are blocked. Models are `ready` through 24 hours old, `degraded` from 24 to 72 hours, and `stale` after 72 hours.
 
-## Native EV smart charging
+Changing the load mapping disarms production control and requires fresh review cycles. Routine retraining does not.
 
-Energy Planner no longer requires the separate EV Smart Charging integration. Open **Configure -> Inputs · EV** and map the vehicle SOC and charging-state entities, plus either one charger switch or separate start/stop controls. Map a vehicle connected-state entity when one is available; without one, connection remains unknown rather than being replaced by a manual helper. Configure the fallback Target SOC in **Configure -> EV, battery and grid**. Energy Planner exposes **EV control**, **Ready by**, **Keep charger on**, **Opportunistic charging**, and **Opportunistic charging price threshold** entities for day-to-day policy changes.
+## HAEO and HAFO
 
-The central **Configure** page contains both connected-input sections and planner-policy sections, such as charge rate, SOC bounds, battery characteristics, grid limits, and confirmation behavior. The integration creates one Energy Planner device and places every entity on it, so status, controls, and troubleshooting are visible together. Day-to-day controls and adjustable device settings remain Home Assistant entities so they can be used in dashboards and automations. Entity-managed settings are intentionally omitted from the settings forms.
+Neither integration is required:
 
-The planner chooses cost-, solar-, carbon-, battery-, and grid-aware charging windows inside the configured earliest-start and ready-by window. Continuous charging is the default to reduce charger cycling; when filtering leaves no full contiguous window, the planner exposes a contiguous partial schedule as infeasible instead of silently splitting charging across gaps. Continuous mode can be disabled for interval-level optimization. A configured maximum import price can exclude expensive intervals. When **Opportunistic charging** is enabled, a current import price at or below the configured threshold triggers charging even before the configured earliest start; later scheduled slots still stay inside the normal window. An EV below the minimum SOC receives the same immediate current-slot override. These overrides still require the EV to need charge and remain subject to connection, target-SOC, input-health, grid-capacity, and active-control safety gates. An optional external target-SOC sensor overrides the centrally configured fallback target, which is useful when the vehicle integration owns the driver's current charge target. If that entity is unavailable or invalid, the configured fallback is used and the source problem remains visible as a non-blocking advisory. **Keep charger on for preconditioning** keeps the charge control enabled after the target is reached while the vehicle remains connected; the normal safety gates still take precedence. When a configured external target is unavailable and the fallback is active, keep-on remains off because the vehicle-enforced limit cannot be verified.
+- HAFO household-load forecasts are replaced by Energy Planner's Recorder-backed model.
+- HAEO is an optional evidence source. Deterministic planning remains available without it.
 
-When a charging-state entity is mapped, start and stop commands are considered successful only after that feedback reaches the requested state. The confirmation timeout and retry count are configurable. Connector-status sensors are supported as authoritative feedback: `CHARGING` and `FINISHING` mean active power delivery; lifecycle states such as `AVAILABLE`, `PREPARING`, and `FAULTED` mean no active power delivery; and `SUSPENDED_EV` or `SUSPENDED_EVSE` mean the connected session is not currently drawing power. A momentary stop is not sent when suspended feedback already proves charging is inactive. Unavailable feedback or an exhausted timeout fails closed, immediately restores the prior writable control state (or issues a safe-stop for momentary controls), records the failure, and engages the normal temporary control pause for starts. A disconnected, unplugged, or merely available feedback state does not by itself prove that a momentary stop disabled automatic charging. A separate stop switch or input boolean is also only a command endpoint: its own state is not proof that charging is disabled. Safety ownership and capacity remain held unless meaningful charging feedback, the persistent EV charger control, or rollback confirms the safe state. A compensating stop that proves this safe state completes the recovery and releases ownership rather than retaining a failed action. Safe-state ownership records both the control that was actually commanded and the actuator mapping used at that time, so restore, automated safety-stop, and manual-stop paths continue to command the original charger after a later EV reconfiguration rather than clearing ownership from the replacement mapping. If compensation cannot be completed, the original state remains in planner ownership for restore-safe-state handling. Without a mapped charging-state entity, the adapter retains command-accepted behavior for ordinary charger commands, while safety reservations still require a confirmed persistent control or rollback before release.
+Before removing HAFO, replace any Energy Planner mapping that points to a HAFO-owned entity. Restart Home Assistant after uninstalling HAEO or HAFO if their entities or services remain registered, then recheck **Next actions** and preflight.
 
-Preconditioning keep-on requires the mapped persistent **EV charger control** to be a switch or input boolean. EV reconfiguration, preflight, and the integration's Keep charger on switch reject configurations that expose only separate start/stop commands. Optional separate start buttons and start switches are never treated as proof that the charger remains enabled. The persistent control is confirmed even when charging feedback reports `fully_charged` or `connected_not_charging`. Keep-on remains disabled when the authoritative external target is unavailable or outside the configured minimum/maximum SOC policy, so vehicle-owned targeting cannot bypass the planner's hard maximum. The current slot conservatively reserves the configured full EV charge rate, so preconditioning cannot bypass grid-import or battery planning constraints.
+## Controls and status
 
-Only actions that actually use current HAEO grid or arbitrage evidence retain an HAEO plan dependency. If HAEO cannot return usable evidence, deterministic tariff, solar, load, and grid fallback remains actionable under the normal production and hard-constraint gates. These EV policy additions change the production-control evidence contract. After upgrading, run fresh review cycles, review preflight, and arm production control again before expecting active commands.
+| Entity | Purpose |
+| --- | --- |
+| **Armed** | Whether Energy Planner may currently issue commands and why |
+| **Current state** | Live state of every configured controlled area |
+| **Next actions** | Next state for every area, planned actions, and decision evidence |
+| **Plan** | Calendar view of upcoming controlled actions |
+| **Automatic control** | Runs preflight and enables or disables all planner-owned commands |
+| Device control switches | Select whether Climate, EV, or Enphase may participate |
+| **Explain or troubleshoot** | Requests one evidence-based AI recommendation on demand |
 
-Scheduled execution and explicit restoration share one coordinator lock, so delayed confirmation cannot let an older plan overwrite a newer decision. If inputs change while a coordinated command is waiting for confirmation, the remaining commands from that obsolete plan are abandoned and replanned. Device or confirmation failures engage an EV pause and command cooldown for subsequent starts. Safety stops bypass failure pauses, command cooldowns, daily action caps, unrelated plan constraints, and unavailable start controls so they can retry making the charger safe; planner-owned capacity and ownership are released only after stop or rollback is confirmed. Restoring an already-active external charger baseline clears planner stop ownership but retains its load in shared household capacity accounting. If unhealthy inputs, an observed disconnect, disabled EV control, or a hard grid-import violation leave planner-owned EV power active, execution prioritizes one audited safety-stop attempt for that plan and releases ownership only after success. Other active scheduled commands remain behind the normal review, production-arming, health, confidence, grid-limit, rate-limit, and restore-safe-state gates.
+Mapped EV start and stop controls are planner actuators. Energy Planner does not expose separate manual Start charging or Stop charging buttons. Target SOC is configured centrally or read from an optional external target sensor; it is not exposed as an Energy Planner number entity.
 
-Existing entries that used the old `ev_smart_charging_*` control keys continue to work during migration. Reconfigure the EV planning area to store the new direct-charger fields. Legacy ready-by helpers remain readable for compatibility, and the external target-SOC input is available to both upgraded and new entries.
+## Planning behavior
 
-## Climate tariff lifecycle
+EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
-When climate control is enabled and the home is occupied, Energy Planner scans every valid tariff slot in the configured planning horizon, including while an unowned HVAC is at or beyond a comfort boundary. Existing climate automations remain responsible until a planned takeover is due. The default horizon remains 12 hours and can be set from 1 to 48 hours; select 24 hours when next-day climate awareness is required. A peak qualifies only when its price clears both configured deltas relative to the cheapest valid tariff in the preconditioning lead window. Consecutive qualifying slots form one persisted expensive period.
+Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs.
 
-Before the earliest feasible period, the planner uses the weather forecast at the peak to select heating or cooling, falling back to current HVAC, outdoor, and indoor evidence only when needed. Heating targets the configured high comfort helper before the peak and coasts at the low helper after the selected run; cooling targets the low helper before the peak and then coasts at the high helper. The learned thermal rate selects the least-cost feasible contiguous run, with the latest run winning equal-cost ties. Without enough learned evidence, the full configured lead window and fallback HVAC load are used. The selected run end is persisted so an early run transitions to pre-peak coasting instead of maintaining the extreme target. The climate timeline exposes future preconditioning, coast, and release phases without executing them early; projected peak load remains zero while the building can coast, then includes conservative maintenance load at the comfort boundary.
+Enphase planning can select configured self-consumption, backup, or AI profiles. Only actions that actually consume HAEO evidence depend on HAEO.
 
-Takeover snapshots each configured `switch` or `input_boolean` zone once, disables all configured climate automations, enables every zone, turns on an off climate entity, selects heat or cool, and sets the extreme target. At the peak it retains ownership, keeps zones on and automations disabled, and changes to the opposite comfort boundary. At peak end it restores every zone to its captured state and enables every configured climate automation. The prior climate mode or setpoint is deliberately not restored because the automations resume responsibility. Lifecycle phase, tariff boundary, baseline and acquisition-time price deltas, mode, targets, controlled zones, release reason, and thermal evidence are available in climate plan and timeline attributes, the decision audit, execution audit, and diagnostics.
+## Safety and recovery
 
-While Energy Planner owns HVAC control, reaching either comfort boundary, losing required temperature, tariff, occupancy, or production-control evidence, pausing Daikin control, a manual thermostat or zone change, or an external manual-override helper turning on releases ownership immediately. An unowned boundary state does not suppress evaluation of a later low-price preconditioning window. Comfort release is latched until that peak ends to prevent repeated takeover. Release is a safety operation: it can restore zones and automations after dry-run is enabled, production is disarmed, climate control is disabled, inputs degrade, or the daily action cap is reached. Partial restoration retains unresolved ownership for later refresh and `restore_safe_state` retries.
+- Device commands require healthy inputs, current plans, matching review evidence, production arming, and enabled device controls.
+- Hard constraints are checked again immediately before every command.
+- Unsafe, missing, stale, or invalid inputs fail closed.
+- Learning and ordinary plan changes remain silent; actionable mapping, restoration, EV-readiness, and grid-limit problems can notify once.
+- AI advice cannot call services, change settings, or bypass constraints.
 
-The optional `climate_manual_override_entity` is authoritative in both directions. External **on** creates an indefinite persisted override, releases HVAC without changing EV or Enphase ownership, and blocks new takeover until external **off** clears it. Service-created and automatically detected overrides remain timed; integration-originated helper changes are guarded so they do not become indefinite. The service reports a restoration failure while leaving the successfully established override active.
+If control behaves unexpectedly:
 
-## Multiple EVs
-
-Create one named Energy Planner integration entry per EV. Each entry has its own EV mapping, native helpers, plan, trip history, production arming, control pause, audit, and storage namespace. Shared read-only household tariff, solar, load, and battery inputs must currently be mapped into each entry. Actuators are single-owner: the same EV persistent/start/stop control, Daikin climate entity, climate automation, climate zone, writable manual-override helper, or Enphase profile control cannot be assigned to more than one planner entry. EV control validation compares native and legacy fields as one set, so the same entity cannot be hidden under different start/stop mappings. When more than one entry is loaded, integration service calls must include `config_entry_id`; the Home Assistant service UI provides an entry selector.
-
-Each entry plans independently, but active execution uses one shared in-memory household reservation gate. Scheduled start and keep-on actions require a usable household projection and atomically reserve their projected EV load against the strictest configured grid-import limit among active reservations. A reservation remains held until a stop or safe-state restoration is confirmed. Observed disconnection requests a stop and does not release headroom until the charger control is proven safe, preventing automatic charging on reconnection from racing ahead of the next plan. Before issuing a start, the reservation and original actuator topology are persisted; after an interrupted command, active control must confirm a recovery stop on that original topology before a new start can run. The reservation high-watermark is rehydrated before entries execute after restart, so an unclean restart cannot forget a previously higher active charge rate; an explicit confirmed release is persisted as inactive. Runtime option changes can increase an active reserved load immediately, but neither the option update nor a later start/no-op action can reduce it while the charger may still draw the earlier load. Import-limit policy updates apply immediately to single- and multi-EV reservations. When combined reservations no longer fit the strictest household limit, one shared atomic shedding claim selects a single loaded planner entry for the confirmed safety-stop path. Other entries keep their reservations while that claim is active, preventing concurrent evaluations from stopping every EV. A failed claimant retains its uncertain reservation but releases the claim so another loaded, controllable EV can attempt shedding; unloaded claimants are handled the same way. The claim clears when the selected reservation is released so the remaining capacity can be evaluated again. This also prevents concurrent entries from consuming the same projected headroom. Energy Planner still does not perform joint cost optimization across vehicles, so charging priority remains first-safe-action-wins when the combined plans do not fit.
-
-For Solcast, configure **Forecast Today** as the primary PV forecast and optionally **Forecast Tomorrow** as the second PV forecast. Secondary values must have timezone-aware timestamps and are stitched in absolute time, including across midnight and daylight-saving transitions, with the primary source taking precedence where values overlap. Until per-slot provenance is retained, secondary PV slots are deliberately excluded from forecast calibration.
-
-## Safety model
-
-Energy Planner is built around conservative production controls:
-
-- **Climate control**, **EV control**, and **Enphase control** select which
-  mapped devices may participate. The **Automatic control** switch is the
-  master activation surface. Turning it on respects that selection, runs preflight, arms the
-  production gate, and leaves review-only mode only when the current plan and
-  recorded dry-run evidence are safe. Turning it off restores planner-owned
-  state, disarms production control, and keeps planning in review-only mode.
-- Turning off a device control switch while Automatic control is on restores
-  only that device; the other selected areas remain armed. If restoration fails,
-  the switch stays on and Home Assistant reports an actionable error. Turning on
-  another device while armed runs preflight before that device may participate.
-- On a new setup, the first activation attempt may remain in review-only mode
-  while three healthy plans are recorded. The translated error reports progress;
-  review the plan and turn **Automatic control** on again when Production
-  readiness reports that evidence is complete.
-- The old planner, dry-run, and legacy `*_control_enabled` entities remain
-  removed. The three current device switches are clean control-area selectors;
-  **Automatic control** is still the only switch that arms device commands.
-- Active control requires mapped inputs for each enabled control area, healthy modular preflight status, production arming, and dry-run review. Unconfigured or disabled device areas do not block a partial installation.
-- Preflight reports historical `dry_run_evidence_complete` separately from `safe_to_activate_now`. Dry-run evidence is bound to configured device mappings and decision/control policy, but runtime device participation switches do not invalidate evidence for unaffected devices. It also intentionally survives switching from dry-run to active mode, changing advisory-only AI settings, and changing the per-run EV ready-by time. Current activation additionally requires a recent successfully refreshed healthy plan, non-zero confidence, at least eight usable priced hours (or the whole configured horizon when shorter), and no active control pause. Execution independently rechecks the evidence fingerprint, bounded evidence count, and strict armed state and fails closed after a contract change or corrupt/missing production state.
-- The executor revalidates hard constraints immediately before every device service call.
-- Device commands are blocked when inputs are stale, missing, unavailable, unsafe, or outside configured policy.
-- Persistent notifications are created once per distinct actionable condition and updated only when their content changes. Broken required mappings, failed restoration, infeasible EV readiness, and grid hard-limit conflicts can notify. Stale data, routine plan changes, successful operations, and safe HAEO fallback remain visible in status or diagnostics without notifying. Actionable plan alerts can be disabled under **AI and safety** without changing fail-closed execution.
-- Device control is paused temporarily when a command fails or a recent planner-owned EV/Enphase state appears to have been changed externally.
-- AI troubleshooting is optional, button-triggered, rate-limited, minimized, and explanatory only. Provider integrations receive a bounded prompt and may log that prompt independently; review the provider's logging configuration and set its logger to warning or stricter when privacy matters.
-- Preflight and restore-safe-state support are available through both services and button entities.
-
-The **Automatic control** switch runs preflight automatically. Advanced users
-can run the same non-commanding check directly:
-
-```yaml
-service: ha_energy_planner.run_preflight
-```
-
-The combined switch proceeds only when `safe_to_activate_now` is true, required
-entities and services are available, and dry-run evidence matches the current
-control contract. Historical evidence alone is not a statement that current
-forecasts are safe.
+1. Turn off **Automatic control**.
+2. Run `ha_energy_planner.restore_safe_state` or press **Restore safe state**.
+3. Confirm EV, Enphase, climate automation, and zone states manually.
+4. Review **Current state**, **Next actions**, preflight, and the support bundle.
+5. Leave automatic control off until the cause is understood.
 
 ## Services
 
-Energy Planner registers these Home Assistant services:
+Common services include:
 
-All services accept an optional `config_entry_id`. It may be omitted with one loaded planner and is required when multiple planner entries are loaded.
+- `ha_energy_planner.replan`
+- `ha_energy_planner.run_preflight`
+- `ha_energy_planner.export_support_bundle`
+- `ha_energy_planner.restore_safe_state`
+- `ha_energy_planner.pause_control` and `ha_energy_planner.resume_control`
+- `ha_energy_planner.set_ev_ready_by` and `ha_energy_planner.set_ev_target_soc`
+- `ha_energy_planner.set_manual_hvac_override`
 
-- `ha_energy_planner.replan`: request an immediate planner refresh.
-- `ha_energy_planner.run_preflight`: check active-mode readiness without issuing device commands. The same check is also exposed as the **Run preflight** button entity.
-- `ha_energy_planner.export_diagnostics`: return redacted diagnostic state.
-- `ha_energy_planner.export_support_bundle`: return preflight plus redacted diagnostics for production review.
-- `ha_energy_planner.restore_safe_state`: restore planner-owned EV, Enphase, and HVAC state where supported.
-- `ha_energy_planner.arm_production_control`: acknowledge production readiness and allow active device commands when other checks pass.
-- `ha_energy_planner.disarm_production_control`: block active device commands until production control is armed again.
-- `ha_energy_planner.pause_control`: temporarily pause planner-owned active control for all devices or a device class.
-- `ha_energy_planner.resume_control`: clear the active-control pause.
-- `ha_energy_planner.set_ev_ready_by`: set and persist the native EV ready-by time.
-- `ha_energy_planner.set_ev_target_soc`: set and persist the native EV target SOC.
-- `ha_energy_planner.set_manual_hvac_override`: create a bounded manual HVAC override and immediately release planner-owned climate automations and zones.
+Advanced arm/disarm and diagnostics services are also available in Home Assistant's service UI. With multiple planner entries, provide `config_entry_id`.
 
-## Production setup checklist
+## Development
 
-1. Install Energy Planner and add it from **Devices & services**.
-2. Add planning areas from the integration page.
-3. Map the required Amber tariff forecasts, external PV forecast, measured whole-home power sensor, battery SOC, and the device inputs for the planning areas you want to use. Confirm Recorder is enabled.
-4. Review the **EV, battery, and grid** configuration, especially EV minimum/maximum SOC, charge rate, earliest start, continuous charging, charging confirmation timeout/retries, price limits, usable home-battery capacity, efficiency, and max charge/discharge power. For climate control, also review the horizon, tariff deltas, lead time, comfort helpers, automations, zones, and manual-override helper.
-5. Set fallback Target SOC under **EV, battery and grid**. Turn on the **Climate control**, **EV control**, and/or **Enphase control** switches for the mapped devices you want Energy Planner to manage. Set other day-to-day behavior through Ready by, Keep charger on, Opportunistic charging, and its price threshold.
-6. Review **Current state** to confirm the mapped climate, EV, and Enphase entities are the ones you expect.
-7. Review **Next actions** and the **Plan** calendar while **Automatic control** is off. Expand the action attributes to see why each action was selected and which constraints were applied. Wait for the built-in load model to become ready, then fix any missing, unavailable, stale, or invalid inputs.
-8. When the plan matches your expectations and the required device control switches are on, turn **Automatic control** on. The
-   integration performs preflight, production arming, and the active-mode
-   transition together. If more evidence is needed, the switch stays off; review
-   the **Armed** attributes for the readiness reason and try again after more
-   healthy review plans have completed.
-9. Optionally export a support bundle with
-   `ha_energy_planner.export_support_bundle` for deeper review.
-
-Detailed bounded comparison, forecast-health, and execution evidence remains
-available in the exported support bundle without adding day-to-day status entities.
-
-## Rollback and manual recovery
-
-If active control behaves unexpectedly:
-
-1. Call `ha_energy_planner.restore_safe_state` or press the **Restore safe state** button.
-2. Turn off **Automatic control**. This restores review-only mode and disarms
-   the production gate.
-3. Turn on the **Dry run** switch.
-4. Confirm EV charging, Enphase profile, and climate automation state manually in Home Assistant. Energy Planner suppresses already-queued plan commits during teardown, refuses config-entry unload when safe-state restoration fails, disarms production control, and leaves the runtime available for retry and diagnostics without scheduling new device actions.
-5. Review `ha_energy_planner.run_preflight`, `ha_energy_planner.export_support_bundle`, and the execution audit entity.
-6. Leave active control disabled until the cause is understood.
-
-## Development and validation
-
-Run the full local validation gate:
+Run the complete validation gate:
 
 ```bash
 scripts/docker-validate.sh
 ```
 
-This runs:
+It runs Ruff, the full pytest suite with 100% coverage, replay/schema/history validation, Home Assistant `check_config`, and a Docker smoke test.
 
-- Python compile checks
-- Ruff lint and import-order checks
-- Shell syntax checks
-- Quality-scale evidence validation
-- Pytest inside the Home Assistant Docker image with 100% coverage
-- Replay fixtures
-- Live-schema fixture validation
-- Real-history fixture validation
-- Rolling-origin external-PV calibration gates plus built-in household-load holdout, persistence-MAE, conservative-coverage, resampling, and DST tests
-- Home Assistant `check_config`
-- Docker smoke test against a real Home Assistant container, unless `HEP_SKIP_HA_SMOKE=1` is set
-
-Routine GitHub CI skips the smoke test to keep normal push and pull-request feedback lighter. The heavier Home Assistant smoke test runs from the **Home Assistant Smoke** workflow on a weekly schedule or when started manually.
-
-Run only the smoke test locally:
-
-```bash
-scripts/docker-ha-smoke.sh
-```
-
-Start a local Home Assistant Core container with the integration mounted:
+Start a local Home Assistant instance with:
 
 ```bash
 docker compose up
 ```
 
-Then open <http://localhost:8124> and add **Energy Planner** from **Devices & services**. The local container uses `docker/homeassistant/config` as its config directory.
+Then open <http://localhost:8124>.
 
-## Replay and real-evidence validation
+## Further documentation
 
-Sanitized replay fixtures can be checked with:
-
-```bash
-scripts/replay-fixture.py tests/fixtures/replay/*.json
-```
-
-Export and validate a real production evidence bundle:
-
-```bash
-HOME_ASSISTANT_URL=http://homeassistant.local:8123 \
-HOME_ASSISTANT_TOKEN=... \
-HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
-HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
-HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
-HEP_PV_ACTUAL_ENTITY=sensor.pv_power \
-HEP_WEATHER_ENTITY=weather.home \
-HEP_EV_CONNECTED_ENTITY=binary_sensor.ev_connected \
-HEP_EV_SOC_ENTITY=sensor.ev_soc \
-HEP_THERMAL_INDOOR_ENTITY=climate.daikin \
-HEP_THERMAL_INDOOR_ATTRIBUTE=current_temperature \
-HEP_DAIKIN_POWER_ENTITY=sensor.daikin_power \
-scripts/export-real-validation-bundle.sh
-```
-
-The core bundle needs no HAEO service or external household-load forecast. Set `HEP_HAEO_SERVICE=haeo.optimize` only when you also want to validate the optional HAEO value-evidence profile. Good output means the core live-schema and real-history profiles pass. The history profile includes rolling, time-aligned external-PV accuracy evidence; each configured horizon bucket must meet its MAE limit and beat a persistence baseline:
-
-- `ha-energy-planner-v1-real`
-- `ha-energy-planner-haeo-value-v1-real` (only when `HEP_HAEO_SERVICE` is set)
-- `ha-energy-planner-history-v1-real`
-
-If fixtures were exported separately, validate them without calling Home Assistant:
-
-```bash
-scripts/export-real-validation-bundle.sh --validate-only
-```
-
-## Documentation
-
-- Release notes: [CHANGELOG.md](CHANGELOG.md)
-- Requirement evidence: [docs/requirements-audit.md](docs/requirements-audit.md)
-- Quality evidence: [quality_scale.yaml](quality_scale.yaml)
-- Issue tracker: [GitHub Issues](https://github.com/barneyonline/ha-energy-planner/issues)
+- [Release notes](CHANGELOG.md)
+- [Requirements and implementation evidence](docs/requirements-audit.md)
+- [Quality-scale evidence](quality_scale.yaml)
