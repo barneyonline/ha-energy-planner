@@ -347,19 +347,27 @@ Status as of 2026-08-09.
   only gaps of at most 30 minutes are interpolated. A bounded recent-load
   correction fades to neutral over two hours, and UTC planning slots are mapped
   through timezone-aware local timestamps for DST folds and gaps.
-- Readiness requires seven complete days, 80% valid historical coverage, two
+- Readiness requires three complete days, 80% valid historical coverage, two
   leakage-free holdout origins with at least 144 aligned samples, MAE no more
   than 10% worse than previous-day persistence, and at least 90% conservative
-  coverage. Ready models are healthy through 24 hours, degraded through 72
-  hours, and stale afterward. Learning and initial quality-gate failures remain
-  silent; missing mapping, unavailable Recorder after a model becomes unsafe,
-  history exceeding the bounded query limit, and a model that remains unusable
-  for 72 hours are actionable. Training occurs at startup, after source changes,
-  and no more than every six hours, with failed-attempt backoff. Recorder reads
+  coverage. Validation-only profiles may use the one or two earlier complete
+  days needed to score those first two origins, while production profiles still
+  require three clean observations per clock bucket. Partial preceding days may
+  provide aligned previous-day persistence samples but are never admitted to
+  the production profile. Ready models are healthy through 24 hours, degraded
+  through 72 hours, and stale afterward. Learning and initial quality-gate
+  failures remain silent; missing mapping, unavailable Recorder after a model
+  becomes unsafe, history exceeding the bounded query limit, and a model that
+  remains unusable for 72 hours are actionable. Training occurs at startup,
+  after source changes, and no more than every six hours, with failed-attempt
+  backoff. Recorder reads
   use adaptive UTC-aligned chunks with a per-entity state limit, beginning at
   seven days and narrowing to one day when necessary, and compact each chunk
   before continuing. Only aggregate profiles, validation metrics, source
   and contract identity, and timestamps are persisted.
+- EV trip-history targeting uses an explicit three-observed-day minimum. Before
+  that threshold, planning uses the configured fallback Target SOC and remains
+  otherwise operational.
 - Config-entry version 2 migrates only the legacy measured-load mapping to
   `household_load_entity`; a legacy forecast-only mapping is removed and active
   control remains fail-closed until a real measured sensor is selected. The

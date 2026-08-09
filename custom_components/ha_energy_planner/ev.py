@@ -8,6 +8,7 @@ from math import ceil
 from typing import Any
 
 MAX_STORED_TRIPS = 120
+MIN_EV_TRIP_HISTORY_DAYS = 3
 
 _EV_ACTIVE_CHARGING_STATES = frozenset(
     {
@@ -141,7 +142,7 @@ class EVChargeSchedule:
 def summarize_trip_history(
     trips: list[EVTripRecord],
     *,
-    minimum_history_days: int = 3,
+    minimum_history_days: int = MIN_EV_TRIP_HISTORY_DAYS,
 ) -> EVTripSummary:
     """Summarize trips into conservative daily SOC consumption."""
     daily: dict[str, float] = {}
@@ -163,7 +164,7 @@ def summarize_trip_history(
 def summarize_stored_trip_history(
     history: dict[str, Any] | None,
     *,
-    minimum_history_days: int = 3,
+    minimum_history_days: int = MIN_EV_TRIP_HISTORY_DAYS,
 ) -> EVTripSummary:
     """Summarize persisted compact trip history."""
     return summarize_trip_history(
