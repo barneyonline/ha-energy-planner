@@ -64,6 +64,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _snapshot_actions,
     _split_entity_values,
     _unexpired_overrides,
+    _updated_load_forecast_training_attempted,
 )
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -108,6 +109,22 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
         "sensor.import_price",
         "sensor.pv_tomorrow",
     ]
+
+
+@pytest.mark.parametrize(
+    ("previously_attempted", "reason", "expected"),
+    [
+        (False, "load_forecast_household_load_not_configured", False),
+        (False, "load_forecast_household_load_unavailable", False),
+        (False, "load_forecast_training_recent", False),
+        (False, "load_forecast_ready", True),
+        (True, "load_forecast_household_load_unavailable", True),
+    ],
+)
+def test_load_forecast_startup_attempt_remains_pending_until_training_runs(
+    previously_attempted: bool, reason: str, expected: bool
+) -> None:
+    assert _updated_load_forecast_training_attempted(previously_attempted, reason) is expected
 
 
 @dataclass(slots=True)
@@ -822,6 +839,96 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
     assert len(calls) == 1
     assert 0 < calls[0] <= 900
     assert coordinator._unsub_listeners == []
+
+
+def test_start_listeners_retries_pending_load_training_when_source_appears(monkeypatch: object) -> None:
+    tracked: list[tuple[list[str], object]] = []
+    scheduled: list[tuple[float, object]] = []
+    unsubscribed: list[str] = []
+
+    def fake_track(hass: object, entity_ids: list[str], action: object) -> object:
+        tracked.append((entity_ids, action))
+        return lambda: unsubscribed.append(entity_ids[0])
+
+    def fake_call_later(hass: object, delay: float, action: object) -> object:
+        scheduled.append((delay, action))
+        return lambda: None
+
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        fake_track,
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        fake_call_later,
+    )
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass({"sensor.house_load": "unavailable"})
+    coordinator.entry = FakeEntry(
+        {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 60},
+    )
+    coordinator._load_forecast_training_attempted = False
+    coordinator._boundary_cancel = None
+    coordinator._debounce_cancel = None
+    coordinator._unsub_listeners = []
+    coordinator._refresh_generation = 0
+    coordinator._force_next_refresh = False
+
+    coordinator.async_start_listeners()
+    source_callback = tracked[0][1]
+    source_callback(FakeEvent("sensor.house_load", "unavailable", "unknown"))
+    assert len(scheduled) == 1
+
+    source_callback(FakeEvent("sensor.house_load", "unknown", "1.2"))
+    source_callback(FakeEvent("sensor.house_load", "1.2", "1.3"))
+
+    assert tracked[0][0] == ["sensor.house_load"]
+    assert unsubscribed == ["sensor.house_load"]
+    assert coordinator._unsub_listeners == []
+    assert len(scheduled) == 2
+    assert scheduled[-1][0] == 0
+    assert coordinator._refresh_generation == 1
+    assert coordinator._force_next_refresh is True
+
+    coordinator._load_forecast_training_attempted = True
+    coordinator._start_load_forecast_source_listener(coordinator.entry_data)
+    assert len(tracked) == 1
+
+
+def test_start_listeners_closes_load_source_setup_race(monkeypatch: object) -> None:
+    scheduled: list[float] = []
+    unsubscribed: list[str] = []
+
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, action: lambda: unsubscribed.append(entity_ids[0]),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: scheduled.append(delay) or (lambda: None),
+    )
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass({"sensor.house_load": "1.2"})
+    coordinator.entry = FakeEntry(
+        {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+        {CONF_PLANNING_INTERVAL_MINUTES: 60},
+    )
+    coordinator._load_forecast_training_attempted = False
+    coordinator._boundary_cancel = None
+    coordinator._debounce_cancel = None
+    coordinator._unsub_listeners = []
+    coordinator._refresh_generation = 0
+    coordinator._force_next_refresh = False
+
+    coordinator.async_start_listeners()
+
+    assert unsubscribed == ["sensor.house_load"]
+    assert coordinator._unsub_listeners == []
+    assert len(scheduled) == 2
+    assert scheduled[-1] == 0
+    assert coordinator._refresh_generation == 1
+    assert coordinator._force_next_refresh is True
 
 
 def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinator(
