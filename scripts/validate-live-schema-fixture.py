@@ -27,18 +27,12 @@ from custom_components.ha_energy_planner.models import (  # noqa: E402
 V1_REAL_PROFILE_REQUIREMENTS = {
     "real_amber_import": {"kind": "forecast_state", "value_kind": "price"},
     "real_amber_export": {"kind": "forecast_state", "value_kind": "price"},
-    "real_pv_hafo": {"kind": "forecast_state", "value_kind": "power"},
-    "real_baseline_load": {"kind": "forecast_state", "value_kind": "power"},
-    "real_weather": {"kind": "forecast_state", "value_kind": "temperature"},
-    "real_haeo_response": {"kind": "haeo_response"},
+    "real_pv_forecast": {"kind": "forecast_state", "value_kind": "power"},
 }
 V1_REAL_PROFILE_SOURCE_FIELDS = {
     "real_amber_import": ("source_entity_id",),
     "real_amber_export": ("source_entity_id",),
-    "real_pv_hafo": ("source_entity_id",),
-    "real_baseline_load": ("source_entity_id",),
-    "real_weather": ("source_entity_id",),
-    "real_haeo_response": ("source_service",),
+    "real_pv_forecast": ("source_entity_id",),
 }
 
 

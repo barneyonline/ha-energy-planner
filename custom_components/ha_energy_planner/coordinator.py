@@ -659,6 +659,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "pv_forecast_kw": _calibration_summary(forecast_calibration, "pv_forecast_kw"),
                 },
                 "built_in_load_forecast": dict(getattr(manager, "load_forecast_details", {})),
+                "action_load_forecasts": _snapshot_action_load_forecasts(plan, context),
                 "confidence": {
                     "overall": plan.confidence,
                     "forecast_source_confidence": getattr(context, "forecast_confidence", plan.confidence),
@@ -709,6 +710,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Request immediate refresh."""
         self._mark_forced_refresh("manual_replan")
         await self.async_request_refresh()
+
+    async def async_reconcile_production_evidence_contract(self) -> bool:
+        """Restore and disarm when the reviewed production contract changed."""
+        production = parse_production_state(self.store.data.get("production"))
+        if not production.armed or production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
+            self.entry_data,
+            self.options,
+        ):
+            return False
+        await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+        await self.async_disarm_production_control("production_evidence_contract_changed")
+        return True
 
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
@@ -1809,6 +1822,35 @@ def _haeo_capability_metadata(adapter: Any) -> dict[str, Any]:
 def _snapshot_actions(plan: EnergyPlan) -> list[dict[str, Any]]:
     """Return bounded action metadata for forecast/audit snapshots."""
     return [_snapshot_action(action) for action in plan.actions[:8]]
+
+
+def _snapshot_action_load_forecasts(
+    plan: EnergyPlan,
+    context: DecisionContext,
+) -> list[dict[str, Any]]:
+    """Return compact load evidence aligned to each planned action."""
+    if not context.slots:
+        return []
+    slots = sorted(context.slots, key=lambda slot: slot.valid_at)
+    rows: list[dict[str, Any]] = []
+    for action in plan.actions[:20]:
+        slot = next(
+            (
+                candidate
+                for candidate in reversed(slots)
+                if candidate.valid_at <= action.execute_not_before
+            ),
+            slots[0],
+        )
+        rows.append(
+            {
+                "action_id": action.action_id,
+                "valid_at": slot.valid_at,
+                "expected_kw": slot.baseline_load_forecast_kw,
+                "conservative_kw": slot.baseline_load_forecast_upper_kw,
+            }
+        )
+    return rows
 
 
 def _snapshot_action(action: Any) -> dict[str, Any]:

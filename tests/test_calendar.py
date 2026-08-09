@@ -42,6 +42,20 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
                 "first_expected_kw": 1.2,
                 "first_upper_kw": 1.5,
             },
+            "action_load_forecasts": [
+                {
+                    "action_id": "ev-start",
+                    "valid_at": (now + timedelta(minutes=10)).isoformat(),
+                    "expected_kw": 1.4,
+                    "conservative_kw": 1.8,
+                },
+                {
+                    "action_id": "climate-precondition",
+                    "valid_at": (now + timedelta(hours=1)).isoformat(),
+                    "expected_kw": 2.2,
+                    "conservative_kw": 2.7,
+                },
+            ],
         }
     ]
     entity = EnergyPlannerCalendar(coordinator)
@@ -53,7 +67,7 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     assert "Confidence:" not in (entity.event.description or "")
     assert "Data quality:" in (entity.event.description or "")
     assert "Constraints:" in (entity.event.description or "")
-    assert "Load forecast: ready; expected 1.2 kW; conservative 1.5 kW." in (entity.event.description or "")
+    assert "Load forecast: ready; expected 1.4 kW; conservative 1.8 kW" in (entity.event.description or "")
 
     events = asyncio.run(
         entity.async_get_events(
@@ -65,6 +79,7 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
 
     assert [event.uid for event in events] == ["ev-start", "climate-precondition"]
     assert "Desired state:" in (events[1].description or "")
+    assert "expected 2.2 kW; conservative 2.7 kW" in (events[1].description or "")
 
 
 def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
@@ -75,6 +90,30 @@ def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
     assert entity.event is None
     assert asyncio.run(entity.async_get_events(coordinator.hass, now, now + timedelta(hours=1))) == []
     assert calendar_module._compact_mapping("plain") == "plain"
+
+
+def test_calendar_renders_missing_action_load_values_as_unknown() -> None:
+    now = datetime.now(UTC)
+    action = _action("ev-start", now + timedelta(minutes=10), now + timedelta(minutes=15))
+    coordinator = _coordinator(_plan([action]))
+    coordinator.store.data["forecast_snapshots"] = [
+        {
+            "plan_id": "plan-1",
+            "built_in_load_forecast": {"status": "learning"},
+            "action_load_forecasts": [
+                {
+                    "action_id": action.action_id,
+                    "valid_at": action.execute_not_before.isoformat(),
+                    "expected_kw": None,
+                    "conservative_kw": None,
+                }
+            ],
+        }
+    ]
+
+    description = EnergyPlannerCalendar(coordinator).event.description or ""
+
+    assert "expected unknown kW; conservative unknown kW" in description
 
 
 def test_calendar_platform_adds_one_system_calendar(monkeypatch: object) -> None:

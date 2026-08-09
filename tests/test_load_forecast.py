@@ -27,6 +27,7 @@ from custom_components.ha_energy_planner.load_forecast import (
     _time_weighted_buckets,
     _timezone,
     build_load_forecast_model,
+    clean_load_history_buckets,
     load_forecast_from_model,
     load_forecast_model_status,
     normalize_power_kw,
@@ -76,6 +77,46 @@ def test_power_normalization_rejects_invalid_values_and_units() -> None:
     assert normalize_power_kw(object(), "kW") is None
     assert _power_events([object()], "kW") == []
     assert _bool_events([object()]) == []
+    unit_transition = _power_events(
+        [
+            type(
+                "State",
+                (),
+                {
+                    "state": "1000",
+                    "last_updated": datetime(2026, 6, 27, tzinfo=UTC),
+                    "attributes": {"unit_of_measurement": "W"},
+                },
+            )(),
+            type(
+                "State",
+                (),
+                {
+                    "state": "1",
+                    "last_updated": datetime(2026, 6, 27, 0, 15, tzinfo=UTC),
+                    "attributes": {"unit_of_measurement": "kW"},
+                },
+            )(),
+        ],
+        "MW",
+    )
+    assert [event.value for event in unit_transition] == [1.0, 1.0]
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    assert clean_load_history_buckets(
+        [],
+        load_unit="kW",
+        start=now - timedelta(hours=1),
+        end=now,
+        timezone="UTC",
+    ) == ([], None, False, False)
+    assert _time_weighted_buckets(
+        [],
+        [],
+        [],
+        start=now - timedelta(hours=1),
+        end=now,
+        zone=ZoneInfo("UTC"),
+    ) == []
 
 
 def test_model_trains_ready_and_forecasts_expected_and_upper_load() -> None:
@@ -269,6 +310,75 @@ def test_recent_correction_is_bounded_and_fades_without_reducing_upper_bound() -
     assert charging.details["recent_correction_factor"] == 1.0
 
 
+def test_profile_is_time_weighted_when_resampled_to_a_coarser_interval() -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    model = build_load_forecast_model(
+        _history(now),
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+    expected = [0.0] * BUCKETS_PER_DAY
+    expected[49] = 10.0
+    model["profiles"] = {
+        day_type: {"expected": list(expected), "upper": list(expected)}
+        for day_type in ("weekday", "weekend")
+    }
+
+    forecast = load_forecast_from_model(
+        model,
+        now=now,
+        timezone="UTC",
+        horizon_hours=1,
+        interval_minutes=30,
+        source_entity_id="sensor.house_load",
+    )
+
+    assert forecast.expected_kw == [5.0, 0.0]
+    assert forecast.upper_kw == [5.0, 0.0]
+
+
+def test_partially_observed_days_do_not_satisfy_complete_day_gate() -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    partial = [
+        HistoryState(
+            "unavailable" if state.last_updated.hour < 5 else state.state,
+            state.last_updated,
+        )
+        for state in _history(now, days=12)
+    ]
+
+    model = build_load_forecast_model(
+        partial,
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+
+    assert model["history_coverage"] >= 0.79
+    assert model["complete_days"] == 0
+    assert model["status"] == "learning"
+    assert "insufficient_complete_days" in model["quality_failures"]
+
+
+def test_exact_midnight_history_start_retains_first_complete_day() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    states = _history(now, days=28)
+
+    model = build_load_forecast_model(
+        states,
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+
+    assert model["history_days"] == 28
+    assert model["complete_days"] == 28
+
+
 def test_profile_interpolation_accepts_only_gaps_up_to_thirty_minutes() -> None:
     now = datetime(2026, 6, 27, 12, tzinfo=UTC)
     model = build_load_forecast_model(
@@ -322,6 +432,24 @@ def test_model_age_transitions_and_source_or_shape_mismatch_fail_closed() -> Non
         source_entity_id="sensor.house_load",
         load_unit="kW",
     )
+    model["last_training_status"] = "failed"
+    model["last_training_quality_failures"] = ["forecast_accuracy_below_persistence_gate"]
+    model["last_training_validation"] = {"mae_kw": 2.0}
+    model["last_attempt_source_entity_id"] = "sensor.house_load"
+
+    visible = load_forecast_from_model(
+        model,
+        now=now,
+        timezone="UTC",
+        horizon_hours=1,
+        interval_minutes=15,
+        source_entity_id="sensor.house_load",
+    )
+    assert visible.details["source_entity_id"] == "sensor.house_load"
+    assert visible.details["last_attempt_source_entity_id"] == "sensor.house_load"
+    assert visible.details["last_training_status"] == "failed"
+    assert visible.details["last_training_quality_failures"] == ["forecast_accuracy_below_persistence_gate"]
+    assert visible.details["last_training_validation"] == {"mae_kw": 2.0}
 
     assert load_forecast_model_status(model, now=now + timedelta(hours=24))[0] == "ready"
     assert load_forecast_model_status(model, now=now + timedelta(hours=25))[0] == "degraded"
@@ -411,14 +539,26 @@ def test_corrupt_model_variants_and_small_helpers_fail_closed() -> None:
         key: {field: list(values) for field, values in value.items()} for key, value in model["profiles"].items()
     }
     inverted_bound["weekday"]["upper"][0] = 0.0
+    boolean_profile = {
+        key: {field: list(values) for field, values in value.items()} for key, value in model["profiles"].items()
+    }
+    boolean_profile["weekday"]["expected"][0] = True
     variants = [
         None,
         {**model, "model_version": 0},
         {**model, "profiles": short_profile},
         {**model, "profiles": invalid_value},
         {**model, "profiles": inverted_bound},
+        {**model, "profiles": boolean_profile},
         {**model, "status": "mystery"},
         {**model, "complete_days": "bad"},
+        {**model, "complete_days": True},
+        {**model, "history_coverage": float("nan")},
+        {**model, "history_coverage": 1.1},
+        {**model, "validation": {**model["validation"], "mae_kw": None}},
+        {**model, "validation": {**model["validation"], "rmse_kw": float("inf")}},
+        {**model, "validation": {**model["validation"], "upper_coverage": 1.1}},
+        {**model, "validation": {**model["validation"], "sample_count": True}},
     ]
 
     for variant in variants:
@@ -438,6 +578,9 @@ def test_corrupt_model_variants_and_small_helpers_fail_closed() -> None:
     assert training_due(without_attempt, now=now + timedelta(hours=5), source_entity_id="sensor.house_load") is False
     assert training_due(without_attempt, now=now + timedelta(hours=6), source_entity_id="sensor.house_load") is True
     assert _profile_value("bad", now) is None
+    long_gap = [1.0] * BUCKETS_PER_DAY
+    long_gap[48:51] = [None, None, None]
+    assert _profile_value(long_gap, now) is None
     assert _distance_to_profile_value([None] * BUCKETS_PER_DAY, 0, 1) == BUCKETS_PER_DAY
     assert str(_timezone("Not/A_Timezone")) == "UTC"
     assert _parse_datetime(now) == now

@@ -544,7 +544,12 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     for action in actions:
         determination = action.get("determination")
         if isinstance(determination, dict):
-            determination["load_forecast"] = load_forecast
+            action_forecast = _action_load_forecast_attrs(
+                coordinator,
+                str(action.get("action_id", "")),
+            )
+            if action_forecast:
+                determination["load_forecast"] = action_forecast
     return {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
@@ -1478,11 +1483,16 @@ def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict
         value = {}
     keys = (
         "source",
+        "source_entity_id",
         "status",
         "model_version",
         "contract_version",
         "trained_at",
         "last_attempt_at",
+        "last_attempt_source_entity_id",
+        "last_training_status",
+        "last_training_quality_failures",
+        "last_training_validation",
         "unusable_since",
         "model_age_hours",
         "history_started_on",
@@ -1500,6 +1510,36 @@ def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict
         "update_reason",
     )
     return {key: _bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
+
+
+def _action_load_forecast_attrs(
+    coordinator: EnergyPlannerCoordinator,
+    action_id: str,
+) -> dict[str, Any]:
+    """Return model health and load evidence aligned to one action."""
+    latest = _latest_forecast_snapshot(coordinator)
+    rows = latest.get("action_load_forecasts") if isinstance(latest, dict) else None
+    if not isinstance(rows, list):
+        return {}
+    row = next(
+        (
+            item
+            for item in rows
+            if isinstance(item, dict) and str(item.get("action_id", "")) == action_id
+        ),
+        None,
+    )
+    if row is None:
+        return {}
+    model = _built_in_load_forecast_attrs(coordinator)
+    model.pop("first_expected_kw", None)
+    model.pop("first_upper_kw", None)
+    return {
+        **model,
+        "valid_at": _bounded_json(row.get("valid_at")),
+        "expected_kw": _bounded_json(row.get("expected_kw")),
+        "conservative_kw": _bounded_json(row.get("conservative_kw")),
+    }
 
 
 def _latest_forecast_snapshot(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:

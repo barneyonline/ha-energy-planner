@@ -384,13 +384,43 @@ def _projected_grid_flows_kw(slot: Any) -> tuple[float | None, float | None]:
     if haeo_import is not None or haeo_export is not None:
         base_import = haeo_import or 0.0
         base_export = haeo_export or 0.0
-        if bool(getattr(slot, "haeo_grid_includes_flexible_loads", False)):
-            return base_import, base_export
-        return base_import + max(flexible_load_kw - base_export, 0.0), max(base_export - flexible_load_kw, 0.0)
-    if slot.baseline_load_forecast_kw is None or slot.pv_forecast_kw is None:
+        expected_net_kw = base_import - base_export
+        includes_flexible_loads = bool(getattr(slot, "haeo_grid_includes_flexible_loads", False))
+        if includes_flexible_loads:
+            point_import_kw = base_import
+            point_export_kw = base_export
+        else:
+            expected_net_kw += flexible_load_kw
+            point_import_kw = base_import + max(flexible_load_kw - base_export, 0.0)
+            point_export_kw = max(base_export - flexible_load_kw, 0.0)
+        # HAEO grid flow is a point estimate. Preserve its battery/grid evidence,
+        # but never let it bypass the local conservative load and PV bounds used
+        # by the hard import-limit gate.
+        expected_load_kw = _positive_float_or_none(slot.baseline_load_forecast_kw)
+        upper_load_kw = _positive_float_or_none(getattr(slot, "baseline_load_forecast_upper_kw", None))
+        expected_pv_kw = _positive_float_or_none(slot.pv_forecast_kw)
+        lower_pv_kw = _positive_float_or_none(getattr(slot, "pv_forecast_lower_kw", None))
+        uncertainty_kw = 0.0
+        if expected_load_kw is not None and upper_load_kw is not None:
+            uncertainty_kw += max(upper_load_kw - expected_load_kw, 0.0)
+        if expected_pv_kw is not None and lower_pv_kw is not None:
+            uncertainty_kw += max(expected_pv_kw - lower_pv_kw, 0.0)
+        # Preserve explicit gross HAEO flows as a fail-closed floor if a
+        # malformed response reports simultaneous import and export.
+        return max(point_import_kw, expected_net_kw + uncertainty_kw, 0.0), point_export_kw
+    expected_load_kw = slot.baseline_load_forecast_kw
+    upper_load_kw = getattr(slot, "baseline_load_forecast_upper_kw", None)
+    expected_pv_kw = slot.pv_forecast_kw
+    lower_pv_kw = getattr(slot, "pv_forecast_lower_kw", None)
+    if expected_load_kw is None or expected_pv_kw is None:
         return None, None
-    net_kw = float(slot.baseline_load_forecast_kw) + flexible_load_kw - float(slot.pv_forecast_kw)
-    return max(net_kw, 0.0), max(-net_kw, 0.0)
+    conservative_import_kw = (
+        float(upper_load_kw if upper_load_kw is not None else expected_load_kw)
+        + flexible_load_kw
+        - float(lower_pv_kw if lower_pv_kw is not None else expected_pv_kw)
+    )
+    expected_net_kw = float(expected_load_kw) + flexible_load_kw - float(expected_pv_kw)
+    return max(conservative_import_kw, 0.0), max(-expected_net_kw, 0.0)
 
 
 def _positive_float_or_none(value: Any) -> float | None:

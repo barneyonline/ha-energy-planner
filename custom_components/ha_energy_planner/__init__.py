@@ -333,6 +333,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
     try:
+        await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)

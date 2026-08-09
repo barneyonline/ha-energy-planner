@@ -163,7 +163,35 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
             "ev_soc_entity": "sensor.ev_soc",
         },
         hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
-        store_data={"ownership": {"hvac_control": {"phase": "precondition"}}},
+        store_data={
+            "ownership": {"hvac_control": {"phase": "precondition"}},
+            "forecast_snapshots": [
+                {
+                    "plan_id": "plan-1",
+                    "built_in_load_forecast": {
+                        "source": "built_in_recorder_history",
+                        "source_entity_id": "sensor.whole_home_power",
+                        "status": "ready",
+                        "first_expected_kw": 1.0,
+                        "first_upper_kw": 1.3,
+                    },
+                    "action_load_forecasts": [
+                        {
+                            "action_id": "climate-1",
+                            "valid_at": (now + timedelta(hours=1)).isoformat(),
+                            "expected_kw": 2.0,
+                            "conservative_kw": 2.4,
+                        },
+                        {
+                            "action_id": "ev-1",
+                            "valid_at": (now + timedelta(hours=2)).isoformat(),
+                            "expected_kw": 1.5,
+                            "conservative_kw": 1.9,
+                        },
+                    ],
+                }
+            ],
+        },
     )
     current = next(item for item in SENSORS if item.key == "current_state")
     next_actions = next(item for item in SENSORS if item.key == "next_actions")
@@ -180,6 +208,8 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     action_attrs = next_actions.attrs_fn(coordinator)
     assert [action["action_id"] for action in action_attrs["actions"]] == ["climate-1", "ev-1"]
     assert action_attrs["actions"][0]["determination"]["accepted_decision"]["score"] == 0.9
+    assert action_attrs["actions"][0]["determination"]["load_forecast"]["expected_kw"] == 2.0
+    assert action_attrs["actions"][1]["determination"]["load_forecast"]["expected_kw"] == 1.5
     assert action_attrs["actions"][0]["desired_state"]["Target temperature C"] == 21
     assert action_attrs["policy_order"] == ["cost", "comfort", "ev_readiness"]
     assert action_attrs["ai_explanation"] == {"available": False, "result": None}
@@ -789,9 +819,14 @@ def test_existing_status_surfaces_expose_builtin_load_evidence() -> None:
                     "plan_id": plan.plan_id,
                     "built_in_load_forecast": {
                         "source": "built_in_recorder_history",
+                        "source_entity_id": "sensor.whole_home_power",
                         "status": "ready",
                         "trained_at": "2026-06-27T00:00:00+00:00",
                         "last_attempt_at": "2026-06-27T00:00:00+00:00",
+                        "last_attempt_source_entity_id": "sensor.whole_home_power",
+                        "last_training_status": "failed",
+                        "last_training_quality_failures": ["forecast_accuracy_below_persistence_gate"],
+                        "last_training_validation": {"mae_kw": 2.0},
                         "unusable_since": "2026-06-20T00:00:00+00:00",
                         "first_expected_kw": 1.2,
                         "first_upper_kw": 1.5,
@@ -806,6 +841,25 @@ def test_existing_status_surfaces_expose_builtin_load_evidence() -> None:
     assert attrs["load_forecast"]["status"] == "ready"
     assert attrs["load_forecast"]["first_expected_kw"] == 1.2
     assert attrs["load_forecast"]["last_attempt_at"] == "2026-06-27T00:00:00+00:00"
+    assert attrs["load_forecast"]["source_entity_id"] == "sensor.whole_home_power"
+    assert attrs["load_forecast"]["last_training_status"] == "failed"
+    assert attrs["load_forecast"]["last_training_validation"] == {"mae_kw": 2.0}
+    assert sensor_module._action_load_forecast_attrs(coordinator, "missing") == {}
+    assert sensor_module._action_load_forecast_attrs(
+        _coordinator(plan, store_data={"forecast_snapshots": []}),
+        "missing",
+    ) == {}
+    assert sensor_module._action_load_forecast_attrs(
+        _coordinator(
+            plan,
+            store_data={
+                "forecast_snapshots": [
+                    {"plan_id": plan.plan_id, "action_load_forecasts": []}
+                ]
+            },
+        ),
+        "missing",
+    ) == {}
     assert (
         sensor_module._confidence_source_reason({"source": "built_in_recorder_history"})
         == "A local deterministic forecast learned from measured household load in Home Assistant Recorder."

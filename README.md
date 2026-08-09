@@ -94,7 +94,7 @@ Energy Planner is currently installed as a custom integration. It is not in the 
 
 - Integration domain: `ha_energy_planner`
 - Integration display name: `Energy Planner`
-- Current manifest version: `0.9.0`
+- Current manifest version: `0.9.1`
 - Minimum Home Assistant version: `2026.6.0`
 - Integration type: `service`
 - IoT class: `calculated`
@@ -125,11 +125,11 @@ Required Amber and PV inputs must expose forecast series; a numeric current valu
 
 ## Built-in household load forecast
 
-Energy Planner trains a deterministic local model from up to 28 days of Recorder history. It converts measured power to time-weighted 15-minute local-time buckets, excludes known EV charging, subtracts time-aligned measured HVAC power when configured, and learns robust weekday/weekend clock-time profiles. The planner uses both an expected load and a conservative upper bound.
+Energy Planner trains a deterministic local model from up to 28 days of Recorder history. It queries bounded UTC-aligned chunks—starting at seven days for sparse histories and shrinking to one day when state density requires it—with a per-entity state limit. Each power state is normalized using its historical W/kW/MW unit before the chunk is immediately compacted into cleaned 15-minute buckets, so source unit changes are safe and the complete raw history is never retained in memory or storage. It excludes known EV charging, subtracts time-aligned measured HVAC power when configured, and learns robust weekday/weekend clock-time profiles. The planner uses both an expected load and a conservative upper bound, including when optional HAEO grid evidence is available.
 
 The model needs at least seven complete days, 80% valid coverage, two leakage-free holdout origins with at least 144 aligned samples, accuracy no more than 10% worse than previous-day persistence, and at least 90% upper-bound coverage. Models are **ready** through 24 hours, **degraded** from 24 to 72 hours, and **stale** after 72 hours. Learning and stale/failed models remain visible in **Current state**, **Next actions**, the **Plan** calendar, diagnostics, and dry-run plans, but forecast-dependent active commands fail closed. Learning is silent; a broken mapping, missing Recorder, or a model that remains unusable requires user action and can notify once.
 
-Training runs at startup, after the measured source changes, and at most every six hours. A retraining candidate that fails quality gates does not replace the last valid aggregate; that model ages through degraded to stale while the failed validation remains visible. Only aggregate profiles, validation metrics, source/version identity, and timestamps are stored—never raw Recorder history. Changing the measured source or forecast contract invalidates production review evidence and requires new review cycles and re-arming; routine retraining does not.
+Training runs at startup, after the measured source changes, and at most every six hours. A retraining candidate that fails quality gates does not replace the last valid aggregate; that model ages through degraded to stale while the failed validation remains visible. Initial model-quality failures remain silent while automatic control stays blocked; they become actionable only after 72 hours of continuous unusability. Missing mappings, unavailable Recorder, and history exceeding the safe query bound remain immediately actionable. Only aggregate profiles, validation metrics, source/version identity, and timestamps are stored—never raw Recorder history. Changing the measured source or forecast contract restores safe state, explicitly disarms production control, and requires new review cycles and re-arming; routine retraining does not.
 
 ## Native EV smart charging
 
@@ -317,9 +317,7 @@ HEP_AMBER_IMPORT_ENTITY=sensor.amber_express_home_general_price \
 HEP_AMBER_EXPORT_ENTITY=sensor.amber_express_home_feed_in_price \
 HEP_PV_FORECAST_ENTITY=sensor.pv_forecast \
 HEP_PV_ACTUAL_ENTITY=sensor.pv_power \
-HEP_LOAD_ACTUAL_ENTITY=sensor.household_load_power \
 HEP_WEATHER_ENTITY=weather.home \
-HEP_HAEO_SERVICE=haeo.optimize \
 HEP_EV_CONNECTED_ENTITY=binary_sensor.ev_connected \
 HEP_EV_SOC_ENTITY=sensor.ev_soc \
 HEP_THERMAL_INDOOR_ENTITY=climate.daikin \
@@ -328,10 +326,10 @@ HEP_DAIKIN_POWER_ENTITY=sensor.daikin_power \
 scripts/export-real-validation-bundle.sh
 ```
 
-Good output means the real live-schema, HAEO value-evidence, and real-history profiles pass. The history profile includes rolling, time-aligned PV and load accuracy evidence; each configured horizon bucket must meet its MAE limit and beat a persistence baseline:
+The core bundle needs no HAEO service or external household-load forecast. Set `HEP_HAEO_SERVICE=haeo.optimize` only when you also want to validate the optional HAEO value-evidence profile. Good output means the core live-schema and real-history profiles pass. The history profile includes rolling, time-aligned external-PV accuracy evidence; each configured horizon bucket must meet its MAE limit and beat a persistence baseline:
 
 - `ha-energy-planner-v1-real`
-- `ha-energy-planner-haeo-value-v1-real`
+- `ha-energy-planner-haeo-value-v1-real` (only when `HEP_HAEO_SERVICE` is set)
 - `ha-energy-planner-history-v1-real`
 
 If fixtures were exported separately, validate them without calling Home Assistant:

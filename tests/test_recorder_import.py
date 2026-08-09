@@ -15,6 +15,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
 )
+from custom_components.ha_energy_planner.load_forecast import build_load_forecast_model
 
 
 class FakeHass:
@@ -105,23 +106,12 @@ def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_on
     monkeypatch: Any,
 ) -> None:
     now = datetime(2026, 6, 27, 12, tzinfo=UTC)
-    loaded = {
-        "load": [RecorderState("2", now - timedelta(days=1))],
-        "ev_charging": [RecorderState("off", now - timedelta(days=1))],
-        "hvac_power": [RecorderState("0.5", now - timedelta(days=1))],
-    }
-    loader_calls: list[tuple[Any, ...]] = []
+    training_calls: list[tuple[Any, ...]] = []
 
-    def fake_load(*args: Any) -> dict[str, list[Any]]:
-        loader_calls.append(args)
-        return loaded
-
-    def fake_build(states: list[Any], **kwargs: Any) -> dict[str, Any]:
-        assert states is loaded["load"]
-        assert kwargs["ev_charging_states"] is loaded["ev_charging"]
-        assert kwargs["hvac_power_states"] is loaded["hvac_power"]
-        assert kwargs["load_unit"] == "W"
-        assert kwargs["hvac_power_unit"] == "kW"
+    def fake_train(*args: Any) -> dict[str, Any]:
+        training_calls.append(args)
+        assert args[1:4] == ("sensor.house_load", "sensor.ev_charging", "sensor.hvac_power")
+        assert args[-2:] == ("W", "kW")
         return {
             "model_version": 1,
             "source_entity_id": "sensor.house_load",
@@ -129,8 +119,7 @@ def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_on
             "status": "ready",
         }
 
-    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
-    monkeypatch.setattr(recorder_import, "build_load_forecast_model", fake_build)
+    monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fake_train)
     hass = ForecastHass(
         {
             "sensor.house_load": CurrentState("2000", "W"),
@@ -156,11 +145,7 @@ def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_on
     assert reason == "load_forecast_ready"
     assert model["status"] == "ready"
     assert "load" not in model
-    assert loader_calls[0][1:4] == (
-        "sensor.house_load",
-        "sensor.ev_charging",
-        "sensor.hvac_power",
-    )
+    assert len(training_calls) == 1
 
 
 def test_builtin_load_forecast_retains_last_model_on_recorder_error(monkeypatch: Any) -> None:
@@ -184,12 +169,59 @@ def test_builtin_load_forecast_retains_last_model_on_recorder_error(monkeypatch:
     assert model is not existing
     assert model["source_entity_id"] == existing["source_entity_id"]
     assert model["last_attempt_at"] == now.isoformat()
+    assert model["last_training_status"] == "failed"
+    assert model["last_training_quality_failures"] == ["recorder_unavailable"]
     assert changed is True
-    assert reason == "load_forecast_recorder_unavailable:RuntimeError"
+    assert reason == "load_forecast_recorder_unavailable:LoadForecastRecorderError"
     assert (
         recorder_import.training_due(model, now=now + timedelta(hours=1), source_entity_id="sensor.house_load")
         is False
     )
+
+
+def test_builtin_load_forecast_reports_dense_history_as_actionable(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+
+    def fail(*args: Any) -> dict[str, Any]:
+        raise recorder_import.LoadForecastHistoryLimitError("sensor.house_load")
+
+    monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fail)
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            {},
+            now=now,
+            timezone="UTC",
+        )
+    )
+
+    assert changed is True
+    assert reason == "load_forecast_history_limit_exceeded:LoadForecastHistoryLimitError"
+    assert model["last_training_quality_failures"] == ["history_limit_exceeded"]
+
+
+def test_builtin_load_forecast_delays_internal_training_error(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+
+    def fail(*args: Any) -> dict[str, Any]:
+        raise ValueError("unexpected model failure")
+
+    monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fail)
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            {},
+            now=now,
+            timezone="UTC",
+        )
+    )
+
+    assert changed is True
+    assert reason == "load_forecast_training_error:ValueError"
+    assert model["last_training_quality_failures"] == ["training_error"]
+    assert model["unusable_since"] == now.isoformat()
 
 
 def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> None:
@@ -205,12 +237,12 @@ def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> 
     }
     calls = 0
 
-    def fake_load(*args: Any) -> dict[str, list[Any]]:
+    def fake_train(*args: Any) -> dict[str, Any]:
         nonlocal calls
         calls += 1
-        return {"load": [], "ev_charging": [], "hvac_power": []}
+        return {"status": "learning", "quality_failures": ["insufficient_complete_days"]}
 
-    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
+    monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fake_train)
     skipped = asyncio.run(
         recorder_import.async_update_builtin_load_forecast(
             ForecastHass({"sensor.house_load": CurrentState("1")}),
@@ -241,9 +273,25 @@ def test_household_forecast_history_loader_uses_recorder_state_changes(monkeypat
     state = RecorderState("1", now - timedelta(hours=1))
     calls: list[dict[str, Any]] = []
 
-    def state_changes(*args: Any, **kwargs: Any) -> dict[str, list[RecorderState]]:
-        calls.append(kwargs)
-        return {kwargs["entity_id"]: [state]}
+    def state_changes(
+        hass: Any,
+        start_time: datetime,
+        end_time: datetime,
+        *,
+        entity_id: str,
+        no_attributes: bool,
+        include_start_time_state: bool,
+        limit: int,
+    ) -> dict[str, list[RecorderState]]:
+        calls.append(
+            {
+                "entity_id": entity_id,
+                "no_attributes": no_attributes,
+                "include_start_time_state": include_start_time_state,
+                "limit": limit,
+            }
+        )
+        return {entity_id: [state]}
 
     monkeypatch.setattr(
         recorder_import,
@@ -264,9 +312,9 @@ def test_household_forecast_history_loader_uses_recorder_state_changes(monkeypat
     assert calls == [
         {
             "entity_id": "sensor.house_load",
-            "no_attributes": True,
+            "no_attributes": False,
             "include_start_time_state": True,
-            "significant_changes_only": False,
+            "limit": recorder_import.MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK,
         }
     ]
 
@@ -285,12 +333,7 @@ def test_retraining_quality_failure_retains_last_ready_aggregate(monkeypatch: An
     }
     monkeypatch.setattr(
         recorder_import,
-        "_load_household_forecast_states",
-        lambda *args: {"load": [], "ev_charging": [], "hvac_power": []},
-    )
-    monkeypatch.setattr(
-        recorder_import,
-        "build_load_forecast_model",
+        "_build_household_load_forecast_model",
         lambda *args, **kwargs: {
             "status": "failed",
             "quality_failures": ["forecast_accuracy_below_persistence_gate"],
@@ -315,6 +358,131 @@ def test_retraining_quality_failure_retains_last_ready_aggregate(monkeypatch: An
     assert retained["profiles"] == {"retained": True}
     assert retained["last_training_status"] == "failed"
     assert retained["last_training_validation"] == {"mae_kw": 2.0}
+
+
+def test_household_forecast_builder_queries_bounded_utc_chunks(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, 12, 7, tzinfo=UTC)
+    windows: list[tuple[datetime, datetime]] = []
+
+    def fake_load(
+        hass: Any,
+        load_entity: str,
+        ev_entity: str | None,
+        hvac_entity: str | None,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, list[Any]]:
+        windows.append((start, end))
+        return {
+            "load": [RecorderState("1", start)],
+            "ev_charging": [],
+            "hvac_power": [],
+        }
+
+    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
+
+    model = recorder_import._build_household_load_forecast_model(
+        object(),
+        "sensor.house_load",
+        None,
+        None,
+        now,
+        "UTC",
+        "kW",
+        "",
+    )
+
+    assert len(windows) == 5
+    assert all(end - start <= timedelta(days=7) for start, end in windows)
+    assert all(end.minute == 0 and end.second == 0 for _start, end in windows[:-1])
+    assert model["source_entity_id"] == "sensor.house_load"
+    assert model["status"] == "ready"
+
+
+def test_chunked_forecast_training_matches_monolithic_history(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, 12, 7, tzinfo=UTC)
+    start = now - timedelta(days=12)
+    load: list[RecorderState] = []
+    cursor = start
+    while cursor <= now:
+        load.append(RecorderState(str(1.0 + (cursor.hour >= 17) * 0.5), cursor))
+        cursor += timedelta(minutes=15)
+    ev = [RecorderState("off", start)]
+    hvac = [RecorderState("0.2", start)]
+
+    def sliced(states: list[RecorderState], chunk_start: datetime, chunk_end: datetime) -> list[RecorderState]:
+        prior = [state for state in states if state.last_updated <= chunk_start]
+        result = [prior[-1]] if prior else []
+        result.extend(state for state in states if chunk_start < state.last_updated < chunk_end)
+        return result
+
+    def fake_load(
+        hass: Any,
+        load_entity: str,
+        ev_entity: str | None,
+        hvac_entity: str | None,
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> dict[str, list[Any]]:
+        return {
+            "load": sliced(load, chunk_start, chunk_end),
+            "ev_charging": sliced(ev, chunk_start, chunk_end),
+            "hvac_power": sliced(hvac, chunk_start, chunk_end),
+        }
+
+    monkeypatch.setattr(recorder_import, "_load_household_forecast_states", fake_load)
+    chunked = recorder_import._build_household_load_forecast_model(
+        object(),
+        "sensor.house_load",
+        "binary_sensor.ev_charging",
+        "sensor.hvac_power",
+        now,
+        "UTC",
+        "kW",
+        "kW",
+    )
+    monolithic = build_load_forecast_model(
+        load,
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+        ev_charging_states=ev,
+        hvac_power_states=hvac,
+        hvac_power_unit="kW",
+    )
+
+    assert chunked["profiles"] == monolithic["profiles"]
+    assert chunked["validation"] == monolithic["validation"]
+    assert chunked["history_coverage"] == monolithic["history_coverage"]
+    assert chunked["cleaning"] == monolithic["cleaning"]
+
+
+def test_household_forecast_builder_rejects_dense_chunk(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    dense = [RecorderState("1", now - timedelta(days=28))] * 2
+    monkeypatch.setattr(recorder_import, "MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK", 2)
+    monkeypatch.setattr(
+        recorder_import,
+        "_load_household_forecast_states",
+        lambda *args: {"load": dense, "ev_charging": [], "hvac_power": []},
+    )
+
+    try:
+        recorder_import._build_household_load_forecast_model(
+            object(),
+            "sensor.house_load",
+            None,
+            None,
+            now,
+            "UTC",
+            "kW",
+            "",
+        )
+    except recorder_import.LoadForecastHistoryLimitError as err:
+        assert str(err) == "sensor.house_load"
+    else:
+        raise AssertionError("dense Recorder history was not rejected")
 
 
 def test_recorder_import_skips_when_recent() -> None:

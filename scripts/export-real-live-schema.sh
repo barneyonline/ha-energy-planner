@@ -30,9 +30,6 @@ required_env=(
   HEP_AMBER_IMPORT_ENTITY
   HEP_AMBER_EXPORT_ENTITY
   HEP_PV_FORECAST_ENTITY
-  HEP_BASELINE_LOAD_ENTITY
-  HEP_WEATHER_ENTITY
-  HEP_HAEO_SERVICE
 )
 
 if [[ "$DRY_RUN" != "1" ]]; then
@@ -96,47 +93,43 @@ run python3 scripts/export-live-schema-fixture.py \
   --value-keys export_price,feed_in_price,per_kwh,price,value
 
 run python3 scripts/export-live-schema-fixture.py \
-  --out "$OUT_DIR/real_pv_hafo.json" \
+  --out "$OUT_DIR/real_pv_forecast.json" \
   --validate \
   "${redact_args[@]}" \
   forecast-state \
-  --name real_pv_hafo \
+  --name real_pv_forecast \
   --entity-id "$(value_or_placeholder HEP_PV_FORECAST_ENTITY sensor.pv_forecast)" \
   --value-kind power \
   --value-keys pv_forecast,pv_estimate,power,watts,w,kw,prediction,value
 
-run python3 scripts/export-live-schema-fixture.py \
-  --out "$OUT_DIR/real_baseline_load.json" \
-  --validate \
-  "${redact_args[@]}" \
-  forecast-state \
-  --name real_baseline_load \
-  --entity-id "$(value_or_placeholder HEP_BASELINE_LOAD_ENTITY sensor.baseline_load)" \
-  --value-kind power \
-  --value-keys baseline_load,load_forecast,power,watts,w,kw,value
+if [[ -n "${HEP_WEATHER_ENTITY:-}" ]]; then
+  run python3 scripts/export-live-schema-fixture.py \
+    --out "$OUT_DIR/real_weather.json" \
+    --validate \
+    "${redact_args[@]}" \
+    forecast-state \
+    --name real_weather \
+    --entity-id "$HEP_WEATHER_ENTITY" \
+    --value-kind temperature \
+    --value-keys temperature,native_temperature,nativeTemperature,currentTemperature,current_temperature,value
+fi
 
-run python3 scripts/export-live-schema-fixture.py \
-  --out "$OUT_DIR/real_weather.json" \
-  --validate \
-  "${redact_args[@]}" \
-  forecast-state \
-  --name real_weather \
-  --entity-id "$(value_or_placeholder HEP_WEATHER_ENTITY weather.home)" \
-  --value-kind temperature \
-  --value-keys temperature,native_temperature,nativeTemperature,currentTemperature,current_temperature,value
-
-run python3 scripts/export-live-schema-fixture.py \
-  --out "$OUT_DIR/real_haeo_response.json" \
-  --validate \
-  "${redact_args[@]}" \
-  haeo-response \
-  --name real_haeo_response \
-  --service "$(value_or_placeholder HEP_HAEO_SERVICE haeo.optimize)" \
-  --service-data-json "$haeo_service_data_json"
+if [[ -n "${HEP_HAEO_SERVICE:-}" ]]; then
+  run python3 scripts/export-live-schema-fixture.py \
+    --out "$OUT_DIR/real_haeo_response.json" \
+    --validate \
+    "${redact_args[@]}" \
+    haeo-response \
+    --name real_haeo_response \
+    --service "$HEP_HAEO_SERVICE" \
+    --service-data-json "$haeo_service_data_json"
+fi
 
 run python3 scripts/validate-live-schema-fixture.py \
   --profile ha-energy-planner-v1-real \
   "$OUT_DIR"/real_*.json
-run python3 scripts/validate-live-schema-fixture.py \
-  --profile ha-energy-planner-haeo-value-v1-real \
-  "$OUT_DIR"/real_*.json
+if [[ -n "${HEP_HAEO_SERVICE:-}" ]]; then
+  run python3 scripts/validate-live-schema-fixture.py \
+    --profile ha-energy-planner-haeo-value-v1-real \
+    "$OUT_DIR"/real_*.json
+fi

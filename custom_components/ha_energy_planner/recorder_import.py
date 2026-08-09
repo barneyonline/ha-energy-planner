@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from functools import partial
 from importlib import import_module
 from typing import Any
 
@@ -17,10 +16,25 @@ from .const import (
     CONF_HOUSEHOLD_LOAD,
 )
 from .ev import import_trip_history_from_state_sequences
-from .load_forecast import HISTORY_LOOKBACK, build_load_forecast_model, training_due
+from .load_forecast import (
+    HISTORY_LOOKBACK,
+    build_load_forecast_model_from_buckets,
+    clean_load_history_buckets,
+    training_due,
+)
 
 RECORDER_IMPORT_INTERVAL = timedelta(hours=24)
 RECORDER_IMPORT_LOOKBACK = timedelta(days=30)
+MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK = 100_000
+INITIAL_LOAD_FORECAST_CHUNK_DAYS = 7
+
+
+class LoadForecastHistoryLimitError(RuntimeError):
+    """Raised when one bounded Recorder chunk is still too dense to process safely."""
+
+
+class LoadForecastRecorderError(RuntimeError):
+    """Raised when Recorder cannot serve a bounded history query."""
 
 
 async def async_update_builtin_load_forecast(
@@ -53,27 +67,16 @@ async def async_update_builtin_load_forecast(
     hvac_state = hass.states.get(hvac_entity) if hvac_entity else None
     try:
         executor = _recorder_executor(hass)
-        histories = await executor(
-            _load_household_forecast_states,
+        updated = await executor(
+            _build_household_load_forecast_model,
             hass,
             load_entity,
             ev_entity,
             hvac_entity,
-            now - HISTORY_LOOKBACK,
             now,
-        )
-        updated = await executor(
-            partial(
-                build_load_forecast_model,
-                histories["load"],
-                now=now,
-                timezone=timezone,
-                source_entity_id=load_entity,
-                load_unit=load_unit,
-                ev_charging_states=histories["ev_charging"],
-                hvac_power_states=histories["hvac_power"],
-                hvac_power_unit=_state_unit(hvac_state),
-            )
+            timezone,
+            load_unit,
+            _state_unit(hvac_state),
         )
         if (
             updated.get("status") != "ready"
@@ -101,7 +104,31 @@ async def async_update_builtin_load_forecast(
                 else now.isoformat()
             )
     except Exception as err:  # noqa: BLE001 - Recorder failures retain the last safe model.
-        return attempted, attempted != model, f"load_forecast_recorder_unavailable:{err.__class__.__name__}"
+        failure = (
+            "history_limit_exceeded"
+            if isinstance(err, LoadForecastHistoryLimitError)
+            else "recorder_unavailable"
+            if isinstance(err, LoadForecastRecorderError)
+            else "training_error"
+        )
+        attempted.update(
+            {
+                "last_training_status": "failed",
+                "last_training_quality_failures": [failure],
+                "last_training_validation": {},
+            }
+        )
+        if not (
+            model.get("quality_ready") is True
+            and model.get("source_entity_id") == load_entity
+            and model.get("timezone") == timezone
+        ):
+            attempted["unusable_since"] = (
+                model.get("unusable_since")
+                if model.get("source_entity_id") == load_entity and model.get("unusable_since")
+                else now.isoformat()
+            )
+        return attempted, attempted != model, f"load_forecast_{failure}:{err.__class__.__name__}"
     reason = f"load_forecast_{updated.get('status', 'failed')}"
     return updated, updated != model, reason
 
@@ -183,7 +210,7 @@ def _load_household_forecast_states(
     history = import_module("homeassistant.components.recorder.history")
     state_changes = history.state_changes_during_period
 
-    def _states(entity_id: str | None) -> list[Any]:
+    def _states(entity_id: str | None, *, no_attributes: bool) -> list[Any]:
         if not entity_id:
             return []
         return list(
@@ -192,17 +219,104 @@ def _load_household_forecast_states(
                 start_time,
                 end_time,
                 entity_id=entity_id,
-                no_attributes=True,
+                no_attributes=no_attributes,
                 include_start_time_state=True,
-                significant_changes_only=False,
+                limit=MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK,
             ).get(entity_id, [])
         )
 
     return {
-        "load": _states(load_entity),
-        "ev_charging": _states(ev_entity),
-        "hvac_power": _states(hvac_entity),
+        "load": _states(load_entity, no_attributes=False),
+        "ev_charging": _states(ev_entity, no_attributes=True),
+        "hvac_power": _states(hvac_entity, no_attributes=False),
     }
+
+
+def _build_household_load_forecast_model(
+    hass: HomeAssistant,
+    load_entity: str,
+    ev_entity: str | None,
+    hvac_entity: str | None,
+    now: datetime,
+    timezone: str,
+    load_unit: str,
+    hvac_power_unit: str,
+) -> dict[str, Any]:
+    """Query, clean, and compact Recorder history one bounded UTC chunk at a time."""
+    history_start = now - HISTORY_LOOKBACK
+    chunk_start = history_start
+    preferred_chunk_days = INITIAL_LOAD_FORECAST_CHUNK_DAYS
+    effective_start: datetime | None = None
+    buckets: list[tuple[datetime, float]] = []
+    ev_intervals_excluded = False
+    hvac_power_subtracted = False
+    while chunk_start < now:
+        chunk_end = _next_load_forecast_chunk_end(chunk_start, now, preferred_chunk_days)
+        while True:
+            try:
+                histories = _load_household_forecast_states(
+                    hass,
+                    load_entity,
+                    ev_entity,
+                    hvac_entity,
+                    chunk_start,
+                    chunk_end,
+                )
+            except Exception as err:  # noqa: BLE001 - preserve the query boundary for notification policy.
+                raise LoadForecastRecorderError from err
+            dense_entity = next(
+                (
+                    entity_id
+                    for entity_id, states in (
+                        (load_entity, histories["load"]),
+                        (ev_entity, histories["ev_charging"]),
+                        (hvac_entity, histories["hvac_power"]),
+                    )
+                    if entity_id and len(states) >= MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK
+                ),
+                None,
+            )
+            duration = chunk_end - chunk_start
+            if dense_entity is None:
+                break
+            if duration <= timedelta(days=1):
+                raise LoadForecastHistoryLimitError(dense_entity)
+            chunk_days = max(int(duration.total_seconds() // timedelta(days=1).total_seconds()), 1)
+            preferred_chunk_days = max(chunk_days // 2, 1)
+            chunk_end = min(chunk_start + timedelta(days=preferred_chunk_days), now)
+        chunk_buckets, chunk_effective_start, ev_excluded, hvac_subtracted = clean_load_history_buckets(
+            histories["load"],
+            load_unit=load_unit,
+            ev_charging_states=histories["ev_charging"],
+            hvac_power_states=histories["hvac_power"],
+            hvac_power_unit=hvac_power_unit,
+            start=chunk_start,
+            end=chunk_end,
+            timezone=timezone,
+        )
+        buckets.extend(chunk_buckets)
+        if effective_start is None and chunk_effective_start is not None:
+            effective_start = chunk_effective_start
+        ev_intervals_excluded = ev_intervals_excluded or ev_excluded
+        hvac_power_subtracted = hvac_power_subtracted or hvac_subtracted
+        chunk_start = chunk_end
+    return build_load_forecast_model_from_buckets(
+        buckets,
+        now=now,
+        timezone=timezone,
+        source_entity_id=load_entity,
+        history_start=effective_start or history_start,
+        ev_intervals_excluded=ev_intervals_excluded,
+        hvac_power_subtracted=hvac_power_subtracted,
+    )
+
+
+def _next_load_forecast_chunk_end(start: datetime, end: datetime, preferred_days: int) -> datetime:
+    """Return an aligned bounded query end, preserving complete UTC buckets."""
+    if any((start.hour, start.minute, start.second, start.microsecond)):
+        next_midnight = (start + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return min(next_midnight, end)
+    return min(start + timedelta(days=max(preferred_days, 1)), end)
 
 
 def _recorder_executor(hass: HomeAssistant) -> Any:

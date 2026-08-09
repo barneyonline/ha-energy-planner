@@ -34,6 +34,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
+    CONF_HOUSEHOLD_LOAD,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
@@ -59,6 +60,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _overrides_from_store,
     _parse_datetime_or_none,
     _seconds_until_next_interval_boundary,
+    _snapshot_action_load_forecasts,
     _snapshot_actions,
     _split_entity_values,
     _unexpired_overrides,
@@ -66,6 +68,7 @@ from custom_components.ha_energy_planner.coordinator import (
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
+    DecisionContext,
     DecisionSlot,
     EnergyPlan,
     HAEOSolvePhase,
@@ -2897,6 +2900,52 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
         }
     ]
 
+    context = DecisionContext(
+        created_at=now,
+        plan_id=plan.plan_id,
+        slots=[
+            DecisionSlot(
+                valid_at=now,
+                import_price=0.2,
+                export_price=0.05,
+                pv_forecast_kw=1.0,
+                baseline_load_forecast_kw=1.2,
+                baseline_load_forecast_upper_kw=1.6,
+            )
+        ],
+        current_battery_soc_percent=50,
+        current_ev_soc_percent=50,
+        occupancy_state=OccupancyState.OCCUPIED,
+        haeo_status=HAEOStatus.STALE,
+        input_health=InputHealth.HEALTHY,
+    )
+    assert _snapshot_action_load_forecasts(plan, context) == [
+        {
+            "action_id": action.action_id,
+            "valid_at": now,
+            "expected_kw": 1.2,
+            "conservative_kw": 1.6,
+        }
+    ]
+    context.slots.append(
+        DecisionSlot(
+            valid_at=now + timedelta(minutes=15),
+            import_price=0.3,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.4,
+            baseline_load_forecast_upper_kw=2.8,
+        )
+    )
+    plan.actions[0] = replace(
+        action,
+        execute_not_before=now + timedelta(minutes=10),
+        execute_not_after=now + timedelta(minutes=14),
+    )
+    assert _snapshot_action_load_forecasts(plan, context)[0]["expected_kw"] == 1.2
+    context.slots = []
+    assert _snapshot_action_load_forecasts(plan, context) == []
+
 
 def test_restore_safe_state_refreshes_by_default() -> None:
     coordinator = _coordinator_for_restore()
@@ -3778,6 +3827,30 @@ def test_production_evidence_resets_when_control_contract_changes() -> None:
 
     assert coordinator.store.data["production"]["dry_run_ready_cycles"] == 1
     assert coordinator.store.data["production"]["dry_run_evidence_fingerprint"] != first_fingerprint
+
+
+def test_changed_production_contract_restores_and_disarms_before_rearming() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_HOUSEHOLD_LOAD: "sensor.house_b"},
+        store_data={
+            "production": {
+                "armed": True,
+                "dry_run_ready_cycles": 3,
+                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                    {CONF_HOUSEHOLD_LOAD: "sensor.house_a"},
+                    {},
+                ),
+            }
+        },
+    )
+
+    changed = asyncio.run(coordinator.async_reconcile_production_evidence_contract())
+
+    assert changed is True
+    assert coordinator.executor.restored == ["production_evidence_contract_changed"]
+    assert coordinator.store.data["production"]["armed"] is False
+    assert coordinator.store.data["production"]["disarmed_reason"] == "production_evidence_contract_changed"
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is False
 
 
 def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:

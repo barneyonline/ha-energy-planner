@@ -299,7 +299,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit EV opportunistic-charging and earliest-start boundary tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age tests, replay fixtures, live-schema fixtures, Recorder history replays, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and Docker smoke are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, explicit EV opportunistic-charging and earliest-start boundary tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and a no-HAEO Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
