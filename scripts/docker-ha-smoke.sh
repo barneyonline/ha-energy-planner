@@ -488,6 +488,9 @@ automation:
     actions:
       - delay: "00:00:08"
       - action: fake_haeo.seed_production_evidence
+      - action: ha_energy_planner.arm_production_control
+        data:
+          reason: docker_smoke_reviewed_contract
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -902,7 +905,6 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           },
           {
             "data": {
-              "haeo_optimize_service": "fake_haeo.optimize",
               "amber_import_price_entity": "sensor.smoke_import_price_forecast",
               "amber_export_price_entity": "sensor.smoke_export_price_forecast",
               "pv_forecast_entity": "sensor.smoke_pv_forecast_series",
@@ -1162,41 +1164,13 @@ if active_plan.get("mode") not in {"DISABLED", "DRY_RUN", "ACTIVE_HEALTHY", "ACT
 if active_plan.get("mode") not in {"ACTIVE_HEALTHY", "ACTIVE_DEGRADED"}:
     raise SystemExit(f"Automatic control did not produce an active plan: {active_plan.get('mode')}")
 if not store_data.get("haeo_runs"):
-    raise SystemExit("Planner Store did not persist HAEO run metadata")
-haeo_evidence_counts = [
-    run.get("baseline", {}).get("evidence_counts", {})
+    raise SystemExit("Planner Store did not persist optional-HAEO fallback metadata")
+if not any(
+    run.get("baseline", {}).get("status") != "ready"
+    and not run.get("baseline", {}).get("evidence_counts")
     for run in store_data.get("haeo_runs", [])
-    if isinstance(run.get("baseline", {}).get("evidence_counts", {}), dict)
-]
-haeo_second_pass_evidence_counts = [
-    (run.get("second_pass") or {}).get("evidence_counts", {})
-    for run in store_data.get("haeo_runs", [])
-    if isinstance((run.get("second_pass") or {}).get("evidence_counts", {}), dict)
-]
-if not any(
-    counts.get("haeo_grid_import_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_charge_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_soc_forecast_percent", 0) >= 4
-    for counts in haeo_evidence_counts
 ):
-    raise SystemExit(f"Planner Store did not persist parsed HAEO grid-charge evidence counts: {haeo_evidence_counts}")
-if not any(
-    counts.get("haeo_grid_export_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_discharge_forecast_kw", 0) >= 4
-    for counts in haeo_evidence_counts
-):
-    raise SystemExit(f"Planner Store did not persist parsed HAEO export/discharge evidence counts: {haeo_evidence_counts}")
-if not any(
-    counts.get("haeo_grid_import_forecast_kw", 0) >= 4
-    and counts.get("haeo_grid_export_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_charge_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_discharge_forecast_kw", 0) >= 4
-    for counts in haeo_second_pass_evidence_counts
-):
-    raise SystemExit(
-        "Planner Store did not persist parsed second-pass HAEO evidence counts: "
-        f"{haeo_second_pass_evidence_counts}"
-    )
+    raise SystemExit("Smoke run did not exercise deterministic planning without HAEO evidence")
 if "discovery" not in store_data:
     raise SystemExit("Planner Store did not persist discovery data")
 ai_discovery = store_data.get("discovery", {}).get("ai", {})
@@ -1253,18 +1227,8 @@ if not any(
     for action in snapshot_actions
 ):
     raise SystemExit("Forecast snapshots did not persist an active EV schedule allocated to a negative import-price slot")
-if not any(
-    str(action.get("action_id", "")).endswith("-enphase-arbitrage-profile")
-    and action.get("kind") == "set_profile"
-    and action.get("desired_state", {}).get("profile") == "Full Backup"
-    and action.get("desired_state", {}).get("arbitrage_source") in {
-        "haeo_battery_arbitrage_value",
-        "haeo_export_value",
-    }
-    and float(action.get("expected_cost_delta") or 0) >= 0.25
-    for action in snapshot_actions
-):
-    raise SystemExit("Forecast snapshots did not persist an Enphase arbitrage action backed by HAEO value evidence")
+if any(action.get("requires_haeo_plan_id") for action in snapshot_actions):
+    raise SystemExit("Deterministic smoke actions unexpectedly retained an HAEO dependency")
 if not latest_snapshot.get("forecast_training_slots"):
     raise SystemExit("Forecast snapshot did not include compact forecast training slots")
 forecast_training_slots = latest_snapshot.get("forecast_training_slots", [])
@@ -1329,6 +1293,14 @@ if "baseline_load_forecast_kw" in forecast_calibration:
 stored_load_forecast = store_data.get("built_in_load_forecast", {})
 if stored_load_forecast.get("source_entity_id") != "input_number.baseline_load":
     raise SystemExit(f"Planner Store did not retain the built-in load model: {stored_load_forecast}")
+if stored_load_forecast.get("last_training_status") != "learning":
+    raise SystemExit(
+        "Real Recorder load training did not complete through the expected learning state: "
+        f"{stored_load_forecast}"
+    )
+training_failures = stored_load_forecast.get("last_training_quality_failures", [])
+if any(failure in training_failures for failure in {"recorder_unavailable", "training_error"}):
+    raise SystemExit(f"Real Recorder load training failed unexpectedly: {stored_load_forecast}")
 if "thermal_model" not in store_data:
     raise SystemExit("Planner Store did not initialize thermal model state")
 thermal_model = store_data.get("thermal_model", {})
@@ -1465,7 +1437,7 @@ enphase_arbitrage_outcomes = [
     for item in outcomes
     if str(item.get("action_id", "")).endswith("-enphase-arbitrage-profile")
 ]
-if not any(
+if enphase_arbitrage_outcomes and not any(
     item.get("result") == "applied"
     and item.get("reason") == "enphase_profile_applied"
     and item.get("post_state", {}).get("enphase_profile_entity") == "Full Backup"
@@ -1478,14 +1450,6 @@ if not any(
     raise SystemExit(
         "Active-mode Enphase arbitrage was neither applied nor safely blocked by conflict/cooldown"
     )
-if not any(
-    item.get("result") == "applied"
-    and str(item.get("action_id", "")).endswith("-enphase-restore-ai")
-    and item.get("reason") == "enphase_profile_applied"
-    and item.get("post_state", {}).get("enphase_profile_entity") == "AI Optimisation"
-    for item in outcomes
-):
-    raise SystemExit("Active-mode Enphase restore-AI action was not applied in the smoke run")
 final_restore_outcomes = [
     item
     for item in outcomes

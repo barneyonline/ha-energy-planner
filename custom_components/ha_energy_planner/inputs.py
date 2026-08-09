@@ -58,7 +58,7 @@ from .forecasts import (
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
 )
-from .load_forecast import load_forecast_from_model, normalize_power_kw
+from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DecisionContext, DecisionSlot, HAEOStatus, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
@@ -516,32 +516,39 @@ class InputManager:
         if not entity_id:
             return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_not_configured"
         state = self._state(entity_id)
+        source_issue: str | None = None
+        current_load: float | None = None
         if not self._valid_state(state):
-            self._record_forecast_confidence(
-                0.0,
-                config_key=CONF_HOUSEHOLD_LOAD,
-                entity_id=entity_id,
-                source="built_in_recorder_history",
+            source_issue = f"{CONF_HOUSEHOLD_LOAD}_unavailable"
+        else:
+            attributes = getattr(state, "attributes", {}) or {}
+            current_load = normalize_power_kw(
+                getattr(state, "state", None),
+                str(_attribute_value(attributes, "unit_of_measurement", "unit") or ""),
             )
-            return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_unavailable"
-        attributes = getattr(state, "attributes", {}) or {}
-        current_load = normalize_power_kw(
-            getattr(state, "state", None),
-            str(_attribute_value(attributes, "unit_of_measurement", "unit") or ""),
-        )
-        if current_load is None:
-            return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_non_numeric"
+            if current_load is None:
+                source_issue = f"{CONF_HOUSEHOLD_LOAD}_non_numeric"
         current_ev_charging, _ev_issue = self._optional_bool_state(CONF_EV_CHARGING)
-        current_hvac_power, _hvac_issue = self._optional_numeric_state(CONF_DAIKIN_POWER)
+        hvac_entity_id = self.entry_data.get(CONF_DAIKIN_POWER)
+        hvac_state = self._state(hvac_entity_id) if hvac_entity_id else None
+        hvac_attributes = getattr(hvac_state, "attributes", {}) or {}
+        current_hvac_power = (
+            normalize_power_kw(
+                getattr(hvac_state, "state", None),
+                str(_attribute_value(hvac_attributes, "unit_of_measurement", "unit") or ""),
+            )
+            if self._valid_state(hvac_state)
+            else None
+        )
         recent_load_is_clean = not (
             self.entry_data.get(CONF_EV_CHARGING) and current_ev_charging is None
         ) and not (
             self.entry_data.get(CONF_DAIKIN_POWER) and current_hvac_power is None
         )
         clean_current_load = (
-            current_load - current_hvac_power
-            if current_hvac_power is not None and current_load >= current_hvac_power
-            else current_load
+            max(current_load - (current_hvac_power or 0.0), 0.0)
+            if current_load is not None
+            else None
         )
         result = load_forecast_from_model(
             self.load_forecast_model,
@@ -557,10 +564,10 @@ class InputManager:
             **result.details,
             "update_reason": self.load_forecast_update_reason,
         }
-        confidence = {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
+        confidence = 0.0 if source_issue else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
         coverage_details = {
             **result.details,
-            "classification": "healthy" if result.status == "ready" else result.status,
+            "classification": source_issue or ("healthy" if result.status == "ready" else result.status),
             "covered_hours": round(
                 sum(value is not None for value in result.expected_kw) * interval / 60,
                 4,
@@ -584,18 +591,31 @@ class InputManager:
             self._forecast_source_issued_at["baseline_load_forecast_kw"] = dt_util.as_utc(trained_at)
         issue = {
             "ready": None,
-            "degraded": f"{CONF_HOUSEHOLD_LOAD}_forecast_degraded",
+            "degraded": f"advisory_{CONF_HOUSEHOLD_LOAD}_forecast_degraded",
             "learning": f"{CONF_HOUSEHOLD_LOAD}_forecast_learning",
             "stale": f"{CONF_HOUSEHOLD_LOAD}_forecast_stale",
-            "failed": f"{CONF_HOUSEHOLD_LOAD}_forecast_failed",
+            "failed": f"{CONF_HOUSEHOLD_LOAD}_forecast_unusable",
         }.get(result.status, f"{CONF_HOUSEHOLD_LOAD}_forecast_failed")
+        unusable_since = dt_util.parse_datetime(str(result.details.get("unusable_since") or ""))
+        if (
+            result.status == "failed"
+            and unusable_since is not None
+            and now - dt_util.as_utc(unusable_since) >= STALE_MODEL_AGE
+        ):
+            issue = f"{CONF_HOUSEHOLD_LOAD}_forecast_failed"
         if (
             result.status in {"stale", "failed"}
             and isinstance(self.load_forecast_update_reason, str)
             and "recorder_unavailable" in self.load_forecast_update_reason
         ):
             issue = f"{CONF_HOUSEHOLD_LOAD}_recorder_unavailable"
-        return result.expected_kw, issue
+        elif (
+            result.status in {"stale", "failed"}
+            and isinstance(self.load_forecast_update_reason, str)
+            and "history_limit_exceeded" in self.load_forecast_update_reason
+        ):
+            issue = f"{CONF_HOUSEHOLD_LOAD}_history_limit_exceeded"
+        return result.expected_kw, source_issue or issue
 
     def _optional_series(
         self,

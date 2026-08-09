@@ -88,27 +88,84 @@ def build_load_forecast_model(
 ) -> dict[str, Any]:
     """Build a compact deterministic model from Recorder state changes."""
     now_utc = _as_utc(now)
-    zone = _timezone(timezone)
     start = now_utc - HISTORY_LOOKBACK
+    bucket_values, effective_start, ev_excluded, hvac_subtracted = clean_load_history_buckets(
+        load_states,
+        load_unit=load_unit,
+        ev_charging_states=ev_charging_states,
+        hvac_power_states=hvac_power_states,
+        hvac_power_unit=hvac_power_unit,
+        start=start,
+        end=now_utc,
+        timezone=timezone,
+    )
+    return build_load_forecast_model_from_buckets(
+        bucket_values,
+        now=now_utc,
+        timezone=timezone,
+        source_entity_id=source_entity_id,
+        history_start=effective_start or start,
+        ev_intervals_excluded=ev_excluded,
+        hvac_power_subtracted=hvac_subtracted,
+    )
+
+
+def clean_load_history_buckets(
+    load_states: list[Any],
+    *,
+    load_unit: str,
+    start: datetime,
+    end: datetime,
+    timezone: str,
+    ev_charging_states: list[Any] | None = None,
+    hvac_power_states: list[Any] | None = None,
+    hvac_power_unit: str = "",
+) -> tuple[list[tuple[datetime, float]], datetime | None, bool, bool]:
+    """Normalize and clean one bounded Recorder history chunk."""
+    start_utc = _as_utc(start)
+    end_utc = _as_utc(end)
     load_events = _power_events(load_states, load_unit)
     ev_events = _bool_events(ev_charging_states or [])
     hvac_events = _power_events(hvac_power_states or [], hvac_power_unit)
-    effective_start = max(start, load_events[0].at) if load_events else start
-    bucket_values = _time_weighted_buckets(
-        load_events,
-        ev_events,
-        hvac_events,
-        start=effective_start,
-        end=now_utc,
-        zone=zone,
+    if not load_events:
+        return [], None, bool(ev_events), bool(hvac_events)
+    effective_start = max(start_utc, load_events[0].at)
+    return (
+        _time_weighted_buckets(
+            load_events,
+            ev_events,
+            hvac_events,
+            start=effective_start,
+            end=end_utc,
+            zone=_timezone(timezone),
+        ),
+        effective_start,
+        bool(ev_events),
+        bool(hvac_events),
     )
+
+
+def build_load_forecast_model_from_buckets(
+    bucket_values: list[tuple[datetime, float]],
+    *,
+    now: datetime,
+    timezone: str,
+    source_entity_id: str,
+    history_start: datetime,
+    ev_intervals_excluded: bool = False,
+    hvac_power_subtracted: bool = False,
+) -> dict[str, Any]:
+    """Build a compact model from already-cleaned 15-minute history buckets."""
+    now_utc = _as_utc(now)
+    zone = _timezone(timezone)
+    effective_start = _as_utc(history_start)
     all_days, eligible_day_count = _historical_days(
         bucket_values,
         start=effective_start,
         end=now_utc,
         zone=zone,
     )
-    complete_days = [day for day in all_days if len(day.values) / BUCKETS_PER_DAY >= MIN_DAY_COVERAGE]
+    complete_days = [day for day in all_days if len(day.values) == BUCKETS_PER_DAY]
     history_coverage = (
         sum(len(day.values) for day in all_days) / (eligible_day_count * BUCKETS_PER_DAY)
         if eligible_day_count
@@ -152,8 +209,8 @@ def build_load_forecast_model(
         "history_coverage": round(history_coverage, 6),
         "uncertainty_buffer_kw": round(uncertainty_buffer, 6),
         "cleaning": {
-            "ev_intervals_excluded": bool(ev_events),
-            "hvac_power_subtracted": bool(hvac_events),
+            "ev_intervals_excluded": ev_intervals_excluded,
+            "hvac_power_subtracted": hvac_power_subtracted,
         },
         "validation": validation,
         "profiles": profiles,
@@ -192,11 +249,20 @@ def load_forecast_from_model(
     upper: list[float | None] = []
     for index in range(slot_count):
         target = now_utc + timedelta(minutes=index * interval_minutes)
-        local = target.astimezone(zone)
-        day_type = _day_type(local.date())
-        profile = profiles.get(day_type, {})
-        expected_value = _profile_value(profile.get("expected"), local)
-        upper_value = _profile_value(profile.get("upper"), local)
+        expected_value = _profile_interval_average(
+            profiles,
+            target,
+            interval_minutes=interval_minutes,
+            zone=zone,
+            profile_key="expected",
+        )
+        upper_value = _profile_interval_average(
+            profiles,
+            target,
+            interval_minutes=interval_minutes,
+            zone=zone,
+            profile_key="upper",
+        )
         if expected_value is None or upper_value is None:
             expected.append(None)
             upper.append(None)
@@ -298,7 +364,9 @@ def _power_events(states: list[Any], unit: str) -> list[_HistoryEvent]:
         if at is None:
             continue
         raw = getattr(state, "state", None)
-        value = None if str(raw).strip().lower() in _UNKNOWN_STATES else normalize_power_kw(raw, unit)
+        attributes = getattr(state, "attributes", {}) or {}
+        state_unit = str(attributes.get("unit_of_measurement") or attributes.get("unit") or unit)
+        value = None if str(raw).strip().lower() in _UNKNOWN_STATES else normalize_power_kw(raw, state_unit)
         events.append(_HistoryEvent(at, value))
     return _deduplicate_events(events)
 
@@ -393,7 +461,10 @@ def _historical_days(
             continue
         index = local.hour * 4 + local.minute // BUCKET_MINUTES
         accumulated.setdefault(local_date, {}).setdefault(index, []).append(value)
-    first_date = start.astimezone(zone).date() + timedelta(days=1)
+    local_start = start.astimezone(zone)
+    first_date = local_start.date()
+    if local_start.timetz().replace(tzinfo=None) != time.min:
+        first_date += timedelta(days=1)
     last_date = end.astimezone(zone).date() - timedelta(days=1)
     days: list[_HistoricalDay] = []
     eligible = 0
@@ -570,15 +641,23 @@ def _validated_model(
         return None
     complete_days = model.get("complete_days")
     history_coverage = model.get("history_coverage")
+    validation = model.get("validation")
     if status == "ready" and (
         model.get("quality_ready") is not True
         or model.get("quality_failures") not in ([], None)
         or not isinstance(complete_days, int)
-        or not isinstance(history_coverage, int | float)
+        or isinstance(complete_days, bool)
+        or not _valid_fraction(history_coverage)
+        or not isinstance(validation, dict)
+        or not _valid_validation_metrics(validation)
         or _quality_failures(
-            complete_days=complete_days if isinstance(complete_days, int) else 0,
-            history_coverage=float(history_coverage) if isinstance(history_coverage, int | float) else 0.0,
-            validation=model.get("validation") if isinstance(model.get("validation"), dict) else {},
+            complete_days=(
+                complete_days
+                if isinstance(complete_days, int) and not isinstance(complete_days, bool)
+                else 0
+            ),
+            history_coverage=float(history_coverage) if _valid_fraction(history_coverage) else 0.0,
+            validation=validation if isinstance(validation, dict) else {},
             profiles=model["profiles"],
         )
     ):
@@ -587,7 +666,32 @@ def _validated_model(
 
 
 def _valid_profile_number(value: Any) -> bool:
-    return value is None or isinstance(value, int | float) and isfinite(value) and value >= 0
+    return value is None or _valid_non_negative_number(value)
+
+
+def _valid_validation_metrics(validation: dict[str, Any]) -> bool:
+    """Return whether persisted ready-model validation evidence is complete."""
+    return (
+        isinstance(validation.get("origin_count"), int)
+        and not isinstance(validation.get("origin_count"), bool)
+        and validation["origin_count"] >= 0
+        and isinstance(validation.get("sample_count"), int)
+        and not isinstance(validation.get("sample_count"), bool)
+        and validation["sample_count"] >= 0
+        and all(
+            _valid_non_negative_number(validation.get(key))
+            for key in ("mae_kw", "rmse_kw", "persistence_mae_kw")
+        )
+        and _valid_fraction(validation.get("upper_coverage"))
+    )
+
+
+def _valid_non_negative_number(value: Any) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and isfinite(value) and value >= 0
+
+
+def _valid_fraction(value: Any) -> bool:
+    return _valid_non_negative_number(value) and float(value) <= 1.0
 
 
 def _recent_correction(
@@ -621,6 +725,28 @@ def _profile_value(values: Any, local: datetime) -> float | None:
     return float(lower_value) * (1 - fraction) + float(upper_value) * fraction
 
 
+def _profile_interval_average(
+    profiles: dict[str, Any],
+    start: datetime,
+    *,
+    interval_minutes: int,
+    zone: ZoneInfo,
+    profile_key: str,
+) -> float | None:
+    """Return the time-weighted profile average across one UTC planning slot."""
+    total = 0.0
+    for minute in range(interval_minutes):
+        midpoint = start + timedelta(minutes=minute, seconds=30)
+        local = midpoint.astimezone(zone)
+        values = profiles[_day_type(local.date())][profile_key]
+        index = local.hour * 4 + local.minute // BUCKET_MINUTES
+        value = _nearest_profile_value(values, index)
+        if value is None:
+            return None
+        total += value
+    return total / interval_minutes
+
+
 def _nearest_profile_value(values: list[Any], index: int) -> float | None:
     value = values[index]
     if isinstance(value, int | float) and isfinite(value):
@@ -649,11 +775,20 @@ def _model_details(model: dict[str, Any] | None, status: str, age_hours: float) 
     source = model if isinstance(model, dict) else {}
     return {
         "source": "built_in_recorder_history",
+        "source_entity_id": source.get("source_entity_id"),
         "status": status,
         "model_version": source.get("model_version"),
         "contract_version": source.get("contract_version"),
         "trained_at": source.get("trained_at"),
         "last_attempt_at": source.get("last_attempt_at"),
+        "last_attempt_source_entity_id": source.get("last_attempt_source_entity_id"),
+        "last_training_status": source.get("last_training_status"),
+        "last_training_quality_failures": list(source.get("last_training_quality_failures", []))[:8]
+        if isinstance(source.get("last_training_quality_failures", []), list)
+        else [],
+        "last_training_validation": dict(source.get("last_training_validation", {}))
+        if isinstance(source.get("last_training_validation"), dict)
+        else {},
         "unusable_since": source.get("unusable_since"),
         "model_age_hours": round(age_hours, 3),
         "history_started_on": source.get("history_started_on"),

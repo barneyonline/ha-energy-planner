@@ -178,6 +178,9 @@ class FakeCoordinator:
     async def async_config_entry_first_refresh(self) -> None:
         self.first_refresh_count += 1
 
+    async def async_reconcile_production_evidence_contract(self) -> bool:
+        return False
+
     def async_start_listeners(self) -> None:
         self.start_count += 1
         self.lifecycle_calls.append("start")

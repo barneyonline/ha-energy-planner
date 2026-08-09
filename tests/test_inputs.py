@@ -125,6 +125,7 @@ def _constant_load_model(
             "origin_count": 2,
             "sample_count": 192,
             "mae_kw": 0.0,
+            "rmse_kw": 0.0,
             "persistence_mae_kw": 0.0,
             "upper_coverage": 1.0,
         },
@@ -212,7 +213,8 @@ def test_builtin_load_controls_without_haeo_or_external_load_forecast(monkeypatc
     assert ready.haeo_status == HAEOStatus.READY
     assert ready.slots[0].baseline_load_forecast_kw == 1.5
     assert ready.slots[0].baseline_load_forecast_upper_kw == 1.5
-    assert degraded.input_health == InputHealth.DEGRADED
+    assert degraded.input_health == InputHealth.HEALTHY
+    assert "advisory_household_load_entity_forecast_degraded" in degraded.input_issues
     assert learning.input_health == InputHealth.UNSAFE
     assert stale.input_health == InputHealth.UNSAFE
 
@@ -232,6 +234,12 @@ def test_builtin_load_mapping_and_recorder_failures_are_explicit(monkeypatch: An
         {CONF_HOUSEHOLD_LOAD: "sensor.house"},
         options,
     )
+    retained_while_unavailable = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("unavailable")}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
     stale_model = _constant_load_model("sensor.house", 1.0, now - timedelta(hours=73))
     recorder_failed = _RawInputManager(
         FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
@@ -240,11 +248,40 @@ def test_builtin_load_mapping_and_recorder_failures_are_explicit(monkeypatch: An
         load_forecast_model=stale_model,
         load_forecast_update_reason="load_forecast_recorder_unavailable:RuntimeError",
     )
+    fresh_failed_model = _constant_load_model("sensor.house", 1.0, now, status="failed")
+    fresh_failed_model["unusable_since"] = (now - timedelta(hours=1)).isoformat()
+    prolonged_failed_model = {**fresh_failed_model, "unusable_since": (now - timedelta(hours=73)).isoformat()}
+    fresh_failed = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=fresh_failed_model,
+    )
+    prolonged_failed = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=prolonged_failed_model,
+    )
+    history_limited = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", {"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=fresh_failed_model,
+        load_forecast_update_reason="load_forecast_history_limit_exceeded:LoadForecastHistoryLimitError",
+    )
 
     assert missing._built_in_load_series(now, 1, 15)[1] == "household_load_entity_not_configured"
     assert unavailable._built_in_load_series(now, 1, 15)[1] == "household_load_entity_unavailable"
     assert invalid._built_in_load_series(now, 1, 15)[1] == "household_load_entity_non_numeric"
+    retained_values, retained_issue = retained_while_unavailable._built_in_load_series(now, 1, 15)
+    assert retained_values == [1.0] * 4
+    assert retained_issue == "household_load_entity_unavailable"
+    assert retained_while_unavailable.load_forecast_details["status"] == "ready"
     assert recorder_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_recorder_unavailable"
+    assert fresh_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_forecast_unusable"
+    assert prolonged_failed._built_in_load_series(now, 1, 15)[1] == "household_load_entity_forecast_failed"
+    assert history_limited._built_in_load_series(now, 1, 15)[1] == "household_load_entity_history_limit_exceeded"
     assert _leading_present_slots([1.0, None, 2.0]) == 1
 
     unclean_recent = _RawInputManager(
@@ -265,6 +302,23 @@ def test_builtin_load_mapping_and_recorder_failures_are_explicit(monkeypatch: An
     )
     unclean_recent._built_in_load_series(now, 1, 15)
     assert unclean_recent.load_forecast_details["recent_correction_factor"] == 1.0
+
+    normalized_hvac = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState("2", {"unit_of_measurement": "kW"}),
+                "sensor.hvac": FakeState("1500", {"unit_of_measurement": "W"}),
+            }
+        ),
+        {
+            CONF_HOUSEHOLD_LOAD: "sensor.house",
+            CONF_DAIKIN_POWER: "sensor.hvac",
+        },
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    normalized_hvac._built_in_load_series(now, 1, 15)
+    assert normalized_hvac.load_forecast_details["recent_correction_factor"] == 0.75
 
 
 def test_forecast_source_issue_time_parses_string_attribute() -> None:

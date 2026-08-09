@@ -223,7 +223,7 @@ Status as of 2026-08-09.
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, and Enphase holds.
 - Executable live-schema fixtures cover representative Amber price, external
-  PV, historical external-load parser compatibility, weather, timestamp-keyed nested HAEO, and list-based nested
+  PV, optional weather, timestamp-keyed nested HAEO, and list-based nested
   HAEO response payload shapes through `scripts/validate-live-schema-fixture.py`,
   so sanitized real Home Assistant exports can be validated outside pytest.
   `scripts/export-real-live-schema.sh` wraps the required real export set, and
@@ -233,20 +233,19 @@ Status as of 2026-08-09.
   optional pre-write parser validation gate. The validator also has a
   `ha-energy-planner-v1-real` profile that reports missing required real-export
   fixture names, mismatched fixture kind/value-kind metadata, and missing
-  exported source entity/service metadata before full live-schema completion is
-  claimed. The stricter `ha-energy-planner-haeo-value-v1-real` profile requires
+  exported source entity metadata before full live-schema completion is
+  claimed. The optional, stricter `ha-energy-planner-haeo-value-v1-real` profile requires
   the real HAEO response fixture to include parsed grid import/export and
   battery charge/discharge evidence before Enphase value-evidence validation is
   accepted.
 - Executable real-history fixtures cover Recorder-style MINI trip replay,
-  Daikin thermal-model replay, and rolling-origin PV/load forecast accuracy
+  Daikin thermal-model replay, and rolling-origin external-PV forecast accuracy
   through `scripts/validate-real-history-fixture.py`. Forecast evidence is
   matched by issue/valid time, reports MAE and RMSE for near/day/long lead-time
   buckets, and must outperform a no-lookahead persistence baseline.
   `scripts/export-real-history-fixtures.sh` wraps sanitized Home Assistant
   history export for the required `real_mini_trip_history`,
-  `real_daikin_thermal_history`, `real_pv_forecast_accuracy`, and
-  `real_load_forecast_accuracy` fixtures, and the
+  `real_daikin_thermal_history` and `real_pv_forecast_accuracy` fixtures, and the
   `ha-energy-planner-history-v1-real` profile verifies exported source entity
   metadata before real-history completion is claimed.
 - Forecast parsing retains uncovered horizon slots as missing values and never
@@ -264,9 +263,9 @@ Status as of 2026-08-09.
   values cannot satisfy forecast coverage. Household load uses the built-in
   Recorder model and never accepts a legacy forecast entity as measured input.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
-  enforces all real validation profiles in one command so full real-system
-  evidence cannot accidentally skip live-schema, HAEO value, or Recorder
-  history validation. Its `--validate-only` mode checks already exported
+  enforces the dependency-free core live-schema and Recorder-history profiles.
+  HAEO export and its value-evidence profile run only when an HAEO service is
+  explicitly supplied. Its `--validate-only` mode checks already exported
   `real_*.json` fixtures without calling Home Assistant again.
 - Docker Home Assistant validation is available through
   `scripts/docker-validate.sh`, `scripts/docker-ha-smoke.sh`, and
@@ -352,22 +351,31 @@ Status as of 2026-08-09.
   leakage-free holdout origins with at least 144 aligned samples, MAE no more
   than 10% worse than previous-day persistence, and at least 90% conservative
   coverage. Ready models are healthy through 24 hours, degraded through 72
-  hours, and stale afterward. Learning remains silent; missing mapping,
-  unavailable Recorder after a model becomes unsafe, failed quality gates, and
-  learning that remains unusable for 72 hours are actionable. Training occurs
-  at startup, after source changes, and no more than every six hours, with
-  failed-attempt backoff. Only aggregate profiles, validation metrics, source
+  hours, and stale afterward. Learning and initial quality-gate failures remain
+  silent; missing mapping, unavailable Recorder after a model becomes unsafe,
+  history exceeding the bounded query limit, and a model that remains unusable
+  for 72 hours are actionable. Training occurs at startup, after source changes,
+  and no more than every six hours, with failed-attempt backoff. Recorder reads
+  use adaptive UTC-aligned chunks with a per-entity state limit, beginning at
+  seven days and narrowing to one day when necessary, and compact each chunk
+  before continuing. Only aggregate profiles, validation metrics, source
   and contract identity, and timestamps are persisted.
 - Config-entry version 2 migrates only the legacy measured-load mapping to
   `household_load_entity`; a legacy forecast-only mapping is removed and active
   control remains fail-closed until a real measured sensor is selected. The
   production evidence fingerprint includes the measured mapping and built-in
   forecast contract version, but excludes routine model values and retraining
-  timestamps. Relevant evidence is exposed through the existing Current state,
-  Next actions, calendar, diagnostics, and support surfaces without adding an
-  entity. Tests cover normalization, cleaning, quality gates, correction,
-  resampling, DST, age/source/corruption recovery, migration, Recorder failure,
-  persistence, notifications, and operation without HAEO or HAFO.
+  timestamps. A mismatch restores safe state and explicitly disarms production
+  control before new dry-run review cycles. Relevant evidence is exposed through
+  the existing Current state, Next actions, calendar, diagnostics, and support
+  surfaces without adding an entity. Tests cover normalization, cleaning,
+  quality gates, correction,
+  true interval aggregation, DST, age/source/corruption recovery, migration,
+  Recorder failure and cardinality bounds, persistence, delayed notifications,
+  conservative grid-limit use with and without HAEO,
+  action-time evidence, and operation without HAEO or HAFO. The Docker smoke
+  entry intentionally leaves HAEO unconfigured and verifies deterministic
+  fallback planning with the built-in aggregate model.
 - Runtime calibration snapshots retain dense near-term targets plus bounded,
   stratified targets through the complete planning horizon. Enabled lead-time
   models expose p10/p90-style bounded factors; conservative flexibility and

@@ -35,13 +35,11 @@ REAL_HISTORY_PROFILE_REQUIREMENTS = {
     "real_mini_trip_history": {"kind": "ev_trip_history"},
     "real_daikin_thermal_history": {"kind": "thermal_history"},
     "real_pv_forecast_accuracy": {"kind": "forecast_accuracy"},
-    "real_load_forecast_accuracy": {"kind": "forecast_accuracy"},
 }
 REAL_HISTORY_PROFILE_ENTITY_KEYS = {
     "real_mini_trip_history": ("ev_connected", "ev_soc"),
     "real_daikin_thermal_history": ("indoor_temperature", "hvac_power"),
     "real_pv_forecast_accuracy": ("forecast", "actual"),
-    "real_load_forecast_accuracy": ("forecast", "actual"),
 }
 
 

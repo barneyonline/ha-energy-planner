@@ -2160,6 +2160,7 @@ def _actionable_input_issues(issues: list[str]) -> list[str]:
         "_unavailable",
         "_forecast_failed",
         "_forecast_stale",
+        "history_limit_exceeded",
         "unexpected_domain",
         "unknown_unit",
     )

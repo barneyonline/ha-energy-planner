@@ -14,9 +14,9 @@ from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import PlanAction
 from .sensor import (
+    _action_load_forecast_attrs,
     _action_sentence,
     _asset_name,
-    _built_in_load_forecast_attrs,
     _decision_data_quality_attrs,
     _plain_action,
 )
@@ -86,13 +86,16 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
     desired_state = details.get("desired_state")
     if desired_state:
         description_lines.append(f"Desired state: {_compact_mapping(desired_state)}")
-    load_forecast = _built_in_load_forecast_attrs(coordinator)
+    load_forecast = _action_load_forecast_attrs(coordinator, action.action_id)
     if load_forecast:
+        expected = load_forecast.get("expected_kw")
+        conservative = load_forecast.get("conservative_kw")
         description_lines.append(
             "Load forecast: "
             f"{load_forecast.get('status', 'unknown')}; "
-            f"expected {load_forecast.get('first_expected_kw', 'unknown')} kW; "
-            f"conservative {load_forecast.get('first_upper_kw', 'unknown')} kW."
+            f"expected {expected if expected is not None else 'unknown'} kW; "
+            f"conservative {conservative if conservative is not None else 'unknown'} kW "
+            f"at {load_forecast.get('valid_at', 'the action time')}."
         )
     return CalendarEvent(
         start=action.execute_not_before,

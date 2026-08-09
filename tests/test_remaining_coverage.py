@@ -937,6 +937,9 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
         async def async_config_entry_first_refresh(self) -> None:
             pass
 
+        async def async_reconcile_production_evidence_contract(self) -> bool:
+            return False
+
         def async_start_listeners(self) -> None:
             pass
 
