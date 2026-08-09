@@ -53,10 +53,7 @@ def test_v1_real_profile_reports_missing_fixture_names() -> None:
     assert missing == [
         "real_amber_export",
         "real_amber_import",
-        "real_baseline_load",
-        "real_haeo_response",
-        "real_pv_hafo",
-        "real_weather",
+        "real_pv_forecast",
     ]
 
 
@@ -76,24 +73,11 @@ def test_v1_real_profile_accepts_required_fixture_names() -> None:
             "source_entity_id": "sensor.amber_export",
         },
         {
-            "name": "real_pv_hafo",
+            "name": "real_pv_forecast",
             "kind": "forecast_state",
             "value_kind": "power",
             "source_entity_id": "sensor.pv_forecast",
         },
-        {
-            "name": "real_baseline_load",
-            "kind": "forecast_state",
-            "value_kind": "power",
-            "source_entity_id": "sensor.baseline_load",
-        },
-        {
-            "name": "real_weather",
-            "kind": "forecast_state",
-            "value_kind": "temperature",
-            "source_entity_id": "weather.home",
-        },
-        {"name": "real_haeo_response", "kind": "haeo_response", "source_service": "haeo.optimize"},
     ]
 
     assert validator._profile_missing_names("ha-energy-planner-v1-real", fixtures) == []
@@ -105,10 +89,7 @@ def test_v1_real_profile_reports_mismatched_fixture_metadata() -> None:
     fixtures = [
         {"name": "real_amber_import", "kind": "forecast_state", "value_kind": "power"},
         {"name": "real_amber_export", "kind": "forecast_state", "value_kind": "price"},
-        {"name": "real_pv_hafo", "kind": "forecast_state", "value_kind": "power"},
-        {"name": "real_baseline_load", "kind": "forecast_state", "value_kind": "power"},
-        {"name": "real_weather", "kind": "forecast_state", "value_kind": "temperature"},
-        {"name": "real_haeo_response", "kind": "forecast_state", "value_kind": "price"},
+        {"name": "real_pv_forecast", "kind": "forecast_state", "value_kind": "power"},
     ]
 
     errors = validator._profile_errors("ha-energy-planner-v1-real", fixtures)
@@ -118,11 +99,6 @@ def test_v1_real_profile_reports_mismatched_fixture_metadata() -> None:
             "name": "real_amber_import",
             "expected": {"kind": "forecast_state", "value_kind": "price"},
             "actual": {"kind": "forecast_state", "value_kind": "power"},
-        },
-        {
-            "name": "real_haeo_response",
-            "expected": {"kind": "haeo_response"},
-            "actual": {"kind": "forecast_state"},
         },
     ]
 
@@ -143,24 +119,11 @@ def test_v1_real_profile_reports_missing_export_source_metadata() -> None:
             "source_entity_id": "<redacted>",
         },
         {
-            "name": "real_pv_hafo",
+            "name": "real_pv_forecast",
             "kind": "forecast_state",
             "value_kind": "power",
             "source_entity_id": "sensor.pv",
         },
-        {
-            "name": "real_baseline_load",
-            "kind": "forecast_state",
-            "value_kind": "power",
-            "source_entity_id": "sensor.load",
-        },
-        {
-            "name": "real_weather",
-            "kind": "forecast_state",
-            "value_kind": "temperature",
-            "source_entity_id": "weather.home",
-        },
-        {"name": "real_haeo_response", "kind": "haeo_response"},
     ]
 
     errors = validator._profile_errors("ha-energy-planner-v1-real", fixtures)
@@ -168,7 +131,6 @@ def test_v1_real_profile_reports_missing_export_source_metadata() -> None:
     assert errors["missing_source_fields"] == [
         {"name": "real_amber_export", "missing_fields": ["source_entity_id"]},
         {"name": "real_amber_import", "missing_fields": ["source_entity_id"]},
-        {"name": "real_haeo_response", "missing_fields": ["source_service"]},
     ]
 
 

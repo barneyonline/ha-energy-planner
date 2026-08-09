@@ -20,7 +20,7 @@ AI_ACTION_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "amber_import_price_entity": ("Import price input", ("amber_import_price", "import_price")),
     "amber_export_price_entity": ("Export price input", ("amber_export_price", "export_price")),
     "pv_forecast_entity": ("PV forecast input", ("pv_forecast", "solar_forecast")),
-    "baseline_load_forecast_entity": ("Baseline load forecast input", ("baseline_load", "load_forecast")),
+    "household_load_entity": ("Household load input", ("household_load", "baseline_load", "load_forecast")),
     "weather_entity": ("Weather input", ("weather_", "outdoor_temperature")),
     "battery_soc_entity": ("Battery SOC input", ("battery_soc", "battery_floor")),
     "ev_soc_entity": ("EV SOC input", ("ev_soc",)),

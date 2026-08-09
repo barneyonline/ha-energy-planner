@@ -84,6 +84,60 @@ def test_ev_action_target_outside_bounds_is_rejected() -> None:
     assert "ev_target_soc_outside_bounds" in violations
 
 
+def test_grid_import_limit_uses_conservative_load_and_pv_bounds() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = _context(now)
+    context.slots[0].baseline_load_forecast_kw = 2.0
+    context.slots[0].baseline_load_forecast_upper_kw = 5.0
+    context.slots[0].pv_forecast_kw = 2.0
+    context.slots[0].pv_forecast_lower_kw = 1.0
+    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
+    options = {**DEFAULT_OPTIONS, "grid_import_limit_kw": 3.5}
+
+    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
+
+    assert "grid_import_limit_exceeded" in violations
+
+
+def test_haeo_grid_evidence_does_not_bypass_conservative_bounds() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = _context(now)
+    slot = context.slots[0]
+    slot.baseline_load_forecast_kw = 2.0
+    slot.baseline_load_forecast_upper_kw = 5.0
+    slot.pv_forecast_kw = 2.0
+    slot.pv_forecast_lower_kw = 1.0
+    slot.haeo_grid_import_forecast_kw = 0.5
+    slot.haeo_grid_export_forecast_kw = 0.0
+    slot.haeo_grid_includes_flexible_loads = True
+    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
+    options = {**DEFAULT_OPTIONS, "grid_import_limit_kw": 3.5}
+
+    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
+
+    assert "grid_import_limit_exceeded" in violations
+
+
+def test_haeo_simultaneous_flows_preserve_gross_grid_limits() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = _context(now)
+    slot = context.slots[0]
+    slot.haeo_grid_import_forecast_kw = 4.0
+    slot.haeo_grid_export_forecast_kw = 3.0
+    slot.haeo_grid_includes_flexible_loads = True
+    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
+    options = {
+        **DEFAULT_OPTIONS,
+        "grid_import_limit_kw": 3.5,
+        "grid_export_limit_kw": 2.5,
+    }
+
+    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
+
+    assert "grid_import_limit_exceeded" in violations
+    assert "grid_export_limit_exceeded" in violations
+
+
 def test_ev_action_rejected_when_vehicle_disconnected() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})

@@ -17,10 +17,16 @@ from custom_components.ha_energy_planner import (
     _freeze_config_value,
     _non_negative_finite_float,
     _rehydrate_ev_grid_reservation,
+    async_migrate_entry,
     async_setup_entry,
     async_unload_entry,
 )
-from custom_components.ha_energy_planner.const import EV_RESERVATION_EXTERNAL_BASELINE
+from custom_components.ha_energy_planner.const import (
+    CONF_BASELINE_LOAD_FORECAST,
+    CONF_BASELINE_LOAD_OBSERVED,
+    CONF_HOUSEHOLD_LOAD,
+    EV_RESERVATION_EXTERNAL_BASELINE,
+)
 from custom_components.ha_energy_planner.models import OutcomeResult
 
 
@@ -87,6 +93,7 @@ class FakeEntry:
     data: dict[str, Any] = field(default_factory=dict)
     options: dict[str, Any] = field(default_factory=lambda: {"planner_enabled": False})
     runtime_data: Any = None
+    version: int = 1
     unload_callbacks: list[Any] = field(default_factory=list)
     subentries: dict[str, Any] = field(
         default_factory=lambda: {
@@ -107,6 +114,32 @@ class FakeEntry:
 
     def add_update_listener(self, listener: Any) -> Any:
         return listener
+
+
+def test_config_entry_migration_uses_only_measured_legacy_load() -> None:
+    manager = FakeConfigEntries()
+    hass = FakeHass(manager)
+    measured = FakeEntry(
+        data={
+            CONF_BASELINE_LOAD_FORECAST: "sensor.predicted_load",
+            CONF_BASELINE_LOAD_OBSERVED: "sensor.whole_home_power",
+        }
+    )
+    forecast_only = FakeEntry(data={CONF_BASELINE_LOAD_FORECAST: "sensor.predicted_load"})
+
+    assert asyncio.run(async_migrate_entry(hass, measured)) is True
+    assert measured.data == {CONF_HOUSEHOLD_LOAD: "sensor.whole_home_power"}
+    assert manager.updated_entries[-1][1]["version"] == 2
+    assert asyncio.run(async_migrate_entry(hass, forecast_only)) is True
+    assert forecast_only.data == {}
+
+
+def test_config_entry_migration_rejects_unknown_future_version() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(version=3, data={CONF_BASELINE_LOAD_OBSERVED: "sensor.load"})
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
+    assert manager.updated_entries == []
 
 
 class FakeStore:
@@ -144,6 +177,9 @@ class FakeCoordinator:
 
     async def async_config_entry_first_refresh(self) -> None:
         self.first_refresh_count += 1
+
+    async def async_reconcile_production_evidence_contract(self) -> bool:
+        return False
 
     def async_start_listeners(self) -> None:
         self.start_count += 1

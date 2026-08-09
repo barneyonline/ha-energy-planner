@@ -89,6 +89,7 @@ from .const import (
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HAEO_OPTIMIZE_SERVICE,
+    CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
@@ -209,12 +210,11 @@ ENERGY_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_PV_FORECAST_SECONDARY): _entity_selector(
             entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)
         ),
-        vol.Required(CONF_BASELINE_LOAD_FORECAST): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Required(CONF_HOUSEHOLD_LOAD): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_CARBON_INTENSITY_FORECAST): _entity_selector(
             entity_filter=_sensor_filter(_CARBON_INTENSITY_SENSOR_UNITS)
         ),
         vol.Optional(CONF_PV_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
-        vol.Optional(CONF_BASELINE_LOAD_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Required(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
     }
 )
@@ -609,7 +609,7 @@ def _option_selector(field: str) -> Any:
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(
         self,
@@ -749,7 +749,11 @@ class OptionsFlow(config_entries.OptionsFlow):
 
     def _async_save_entry_data(self, data: dict[str, Any]) -> None:
         """Persist central input settings with the completed options form."""
-        self._data = dict(data)
+        self._data = {
+            key: value
+            for key, value in data.items()
+            if key not in {CONF_BASELINE_LOAD_FORECAST, CONF_BASELINE_LOAD_OBSERVED}
+        }
         hass = getattr(self, "hass", None)
         config_entries_manager = getattr(hass, "config_entries", None)
         async_update_entry = getattr(config_entries_manager, "async_update_entry", None)
@@ -818,10 +822,7 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
 def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[str, str]:
     """Validate configured entities without calling device services."""
     errors: dict[str, str] = {}
-    for observed_key, forecast_key in (
-        (CONF_PV_OBSERVED, CONF_PV_FORECAST),
-        (CONF_BASELINE_LOAD_OBSERVED, CONF_BASELINE_LOAD_FORECAST),
-    ):
+    for observed_key, forecast_key in ((CONF_PV_OBSERVED, CONF_PV_FORECAST),):
         if user_input.get(observed_key) and user_input.get(observed_key) == user_input.get(forecast_key):
             errors[observed_key] = "observation_must_differ_from_forecast"
     if user_input.get(CONF_PV_FORECAST_SECONDARY) and user_input.get(CONF_PV_FORECAST_SECONDARY) == user_input.get(
@@ -949,10 +950,9 @@ _ENTITY_DOMAIN_RULES = {
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},
     CONF_PV_FORECAST_SECONDARY: {"sensor"},
-    CONF_BASELINE_LOAD_FORECAST: {"sensor"},
+    CONF_HOUSEHOLD_LOAD: {"sensor"},
     CONF_CARBON_INTENSITY_FORECAST: {"sensor"},
     CONF_PV_OBSERVED: {"sensor"},
-    CONF_BASELINE_LOAD_OBSERVED: {"sensor"},
     CONF_BATTERY_SOC: {"sensor"},
     CONF_ENPHASE_PROFILE: {"select", "input_select"},
     CONF_DAIKIN_CLIMATE: {"climate"},
@@ -1106,10 +1106,9 @@ _ENTITY_UNIT_RULES = {
     CONF_AMBER_EXPORT_PRICE: _PRICE_UNITS,
     CONF_PV_FORECAST: _POWER_UNITS | _ENERGY_UNITS,
     CONF_PV_FORECAST_SECONDARY: _POWER_UNITS | _ENERGY_UNITS,
-    CONF_BASELINE_LOAD_FORECAST: _POWER_UNITS,
+    CONF_HOUSEHOLD_LOAD: _POWER_UNITS,
     CONF_CARBON_INTENSITY_FORECAST: _CARBON_INTENSITY_UNITS,
     CONF_PV_OBSERVED: _POWER_UNITS,
-    CONF_BASELINE_LOAD_OBSERVED: _POWER_UNITS,
     CONF_BATTERY_SOC: _PERCENT_UNITS,
     CONF_DAIKIN_POWER: _POWER_UNITS,
     CONF_EV_SOC: _PERCENT_UNITS,

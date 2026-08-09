@@ -14,10 +14,13 @@ CONF_AMBER_IMPORT_PRICE = "amber_import_price_entity"
 CONF_AMBER_EXPORT_PRICE = "amber_export_price_entity"
 CONF_PV_FORECAST = "pv_forecast_entity"
 CONF_PV_FORECAST_SECONDARY = "pv_forecast_secondary_entity"
+# Legacy load keys are read only by entry migration. Runtime planning uses the
+# measured whole-home sensor and the built-in Recorder-backed model.
 CONF_BASELINE_LOAD_FORECAST = "baseline_load_forecast_entity"
 CONF_CARBON_INTENSITY_FORECAST = "carbon_intensity_forecast_entity"
 CONF_PV_OBSERVED = "pv_observed_entity"
 CONF_BASELINE_LOAD_OBSERVED = "baseline_load_observed_entity"
+CONF_HOUSEHOLD_LOAD = "household_load_entity"
 CONF_BATTERY_SOC = "battery_soc_entity"
 CONF_ENPHASE_PROFILE = "enphase_profile_entity"
 CONF_ENPHASE_PROFILE_CONTROL_SERVICE = "enphase_profile_control_service"

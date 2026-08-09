@@ -28,6 +28,7 @@ _DICT_FIELDS = {
     "discovery",
     "ev_grid_reservation",
     "forecast_calibration",
+    "built_in_load_forecast",
     "ownership",
     "control_pause",
     "production",
@@ -129,6 +130,10 @@ class PlannerStore:
     async def async_save_forecast_calibration(self, model: dict[str, Any]) -> None:
         """Persist compact forecast calibration statistics."""
         await self._async_set_if_changed("forecast_calibration", model)
+
+    async def async_save_builtin_load_forecast(self, model: dict[str, Any]) -> None:
+        """Persist the aggregate Recorder-trained load model."""
+        await self._async_set_if_changed("built_in_load_forecast", model)
 
     async def async_add_haeo_run(self, run: dict[str, Any]) -> None:
         """Persist compact HAEO run metadata."""
@@ -255,6 +260,7 @@ def _default_data() -> dict[str, Any]:
         "dry_run_comparisons": [],
         "ev_grid_reservation": {},
         "forecast_calibration": {},
+        "built_in_load_forecast": {},
         "haeo_runs": [],
         "discovery": {},
         "command_rate_limits": {},

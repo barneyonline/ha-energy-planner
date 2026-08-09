@@ -47,8 +47,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
-    CONF_BASELINE_LOAD_FORECAST,
-    CONF_BASELINE_LOAD_OBSERVED,
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
@@ -86,6 +84,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HAEO_OPTIMIZE_SERVICE,
+    CONF_HOUSEHOLD_LOAD,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
@@ -104,6 +103,8 @@ from custom_components.ha_energy_planner.subentry_migration import (
     async_migrate_subentries_to_entry_data,
     grouped_subentry_data,
 )
+
+CONF_BASELINE_LOAD_FORECAST = CONF_HOUSEHOLD_LOAD
 
 
 @dataclass(slots=True)
@@ -494,7 +495,6 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     baseline_filter = schema_fields[CONF_BASELINE_LOAD_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     carbon_filter = schema_fields[CONF_CARBON_INTENSITY_FORECAST].serialize()["selector"]["entity"]["filter"][0]
     pv_observed_filter = schema_fields[CONF_PV_OBSERVED].serialize()["selector"]["entity"]["filter"][0]
-    load_observed_filter = schema_fields[CONF_BASELINE_LOAD_OBSERVED].serialize()["selector"]["entity"]["filter"][0]
     battery_filter = schema_fields[CONF_BATTERY_SOC].serialize()["selector"]["entity"]["filter"][0]
 
     assert import_filter["domain"] == ["sensor"]
@@ -506,7 +506,6 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
     assert "kWh" not in baseline_filter["unit_of_measurement"]
     assert {"gCO2/kWh", "kgCO₂/kWh"} <= set(carbon_filter["unit_of_measurement"])
     assert pv_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
-    assert load_observed_filter["unit_of_measurement"] == ["W", "kW", "MW"]
     assert battery_filter["unit_of_measurement"] == ["%", "percent", "percentage"]
 
 
@@ -1415,6 +1414,31 @@ def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
         "ai_advisor_service": "ai_task.generate_data",
         CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
     }
+
+
+def test_legacy_load_subentry_maps_only_measured_sensor() -> None:
+    measured = SimpleNamespace(
+        subentries={
+            "forecasts": SimpleNamespace(
+                subentry_type="forecasts",
+                data={
+                    "baseline_load_forecast_entity": "sensor.prediction",
+                    "baseline_load_observed_entity": "sensor.whole_home_power",
+                },
+            )
+        }
+    )
+    forecast_only = SimpleNamespace(
+        subentries={
+            "forecasts": SimpleNamespace(
+                subentry_type="forecasts",
+                data={"baseline_load_forecast_entity": "sensor.prediction"},
+            )
+        }
+    )
+
+    assert grouped_subentry_data(measured)["energy"][CONF_HOUSEHOLD_LOAD] == "sensor.whole_home_power"
+    assert "household_load_entity" not in grouped_subentry_data(forecast_only).get("energy", {})
 
 
 def test_migration_moves_all_subentry_settings_into_main_entry() -> None:

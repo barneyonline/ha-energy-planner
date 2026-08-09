@@ -9,7 +9,7 @@ from math import isfinite
 from statistics import median
 from typing import Any
 
-FORECAST_CALIBRATION_FIELDS = ("pv_forecast_kw", "baseline_load_forecast_kw")
+FORECAST_CALIBRATION_FIELDS = ("pv_forecast_kw",)
 MIN_CALIBRATION_SAMPLES = 48
 MIN_HOLDOUT_SAMPLES = 12
 MIN_SAMPLE_SPAN = timedelta(hours=6)
@@ -96,8 +96,6 @@ def update_forecast_calibration(
 
     for field in FORECAST_CALIBRATION_FIELDS:
         field_observations = observations[field]
-        if not field_observations:
-            continue
         calibration = dict(updated.get(field, {})) if isinstance(updated.get(field), Mapping) else {}
         processed_sample_ids = _processed_sample_ids(calibration.get("processed_sample_ids"))
         samples = _stored_samples(calibration.get("samples", []), field)
@@ -155,7 +153,8 @@ def _migrate_calibration_model(
         key: dict(value) if isinstance(value, Mapping) else value
         for key, value in dict(model or {}).items()
     }
-    changed = False
+    changed = any(key not in FORECAST_CALIBRATION_FIELDS for key in updated)
+    updated = {key: value for key, value in updated.items() if key in FORECAST_CALIBRATION_FIELDS}
     for field in FORECAST_CALIBRATION_FIELDS:
         value = updated.get(field)
         if value is None:

@@ -84,8 +84,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                             "valid_at": valid_at.isoformat(),
                             "pv_forecast_kw_issued_at": issued_at.isoformat(),
                             "pv_forecast_kw": 1.0,
-                            "baseline_load_forecast_kw_issued_at": issued_at.isoformat(),
-                            "baseline_load_forecast_kw": 1.0,
                         }
                     ],
                 }
@@ -118,6 +116,23 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             if store is None:
                 continue
             await store.async_save_command_rate_limits({"enphase:set_profile": attempted_at.isoformat()})
+
+    async def seed_production_evidence(call: ServiceCall) -> None:
+        """Bind smoke review evidence to the integration's current production contract."""
+        from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+        for entry in hass.config_entries.async_entries("ha_energy_planner"):
+            coordinator = getattr(entry, "runtime_data", None)
+            store = getattr(coordinator, "store", None)
+            if store is None:
+                continue
+            production = dict(store.data.get("production", {}))
+            production["dry_run_ready_cycles"] = 3
+            production["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+                coordinator.entry_data,
+                coordinator.options,
+            )
+            await store.async_save_production(production)
 
     async def capture_persistent_notification(call: ServiceCall) -> None:
         """Capture persistent notification calls for smoke validation."""
@@ -220,6 +235,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "seed_due_forecast_snapshot", seed_due_forecast_snapshot)
     hass.services.async_register(DOMAIN, "seed_thermal_model_sample", seed_thermal_model_sample)
     hass.services.async_register(DOMAIN, "seed_enphase_command_rate_limit", seed_enphase_command_rate_limit)
+    hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -250,6 +266,7 @@ input_number:
     initial: 2.5
   baseline_load:
     name: Baseline load
+    unit_of_measurement: kW
     min: 0
     max: 20
     step: 0.1
@@ -419,12 +436,6 @@ template:
           unitOfMeasurement: "W"
           confidence: "{{ 0.92 }}"
           detailedForecast: "{{ ([{'prediction': {'watts': 2500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 5000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 2500}}, {'prediction': {'watts': 2000}}] * 24) }}"
-      - name: Smoke baseline load forecast series
-        state: "{{ states('input_number.baseline_load') }}"
-        attributes:
-          unitOfMeasurement: "W"
-          confidence: "{{ 0.91 }}"
-          detailedForecast: "{{ ([{'watts': 1200}, {'watts': 1400}, {'watts': 1600}, {'watts': 1800}, {'watts': 2000}, {'watts': 2200}, {'watts': 2000}, {'watts': 1800}, {'watts': 1600}, {'watts': 1400}, {'watts': 1200}, {'watts': 1000}] * 24) }}"
       - name: Smoke weather forecast
         state: "sunny"
         attributes:
@@ -476,6 +487,10 @@ automation:
         event: start
     actions:
       - delay: "00:00:08"
+      - action: fake_haeo.seed_production_evidence
+      - action: ha_energy_planner.arm_production_control
+        data:
+          reason: docker_smoke_reviewed_contract
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -767,6 +782,7 @@ automation:
         data:
           reason: docker_smoke_automatic_control
       - delay: "00:00:01"
+      - action: fake_haeo.seed_production_evidence
       - action: switch.turn_on
         data:
           entity_id: switch.energy_planner_automatic_control
@@ -889,13 +905,11 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           },
           {
             "data": {
-              "haeo_optimize_service": "fake_haeo.optimize",
               "amber_import_price_entity": "sensor.smoke_import_price_forecast",
               "amber_export_price_entity": "sensor.smoke_export_price_forecast",
               "pv_forecast_entity": "sensor.smoke_pv_forecast_series",
-              "baseline_load_forecast_entity": "sensor.smoke_baseline_load_forecast_series",
+              "household_load_entity": "input_number.baseline_load",
               "pv_observed_entity": "input_number.pv_forecast",
-              "baseline_load_observed_entity": "input_number.baseline_load",
               "battery_soc_entity": "input_number.battery_soc"
             },
             "subentry_id": "haep_energy",
@@ -967,7 +981,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
         ],
         "title": "HA Energy Planner",
         "unique_id": "ha_energy_planner",
-        "version": 1
+        "version": 2
       }
     ]
   }
@@ -991,11 +1005,55 @@ cat > "$TMP_DIR/.storage/ha_energy_planner_state" <<'JSON'
       "armed_reason": "docker_smoke",
       "acknowledged_at": "2026-06-27T00:00:00+00:00",
       "dry_run_ready_cycles": 3,
-      "dry_run_evidence_fingerprint": "c74a578a975db5ffc6fbedc262b7df605c30c83df8e1d651a8ae0ae66d9c77d2"
+      "dry_run_evidence_fingerprint": "257f55a1b55f9b2be3ac33fd1e53358ff7db4de695473c461751973bf6928181"
     }
   }
 }
 JSON
+
+python3 - "$TMP_DIR" <<'PY'
+from datetime import UTC, datetime
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]) / ".storage" / "ha_energy_planner_state"
+payload = json.loads(path.read_text())
+trained_at = datetime.now(UTC).isoformat()
+expected = [1.2] * 96
+upper = [1.5] * 96
+payload["data"]["built_in_load_forecast"] = {
+    "model_version": 1,
+    "contract_version": 1,
+    "status": "ready",
+    "quality_ready": True,
+    "quality_failures": [],
+    "source_entity_id": "input_number.baseline_load",
+    "trained_at": trained_at,
+    "last_attempt_at": trained_at,
+    "last_attempt_source_entity_id": "input_number.baseline_load",
+    "timezone": "UTC",
+    "history_started_on": "2026-06-01",
+    "history_ended_on": "2026-06-27",
+    "history_days": 26,
+    "complete_days": 26,
+    "history_coverage": 1.0,
+    "validation": {
+        "origin_count": 2,
+        "sample_count": 192,
+        "mae_kw": 0.1,
+        "rmse_kw": 0.12,
+        "persistence_mae_kw": 0.1,
+        "upper_coverage": 0.95,
+    },
+    "cleaning": {"ev_intervals_excluded": True, "hvac_power_subtracted": True},
+    "profiles": {
+        "weekday": {"expected": expected, "upper": upper},
+        "weekend": {"expected": expected, "upper": upper},
+    },
+}
+path.write_text(json.dumps(payload, indent=2) + "\n")
+PY
 
 set +e
 docker run --rm \
@@ -1106,41 +1164,13 @@ if active_plan.get("mode") not in {"DISABLED", "DRY_RUN", "ACTIVE_HEALTHY", "ACT
 if active_plan.get("mode") not in {"ACTIVE_HEALTHY", "ACTIVE_DEGRADED"}:
     raise SystemExit(f"Automatic control did not produce an active plan: {active_plan.get('mode')}")
 if not store_data.get("haeo_runs"):
-    raise SystemExit("Planner Store did not persist HAEO run metadata")
-haeo_evidence_counts = [
-    run.get("baseline", {}).get("evidence_counts", {})
+    raise SystemExit("Planner Store did not persist optional-HAEO fallback metadata")
+if not any(
+    run.get("baseline", {}).get("status") != "ready"
+    and not run.get("baseline", {}).get("evidence_counts")
     for run in store_data.get("haeo_runs", [])
-    if isinstance(run.get("baseline", {}).get("evidence_counts", {}), dict)
-]
-haeo_second_pass_evidence_counts = [
-    (run.get("second_pass") or {}).get("evidence_counts", {})
-    for run in store_data.get("haeo_runs", [])
-    if isinstance((run.get("second_pass") or {}).get("evidence_counts", {}), dict)
-]
-if not any(
-    counts.get("haeo_grid_import_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_charge_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_soc_forecast_percent", 0) >= 4
-    for counts in haeo_evidence_counts
 ):
-    raise SystemExit(f"Planner Store did not persist parsed HAEO grid-charge evidence counts: {haeo_evidence_counts}")
-if not any(
-    counts.get("haeo_grid_export_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_discharge_forecast_kw", 0) >= 4
-    for counts in haeo_evidence_counts
-):
-    raise SystemExit(f"Planner Store did not persist parsed HAEO export/discharge evidence counts: {haeo_evidence_counts}")
-if not any(
-    counts.get("haeo_grid_import_forecast_kw", 0) >= 4
-    and counts.get("haeo_grid_export_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_charge_forecast_kw", 0) >= 4
-    and counts.get("haeo_battery_discharge_forecast_kw", 0) >= 4
-    for counts in haeo_second_pass_evidence_counts
-):
-    raise SystemExit(
-        "Planner Store did not persist parsed second-pass HAEO evidence counts: "
-        f"{haeo_second_pass_evidence_counts}"
-    )
+    raise SystemExit("Smoke run did not exercise deterministic planning without HAEO evidence")
 if "discovery" not in store_data:
     raise SystemExit("Planner Store did not persist discovery data")
 ai_discovery = store_data.get("discovery", {}).get("ai", {})
@@ -1197,27 +1227,20 @@ if not any(
     for action in snapshot_actions
 ):
     raise SystemExit("Forecast snapshots did not persist an active EV schedule allocated to a negative import-price slot")
-if not any(
-    str(action.get("action_id", "")).endswith("-enphase-arbitrage-profile")
-    and action.get("kind") == "set_profile"
-    and action.get("desired_state", {}).get("profile") == "Full Backup"
-    and action.get("desired_state", {}).get("arbitrage_source") in {
-        "haeo_battery_arbitrage_value",
-        "haeo_export_value",
-    }
-    and float(action.get("expected_cost_delta") or 0) >= 0.25
-    for action in snapshot_actions
-):
-    raise SystemExit("Forecast snapshots did not persist an Enphase arbitrage action backed by HAEO value evidence")
+if any(action.get("requires_haeo_plan_id") for action in snapshot_actions):
+    raise SystemExit("Deterministic smoke actions unexpectedly retained an HAEO dependency")
 if not latest_snapshot.get("forecast_training_slots"):
     raise SystemExit("Forecast snapshot did not include compact forecast training slots")
 forecast_training_slots = latest_snapshot.get("forecast_training_slots", [])
 pv_training = [slot.get("pv_forecast_kw") for slot in forecast_training_slots[:4]]
 if pv_training != [2.5, 3.0, 3.5, 4.0]:
     raise SystemExit(f"Forecast snapshot did not use HA template PV forecast attributes: {pv_training}")
-baseline_training = [slot.get("baseline_load_forecast_kw") for slot in forecast_training_slots[:4]]
-if baseline_training != [1.2, 1.4, 1.6, 1.8]:
-    raise SystemExit(f"Forecast snapshot did not use HA template load forecast attributes: {baseline_training}")
+if not any(
+    [slot.get("baseline_load_forecast_kw") for slot in snapshot.get("forecast_training_slots", [])[:4]]
+    == [1.2, 1.2, 1.2, 1.2]
+    for snapshot in snapshots
+):
+    raise SystemExit("Forecast snapshots did not use the built-in Recorder load model")
 if not any(
     len(snapshot.get("preview", [])) >= 4
     and [slot.get("import_price") for slot in snapshot["preview"][:4]][1:] == [0.11, 0.12, 0.13]
@@ -1230,6 +1253,9 @@ if weather_preview != [19.0, 20.0, 21.0, 22.0]:
     raise SystemExit(f"Forecast preview did not use HA template weather forecast attributes: {weather_preview}")
 if "forecast_calibration" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include calibration metadata")
+load_forecast = latest_snapshot.get("built_in_load_forecast", {})
+if load_forecast.get("status") not in {"ready", "degraded"} or load_forecast.get("source") != "built_in_recorder_history":
+    raise SystemExit(f"Forecast snapshot did not include healthy built-in load evidence: {load_forecast}")
 if "thermal_model" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include thermal model metadata")
 if latest_snapshot.get("trip_history", {}).get("recorder_import_reason") not in {
@@ -1257,12 +1283,24 @@ if not any(
 if "forecast_calibration" not in store_data:
     raise SystemExit("Planner Store did not initialize forecast calibration state")
 forecast_calibration = store_data.get("forecast_calibration", {})
-for field in ("pv_forecast_kw", "baseline_load_forecast_kw"):
-    calibration = forecast_calibration.get(field, {})
-    if calibration.get("model_version") != 3 or calibration.get("sample_count", 0) < 1:
-        raise SystemExit(f"Forecast calibration did not store samples for {field}: {forecast_calibration}")
-    if not any(sample.get("forecast") == 1.0 and sample.get("actual") == 2.0 for sample in calibration.get("samples", [])):
-        raise SystemExit(f"Forecast calibration did not consume the aligned smoke sample for {field}: {calibration}")
+calibration = forecast_calibration.get("pv_forecast_kw", {})
+if calibration.get("model_version") != 3 or calibration.get("sample_count", 0) < 1:
+    raise SystemExit(f"Forecast calibration did not store PV samples: {forecast_calibration}")
+if not any(sample.get("forecast") == 1.0 and sample.get("actual") == 2.0 for sample in calibration.get("samples", [])):
+    raise SystemExit(f"Forecast calibration did not consume the aligned PV smoke sample: {calibration}")
+if "baseline_load_forecast_kw" in forecast_calibration:
+    raise SystemExit(f"Obsolete external load calibration was retained: {forecast_calibration}")
+stored_load_forecast = store_data.get("built_in_load_forecast", {})
+if stored_load_forecast.get("source_entity_id") != "input_number.baseline_load":
+    raise SystemExit(f"Planner Store did not retain the built-in load model: {stored_load_forecast}")
+if stored_load_forecast.get("last_training_status") != "learning":
+    raise SystemExit(
+        "Real Recorder load training did not complete through the expected learning state: "
+        f"{stored_load_forecast}"
+    )
+training_failures = stored_load_forecast.get("last_training_quality_failures", [])
+if any(failure in training_failures for failure in {"recorder_unavailable", "training_error"}):
+    raise SystemExit(f"Real Recorder load training failed unexpectedly: {stored_load_forecast}")
 if "thermal_model" not in store_data:
     raise SystemExit("Planner Store did not initialize thermal model state")
 thermal_model = store_data.get("thermal_model", {})
@@ -1399,7 +1437,7 @@ enphase_arbitrage_outcomes = [
     for item in outcomes
     if str(item.get("action_id", "")).endswith("-enphase-arbitrage-profile")
 ]
-if not any(
+if enphase_arbitrage_outcomes and not any(
     item.get("result") == "applied"
     and item.get("reason") == "enphase_profile_applied"
     and item.get("post_state", {}).get("enphase_profile_entity") == "Full Backup"
@@ -1412,14 +1450,6 @@ if not any(
     raise SystemExit(
         "Active-mode Enphase arbitrage was neither applied nor safely blocked by conflict/cooldown"
     )
-if not any(
-    item.get("result") == "applied"
-    and str(item.get("action_id", "")).endswith("-enphase-restore-ai")
-    and item.get("reason") == "enphase_profile_applied"
-    and item.get("post_state", {}).get("enphase_profile_entity") == "AI Optimisation"
-    for item in outcomes
-):
-    raise SystemExit("Active-mode Enphase restore-AI action was not applied in the smoke run")
 final_restore_outcomes = [
     item
     for item in outcomes
