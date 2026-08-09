@@ -82,6 +82,11 @@ Negative and unavailable readings are treated as missing, not clamped to zero. A
 
 Energy Planner trains from up to 28 days of Recorder history. It removes known EV-charging intervals, subtracts measured HVAC power when available, and builds expected and conservative load profiles.
 
+If the mapped load entity has not yet appeared during Home Assistant startup,
+Energy Planner remains fail-closed and retries when the source becomes
+available; the transient absence does not consume the six-hour training retry
+interval.
+
 The model requires:
 
 - Three complete local-time days

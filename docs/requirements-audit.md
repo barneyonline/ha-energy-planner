@@ -365,6 +365,10 @@ Status as of 2026-08-09.
   seven days and narrowing to one day when necessary, and compact each chunk
   before continuing. Only aggregate profiles, validation metrics, source
   and contract identity, and timestamps are persisted.
+- A mapped load entity that has not yet been restored during Home Assistant
+  startup leaves the persisted model and training cadence unchanged. The next
+  coordinator refresh after the source appears can therefore train immediately
+  while planning remains fail-closed during the transient absence.
 - EV trip-history targeting uses an explicit three-observed-day minimum. Before
   that threshold, planning uses the configured fallback Target SOC and remains
   otherwise operational.

@@ -14,6 +14,7 @@ from .const import (
     CONF_EV_CONNECTED,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    STATE_UNKNOWN_VALUES,
 )
 from .ev import import_trip_history_from_state_sequences
 from .load_forecast import (
@@ -39,6 +40,12 @@ class LoadForecastRecorderError(RuntimeError):
     """Raised when Recorder cannot serve a bounded history query."""
 
 
+def load_forecast_source_available(state: Any) -> bool:
+    """Return whether the mapped household-load source has a usable state."""
+    value = getattr(state, "state", None) if state is not None else None
+    return value is not None and str(value).strip().lower() not in STATE_UNKNOWN_VALUES
+
+
 async def async_update_builtin_load_forecast(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
@@ -52,6 +59,13 @@ async def async_update_builtin_load_forecast(
     load_entity = str(entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
     if not load_entity:
         return model, False, "load_forecast_household_load_not_configured"
+    load_state = hass.states.get(load_entity)
+    if not load_forecast_source_available(load_state):
+        # Home Assistant may set up this config entry before the mapped source
+        # integration has restored its entities. This is not a training
+        # attempt: preserve the stored model and let the source state-change
+        # refresh retry immediately instead of starting the six-hour backoff.
+        return model, False, "load_forecast_household_load_unavailable"
     if not force and not training_due(model, now=now, source_entity_id=load_entity, timezone=timezone):
         return model, False, "load_forecast_training_recent"
     model_contract_current = (
@@ -77,9 +91,6 @@ async def async_update_builtin_load_forecast(
                 "profiles": {},
             }
         )
-    load_state = hass.states.get(load_entity)
-    if load_state is None:
-        return attempted, attempted != model, "load_forecast_household_load_unavailable"
     load_unit = _state_unit(load_state)
     ev_entity = str(entry_data.get(CONF_EV_CHARGING, "") or "").strip() or None
     hvac_entity = str(entry_data.get(CONF_DAIKIN_POWER, "") or "").strip() or None

@@ -7,6 +7,8 @@ import types
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 import custom_components.ha_energy_planner.recorder_import as recorder_import
 from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_POWER,
@@ -100,10 +102,85 @@ def test_builtin_load_forecast_requires_mapping_and_current_state() -> None:
     assert missing == {"existing": True}
     assert changed is False
     assert reason == "load_forecast_household_load_not_configured"
-    assert unavailable["existing"] is True
-    assert unavailable_changed is True
-    assert unavailable["last_attempt_at"] == now.isoformat()
+    assert unavailable == {"existing": True}
+    assert unavailable_changed is False
     assert unavailable_reason == "load_forecast_household_load_unavailable"
+
+
+@pytest.mark.parametrize("state_value", ["unknown", "unavailable"])
+def test_builtin_load_forecast_defers_unknown_startup_states(state_value: str) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {"existing": True}
+
+    result = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState(state_value)}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+            force=True,
+        )
+    )
+
+    assert result == (existing, False, "load_forecast_household_load_unavailable")
+
+
+def test_startup_source_appearance_retries_training_without_backoff(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {
+        "model_version": MODEL_VERSION,
+        "contract_version": FORECAST_CONTRACT_VERSION,
+        "status": "ready",
+        "quality_ready": True,
+        "source_entity_id": "sensor.house_load",
+        "timezone": "UTC",
+        "trained_at": (now - timedelta(hours=1)).isoformat(),
+        "last_attempt_at": (now - timedelta(hours=1)).isoformat(),
+        "last_attempt_source_entity_id": "sensor.house_load",
+        "last_attempt_timezone": "UTC",
+    }
+    calls = 0
+
+    def fake_train(*args: Any) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        return {
+            "model_version": MODEL_VERSION,
+            "contract_version": FORECAST_CONTRACT_VERSION,
+            "status": "ready",
+            "quality_ready": True,
+            "quality_failures": [],
+            "source_entity_id": "sensor.house_load",
+            "trained_at": (now + timedelta(seconds=1)).isoformat(),
+        }
+
+    monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fake_train)
+    unavailable = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            existing,
+            now=now,
+            timezone="UTC",
+            force=True,
+        )
+    )
+    retrained = asyncio.run(
+        recorder_import.async_update_builtin_load_forecast(
+            ForecastHass({"sensor.house_load": CurrentState("1")}),
+            {CONF_HOUSEHOLD_LOAD: "sensor.house_load"},
+            unavailable[0],
+            now=now + timedelta(seconds=1),
+            timezone="UTC",
+            force=True,
+        )
+    )
+
+    assert unavailable == (existing, False, "load_forecast_household_load_unavailable")
+    assert calls == 1
+    assert retrained[1:] == (True, "load_forecast_ready")
+    assert retrained[0]["contract_version"] == FORECAST_CONTRACT_VERSION
 
 
 def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_only_model(
