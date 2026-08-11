@@ -50,8 +50,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_BATTERY_SOC,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_CLIMATE_ZONES,
@@ -207,6 +209,8 @@ def _valid_hass() -> FakeHass:
             "switch.living_zone",
             "input_boolean.study_zone",
             "input_boolean.hvac_override",
+            "input_boolean.scheduler_change",
+            "timer.scheduler_guard",
             "select.enphase_profile",
             "switch.shared_charger",
             "ai_task.extended_openai_ai_task",
@@ -261,6 +265,38 @@ def _settings_submission(
 
 def test_validate_config_accepts_available_entities_and_services() -> None:
     assert _validate_config(_valid_hass(), _valid_input()) == {}
+
+
+def test_validate_config_requires_complete_scheduler_guard_pair() -> None:
+    missing_timer = _validate_config(
+        _valid_hass(),
+        _valid_input(
+            {CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change"}
+        ),
+    )
+    missing_boolean = _validate_config(
+        _valid_hass(),
+        _valid_input(
+            {CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard"}
+        ),
+    )
+    complete = _validate_config(
+        _valid_hass(),
+        _valid_input(
+            {
+                CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+                CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+            }
+        ),
+    )
+
+    assert missing_timer[CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == (
+        "climate_scheduler_guard_pair_required"
+    )
+    assert missing_boolean[CONF_CLIMATE_CHANGE_FROM_SCHEDULER] == (
+        "climate_scheduler_guard_pair_required"
+    )
+    assert complete == {}
 
 
 def test_validate_config_accepts_multi_entity_selector_lists() -> None:
@@ -1057,6 +1093,29 @@ def test_options_flow_section_validation_returns_form_errors() -> None:
 
     assert result["type"] == "form"
     assert result["errors"]["base"] == "ev_min_above_max"
+
+
+def test_options_flow_rejects_incomplete_climate_scheduler_guard() -> None:
+    entry = SimpleNamespace(entry_id="entry-current", data={}, options={}, subentries={})
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+    submission = _settings_submission(
+        flow,
+        input_sections={
+            INPUT_STEP_CLIMATE: {
+                CONF_DAIKIN_CLIMATE: "climate.daikin",
+                CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+                CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+                CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+            }
+        },
+    )
+
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "climate_scheduler_guard_pair_required"}
 
 
 def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> None:
