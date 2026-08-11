@@ -27,6 +27,7 @@ from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BATTERY_SOC,
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -577,6 +578,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 now=dt_util.utcnow(),
                 timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
                 force=not getattr(self, "_load_forecast_training_attempted", False),
+                bypass_conservative_bound_gate=strict_bool(
+                    options.get(CONF_BYPASS_SAFETY_GATES),
+                    default=False,
+                ),
             )
         )
         self._load_forecast_training_attempted = _updated_load_forecast_training_attempted(

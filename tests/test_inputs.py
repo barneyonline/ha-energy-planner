@@ -115,6 +115,7 @@ def _constant_load_model(
         "status": status,
         "quality_ready": status == "ready",
         "quality_failures": [] if status == "ready" else ["insufficient_training_days"],
+        "safety_gates_bypassed": False,
         "source_entity_id": entity_id,
         "timezone": timezone,
         "trained_at": trained_at.isoformat(),
@@ -131,6 +132,8 @@ def _constant_load_model(
             "rmse_kw": 0.0,
             "persistence_mae_kw": 0.0,
             "upper_coverage": 1.0,
+            "positive_residual_p90_kw": 0.0,
+            "calibration_buffer_kw": 0.0,
         },
         "cleaning": {},
         "profiles": {

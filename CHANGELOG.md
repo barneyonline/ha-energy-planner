@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.4 - 2026-08-11
+
+### Changed
+
+- Consolidated the settings form from thirteen menus into six task-oriented
+  sections. EV charging now contains its entity mappings, Ready by,
+  Opportunistic charging, opportunistic price threshold, Keep charger on, and
+  charging policy in one place; Climate, Enphase, Energy, Planning, and
+  Safety/troubleshooting settings are similarly grouped.
+- Added a default-off **Bypass safety gates** option. When explicitly enabled,
+  it waives the household-load 90% coverage gate, production preflight checks,
+  and dry-run evidence checks so Automatic control can arm. Device selection,
+  command execution, service errors, and feedback confirmation remain visible
+  and enforced.
+
+### Fixed
+
+- Household-load conservative bounds now calibrate correlated 15-minute
+  residuals as day-level blocks using finite-sample upper quantiles. This keeps
+  the existing 90% safety gate while preventing a small number of historical
+  days from producing an under-sized uncertainty buffer. The model and forecast
+  contracts are version 3 and 4 respectively, so existing models retrain and
+  production review evidence is intentionally renewed after upgrade.
+- Added a diagnostic Load forecast coverage score sensor with the current
+  percentage, required threshold, model status, and combined bypass state.
+
 ## 0.9.3 - 2026-08-11
 
 ### Changed

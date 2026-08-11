@@ -19,6 +19,7 @@ from custom_components.ha_energy_planner.const import (
     ATTR_READY_BY,
     ATTR_REASON,
     ATTR_TARGET_SOC,
+    CONF_BYPASS_SAFETY_GATES,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HOUSEHOLD_LOAD,
@@ -576,6 +577,26 @@ def test_run_preflight_separates_historical_evidence_from_current_safety() -> No
     assert response["safe_to_activate_now"] is False
     assert response["active_control_ready"] is False
     assert response["current_plan"]["healthy"] is False
+
+
+def test_run_preflight_combined_safety_bypass_waives_all_prechecks() -> None:
+    coordinator = _coordinator()
+    coordinator.entry.options[CONF_BYPASS_SAFETY_GATES] = True
+    coordinator.data.health = InputHealth.UNSAFE
+    coordinator.data.status = "unsafe"
+    coordinator.store.data["control_pause"] = {
+        "active": True,
+        "until": datetime.now(UTC) + timedelta(minutes=10),
+        "assets": ["all"],
+    }
+
+    response = _run_preflight(coordinator)
+
+    assert response["safety_gates_bypassed"] is True
+    assert response["safe_to_activate_now"] is True
+    assert response["active_control_ready"] is True
+    assert all(check["blocking"] is False for check in response["checks"])
+    assert any(check["bypassed"] is True for check in response["checks"])
 
 
 def test_run_preflight_requires_eight_usable_priced_hours() -> None:

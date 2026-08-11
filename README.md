@@ -38,7 +38,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.3.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.4.
 
 ## Installation
 
@@ -80,7 +80,7 @@ Choose a sensor that reports gross household demand. Do not use:
 
 Negative and unavailable readings are treated as missing, not clamped to zero. A grouped sensor can be used, but it represents only its included circuits and may underestimate unmonitored load.
 
-Energy Planner trains from up to 28 days of Recorder history. It removes known EV-charging intervals, subtracts measured HVAC power when available, and builds expected and conservative load profiles.
+Energy Planner trains from up to 28 days of Recorder history. It removes known EV-charging intervals, subtracts measured HVAC power when available, and builds expected and conservative load profiles. Conservative-bound calibration scores each day as one block so correlated 15-minute readings do not overstate the amount of independent safety evidence.
 
 If the mapped load entity has not yet appeared during Home Assistant startup,
 Energy Planner remains fail-closed and retries when the source becomes
@@ -97,6 +97,8 @@ The model requires:
 
 **History days** means Recorder data exists for those dates. **Training days** may contain bounded gaps: EV charging, historical negative readings, unavailable states, or missing HVAC alignment can remove up to 20% of a day's buckets without discarding the entire day. The model still requires rolling holdout validation and three observations for every production-profile clock bucket.
 
+The diagnostic **Load forecast coverage score** sensor shows the current holdout coverage percentage and required 90% threshold. The default-off **Bypass safety gates** setting waives this threshold, production preflight, and dry-run evidence requirements when an operator explicitly accepts reduced protection. It does not hide service failures or device feedback results.
+
 Training runs at startup, after a source change, and at most every six hours. Replanning cannot create missing history. While the status is `learning`, plans remain visible but forecast-dependent active commands are blocked. Models are `ready` through 24 hours old, `degraded` from 24 to 72 hours, and `stale` after 72 hours.
 
 Changing the load mapping disarms production control and requires fresh review cycles. Routine retraining does not.
@@ -108,10 +110,13 @@ Changing the load mapping disarms production control and requires fresh review c
 | **Armed** | Whether Energy Planner may currently issue commands and why |
 | **Current state** | Live state of every configured controlled area |
 | **Next actions** | Next state for every area, planned actions, and decision evidence |
+| **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
 | **Plan** | Calendar view of upcoming controlled actions |
 | **Automatic control** | Runs preflight and enables or disables all planner-owned commands |
 | Device control switches | Select whether Climate, EV, or Enphase may participate |
 | **Explain or troubleshoot** | Requests one evidence-based AI recommendation on demand |
+
+Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy.
 
 Mapped EV start and stop controls are planner actuators. Energy Planner does not expose separate manual Start charging or Stop charging buttons. Target SOC is configured centrally or read from an optional external target sensor; it is not exposed as an Energy Planner number entity.
 
