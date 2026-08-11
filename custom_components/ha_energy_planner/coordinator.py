@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from math import ceil, isfinite
 from time import monotonic, perf_counter
-from typing import Any
+from typing import Any, Never
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -20,7 +20,7 @@ from homeassistant.helpers.event import async_call_later, async_track_state_chan
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .ai_advisor import AIAdviceResult, LocalAIAdvisor
+from .ai_advisor import AI_ACTION_TARGETS, AIAdviceResult, LocalAIAdvisor
 from .const import (
     AI_ADVICE_MIN_INTERVAL_SECONDS,
     CONF_AI_TASK_ENTITY,
@@ -96,6 +96,8 @@ from .type_defs import EnergyPlannerConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
+_AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
+
 _LOAD_FORECAST_TRAINING_DEFERRED_REASONS = frozenset(
     {
         "load_forecast_household_load_not_configured",
@@ -158,6 +160,7 @@ def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
         if check.get("blocking") and not check.get("ok"):
             return str(check.get("message") or "a safety check failed")
     return str(report.get("current_plan", {}).get("message") or "a safety check failed")
+
 
 _HVAC_CONTROL_ATTRIBUTE_KEYS = frozenset(
     {
@@ -570,19 +573,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if trip_import_changed:
             await self.store.async_save_trip_history(trip_history)
         load_forecast_model = dict(self.store.data.get("built_in_load_forecast", {}))
-        load_forecast_model, load_forecast_changed, load_forecast_reason = (
-            await async_update_builtin_load_forecast(
-                self.hass,
-                entry_data,
-                load_forecast_model,
-                now=dt_util.utcnow(),
-                timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
-                force=not getattr(self, "_load_forecast_training_attempted", False),
-                bypass_conservative_bound_gate=strict_bool(
-                    options.get(CONF_BYPASS_SAFETY_GATES),
-                    default=False,
-                ),
-            )
+        load_forecast_model, load_forecast_changed, load_forecast_reason = await async_update_builtin_load_forecast(
+            self.hass,
+            entry_data,
+            load_forecast_model,
+            now=dt_util.utcnow(),
+            timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
+            force=not getattr(self, "_load_forecast_training_attempted", False),
+            bypass_conservative_bound_gate=strict_bool(
+                options.get(CONF_BYPASS_SAFETY_GATES),
+                default=False,
+            ),
         )
         self._load_forecast_training_attempted = _updated_load_forecast_training_attempted(
             getattr(self, "_load_forecast_training_attempted", False),
@@ -1386,27 +1387,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_request_ai_advice(self) -> None:
         """Schedule a fresh bounded explanation for the current safe plan."""
         if not str(self.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip():
-            raise HomeAssistantError(
+            await self._async_reject_ai_advice_request(
                 "AI troubleshooting is not ready: no AI Task entity is configured.",
-                translation_domain=DOMAIN,
-                translation_key="ai_advice_not_ready",
-                translation_placeholders={"reason": "No AI Task entity is configured."},
+                "No AI Task entity is configured.",
             )
         plan = self.data
         context = getattr(self, "_last_decision_context", None)
         if plan is None or context is None:
-            raise HomeAssistantError(
+            await self._async_reject_ai_advice_request(
                 "AI troubleshooting is not ready: no current plan is available.",
-                translation_domain=DOMAIN,
-                translation_key="ai_advice_not_ready",
-                translation_placeholders={"reason": "No current plan is available."},
+                "No current plan is available.",
             )
         if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
-            raise HomeAssistantError(
+            await self._async_reject_ai_advice_request(
                 "AI troubleshooting is not ready: the current plan is unsafe.",
-                translation_domain=DOMAIN,
-                translation_key="ai_advice_not_ready",
-                translation_placeholders={"reason": "The current plan is unsafe or has zero confidence."},
+                "The current plan is unsafe or has zero confidence.",
             )
         now = dt_util.utcnow()
         last_called_at = _latest_ai_service_call_at(self.store.data.get("ai_recommendations"))
@@ -1414,22 +1409,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             remaining = AI_ADVICE_MIN_INTERVAL_SECONDS - (now - last_called_at).total_seconds()
             if remaining > 0:
                 seconds = max(ceil(remaining), 1)
-                raise HomeAssistantError(
+                await self._async_reject_ai_advice_request(
                     f"AI troubleshooting is rate limited for another {seconds} seconds.",
-                    translation_domain=DOMAIN,
-                    translation_key="ai_advice_not_ready",
-                    translation_placeholders={"reason": f"Try again in {seconds} seconds."},
+                    f"Try again in {seconds} seconds.",
                 )
         fingerprint = _material_plan_fingerprint(plan)
         current = getattr(self, "_ai_advice_task", None)
-        if current is not None and not current.done():
+        if getattr(self, "_ai_advice_pending_fingerprint", None) == fingerprint or (
+            current is not None and not current.done()
+        ):
             self._set_ai_advice_pending(fingerprint, "request_in_flight")
+            await self._async_notify_ai_advice("An explanation is already being prepared.")
             return
         self._ai_current_plan_safe = True
         self._ai_current_plan_fingerprint = fingerprint
         self._ai_advice_fingerprint = fingerprint
         self._set_ai_advice_pending(fingerprint, "request_in_flight")
         request_context = replace(context, created_at=now)
+        self.async_update_listeners()
+        await self._async_notify_ai_advice("Preparing an explanation for the current plan…")
         self._ai_advice_task = self.hass.async_create_task(
             self._async_run_ai_advice(
                 request_context,
@@ -1440,7 +1438,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 force_current_plan=True,
             )
         )
-        self.async_update_listeners()
 
     @callback
     def _sync_ai_request_to_plan(self, plan: EnergyPlan) -> None:
@@ -1479,12 +1476,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     force_current_plan=True,
                 )
             else:
-                ai_result, should_store = await self._async_get_throttled_ai_advice(
-                    context, plan, entry_data, options
-                )
+                ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
             if not should_store:
                 self._clear_ai_advice_pending(fingerprint)
                 self.async_update_listeners()
+                if force_current_plan:
+                    await self._async_notify_ai_advice(_ai_advice_notification_message(ai_result))
                 return
             if (
                 self._ai_advice_fingerprint != fingerprint
@@ -1492,46 +1489,68 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 or self._ai_current_plan_fingerprint != fingerprint
             ):
                 self._clear_ai_advice_pending(fingerprint)
+                if force_current_plan:
+                    await self._async_notify_ai_advice(
+                        "The plan changed before the explanation completed. Press Explain to try again."
+                    )
                 return
+            plan_changed_while_waiting = False
             async with self._planner_lock:
                 if not self._ai_current_plan_safe or self._ai_current_plan_fingerprint != fingerprint:
                     self._clear_ai_advice_pending(fingerprint)
-                    return
-                await self.store.async_add_ai_recommendation(
-                    {
-                        "created_at": context.created_at,
-                        "plan_id": plan.plan_id,
-                        "plan_fingerprint": fingerprint,
-                        "plan_health": str(plan.health),
-                        "status": ai_result.status,
-                        "accepted": ai_result.accepted,
-                        "rejected_reason": ai_result.rejected_reason,
-                        "rejected_detail": ai_result.rejected_detail,
-                        "service_called": ai_result.service_called,
-                        CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                    }
-                )
-                await self.store.async_attach_ai_to_forecast_snapshot(
-                    plan.plan_id,
-                    {
-                        "status": ai_result.status,
-                        "accepted_fields": sorted(ai_result.accepted),
-                        "rejected_reason": ai_result.rejected_reason,
-                        "rejected_detail": ai_result.rejected_detail,
-                        "service_called": ai_result.service_called,
-                        CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                    },
-                )
+                    plan_changed_while_waiting = True
+                else:
+                    await self.store.async_add_ai_recommendation(
+                        {
+                            "created_at": context.created_at,
+                            "plan_id": plan.plan_id,
+                            "plan_fingerprint": fingerprint,
+                            "plan_health": str(plan.health),
+                            "status": ai_result.status,
+                            "accepted": ai_result.accepted,
+                            "rejected_reason": ai_result.rejected_reason,
+                            "rejected_detail": ai_result.rejected_detail,
+                            "service_called": ai_result.service_called,
+                            CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
+                        }
+                    )
+                    await self.store.async_attach_ai_to_forecast_snapshot(
+                        plan.plan_id,
+                        {
+                            "status": ai_result.status,
+                            "accepted_fields": sorted(ai_result.accepted),
+                            "rejected_reason": ai_result.rejected_reason,
+                            "rejected_detail": ai_result.rejected_detail,
+                            "service_called": ai_result.service_called,
+                            CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
+                        },
+                    )
+            if plan_changed_while_waiting:
+                if force_current_plan:
+                    await self._async_notify_ai_advice(
+                        "The plan changed before the explanation completed. Press Explain to try again."
+                    )
+                return
             self._clear_ai_advice_pending(fingerprint)
             self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
             self.async_update_listeners()
+            if force_current_plan:
+                await self._async_notify_ai_advice(_ai_advice_notification_message(ai_result))
         except asyncio.CancelledError:
             self._clear_ai_advice_pending(fingerprint)
+            if force_current_plan and not getattr(self, "_tearing_down", False):
+                await self._async_notify_ai_advice(
+                    "The plan changed before the explanation completed. Press Explain to try again."
+                )
             raise
         except Exception:  # noqa: BLE001 - advice must never fail the planner task.
             self._clear_ai_advice_pending(fingerprint)
             self.async_update_listeners()
             _LOGGER.exception("AI troubleshooting failed")
+            if force_current_plan:
+                await self._async_notify_ai_advice(
+                    "The explanation could not be completed. Check the Energy Planner logs and try again."
+                )
         finally:
             if getattr(self, "_ai_advice_task", None) is asyncio.current_task():
                 self._ai_advice_task = None
@@ -1550,6 +1569,44 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return
         self._ai_advice_pending_fingerprint = None
         self._ai_advice_pending_reason = None
+
+    async def _async_notify_ai_advice(self, message: str) -> None:
+        """Publish bounded button feedback without affecting planner operation."""
+        services = getattr(getattr(self, "hass", None), "services", None)
+        async_call = getattr(services, "async_call", None)
+        if not callable(async_call):
+            return
+        entry = getattr(self, "entry", None)
+        entry_id = getattr(entry, "entry_id", None)
+        notification_id = f"{_AI_ADVICE_NOTIFICATION_ID}_{entry_id}" if entry_id else _AI_ADVICE_NOTIFICATION_ID
+        title = getattr(entry, "title", None) or "Energy Planner"
+        try:
+            await async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": f"{title}: explanation",
+                    "message": message[:2000],
+                    "notification_id": notification_id,
+                },
+                blocking=False,
+            )
+        except Exception:  # noqa: BLE001 - notification failure must not discard advice.
+            _LOGGER.warning("Could not publish the Energy Planner explanation notification")
+
+    async def _async_reject_ai_advice_request(
+        self,
+        error_message: str,
+        reason: str,
+    ) -> Never:
+        """Notify the operator and reject an explanation that cannot start."""
+        await self._async_notify_ai_advice(f"**Explanation unavailable.**\n\n{reason}")
+        raise HomeAssistantError(
+            error_message,
+            translation_domain=DOMAIN,
+            translation_key="ai_advice_not_ready",
+            translation_placeholders={"reason": reason},
+        )
 
     def _non_manual_refresh_delay(self) -> float:
         """Return delay needed to enforce the safe non-manual refresh cadence."""
@@ -1727,11 +1784,7 @@ def _snapshot_action_load_forecasts(
     rows: list[dict[str, Any]] = []
     for action in plan.actions[:20]:
         slot = next(
-            (
-                candidate
-                for candidate in reversed(slots)
-                if candidate.valid_at <= action.execute_not_before
-            ),
+            (candidate for candidate in reversed(slots) if candidate.valid_at <= action.execute_not_before),
             slots[0],
         )
         rows.append(
@@ -2000,6 +2053,8 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
+
+
 def _is_ev_history_state_change(entry_data: dict[str, Any], event: Any) -> bool:
     entity_id = event.data.get("entity_id")
     return entity_id in {
@@ -2053,6 +2108,29 @@ def _float_state_value(hass: HomeAssistant, entity_id: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if isfinite(value) else None
+
+
+def _ai_advice_notification_message(result: AIAdviceResult) -> str:
+    """Render a bounded, user-visible explanation result."""
+    accepted = result.accepted if isinstance(result.accepted, dict) else {}
+    outcome = accepted.get("outcome")
+    summary = str(accepted.get("summary", "") or "").strip()
+    if outcome == "no_action_needed" and summary:
+        return f"**No action needed.**\n\n{summary}"
+    if outcome == "action_required" and summary:
+        target = str(accepted.get("affected_item", "") or "")
+        target_name = AI_ACTION_TARGETS.get(target, (target.replace("_", " ").title(), ()))[0]
+        return (
+            f"{summary}\n\n"
+            f"- **Affected item:** {target_name}\n"
+            f"- **Problem:** {accepted.get('problem', 'Not provided')}\n"
+            f"- **Next step:** {accepted.get('next_step', 'Not provided')}\n"
+            f"- **Expected benefit:** {accepted.get('expected_benefit', 'Not provided')}\n"
+            f"- **Verify:** {accepted.get('verification', 'Not provided')}"
+        )
+    detail = result.rejected_detail if isinstance(result.rejected_detail, dict) else {}
+    message = str(detail.get("message", "") or "").strip()
+    return f"**No explanation available.**\n\n{message or 'The AI response was not usable. Try again.'}"
 
 
 def _parse_datetime_or_none(value: Any) -> Any | None:

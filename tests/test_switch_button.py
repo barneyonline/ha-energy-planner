@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.const import EntityCategory
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import button as button_module
@@ -19,7 +20,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
-    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_PLANNER_ENABLED,
 )
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -162,9 +162,15 @@ def test_automatic_control_switch_uses_combined_coordinator_path() -> None:
 
 
 def test_switches_expose_one_master_and_three_device_controls() -> None:
-    keys = {description.key for description in SWITCHES}
+    descriptions = {description.key: description for description in SWITCHES}
+    keys = set(descriptions)
 
     assert {"active_control", "climate_control", "ev_control", "enphase_control"} <= keys
+    assert all(
+        descriptions[key].entity_category is None
+        for key in ("active_control", "climate_control", "ev_control", "enphase_control")
+    )
+    assert descriptions["ev_keep_charger_on"].entity_category == EntityCategory.CONFIG
     assert keys.isdisjoint(
         {
             "enabled",
@@ -195,31 +201,13 @@ def test_device_control_switches_use_guarded_coordinator_path(switch_key: str, o
     switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
     switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
 
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.device_control_calls == [(option_key, True)]
-    assert coordinator.entry.options[option_key] is True
-    assert switch.write_count == 1
-
-
-def test_non_activation_switches_still_use_their_own_options() -> None:
-    coordinator = FakeCoordinator({CONF_EV_LOW_PRICE_CHARGING_ENABLED: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description for description in SWITCHES if description.key == "ev_opportunistic_charging"
-        ),
-        write_count=0,
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
-
     assert PlannerSwitch.is_on.fget(switch) is False
     asyncio.run(PlannerSwitch.async_turn_on(switch))
+    assert PlannerSwitch.is_on.fget(switch) is True
     asyncio.run(PlannerSwitch.async_turn_off(switch))
 
-    assert coordinator.entry.options[CONF_EV_LOW_PRICE_CHARGING_ENABLED] is False
-    assert coordinator.replan_count == 2
+    assert coordinator.device_control_calls == [(option_key, True), (option_key, False)]
+    assert coordinator.entry.options[option_key] is False
     assert switch.write_count == 2
 
 
@@ -258,28 +246,8 @@ def test_switch_setup_and_constructor(monkeypatch: object) -> None:
         "switch.entry-1_climate_control_enabled",
         "switch.entry-1_enphase_control_enabled",
         "switch.entry-1_ev_connected_helper",
+        "switch.entry-1_ev_opportunistic_charging",
     ]
-
-
-def test_opportunistic_charging_switch_persists_and_replans() -> None:
-    coordinator = FakeCoordinator({CONF_EV_LOW_PRICE_CHARGING_ENABLED: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description
-            for description in SWITCHES
-            if description.option_key == CONF_EV_LOW_PRICE_CHARGING_ENABLED
-        ),
-        write_count=0,
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: setattr(switch, "write_count", switch.write_count + 1)
-
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.entry.options[CONF_EV_LOW_PRICE_CHARGING_ENABLED] is True
-    assert coordinator.replan_count == 1
-    assert switch.write_count == 1
 
 
 def test_keep_on_switch_uses_coordinator_validation_path() -> None:
@@ -287,9 +255,7 @@ def test_keep_on_switch_uses_coordinator_validation_path() -> None:
     switch = SimpleNamespace(
         coordinator=coordinator,
         entity_description=next(
-            description
-            for description in SWITCHES
-            if description.option_key == CONF_EV_KEEP_CHARGER_ON
+            description for description in SWITCHES if description.option_key == CONF_EV_KEEP_CHARGER_ON
         ),
         write_count=0,
     )
@@ -452,7 +418,7 @@ def test_preflight_notification_message_reports_success() -> None:
     )
 
 
-def test_successful_preflight_dismisses_old_alert_without_notifying(monkeypatch: object) -> None:
+def test_successful_preflight_returns_passed_notification(monkeypatch: object) -> None:
     coordinator = FakeCoordinator()
     button = SimpleNamespace(
         coordinator=coordinator,
@@ -469,8 +435,12 @@ def test_successful_preflight_dismisses_old_alert_without_notifying(monkeypatch:
     assert coordinator.hass.services.calls == [
         (
             "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_preflight_entry-1"},
+            "create",
+            {
+                "title": "Garage EV: preflight passed",
+                "message": "Active control is ready.\n\nAll preflight checks passed.",
+                "notification_id": "ha_energy_planner_preflight_entry-1",
+            },
             False,
         )
     ]

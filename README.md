@@ -38,7 +38,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.4.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.5.
 
 ## Installation
 
@@ -111,12 +111,14 @@ Changing the load mapping disarms production control and requires fresh review c
 | **Current state** | Live state of every configured controlled area |
 | **Next actions** | Next state for every area, planned actions, and decision evidence |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
-| **Plan** | Calendar view of upcoming controlled actions |
+| **Plan** | Calendar view of upcoming controlled actions, with complete EV charging start/stop windows |
 | **Automatic control** | Runs preflight and enables or disables all planner-owned commands |
-| Device control switches | Select whether Climate, EV, or Enphase may participate |
-| **Explain or troubleshoot** | Requests one evidence-based AI recommendation on demand |
+| Device control switches | Select whether Climate, EV, or Enphase may participate; grouped under Controls |
+| **Explain** | Requests one evidence-based AI explanation and returns it as a Home Assistant notification |
 
-Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy.
+The advanced **Run safety check** button always returns a Home Assistant notification, including when every check passes.
+
+Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy. Ready by and both opportunistic-charging values are settings-only; obsolete native entities for those values are removed on upgrade.
 
 Mapped EV start and stop controls are planner actuators. Energy Planner does not expose separate manual Start charging or Stop charging buttons. Target SOC is configured centrally or read from an optional external target sensor; it is not exposed as an Energy Planner number entity.
 

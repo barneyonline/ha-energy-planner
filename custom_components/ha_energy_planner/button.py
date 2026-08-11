@@ -60,14 +60,6 @@ async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
     title = getattr(entry, "title", None) or "Energy Planner"
     entry_id = getattr(entry, "entry_id", None)
     notification_id = f"{_PREFLIGHT_NOTIFICATION_ID}_{entry_id}" if entry_id else _PREFLIGHT_NOTIFICATION_ID
-    if report.get("active_control_ready"):
-        await coordinator.hass.services.async_call(
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": notification_id},
-            blocking=False,
-        )
-        return
     await coordinator.hass.services.async_call(
         "persistent_notification",
         "create",
