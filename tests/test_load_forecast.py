@@ -17,7 +17,9 @@ from custom_components.ha_energy_planner.load_forecast import (
     MODEL_VERSION,
     _bool_events,
     _distance_to_profile_value,
+    _finite_sample_upper_quantile,
     _HistoricalDay,
+    _leave_one_out_buffer,
     _parse_datetime,
     _percentile,
     _power_events,
@@ -138,6 +140,7 @@ def test_model_trains_ready_and_forecasts_expected_and_upper_load() -> None:
     assert model["validation"]["origin_count"] == 2
     assert model["validation"]["sample_count"] >= 144
     assert model["validation"]["upper_coverage"] >= 0.9
+    assert model["validation"]["calibration_buffer_kw"] >= 0
     assert len(model["profiles"]["weekday"]["expected"]) == BUCKETS_PER_DAY
 
     forecast = load_forecast_from_model(
@@ -282,6 +285,52 @@ def test_three_complete_days_can_train_while_short_or_gappy_history_remains_lear
     assert short["status"] == "learning"
     assert "insufficient_training_days" in short["quality_failures"]
     assert gappy["status"] in {"learning", "failed"}
+
+
+def test_day_block_calibration_preserves_correlated_peak_evidence() -> None:
+    baseline = {index: 1.0 for index in range(BUCKETS_PER_DAY)}
+    peak = {**baseline, **{index: 4.0 for index in range(12)}}
+    days = [
+        _HistoricalDay(date(2026, 6, 1), "weekday", peak),
+        _HistoricalDay(date(2026, 6, 2), "weekday", baseline),
+        _HistoricalDay(date(2026, 6, 3), "weekday", baseline),
+        _HistoricalDay(date(2026, 6, 4), "weekday", baseline),
+    ]
+
+    assert _percentile([3.0] * 12 + [0.0] * (BUCKETS_PER_DAY * 4 - 12), 0.90) == 0
+    assert _leave_one_out_buffer(days, minimum_samples=1) == 3
+    assert _finite_sample_upper_quantile([0.0, 1.0, 2.0, 3.0], 0.90) == 3
+
+
+def test_conservative_coverage_gate_has_explicit_narrow_bypass() -> None:
+    validation = {
+        "origin_count": 2,
+        "sample_count": 144,
+        "mae_kw": 1.0,
+        "persistence_mae_kw": 1.0,
+        "upper_coverage": 0.86,
+    }
+    profiles = {
+        "weekday": {"expected": [1.0] * BUCKETS_PER_DAY, "upper": [2.0] * BUCKETS_PER_DAY},
+        "weekend": {"expected": [1.0] * BUCKETS_PER_DAY, "upper": [2.0] * BUCKETS_PER_DAY},
+    }
+
+    enforced = _quality_failures(
+        training_days=3,
+        history_coverage=1.0,
+        validation=validation,
+        profiles=profiles,
+    )
+    bypassed = _quality_failures(
+        training_days=3,
+        history_coverage=1.0,
+        validation=validation,
+        profiles=profiles,
+        bypass_conservative_bound_gate=True,
+    )
+
+    assert "conservative_bound_coverage_below_gate" in enforced
+    assert "conservative_bound_coverage_below_gate" not in bypassed
 
 
 def test_bounded_negative_and_ev_gaps_still_qualify_training_days() -> None:
@@ -579,6 +628,12 @@ def test_model_age_transitions_and_source_or_shape_mismatch_fail_closed() -> Non
     assert training_due(model, now=now + timedelta(hours=6), source_entity_id="sensor.house_load") is True
     assert training_due(model, now=now, source_entity_id="sensor.replacement") is True
     assert training_due(
+        model,
+        now=now,
+        source_entity_id="sensor.house_load",
+        bypass_conservative_bound_gate=True,
+    ) is True
+    assert training_due(
         {**model, "contract_version": FORECAST_CONTRACT_VERSION - 1},
         now=now,
         source_entity_id="sensor.house_load",
@@ -615,8 +670,17 @@ def test_model_age_transitions_and_source_or_shape_mismatch_fail_closed() -> Non
         interval_minutes=5,
         source_entity_id="sensor.house_load",
     )
+    missing_bypass_contract = load_forecast_from_model(
+        {key: value for key, value in model.items() if key != "safety_gates_bypassed"},
+        now=now,
+        timezone="UTC",
+        horizon_hours=1,
+        interval_minutes=5,
+        source_entity_id="sensor.house_load",
+    )
     assert wrong_source.status == "failed"
     assert corrupt.status == "failed"
+    assert missing_bypass_contract.status == "failed"
     assert wrong_source.expected_kw == [None] * 12
     corrupt_quality = load_forecast_from_model(
         {**model, "validation": {**model["validation"], "upper_coverage": 0.2}},

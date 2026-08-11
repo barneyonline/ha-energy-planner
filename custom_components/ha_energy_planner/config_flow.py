@@ -39,6 +39,7 @@ from .const import (
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_SOC,
     CONF_BATTERY_USABLE_CAPACITY_KWH,
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -347,15 +348,11 @@ _POLICY_SECTION_OPTIONS = (
 # Home Assistant surface that can also be automated.
 _ENTITY_MANAGED_OPTION_FIELDS = frozenset(
     {
-        CONF_DEFAULT_READY_BY,
         CONF_PLANNER_ENABLED,
         CONF_DRY_RUN,
         CONF_EV_CONTROL_ENABLED,
         CONF_CLIMATE_CONTROL_ENABLED,
         CONF_ENPHASE_CONTROL_ENABLED,
-        CONF_EV_KEEP_CHARGER_ON,
-        CONF_EV_LOW_PRICE_CHARGING_ENABLED,
-        CONF_EV_LOW_PRICE_THRESHOLD,
     }
 )
 
@@ -414,6 +411,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_MAX_DAILY_ENPHASE_ACTIONS,
     ),
     POLICY_STEP_DATA_HEALTH: (
+        CONF_BYPASS_SAFETY_GATES,
         CONF_PRICE_FRESHNESS_MINUTES,
         CONF_FORECAST_FRESHNESS_MINUTES,
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -433,6 +431,62 @@ _POLICY_SECTION_FIELDS = {
 }
 
 _POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_SECTION_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
+
+_SETTINGS_SECTION_INPUT_TYPES = {
+    INPUT_STEP_ENERGY: (SUBENTRY_ENERGY,),
+    INPUT_STEP_CLIMATE: (SUBENTRY_CLIMATE, SUBENTRY_PRESENCE),
+    INPUT_STEP_ENPHASE: (SUBENTRY_ENPHASE,),
+    INPUT_STEP_AI: (SUBENTRY_AI,),
+    INPUT_STEP_EV: (SUBENTRY_EV,),
+    POLICY_STEP_PRIORITIES: (),
+}
+
+_SETTINGS_SECTION_OPTION_FIELDS = {
+    INPUT_STEP_ENERGY: (
+        CONF_BATTERY_MIN_SOC_PERCENT,
+        CONF_BATTERY_USABLE_CAPACITY_KWH,
+        CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
+        CONF_BATTERY_MAX_CHARGE_KW,
+        CONF_BATTERY_MAX_DISCHARGE_KW,
+        CONF_GRID_IMPORT_LIMIT_KW,
+        CONF_GRID_EXPORT_LIMIT_KW,
+        *tuple(
+            field
+            for field in _POLICY_SECTION_FIELDS[POLICY_STEP_DATA_HEALTH]
+            if field != CONF_BYPASS_SAFETY_GATES
+        ),
+    ),
+    INPUT_STEP_CLIMATE: _POLICY_SECTION_FIELDS[POLICY_STEP_CLIMATE],
+    INPUT_STEP_ENPHASE: _POLICY_SECTION_FIELDS[POLICY_STEP_ENPHASE],
+    INPUT_STEP_AI: (
+        CONF_BYPASS_SAFETY_GATES,
+        *_POLICY_SECTION_FIELDS[POLICY_STEP_AI_SAFETY],
+    ),
+    INPUT_STEP_EV: (
+        CONF_DEFAULT_READY_BY,
+        CONF_EV_MIN_SOC_PERCENT,
+        CONF_EV_MAX_SOC_PERCENT,
+        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+        CONF_EV_CHARGE_RATE_KW,
+        CONF_EV_SOC_PER_KWH,
+        CONF_EV_CONTINUOUS_CHARGING,
+        CONF_EV_EARLIEST_START,
+        CONF_EV_PRICE_LIMIT_ENABLED,
+        CONF_EV_MAX_IMPORT_PRICE,
+        CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+        CONF_EV_LOW_PRICE_THRESHOLD,
+        CONF_EV_KEEP_CHARGER_ON,
+        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
+        CONF_EV_CONFIRMATION_RETRIES,
+    ),
+    POLICY_STEP_PRIORITIES: (
+        CONF_PLANNING_HORIZON_HOURS,
+        CONF_PLANNING_INTERVAL_MINUTES,
+        *_POLICY_SECTION_FIELDS[POLICY_STEP_PRIORITIES],
+    ),
+}
+
+_SETTINGS_SECTION_ORDER = tuple(_SETTINGS_SECTION_INPUT_TYPES)
 
 
 def _options_schema(options: dict[str, Any]) -> vol.Schema:
@@ -559,6 +613,7 @@ def _option_selector(field: str) -> Any:
         CONF_AI_TIMEOUT_SECONDS: NumberSelector(
             NumberSelectorConfig(min=1, max=120, step=1, mode=NumberSelectorMode.BOX)
         ),
+        CONF_BYPASS_SAFETY_GATES: BooleanSelector(),
         CONF_PRICE_FRESHNESS_MINUTES: NumberSelector(
             NumberSelectorConfig(min=1, max=240, step=1, mode=NumberSelectorMode.BOX)
         ),
@@ -664,31 +719,51 @@ class OptionsFlow(config_entries.OptionsFlow):
         if user_input is not None:
             updated_data = dict(self._data)
             updated_options = {**DEFAULT_OPTIONS, **self._options}
-            for step_id, input_type in _INPUT_SECTION_TYPES.items():
+            for step_id in _SETTINGS_SECTION_ORDER:
                 if step_id not in user_input:
                     continue
-                data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
-                section_fields = _schema_field_names(data_schema)
-                if input_type == SUBENTRY_AI:
-                    section_fields.add(CONF_AI_ADVISOR_SERVICE)
                 submitted = dict(user_input[step_id])
-                if input_type == SUBENTRY_AI:
-                    submitted = _normalize_ai_config(submitted)
-                section_errors = _validate_subentry_config(
-                    self.hass,
-                    self._config_entry,
-                    submitted,
-                    subentry_type=input_type,
+                for input_type in _SETTINGS_SECTION_INPUT_TYPES[step_id]:
+                    data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
+                    section_fields = _schema_field_names(data_schema)
+                    if input_type == SUBENTRY_AI:
+                        section_fields.add(CONF_AI_ADVISOR_SERVICE)
+                    submitted_data = {
+                        key: value for key, value in submitted.items() if key in section_fields
+                    }
+                    if input_type == SUBENTRY_AI:
+                        submitted_data = _normalize_ai_config(submitted_data)
+                    entity_fields = section_fields - {CONF_AI_ADVISOR_SERVICE}
+                    mappings_changed = any(
+                        submitted_data.get(key) != self._data.get(key)
+                        for key in entity_fields
+                    )
+                    section_errors = (
+                        _validate_subentry_config(
+                            self.hass,
+                            self._config_entry,
+                            submitted_data,
+                            subentry_type=input_type,
+                        )
+                        if mappings_changed
+                        else {}
+                    )
+                    if section_errors:
+                        errors.setdefault("base", next(iter(section_errors.values())))
+                        continue
+                    updated_data = {
+                        key: value
+                        for key, value in updated_data.items()
+                        if key not in section_fields
+                    }
+                    updated_data.update(submitted_data)
+                updated_options.update(
+                    {
+                        key: value
+                        for key, value in submitted.items()
+                        if key in _SETTINGS_SECTION_OPTION_FIELDS[step_id]
+                    }
                 )
-                if section_errors:
-                    errors.setdefault("base", next(iter(section_errors.values())))
-                    continue
-                updated_data = {
-                    key: value
-                    for key, value in updated_data.items()
-                    if key not in section_fields
-                }
-                updated_data.update(submitted)
 
             duplicate_errors = _duplicate_household_actuator_errors(
                 self.hass,
@@ -698,10 +773,6 @@ class OptionsFlow(config_entries.OptionsFlow):
             if duplicate_errors:
                 errors.setdefault("base", next(iter(duplicate_errors.values())))
 
-            for step_id in _POLICY_SECTION_OPTIONS:
-                submitted_options = user_input.get(step_id)
-                if isinstance(submitted_options, dict):
-                    updated_options.update(submitted_options)
             option_errors = _validate_options(updated_options)
             if not _ev_keep_on_control_compatible(updated_data, updated_options):
                 option_errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
@@ -723,27 +794,27 @@ class OptionsFlow(config_entries.OptionsFlow):
     def _settings_schema(self) -> vol.Schema:
         """Return one form with collapsible sections for all settings."""
         schema: dict[Any, Any] = {}
-        for step_id, input_type in _INPUT_SECTION_TYPES.items():
-            data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
-            schema_fields = _schema_field_names(data_schema)
+        options = {**DEFAULT_OPTIONS, **self._options}
+        for step_id in _SETTINGS_SECTION_ORDER:
+            input_types = _SETTINGS_SECTION_INPUT_TYPES[step_id]
+            nested_fields: dict[Any, Any] = {}
+            schema_fields: set[str] = set()
+            for input_type in input_types:
+                data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
+                nested_fields.update(_optional_settings_fields(data_schema))
+                schema_fields.update(_schema_field_names(data_schema))
+            option_fields = _SETTINGS_SECTION_OPTION_FIELDS[step_id]
+            nested_fields.update(_options_section_schema(options, option_fields).schema)
             current = {
                 key: value
                 for key, value in self._data.items()
                 if key in schema_fields
             }
             nested = self.add_suggested_values_to_schema(
-                data_schema,
+                vol.Schema(nested_fields),
                 _form_suggested_values(current),
             )
-            marker: Any = vol.Optional(step_id, default=current) if current else vol.Optional(step_id)
-            schema[marker] = section(nested, SectionConfig(collapsed=True))
-
-        options = {**DEFAULT_OPTIONS, **self._options}
-        for step_id in _POLICY_SECTION_OPTIONS:
-            schema[vol.Required(step_id)] = section(
-                _options_section_schema(options, _POLICY_SECTION_FIELDS[step_id]),
-                SectionConfig(collapsed=True),
-            )
+            schema[vol.Required(step_id)] = section(nested, SectionConfig(collapsed=True))
         return vol.Schema(schema)
 
     def _async_save_entry_data(self, data: dict[str, Any]) -> None:
@@ -767,6 +838,16 @@ def _form_suggested_values(data: dict[str, Any]) -> dict[str, Any]:
         if key in values:
             values[key] = _entity_values(values[key])
     return values
+
+
+def _optional_settings_fields(schema: vol.Schema) -> dict[Any, Any]:
+    """Return input mappings as removable fields inside combined settings sections."""
+    fields: dict[Any, Any] = {}
+    for marker, validator in schema.schema.items():
+        if isinstance(marker, vol.Required):
+            marker = vol.Optional(marker.schema)
+        fields[marker] = validator
+    return fields
 
 
 def _schema_field_names(schema: vol.Schema) -> set[str]:
