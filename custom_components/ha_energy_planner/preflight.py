@@ -12,6 +12,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_ZONES,
@@ -74,6 +75,7 @@ def build_preflight_report(
     """Return a redacted readiness report without calling device services."""
     entry_data = combined_entry_data(coordinator.entry)
     options = coordinator.options if options_override is None else {**coordinator.options, **options_override}
+    bypass_safety_gates = strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False)
     control_areas = _control_area_report(entry_data, options)
     discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
     _apply_ev_keep_on_preflight(discovery, entry_data, options)
@@ -189,7 +191,11 @@ def build_preflight_report(
             ),
         },
     ]
-    safe_to_activate_now = (
+    if bypass_safety_gates:
+        for check in checks:
+            check["bypassed"] = not bool(check["ok"])
+            check["blocking"] = False
+    safe_to_activate_now = bypass_safety_gates or (
         not blocking
         and bool(control_areas["required"])
         and all(bool(discovery[area]["supported"]) for area in control_areas["required"])
@@ -199,11 +205,13 @@ def build_preflight_report(
         and not control_paused
     )
     production["safe_to_activate_now"] = safe_to_activate_now
+    production["safety_gates_bypassed"] = bypass_safety_gates
     active_control_ready = safe_to_activate_now and production["armed"]
     return {
         "ok": active_control_ready,
         "active_control_ready": active_control_ready,
         "safe_to_activate_now": safe_to_activate_now,
+        "safety_gates_bypassed": bypass_safety_gates,
         "current_plan": current_plan,
         "mode": safety,
         "production": production,

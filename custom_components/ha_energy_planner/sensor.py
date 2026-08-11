@@ -17,6 +17,7 @@ from homeassistant.util import dt as dt_util
 from .ai_advisor import ai_rejection_detail, ai_target_detail
 from .const import (
     CONF_AI_TASK_ENTITY,
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_ZONES,
@@ -42,6 +43,7 @@ from .coordinator import (
     _material_plan_fingerprint,
 )
 from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .load_forecast import MIN_UPPER_COVERAGE
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .preflight import _control_area_report, production_evidence_fingerprint
 from .safety import (
@@ -317,6 +319,15 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         icon="mdi:timeline-clock-outline",
         value_fn=lambda coordinator: _next_actions_state(coordinator),
         attrs_fn=lambda coordinator: _next_actions_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="load_forecast_coverage_score",
+        translation_key="load_forecast_coverage_score",
+        icon="mdi:shield-percent-outline",
+        native_unit_of_measurement="%",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _load_forecast_coverage_score(coordinator),
+        attrs_fn=lambda coordinator: _load_forecast_coverage_attrs(coordinator),
     ),
 )
 
@@ -1492,11 +1503,49 @@ def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict
         "first_expected_kw",
         "first_upper_kw",
         "quality_failures",
+        "safety_gates_bypassed",
         "validation",
         "cleaning",
         "update_reason",
     )
     return {key: _bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
+
+
+def _load_forecast_coverage_score(
+    coordinator: EnergyPlannerCoordinator,
+) -> float | None:
+    """Return the current conservative-bound holdout coverage percentage."""
+    model = coordinator.store.data.get("built_in_load_forecast", {})
+    validation = model.get("validation", {}) if isinstance(model, dict) else {}
+    coverage = validation.get("upper_coverage") if isinstance(validation, dict) else None
+    if not isinstance(coverage, int | float) or isinstance(coverage, bool):
+        return None
+    if not 0 <= float(coverage) <= 1:
+        return None
+    return round(float(coverage) * 100, 1)
+
+
+def _load_forecast_coverage_attrs(
+    coordinator: EnergyPlannerCoordinator,
+) -> dict[str, Any]:
+    """Return the safety threshold and explicit bypass state."""
+    model = coordinator.store.data.get("built_in_load_forecast", {})
+    model = model if isinstance(model, dict) else {}
+    score = _load_forecast_coverage_score(coordinator)
+    bypass_enabled = strict_bool(
+        coordinator.options.get(CONF_BYPASS_SAFETY_GATES),
+        default=False,
+    )
+    return {
+        "required_threshold_percent": MIN_UPPER_COVERAGE * 100,
+        "meets_threshold": None if score is None else score >= MIN_UPPER_COVERAGE * 100,
+        "bypass_enabled": bypass_enabled,
+        "bypass_applied_to_model": model.get("safety_gates_bypassed") is True,
+        "model_status": model.get("status", "unknown"),
+        "quality_failures": list(model.get("quality_failures", []))[:8]
+        if isinstance(model.get("quality_failures"), list)
+        else [],
+    }
 
 
 def _action_load_forecast_attrs(

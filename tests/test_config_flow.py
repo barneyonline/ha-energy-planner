@@ -231,23 +231,31 @@ def _settings_submission(
     policy_overrides: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Return a complete central-settings submission using schema defaults."""
-    policy_steps = {
-        POLICY_STEP_SCHEDULE,
-        POLICY_STEP_EV_BATTERY_GRID,
-        POLICY_STEP_CLIMATE,
-        POLICY_STEP_ENPHASE,
-        POLICY_STEP_AI_SAFETY,
-        POLICY_STEP_DATA_HEALTH,
-        POLICY_STEP_PRIORITIES,
-    }
     submission: dict[str, dict[str, Any]] = {}
     for marker, validator in flow._settings_schema().schema.items():
         key = str(getattr(marker, "schema", marker))
-        if key in policy_steps:
-            submission[key] = validator({})
-    submission.update(input_sections or {})
+        current = {
+            str(getattr(field, "schema", field)): flow._data[str(getattr(field, "schema", field))]
+            for field in validator.schema.schema
+            if str(getattr(field, "schema", field)) in flow._data
+        }
+        submission[key] = validator(current)
+    for step_id, values in (input_sections or {}).items():
+        target = INPUT_STEP_CLIMATE if step_id == INPUT_STEP_PRESENCE else step_id
+        for key in set(submission[target]) & flow._data.keys():
+            submission[target].pop(key)
+        submission[target].update(values)
+    merged_section = {
+        POLICY_STEP_SCHEDULE: POLICY_STEP_PRIORITIES,
+        POLICY_STEP_EV_BATTERY_GRID: INPUT_STEP_EV,
+        POLICY_STEP_CLIMATE: INPUT_STEP_CLIMATE,
+        POLICY_STEP_ENPHASE: INPUT_STEP_ENPHASE,
+        POLICY_STEP_AI_SAFETY: INPUT_STEP_AI,
+        POLICY_STEP_DATA_HEALTH: INPUT_STEP_ENERGY,
+        POLICY_STEP_PRIORITIES: POLICY_STEP_PRIORITIES,
+    }
     for step_id, values in (policy_overrides or {}).items():
-        submission[step_id].update(values)
+        submission[merged_section[step_id]].update(values)
     return submission
 
 
@@ -697,7 +705,7 @@ def test_central_input_sections_have_readable_translation_labels() -> None:
     step_by_type = {
         "energy": INPUT_STEP_ENERGY,
         "climate": INPUT_STEP_CLIMATE,
-        "presence": INPUT_STEP_PRESENCE,
+        "presence": INPUT_STEP_CLIMATE,
         "enphase": INPUT_STEP_ENPHASE,
         "ai": INPUT_STEP_AI,
         "ev": INPUT_STEP_EV,
@@ -723,10 +731,10 @@ def test_english_locale_files_include_central_input_section_labels() -> None:
     expected_steps = {
         INPUT_STEP_ENERGY,
         INPUT_STEP_CLIMATE,
-        INPUT_STEP_PRESENCE,
         INPUT_STEP_ENPHASE,
         INPUT_STEP_AI,
         INPUT_STEP_EV,
+        POLICY_STEP_PRIORITIES,
     }
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
@@ -777,7 +785,7 @@ def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        label = translations["options"]["step"]["init"]["sections"]["ev_battery_grid"]["data"][
+        label = translations["options"]["step"]["init"]["sections"][INPUT_STEP_EV]["data"][
             CONF_EV_CHARGE_RATE_KW
         ]
 
@@ -817,7 +825,7 @@ def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
         integration_dir / "translations" / "en-GB.json",
     ):
         strings = json.loads(path.read_text(encoding="utf-8"))
-        section = strings["options"]["step"]["init"]["sections"][POLICY_STEP_AI_SAFETY]
+        section = strings["options"]["step"]["init"]["sections"][INPUT_STEP_AI]
         assert section["data"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_heading
         assert section["data_description"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_description
 
@@ -833,16 +841,9 @@ def test_options_flow_init_shows_one_collapsible_settings_form() -> None:
     assert tuple(str(getattr(key, "schema", key)) for key in result["data_schema"].schema) == (
         INPUT_STEP_ENERGY,
         INPUT_STEP_CLIMATE,
-        INPUT_STEP_PRESENCE,
         INPUT_STEP_ENPHASE,
         INPUT_STEP_AI,
         INPUT_STEP_EV,
-        POLICY_STEP_SCHEDULE,
-        POLICY_STEP_EV_BATTERY_GRID,
-        POLICY_STEP_CLIMATE,
-        POLICY_STEP_ENPHASE,
-        POLICY_STEP_AI_SAFETY,
-        POLICY_STEP_DATA_HEALTH,
         POLICY_STEP_PRIORITIES,
     )
 
@@ -897,12 +898,51 @@ def test_config_flow_reports_options_without_add_device_subentry_flows() -> None
     assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {}
 
 
-def test_options_flow_contains_all_input_and_policy_sections() -> None:
+def test_options_flow_consolidates_related_settings_sections() -> None:
     flow = OptionsFlow(SimpleNamespace(options={}))
     schema = flow._settings_schema()
 
-    assert len(schema.schema) == 13
+    assert len(schema.schema) == 6
     assert all(validator.options["collapsed"] is True for validator in schema.schema.values())
+
+
+def test_options_flow_accepts_a_partial_combined_section_submission() -> None:
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    schema = flow._settings_schema()
+    planning = next(
+        validator
+        for marker, validator in schema.schema.items()
+        if str(getattr(marker, "schema", marker)) == POLICY_STEP_PRIORITIES
+    )
+
+    result = asyncio.run(
+        flow.async_step_init({POLICY_STEP_PRIORITIES: planning({})})
+    )
+
+    assert result["type"] == "create_entry"
+
+
+def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> None:
+    schema = OptionsFlow(SimpleNamespace(data={}, options={}))._settings_schema()
+    ev_section = next(
+        validator
+        for marker, validator in schema.schema.items()
+        if str(getattr(marker, "schema", marker)) == INPUT_STEP_EV
+    )
+    fields = {
+        str(getattr(marker, "schema", marker))
+        for marker in ev_section.schema.schema
+    }
+
+    assert {
+        CONF_EV_SOC,
+        CONF_EV_CHARGER,
+        CONF_DEFAULT_READY_BY,
+        CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+        CONF_EV_LOW_PRICE_THRESHOLD,
+        CONF_EV_KEEP_CHARGER_ON,
+    } <= fields
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
@@ -913,20 +953,20 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
 
     assert schema_keys.isdisjoint(
         {
-            CONF_DEFAULT_READY_BY,
             CONF_PLANNER_ENABLED,
             CONF_DRY_RUN,
             CONF_AI_ENABLED,
             CONF_EV_CONTROL_ENABLED,
             CONF_CLIMATE_CONTROL_ENABLED,
             CONF_ENPHASE_CONTROL_ENABLED,
-            CONF_EV_KEEP_CHARGER_ON,
-            CONF_EV_LOW_PRICE_CHARGING_ENABLED,
-            CONF_EV_LOW_PRICE_THRESHOLD,
         }
     )
 
     assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT in schema_keys
+    assert CONF_DEFAULT_READY_BY in schema_keys
+    assert CONF_EV_LOW_PRICE_CHARGING_ENABLED in schema_keys
+    assert CONF_EV_LOW_PRICE_THRESHOLD in schema_keys
+    assert CONF_EV_KEEP_CHARGER_ON in schema_keys
 
 
 def test_options_flow_saves_all_sections_together_and_preserves_options() -> None:
@@ -957,7 +997,17 @@ def test_options_flow_saves_all_sections_together_and_preserves_options() -> Non
     result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "create_entry"
-    assert updates == [{"data": {CONF_INSTANCE_NAME: "Energy Planner"}}]
+    assert updates == [
+        {
+            "data": {
+                CONF_INSTANCE_NAME: "Energy Planner",
+                CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+                CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
+                CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
+                CONF_AI_ADVISOR_SERVICE: "",
+            }
+        }
+    ]
     assert result["data"][CONF_PLANNING_HORIZON_HOURS] == 36
     assert result["data"][CONF_EV_MIN_SOC_PERCENT] == 55
     assert result["data"][CONF_PRIORITY_WEIGHTS] == (
@@ -979,7 +1029,7 @@ def test_options_flow_sections_prefill_saved_policy_values() -> None:
     schedule = next(
         validator
         for marker, validator in schema.schema.items()
-        if str(getattr(marker, "schema", marker)) == POLICY_STEP_SCHEDULE
+        if str(getattr(marker, "schema", marker)) == POLICY_STEP_PRIORITIES
     )
     fields = {
         str(getattr(marker, "schema", marker)): marker
@@ -1169,11 +1219,15 @@ def test_central_energy_settings_updates_main_entry_data() -> None:
     assert result["type"] == "create_entry"
     assert updates == [
         {
-            "data": {
-                CONF_INSTANCE_NAME: "Energy Planner",
-                CONF_AI_TASK_ENTITY: "ai_task.old",
-                **energy,
-            }
+                "data": {
+                    CONF_INSTANCE_NAME: "Energy Planner",
+                    CONF_AI_TASK_ENTITY: "ai_task.old",
+                    CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                    CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+                    CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
+                    CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
+                    **energy,
+                }
         }
     ]
 
@@ -1262,12 +1316,17 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
         async_entries=lambda domain: [entry],
         async_update_entry=lambda entry_arg, **changes: updates.append(changes),
     )
-    ai_marker = next(
-        marker
-        for marker in flow._settings_schema().schema
+    ai_section = next(
+        validator
+        for marker, validator in flow._settings_schema().schema.items()
         if str(getattr(marker, "schema", marker)) == INPUT_STEP_AI
     )
-    assert ai_marker.default() == {CONF_AI_TASK_ENTITY: "ai_task.old"}
+    ai_task_marker = next(
+        marker
+        for marker in ai_section.schema.schema
+        if str(getattr(marker, "schema", marker)) == CONF_AI_TASK_ENTITY
+    )
+    assert ai_task_marker.description["suggested_value"] == "ai_task.old"
 
     result = asyncio.run(
         flow.async_step_init(
@@ -1309,7 +1368,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
     assert updates[-1]["data"][CONF_AI_ADVISOR_SERVICE] == ""
 
 
-def test_central_input_sections_are_optional_collapsible_groups() -> None:
+def test_consolidated_settings_sections_are_required_collapsible_groups() -> None:
     flow = OptionsFlow(SimpleNamespace(data={}, options={}))
     schema = flow._settings_schema()
     fields = {
@@ -1320,12 +1379,12 @@ def test_central_input_sections_are_optional_collapsible_groups() -> None:
     for step_id in (
         INPUT_STEP_ENERGY,
         INPUT_STEP_CLIMATE,
-        INPUT_STEP_PRESENCE,
         INPUT_STEP_ENPHASE,
         INPUT_STEP_AI,
         INPUT_STEP_EV,
+        POLICY_STEP_PRIORITIES,
     ):
-        assert isinstance(fields[step_id], vol.Optional)
+        assert isinstance(fields[step_id], vol.Required)
         assert schema.schema[fields[step_id]].options["collapsed"] is True
 
 

@@ -131,6 +131,7 @@ def test_startup_source_appearance_retries_training_without_backoff(monkeypatch:
     existing = {
         "model_version": MODEL_VERSION,
         "contract_version": FORECAST_CONTRACT_VERSION,
+        "safety_gates_bypassed": False,
         "status": "ready",
         "quality_ready": True,
         "source_entity_id": "sensor.house_load",
@@ -148,6 +149,7 @@ def test_startup_source_appearance_retries_training_without_backoff(monkeypatch:
         return {
             "model_version": MODEL_VERSION,
             "contract_version": FORECAST_CONTRACT_VERSION,
+            "safety_gates_bypassed": False,
             "status": "ready",
             "quality_ready": True,
             "quality_failures": [],
@@ -192,7 +194,7 @@ def test_builtin_load_forecast_loads_optional_cleaning_histories_and_persists_on
     def fake_train(*args: Any) -> dict[str, Any]:
         training_calls.append(args)
         assert args[1:4] == ("sensor.house_load", "sensor.ev_charging", "sensor.hvac_power")
-        assert args[-2:] == ("W", "kW")
+        assert args[-3:] == ("W", "kW", False)
         return {
             "model_version": 1,
             "source_entity_id": "sensor.house_load",
@@ -314,6 +316,7 @@ def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> 
     existing = {
         "model_version": MODEL_VERSION,
         "contract_version": FORECAST_CONTRACT_VERSION,
+        "safety_gates_bypassed": False,
         "source_entity_id": "sensor.house_load",
         "trained_at": now.isoformat(),
         "last_attempt_at": now.isoformat(),
@@ -410,6 +413,7 @@ def test_retraining_quality_failure_retains_last_ready_aggregate(monkeypatch: An
     existing = {
         "model_version": MODEL_VERSION,
         "contract_version": FORECAST_CONTRACT_VERSION,
+        "safety_gates_bypassed": False,
         "status": "ready",
         "quality_ready": True,
         "source_entity_id": "sensor.house_load",

@@ -30,6 +30,7 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     assert values == {
         "current_state": "No controls configured",
         "next_actions": "Unknown",
+        "load_forecast_coverage_score": None,
     }
     assert attrs["current_state"] == {
         "mode": "Unknown",
@@ -37,11 +38,49 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "controlled_assets": [],
     }
     assert attrs["next_actions"] == {"actions": []}
+    assert attrs["load_forecast_coverage_score"] == {
+        "required_threshold_percent": 90.0,
+        "meets_threshold": None,
+        "bypass_enabled": False,
+        "bypass_applied_to_model": False,
+        "model_status": "unknown",
+        "quality_failures": [],
+    }
 
     coordinator.data = _plan()
     assert next(item for item in SENSORS if item.key == "next_actions").value_fn(coordinator) == (
         "No controls configured"
     )
+
+
+def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> None:
+    coordinator = _coordinator(
+        None,
+        options={"bypass_safety_gates": True},
+        store_data={
+            "built_in_load_forecast": {
+                "status": "ready",
+                "safety_gates_bypassed": True,
+                "quality_failures": [],
+                "validation": {"upper_coverage": 0.864198},
+            }
+        },
+    )
+    description = next(
+        item for item in SENSORS if item.key == "load_forecast_coverage_score"
+    )
+
+    assert description.value_fn(coordinator) == 86.4
+    assert description.attrs_fn(coordinator) == {
+        "required_threshold_percent": 90.0,
+        "meets_threshold": False,
+        "bypass_enabled": True,
+        "bypass_applied_to_model": True,
+        "model_status": "ready",
+        "quality_failures": [],
+    }
+    coordinator.store.data["built_in_load_forecast"]["validation"]["upper_coverage"] = 1.1
+    assert description.value_fn(coordinator) is None
 
 
 def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> None:

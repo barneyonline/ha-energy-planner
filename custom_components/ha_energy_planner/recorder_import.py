@@ -54,6 +54,7 @@ async def async_update_builtin_load_forecast(
     now: datetime,
     timezone: str,
     force: bool = False,
+    bypass_conservative_bound_gate: bool = False,
 ) -> tuple[dict[str, Any], bool, str]:
     """Train the compact household-load model when its bounded refresh is due."""
     load_entity = str(entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
@@ -66,11 +67,20 @@ async def async_update_builtin_load_forecast(
         # attempt: preserve the stored model and let the source state-change
         # refresh retry immediately instead of starting the six-hour backoff.
         return model, False, "load_forecast_household_load_unavailable"
-    if not force and not training_due(model, now=now, source_entity_id=load_entity, timezone=timezone):
+    if not force and not training_due(
+        model,
+        now=now,
+        source_entity_id=load_entity,
+        timezone=timezone,
+        bypass_conservative_bound_gate=bypass_conservative_bound_gate,
+    ):
         return model, False, "load_forecast_training_recent"
     model_contract_current = (
         model.get("model_version") == MODEL_VERSION
         and model.get("contract_version") == FORECAST_CONTRACT_VERSION
+    )
+    model_policy_current = (
+        model.get("safety_gates_bypassed") is bypass_conservative_bound_gate
     )
     attempted = {
         **model,
@@ -89,6 +99,7 @@ async def async_update_builtin_load_forecast(
                 "source_entity_id": load_entity,
                 "timezone": timezone,
                 "profiles": {},
+                "safety_gates_bypassed": bypass_conservative_bound_gate,
             }
         )
     load_unit = _state_unit(load_state)
@@ -107,10 +118,12 @@ async def async_update_builtin_load_forecast(
             timezone,
             load_unit,
             _state_unit(hvac_state),
+            bypass_conservative_bound_gate,
         )
         if (
             updated.get("status") != "ready"
             and model_contract_current
+            and model_policy_current
             and model.get("quality_ready") is True
             and model.get("source_entity_id") == load_entity
             and model.get("timezone") == timezone
@@ -274,6 +287,7 @@ def _build_household_load_forecast_model(
     timezone: str,
     load_unit: str,
     hvac_power_unit: str,
+    bypass_conservative_bound_gate: bool = False,
 ) -> dict[str, Any]:
     """Query, clean, and compact Recorder history one bounded UTC chunk at a time."""
     history_start = now - HISTORY_LOOKBACK
@@ -341,6 +355,7 @@ def _build_household_load_forecast_model(
         history_start=effective_start or history_start,
         ev_intervals_excluded=ev_intervals_excluded,
         hvac_power_subtracted=hvac_power_subtracted,
+        bypass_conservative_bound_gate=bypass_conservative_bound_gate,
     )
 
 
