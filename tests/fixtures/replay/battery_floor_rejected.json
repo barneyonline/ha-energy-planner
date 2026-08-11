@@ -20,7 +20,6 @@
     "current_battery_soc_percent": 10,
     "current_ev_soc_percent": 50,
     "occupancy_state": "occupied",
-    "haeo_status": "ready",
     "input_health": "healthy",
     "slots": [
       {

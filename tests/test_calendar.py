@@ -147,7 +147,6 @@ def _action(action_id: str, start: datetime, end: datetime) -> PlanAction:
         reason_codes=["ev_soc_below_target"],
         expected_cost_delta=0.25,
         confidence=0.9,
-        requires_haeo_plan_id=None,
     )
 
 

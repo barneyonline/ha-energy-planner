@@ -318,7 +318,7 @@
             "data_description": {
               "planner_enabled": "Turns on planner-owned device control. Leave off until preflight and dry-run behavior are reviewed.",
               "dry_run": "When enabled, the planner records decisions without calling device-control services.",
-              "plan_fallback_notifications_enabled": "Shows persistent notifications only for problems that normally require user action, such as broken required mappings or a configured grid hard limit. Routine changes, successful recovery, and safe HAEO fallback do not notify.",
+              "plan_fallback_notifications_enabled": "Shows persistent notifications only for problems that normally require user action, such as broken required mappings or a configured grid hard limit. Routine changes and successful recovery do not notify.",
               "ev_control_enabled": "Allows active-mode EV start, stop, and schedule commands after production is armed.",
               "climate_control_enabled": "Allows active-mode climate commands after production is armed.",
               "enphase_control_enabled": "Allows active-mode Enphase profile changes after production is armed.",

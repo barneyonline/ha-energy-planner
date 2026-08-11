@@ -9,7 +9,6 @@ CONF_INSTANCE_NAME = "instance_name"
 
 PLATFORMS = ["sensor", "binary_sensor", "switch", "button", "number", "time", "calendar"]
 
-CONF_HAEO_OPTIMIZE_SERVICE = "haeo_optimize_service"
 CONF_AMBER_IMPORT_PRICE = "amber_import_price_entity"
 CONF_AMBER_EXPORT_PRICE = "amber_export_price_entity"
 CONF_PV_FORECAST = "pv_forecast_entity"
@@ -55,7 +54,6 @@ CONF_AI_ADVISOR_SERVICE = "ai_advisor_service"
 CONF_AI_TASK_ENTITY = "ai_task_entity"
 CONF_WEATHER = "weather_entity"
 
-DEFAULT_HAEO_OPTIMIZE_SERVICE = "haeo.optimize"
 DEFAULT_ENPHASE_AI_PROFILE = "AI Optimisation"
 DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE = "Self-Consumption"
 DEFAULT_ENPHASE_FULL_BACKUP_PROFILE = "Full Backup"

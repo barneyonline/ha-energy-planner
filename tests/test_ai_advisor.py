@@ -30,7 +30,6 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlannerMode,
@@ -192,7 +191,6 @@ def _context() -> DecisionContext:
         current_battery_soc_percent=50,
         current_ev_soc_percent=60,
         occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.READY,
         input_health=InputHealth.HEALTHY,
     )
 

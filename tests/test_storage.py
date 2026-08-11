@@ -173,6 +173,31 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
     assert store.data["future_metadata"] == {"kept": True}
 
 
+def test_store_load_persists_retired_optimizer_cleanup(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = {
+        "haeo_runs": [{"status": "failed"}],
+        "active_plan": {
+            "plan_id": "plan-1",
+            "actions": [
+                "malformed-action",
+                {
+                    "action_id": "action-1",
+                    "requires_haeo_plan_id": "optimizer-plan",
+                }
+            ],
+        },
+    }
+    FakeStore.saved = None
+
+    store = PlannerStore(object())
+    asyncio.run(store.async_load())
+
+    assert "haeo_runs" not in store.data
+    assert store.data["active_plan"]["actions"] == ["malformed-action", {"action_id": "action-1"}]
+    assert FakeStore.saved == store.data
+
+
 def test_store_persists_compact_builtin_load_model_only_when_changed(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.loaded = None
@@ -543,19 +568,17 @@ def test_store_persists_plan_and_list_backed_records(monkeypatch: object) -> Non
         )
         await store.async_add_forecast_snapshot({"plan_id": "plan-1"})
         await store.async_save_forecast_calibration({"pv_forecast_kw": {"factor": 1.1}})
-        await store.async_add_haeo_run({"plan_id": "plan-1"})
         await store.async_add_ai_recommendation({"plan_id": "plan-1"})
         await store.async_save_thermal_model({"last_sample": {"temperature": 20}})
         await store.async_clear_ownership()
 
     asyncio.run(persist_records())
 
-    assert FakeStore.save_count == 7
+    assert FakeStore.save_count == 6
     assert store.data["active_plan"]["plan_id"] == "plan-1"
     assert store.data["overrides"][0]["reason"] == "testing"
     assert store.data["forecast_snapshots"] == [{"plan_id": "plan-1"}]
     assert store.data["forecast_calibration"] == {"pv_forecast_kw": {"factor": 1.1}}
-    assert store.data["haeo_runs"] == [{"plan_id": "plan-1"}]
     assert store.data["ai_recommendations"] == [{"plan_id": "plan-1"}]
     assert store.data["thermal_model"] == {"last_sample": {"temperature": 20}}
 
@@ -700,11 +723,6 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
     ]
 
     asyncio.run(store.async_add_forecast_snapshot({"created_at": now, "plan_id": "latest"}))
-    store.data["haeo_runs"] = [
-        {"created_at": (now - timedelta(hours=49)).isoformat(), "plan_id": "expired"},
-        {"created_at": (now - timedelta(hours=1)).isoformat(), "plan_id": "recent"},
-    ]
-    asyncio.run(store.async_add_haeo_run({"created_at": now, "plan_id": "latest"}))
     store.data["dry_run_comparisons"] = [
         {"created_at": (now - timedelta(days=8)).isoformat(), "planned_action_count": 1},
         {"created_at": (now - timedelta(days=1)).isoformat(), "planned_action_count": 2},
@@ -714,7 +732,6 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
     assert len(store.data["forecast_snapshots"]) == 501
     assert all(item["plan_id"] != "expired" for item in store.data["forecast_snapshots"])
     assert all(isinstance(item, dict) for item in store.data["forecast_snapshots"])
-    assert [item["plan_id"] for item in store.data["haeo_runs"]] == ["recent", "latest"]
     assert [item["planned_action_count"] for item in store.data["dry_run_comparisons"]] == [2, 3]
 
 

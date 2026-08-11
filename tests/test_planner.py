@@ -11,7 +11,6 @@ from custom_components.ha_energy_planner.models import (
     ActionKind,
     DecisionContext,
     DecisionSlot,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     Override,
@@ -22,7 +21,6 @@ from custom_components.ha_energy_planner.planner import (
     DryRunPlanner,
     _arbitrage_spread,
     _ev_earliest_start,
-    _haeo_battery_arbitrage_value,
     _next_ready_by,
 )
 from custom_components.ha_energy_planner.thermal_model import update_thermal_model
@@ -47,7 +45,6 @@ def _context(health: InputHealth = InputHealth.HEALTHY) -> DecisionContext:
         current_battery_soc_percent=50,
         current_ev_soc_percent=60,
         occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.READY,
         input_health=health,
     )
 
@@ -116,7 +113,6 @@ def test_carbon_objective_scores_low_carbon_ev_schedule_and_changes_weight_by_pr
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
     components = planner_module._score_components(action, context)
@@ -158,7 +154,6 @@ def test_carbon_score_rewards_load_reduction_during_high_carbon_period() -> None
             reason_codes=[],
             expected_cost_delta=None,
             confidence=1.0,
-            requires_haeo_plan_id=None,
         )
 
     assert planner_module._carbon_action_score(climate_action("off"), context) == 1.0
@@ -242,118 +237,6 @@ def test_estimated_cost_includes_projected_flexible_load() -> None:
     assert plan.estimated_daily_cost == 0.25
 
 
-def test_estimated_cost_prefers_haeo_grid_flow_forecasts() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    context = _context()
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.30,
-            export_price=0.10,
-            pv_forecast_kw=8.0,
-            baseline_load_forecast_kw=1.0,
-            haeo_grid_import_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=0.0,
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=5),
-            import_price=0.30,
-            export_price=0.10,
-            pv_forecast_kw=0.0,
-            baseline_load_forecast_kw=8.0,
-            haeo_grid_import_forecast_kw=0.0,
-            haeo_grid_export_forecast_kw=3.0,
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.estimated_daily_cost == 0.025
-
-
-def test_estimated_cost_adds_flexible_load_only_to_baseline_haeo_grid_flow() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    context = _context()
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.30,
-            export_price=0.10,
-            pv_forecast_kw=0.0,
-            baseline_load_forecast_kw=1.0,
-            projected_ev_load_kw=3.0,
-            haeo_grid_import_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=0.0,
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=5),
-            import_price=0.30,
-            export_price=0.10,
-            pv_forecast_kw=0.0,
-            baseline_load_forecast_kw=1.0,
-            projected_ev_load_kw=3.0,
-            haeo_grid_import_forecast_kw=5.0,
-            haeo_grid_export_forecast_kw=0.0,
-            haeo_grid_includes_flexible_loads=True,
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.estimated_daily_cost == 0.25
-
-
-def test_estimated_cost_accounts_for_haeo_battery_power_without_grid_flow() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    context = _context()
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.24,
-            export_price=0.06,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=1.0,
-            haeo_battery_charge_forecast_kw=2.0,
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=5),
-            import_price=0.24,
-            export_price=0.06,
-            pv_forecast_kw=0.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_battery_discharge_forecast_kw=2.0,
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.estimated_daily_cost == 0.04
-
-
-def test_estimated_cost_falls_back_when_haeo_grid_flow_is_partial() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    context = _context()
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.24,
-            export_price=0.06,
-            pv_forecast_kw=0.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_import_forecast_kw=None,
-            haeo_grid_export_forecast_kw=0.0,
-        )
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.estimated_daily_cost == 0.04
-
-
 def test_unsafe_context_suppresses_plan() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     plan = DryRunPlanner(options).create_plan(_context(InputHealth.UNSAFE))
@@ -435,7 +318,6 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert plan.actions[0].desired_state["target_soc_percent"] == 70.0
     assert plan.actions[0].desired_state["charging_required_now"] is True
     assert plan.actions[0].desired_state["continuous_charging"] is True
-    assert plan.actions[0].requires_haeo_plan_id is None
     assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0, 0.0]
     assert plan.device_plans["ev"]["total_estimated_energy_kwh"] == 1.0
     timeline = plan.device_plans["ev"]["timeline"]
@@ -822,7 +704,6 @@ def test_carbon_action_score_covers_allocation_and_asset_edges() -> None:
             reason_codes=[],
             expected_cost_delta=None,
             confidence=1.0,
-            requires_haeo_plan_id=None,
         )
 
     assert planner_module._carbon_action_score(action(ActionAsset.EV, {}), context) == 0.0
@@ -888,7 +769,6 @@ def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None
     context.slots = [DecisionSlot(now, None, None, None, None)]
 
     assert _next_ready_by(now, "bad") == datetime(2026, 6, 28, 7, 0, tzinfo=UTC)
-    assert _haeo_battery_arbitrage_value(context, 5) is None
     assert _arbitrage_spread(context) == 0.0
     assert planner_module._forecast_solar_export_value(context, 5) is None
     context.slots = [DecisionSlot(now, 0.25, 0.50, None, None)]
@@ -1007,7 +887,6 @@ def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> Non
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     assert not planner_module._action_meets_confidence_threshold(
         action,
@@ -1073,60 +952,6 @@ def test_device_plans_include_climate_timeline() -> None:
         {
             "state": "idle",
             "start": "2026-06-27T00:05:00+00:00",
-            "end": "2026-06-27T00:15:00+00:00",
-        },
-    ]
-
-
-def test_device_plans_include_enphase_haeo_timeline() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": True}
-    context = _context()
-    context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=offset),
-            import_price=0.20,
-            export_price=0.05,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_battery_charge_forecast_kw=charge,
-            haeo_battery_discharge_forecast_kw=discharge,
-            haeo_battery_soc_forecast_percent=soc,
-        )
-        for offset, charge, discharge, soc in (
-            (0, 2.0, 0.0, 50),
-            (5, 2.0, 0.0, 51),
-            (10, 0.0, 1.5, 50),
-        )
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.device_plans["enphase"]["total_estimated_battery_charge_kwh"] == 0.3334
-    assert plan.device_plans["enphase"]["total_estimated_battery_discharge_kwh"] == 0.125
-    assert plan.device_plans["enphase"]["timeline"] == [
-        {
-            "state": "charge_battery",
-            "battery_charge_kw": 2.0,
-            "estimated_battery_charge_kwh": 0.1667,
-            "battery_soc_percent": 50,
-            "start": "2026-06-27T00:00:00+00:00",
-            "end": "2026-06-27T00:05:00+00:00",
-        },
-        {
-            "state": "charge_battery",
-            "battery_charge_kw": 2.0,
-            "estimated_battery_charge_kwh": 0.1667,
-            "battery_soc_percent": 51,
-            "start": "2026-06-27T00:05:00+00:00",
-            "end": "2026-06-27T00:10:00+00:00",
-        },
-        {
-            "state": "consume_battery",
-            "battery_discharge_kw": 1.5,
-            "estimated_battery_discharge_kwh": 0.125,
-            "battery_soc_percent": 50,
-            "start": "2026-06-27T00:10:00+00:00",
             "end": "2026-06-27T00:15:00+00:00",
         },
     ]
@@ -1296,7 +1121,6 @@ def test_active_plan_sets_enphase_arbitrage_profile_when_forecast_solar_export_v
     assert plan.actions[0].expected_cost_delta == 0.27
     assert plan.actions[0].desired_state["arbitrage_details"]["accepted_surplus_kwh"] == 1.5
     assert plan.actions[0].desired_state["arbitrage_details"]["battery_round_trip_efficiency"] == 0.9
-    assert plan.actions[0].requires_haeo_plan_id is None
     assert plan.device_plans["enphase"]["current_state"] == {
         "state": "AI Optimisation",
         "profile": "AI Optimisation",
@@ -1349,7 +1173,6 @@ def test_active_plan_restores_enphase_ai_when_arbitrage_spread_below_threshold()
     assert plan.actions[0].desired_state["profile"] == "AI Optimisation"
     assert plan.actions[0].desired_state["arbitrage_source"] == "insufficient_arbitrage_evidence"
     assert plan.actions[0].reason_codes == ["enphase_insufficient_arbitrage_evidence_below_threshold"]
-    assert plan.actions[0].requires_haeo_plan_id is None
     assert plan.device_plans["enphase"]["current_state_label"] == "Self-Consumption"
     assert plan.device_plans["enphase"]["next_planned_state_label"] == "Restore AI: AI Optimisation"
 
@@ -2875,219 +2698,3 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
     assert active_action.desired_state["phase"] == "pre_peak_coast"
     assert active_action.desired_state["target_temperature"] == 19.0
     assert context.slots[0].projected_hvac_load_kw == 0.0
-
-
-def test_active_plan_prefers_haeo_export_value_for_enphase_arbitrage() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "enphase_minimum_savings": 0.25,
-        "planning_interval_minutes": 30,
-    }
-    context = _context()
-    context.current_enphase_profile = "AI Optimisation"
-    context.enphase_ai_profile = "AI Optimisation"
-    context.enphase_self_consumption_profile = "Self-Consumption"
-    context.enphase_full_backup_profile = "Full Backup"
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.05,
-            export_price=0.40,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=2.0,
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=30),
-            import_price=0.05,
-            export_price=0.35,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=1.0,
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.actions[0].asset == ActionAsset.ENPHASE
-    assert plan.actions[0].desired_state["profile"] == "Self-Consumption"
-    assert plan.actions[0].desired_state["arbitrage_source"] == "haeo_export_value"
-    assert plan.actions[0].desired_state["arbitrage_direction"] == "consume"
-    assert plan.actions[0].expected_cost_delta == 0.575
-    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
-
-
-def test_active_plan_prefers_haeo_battery_arbitrage_value_for_enphase() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "enphase_minimum_savings": 0.25,
-        "planning_interval_minutes": 30,
-    }
-    context = _context()
-    context.current_enphase_profile = "AI Optimisation"
-    context.enphase_ai_profile = "AI Optimisation"
-    context.enphase_self_consumption_profile = "Self-Consumption"
-    context.enphase_full_backup_profile = "Full Backup"
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.10,
-            export_price=0.05,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_import_forecast_kw=2.0,
-            haeo_battery_charge_forecast_kw=2.0,
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=30),
-            import_price=0.50,
-            export_price=0.40,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=2.0,
-            haeo_battery_discharge_forecast_kw=2.0,
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.actions[0].asset == ActionAsset.ENPHASE
-    assert plan.actions[0].desired_state["profile"] == "Full Backup"
-    assert plan.actions[0].desired_state["arbitrage_source"] == "haeo_battery_arbitrage_value"
-    assert plan.actions[0].desired_state["arbitrage_direction"] == "charge"
-    assert plan.actions[0].expected_cost_delta == 0.3
-    assert plan.actions[0].requires_haeo_plan_id == context.plan_id
-
-
-def test_active_ev_plan_requires_haeo_only_when_current_grid_evidence_is_used() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
-    context = _context()
-    context.slots[0].haeo_grid_import_forecast_kw = 1.0
-    context.slots[0].haeo_grid_export_forecast_kw = 0.0
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
-    assert action.requires_haeo_plan_id == context.plan_id
-
-    context.haeo_status = HAEOStatus.STALE
-    fallback_plan = DryRunPlanner(options).create_plan(context)
-    fallback_action = next(action for action in fallback_plan.actions if action.asset == ActionAsset.EV)
-    assert fallback_action.requires_haeo_plan_id is None
-
-
-def test_stale_haeo_arbitrage_evidence_falls_back_to_deterministic_forecast() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "enphase_minimum_savings": 0.25,
-        "planning_interval_minutes": 30,
-    }
-    context = _context()
-    context.haeo_status = HAEOStatus.STALE
-    context.current_enphase_profile = "AI Optimisation"
-    context.enphase_ai_profile = "AI Optimisation"
-    context.enphase_self_consumption_profile = "Self-Consumption"
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=offset),
-            import_price=import_price,
-            export_price=0.20,
-            pv_forecast_kw=pv_forecast_kw,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=10.0,
-        )
-        for offset, import_price, pv_forecast_kw in [(0, 0.05, 4.0), (30, 0.15, 3.0)]
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.actions[0].desired_state["arbitrage_source"] == "forecast_solar_export_value"
-    assert plan.actions[0].requires_haeo_plan_id is None
-
-
-def test_enphase_arbitrage_ignores_non_finite_direct_haeo_evidence() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "enphase_minimum_savings": 0.25,
-        "planning_interval_minutes": 30,
-    }
-    context = _context()
-    context.current_enphase_profile = "AI Optimisation"
-    context.enphase_ai_profile = "AI Optimisation"
-    context.enphase_self_consumption_profile = "Self-Consumption"
-    context.enphase_full_backup_profile = "Full Backup"
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.05,
-            export_price=0.20,
-            pv_forecast_kw=4.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_import_forecast_kw=float("nan"),
-            haeo_battery_charge_forecast_kw=float("nan"),
-        ),
-        DecisionSlot(
-            valid_at=context.created_at + timedelta(minutes=30),
-            import_price=0.15,
-            export_price=0.20,
-            pv_forecast_kw=3.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=float("inf"),
-            haeo_battery_discharge_forecast_kw=float("-inf"),
-        ),
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.actions[0].asset == ActionAsset.ENPHASE
-    assert plan.actions[0].desired_state["profile"] == "Self-Consumption"
-    assert plan.actions[0].desired_state["arbitrage_source"] == "forecast_solar_export_value"
-    assert plan.actions[0].desired_state["arbitrage_direction"] == "consume"
-    assert plan.actions[0].expected_cost_delta == 0.27
-
-
-def test_enphase_restore_not_suppressed_by_non_finite_direct_haeo_evidence() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "enphase_minimum_savings": 0.25,
-        "planning_interval_minutes": 30,
-    }
-    context = _context()
-    context.current_enphase_profile = "Self-Consumption"
-    context.enphase_ai_profile = "AI Optimisation"
-    context.enphase_self_consumption_profile = "Self-Consumption"
-    context.enphase_full_backup_profile = "Full Backup"
-    context.current_ev_soc_percent = None
-    context.slots = [
-        DecisionSlot(
-            valid_at=context.created_at,
-            import_price=0.10,
-            export_price=0.12,
-            pv_forecast_kw=1.0,
-            baseline_load_forecast_kw=2.0,
-            haeo_grid_export_forecast_kw=float("nan"),
-            haeo_battery_discharge_forecast_kw=float("nan"),
-        )
-    ]
-
-    plan = DryRunPlanner(options).create_plan(context)
-
-    assert plan.actions[0].asset == ActionAsset.ENPHASE
-    assert plan.actions[0].kind == ActionKind.RESTORE_AI
-    assert plan.actions[0].desired_state["arbitrage_source"] == "insufficient_arbitrage_evidence"
-    assert plan.actions[0].reason_codes == ["enphase_insufficient_arbitrage_evidence_below_threshold"]
-    assert plan.actions[0].expected_cost_delta == 0.0

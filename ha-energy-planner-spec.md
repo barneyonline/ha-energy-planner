@@ -2,18 +2,14 @@
 
 > **v0.6 native EV uplift:** Energy Planner now owns EV smart-charging optimization and directly controls a configured charger switch or start/stop controls. Native Target SOC and Ready by entities supersede the v1 dependency on EV Smart Charging. Legacy keys remain readable only for migration. Where the historical v1 text below refers to EV Smart Charging, the v0.6 implementation and requirement evidence in `docs/requirements-audit.md` take precedence.
 
-> **Built-in load forecast uplift:** Energy Planner now requires a measured
-> whole-home power sensor and trains its household-load forecast locally from
-> Home Assistant Recorder history. HAFO is not required. HAEO is optional and
-> only actions that consume HAEO evidence depend on it. This current contract
-> and `docs/requirements-audit.md` take precedence over historical HAFO/required
-> HAEO language below.
+> **Current optimizer contract:** Energy Planner requires a measured whole-home
+> power sensor and trains its household-load forecast locally from Home
+> Assistant Recorder history. External optimizer support has been retired.
 
 ## 1. Purpose
 
 `ha-energy-planner` is a Home Assistant custom integration that coordinates
-home energy decisions. It has a deterministic local planner and can optionally
-consume HAEO energy-flow evidence when available:
+home energy decisions using a deterministic local planner:
 
 - EV charging requirements and execution through the existing EV Smart
   Charging integration.
@@ -50,7 +46,7 @@ them without changing the core plan, safety, or audit contracts.
   occupancy, device state, and vehicle state.
 - Configurable, hard constraints for battery reserve, EV SOC, EV ready-by time,
   and occupied HVAC comfort.
-- Cost-minimizing deterministic planning with optional HAEO enhancement.
+- Cost-minimizing deterministic planning.
 - Automatic control, subject to hard constraints, freshness checks, and manual
   override rules.
 - Local AI advice within a deterministic policy envelope.
@@ -95,8 +91,7 @@ The integration shall:
 
 1. Build a normalized five-minute decision context for the next 24 hours.
 2. Build a deterministic baseline plan from prices, external PV, the built-in
-   load forecast, grid limits, battery state, and configured battery limits;
-   enrich it with HAEO evidence when available.
+   load forecast, grid limits, battery state, and configured battery limits.
 3. Build hard constraints from user options and current state.
 4. Schedule EV charging to meet forecast driving needs by the active
    `ready_by` deadline at the lowest feasible cost.
@@ -104,8 +99,8 @@ The integration shall:
    preconditioning rule introduced in a future configuration option.
 6. Delay or suppress an HVAC automation when the comfort range remains valid
    and an expensive tariff period makes the action uneconomic.
-7. Project flexible EV/HVAC demand into a second HAEO solve so the battery and
-   grid plan reflects the intended flexible-load schedule.
+7. Project flexible EV/HVAC demand into the local grid-flow checks so the
+   final schedule respects configured limits.
 8. Validate every planned action immediately before execution.
 9. Publish a human-readable plan, health, next action, confidence, and audit
    status as Home Assistant entities.
@@ -131,13 +126,10 @@ The integration shall:
 flowchart LR
   S["Home Assistant Inputs\nAmber, PV, measured load, Recorder, weather, devices"] --> N["Input Normalizer and built-in load forecast"]
   N --> C["Decision Context\n24 h x 5 min"]
-  C --> H1["Optional HAEO Baseline Solve"]
-  H1 --> P["Flexible-Load Planner\nEV + HVAC + Enphase profile intent"]
-  C --> P
+  C --> P["Flexible-Load Planner\nEV + HVAC + Enphase profile intent"]
   A["Local AI Advisor\nstructured advice only"] --> P
   P --> V["Hard-Constraint Validator"]
-  V --> H2["HAEO Re-solve\nwith flexible-load forecast"]
-  H2 --> X["Execution Gate\nrevalidate current state"]
+  V --> X["Execution Gate\nrevalidate current state"]
   X --> D["HA Services\nEnphase, Daikin, EV Smart Charging"]
   D --> O["Plan and Outcome Audit"]
   O --> N
@@ -148,24 +140,20 @@ flowchart LR
 | Component | Responsibility | Must not do |
 | --- | --- | --- |
 | Source integrations | Expose current state and forecasts. | Make cross-device decisions. |
-| HAEO (optional) | Enhance grid, solar, battery, and forecast-load evidence. | Fetch forecasts, infer intent, or control devices. |
-| `ha-energy-planner` | Compose inputs, create EV/HVAC/profile plan, validate and execute it. | Depend on HAEO private implementation internals. |
+| `ha-energy-planner` | Compose inputs, create EV/HVAC/profile plan, validate and execute it. | Assume undocumented device controls or bypass hard constraints. |
 | Home Assistant automations | Continue normal HVAC scheduling outside planner takeover. | Override active planner ownership without the agreed handoff. |
 | Local AI advisor | Produce bounded recommendations and explanations. | Call services, modify hard constraints, or replace the deterministic planner. |
 
-### 5.2 Two-pass planning loop
+### 5.2 Planning loop
 
 1. Normalize forecast and current-state inputs.
-2. Build the deterministic baseline and optionally request a HAEO solve.
-3. Use available deterministic and HAEO evidence with EV and HVAC constraints to create candidate
-   flexible-load actions.
+2. Build the deterministic baseline from normalized price, PV, household-load,
+   battery, EV, and HVAC evidence.
+3. Apply EV and HVAC constraints to create candidate flexible-load actions.
 4. Convert candidate actions into projected flexible-load power forecasts.
-5. Run HAEO a second time with projected flexible demand included.
-6. Validate the final schedule against hard constraints and live ownership.
-7. Publish the plan and execute only the immediate eligible action.
-
-Version 1 performs one re-solve. Iterative re-solving is deferred until replay
-tests show it is needed and does not cause plan oscillation.
+5. Validate projected grid flow and the final schedule against hard constraints
+   and live ownership.
+6. Publish the plan and execute only the immediate eligible action.
 
 ## 6. Home Assistant Integration Inventory
 
@@ -177,8 +165,6 @@ entity IDs change. The following current entities are expected starting points.
 | Amber | `sensor.amber_express_home_general_price` | Import price and forecast. |
 | Amber | `sensor.amber_express_home_feed_in_price` | Export price and forecast. |
 | Amber | `binary_sensor.amber_express_home_price_spike` | Price-spike input and diagnostic signal. |
-| HAEO (optional) | `haeo.optimize` service and HAEO forecast sensors | Baseline and second-pass energy-flow enhancement. |
-| HAEO | Grid, battery, solar, load, and price forecast entities | Forecast exchange and validation. |
 | Enphase | Enphase battery SOC, grid, PV, consumption, and system profile entities | Current energy state and profile control verification. |
 | Daikin | `climate.daikinap02966` | Direct HVAC mode and target control. |
 | Daikin | `sensor.daikinap02966_power` | HVAC power and thermal-model input. |
@@ -214,7 +200,6 @@ services and entity capabilities:
 
 The initial config flow should collect only the minimum safe mapping:
 
-- HAEO hub/optimization service.
 - Amber import/export price entities.
 - Enphase SOC, profile state, and profile-control service mapping.
 - Daikin climate entity and relevant climate automation entity IDs.
@@ -299,7 +284,6 @@ slots: list[DecisionSlot]
 current_battery_soc_percent: float
 current_ev_soc_percent: float | None
 occupancy_state: occupied | away | unknown
-haeo_status: ready | stale | failed
 input_health: healthy | degraded | unsafe
 active_overrides: list[Override]
 ```
@@ -316,9 +300,6 @@ projected_ev_load_kw
 projected_hvac_load_kw
 outdoor_temperature_forecast_c
 occupied
-haeo_battery_soc_forecast_percent
-haeo_grid_import_forecast_kw
-haeo_grid_export_forecast_kw
 ```
 
 ### 8.3 `PlanAction`
@@ -335,7 +316,6 @@ hard_constraints: list[str]
 reason_codes: list[str]
 expected_cost_delta: float | None
 confidence: float
-requires_haeo_plan_id: str | None
 ```
 
 ### 8.4 `ActionOutcome`
@@ -380,7 +360,7 @@ preview in entity attributes.
    method must be documented and conservative when history is sparse.
 4. Clamp required target SOC to configured minimum and maximum values.
 5. Allocate required charging energy to the least-cost feasible slots before
-   ready-by, considering HAEO grid/battery/PV forecast and charger limits.
+   ready-by, considering local grid-flow projections and charger limits.
 6. If the target is infeasible, choose the maximum attainable SOC, raise a
    persistent alert, and retain the evidence in the outcome log.
 7. Execute through EV Smart Charging and verify its observable state.
@@ -408,7 +388,8 @@ without increasing comfort violations.
 ### 9.4 Enphase policy
 
 1. Treat configured battery SOC floor and grid import/export limits as hard.
-2. Use HAEO to evaluate the value of grid charging, discharging, and export.
+2. Use price, PV, household-load, battery-state, and profile evidence to
+   evaluate the value of Enphase profile changes.
 3. Change Enphase profile/mode only when the expected benefit exceeds the
    configurable takeover threshold and no manual or failure hold is active.
 4. Enforce a 30-minute configurable profile hold before another profile change.
@@ -417,8 +398,8 @@ without increasing comfort violations.
 6. Verify each transition through the observed Enphase profile/status entity.
    Do not assume a successful service call implies a successful device change.
 
-No battery-cycle wear cost is included in v1. Efficiency and available battery
-limits should still be represented by HAEO where those inputs are available.
+No battery-cycle wear cost is included in v1. Verified efficiency and available
+battery limits should be represented where mapped entities expose them.
 
 ## 10. AI Advisor
 
@@ -492,12 +473,11 @@ Before every action, confirm:
 1. Planner is enabled and not in dry run.
 2. Plan is current and has not expired.
 3. All required inputs are fresh and valid.
-4. HAEO status is healthy for actions that depend on it.
-5. Asset is available and reports a supported state.
-6. No active user/manual override conflicts with the action.
-7. Hard constraints remain satisfied after the action forecast.
-8. The action does not violate Enphase profile hold or HVAC cycle/rest rules.
-9. The command is materially different from current state.
+4. Asset is available and reports a supported state.
+5. No active user/manual override conflicts with the action.
+6. Hard constraints remain satisfied after the action forecast.
+7. The action does not violate Enphase profile hold or HVAC cycle/rest rules.
+8. The command is materially different from current state.
 
 ### 11.3 Failsafe restore
 
@@ -557,7 +537,6 @@ custom_components/ha_energy_planner/
   inputs.py
   models.py
   forecasts.py
-  haeo_adapter.py
   planner.py
   constraints.py
   executor.py
@@ -606,9 +585,8 @@ An older solve may never overwrite a newer plan.
 ### 13.4 Dependencies
 
 Initial implementation should use Home Assistant APIs and Python standard
-library modules where possible. Do not import HAEO private Python modules.
+library modules where possible.
 
-- HAEO interaction: Home Assistant entities and supported service calls only.
 - Forecast/history: mapped forecast entities plus Home Assistant Recorder data
   where supported.
 - Optimization: deterministic scheduling heuristics in v1. Add a declared,
@@ -634,7 +612,7 @@ or compute unsuitable, migrate only those functions to a separate App and
 time-series database without changing the entity/service contract.
 
 Provide `async_get_config_entry_diagnostics` with redacted input health,
-entity mapping, plan metadata, recent action outcomes, and HAEO status. Do not
+entity mapping, plan metadata, and recent action outcomes. Do not
 include API tokens, raw local-model prompts, addresses, or full location data.
 
 ## 15. Test Strategy
@@ -657,8 +635,7 @@ include API tokens, raw local-model prompts, addresses, or full location data.
 - Debounce, cancellation, and stale-plan race handling.
 - Entity updates and service validation.
 - Safe unload and restart recovery.
-- Service-call sequencing with mocked Enphase, Daikin, EV Smart Charging, and
-  HAEO entities/services.
+- Service-call sequencing with mocked Enphase, Daikin, and EV charger controls.
 
 ### 15.3 Replay tests
 
@@ -696,7 +673,6 @@ Build:
 - Entity mapping, source validation, input freshness, and health sensor.
 - Five-minute scheduler and material-change debounce.
 - Decision-context and plan data models.
-- HAEO adapter that reads/publishes only supported entities/services.
 - Compact plan status, next action, diagnostics, and audit storage.
 - Deterministic dry-run plan generation with no device service calls.
 
@@ -756,7 +732,7 @@ Build:
 - Verified Enphase service/profile mapping.
 - Takeover benefit threshold, 30-minute hold, status confirmation, and AI
   restore action.
-- Second-pass HAEO planning with flexible-demand forecast.
+- Projected flexible-demand grid-limit validation.
 
 Exit criteria:
 
@@ -803,8 +779,8 @@ tasks that must complete before the relevant execution milestone:
 4. Identify the local Home Assistant conversation/model agent and whether it
    can reliably return structured JSON.
 5. Verify MINI trip-history availability and establish the fallback SOC option.
-6. Confirm forecast attribute formats and units for Amber, external PV, the
-   measured household-load sensor, and optional HAEO evidence.
+6. Confirm forecast attribute formats and units for Amber, external PV, and the
+   measured household-load sensor.
 
 ## 19. First Build Definition
 

@@ -19,7 +19,6 @@
     "current_battery_soc_percent": 55,
     "current_ev_soc_percent": 35,
     "occupancy_state": "occupied",
-    "haeo_status": "stale",
     "input_health": "unsafe",
     "input_issues": ["amber_import_price_stale"],
     "slots": [

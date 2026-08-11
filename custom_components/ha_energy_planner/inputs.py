@@ -59,7 +59,7 @@ from .forecasts import (
     normalize_scalar_value,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
-from .models import DecisionContext, DecisionSlot, HAEOStatus, InputHealth, OccupancyState, Override
+from .models import DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -296,7 +296,6 @@ class InputManager:
             current_battery_soc_percent=battery_soc,
             current_ev_soc_percent=ev_soc,
             occupancy_state=occupancy_state,
-            haeo_status=HAEOStatus.READY if input_health != InputHealth.UNSAFE else HAEOStatus.STALE,
             input_health=input_health,
             current_enphase_profile=enphase_profile,
             enphase_ai_profile=_profile_name(self.entry_data, CONF_ENPHASE_AI_PROFILE, DEFAULT_ENPHASE_AI_PROFILE),

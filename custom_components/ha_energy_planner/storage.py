@@ -18,7 +18,6 @@ _LIST_FIELDS = {
     "execution_audit",
     "forecast_snapshots",
     "dry_run_comparisons",
-    "haeo_runs",
     "outcomes",
     "overrides",
 }
@@ -70,6 +69,8 @@ class PlannerStore:
                 await self._legacy_store.async_save(marked_legacy)
         if loaded:
             self.data = _normalize_loaded_data(loaded)
+            if self.data != loaded:
+                await self._store.async_save(self.data)
 
     async def async_save_plan(self, plan: EnergyPlan) -> None:
         """Persist the compact active plan."""
@@ -134,13 +135,6 @@ class PlannerStore:
     async def async_save_builtin_load_forecast(self, model: dict[str, Any]) -> None:
         """Persist the aggregate Recorder-trained load model."""
         await self._async_set_if_changed("built_in_load_forecast", model)
-
-    async def async_add_haeo_run(self, run: dict[str, Any]) -> None:
-        """Persist compact HAEO run metadata."""
-        runs = list(self.data.get("haeo_runs", []))
-        runs.append(to_jsonable(run))
-        self.data["haeo_runs"] = _retain_by_time(runs, hours=48, hard_cap=2048)
-        await self._async_save()
 
     async def async_add_ai_recommendation(self, recommendation: dict[str, Any]) -> None:
         """Persist compact AI recommendation metadata."""
@@ -261,7 +255,6 @@ def _default_data() -> dict[str, Any]:
         "ev_grid_reservation": {},
         "forecast_calibration": {},
         "built_in_load_forecast": {},
-        "haeo_runs": [],
         "discovery": {},
         "command_rate_limits": {},
         "production": {},
@@ -275,6 +268,7 @@ def _default_data() -> dict[str, Any]:
 def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data = _default_data()
     data.update(loaded)
+    data.pop("haeo_runs", None)
     for key in _LIST_FIELDS:
         if not isinstance(data.get(key), list):
             data[key] = []
@@ -284,6 +278,20 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     active_plan = data.get("active_plan")
     if active_plan is not None and not isinstance(active_plan, dict):
         data["active_plan"] = None
+    elif isinstance(active_plan, dict):
+        actions = active_plan.get("actions")
+        if isinstance(actions, list):
+            normalized_actions = []
+            for action in actions:
+                if not isinstance(action, dict):
+                    normalized_actions.append(action)
+                    continue
+                normalized_action = dict(action)
+                normalized_action.pop("requires_haeo_plan_id", None)
+                normalized_actions.append(normalized_action)
+            active_plan = dict(active_plan)
+            active_plan["actions"] = normalized_actions
+            data["active_plan"] = active_plan
     return data
 
 
@@ -352,7 +360,6 @@ def _dry_run_signature(item: dict[str, Any]) -> dict[str, Any]:
                 "reason_codes",
                 "expected_cost_delta",
                 "confidence",
-                "requires_haeo_plan_id",
             )
         }
     else:
