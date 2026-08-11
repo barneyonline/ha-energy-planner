@@ -7,11 +7,7 @@ from types import SimpleNamespace
 
 from custom_components.ha_energy_planner.const import DOMAIN
 from custom_components.ha_energy_planner.models import InputHealth, PlannerMode
-from custom_components.ha_energy_planner.system_health import (
-    _latest_haeo_metric,
-    _latest_value,
-    system_health_info,
-)
+from custom_components.ha_energy_planner.system_health import _latest_value, system_health_info
 
 
 class FakeConfigEntries:
@@ -44,19 +40,16 @@ def test_system_health_reports_loaded_planner_state() -> None:
         },
         store=SimpleNamespace(
             data={
-                "haeo_runs": [
-                    {
-                        "baseline": {"status": "ready", "duration_ms": 10.0, "cache_hit": False},
-                        "second_pass": {"duration_ms": 2.5, "cache_hit": True},
-                    }
-                ],
                 "ai_recommendations": [{"status": "accepted"}],
             }
         ),
     )
     entry = SimpleNamespace(
         runtime_data=coordinator,
-        data={"amber_import_price_entity": "sensor.price", "daikin_climate_entity": "climate.home"},
+        data={
+            "amber_import_price_entity": "sensor.price",
+            "daikin_climate_entity": "climate.home",
+        },
     )
     hass = SimpleNamespace(config_entries=FakeConfigEntries([entry]))
 
@@ -72,7 +65,6 @@ def test_system_health_reports_loaded_planner_state() -> None:
         "plan_mode": "DRY_RUN",
         "plan_health": "healthy",
         "configured_input_sections": 2,
-        "latest_haeo_status": "ready",
         "last_refresh_duration_ms": 15.0,
         "refreshes_per_hour": 12,
         "refresh_trigger_counts": {},
@@ -88,8 +80,6 @@ def test_system_health_reports_loaded_planner_state() -> None:
             "coalesced": 4,
             "phase_durations_ms": {"inputs": 4.5},
         },
-        "latest_haeo_duration_ms": 12.5,
-        "latest_haeo_cache_hit": True,
         "latest_ai_status": "accepted",
     }
 
@@ -125,6 +115,7 @@ def test_system_health_aggregates_multiple_entries_deterministically() -> None:
         return SimpleNamespace(
             entry_id=entry_id,
             runtime_data=coordinator,
+            data={},
             subentries={"ev": object()},
         )
 
@@ -167,6 +158,7 @@ def test_system_health_keeps_worst_entry_in_truncated_details() -> None:
         return SimpleNamespace(
             entry_id=entry_id,
             runtime_data=coordinator,
+            data={},
             subentries={"ev": object()},
         )
 
@@ -190,7 +182,3 @@ def test_latest_value_rejects_malformed_history() -> None:
     assert _latest_value([], "duration_ms") is None
     assert _latest_value(["invalid"], "duration_ms") is None
     assert _latest_value([{"duration_ms": 4.0}], "duration_ms") == 4.0
-    assert _latest_haeo_metric(None, "duration_ms") is None
-    assert _latest_haeo_metric([{"duration_ms": 3.0}], "duration_ms") == 3.0
-    assert _latest_haeo_metric([{"baseline": {"status": "ready"}}], "duration_ms") is None
-    assert _latest_haeo_metric([{"baseline": {"status": "ready"}}], "status") == "ready"

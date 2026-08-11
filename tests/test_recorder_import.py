@@ -326,7 +326,7 @@ def test_builtin_load_forecast_force_retrains_recent_model(monkeypatch: Any) -> 
     def fake_train(*args: Any) -> dict[str, Any]:
         nonlocal calls
         calls += 1
-        return {"status": "learning", "quality_failures": ["insufficient_complete_days"]}
+        return {"status": "learning", "quality_failures": ["insufficient_training_days"]}
 
     monkeypatch.setattr(recorder_import, "_build_household_load_forecast_model", fake_train)
     skipped = asyncio.run(

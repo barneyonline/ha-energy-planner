@@ -21,6 +21,8 @@ from custom_components.ha_energy_planner.load_forecast import (
     _parse_datetime,
     _percentile,
     _power_events,
+    _profile_interval_average,
+    _profile_is_forecastable,
     _profile_value,
     _quality_failures,
     _rolling_validation,
@@ -278,8 +280,66 @@ def test_three_complete_days_can_train_while_short_or_gappy_history_remains_lear
     assert three_day["validation"]["positive_residual_p90_kw"] >= 0
     assert short["complete_days"] == 2
     assert short["status"] == "learning"
-    assert "insufficient_complete_days" in short["quality_failures"]
+    assert "insufficient_training_days" in short["quality_failures"]
     assert gappy["status"] in {"learning", "failed"}
+
+
+def test_bounded_negative_and_ev_gaps_still_qualify_training_days() -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    load_states: list[HistoryState] = []
+    ev_states: list[HistoryState] = []
+    for state in _history(now):
+        # Simulate historical signed-source glitches and normal EV exclusions
+        # without allowing either bounded gap to invalidate the whole day.
+        gap_hour = state.last_updated.day % 12
+        load_value = "-1" if state.last_updated.hour == gap_hour and state.last_updated.minute == 0 else state.state
+        ev_value = (
+            "charging"
+            if state.last_updated.hour == (gap_hour + 6) % 24 and state.last_updated.minute == 0
+            else "available"
+        )
+        load_states.append(HistoryState(load_value, state.last_updated))
+        ev_states.append(HistoryState(ev_value, state.last_updated))
+
+    model = build_load_forecast_model(
+        load_states,
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+        ev_charging_states=ev_states,
+    )
+
+    assert model["fully_observed_days"] == 0
+    assert model["complete_days"] == model["fully_observed_days"]
+    assert model["training_days"] >= 3
+    assert model["minimum_training_day_coverage"] == 0.8
+    assert model["status"] == "ready"
+    assert model["quality_failures"] == []
+
+
+def test_recurring_training_day_gaps_do_not_produce_an_unusable_ready_model() -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    states = [
+        HistoryState(
+            "unavailable" if 1 <= state.last_updated.hour < 5 else state.state,
+            state.last_updated,
+        )
+        for state in _history(now, days=7)
+    ]
+
+    model = build_load_forecast_model(
+        states,
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+
+    assert model["training_days"] >= 3
+    assert model["history_coverage"] >= 0.8
+    assert model["status"] == "failed"
+    assert "forecast_profile_unavailable" in model["quality_failures"]
 
 
 def test_recent_correction_is_bounded_and_fades_without_reducing_upper_bound() -> None:
@@ -373,7 +433,7 @@ def test_partially_observed_days_do_not_satisfy_complete_day_gate() -> None:
     assert model["history_coverage"] >= 0.79
     assert model["complete_days"] == 0
     assert model["status"] == "learning"
-    assert "insufficient_complete_days" in model["quality_failures"]
+    assert "insufficient_training_days" in model["quality_failures"]
 
 
 def test_exact_midnight_history_start_retains_first_complete_day() -> None:
@@ -434,6 +494,53 @@ def test_profile_interpolation_accepts_only_gaps_up_to_thirty_minutes() -> None:
     assert accepted.expected_kw[0] is not None
     assert rejected.expected_kw == [None]
     assert rejected.status == "failed"
+
+
+def test_profile_forecastability_rejects_malformed_and_long_runtime_gaps() -> None:
+    values: list[float | None] = [1.0] * BUCKETS_PER_DAY
+    values[48:51] = [None, None, None]
+    profiles = {
+        day_type: {"expected": list(values), "upper": list(values)}
+        for day_type in ("weekday", "weekend")
+    }
+
+    assert _profile_is_forecastable(None) is False
+    assert _profile_is_forecastable(profiles["weekday"]) is False
+    assert _profile_interval_average(
+        profiles,
+        datetime(2026, 6, 27, 12, tzinfo=UTC),
+        interval_minutes=15,
+        zone=ZoneInfo("UTC"),
+        profile_key="expected",
+    ) is None
+
+
+def test_unexpected_runtime_profile_failure_still_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = datetime(2026, 6, 27, 12, tzinfo=UTC)
+    model = build_load_forecast_model(
+        _history(now),
+        now=now,
+        timezone="UTC",
+        source_entity_id="sensor.house_load",
+        load_unit="kW",
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.load_forecast._profile_interval_average",
+        lambda *args, **kwargs: None,
+    )
+
+    forecast = load_forecast_from_model(
+        model,
+        now=now,
+        timezone="UTC",
+        horizon_hours=0.25,
+        interval_minutes=15,
+        source_entity_id="sensor.house_load",
+    )
+
+    assert forecast.expected_kw == [None]
+    assert forecast.upper_kw == [None]
+    assert forecast.status == "failed"
 
 
 def test_model_age_transitions_and_source_or_shape_mismatch_fail_closed() -> None:
@@ -621,7 +728,7 @@ def test_validation_skips_unaligned_origins_and_reports_quality_failures() -> No
         ]
     )
     failures = _quality_failures(
-        complete_days=3,
+        training_days=3,
         history_coverage=1.0,
         validation={
             "origin_count": 2,

@@ -21,7 +21,7 @@ Energy Planner is a local-first Home Assistant custom integration for coordinati
 - A guarded **Automatic control** switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
 - A built-in household-load forecast trained from Home Assistant Recorder
 - Native EV scheduling and tariff-aware climate preconditioning
-- Optional Enphase profile control, HAEO evidence, and on-demand AI troubleshooting
+- Optional Enphase profile control and on-demand AI troubleshooting
 - Notifications only for problems that normally require user action
 
 ## Requirements
@@ -36,9 +36,9 @@ For full planning, configure:
 - Home Assistant Recorder
 - Battery state of charge and the entities for each device you want to control
 
-Weather, carbon intensity, measured PV power, HAEO, and AI are optional. HAFO is not required. An external solar forecast is still required.
+Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.2.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.3.
 
 ## Installation
 
@@ -89,13 +89,13 @@ interval.
 
 The model requires:
 
-- Three complete local-time days
+- Three qualifying local-time training days with at least 80% valid buckets each
 - At least 80% overall valid coverage
 - Two holdout origins with at least 144 aligned samples
 - Accuracy no more than 10% worse than previous-day persistence
 - At least 90% conservative-bound coverage
 
-**History days** means Recorder data exists for those dates. **Complete days** is stricter: every 15-minute bucket must have enough valid cleaned data. EV charging, negative readings, unavailable states, or missing HVAC alignment can therefore produce nine history days but only three complete days.
+**History days** means Recorder data exists for those dates. **Training days** may contain bounded gaps: EV charging, historical negative readings, unavailable states, or missing HVAC alignment can remove up to 20% of a day's buckets without discarding the entire day. The model still requires rolling holdout validation and three observations for every production-profile clock bucket.
 
 Training runs at startup, after a source change, and at most every six hours. Replanning cannot create missing history. While the status is `learning`, plans remain visible but forecast-dependent active commands are blocked. Models are `ready` through 24 hours old, `degraded` from 24 to 72 hours, and `stale` after 72 hours.
 
@@ -121,7 +121,7 @@ EV planning considers target SOC, ready-by time, price, solar, battery reserve, 
 
 Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs.
 
-Enphase planning can select configured self-consumption, backup, or AI profiles. Only actions that actually consume HAEO evidence depend on HAEO.
+Enphase planning can select configured self-consumption, backup, or AI profiles using local tariff, PV, household-load, battery, and policy evidence.
 
 ## Safety and recovery
 

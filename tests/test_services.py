@@ -276,10 +276,9 @@ def test_run_preflight_returns_active_mode_readiness_without_scheduling_work() -
     assert hass.created_tasks == []
 
 
-def test_run_preflight_reports_missing_configured_entities_and_services() -> None:
+def test_run_preflight_reports_missing_entities() -> None:
     coordinator = _coordinator()
     coordinator.entry.data["ev_smart_charging_stop_entity"] = "input_boolean.missing_stop"
-    coordinator.entry.data["haeo_optimize_service"] = "haeo.missing"
     coordinator.entry.options["planner_enabled"] = True
     hass = FakeHass(coordinator)
     asyncio.run(async_setup(hass, {}))
@@ -289,11 +288,10 @@ def test_run_preflight_reports_missing_configured_entities_and_services() -> Non
 
     assert response["ok"] is False
     assert "input_boolean.missing_stop" in response["entities"]["missing"]
-    assert "haeo.missing" in response["services"]["unavailable"]
-    assert response["discovery"]["haeo"]["supported"] is False
+    assert response["services"]["unavailable"] == []
     checks = {check["check"]: check for check in response["checks"]}
     assert "input_boolean.missing_stop" in checks["configured_entities_available"]["message"]
-    assert "haeo.missing" in checks["configured_services_available"]["message"]
+    assert checks["configured_services_available"]["ok"] is True
 
 
 def test_run_preflight_accepts_unknown_stateless_ev_buttons() -> None:
@@ -514,14 +512,14 @@ def test_run_preflight_ignores_entities_for_disabled_control_areas() -> None:
 
 def test_run_preflight_no_control_dry_run_treats_discovery_as_advisory() -> None:
     coordinator = _partial_coordinator(
-        {"haeo_optimize_service": "haeo.missing"},
+        {"haeo_optimize_service": "retired.value"},
         planner_enabled=False,
         dry_run=True,
     )
     response = _run_preflight(coordinator)
 
     assert response["ok"] is False
-    assert response["control_areas"]["configured"] == ["haeo"]
+    assert response["control_areas"]["configured"] == []
     assert response["control_areas"]["required"] == []
     assert response["services"]["configured"] == []
     assert response["production"]["ready_to_arm"] is False
@@ -551,17 +549,17 @@ def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
     assert "hvac" in checks["required_control_areas_supported"]["message"]
 
 
-def test_run_preflight_requires_configured_haeo_for_enabled_planning() -> None:
+def test_run_preflight_ignores_retired_optimizer_configuration() -> None:
     coordinator = _partial_coordinator(
-        {"haeo_optimize_service": "haeo.optimize"},
+        {"haeo_optimize_service": "retired.value"},
         planner_enabled=True,
         dry_run=False,
     )
     response = _run_preflight(coordinator)
 
-    assert response["ok"] is True
-    assert response["control_areas"]["required"] == ["haeo"]
-    assert response["services"]["configured"] == ["haeo.optimize"]
+    assert response["ok"] is False
+    assert response["control_areas"]["required"] == []
+    assert response["services"]["configured"] == []
 
 
 def test_run_preflight_separates_historical_evidence_from_current_safety() -> None:
@@ -719,7 +717,7 @@ def test_run_preflight_rejects_truthy_string_safety_options() -> None:
 def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
     entry_data = {
         "ev_smart_charging_start_entity": "button.ev_start",
-        "haeo_optimize_service": "haeo.optimize",
+        "haeo_optimize_service": "retired.value",
         "ai_task_entity": "ai_task.local",
     }
     options = {
@@ -860,7 +858,6 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
         {
             "entry_id": entry_id,
             "data": {
-                "haeo_optimize_service": "haeo.optimize",
                 "amber_import_price_entity": "sensor.import_price",
                 "amber_export_price_entity": "sensor.export_price",
                 "pv_forecast_entity": "sensor.pv_forecast",

@@ -24,36 +24,34 @@ trap cleanup EXIT
 
 mkdir -p "$TMP_DIR/custom_components" "$TMP_DIR/.storage"
 cp -R "$ROOT_DIR/custom_components/ha_energy_planner" "$TMP_DIR/custom_components/"
-mkdir -p "$TMP_DIR/custom_components/fake_haeo"
-cat > "$TMP_DIR/custom_components/fake_haeo/manifest.json" <<'JSON'
+mkdir -p "$TMP_DIR/custom_components/fake_planner_test"
+cat > "$TMP_DIR/custom_components/fake_planner_test/manifest.json" <<'JSON'
 {
-  "domain": "fake_haeo",
-  "name": "Fake HAEO",
+  "domain": "fake_planner_test",
+  "name": "Fake Planner Test Helpers",
   "version": "0.1.0",
-  "documentation": "https://example.invalid/fake-haeo",
+  "documentation": "https://example.invalid/fake-planner-test",
   "integration_type": "hub",
   "iot_class": "local_push"
 }
 JSON
-cat > "$TMP_DIR/custom_components/fake_haeo/__init__.py" <<'PY'
-"""Fake HAEO service-response integration for Docker smoke tests."""
+cat > "$TMP_DIR/custom_components/fake_planner_test/__init__.py" <<'PY'
+"""Test helpers for Docker smoke tests."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 import json
-import voluptuous as vol
-
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.util import dt as dt_util
 
-DOMAIN = "fake_haeo"
+DOMAIN = "fake_planner_test"
 PLATFORMS: list[Platform] = []
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Register a response-capable fake HAEO optimize service."""
+    """Register smoke-test helper services."""
 
     async def force_trip_import_due(call: ServiceCall) -> None:
         """Mark HA Energy Planner trip Recorder import due for smoke validation."""
@@ -165,59 +163,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
         }
 
-    async def optimize(call: ServiceCall) -> dict:
-        horizon_slot_count = max(1, int(call.data.get("horizon_slot_count", 12)))
-        export_state = hass.states.get("input_number.export_price")
-        import_state = hass.states.get("input_number.import_price")
-        try:
-            export_price = float(export_state.state) if export_state else 0.0
-        except (TypeError, ValueError):
-            export_price = 0.0
-        try:
-            import_price = float(import_state.state) if import_state else 0.0
-        except (TypeError, ValueError):
-            import_price = 0.0
-
-        if export_price >= 0.5:
-            slots = [
-                {
-                    "gridImportW": 0,
-                    "gridExportW": 6000,
-                    "batteryChargeW": 0,
-                    "batteryDischargeW": 6000,
-                    "batterySocPercent": 58,
-                }
-                for _index in range(horizon_slot_count)
-            ]
-        else:
-            slots = [
-                {
-                    "gridImportW": 1200 if import_price >= 0 else 0,
-                    "gridExportW": 0,
-                    "batteryChargeW": 500,
-                    "batteryDischargeW": 0,
-                    "batterySocPercent": 56,
-                }
-                for _index in range(horizon_slot_count)
-            ]
-
-        return {
-            "ok": True,
-            "phase": call.data.get("phase"),
-            "plan_id": call.data.get("plan_id"),
-            "result": {"slots": slots},
-        }
-
-    hass.services.async_register(
-        DOMAIN,
-        "optimize",
-        optimize,
-        schema=vol.Schema(
-            {vol.Optional("flexible_load_projection", default=[]): list},
-            extra=vol.ALLOW_EXTRA,
-        ),
-        supports_response=SupportsResponse.ONLY,
-    )
     hass.services.async_register(
         DOMAIN,
         "ai_advice",
@@ -243,7 +188,7 @@ PY
 cat > "$TMP_DIR/configuration.yaml" <<'YAML'
 default_config:
 
-fake_haeo:
+fake_planner_test:
 
 input_number:
   import_price:
@@ -411,11 +356,6 @@ climate:
     max_temp: 35
     target_temp: 21
 
-script:
-  haeo_optimize:
-    sequence:
-      - delay: "00:00:00"
-
 template:
   - sensor:
       - name: Smoke import price forecast
@@ -487,7 +427,7 @@ automation:
         event: start
     actions:
       - delay: "00:00:08"
-      - action: fake_haeo.seed_production_evidence
+      - action: fake_planner_test.seed_production_evidence
       - action: ha_energy_planner.arm_production_control
         data:
           reason: docker_smoke_reviewed_contract
@@ -617,7 +557,7 @@ automation:
         data:
           entity_id: input_boolean.ev_connected
       - delay: "00:00:05"
-      - action: fake_haeo.force_trip_import_due
+      - action: fake_planner_test.force_trip_import_due
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_number.set_value
@@ -628,7 +568,7 @@ automation:
         data:
           entity_id: input_number.baseline_load
           value: 2.0
-      - action: fake_haeo.seed_due_forecast_snapshot
+      - action: fake_planner_test.seed_due_forecast_snapshot
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_number.set_value
@@ -649,7 +589,7 @@ automation:
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_change_from_scheduler
-      - action: fake_haeo.seed_thermal_model_sample
+      - action: fake_planner_test.seed_thermal_model_sample
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_select.select_option
@@ -743,7 +683,7 @@ automation:
         data:
           entity_id: input_number.export_price
           value: 0.60
-      - action: fake_haeo.seed_enphase_command_rate_limit
+      - action: fake_planner_test.seed_enphase_command_rate_limit
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: button.press
@@ -782,7 +722,7 @@ automation:
         data:
           reason: docker_smoke_automatic_control
       - delay: "00:00:01"
-      - action: fake_haeo.seed_production_evidence
+      - action: fake_planner_test.seed_production_evidence
       - action: switch.turn_on
         data:
           entity_id: switch.energy_planner_automatic_control
@@ -1000,12 +940,11 @@ cat > "$TMP_DIR/.storage/ha_energy_planner_state" <<'JSON'
       }
     },
     "production": {
-      "armed": true,
+      "armed": false,
       "armed_at": "2026-06-27T00:00:00+00:00",
       "armed_reason": "docker_smoke",
       "acknowledged_at": "2026-06-27T00:00:00+00:00",
-      "dry_run_ready_cycles": 3,
-      "dry_run_evidence_fingerprint": "257f55a1b55f9b2be3ac33fd1e53358ff7db4de695473c461751973bf6928181"
+      "dry_run_ready_cycles": 0
     }
   }
 }
@@ -1023,8 +962,8 @@ trained_at = datetime.now(UTC).isoformat()
 expected = [1.2] * 96
 upper = [1.5] * 96
 payload["data"]["built_in_load_forecast"] = {
-    "model_version": 1,
-    "contract_version": 2,
+    "model_version": 2,
+    "contract_version": 3,
     "status": "ready",
     "quality_ready": True,
     "quality_failures": [],
@@ -1036,7 +975,10 @@ payload["data"]["built_in_load_forecast"] = {
     "history_started_on": "2026-06-01",
     "history_ended_on": "2026-06-27",
     "history_days": 26,
+    "training_days": 26,
     "complete_days": 26,
+    "fully_observed_days": 26,
+    "minimum_training_day_coverage": 0.8,
     "history_coverage": 1.0,
     "validation": {
         "origin_count": 2,
@@ -1163,14 +1105,6 @@ if active_plan.get("mode") not in {"DISABLED", "DRY_RUN", "ACTIVE_HEALTHY", "ACT
     raise SystemExit(f"Unexpected persisted planner mode: {active_plan.get('mode')}")
 if active_plan.get("mode") not in {"ACTIVE_HEALTHY", "ACTIVE_DEGRADED"}:
     raise SystemExit(f"Automatic control did not produce an active plan: {active_plan.get('mode')}")
-if not store_data.get("haeo_runs"):
-    raise SystemExit("Planner Store did not persist optional-HAEO fallback metadata")
-if not any(
-    run.get("baseline", {}).get("status") != "ready"
-    and not run.get("baseline", {}).get("evidence_counts")
-    for run in store_data.get("haeo_runs", [])
-):
-    raise SystemExit("Smoke run did not exercise deterministic planning without HAEO evidence")
 if "discovery" not in store_data:
     raise SystemExit("Planner Store did not persist discovery data")
 ai_discovery = store_data.get("discovery", {}).get("ai", {})
@@ -1227,8 +1161,6 @@ if not any(
     for action in snapshot_actions
 ):
     raise SystemExit("Forecast snapshots did not persist an active EV schedule allocated to a negative import-price slot")
-if any(action.get("requires_haeo_plan_id") for action in snapshot_actions):
-    raise SystemExit("Deterministic smoke actions unexpectedly retained an HAEO dependency")
 if not latest_snapshot.get("forecast_training_slots"):
     raise SystemExit("Forecast snapshot did not include compact forecast training slots")
 forecast_training_slots = latest_snapshot.get("forecast_training_slots", [])

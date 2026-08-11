@@ -16,14 +16,6 @@ class OccupancyState(StrEnum):
     UNKNOWN = "unknown"
 
 
-class HAEOStatus(StrEnum):
-    """HAEO health in the current context."""
-
-    READY = "ready"
-    STALE = "stale"
-    FAILED = "failed"
-
-
 class InputHealth(StrEnum):
     """Input health classification."""
 
@@ -73,13 +65,6 @@ class OutcomeResult(StrEnum):
     RESTORED = "restored"
 
 
-class HAEOSolvePhase(StrEnum):
-    """HAEO solve phases."""
-
-    BASELINE = "baseline"
-    FLEXIBLE_LOAD = "flexible_load"
-
-
 @dataclass(slots=True)
 class ForecastPoint:
     """Normalized forecast point."""
@@ -116,12 +101,6 @@ class DecisionSlot:
     projected_hvac_load_kw: float = 0.0
     outdoor_temperature_forecast_c: float | None = None
     occupied: bool | None = None
-    haeo_battery_soc_forecast_percent: float | None = None
-    haeo_grid_import_forecast_kw: float | None = None
-    haeo_grid_export_forecast_kw: float | None = None
-    haeo_battery_charge_forecast_kw: float | None = None
-    haeo_battery_discharge_forecast_kw: float | None = None
-    haeo_grid_includes_flexible_loads: bool = False
     pv_forecast_lower_kw: float | None = None
     baseline_load_forecast_upper_kw: float | None = None
     carbon_intensity_g_per_kwh: float | None = None
@@ -137,7 +116,6 @@ class DecisionContext:
     current_battery_soc_percent: float | None
     current_ev_soc_percent: float | None
     occupancy_state: OccupancyState
-    haeo_status: HAEOStatus
     input_health: InputHealth
     current_enphase_profile: str | None = None
     enphase_ai_profile: str | None = None
@@ -182,7 +160,6 @@ class PlanAction:
     reason_codes: list[str]
     expected_cost_delta: float | None
     confidence: float
-    requires_haeo_plan_id: str | None
 
 
 @dataclass(slots=True)
@@ -211,27 +188,6 @@ class ConstraintViolation:
     asset: ActionAsset | None = None
     action_id: str | None = None
     blocking: bool = True
-
-
-@dataclass(slots=True)
-class FlexibleLoadProjection:
-    """Projected flexible-load contribution for one decision slot."""
-
-    valid_at: datetime
-    ev_load_kw: float = 0.0
-    hvac_load_kw: float = 0.0
-
-
-@dataclass(slots=True)
-class HAEOSolveResult:
-    """Result of invoking or checking HAEO."""
-
-    phase: HAEOSolvePhase
-    status: HAEOStatus
-    reason: str
-    plan_id: str
-    service_called: str | None = None
-    response: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

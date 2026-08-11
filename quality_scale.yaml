@@ -272,7 +272,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   log-when-unavailable:
     status: done
-    comment: Unavailable required inputs and HAEO/service fallback classes are persisted and notified with compact reasons instead of noisy repeated logs.
+    comment: Unavailable required inputs and configured service failures are persisted with compact reasons instead of noisy repeated logs.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -299,7 +299,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit three-day EV and household-history boundaries, startup source-appearance retry coverage, EV opportunistic-charging and earliest-start boundary tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and a no-HAEO Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, startup source-appearance retry coverage, EV opportunistic-charging and earliest-start boundary tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
@@ -491,14 +491,12 @@ rules:
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
-        - custom_components/ha_energy_planner/haeo_adapter.py
         - custom_components/ha_energy_planner/ai_advisor.py
   inject-websession:
     status: n/a
-    comment: The integration does not maintain an aiohttp API client; external optimization and AI calls are delegated to configured Home Assistant services.
+    comment: The integration does not maintain an aiohttp API client; optional AI calls are delegated to configured Home Assistant services.
     references:
       code:
-        - custom_components/ha_energy_planner/haeo_adapter.py
         - custom_components/ha_energy_planner/ai_advisor.py
   strict-typing:
     status: todo

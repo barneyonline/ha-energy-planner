@@ -70,11 +70,6 @@ fi
 run python3 scripts/validate-live-schema-fixture.py \
   --profile ha-energy-planner-v1-real \
   "$LIVE_OUT_DIR"/real_*.json
-if [[ -f "$LIVE_OUT_DIR/real_haeo_response.json" ]]; then
-  run python3 scripts/validate-live-schema-fixture.py \
-    --profile ha-energy-planner-haeo-value-v1-real \
-    "$LIVE_OUT_DIR"/real_*.json
-fi
 run python3 scripts/validate-real-history-fixture.py \
   --profile ha-energy-planner-history-v1-real \
   "$HISTORY_OUT_DIR"/real_*.json

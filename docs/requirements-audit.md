@@ -10,7 +10,7 @@ Status as of 2026-08-09.
   entries remain visible on the main Devices & services integration page rather
   than being routed to the Helpers-only experience.
   Diagnostics expose redacted entity/service mapping, input-health metadata,
-  plan metadata, latest HAEO run status, bounded recent outcomes, and compact
+  plan metadata, bounded recent outcomes, and compact
   Store summaries rather than relying on unbounded raw Store inspection.
   Store load normalizes known schema fields so missing or malformed older data
   falls back to safe list/dict defaults while preserving unknown metadata, and
@@ -47,7 +47,7 @@ Status as of 2026-08-09.
   Target SOC number, manual EV start/stop buttons, and connected helper are
   removed from the entity registry during setup.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
-  plan, HAEO, forecast, bounded action, AI, ownership, override, and outcome
+  plan, forecast, bounded action, AI, ownership, override, and outcome
   records.
 - Published current-state and next-actions attributes are compact, JSON-friendly,
   and bounded so enum/datetime values are serialized and nested action evidence
@@ -62,33 +62,12 @@ Status as of 2026-08-09.
 - Weather forecast attributes and current weather state are normalized into
   outdoor temperature values for the decision context, with canonical attribute
   matching and Fahrenheit-to-Celsius conversion for common weather schemas.
-- HAEO integration uses configured Home Assistant services only, with baseline
-  and flexible-load second-pass calls and no private HAEO imports. Parsed
-  second-pass grid/battery evidence is applied before final hard-constraint
-  validation and persisted with the HAEO run metadata. Service failures,
-  including legacy no-`return_response` fallback failures, are reported as
-  failed HAEO solves instead of raising through planner refresh.
-  EV and Enphase actions carry an HAEO dependency only when their grid-safety
-  or arbitrage decision actually used current HAEO evidence; deterministic
-  fallback actions remain executable while the existing action validator still
-  fails closed for genuinely HAEO-derived actions whose evidence is no longer
-  ready.
-- HAEO response parsing accepts flat slot lists, timestamp-keyed schedules,
-  nested grid/battery evidence, and camelCase live-export keys with W-to-kW
-  normalization; parsed battery charge/discharge evidence is covered through
-  the Enphase arbitrage planner path. Non-finite and out-of-horizon timestamped
-  HAEO evidence is ignored before it can influence grid-limit validation or
-  arbitrage-value calculations.
-- Flexible-load second-pass readiness clears inherited baseline grid fields
-  before checking response coverage. Accepted import/export pairs carry per-slot
-  provenance so constraints and cost estimates do not add projected EV/HVAC
-  demand twice; uncovered slots retain their baseline evidence instead.
 - Safety defaults are fail-closed: execution disabled, dry-run enabled, stale
   required inputs unsafe, non-finite numeric inputs rejected, and due actions
   revalidated before execution.
 - Configurable grid import/export kW limits are represented as options and
-  validated as hard constraints against HAEO grid-flow evidence when available,
-  otherwise against normalized PV/load plus projected EV/HVAC flexible load.
+  validated as hard constraints against normalized PV/load plus projected
+  EV/HVAC flexible load.
 - Native EV charger, Daikin HVAC, and Enphase profile adapters execute through
   mapped Home Assistant entities/services and support restore where configured.
 - Native EV execution optionally confirms mapped charging-state feedback after
@@ -199,11 +178,11 @@ Status as of 2026-08-09.
   user action: broken required mappings/capabilities, failed safe-state
   restoration, infeasible EV readiness, and configured grid hard-limit
   conflicts. Successful restore/preflight operations, routine changes, stale
-  data, and safe HAEO fallback remain silent. Stable IDs and content signatures
+  data remain silent. Stable IDs and content signatures
   deduplicate repeated alerts; the actionable plan-alert group can be disabled
   without changing plan health or fail-closed execution. User-provided reason
   fields are compacted and redacted before they can be shown.
-- Discovery records non-commanding capability evidence for HAEO, EV, Daikin,
+- Discovery records non-commanding capability evidence for EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
 - AI explanation and troubleshooting is on-demand, minimized, structured, and
   whitelisted. Automatic background calls and the AI Enabled entity are removed.
@@ -223,8 +202,7 @@ Status as of 2026-08-09.
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
   override rules, and Enphase holds.
 - Executable live-schema fixtures cover representative Amber price, external
-  PV, optional weather, timestamp-keyed nested HAEO, and list-based nested
-  HAEO response payload shapes through `scripts/validate-live-schema-fixture.py`,
+  PV, and optional weather payload shapes through `scripts/validate-live-schema-fixture.py`,
   so sanitized real Home Assistant exports can be validated outside pytest.
   `scripts/export-real-live-schema.sh` wraps the required real export set, and
   `scripts/export-live-schema-fixture.py` can export individual Home Assistant
@@ -234,10 +212,7 @@ Status as of 2026-08-09.
   `ha-energy-planner-v1-real` profile that reports missing required real-export
   fixture names, mismatched fixture kind/value-kind metadata, and missing
   exported source entity metadata before full live-schema completion is
-  claimed. The optional, stricter `ha-energy-planner-haeo-value-v1-real` profile requires
-  the real HAEO response fixture to include parsed grid import/export and
-  battery charge/discharge evidence before Enphase value-evidence validation is
-  accepted.
+  claimed.
 - Executable real-history fixtures cover Recorder-style MINI trip replay,
   Daikin thermal-model replay, and rolling-origin external-PV forecast accuracy
   through `scripts/validate-real-history-fixture.py`. Forecast evidence is
@@ -264,8 +239,7 @@ Status as of 2026-08-09.
   Recorder model and never accepts a legacy forecast entity as measured input.
 - `scripts/export-real-validation-bundle.sh` runs both real export wrappers and
   enforces the dependency-free core live-schema and Recorder-history profiles.
-  HAEO export and its value-evidence profile run only when an HAEO service is
-  explicitly supplied. Its `--validate-only` mode checks already exported
+  Its `--validate-only` mode checks already exported
   `real_*.json` fixtures without calling Home Assistant again.
 - Docker Home Assistant validation is available through
   `scripts/docker-validate.sh`, `scripts/docker-ha-smoke.sh`, and
@@ -274,9 +248,7 @@ Status as of 2026-08-09.
   `check_config`, and the smoke test in one repeatable sequence. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Current state/Next actions/Plan calendar surface,
-  Automatic control and its three device selectors, device registry registration, persisted active plan, HAEO run
-  metadata including parsed camelCase grid-charge and export/discharge evidence
-  counts from a response-capable Home Assistant service, discovery storage,
+  Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
   forecast snapshot training slots sourced from Home Assistant PV template
   attributes and the persisted built-in household-load model, Amber cent/kWh forecast attributes reflected in compact plan
   previews, weather camelCase forecast attributes reflected in compact plan previews,
@@ -286,8 +258,8 @@ Status as of 2026-08-09.
   imported from Home Assistant Recorder state history. It also verifies
   bounded forecast-snapshot action metadata for the active EV schedule with
   runtime ready-by override, an active EV schedule allocated to a negative
-  import-price slot, and an Enphase arbitrage action backed by parsed HAEO
-  value evidence. It also verifies
+  import-price slot, and an Enphase arbitrage action backed by deterministic
+  forecast evidence. It also verifies
   real HA service invocation for manual HVAC override plus restore-safe-state,
   active-mode occupied HVAC preconditioning before an expensive period with
   automation suppression and restoration, an active-mode occupied
@@ -321,9 +293,7 @@ Status as of 2026-08-09.
   price and W/kW/MW power normalization, plus weather forecast temperature attributes, with
   point-sensor fallback. Optional point-sensor power inputs used for forecast
   calibration and the HVAC thermal model use the same W/kW/MW normalization.
-  HAEO evidence applies the same W/kW/MW normalization and canonical key
-  matching before grid-limit or arbitrage calculations. Representative
-  integration-specific Amber, external PV, weather, and optional HAEO schemas are covered by
+  Representative integration-specific Amber, external PV, and weather schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
 - Compact external-PV forecast calibration is implemented. It records due PV
   forecasts only when a separately configured measured-power observation is
@@ -347,14 +317,18 @@ Status as of 2026-08-09.
   only gaps of at most 30 minutes are interpolated. A bounded recent-load
   correction fades to neutral over two hours, and UTC planning slots are mapped
   through timezone-aware local timestamps for DST folds and gaps.
-- Readiness requires three complete days, 80% valid historical coverage, two
+- Readiness requires three training days with at least 80% valid buckets per
+  day, 80% valid historical coverage, two
   leakage-free holdout origins with at least 144 aligned samples, MAE no more
   than 10% worse than previous-day persistence, and at least 90% conservative
-  coverage. Validation-only profiles may use the one or two earlier complete
-  days needed to score those first two origins, while production profiles still
-  require three clean observations per clock bucket. Partial preceding days may
-  provide aligned previous-day persistence samples but are never admitted to
-  the production profile. Ready models are healthy through 24 hours, degraded
+  coverage. Bounded gaps from excluded EV charging, historical invalid power,
+  or brief source outages no longer discard an otherwise usable day.
+  Validation-only profiles may use the one or two earlier training days needed
+  to score those first two origins, while production profiles still
+  require three clean observations per clock bucket. Preceding days below the
+  per-day coverage gate may provide aligned previous-day persistence samples
+  but are never admitted to the production profile. Ready models are healthy
+  through 24 hours, degraded
   through 72 hours, and stale afterward. Learning and initial quality-gate
   failures remain silent; missing mapping, unavailable Recorder after a model
   becomes unsafe, history exceeding the bounded query limit, and a model that
@@ -384,10 +358,8 @@ Status as of 2026-08-09.
   quality gates, correction,
   true interval aggregation, DST, age/source/corruption recovery, migration,
   Recorder failure and cardinality bounds, persistence, delayed notifications,
-  conservative grid-limit use with and without HAEO,
-  action-time evidence, and operation without HAEO or HAFO. The Docker smoke
-  entry intentionally leaves HAEO unconfigured and verifies deterministic
-  fallback planning with the built-in aggregate model.
+  conservative grid-limit use, action-time evidence, and deterministic
+  operation with the built-in aggregate model.
 - Runtime calibration snapshots retain dense near-term targets plus bounded,
   stratified targets through the complete planning horizon. Enabled lead-time
   models expose p10/p90-style bounded factors; conservative flexibility and
@@ -458,13 +430,9 @@ Status as of 2026-08-09.
   thresholds, and release evidence.
 - Enphase execution, verification, hold, minimum-savings gates, and profile
   action generation are implemented. The planner can set a configured
-  arbitrage profile when HAEO battery charge/discharge value, HAEO export
-  forecast value, or fallback import/export spread exceeds the threshold, and
-  restore the configured AI profile when takeover is no longer justified. HAEO
-  service responses are parsed into compact grid import/export, battery
-  charge/discharge, and battery SOC forecast evidence where available. Direct
-  replay or persisted non-finite HAEO evidence is ignored before Enphase value
-  calculations so it cannot suppress restore or publish NaN plan values.
+  arbitrage profile when deterministic forecast solar-export value exceeds the
+  threshold and restore the configured AI profile when takeover is no longer
+  justified.
 - HVAC automation/zone takeover and Enphase profile commands use bounded,
   transactional compensation. Any automation, zone, or saved profile that
   cannot be restored remains in ownership for a later refresh or
@@ -474,7 +442,7 @@ Status as of 2026-08-09.
   observed power entities cannot create feedback loops; observation-only
   values are sampled on planning boundaries. Material changes are debounced,
   constrained by a one-minute non-manual refresh floor, and coalesced. A stable
-  decision-input fingerprint skips HAEO, planning, execution, snapshots, and
+  decision-input fingerprint skips planning, execution, snapshots, and
   persistence when no material input changed, while explicit manual replans
   always force a fresh computation.
 - Coordinator startup schedules recurring wall-clock planning-interval boundary
@@ -487,15 +455,6 @@ Status as of 2026-08-09.
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare
   timestamps, so their duration is independent of planning interval.
-- HAEO integration detects response and flexible-projection capabilities,
-  deterministically selects a unique native config entry, skips services that
-  cannot return planner evidence and unsupported second passes, and uses a
-  bounded 30-second equivalent-input cache. Service-call status is distinct
-  from forecast-evidence status; READY requires continuous import and export
-  evidence across at least 80% of the requested solve slots. Solve and
-  coordinator refresh duration,
-  trigger, coalesced/skipped counters, refreshes/hour, phase timing, cache,
-  evidence, and capability metadata are available to diagnostics consumers.
 - Dry-run actions are recorded as intentionally skipped with the stable
   `dry_run` reason. Plan-wide violations remain on plan health instead of being
   copied to unrelated action rejections, including neutral Enphase restores,
@@ -512,7 +471,7 @@ Status as of 2026-08-09.
   with an equivalent material signature. Changed plans show bounded pending
   metadata while provider work is in flight or rate-limited, and a single
   delayed retry runs when the provider-call window opens.
-- Forecast snapshots, dry-run comparisons, and HAEO run evidence use time-based
+- Forecast snapshots and dry-run comparisons use time-based
   retention with defensive hard caps, preserving day-ahead training evidence
   across manual refresh bursts without unbounded storage growth.
 - Store persistence serializes concurrent writers and tracks mutation/saved
@@ -523,11 +482,12 @@ Status as of 2026-08-09.
   counters are inconsistent or implausibly large. Bounded processed-observation
   observation-plus-lead identities prevent duplicate training without dropping
   older observations or newly available lead buckets that arrive out of order.
-- Preflight discovery blocks only configured and enabled control areas. AI
+- Preflight discovery blocks only configured and enabled EV, Climate, and
+  Enphase control areas. AI
   provider configuration remains advisory, custom Enphase control services are
   discovered consistently with execution, and keep-on requires an available
   persistent switch/input-boolean. Partial
-  EV, Climate, Enphase, or explicit HAEO installations can arm independently;
+  EV, Climate, or Enphase installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
   production readiness without an enabled controllable area.
 - Preflight distinguishes historical dry-run evidence from current activation
@@ -584,7 +544,7 @@ Status as of 2026-08-09.
 - `export_diagnostics` returns the same redacted compact config-entry
   diagnostics payload exposed through Home Assistant diagnostics, with tests for
   token, coordinate, address, raw prompt, raw model response, location-history
-  field redaction, entity mapping, latest HAEO status, plan metadata, and
+  field redaction, entity mapping, plan metadata, and
   bounded recent outcomes.
 - Diagnostics and system health expose rolling refresh metrics when supplied by
   the coordinator, including refreshes per hour, last trigger,

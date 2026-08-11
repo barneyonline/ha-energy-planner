@@ -64,7 +64,12 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
         options={"password": "hidden", "dry_run": True},
         runtime_data=FakeCoordinator(
             data=plan,
-            store=FakeStore({"discovery": {"longitude": 145.1, "status": "ok"}}),
+            store=FakeStore(
+                {
+                    "discovery": {"longitude": 145.1, "status": "ok"},
+                    "haeo_runs": [{"baseline": {"status": "stale"}}],
+                }
+            ),
         ),
     )
 
@@ -132,7 +137,6 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
         reason_codes=["ev_soc_below_target"],
         expected_cost_delta=None,
         confidence=0.8,
-        requires_haeo_plan_id="plan-1",
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -147,12 +151,12 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
         estimated_daily_cost=3.25,
         actions=[action],
         preview=[],
-        input_issues=["haeo_service_called"],
+        input_issues=["ev_soc_missing"],
     )
     entry = FakeEntry(
         data={
             "amber_import_price_entity": "sensor.import",
-            "haeo_optimize_service": "haeo.optimize",
+            "haeo_optimize_service": "retired.value",
             "plain_setting": "ignored",
         },
         options={},
@@ -161,10 +165,6 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
             store=FakeStore(
                 {
                     "active_plan": {"plan_id": "plan-1"},
-                    "haeo_runs": [
-                        {"plan_id": "old", "baseline": {"status": "stale"}},
-                        {"plan_id": "plan-1", "baseline": {"status": "ready"}},
-                    ],
                     "outcomes": [{"action_id": f"old-{index}"} for index in range(12)],
                     "forecast_snapshots": [{}, {}],
                     "ai_recommendations": [{}],
@@ -189,19 +189,17 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
 
     assert diagnostics["entity_mapping"] == {
         "amber_import_price_entity": "sensor.import",
-        "haeo_optimize_service": "haeo.optimize",
     }
     assert diagnostics["input_health"] == {
         "health": "healthy",
         "confidence": 0.8,
-        "issues": ["haeo_service_called"],
+        "issues": ["ev_soc_missing"],
     }
     assert diagnostics["plan"]["summary"] == "test summary"
     assert diagnostics["plan"]["estimated_daily_cost"] == 3.25
     assert diagnostics["plan"]["action_count"] == 1
     assert diagnostics["plan"]["next_action"]["action_id"] == "action-1"
     assert diagnostics["plan"]["next_action"]["desired_state"] == {"target_soc_percent": 80}
-    assert diagnostics["haeo"]["plan_id"] == "plan-1"
     assert diagnostics["refresh_performance"] == {
         "refreshes_per_hour": 12.0,
         "trigger_counts": {"boundary": 10, "state": 2},
@@ -210,7 +208,6 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
         "latest": {"duration_ms": 25.0},
     }
     assert diagnostics["store"]["active_plan_present"] is True
-    assert diagnostics["store"]["haeo_run_count"] == 2
     assert diagnostics["store"]["forecast_snapshot_count"] == 2
     assert diagnostics["store"]["ai_recommendation_count"] == 1
     assert diagnostics["store"]["built_in_load_forecast"] == {

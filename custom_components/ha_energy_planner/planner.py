@@ -51,8 +51,6 @@ from .models import (
     ActionKind,
     DecisionContext,
     EnergyPlan,
-    FlexibleLoadProjection,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -239,7 +237,6 @@ class DryRunPlanner:
                     reason_codes=["away_hvac_policy"],
                     expected_cost_delta=None,
                     confidence=confidence_from_context(context),
-                    requires_haeo_plan_id=None,
                 )
             )
         else:
@@ -410,7 +407,6 @@ class DryRunPlanner:
                     reason_codes=[charging_reason, target.reason, schedule.reason],
                     expected_cost_delta=None,
                     confidence=confidence_from_context(context),
-                    requires_haeo_plan_id=_haeo_grid_dependency_plan_id(context),
                 )
             )
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
@@ -434,7 +430,7 @@ class DryRunPlanner:
         value = arbitrage["value"]
         min_savings = float(self.options[CONF_ENPHASE_MIN_SAVINGS])
         current_profile = context.current_enphase_profile
-        arbitrage_profile = _enphase_profile_for_arbitrage(context, arbitrage["direction"])
+        arbitrage_profile = _enphase_profile_for_arbitrage(context)
         ai_profile = context.enphase_ai_profile
         if value >= min_savings and arbitrage_profile and current_profile != arbitrage_profile:
             return PlanAction(
@@ -455,12 +451,6 @@ class DryRunPlanner:
                 reason_codes=[f"enphase_{arbitrage['source']}_above_threshold"],
                 expected_cost_delta=round(value, 4),
                 confidence=confidence_from_context(context),
-                requires_haeo_plan_id=(
-                    context.plan_id
-                    if context.haeo_status == HAEOStatus.READY
-                    and str(arbitrage["source"]).startswith("haeo_")
-                    else None
-                ),
             )
         if value < min_savings and ai_profile and current_profile and current_profile != ai_profile:
             return PlanAction(
@@ -481,7 +471,6 @@ class DryRunPlanner:
                 reason_codes=[f"enphase_{arbitrage['source']}_below_threshold"],
                 expected_cost_delta=0.0,
                 confidence=confidence_from_context(context),
-                requires_haeo_plan_id=None,
             )
         return None
 
@@ -936,7 +925,6 @@ class DryRunPlanner:
             reason_codes=[f"hvac_{phase}"],
             expected_cost_delta=float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
             confidence=confidence_from_context(context),
-            requires_haeo_plan_id=None,
         )
 
     def _project_active_hvac_slots(
@@ -1033,54 +1021,19 @@ class DryRunPlanner:
             reason_codes=[reason],
             expected_cost_delta=0.0,
             confidence=confidence_from_context(context),
-            requires_haeo_plan_id=None,
         )
-
-    @staticmethod
-    def project_flexible_loads(context: DecisionContext) -> list[FlexibleLoadProjection]:
-        """Project flexible EV/HVAC load for HAEO second-pass planning."""
-        return [
-            FlexibleLoadProjection(
-                valid_at=slot.valid_at,
-                ev_load_kw=slot.projected_ev_load_kw,
-                hvac_load_kw=slot.projected_hvac_load_kw,
-            )
-            for slot in context.slots
-            if slot.projected_ev_load_kw or slot.projected_hvac_load_kw
-        ]
 
     def _estimate_cost(self, context: DecisionContext) -> float | None:
         total = 0.0
         has_data = False
         interval_hours = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES])).total_seconds() / 3600
         for slot in context.slots:
-            haeo_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
-            haeo_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
-            if haeo_import_kw is not None and haeo_export_kw is not None:
-                if not bool(getattr(slot, "haeo_grid_includes_flexible_loads", False)):
-                    flexible_load_kw = max(float(slot.projected_ev_load_kw or 0.0), 0.0) + max(
-                        float(slot.projected_hvac_load_kw or 0.0),
-                        0.0,
-                    )
-                    haeo_import_kw += max(flexible_load_kw - haeo_export_kw, 0.0)
-                    haeo_export_kw = max(haeo_export_kw - flexible_load_kw, 0.0)
-                if slot.import_price is not None:
-                    total += haeo_import_kw * interval_hours * slot.import_price
-                    has_data = True
-                if slot.export_price is not None:
-                    total -= haeo_export_kw * interval_hours * slot.export_price
-                    has_data = True
-                continue
             if slot.import_price is None or slot.baseline_load_forecast_kw is None:
                 continue
-            battery_charge_kw = _positive_or_none(slot.haeo_battery_charge_forecast_kw) or 0.0
-            battery_discharge_kw = _positive_or_none(slot.haeo_battery_discharge_forecast_kw) or 0.0
             load_kw = (
                 slot.baseline_load_forecast_kw
                 + slot.projected_ev_load_kw
                 + slot.projected_hvac_load_kw
-                + battery_charge_kw
-                - battery_discharge_kw
             )
             net_kw = load_kw - (slot.pv_forecast_kw or 0.0)
             if net_kw >= 0:
@@ -1094,12 +1047,6 @@ class DryRunPlanner:
         """Return the duration represented by usable estimated-cost slots."""
         usable_slots = 0
         for slot in context.slots:
-            haeo_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
-            haeo_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
-            if haeo_import_kw is not None and haeo_export_kw is not None:
-                if slot.import_price is not None or slot.export_price is not None:
-                    usable_slots += 1
-                continue
             if slot.import_price is not None and slot.baseline_load_forecast_kw is not None:
                 usable_slots += 1
         if usable_slots == 0:
@@ -1222,7 +1169,6 @@ def _confidence_rejection_reason(
         reason_codes=[],
         expected_cost_delta=None,
         confidence=confidence_from_context(context),
-        requires_haeo_plan_id=None,
     )
     if _action_meets_confidence_threshold(fake_action, context, options):
         return None
@@ -1714,8 +1660,6 @@ def _device_plan(
         "horizon_hours": len(context.slots) * interval_minutes / 60,
         "interval_minutes": interval_minutes,
         "total_estimated_energy_kwh": _timeline_sum(timeline, "estimated_energy_kwh"),
-        "total_estimated_battery_charge_kwh": _timeline_sum(timeline, "estimated_battery_charge_kwh"),
-        "total_estimated_battery_discharge_kwh": _timeline_sum(timeline, "estimated_battery_discharge_kwh"),
         "timeline": timeline,
     }
 
@@ -1916,8 +1860,6 @@ def _timeline_payload(entry: dict[str, Any]) -> dict[str, Any]:
             "start",
             "end",
             "estimated_energy_kwh",
-            "estimated_battery_charge_kwh",
-            "estimated_battery_discharge_kwh",
         }
     }
 
@@ -1928,15 +1870,11 @@ def _add_energy_estimates(entry: dict[str, Any], interval_hours: float) -> None:
         entry["estimated_energy_kwh"] = _energy_kwh(entry["projected_hvac_load_kw"], interval_hours)
     if "charge_kw" in entry:
         entry["estimated_energy_kwh"] = _energy_kwh(entry["charge_kw"], interval_hours)
-    if "battery_charge_kw" in entry:
-        entry["estimated_battery_charge_kwh"] = _energy_kwh(entry["battery_charge_kw"], interval_hours)
-    if "battery_discharge_kw" in entry:
-        entry["estimated_battery_discharge_kwh"] = _energy_kwh(entry["battery_discharge_kw"], interval_hours)
 
 
 def _merge_energy_estimates(target: dict[str, Any], source: dict[str, Any]) -> None:
     """Sum per-slot kWh values into a compressed timeline segment."""
-    for key in ("estimated_energy_kwh", "estimated_battery_charge_kwh", "estimated_battery_discharge_kwh"):
+    for key in ("estimated_energy_kwh",):
         if key in source:
             target[key] = round(float(target.get(key, 0.0) or 0.0) + float(source[key]), 4)
 
@@ -2021,17 +1959,9 @@ def _enphase_timeline_entry(slot: Any, slot_actions: list[PlanAction], actions: 
             entry["arbitrage_value"] = action.desired_state.get("arbitrage_value")
         return entry
 
-    charge_kw = _positive_or_none(slot.haeo_battery_charge_forecast_kw)
-    discharge_kw = _positive_or_none(slot.haeo_battery_discharge_forecast_kw)
     entry: dict[str, Any] = {"state": "idle"}
-    if charge_kw is not None and charge_kw > 0:
-        entry = {"state": "charge_battery", "battery_charge_kw": round(charge_kw, 4)}
-    elif discharge_kw is not None and discharge_kw > 0:
-        entry = {"state": "consume_battery", "battery_discharge_kw": round(discharge_kw, 4)}
     if planned_profile:
         entry["profile"] = planned_profile
-    if slot.haeo_battery_soc_forecast_percent is not None:
-        entry["battery_soc_percent"] = slot.haeo_battery_soc_forecast_percent
     return entry
 
 
@@ -2147,23 +2077,6 @@ def _arbitrage_value(
     interval_minutes: int,
     options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if context.haeo_status == HAEOStatus.READY:
-        battery_arbitrage = _haeo_battery_arbitrage(context, interval_minutes, options)
-        if battery_arbitrage is not None:
-            return {
-                "value": battery_arbitrage["value"],
-                "source": "haeo_battery_arbitrage_value",
-                "direction": battery_arbitrage["direction"],
-                "details": battery_arbitrage.get("details", {}),
-            }
-        haeo_export_value = _haeo_export_value(context, interval_minutes)
-        if haeo_export_value is not None:
-            return {
-                "value": haeo_export_value,
-                "source": "haeo_export_value",
-                "direction": "consume",
-                "details": {"source": "haeo_grid_export_forecast_kw"},
-            }
     forecast_export = _forecast_solar_export_value(context, interval_minutes, options)
     if forecast_export is not None:
         return {
@@ -2180,99 +2093,8 @@ def _arbitrage_value(
     }
 
 
-def _haeo_grid_dependency_plan_id(context: DecisionContext) -> str | None:
-    """Return the plan ID only when grid safety uses current HAEO evidence."""
-    if context.haeo_status != HAEOStatus.READY:
-        return None
-    for slot in context.slots:
-        if (
-            _positive_or_none(slot.haeo_grid_import_forecast_kw) is not None
-            or _positive_or_none(slot.haeo_grid_export_forecast_kw) is not None
-        ):
-            return context.plan_id
-    return None
-
-
-def _haeo_battery_arbitrage(
-    context: DecisionContext,
-    interval_minutes: int,
-    options: Mapping[str, Any] | None = None,
-) -> dict[str, Any] | None:
-    total = 0.0
-    has_battery_evidence = False
-    first_direction: str | None = None
-    interval_hours = interval_minutes / 60
-    battery = _battery_model(context, options or {})
-    remaining_charge_kwh = battery["charge_headroom_kwh"]
-    remaining_discharge_kwh = battery["discharge_available_kwh"]
-    for slot in context.slots:
-        charge_kw = _positive_or_none(slot.haeo_battery_charge_forecast_kw)
-        discharge_kw = _positive_or_none(slot.haeo_battery_discharge_forecast_kw)
-        if charge_kw is not None:
-            has_battery_evidence = True
-            first_direction = first_direction or "charge"
-            grid_import_kw = _positive_or_none(slot.haeo_grid_import_forecast_kw)
-            import_price = _float_or_none(slot.import_price)
-            if grid_import_kw is not None and import_price is not None:
-                grid_charge_kw = min(charge_kw, grid_import_kw, battery["max_charge_kw"])
-                charged_kwh = min(
-                    grid_charge_kw * interval_hours * battery["round_trip_efficiency"],
-                    remaining_charge_kwh,
-                )
-                if charged_kwh > 0:
-                    remaining_charge_kwh -= charged_kwh
-                    total -= (charged_kwh / battery["round_trip_efficiency"]) * import_price
-        if discharge_kw is not None:
-            has_battery_evidence = True
-            first_direction = first_direction or "consume"
-            price = None
-            grid_export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
-            if grid_export_kw is not None and grid_export_kw > 0:
-                price = _float_or_none(slot.export_price)
-            if price is None:
-                price = _float_or_none(slot.import_price)
-            if price is not None:
-                discharge_kw = min(discharge_kw, battery["max_discharge_kw"])
-                discharged_kwh = min(discharge_kw * interval_hours, remaining_discharge_kwh)
-                remaining_discharge_kwh -= discharged_kwh
-                total += discharged_kwh * price
-    if not has_battery_evidence:
-        return None
-    return {
-        "value": round(total, 4),
-        "direction": first_direction or "consume",
-        "details": {
-            "battery_charge_headroom_kwh": battery["charge_headroom_kwh"],
-            "battery_discharge_available_kwh": battery["discharge_available_kwh"],
-            "remaining_charge_headroom_kwh": round(remaining_charge_kwh, 4),
-            "remaining_discharge_available_kwh": round(remaining_discharge_kwh, 4),
-        },
-    }
-
-
-def _haeo_battery_arbitrage_value(context: DecisionContext, interval_minutes: int) -> float | None:
-    arbitrage = _haeo_battery_arbitrage(context, interval_minutes)
-    return None if arbitrage is None else arbitrage["value"]
-
-
-def _enphase_profile_for_arbitrage(context: DecisionContext, direction: str) -> str | None:
-    if direction == "charge":
-        return context.enphase_full_backup_profile
+def _enphase_profile_for_arbitrage(context: DecisionContext) -> str | None:
     return context.enphase_self_consumption_profile or context.enphase_arbitrage_profile
-
-
-def _haeo_export_value(context: DecisionContext, interval_minutes: int) -> float | None:
-    total = 0.0
-    has_haeo_export = False
-    interval_hours = interval_minutes / 60
-    for slot in context.slots:
-        export_kw = _positive_or_none(slot.haeo_grid_export_forecast_kw)
-        export_price = _float_or_none(slot.export_price)
-        if export_kw is None or export_price is None:
-            continue
-        has_haeo_export = True
-        total += export_kw * export_price * interval_hours
-    return round(total, 4) if has_haeo_export else None
 
 
 def _forecast_solar_export_value(

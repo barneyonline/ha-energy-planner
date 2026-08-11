@@ -7,6 +7,8 @@ from typing import Any
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
+from .entry_data import remove_retired_config_keys
+
 SUBENTRY_SYSTEM = "system"
 SUBENTRY_ENERGY = "energy"
 SUBENTRY_CLIMATE = "climate"
@@ -41,11 +43,9 @@ _ENPHASE_DEFAULTS = {
 _LEGACY_LOAD_FORECAST = "baseline_load_forecast_entity"
 _LEGACY_LOAD_OBSERVED = "baseline_load_observed_entity"
 _HOUSEHOLD_LOAD = "household_load_entity"
-
-
 def _migrate_load_keys(data: dict[str, Any]) -> dict[str, Any]:
     """Retain only an explicitly measured legacy load as built-in model input."""
-    migrated = dict(data)
+    migrated = remove_retired_config_keys(data)
     if not migrated.get(_HOUSEHOLD_LOAD) and migrated.get(_LEGACY_LOAD_OBSERVED):
         migrated[_HOUSEHOLD_LOAD] = migrated[_LEGACY_LOAD_OBSERVED]
     migrated.pop(_LEGACY_LOAD_FORECAST, None)
@@ -98,7 +98,11 @@ def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: ConfigEnt
     """Move every legacy Add device section into the main config entry."""
     subentries = list(getattr(entry, "subentries", {}).values())
     if not subentries:
-        return False
+        data = _migrate_load_keys(dict(entry.data))
+        if data == dict(entry.data):
+            return False
+        hass.config_entries.async_update_entry(entry, data=data)
+        return True
 
     data = _migrate_load_keys(dict(entry.data))
     for section_data in grouped_subentry_data(entry).values():
