@@ -17,7 +17,6 @@ from .models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -113,18 +112,12 @@ def _context_from_fixture(data: dict[str, Any]) -> DecisionContext:
                 projected_hvac_load_kw=float(slot.get("projected_hvac_load_kw", 0.0)),
                 outdoor_temperature_forecast_c=slot.get("outdoor_temperature_forecast_c"),
                 occupied=slot.get("occupied"),
-                haeo_battery_soc_forecast_percent=slot.get("haeo_battery_soc_forecast_percent"),
-                haeo_grid_import_forecast_kw=slot.get("haeo_grid_import_forecast_kw"),
-                haeo_grid_export_forecast_kw=slot.get("haeo_grid_export_forecast_kw"),
-                haeo_battery_charge_forecast_kw=slot.get("haeo_battery_charge_forecast_kw"),
-                haeo_battery_discharge_forecast_kw=slot.get("haeo_battery_discharge_forecast_kw"),
             )
             for slot in data["slots"]
         ],
         current_battery_soc_percent=data.get("current_battery_soc_percent"),
         current_ev_soc_percent=data.get("current_ev_soc_percent"),
         occupancy_state=OccupancyState(data["occupancy_state"]),
-        haeo_status=HAEOStatus(data["haeo_status"]),
         input_health=InputHealth(data["input_health"]),
         current_hvac_mode=data.get("current_hvac_mode"),
         current_hvac_temperature_c=data.get("current_hvac_temperature_c"),
@@ -167,7 +160,6 @@ def _action_from_fixture(data: dict[str, Any], plan_id: str) -> PlanAction:
         reason_codes=list(data.get("reason_codes", [])),
         expected_cost_delta=data.get("expected_cost_delta"),
         confidence=float(data.get("confidence", 1.0)),
-        requires_haeo_plan_id=data.get("requires_haeo_plan_id"),
     )
 
 

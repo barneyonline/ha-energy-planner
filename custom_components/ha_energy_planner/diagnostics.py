@@ -76,7 +76,6 @@ async def async_get_config_entry_diagnostics(
             },
             "issues": plan.input_issues[:20],
         },
-        "haeo": _redact(_latest_haeo_status(store_data)),
         "refresh_performance": _redact(_refresh_performance(coordinator)),
         "recent_outcomes": _redact(_recent_items(store_data, "outcomes", limit=10)),
         "recent_audit": _redact(_recent_items(store_data, "execution_audit", limit=20)),
@@ -117,17 +116,6 @@ def _entity_mapping(entry_data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _latest_haeo_status(store_data: dict[str, Any]) -> dict[str, Any] | None:
-    """Return the latest compact HAEO run summary."""
-    latest_run = _latest_item(store_data, "haeo_runs")
-    if latest_run is not None:
-        return latest_run
-    latest_snapshot = _latest_item(store_data, "forecast_snapshots")
-    if isinstance(latest_snapshot, dict):
-        return latest_snapshot.get("haeo")
-    return None
-
-
 def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
     """Return bounded Store metadata instead of the full Store payload."""
     return {
@@ -138,7 +126,6 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
             if isinstance(store_data.get("forecast_snapshots"), list)
             else 0
         ),
-        "haeo_run_count": len(store_data.get("haeo_runs", [])) if isinstance(store_data.get("haeo_runs"), list) else 0,
         "dry_run_comparison_count": (
             len(store_data.get("dry_run_comparisons", []))
             if isinstance(store_data.get("dry_run_comparisons"), list)
@@ -181,10 +168,3 @@ def _recent_items(store_data: dict[str, Any], key: str, *, limit: int) -> list[A
     if not isinstance(value, list):
         return []
     return value[-limit:]
-
-
-def _latest_item(store_data: dict[str, Any], key: str) -> Any:
-    value = store_data.get(key, [])
-    if not isinstance(value, list) or not value:
-        return None
-    return value[-1]

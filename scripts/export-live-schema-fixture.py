@@ -36,8 +36,8 @@ SENSITIVE_KEY_PARTS = (
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Export sanitized Home Assistant entity states or response-capable service "
-            "results into fixtures accepted by scripts/validate-live-schema-fixture.py."
+            "Export sanitized Home Assistant entity states into fixtures accepted by "
+            "scripts/validate-live-schema-fixture.py."
         )
     )
     parser.add_argument("--ha-url", default=os.environ.get("HOME_ASSISTANT_URL"))
@@ -65,17 +65,6 @@ def main() -> int:
     forecast.add_argument("--value-kind", required=True, choices=("power", "price", "temperature"))
     forecast.add_argument("--value-keys", required=True, help="Comma-separated candidate value keys.")
 
-    service = subparsers.add_parser(
-        "haeo-response",
-        help="Call a response-capable HAEO optimize service and export the sanitized response.",
-    )
-    service.add_argument("--name", required=True)
-    service.add_argument("--service", required=True, help="Service name like haeo.optimize.")
-    service.add_argument("--service-data-json", default="{}")
-    service.add_argument("--issued-at", default=None)
-    service.add_argument("--interval-minutes", type=int, default=5)
-    service.add_argument("--slot-count", type=int, default=288)
-
     args = parser.parse_args()
     if not args.ha_url:
         parser.error("--ha-url or HOME_ASSISTANT_URL is required")
@@ -99,8 +88,6 @@ def main() -> int:
 def _build_fixture(args: argparse.Namespace) -> dict[str, Any]:
     if args.kind == "forecast-state":
         return _forecast_fixture(args)
-    if args.kind == "haeo-response":
-        return _haeo_fixture(args)
     raise ValueError(f"Unsupported fixture kind: {args.kind!r}")
 
 
@@ -121,37 +108,6 @@ def _forecast_fixture(args: argparse.Namespace) -> dict[str, Any]:
         "value_keys": value_keys,
         "state": _sanitize(entity.get("state"), extra_parts=extra_redact_parts),
         "attributes": _sanitize(entity.get("attributes", {}), extra_parts=extra_redact_parts),
-    }
-
-
-def _haeo_fixture(args: argparse.Namespace) -> dict[str, Any]:
-    if "." not in args.service:
-        raise ValueError("--service must be in domain.service form")
-    domain, service = args.service.split(".", 1)
-    try:
-        service_data = json.loads(args.service_data_json)
-    except json.JSONDecodeError as err:
-        raise ValueError(f"--service-data-json is invalid JSON: {err}") from err
-    if not isinstance(service_data, dict):
-        raise ValueError("--service-data-json must decode to an object")
-
-    response = _request_json(
-        args.ha_url,
-        args.token,
-        f"/api/services/{quote(domain, safe='')}/{quote(service, safe='')}?return_response",
-        method="POST",
-        body=service_data,
-    )
-    payload = response.get("service_response", response) if isinstance(response, dict) else response
-    extra_redact_parts = _extra_redact_parts(args)
-    return {
-        "kind": "haeo_response",
-        "name": args.name,
-        "source_service": args.service,
-        "issued_at": _issued_at(args.issued_at),
-        "interval_minutes": args.interval_minutes,
-        "slot_count": args.slot_count,
-        "response": _sanitize(payload, extra_parts=extra_redact_parts),
     }
 
 

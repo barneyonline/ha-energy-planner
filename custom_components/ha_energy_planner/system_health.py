@@ -8,6 +8,7 @@ from homeassistant.components import system_health
 from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN
+from .entry_data import combined_entry_data
 from .models import InputHealth
 
 _INPUT_SECTION_PREFIXES = (
@@ -90,7 +91,7 @@ def _entry_health_summary(entry: Any) -> dict[str, Any]:
     store_data = dict(coordinator.store.data)
     refresh_metrics = getattr(coordinator, "refresh_metrics", None)
     refresh_metrics = dict(refresh_metrics) if isinstance(refresh_metrics, dict) else {}
-    entry_data = dict(getattr(entry, "data", {}))
+    entry_data = combined_entry_data(entry)
     return {
         "planner_enabled": bool(coordinator.options.get("planner_enabled", False)),
         "dry_run": bool(coordinator.options.get("dry_run", True)),
@@ -102,7 +103,6 @@ def _entry_health_summary(entry: Any) -> dict[str, Any]:
             any(value and key.startswith(prefixes) for key, value in entry_data.items())
             for prefixes in _INPUT_SECTION_PREFIXES
         ),
-        "latest_haeo_status": _latest_status(store_data.get("haeo_runs")),
         "last_refresh_duration_ms": (getattr(coordinator, "last_refresh_metadata", None) or {}).get(
             "duration_ms"
         ),
@@ -121,8 +121,6 @@ def _entry_health_summary(entry: Any) -> dict[str, Any]:
         "usable_optimization_horizon_hours": (
             None if plan is None else getattr(plan, "estimated_cost_horizon_hours", None)
         ),
-        "latest_haeo_duration_ms": _latest_haeo_metric(store_data.get("haeo_runs"), "duration_ms"),
-        "latest_haeo_cache_hit": _latest_haeo_metric(store_data.get("haeo_runs"), "cache_hit"),
         "latest_ai_status": _latest_status(store_data.get("ai_recommendations")),
     }
 
@@ -153,18 +151,3 @@ def _latest_value(value: Any, key: str) -> Any:
     if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
         return None
     return value[-1].get(key)
-
-
-def _latest_haeo_metric(value: Any, key: str) -> Any:
-    """Return a combined metric from the latest HAEO baseline/second pass."""
-    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
-        return None
-    phases = [value[-1].get(name) for name in ("baseline", "second_pass")]
-    phase_values = [phase.get(key) for phase in phases if isinstance(phase, dict) and phase.get(key) is not None]
-    if not phase_values:
-        return value[-1].get(key)
-    if key == "duration_ms":
-        return round(sum(float(item) for item in phase_values), 3)
-    if key == "cache_hit":
-        return any(bool(item) for item in phase_values)
-    return phase_values[-1]

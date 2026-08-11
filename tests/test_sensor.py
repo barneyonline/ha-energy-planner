@@ -75,6 +75,12 @@ def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> 
     assert sensor_module._support_bundle_state(coordinator) == "No Plan"
 
 
+def test_plan_status_ignores_retired_optimizer_history() -> None:
+    coordinator = _coordinator(_plan(), store_data={"haeo_runs": [{"status": "failed"}]})
+
+    assert "haeo" not in sensor_module._plan_status_attrs(coordinator)
+
+
 def test_consolidated_ownership_covers_enphase_and_disabled_control_reason() -> None:
     assert sensor_module._asset_owned(
         {"ownership": {"enphase_profile_changed_at": "2026-08-08T00:00:00+00:00"}},
@@ -105,7 +111,6 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
         reason_codes=["precondition_before_peak"],
         expected_cost_delta=0.42,
         confidence=0.9,
-        requires_haeo_plan_id=None,
     )
     ev_action = replace(
         climate_action,
@@ -316,7 +321,6 @@ def test_dry_run_comparison_attributes_stay_below_recorder_limit() -> None:
                 "desired_state": {huge_text: huge_text},
                 "hard_constraints": [huge_text] * 8,
                 "reason_codes": [huge_text] * 8,
-                "requires_haeo_plan_id": huge_text,
             },
         }
         for day in range(1, 7)
@@ -866,13 +870,6 @@ def test_existing_status_surfaces_expose_builtin_load_evidence() -> None:
     )
 
 
-def test_latest_store_item_rejects_malformed_history() -> None:
-    assert sensor_module._latest_store_item(None) is None
-    assert sensor_module._latest_store_item([]) is None
-    assert sensor_module._latest_store_item(["invalid"]) is None
-    assert sensor_module._latest_store_item([{"status": "ready"}]) == {"status": "ready"}
-
-
 def test_plan_status_attributes_are_json_friendly_and_bounded() -> None:
     plan = _plan(
         preview=[{"slot": index} for index in range(20)],
@@ -904,7 +901,6 @@ def test_next_action_sensor_exposes_plain_english_action() -> None:
         reason_codes=["least_cost_slots_before_ready_by"],
         expected_cost_delta=-0.25,
         confidence=0.8,
-        requires_haeo_plan_id=None,
     )
     plan = _plan(actions=[action])
     coordinator = _coordinator(plan)
@@ -921,7 +917,6 @@ def test_next_action_sensor_exposes_plain_english_action() -> None:
         "constraints": ["EV Bounds"],
         "desired_state": {"Target SOC percent": 80},
         "estimated_value": -0.25,
-        "requires_haeo_plan": False,
     }
 
 
@@ -939,7 +934,6 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
         reason_codes=["hvac_precondition_before_expensive_period"],
         expected_cost_delta=0.4,
         confidence=0.7,
-        requires_haeo_plan_id=None,
     )
     ev_action = PlanAction(
         action_id="ev-1",
@@ -953,7 +947,6 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
         reason_codes=["least_cost_slots_before_ready_by"],
         expected_cost_delta=None,
         confidence=0.8,
-        requires_haeo_plan_id="plan-1",
     )
     plan = _plan(actions=[climate_action, ev_action])
     coordinator = _coordinator(plan, store_data={"trip_history": {"records": [{"soc": 10}, {"soc": 20}]}})
@@ -1636,7 +1629,6 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         reason_codes=["enphase_price_spread_above_threshold"],
         expected_cost_delta=0.3,
         confidence=0.7,
-        requires_haeo_plan_id="plan-1",
     )
     restore_action = PlanAction(
         action_id="enphase-restore",
@@ -1650,7 +1642,6 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     climate_action = PlanAction(
         action_id="climate-1",
@@ -1664,7 +1655,6 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     start_action = PlanAction(
         action_id="ev-start",
@@ -1678,7 +1668,6 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
     assert sensor_module._asset_plan_state(_plan(), ActionAsset.EV) == "Idle"
@@ -1703,7 +1692,7 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         "2 more segment(s) omitted."
     )
     assert sensor_module._plain_action(profile_action)["decision"] == "Switch Enphase profile to Self-Consumption."
-    assert sensor_module._plain_action(profile_action)["requires_haeo_plan"] is True
+    assert "requires_haeo_plan" not in sensor_module._plain_action(profile_action)
     assert sensor_module._action_sentence(restore_action) == "Restore Enphase to AI Optimisation."
     assert sensor_module._action_sentence(climate_action) == "Set climate to Off."
     climate_action.kind = ActionKind.RELEASE_HVAC
@@ -1762,7 +1751,6 @@ def test_planned_action_windows_show_explicit_home_assistant_local_date(monkeypa
         reason_codes=["hvac_thermal_shift_before_expensive_period"],
         expected_cost_delta=0.2,
         confidence=0.7,
-        requires_haeo_plan_id=None,
     )
 
     assert sensor_module._action_window(action) == "Sat 8 Aug, 15:30-16:00"

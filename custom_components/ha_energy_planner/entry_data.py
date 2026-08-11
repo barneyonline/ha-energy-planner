@@ -16,14 +16,27 @@ from .const import (
     CONF_EV_SMART_CHARGING_STOP,
 )
 
+_RETIRED_CONFIG_KEYS = frozenset(
+    {
+        "haeo_config_entry_id",
+        "haeo_entry_id",
+        "haeo_optimize_service",
+    }
+)
+
+
+def remove_retired_config_keys(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Return config data without keys used by retired integrations."""
+    return {key: value for key, value in data.items() if key not in _RETIRED_CONFIG_KEYS}
+
 
 def combined_entry_data(entry: ConfigEntry) -> dict[str, Any]:
     """Return hub data merged with planner input subentry data."""
-    data: dict[str, Any] = dict(entry.data)
+    data = remove_retired_config_keys(entry.data)
     for subentry in getattr(entry, "subentries", {}).values():
         subentry_data = getattr(subentry, "data", None)
         if isinstance(subentry_data, Mapping):
-            data.update(dict(subentry_data))
+            data.update(remove_retired_config_keys(subentry_data))
     # Read legacy EV Smart Charging control keys as direct charger controls.
     # This keeps existing entries safe until the EV subentry is reconfigured.
     aliases = {

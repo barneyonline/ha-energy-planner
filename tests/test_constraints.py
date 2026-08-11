@@ -12,7 +12,6 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -37,7 +36,6 @@ def _context(now: datetime) -> DecisionContext:
         current_battery_soc_percent=50,
         current_ev_soc_percent=50,
         occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.READY,
         input_health=InputHealth.HEALTHY,
     )
 
@@ -72,7 +70,6 @@ def _action(now: datetime, asset: ActionAsset, kind: ActionKind, desired_state: 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
 
@@ -97,45 +94,6 @@ def test_grid_import_limit_uses_conservative_load_and_pv_bounds() -> None:
     violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
 
     assert "grid_import_limit_exceeded" in violations
-
-
-def test_haeo_grid_evidence_does_not_bypass_conservative_bounds() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = _context(now)
-    slot = context.slots[0]
-    slot.baseline_load_forecast_kw = 2.0
-    slot.baseline_load_forecast_upper_kw = 5.0
-    slot.pv_forecast_kw = 2.0
-    slot.pv_forecast_lower_kw = 1.0
-    slot.haeo_grid_import_forecast_kw = 0.5
-    slot.haeo_grid_export_forecast_kw = 0.0
-    slot.haeo_grid_includes_flexible_loads = True
-    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
-    options = {**DEFAULT_OPTIONS, "grid_import_limit_kw": 3.5}
-
-    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
-
-    assert "grid_import_limit_exceeded" in violations
-
-
-def test_haeo_simultaneous_flows_preserve_gross_grid_limits() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = _context(now)
-    slot = context.slots[0]
-    slot.haeo_grid_import_forecast_kw = 4.0
-    slot.haeo_grid_export_forecast_kw = 3.0
-    slot.haeo_grid_includes_flexible_loads = True
-    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
-    options = {
-        **DEFAULT_OPTIONS,
-        "grid_import_limit_kw": 3.5,
-        "grid_export_limit_kw": 2.5,
-    }
-
-    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
-
-    assert "grid_import_limit_exceeded" in violations
-    assert "grid_export_limit_exceeded" in violations
 
 
 def test_ev_action_rejected_when_vehicle_disconnected() -> None:
@@ -384,7 +342,6 @@ def test_plan_validation_reports_config_and_grid_limit_issues() -> None:
     assert "grid_import_limit_exceeded" in violations
     assert "grid_export_limit_exceeded" in violations
 
-
 def test_disabled_plan_validation_rejects_control_actions() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = _context(now)
@@ -399,11 +356,9 @@ def test_disabled_plan_validation_rejects_control_actions() -> None:
 def test_action_validation_reports_global_and_time_window_issues() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
-    action.requires_haeo_plan_id = "haeo-plan"
     action.execute_not_before = now + timedelta(minutes=5)
     context = _context(now)
     context.input_health = InputHealth.DEGRADED
-    context.haeo_status = HAEOStatus.STALE
     plan = _plan(now - timedelta(hours=25), action)
     options = {**DEFAULT_OPTIONS, "planner_enabled": False, "dry_run": True}
 
@@ -412,7 +367,6 @@ def test_action_validation_reports_global_and_time_window_issues() -> None:
     assert "planner_disabled" in violations
     assert "dry_run_enabled" in violations
     assert "input_health_not_healthy" in violations
-    assert "haeo_not_ready" in violations
     assert "action_outside_execution_window" in violations
     assert "plan_expired" in violations
 
@@ -551,41 +505,3 @@ def test_plan_rejects_projected_grid_export_above_configured_limit() -> None:
     violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
 
     assert "grid_export_limit_exceeded" in violations
-
-
-def test_plan_applies_flexible_load_to_haeo_grid_limit_evidence() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
-    context = _context(now)
-    context.slots[0].haeo_grid_export_forecast_kw = 1.0
-    context.slots[0].projected_ev_load_kw = 3.0
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "grid_import_limit_kw": 1.5,
-    }
-
-    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
-
-    assert "grid_import_limit_exceeded" in violations
-
-
-def test_plan_does_not_double_count_flexible_load_in_second_pass_grid_evidence() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
-    context = _context(now)
-    context.slots[0].haeo_grid_import_forecast_kw = 4.5
-    context.slots[0].haeo_grid_export_forecast_kw = 0.0
-    context.slots[0].haeo_grid_includes_flexible_loads = True
-    context.slots[0].projected_ev_load_kw = 3.0
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "grid_import_limit_kw": 5.0,
-    }
-
-    violations = ConstraintValidator(options).validate_plan(context, _plan(now, action))
-
-    assert "grid_import_limit_exceeded" not in violations

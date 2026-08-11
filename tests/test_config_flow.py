@@ -83,7 +83,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
-    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HOUSEHOLD_LOAD,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
@@ -213,7 +212,6 @@ def _valid_hass() -> FakeHass:
             "ai_task.extended_openai_ai_task",
         },
         {
-            ("haeo", "optimize"),
             ("select", "select_option"),
             ("conversation", "process"),
             ("ai_task", "generate_data"),
@@ -580,13 +578,6 @@ def test_weather_entity_lives_in_climate_group_not_energy_group() -> None:
     assert CONF_WEATHER not in energy_fields
 
 
-def test_haeo_service_is_not_user_configurable_in_energy_group() -> None:
-    energy_schema = PLANNER_SUBENTRY_SCHEMAS["energy"]
-    energy_fields = {getattr(key, "schema", key) for key in energy_schema.schema}
-
-    assert CONF_HAEO_OPTIMIZE_SERVICE not in energy_fields
-
-
 def test_enphase_profile_defaults_match_planner_roles() -> None:
     enphase_schema = PLANNER_SUBENTRY_SCHEMAS["enphase"]
     fields = {getattr(key, "schema", key) for key in enphase_schema.schema}
@@ -635,7 +626,7 @@ def test_ev_target_soc_can_follow_vehicle_and_ready_by_remains_native() -> None:
 def test_validate_config_accepts_input_button_ev_controls() -> None:
     hass = FakeHass(
         {"input_button.ev_start", "input_button.ev_stop"},
-        {("haeo", "optimize"), ("select", "select_option")},
+        {("select", "select_option")},
     )
 
     assert (
@@ -653,7 +644,7 @@ def test_validate_config_accepts_input_button_ev_controls() -> None:
 def test_validate_config_accepts_ev_target_soc_sensor_and_ready_by_select() -> None:
     hass = FakeHass(
         {"sensor.ev_target_soc", "select.ev_ready_by"},
-        {("haeo", "optimize"), ("select", "select_option")},
+        {("select", "select_option")},
         {
             "sensor.ev_target_soc": {
                 "state_class": "measurement",
@@ -815,8 +806,7 @@ def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
     expected_heading = "Enable plan fallback notifications"
     expected_description = (
         "Shows persistent notifications only for problems that normally require user action, such as broken "
-        "required mappings or a configured grid hard limit. Routine changes, successful recovery, and safe HAEO "
-        "fallback do not notify."
+        "required mappings or a configured grid hard limit. Routine changes and successful recovery do not notify."
     )
 
     integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"
@@ -1110,7 +1100,11 @@ def test_production_code_does_not_hardcode_inventory_entity_ids() -> None:
 
 def test_combined_entry_data_merges_subentries_after_hub_data() -> None:
     entry = SimpleNamespace(
-        data={CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize", CONF_AMBER_IMPORT_PRICE: "sensor.old_import"},
+        data={
+            "haeo_optimize_service": "haeo.optimize",
+            "haeo_config_entry_id": "optimizer-entry",
+            CONF_AMBER_IMPORT_PRICE: "sensor.old_import",
+        },
         subentries={
             "prices": SimpleNamespace(
                 data={
@@ -1120,6 +1114,7 @@ def test_combined_entry_data_merges_subentries_after_hub_data() -> None:
             ),
             "forecasts": SimpleNamespace(
                 data={
+                    "haeo_entry_id": "legacy-optimizer-entry",
                     CONF_PV_FORECAST: "sensor.pv_forecast",
                     CONF_BASELINE_LOAD_FORECAST: "sensor.baseline_load",
                     CONF_BATTERY_SOC: "sensor.battery_soc",
@@ -1129,7 +1124,6 @@ def test_combined_entry_data_merges_subentries_after_hub_data() -> None:
     )
 
     assert combined_entry_data(entry) == {
-        CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize",
         CONF_AMBER_IMPORT_PRICE: "sensor.import_price",
         CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
         CONF_PV_FORECAST: "sensor.pv_forecast",
@@ -1353,7 +1347,7 @@ def test_ai_subentry_normalizes_task_and_ignores_legacy_agent_selection() -> Non
 def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
     entry = SimpleNamespace(
         subentries={
-            "optimizer": SimpleNamespace(subentry_type="optimizer", data={CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize"}),
+            "optimizer": SimpleNamespace(subentry_type="optimizer", data={"haeo_optimize_service": "haeo.optimize"}),
             "prices": SimpleNamespace(
                 subentry_type="prices",
                 data={
@@ -1395,7 +1389,6 @@ def test_legacy_subentry_data_groups_into_consolidated_buttons() -> None:
     grouped = grouped_subentry_data(entry)
 
     assert grouped["energy"] == {
-        CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize",
         CONF_AMBER_IMPORT_PRICE: "sensor.import_price",
         CONF_AMBER_EXPORT_PRICE: "sensor.export_price",
         CONF_PV_FORECAST: "sensor.pv_forecast",
@@ -1468,6 +1461,24 @@ def test_migration_moves_all_subentry_settings_into_main_entry() -> None:
         )
     ]
     assert hass.config_entries.removed == ["energy"]
+
+
+def test_migration_removes_retired_config_from_entry_without_subentries() -> None:
+    hass = SimpleNamespace(config_entries=FakeConfigEntries())
+    entry = SimpleNamespace(
+        data={
+            CONF_INSTANCE_NAME: "Energy Planner",
+            "haeo_optimize_service": "haeo.optimize",
+            "haeo_config_entry_id": "optimizer-entry",
+            "haeo_entry_id": "legacy-optimizer-entry",
+        },
+        subentries={},
+    )
+
+    assert async_migrate_subentries_to_entry_data(hass, entry) is True
+    assert hass.config_entries.entry_updates == [
+        (entry, {"data": {CONF_INSTANCE_NAME: "Energy Planner"}})
+    ]
 
 
 def test_validate_config_accepts_compatible_units() -> None:
@@ -1550,35 +1561,15 @@ def test_validate_config_rejects_wrong_entity_domain() -> None:
     assert errors[CONF_AMBER_IMPORT_PRICE] == "invalid_entity_domain"
 
 
-def test_validate_config_rejects_missing_service() -> None:
-    errors = _validate_config(
-        FakeHass(_valid_hass().states.entity_ids, {("select", "select_option")}),
-        _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize"}),
-    )
-
-    assert errors[CONF_HAEO_OPTIMIZE_SERVICE] == "service_not_found"
-
-
-def test_validate_config_rejects_invalid_service_name() -> None:
-    errors = _validate_config(
+def test_validate_config_rejects_empty_ai_service_parts() -> None:
+    assert _validate_config(
         _valid_hass(),
-        _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: "haeo"}),
-    )
-
-    assert errors[CONF_HAEO_OPTIMIZE_SERVICE] == "invalid_service_name"
-
-
-def test_validate_config_rejects_empty_service_domain_or_service() -> None:
-    assert (
-        _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: ".optimize"}))[
-            CONF_HAEO_OPTIMIZE_SERVICE
-        ]
-        == "invalid_service_name"
-    )
-    assert (
-        _validate_config(_valid_hass(), _valid_input({CONF_HAEO_OPTIMIZE_SERVICE: "haeo."}))[CONF_HAEO_OPTIMIZE_SERVICE]
-        == "invalid_service_name"
-    )
+        _valid_input({CONF_AI_ADVISOR_SERVICE: ".generate_data"}),
+    )[CONF_AI_ADVISOR_SERVICE] == "invalid_service_name"
+    assert _validate_config(
+        _valid_hass(),
+        _valid_input({CONF_AI_ADVISOR_SERVICE: "ai_task."}),
+    )[CONF_AI_ADVISOR_SERVICE] == "invalid_service_name"
 
 
 def test_validate_config_rejects_invalid_or_missing_entities() -> None:

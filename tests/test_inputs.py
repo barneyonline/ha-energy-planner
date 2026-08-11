@@ -53,7 +53,7 @@ from custom_components.ha_energy_planner.inputs import (
     _state_confidence,
 )
 from custom_components.ha_energy_planner.load_forecast import BUCKETS_PER_DAY, FORECAST_CONTRACT_VERSION, MODEL_VERSION
-from custom_components.ha_energy_planner.models import HAEOStatus, InputHealth, OccupancyState
+from custom_components.ha_energy_planner.models import InputHealth, OccupancyState
 from custom_components.ha_energy_planner.planner import DryRunPlanner
 
 # Existing normalization scenarios use this local name for the load slot; the
@@ -114,12 +114,15 @@ def _constant_load_model(
         "contract_version": FORECAST_CONTRACT_VERSION,
         "status": status,
         "quality_ready": status == "ready",
-        "quality_failures": [] if status == "ready" else ["insufficient_complete_days"],
+        "quality_failures": [] if status == "ready" else ["insufficient_training_days"],
         "source_entity_id": entity_id,
         "timezone": timezone,
         "trained_at": trained_at.isoformat(),
         "history_days": 10,
+        "training_days": 9,
         "complete_days": 9,
+        "fully_observed_days": 9,
+        "minimum_training_day_coverage": 0.8,
         "history_coverage": 1.0,
         "validation": {
             "origin_count": 2,
@@ -161,7 +164,7 @@ def InputManager(
     return _RawInputManager(hass, entry_data, options, **kwargs)
 
 
-def test_builtin_load_controls_without_haeo_or_external_load_forecast(monkeypatch: Any) -> None:
+def test_builtin_load_controls_without_external_load_forecast(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, 12, tzinfo=UTC)
     monkeypatch.setattr("custom_components.ha_energy_planner.inputs.dt_util.utcnow", lambda: now)
     options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
@@ -210,7 +213,6 @@ def test_builtin_load_controls_without_haeo_or_external_load_forecast(monkeypatc
     ).build_context()
 
     assert ready.input_health == InputHealth.HEALTHY
-    assert ready.haeo_status == HAEOStatus.READY
     assert ready.slots[0].baseline_load_forecast_kw == 1.5
     assert ready.slots[0].baseline_load_forecast_upper_kw == 1.5
     assert degraded.input_health == InputHealth.HEALTHY
@@ -1478,7 +1480,6 @@ def test_input_manager_marks_required_non_finite_numeric_state_unsafe() -> None:
 
     assert context.current_battery_soc_percent is None
     assert context.input_health == InputHealth.UNSAFE
-    assert context.haeo_status == HAEOStatus.STALE
     assert "battery_soc_entity_non_numeric" in context.input_issues
 
 

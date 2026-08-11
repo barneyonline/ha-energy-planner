@@ -67,12 +67,11 @@ from .storage import PlannerStore
 
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
-_HAEO_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
+_RETIRED_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
 _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _PLAN_UNSAFE_NOTIFICATION_ID,
     _GRID_LIMIT_NOTIFICATION_ID,
-    _HAEO_FALLBACK_NOTIFICATION_ID,
     _EV_INFEASIBLE_NOTIFICATION_ID,
 )
 PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
@@ -1450,9 +1449,11 @@ class Executor:
             )
         else:
             await self._async_dismiss_plan_fallback_notification(self._notification_id(_GRID_LIMIT_NOTIFICATION_ID))
-        # HAEO fallback is safe and self-recovering. Clear notifications from
-        # earlier versions instead of asking the user to intervene.
-        await self._async_dismiss_plan_fallback_notification(self._notification_id(_HAEO_FALLBACK_NOTIFICATION_ID))
+        # Remove notifications created by releases that supported the retired
+        # optimizer. This is intentionally cleanup-only and never creates one.
+        await self._async_dismiss_plan_fallback_notification(
+            self._notification_id(_RETIRED_FALLBACK_NOTIFICATION_ID)
+        )
         if not any(
             action.asset == ActionAsset.EV and action.desired_state.get("infeasible") for action in plan.actions
         ):
@@ -1499,7 +1500,10 @@ class Executor:
 
     def _plan_fallback_notification_ids(self) -> tuple[str, ...]:
         """Return all stable fallback IDs isolated to this config entry."""
-        return tuple(self._notification_id(notification_id) for notification_id in _PLAN_FALLBACK_NOTIFICATION_IDS)
+        return tuple(
+            self._notification_id(notification_id)
+            for notification_id in (*_PLAN_FALLBACK_NOTIFICATION_IDS, _RETIRED_FALLBACK_NOTIFICATION_ID)
+        )
 
     def _notification_title(self, suffix: str) -> str:
         """Return a title that identifies the planner instance."""
@@ -2167,7 +2171,7 @@ def _actionable_input_issues(issues: list[str]) -> list[str]:
     return [
         code
         for code in _clean_reason_codes(issues)
-        if not code.startswith("haeo_") and any(marker in code for marker in actionable_markers)
+        if any(marker in code for marker in actionable_markers)
     ]
 
 

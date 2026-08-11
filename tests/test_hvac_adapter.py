@@ -99,7 +99,6 @@ def _action(desired_state: dict[str, Any]) -> PlanAction:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
 

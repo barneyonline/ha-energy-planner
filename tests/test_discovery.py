@@ -19,7 +19,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
-    CONF_HAEO_OPTIMIZE_SERVICE,
 )
 from custom_components.ha_energy_planner.discovery import (
     CapabilityDiscovery,
@@ -75,7 +74,7 @@ def test_discovery_reports_supported_controls() -> None:
             "ai_task.extended_openai": "ready",
             "select.enphase_profile": "AI Optimisation",
         },
-        {("haeo", "optimize"), ("select", "select_option"), ("ai_task", "generate_data")},
+        {("select", "select_option"), ("ai_task", "generate_data")},
     )
     report = CapabilityDiscovery(
         hass,
@@ -89,7 +88,6 @@ def test_discovery_reports_supported_controls() -> None:
             CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
         },
     ).inspect()
-    assert report.haeo.supported is True
     assert report.ev.supported is True
     assert report.hvac.supported is True
     assert report.enphase.supported is True
@@ -208,13 +206,6 @@ def test_discovery_honors_configured_enphase_profile_control_service() -> None:
         },
     ).inspect()
     assert unavailable.enphase.issues == ["enphase_profile_control_unavailable"]
-
-
-def test_discovery_reports_unavailable_service() -> None:
-    hass = FakeHass({}, set())
-    report = CapabilityDiscovery(hass, {CONF_HAEO_OPTIMIZE_SERVICE: "haeo.optimize"}).inspect()
-    assert report.haeo.supported is False
-    assert report.haeo.issues == ["haeo_service_unavailable"]
 
 
 def test_discovery_reports_missing_and_invalid_surfaces() -> None:

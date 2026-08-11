@@ -51,8 +51,6 @@ for key in "${redact_keys[@]}"; do
   fi
 done
 
-haeo_service_data_json="${HEP_HAEO_SERVICE_DATA_JSON:-{\"source\":\"schema_export\"}}"
-
 value_or_placeholder() {
   local name="$1"
   local placeholder="$2"
@@ -114,22 +112,6 @@ if [[ -n "${HEP_WEATHER_ENTITY:-}" ]]; then
     --value-keys temperature,native_temperature,nativeTemperature,currentTemperature,current_temperature,value
 fi
 
-if [[ -n "${HEP_HAEO_SERVICE:-}" ]]; then
-  run python3 scripts/export-live-schema-fixture.py \
-    --out "$OUT_DIR/real_haeo_response.json" \
-    --validate \
-    "${redact_args[@]}" \
-    haeo-response \
-    --name real_haeo_response \
-    --service "$HEP_HAEO_SERVICE" \
-    --service-data-json "$haeo_service_data_json"
-fi
-
 run python3 scripts/validate-live-schema-fixture.py \
   --profile ha-energy-planner-v1-real \
   "$OUT_DIR"/real_*.json
-if [[ -n "${HEP_HAEO_SERVICE:-}" ]]; then
-  run python3 scripts/validate-live-schema-fixture.py \
-    --profile ha-energy-planner-haeo-value-v1-real \
-    "$OUT_DIR"/real_*.json
-fi

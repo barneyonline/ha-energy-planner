@@ -642,10 +642,9 @@ def _forecast_calibration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
 
 
 def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return plan status with bounded refresh and HAEO performance telemetry."""
+    """Return plan status with bounded refresh telemetry."""
     if not coordinator.data:
         return {}
-    latest_haeo = _latest_store_item(coordinator.store.data.get("haeo_runs"))
     return to_jsonable(
         {
             "plan_id": coordinator.data.plan_id,
@@ -657,15 +656,8 @@ def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
             "preview": coordinator.data.preview[:12],
             "refresh": getattr(coordinator, "last_refresh_metadata", None),
             "refresh_metrics": getattr(coordinator, "refresh_metrics", None),
-            "haeo": latest_haeo,
         }
     )
-
-
-def _latest_store_item(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
-        return None
-    return value[-1]
 
 
 def _asset_plan_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
@@ -820,12 +812,6 @@ def _asset_plan_attrs(plan: EnergyPlan | None, asset: ActionAsset) -> dict[str, 
         "total_estimated_energy_kwh": device_plan.get("total_estimated_energy_kwh")
         if isinstance(device_plan, dict)
         else None,
-        "total_estimated_battery_charge_kwh": device_plan.get("total_estimated_battery_charge_kwh")
-        if isinstance(device_plan, dict)
-        else None,
-        "total_estimated_battery_discharge_kwh": device_plan.get("total_estimated_battery_discharge_kwh")
-        if isinstance(device_plan, dict)
-        else None,
         "summary": _asset_plan_summary(plan, asset, actions, timeline),
         "planned_action_count": len(actions),
         "planned_actions": [_plain_action(action) for action in actions[:5]],
@@ -882,7 +868,6 @@ def _plain_action(action: PlanAction) -> dict[str, Any]:
         "constraints": [_plain_reason(item) for item in action.hard_constraints[:8]],
         "desired_state": _plain_state_details(action.desired_state),
         "estimated_value": action.expected_cost_delta,
-        "requires_haeo_plan": bool(action.requires_haeo_plan_id),
     }
     return {key: value for key, value in attrs.items() if value not in (None, [], {})}
 
@@ -1395,7 +1380,6 @@ def _confidence_issue_groups(issues: list[str]) -> dict[str, Any]:
         "ev": ("ev_",),
         "climate": ("daikin_", "climate_", "weather_"),
         "occupancy": ("person_", "occupancy_"),
-        "haeo": ("haeo_",),
     }
     return {
         name: {"issues": [issue for issue in issues if any(issue.startswith(prefix) for prefix in prefixes)][:8]}
@@ -1498,7 +1482,10 @@ def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict
         "history_started_on",
         "history_ended_on",
         "history_days",
+        "training_days",
         "complete_days",
+        "fully_observed_days",
+        "minimum_training_day_coverage",
         "history_coverage",
         "forecast_coverage",
         "recent_correction_factor",
@@ -1819,7 +1806,6 @@ def _dry_run_comparison_summary(item: dict[str, Any], *, include_next_action: bo
                     "execute_not_after",
                     "expected_cost_delta",
                     "confidence",
-                    "requires_haeo_plan_id",
                 )
                 if key in next_action
             }
@@ -1900,7 +1886,6 @@ def _asset_issues(plan: EnergyPlan, asset: ActionAsset) -> list[str]:
             "amber_export_price_",
             "pv_forecast_",
             "baseline_load_forecast_",
-            "haeo_",
         ),
         ActionAsset.EV: (
             "ev_",
@@ -1945,10 +1930,6 @@ def _plain_reason(value: Any) -> str:
             "expensive period."
         ),
         "enphase_price_spread_above_threshold": "The forecast price spread is above the Enphase savings threshold.",
-        "enphase_haeo_export_value_above_threshold": "HAEO expects export value above the Enphase savings threshold.",
-        "enphase_haeo_battery_arbitrage_value_above_threshold": (
-            "HAEO expects battery arbitrage value above the Enphase savings threshold."
-        ),
         "enphase_forecast_solar_export_value_above_threshold": (
             "Forecast solar surplus value is above the Enphase savings threshold."
         ),
