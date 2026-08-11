@@ -20,7 +20,9 @@ Status as of 2026-08-09.
   **Next actions**, and the read-only **Plan** calendar. Armed is tied to
   persisted production state; Current state publishes actual configured entity
   snapshots and ownership; Next actions mirrors the combined per-area state
-  summary and exposes bounded decision evidence in attributes.
+  summary and exposes bounded decision evidence in attributes. The Plan calendar
+  expands allocated EV slots into contiguous charging windows with explicit
+  start and stop times instead of showing the planner's short recheck interval.
 - The integration creates one Energy Planner device and attaches every entity to
   it. Connected inputs and policy are configured on one central **Configure**
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
@@ -28,7 +30,8 @@ Status as of 2026-08-09.
   subentry mappings are folded into the main config entry during setup.
 - Automatic control is the sole master activation switch and combines preflight,
   production arming, and active/review transitions. Separate Climate control,
-  EV control, and Enphase control switches select the participating areas. A
+  EV control, and Enphase control switches select the participating areas and
+  appear with Automatic control in the device's Controls section. A
   device-off transition while armed restores only that asset and fails without
   changing the selector if restoration is incomplete; device-on transitions pass
   preflight before execution while unaffected controls remain armed. The former planner, dry-run, and legacy
@@ -42,10 +45,10 @@ Status as of 2026-08-09.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Settings backed by remaining native entities are centrally excluded from the
-  settings schemas. Fallback Target SOC is configured centrally; the retired
-  Target SOC number, manual EV start/stop buttons, and connected helper are
-  removed from the entity registry during setup.
+  Fallback Target SOC, Ready by, and opportunistic-charging policy are configured
+  centrally. Their retired number, time, and switch entities, along with the
+  manual EV start/stop buttons and connected helper, are removed from the entity
+  registry during setup.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, forecast, bounded action, AI, ownership, override, and outcome
   records.
@@ -68,6 +71,11 @@ Status as of 2026-08-09.
 - Configurable grid import/export kW limits are represented as options and
   validated as hard constraints against normalized PV/load plus projected
   EV/HVAC flexible load.
+- EV momentary command endpoints treat a service exception as an ambiguous
+  outcome when charging feedback is available. The adapter waits through the
+  configured confirmation window and accepts delayed matching feedback before
+  attempting rollback, preventing an accepted Start command from being followed
+  immediately by Stop solely because the provider response timed out.
 - Native EV charger, Daikin HVAC, and Enphase profile adapters execute through
   mapped Home Assistant entities/services and support restore where configured.
 - Native EV execution optionally confirms mapped charging-state feedback after
@@ -174,11 +182,12 @@ Status as of 2026-08-09.
   persist across restart, and release only HVAC ownership. An externally
   enabled manual-override helper creates an authoritative indefinite override;
   helper feedback from integration-created timed overrides is guarded.
-- Persistent notifications are limited to conditions that normally require
-  user action: broken required mappings/capabilities, failed safe-state
-  restoration, infeasible EV readiness, and configured grid hard-limit
-  conflicts. Successful restore/preflight operations, routine changes, stale
-  data remain silent. Stable IDs and content signatures
+- Automatic notifications are limited to conditions that normally require user
+  action: broken required mappings/capabilities, failed safe-state restoration,
+  infeasible EV readiness, and configured grid hard-limit conflicts. Explicitly
+  pressing **Run safety check** or **Explain** always returns a notification,
+  including successful safety checks. Successful restore operations, routine
+  changes, and stale data remain silent. Stable IDs and content signatures
   deduplicate repeated alerts; the actionable plan-alert group can be disabled
   without changing plan health or fail-closed execution. User-provided reason
   fields are compacted and redacted before they can be shown.
@@ -186,15 +195,17 @@ Status as of 2026-08-09.
   Enphase, and the local AI service before active control is allowed.
 - AI explanation and troubleshooting is on-demand, minimized, structured, and
   whitelisted. Automatic background calls and the AI Enabled entity are removed.
-  The primary **Explain or troubleshoot** button accepts only **No action
+  The primary **Explain** button accepts only **No action
   needed** or one complete action anchored to a current planner issue/rejection
   target, including the affected configured entity or setting, problem, exact
   next step, expected benefit, and verification. Generic tuning suggestions are
   rejected, and AI cannot call services, change settings, or bypass hard
   constraints. The result and pending state are published in **Next actions**
   attributes instead of a separate status entity. Home Assistant's AI Task
-  structured-output schema is supplied to the provider, and rejected results
-  remain visible across equivalent plan refreshes. The integration warns that provider
+  structured-output schema is supplied to the provider. Pressing the button
+  immediately publishes pending feedback, then replaces it with the accepted,
+  rejected, or failed result; rejected results also remain visible across
+  equivalent plan refreshes. The integration warns that provider
   integrations may independently log bounded prompts. Docker smoke coverage
   exercises a response-capable local AI advisor service through Home Assistant
   Core and verifies accepted bounded advice in Store recommendations.
@@ -523,12 +534,11 @@ Status as of 2026-08-09.
   `export_diagnostics` response service awaits and returns a payload. Service
   reason inputs are bounded and restricted to compact audit codes.
 - The `set_ev_ready_by` service validates local time input, normalizes accepted
-  values to `HH:MM`, persists the native setting, and queues planner work. The
-  `set_ev_target_soc` service validates and persists a percentage target. Native
-  time/number entities expose the same controls on the single Energy Planner
-  device. It also exposes a native opportunistic-charging switch and import-price threshold
-  number; both persist the corresponding planner option and request an immediate
-  replan.
+  values to `HH:MM`, persists the central EV setting, and queues planner work.
+  The `set_ev_target_soc` service validates and persists a percentage target.
+  Ready by, opportunistic charging, and its import-price threshold are exposed
+  only in EV settings; setup removes their obsolete duplicate entities without
+  changing the stored option values.
 - Climate, EV, and Enphase each expose a translated device control switch on the
   same Energy Planner device. Automatic control remains the guarded master arm;
   disabling a device restores only that asset, failed restoration leaves the

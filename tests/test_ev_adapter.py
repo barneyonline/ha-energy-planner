@@ -677,9 +677,7 @@ def test_ev_stop_does_not_treat_disconnection_as_safe_button_confirmation() -> N
 
     assert result.applied is True
     assert result.safe_state_confirmed is False
-    assert hass.services.calls == [
-        ("button", "press", {"entity_id": "button.ev_stop"})
-    ]
+    assert hass.services.calls == [("button", "press", {"entity_id": "button.ev_stop"})]
 
 
 def test_ev_stop_skips_button_when_vehicle_has_suspended_charging() -> None:
@@ -718,9 +716,7 @@ def test_ev_stop_confirms_stateful_control_without_charging_feedback() -> None:
 
     assert result.applied is True
     assert result.safe_state_confirmed is True
-    assert hass.services.calls == [
-        ("switch", "turn_off", {"entity_id": "switch.ev_charger"})
-    ]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.ev_charger"})]
     assert adapter._charging_feedback_proves_safe("binary_sensor.missing") is False
 
 
@@ -943,9 +939,7 @@ def test_ev_keep_on_confirms_stateful_control_without_requiring_active_charging(
         confirmation_timeout_seconds=0,
     )
 
-    result = asyncio.run(
-        adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True}))
-    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True})))
 
     assert result.applied is True
     assert result.reason == "ev_charger_enabled_for_preconditioning"
@@ -967,9 +961,7 @@ def test_ev_keep_on_rejects_momentary_start_control() -> None:
         },
     )
 
-    result = asyncio.run(
-        adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True}))
-    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True})))
 
     assert result.applied is False
     assert result.reason == "ev_keep_on_requires_stateful_control"
@@ -994,15 +986,11 @@ def test_ev_keep_on_prefers_persistent_charger_over_optional_start_button() -> N
         confirmation_timeout_seconds=0,
     )
 
-    result = asyncio.run(
-        adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True}))
-    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True})))
 
     assert result.applied is True
     assert result.reason == "ev_charger_enabled_for_preconditioning"
-    assert hass.services.calls == [
-        ("switch", "turn_on", {"entity_id": "switch.ev_control"})
-    ]
+    assert hass.services.calls == [("switch", "turn_on", {"entity_id": "switch.ev_control"})]
 
 
 def test_ev_keep_on_rejects_separate_start_switch_without_persistent_control() -> None:
@@ -1020,9 +1008,7 @@ def test_ev_keep_on_rejects_separate_start_switch_without_persistent_control() -
         },
     )
 
-    result = asyncio.run(
-        adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True}))
-    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {"keep_charger_on": True})))
 
     assert result.applied is False
     assert result.reason == "ev_keep_on_requires_stateful_control"
@@ -1356,9 +1342,7 @@ def test_ev_restore_momentary_takeover_ignores_unrelated_persistent_control() ->
     assert result.applied is False
     assert result.reason == "ev_stop_not_confirmed"
     assert result.safe_state_confirmed is False
-    assert hass.services.calls == [
-        ("button", "press", {"entity_id": "button.ev_stop"})
-    ]
+    assert hass.services.calls == [("button", "press", {"entity_id": "button.ev_stop"})]
 
 
 def test_ev_restore_accepts_confirmed_nested_safe_stop_compensation() -> None:
@@ -1371,11 +1355,7 @@ def test_ev_restore_accepts_confirmed_nested_safe_stop_compensation() -> None:
             blocking: bool = False,
         ) -> None:
             await super().async_call(domain, service, data, blocking)
-            stop_calls = [
-                call
-                for call in self.calls
-                if call == ("button", "press", {"entity_id": "button.ev_stop"})
-            ]
+            stop_calls = [call for call in self.calls if call == ("button", "press", {"entity_id": "button.ev_stop"})]
             if len(stop_calls) == 2:
                 self.states.values["binary_sensor.ev_charging"] = "off"
 
@@ -1398,9 +1378,7 @@ def test_ev_restore_accepts_confirmed_nested_safe_stop_compensation() -> None:
         confirmation_retries=0,
     )
 
-    saved_result = asyncio.run(
-        adapter.async_restore({CONF_EV_SMART_CHARGING_START: "unknown"})
-    )
+    saved_result = asyncio.run(adapter.async_restore({CONF_EV_SMART_CHARGING_START: "unknown"}))
 
     assert saved_result.applied is True
     assert saved_result.reason == "ev_saved_state_safe_stop"
@@ -1575,6 +1553,134 @@ def test_ev_control_service_errors_fail_closed() -> None:
     assert switch.reason == "ev_control_service_failed"
     assert switch.command_sent is True
     assert switch.rollback_succeeded is False
+
+
+def test_ev_start_service_error_waits_for_delayed_feedback_before_rollback() -> None:
+    class AcceptedThenRaisedServices(FakeServices):
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            self.calls.append((domain, service, data))
+
+            async def delayed_feedback() -> None:
+                await asyncio.sleep(0.002)
+                self.states.values["sensor.ev_connector_status"] = "CHARGING"
+
+            asyncio.create_task(delayed_feedback())
+            raise RuntimeError("provider timed out after accepting command")
+
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "sensor.ev_connector_status": "SUSPENDED_EVSE",
+            "button.ev_start": "unknown",
+            "button.ev_stop": "unknown",
+        }
+    )
+    hass.services = AcceptedThenRaisedServices(hass.states)
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGING: "sensor.ev_connector_status",
+            CONF_EV_CHARGER_START: "button.ev_start",
+            CONF_EV_CHARGER_STOP: "button.ev_stop",
+        },
+        confirmation_timeout_seconds=0.02,
+        confirmation_poll_seconds=0.001,
+    )
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START)))
+
+    assert result.applied is True
+    assert result.reason == "ev_charging_confirmed_after_service_error"
+    assert result.command_sent is True
+    assert result.rollback_succeeded is None
+    assert hass.services.calls == [("button", "press", {"entity_id": "button.ev_start"})]
+
+
+def test_ev_stop_button_service_error_accepts_delayed_safe_feedback() -> None:
+    class AcceptedThenRaisedServices(FakeServices):
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            self.calls.append((domain, service, data))
+
+            async def delayed_feedback() -> None:
+                await asyncio.sleep(0.002)
+                self.states.values["sensor.ev_connector_status"] = "SUSPENDED_EVSE"
+
+            asyncio.create_task(delayed_feedback())
+            raise RuntimeError("provider timed out after accepting stop")
+
+    hass = FakeHass(
+        {
+            "sensor.ev_connector_status": "CHARGING",
+            "button.ev_stop": "unknown",
+        }
+    )
+    hass.services = AcceptedThenRaisedServices(hass.states)
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CHARGING: "sensor.ev_connector_status",
+            CONF_EV_CHARGER_STOP: "button.ev_stop",
+        },
+        confirmation_timeout_seconds=0.02,
+        confirmation_poll_seconds=0.001,
+    )
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_STOP)))
+
+    assert result.applied is True
+    assert result.reason == "ev_charging_stopped_confirmed_after_service_error"
+    assert result.safe_state_confirmed is True
+    assert hass.services.calls == [("button", "press", {"entity_id": "button.ev_stop"})]
+
+
+def test_ev_stateful_stop_service_error_confirms_control_and_feedback() -> None:
+    class AcceptedThenRaisedServices(FakeServices):
+        async def async_call(
+            self,
+            domain: str,
+            service: str,
+            data: dict[str, Any],
+            blocking: bool = False,
+        ) -> None:
+            await super().async_call(domain, service, data, blocking)
+            self.states.values["binary_sensor.ev_charging"] = "off"
+            raise RuntimeError("provider timed out after accepting stop")
+
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_charging": "on",
+            "switch.ev_charger": "on",
+        }
+    )
+    hass.services = AcceptedThenRaisedServices(hass.states)
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_CHARGER: "switch.ev_charger",
+        },
+        confirmation_timeout_seconds=0,
+    )
+
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_STOP)))
+
+    assert result.applied is True
+    assert result.reason == "ev_charging_stopped_confirmed_after_service_error"
+    assert result.safe_state_confirmed is True
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.ev_charger"})]
 
 
 def test_ev_control_service_exception_restores_a_mutated_switch() -> None:

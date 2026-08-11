@@ -266,7 +266,7 @@
               "ev_control_enabled": "Allows active-mode EV start, stop, and schedule commands after production is armed.",
               "climate_control_enabled": "Allows active-mode climate commands after production is armed.",
               "enphase_control_enabled": "Allows active-mode Enphase profile changes after production is armed.",
-              "ai_timeout_seconds": "Maximum time to wait after pressing Explain or troubleshoot.",
+              "ai_timeout_seconds": "Maximum time to wait after pressing Explain.",
               "command_rate_limit_seconds": "Cooldown between repeated commands to the same device target.",
               "max_daily_ev_actions": "Maximum EV control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
               "max_daily_climate_actions": "Maximum climate control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
@@ -456,19 +456,6 @@
       },
       "ev_keep_charger_on": {
         "name": "Keep charger on"
-      },
-      "ev_opportunistic_charging": {
-        "name": "Opportunistic charging"
-      }
-    },
-    "number": {
-      "ev_opportunistic_charging_price_threshold": {
-        "name": "Opportunistic charging price threshold"
-      }
-    },
-    "time": {
-      "ev_ready_by": {
-        "name": "Ready by"
       }
     },
     "button": {
@@ -479,7 +466,7 @@
         "name": "Restore safe state"
       },
       "request_ai_advice": {
-        "name": "Explain or troubleshoot"
+        "name": "Explain"
       },
       "run_preflight": {
         "name": "Advanced: Run safety check"
