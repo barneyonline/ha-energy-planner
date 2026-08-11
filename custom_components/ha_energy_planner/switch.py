@@ -15,7 +15,6 @@ from .const import (
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
-    CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     DOMAIN,
 )
 from .coordinator import EnergyPlannerCoordinator
@@ -46,7 +45,6 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         key="climate_control",
         translation_key="climate_control",
         icon="mdi:thermostat-auto",
-        entity_category=EntityCategory.CONFIG,
         option_key=CONF_CLIMATE_CONTROL_ENABLED,
         default=False,
     ),
@@ -54,7 +52,6 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         key="ev_control",
         translation_key="ev_control",
         icon="mdi:ev-station",
-        entity_category=EntityCategory.CONFIG,
         option_key=CONF_EV_CONTROL_ENABLED,
         default=False,
     ),
@@ -62,7 +59,6 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         key="enphase_control",
         translation_key="enphase_control",
         icon="mdi:home-battery-outline",
-        entity_category=EntityCategory.CONFIG,
         option_key=CONF_ENPHASE_CONTROL_ENABLED,
         default=False,
     ),
@@ -72,14 +68,6 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
         icon="mdi:car-defrost-front",
         entity_category=EntityCategory.CONFIG,
         option_key=CONF_EV_KEEP_CHARGER_ON,
-        default=False,
-    ),
-    PlannerSwitchDescription(
-        key="ev_opportunistic_charging",
-        translation_key="ev_opportunistic_charging",
-        icon="mdi:cash-clock",
-        entity_category=EntityCategory.CONFIG,
-        option_key=CONF_EV_LOW_PRICE_CHARGING_ENABLED,
         default=False,
     ),
 )
@@ -92,6 +80,7 @@ _RETIRED_CONTROL_SWITCH_KEYS = (
     "climate_control_enabled",
     "enphase_control_enabled",
     "ev_connected_helper",
+    "ev_opportunistic_charging",
 )
 
 
@@ -162,16 +151,10 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
             await self.coordinator.async_set_ev_keep_charger_on(value)
             self.async_write_ha_state()
             return
-        if option_key in {
+        assert option_key in {
             CONF_CLIMATE_CONTROL_ENABLED,
             CONF_EV_CONTROL_ENABLED,
             CONF_ENPHASE_CONTROL_ENABLED,
-        }:
-            await self.coordinator.async_set_device_control(option_key, value)
-            self.async_write_ha_state()
-            return
-        options = self.coordinator.options
-        options[option_key] = value
-        self.coordinator.hass.config_entries.async_update_entry(self.coordinator.entry, options=options)
+        }
+        await self.coordinator.async_set_device_control(option_key, value)
         self.async_write_ha_state()
-        await self.coordinator.async_handle_options_update()

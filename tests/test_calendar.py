@@ -92,6 +92,85 @@ def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
     assert calendar_module._compact_mapping("plain") == "plain"
 
 
+def test_calendar_expands_ev_schedule_into_complete_charging_windows() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    action = replace(
+        _action("ev-schedule", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "target_soc_percent": 80,
+            "ready_by": "07:00",
+            "allocated_slots": [
+                {"valid_at": (now + timedelta(minutes=30)).isoformat(), "charge_kw": 7},
+                {"valid_at": (now + timedelta(minutes=35)).isoformat(), "charge_kw": 6},
+                {"valid_at": (now + timedelta(minutes=50)).isoformat(), "charge_kw": 7},
+            ],
+        },
+    )
+    coordinator = _coordinator(_plan([action]))
+    entity = EnergyPlannerCalendar(coordinator)
+
+    events = asyncio.run(
+        entity.async_get_events(
+            coordinator.hass,
+            now,
+            now + timedelta(hours=2),
+        )
+    )
+
+    assert [event.summary for event in events] == ["EV: Charging window", "EV: Charging window"]
+    assert [(event.start, event.end) for event in events] == [
+        (now + timedelta(minutes=30), now + timedelta(minutes=40)),
+        (now + timedelta(minutes=50), now + timedelta(minutes=55)),
+    ]
+    assert entity.event == events[0]
+    assert events[0].uid == "ev-schedule-window-1"
+    assert "Start charging:" in (events[0].description or "")
+    assert "Stop charging:" in (events[0].description or "")
+    assert "+00:00" not in (events[0].description or "")
+    assert "Charging power: 6-7 kW" in (events[0].description or "")
+    assert "Estimated energy: 1.08 kWh" in (events[0].description or "")
+    assert "Target SOC: 80%" in (events[0].description or "")
+    assert "Ready by: 07:00" in (events[0].description or "")
+    assert "Charging power: 7 kW" in (events[1].description or "")
+
+
+def test_calendar_omits_ev_schedule_without_allocated_charging() -> None:
+    now = datetime.now(UTC)
+    action = replace(
+        _action("ev-idle", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={"charging_required_now": False, "allocated_slots": []},
+    )
+    coordinator = _coordinator(_plan([action]))
+
+    assert EnergyPlannerCalendar(coordinator).event is None
+
+
+def test_calendar_ignores_malformed_ev_slots() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    action = replace(
+        _action("ev-invalid-slots", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "allocated_slots": [
+                None,
+                {"valid_at": "not-a-date", "charge_kw": 7},
+                {"valid_at": now.replace(tzinfo=None).isoformat(), "charge_kw": 7},
+                {"valid_at": now.isoformat(), "charge_kw": "invalid"},
+                {"valid_at": now.isoformat(), "charge_kw": "nan"},
+                {"valid_at": now.isoformat(), "charge_kw": 0},
+                {"valid_at": now.isoformat(), "charge_kw": 7},
+            ]
+        },
+    )
+
+    events = calendar_module._calendar_events(_coordinator(_plan([action])))
+
+    assert len(events) == 1
+    assert events[0].start == now
+
+
 def test_calendar_renders_missing_action_load_values_as_unknown() -> None:
     now = datetime.now(UTC)
     action = _action("ev-start", now + timedelta(minutes=10), now + timedelta(minutes=15))

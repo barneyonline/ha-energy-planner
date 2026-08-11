@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.5 - 2026-08-11
+
+### Fixed
+
+- Removed the obsolete Ready by, Opportunistic charging, and Opportunistic
+  charging price threshold entities during setup now that those controls live
+  in EV settings. Existing option values are preserved.
+- Renamed **Explain or troubleshoot** to **Explain** and made every button press
+  publish a Home Assistant notification, including not-ready and rate-limit
+  rejections, immediate pending feedback, and the accepted, rejected, or failed
+  result.
+- Moved **Climate control**, **EV control**, and **Enphase control** from the
+  Configuration grouping into the device's Controls section alongside
+  **Automatic control**.
+- **Run safety check** now always publishes its result as a Home Assistant
+  notification, including an explicit success response when every check passes.
+- Replaced the misleading short **Schedule EV charging** calendar entry with
+  complete contiguous **EV: Charging window** events derived from allocated
+  slots. Each event now shows its actual start, stop, power, and estimated
+  energy in Home Assistant's local timezone; no event is created when no
+  charging was allocated, and malformed slots cannot break the calendar.
+- Prevented momentary EV start/stop oscillation when a charger service times out
+  after accepting a command. Energy Planner now waits for delayed charging
+  feedback before deciding whether rollback is necessary, so a confirmed late
+  start is not immediately followed by Stop charging.
+
 ## 0.9.4 - 2026-08-11
 
 ### Changed
