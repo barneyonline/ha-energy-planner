@@ -45,6 +45,7 @@ from .const import (
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_TARGET_HIGH,
     CONF_CLIMATE_TARGET_LOW,
     CONF_CLIMATE_ZONES,
@@ -245,6 +246,7 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
         vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(["switch", "input_boolean"], multiple=True),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
+        vol.Optional(CONF_CLIMATE_SCHEDULER_GUARD_TIMER): _entity_selector("timer"),
         vol.Optional(CONF_CLIMATE_MANUAL_OVERRIDE): _entity_selector("input_boolean"),
         vol.Required(CONF_CLIMATE_TARGET_LOW): _entity_selector("input_number"),
         vol.Required(CONF_CLIMATE_TARGET_HIGH): _entity_selector("input_number"),
@@ -902,6 +904,15 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
 def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[str, str]:
     """Validate configured entities without calling device services."""
     errors: dict[str, str] = {}
+    scheduler_guard = bool(user_input.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER))
+    scheduler_timer = bool(user_input.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER))
+    if scheduler_guard != scheduler_timer:
+        missing_key = (
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER
+            if scheduler_guard
+            else CONF_CLIMATE_CHANGE_FROM_SCHEDULER
+        )
+        errors[missing_key] = "climate_scheduler_guard_pair_required"
     for observed_key, forecast_key in ((CONF_PV_OBSERVED, CONF_PV_FORECAST),):
         if user_input.get(observed_key) and user_input.get(observed_key) == user_input.get(forecast_key):
             errors[observed_key] = "observation_must_differ_from_forecast"
@@ -1040,6 +1051,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_CLIMATE_AUTOMATIONS: {"automation"},
     CONF_CLIMATE_ZONES: {"switch", "input_boolean"},
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER: {"input_boolean"},
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER: {"timer"},
     CONF_CLIMATE_MANUAL_OVERRIDE: {"input_boolean"},
     CONF_CLIMATE_TARGET_LOW: {"input_number"},
     CONF_CLIMATE_TARGET_HIGH: {"input_number"},

@@ -38,7 +38,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.5.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.6.
 
 ## Installation
 
@@ -118,7 +118,7 @@ Changing the load mapping disarms production control and requires fresh review c
 
 The advanced **Run safety check** button always returns a Home Assistant notification, including when every check passes.
 
-Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy. Ready by and both opportunistic-charging values are settings-only; obsolete native entities for those values are removed on upgrade.
+Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy. Ready by, both opportunistic-charging values, and Keep charger on are settings-only; obsolete native entities for those values are removed on upgrade. The one- and four-hour pause buttons are also retired; automations can still call `ha_energy_planner.pause_control` with any supported duration.
 
 Mapped EV start and stop controls are planner actuators. Energy Planner does not expose separate manual Start charging or Stop charging buttons. Target SOC is configured centrally or read from an optional external target sensor; it is not exposed as an Energy Planner number entity.
 
@@ -126,7 +126,7 @@ Mapped EV start and stop controls are planner actuators. Energy Planner does not
 
 EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. After three observed trip days it can derive a conservative target from local history; until then it uses the configured fallback Target SOC. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
-Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs.
+Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and guard `timer` under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual.
 
 Enphase planning can select configured self-consumption, backup, or AI profiles using local tariff, PV, household-load, battery, and policy evidence.
 

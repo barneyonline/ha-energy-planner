@@ -8,7 +8,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
@@ -176,6 +178,58 @@ def test_discovery_reports_missing_manual_override_helper() -> None:
     assert report.hvac.issues == ["climate_manual_override_unavailable"]
     assert report.hvac.details["manual_override_entity"] == (
         "input_boolean.hvac_override"
+    )
+
+
+def test_discovery_requires_available_scheduler_guard_pair() -> None:
+    incomplete = CapabilityDiscovery(
+        FakeHass(
+            {
+                "climate.daikin": "heat",
+                "input_boolean.scheduler_change": "off",
+            },
+            set(),
+        ),
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        },
+    ).inspect()
+    unavailable = CapabilityDiscovery(
+        FakeHass(
+            {
+                "climate.daikin": "heat",
+                "input_boolean.scheduler_change": "off",
+            },
+            set(),
+        ),
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    ).inspect()
+    available = CapabilityDiscovery(
+        FakeHass(
+            {
+                "climate.daikin": "heat",
+                "input_boolean.scheduler_change": "off",
+                "timer.scheduler_guard": "idle",
+            },
+            set(),
+        ),
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    ).inspect()
+
+    assert incomplete.hvac.issues == ["climate_scheduler_guard_incomplete"]
+    assert unavailable.hvac.issues == ["climate_scheduler_guard_unavailable"]
+    assert available.hvac.supported is True
+    assert available.hvac.details["scheduler_guard_timer_entity"] == (
+        "timer.scheduler_guard"
     )
 
 

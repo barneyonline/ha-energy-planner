@@ -7,8 +7,11 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from custom_components.ha_energy_planner import hvac_adapter as hvac_adapter_module
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
 )
@@ -59,6 +62,10 @@ class FakeServices:
             self.states.values[entity_id] = "on"
         elif service == "turn_off":
             self.states.values[entity_id] = "off"
+        elif service == "start" and domain == "timer":
+            self.states.values[entity_id] = "active"
+        elif service == "cancel" and domain == "timer":
+            self.states.values[entity_id] = "idle"
         elif service == "set_hvac_mode":
             current = self.states.get(entity_id)
             self.states.values[entity_id] = FakeState(
@@ -119,6 +126,184 @@ def test_hvac_action_disables_automation_then_controls_climate() -> None:
         ("automation", "turn_off", {"entity_id": "automation.climate"}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 20}),
     ]
+
+
+def test_hvac_action_arms_scheduler_classifier_guard_before_actuators() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 19}),
+            "automation.climate": "on",
+            "input_boolean.scheduler_change": "off",
+            "timer.scheduler_guard": "idle",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "target_temperature": 20}))
+    )
+
+    assert result.applied is True
+    assert hass.services.calls == [
+        (
+            "timer",
+            "start",
+            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+        ),
+        ("input_boolean", "turn_on", {"entity_id": "input_boolean.scheduler_change"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 20}),
+    ]
+
+
+def test_hvac_action_fails_closed_when_scheduler_guard_is_incomplete() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "input_boolean.scheduler_change": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.applied is False
+    assert result.reason == "climate_scheduler_guard_failed"
+    assert result.rollback_succeeded is False
+    assert hass.services.calls == []
+
+
+def test_hvac_action_rolls_back_failed_guard_without_touching_actuators() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "input_boolean.scheduler_change": "off",
+            "timer.scheduler_guard": "idle",
+        }
+    )
+    hass.services.fail_services.add(("input_boolean", "turn_on"))
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.reason == "climate_scheduler_guard_failed"
+    assert hass.services.calls == [
+        (
+            "timer",
+            "start",
+            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+        ),
+        ("input_boolean", "turn_on", {"entity_id": "input_boolean.scheduler_change"}),
+        ("input_boolean", "turn_off", {"entity_id": "input_boolean.scheduler_change"}),
+        ("timer", "cancel", {"entity_id": "timer.scheduler_guard"}),
+    ]
+
+
+def test_hvac_guard_fails_when_timer_does_not_confirm(monkeypatch: Any) -> None:
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "input_boolean.scheduler_change": "off",
+            "timer.scheduler_guard": "idle",
+        }
+    )
+    hass.services.noop_entities.add("timer.scheduler_guard")
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.reason == "climate_scheduler_guard_failed"
+    assert hass.services.calls == [
+        (
+            "timer",
+            "start",
+            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+        ),
+        ("input_boolean", "turn_off", {"entity_id": "input_boolean.scheduler_change"}),
+        ("timer", "cancel", {"entity_id": "timer.scheduler_guard"}),
+    ]
+
+
+def test_hvac_guard_cleanup_service_errors_remain_fail_closed() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": "heat",
+            "input_boolean.scheduler_change": "off",
+            "timer.scheduler_guard": "idle",
+        }
+    )
+    hass.services.fail_services.update(
+        {
+            ("input_boolean", "turn_on"),
+            ("input_boolean", "turn_off"),
+            ("timer", "cancel"),
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    )
+
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool"})))
+
+    assert result.reason == "climate_scheduler_guard_failed"
+    assert all(domain not in {"climate", "automation", "switch"} for domain, _, _ in hass.services.calls)
+
+
+def test_hvac_restore_fails_closed_when_scheduler_guard_is_incomplete() -> None:
+    hass = FakeHass(
+        {
+            "automation.climate": "off",
+            "input_boolean.scheduler_change": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        },
+    )
+
+    result = asyncio.run(adapter.async_restore({"automation.climate": "on"}))
+
+    assert result.applied is False
+    assert result.reason == "climate_scheduler_guard_failed"
+    assert result.saved_automation_states == {"automation.climate": "on"}
+    assert hass.services.calls == []
 
 
 def test_hvac_action_only_calls_services_for_fields_that_differ() -> None:
