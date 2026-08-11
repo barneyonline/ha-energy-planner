@@ -29,7 +29,6 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
-    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -44,10 +43,7 @@ from .safety import (
     strict_bool,
 )
 
-_SERVICE_KEYS = (
-    CONF_HAEO_OPTIMIZE_SERVICE,
-    CONF_AI_ADVISOR_SERVICE,
-)
+_SERVICE_KEYS = (CONF_AI_ADVISOR_SERVICE,)
 _EVIDENCE_OPTION_EXCLUSIONS = {
     CONF_AI_ADVISOR_SERVICE,
     CONF_DEFAULT_READY_BY,
@@ -60,7 +56,13 @@ _EVIDENCE_OPTION_EXCLUSIONS = {
     CONF_ENPHASE_CONTROL_ENABLED,
     "ev_connected_helper",
 }
-_EVIDENCE_ENTRY_EXCLUSIONS = {CONF_AI_ADVISOR_SERVICE, "ai_task_entity"}
+_EVIDENCE_ENTRY_EXCLUSIONS = {
+    CONF_AI_ADVISOR_SERVICE,
+    "ai_task_entity",
+    "haeo_config_entry_id",
+    "haeo_entry_id",
+    "haeo_optimize_service",
+}
 
 
 def build_preflight_report(
@@ -444,13 +446,11 @@ def _service_report(
 
 def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str] | None = None) -> list[str]:
     configured: list[str] = []
-    if entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) and (required_areas is None or "haeo" in required_areas):
-        configured.append(str(entry_data[CONF_HAEO_OPTIMIZE_SERVICE]))
     if required_areas is None:
         configured.extend(
             str(entry_data[key])
             for key in _SERVICE_KEYS
-            if entry_data.get(key) and key != CONF_HAEO_OPTIMIZE_SERVICE
+            if entry_data.get(key)
         )
     return configured
 
@@ -565,7 +565,6 @@ def _as_utc(value: datetime) -> datetime:
 def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) -> dict[str, Any]:
     """Return configured, enabled, and required control surfaces."""
     configured = {
-        "haeo": bool(str(entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE, "") or "").strip()),
         "ev": any(
             bool(str(entry_data.get(key, "") or "").strip())
             for key in (
@@ -581,14 +580,11 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
         "enphase": bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
     }
     enabled = {
-        "haeo": strict_bool(options.get(CONF_PLANNER_ENABLED), default=False),
         "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
         "hvac": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
         "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
     }
-    required = [
-        area for area in ("haeo", "ev", "hvac", "enphase") if enabled[area] and (area != "haeo" or configured[area])
-    ]
+    required = [area for area in ("ev", "hvac", "enphase") if enabled[area]]
     return {
         "configured": [area for area, value in configured.items() if value],
         "enabled": [area for area, value in enabled.items() if value],
@@ -599,7 +595,7 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
                 "enabled": enabled[area],
                 "required": area in required,
             }
-            for area in ("haeo", "ev", "hvac", "enphase")
+            for area in ("ev", "hvac", "enphase")
         },
     }
 

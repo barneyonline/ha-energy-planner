@@ -73,7 +73,6 @@ def _action(kind: ActionKind, desired_state: dict[str, Any] | None = None) -> Pl
         reason_codes=[],
         expected_cost_delta=1.0,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
 

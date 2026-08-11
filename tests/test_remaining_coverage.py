@@ -34,7 +34,6 @@ from custom_components.ha_energy_planner.coordinator import (
     _bounded_json as coordinator_bounded_json,
 )
 from custom_components.ha_energy_planner.diagnostics import (
-    _latest_haeo_status,
     _recent_items,
     _store_summary,
     _trip_history_summary,
@@ -46,7 +45,6 @@ from custom_components.ha_energy_planner.ev import update_trip_history_from_valu
 from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter, _time_parts
 from custom_components.ha_energy_planner.executor import Executor, _profile_control_service_for_target
 from custom_components.ha_energy_planner.forecasts import _energy_items_as_average_power, _items_from_value, _parse_item
-from custom_components.ha_energy_planner.haeo_adapter import apply_haeo_response_to_context
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
 from custom_components.ha_energy_planner.inputs import InputManager
 from custom_components.ha_energy_planner.models import (
@@ -56,9 +54,6 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOSolvePhase,
-    HAEOSolveResult,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -67,6 +62,7 @@ from custom_components.ha_energy_planner.models import (
 from custom_components.ha_energy_planner.ownership import EnphaseProfileGuard, OwnershipState
 from custom_components.ha_energy_planner.preflight import (
     _audit_report,
+    _availability_message,
     _bounded_join,
     _current_plan_report,
     _entity_report,
@@ -176,13 +172,21 @@ def test_remaining_preflight_helpers() -> None:
         "ev_unavailable_entity": "button.ev_unavailable",
         "person_entities": ["person.a", "bad"],
         "service_key": "badservice",
-        "haeo_optimize_service": "ok.service",
+        "ai_advisor_service": "ok.service",
     }
 
     assert _entity_report(hass, entry_data)["unavailable"] == ["button.ev_unavailable", "sensor.a"]
-    assert _service_report(hass, {"haeo_optimize_service": "ok.service", "ai_advisor_service": "badservice"})[
+    assert _service_report(hass, {"ai_advisor_service": "badservice"})[
         "missing"
     ] == ["badservice"]
+    assert _service_report(hass, {"ai_advisor_service": "missing.service"})["unavailable"] == [
+        "missing.service"
+    ]
+    assert _availability_message(
+        "ready",
+        missing=["sensor.missing"],
+        unavailable=["sensor.unavailable"],
+    ) == "Configured references are not ready; missing: sensor.missing; unavailable: sensor.unavailable."
     assert _split_entities(["sensor.a", "bad"]) == ["sensor.a"]
     assert _split_entities(123) == []
     assert _audit_report({"execution_audit": ["bad", {"plan_id": "plan-1", "secret": "drop"}]})["recent_outcomes"] == [
@@ -313,7 +317,6 @@ def test_remaining_coordinator_and_executor_branches(monkeypatch: pytest.MonkeyP
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY, "summary", 1, None, [action], []
@@ -325,7 +328,6 @@ def test_remaining_coordinator_and_executor_branches(monkeypatch: pytest.MonkeyP
         50,
         50,
         OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
         InputHealth.UNSAFE,
     )
     store = SimpleNamespace(
@@ -343,139 +345,6 @@ def test_remaining_coordinator_and_executor_branches(monkeypatch: pytest.MonkeyP
         )
         is None
     )
-
-
-def test_remaining_coordinator_haeo_non_ready_branch(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-    )
-
-    class Store:
-        def __init__(self) -> None:
-            self.data: dict[str, Any] = {"trip_history": {}, "forecast_snapshots": []}
-            self.haeo_runs: list[dict[str, Any]] = []
-            self.forecast_snapshots: list[dict[str, Any]] = []
-
-        async def async_save_discovery(self, data: dict[str, Any]) -> None:
-            pass
-
-        async def async_add_haeo_run(self, run: dict[str, Any]) -> None:
-            self.haeo_runs.append(run)
-
-        async def async_add_forecast_snapshot(self, snapshot: dict[str, Any]) -> None:
-            self.forecast_snapshots.append(snapshot)
-
-        async def async_save_plan(self, plan: EnergyPlan) -> None:
-            pass
-
-    class HAEO:
-        def __init__(self, hass: Any, service: str) -> None:
-            pass
-
-        async def async_solve_baseline(self, ctx: DecisionContext) -> HAEOSolveResult:
-            return HAEOSolveResult(HAEOSolvePhase.BASELINE, HAEOStatus.READY, "baseline", "plan")
-
-        async def async_solve_with_flexible_load(self, ctx: DecisionContext, projections: list[Any]) -> HAEOSolveResult:
-            return HAEOSolveResult(HAEOSolvePhase.FLEXIBLE_LOAD, HAEOStatus.FAILED, "second_failed", "plan")
-
-    class Planner:
-        def __init__(self, options: dict[str, Any], thermal_model: dict[str, Any]) -> None:
-            pass
-
-        def create_plan(self, ctx: DecisionContext) -> EnergyPlan:
-            return EnergyPlan(
-                "plan",
-                now,
-                24,
-                5,
-                "current",
-                InputHealth.HEALTHY,
-                PlannerMode.ACTIVE_HEALTHY,
-                "summary",
-                1,
-                None,
-                [],
-                [],
-            )
-
-        def project_flexible_loads(self, ctx: DecisionContext) -> list[str]:
-            return ["projection"]
-
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
-        lambda hass, data: SimpleNamespace(inspect=lambda: SimpleNamespace(as_dict=lambda: {})),
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder", _trip_import_noop
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.InputManager",
-        lambda *a, **k: SimpleNamespace(
-            current_forecast_observations=lambda: {},
-            build_context=lambda overrides: context,
-            thermal_sample=lambda ctx: {},
-            forecast_training_slots=[],
-            forecast_calibration={},
-        ),
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_forecast_calibration", lambda *a, **k: ({}, False)
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_thermal_model", lambda *a, **k: ({}, False)
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", HAEO)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", Planner)
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.ConstraintValidator",
-        lambda options: SimpleNamespace(validate_plan=lambda ctx, plan: []),
-    )
-
-    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-
-    class Hass:
-        async def async_add_executor_job(self, fn: Any, *args: Any) -> Any:
-            return fn(*args)
-
-    coordinator.hass = Hass()
-    coordinator.entry = SimpleNamespace(data={}, options={})
-    coordinator.store = Store()
-    coordinator.executor = SimpleNamespace(
-        entry_data={}, options={}, async_notify_plan_fallback=_noop_async, async_evaluate=_noop_async
-    )
-    coordinator.overrides = []
-    coordinator.ready_by = "07:00"
-    coordinator._refresh_generation = 0
-
-    result = asyncio.run(coordinator._async_update_data_locked())
-
-    assert "second_failed" in result.input_issues
-    assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == HAEOStatus.FAILED
-
-    class FailedBaselineHAEO(HAEO):
-        async def async_solve_baseline(self, ctx: DecisionContext) -> HAEOSolveResult:
-            return HAEOSolveResult(HAEOSolvePhase.BASELINE, HAEOStatus.FAILED, "baseline_failed", None)
-
-    class NoProjectionPlanner(Planner):
-        def project_flexible_loads(self, ctx: DecisionContext) -> list[str]:
-            return []
-
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", FailedBaselineHAEO)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", NoProjectionPlanner)
-    coordinator.store = Store()
-
-    result = asyncio.run(coordinator._async_update_data_locked())
-
-    assert "baseline_failed" in result.input_issues
-    assert coordinator.store.haeo_runs[0]["second_pass"] is None
 
 
 def test_remaining_subentry_migration_branches() -> None:
@@ -581,7 +450,6 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
         "occupied": ["home"],
     }
 
-    assert _latest_haeo_status({"forecast_snapshots": [{"haeo": {"status": "ready"}}]}) == {"status": "ready"}
     assert _trip_history_summary("bad") == {}
     assert _recent_items({"items": "bad"}, "items", limit=2) == []
     summary = _store_summary({"trip_history": {"records": "bad"}, "outcomes": "bad"})
@@ -613,23 +481,26 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
     coordinator = SimpleNamespace(
         data=plan,
         store=SimpleNamespace(
-            data={"haeo_runs": [{"baseline": {"status": "ready"}}], "ai_recommendations": [{"status": "accepted"}]}
+            data={"ai_recommendations": [{"status": "accepted"}]}
         ),
         options={"planner_enabled": True, "dry_run": False},
     )
-    entry = SimpleNamespace(runtime_data=coordinator, subentries={"a": object()})
+    entry = SimpleNamespace(
+        runtime_data=coordinator,
+        subentries={"a": object()},
+        data={},
+    )
     info = asyncio.run(
         system_health_info(SimpleNamespace(config_entries=SimpleNamespace(async_entries=lambda domain: [entry])))
     )
     assert info["loaded_entries"] == 1
-    assert info["latest_haeo_status"] == "ready"
     assert info["latest_ai_status"] == "accepted"
 
 
 def test_remaining_config_and_adapter_tail_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     hass = SimpleNamespace(states=States({"sensor.value": "1"}), services=Services())
-    assert _validate_config(hass, {"amber_import_price_entity": "sensor.value", "haeo_optimize_service": "bad"})[
-        "haeo_optimize_service"
+    assert _validate_config(hass, {"amber_import_price_entity": "sensor.value", "ai_advisor_service": "bad"})[
+        "ai_advisor_service"
     ]
 
     assert (
@@ -642,7 +513,6 @@ def test_remaining_config_and_adapter_tail_branches(monkeypatch: pytest.MonkeyPa
 def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None:
     import voluptuous as vol
 
-    from custom_components.ha_energy_planner import config_flow as config_flow_module
     from custom_components.ha_energy_planner import diagnostics as diagnostics_module
     from custom_components.ha_energy_planner import system_health as system_health_module
     from custom_components.ha_energy_planner.enphase_adapter import EnphaseProfileAdapter
@@ -694,10 +564,9 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         CapabilityEvidence(True),
         CapabilityEvidence(True),
         CapabilityEvidence(True),
-        CapabilityEvidence(True),
     )
     assert report.for_asset("bad") == CapabilityEvidence(False, ["unknown_asset"])
-    assert report.as_dict()["haeo"] == {"supported": True, "issues": [], "details": {}}
+    assert set(report.as_dict()) == {"ev", "hvac", "enphase", "ai"}
     assert discovery_split_entities(["sensor.a", " bad "]) == ["sensor.a", "bad"]
     assert discovery_split_entities(123) == []
     registered: list[Any] = []
@@ -736,7 +605,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         [],
         None,
         1,
-        None,
     )
     suppress_result = asyncio.run(
         DaikinHVACAdapter(
@@ -767,7 +635,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         [],
         None,
         1.0,
-        None,
     )
     store = SimpleNamespace(data={"command_rate_limits": {"ev:ev_start": now.isoformat()}})
     assert (
@@ -784,41 +651,20 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
 
     assert (
         _service_target_for_action(
-            PlanAction("x", "p", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1, None),
+            PlanAction("x", "p", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1),
             {"enphase_profile_control_service": "select.select_option"},
         )
         == "select.select_option"
     )
     assert (
         _service_target_for_action(
-            PlanAction("x", "p", now, now, ActionAsset.EV, ActionKind.SET_PROFILE, {}, [], [], None, 1, None), {}
+            PlanAction("x", "p", now, now, ActionAsset.EV, ActionKind.SET_PROFILE, {}, [], [], None, 1), {}
         )
         is None
     )
     assert _profile_control_service_for_target({}, "input_select.profile") == "input_select.select_option"
     assert _latest_ai_service_call_at([{"service_called": False}, "bad"]) is None
     assert coordinator_bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {"a": {"b": {"c": {"d": "<truncated>"}}}}
-
-    # HAEO response skip branches.
-    context = DecisionContext(
-        now,
-        "plan",
-        [DecisionSlot(now, 0.2, 0.05, 0, 1)],
-        50,
-        50,
-        OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
-        InputHealth.HEALTHY,
-    )
-    assert (
-        apply_haeo_response_to_context(
-            context, {"slots": [{"valid_at": now.isoformat(), "grid_import_kw": 1e308, "unit": "MW"}]}
-        )
-        == {}
-    )
-    assert apply_haeo_response_to_context(context, {"slots": [{"valid_at": "bad", "grid_import_kw": "nan"}]}) == {}
-    assert apply_haeo_response_to_context(context, {"slots": ["bad"]}) == {}
-    assert apply_haeo_response_to_context(context, {"outer": {"inner": {}}}) == {}
 
     # Input and planner small branches.
     assert InputManager(
@@ -845,10 +691,9 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         is False
     )
     assert EnphaseProfileGuard(min_hold=timedelta(minutes=5), last_changed_at=None).remaining_hold(now) == timedelta(0)
-    monkeypatch.setattr(config_flow_module, "_ENTITY_DOMAIN_RULES", {"haeo_optimize_service": {"sensor"}})
     assert _validate_config(
-        SimpleNamespace(states=States({}), services=Services()), {"haeo_optimize_service": "missing.service"}
-    ) == {"haeo_optimize_service": "service_not_found"}
+        SimpleNamespace(states=States({}), services=Services()), {"ai_advisor_service": "missing.service"}
+    ) == {"ai_advisor_service": "service_not_found"}
 
     class FailingServices:
         def has_service(self, domain: str, service: str) -> bool:
@@ -869,7 +714,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         [],
         None,
         1,
-        None,
     )
     ev_result = asyncio.run(
         EVSmartChargingAdapter(
@@ -887,7 +731,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert ev_result.reason == "ev_ready_by_helper_unsupported"
 
     unsupported_enphase = PlanAction(
-        "bad", "plan", now, now, ActionAsset.ENPHASE, ActionKind.EV_START, {}, [], [], None, 1, None
+        "bad", "plan", now, now, ActionAsset.ENPHASE, ActionKind.EV_START, {}, [], [], None, 1
     )
     assert ConstraintValidator(DEFAULT_OPTIONS)._evaluate_enphase_action(unsupported_enphase, now, None) == []
     invalid_context = DecisionContext(
@@ -897,7 +741,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         50,
         50,
         OccupancyState.OCCUPIED,
-        HAEOStatus.READY,
         InputHealth.HEALTHY,
     )
     hvac_action = PlanAction(
@@ -912,7 +755,6 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         [],
         None,
         1,
-        None,
     )
     assert (
         ConstraintValidator(DEFAULT_OPTIONS)

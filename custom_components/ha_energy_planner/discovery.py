@@ -27,8 +27,6 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
-    CONF_HAEO_OPTIMIZE_SERVICE,
-    DEFAULT_HAEO_OPTIMIZE_SERVICE,
 )
 from .models import ActionAsset
 
@@ -46,7 +44,6 @@ class CapabilityEvidence:
 class DiscoveryReport:
     """Non-commanding discovery report."""
 
-    haeo: CapabilityEvidence
     ev: CapabilityEvidence
     hvac: CapabilityEvidence
     enphase: CapabilityEvidence
@@ -65,7 +62,6 @@ class DiscoveryReport:
     def as_dict(self) -> dict[str, Any]:
         """Return JSON-friendly report."""
         return {
-            "haeo": _evidence_dict(self.haeo),
             "ev": _evidence_dict(self.ev),
             "hvac": _evidence_dict(self.hvac),
             "enphase": _evidence_dict(self.enphase),
@@ -84,16 +80,11 @@ class CapabilityDiscovery:
     def inspect(self) -> DiscoveryReport:
         """Return current capability evidence."""
         return DiscoveryReport(
-            haeo=self._inspect_haeo(),
             ev=self._inspect_ev(),
             hvac=self._inspect_hvac(),
             enphase=self._inspect_enphase(),
             ai=self._inspect_ai(),
         )
-
-    def _inspect_haeo(self) -> CapabilityEvidence:
-        service = self.entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) or DEFAULT_HAEO_OPTIMIZE_SERVICE
-        return _service_evidence(self.hass, service, "haeo_service")
 
     def _inspect_ev(self) -> CapabilityEvidence:
         issues: list[str] = []

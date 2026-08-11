@@ -26,7 +26,6 @@ from .models import (
     ConstraintViolation,
     DecisionContext,
     EnergyPlan,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     PlanAction,
@@ -138,10 +137,6 @@ class ConstraintValidator:
             violations.append(_action_violation(action, "dry_run_enabled", "Dry run is enabled."))
         if context.input_health != InputHealth.HEALTHY:
             violations.append(_action_violation(action, "input_health_not_healthy", "Inputs are not healthy."))
-        if context.haeo_status != HAEOStatus.READY and action.requires_haeo_plan_id:
-            violations.append(
-                _action_violation(action, "haeo_not_ready", "Action depends on HAEO but HAEO is not ready.")
-            )
         if not _action_window_contains(action, now):
             violations.append(
                 _action_violation(action, "action_outside_execution_window", "Action is not currently due.")
@@ -379,35 +374,6 @@ def _projected_grid_flows_kw(slot: Any) -> tuple[float | None, float | None]:
         float(slot.projected_hvac_load_kw or 0.0),
         0.0,
     )
-    haeo_import = _positive_float_or_none(slot.haeo_grid_import_forecast_kw)
-    haeo_export = _positive_float_or_none(slot.haeo_grid_export_forecast_kw)
-    if haeo_import is not None or haeo_export is not None:
-        base_import = haeo_import or 0.0
-        base_export = haeo_export or 0.0
-        expected_net_kw = base_import - base_export
-        includes_flexible_loads = bool(getattr(slot, "haeo_grid_includes_flexible_loads", False))
-        if includes_flexible_loads:
-            point_import_kw = base_import
-            point_export_kw = base_export
-        else:
-            expected_net_kw += flexible_load_kw
-            point_import_kw = base_import + max(flexible_load_kw - base_export, 0.0)
-            point_export_kw = max(base_export - flexible_load_kw, 0.0)
-        # HAEO grid flow is a point estimate. Preserve its battery/grid evidence,
-        # but never let it bypass the local conservative load and PV bounds used
-        # by the hard import-limit gate.
-        expected_load_kw = _positive_float_or_none(slot.baseline_load_forecast_kw)
-        upper_load_kw = _positive_float_or_none(getattr(slot, "baseline_load_forecast_upper_kw", None))
-        expected_pv_kw = _positive_float_or_none(slot.pv_forecast_kw)
-        lower_pv_kw = _positive_float_or_none(getattr(slot, "pv_forecast_lower_kw", None))
-        uncertainty_kw = 0.0
-        if expected_load_kw is not None and upper_load_kw is not None:
-            uncertainty_kw += max(upper_load_kw - expected_load_kw, 0.0)
-        if expected_pv_kw is not None and lower_pv_kw is not None:
-            uncertainty_kw += max(expected_pv_kw - lower_pv_kw, 0.0)
-        # Preserve explicit gross HAEO flows as a fail-closed floor if a
-        # malformed response reports simultaneous import and export.
-        return max(point_import_kw, expected_net_kw + uncertainty_kw, 0.0), point_export_kw
     expected_load_kw = slot.baseline_load_forecast_kw
     upper_load_kw = getattr(slot, "baseline_load_forecast_upper_kw", None)
     expected_pv_kw = slot.pv_forecast_kw
@@ -421,9 +387,3 @@ def _projected_grid_flows_kw(slot: Any) -> tuple[float | None, float | None]:
     )
     expected_net_kw = float(expected_load_kw) + flexible_load_kw - float(expected_pv_kw)
     return max(conservative_import_kw, 0.0), max(-expected_net_kw, 0.0)
-
-
-def _positive_float_or_none(value: Any) -> float | None:
-    if value is None:
-        return None
-    return max(float(value), 0.0)

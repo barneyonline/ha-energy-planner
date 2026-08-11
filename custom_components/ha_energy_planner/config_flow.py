@@ -88,7 +88,6 @@ from .const import (
     CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
-    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
@@ -833,7 +832,7 @@ def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[st
         CONF_PV_FORECAST_SECONDARY
     ):
         errors[CONF_PV_OBSERVED] = "observation_must_differ_from_forecast"
-    for key in (CONF_HAEO_OPTIMIZE_SERVICE, CONF_AI_ADVISOR_SERVICE):
+    for key in (CONF_AI_ADVISOR_SERVICE,):
         value = user_input.get(key)
         if not value:
             continue

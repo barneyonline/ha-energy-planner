@@ -59,7 +59,6 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     OutcomeResult,
@@ -76,7 +75,6 @@ def test_only_actionable_load_forecast_failures_request_notifications() -> None:
     assert _actionable_input_issues(["household_load_entity_forecast_failed"]) == [
         "household_load_entity_forecast_failed"
     ]
-    assert _actionable_input_issues(["haeo_service_not_configured"]) == []
     assert _actionable_input_issues(["household_load_entity_forecast_stale"]) == [
         "household_load_entity_forecast_stale"
     ]
@@ -172,7 +170,6 @@ def _context(now: datetime) -> DecisionContext:
         current_battery_soc_percent=50,
         current_ev_soc_percent=40,
         occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.READY,
         input_health=InputHealth.HEALTHY,
     )
 
@@ -216,7 +213,6 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -266,7 +262,6 @@ def test_executor_keep_on_ignores_unavailable_separate_start_control() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -328,7 +323,6 @@ def test_executor_keep_on_rejects_invalid_persistent_controls() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -482,7 +476,6 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -630,7 +623,7 @@ def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["input_health_unsafe", "haeo_service_failed:ServiceValidationError"],
+        input_issues=["input_health_unsafe", "daikin_climate_unavailable"],
     )
     store = FakeStore()
     hass = FakeHass()
@@ -652,12 +645,12 @@ def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
         (
             "persistent_notification",
             "dismiss",
-            {"notification_id": "ha_energy_planner_haeo_fallback"},
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
         (
             "persistent_notification",
             "dismiss",
-            {"notification_id": "ha_energy_planner_ev_infeasible"},
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
     ]
 
@@ -677,7 +670,7 @@ def test_plan_fallback_notifications_can_be_disabled() -> None:
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["input_health_unsafe", "haeo_service_unavailable"],
+        input_issues=["input_health_unsafe", "daikin_climate_unavailable"],
     )
     store = FakeStore()
     hass = FakeHass()
@@ -708,59 +701,12 @@ def test_plan_fallback_notifications_can_be_disabled() -> None:
         (
             "persistent_notification",
             "dismiss",
-            {"notification_id": "ha_energy_planner_haeo_fallback"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
             {"notification_id": "ha_energy_planner_ev_infeasible"},
-        ),
-    ]
-
-
-def test_plan_fallback_notification_suppresses_safe_haeo_fallback() -> None:
-    now = datetime.now(UTC)
-    plan = EnergyPlan(
-        plan_id="plan-1",
-        created_at=now,
-        horizon_hours=24,
-        interval_minutes=5,
-        status="current",
-        health=InputHealth.HEALTHY,
-        mode=PlannerMode.ACTIVE_HEALTHY,
-        summary="test",
-        confidence=1.0,
-        estimated_daily_cost=None,
-        actions=[],
-        preview=[],
-        input_issues=["haeo_service_unavailable"],
-    )
-    store = FakeStore()
-    hass = FakeHass()
-    executor = Executor(store, hass=hass)
-
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-
-    assert hass.services.calls == [
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_plan_unsafe"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_grid_limit_fallback"},
         ),
         (
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
     ]
 
@@ -787,55 +733,6 @@ def test_plan_fallback_notification_ignores_self_recovering_stale_input() -> Non
     asyncio.run(Executor(FakeStore(), hass=hass).async_notify_plan_fallback(plan, ["input_health_unsafe"]))
 
     assert all(call[1] == "dismiss" for call in hass.services.calls)
-
-
-def test_plan_fallback_notification_ignores_haeo_capability_gaps() -> None:
-    now = datetime.now(UTC)
-    plan = EnergyPlan(
-        plan_id="plan-1",
-        created_at=now,
-        horizon_hours=24,
-        interval_minutes=5,
-        status="current",
-        health=InputHealth.HEALTHY,
-        mode=PlannerMode.ACTIVE_HEALTHY,
-        summary="test",
-        confidence=1.0,
-        estimated_daily_cost=None,
-        actions=[],
-        preview=[],
-        input_issues=[
-            "haeo_response_unsupported",
-            "haeo_flexible_projection_unsupported",
-        ],
-    )
-    hass = FakeHass()
-    executor = Executor(FakeStore(), hass=hass)
-
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-
-    assert hass.services.calls == [
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_plan_unsafe"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_grid_limit_fallback"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_haeo_fallback"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_ev_infeasible"},
-        ),
-    ]
 
 
 def test_actionable_notification_is_not_recreated_until_condition_changes() -> None:
@@ -912,43 +809,6 @@ def test_actionable_notification_is_not_recreated_until_condition_changes() -> N
     assert len(create_calls) == 2
 
 
-def test_plan_fallback_notification_ignores_successful_haeo_call_reason() -> None:
-    now = datetime.now(UTC)
-    plan = EnergyPlan(
-        plan_id="plan-1",
-        created_at=now,
-        horizon_hours=24,
-        interval_minutes=5,
-        status="current",
-        health=InputHealth.HEALTHY,
-        mode=PlannerMode.ACTIVE_HEALTHY,
-        summary="test",
-        confidence=1.0,
-        estimated_daily_cost=None,
-        actions=[],
-        preview=[],
-        input_issues=["haeo_service_called"],
-    )
-    store = FakeStore()
-    hass = FakeHass()
-    executor = Executor(store, hass=hass)
-
-    asyncio.run(executor.async_notify_plan_fallback(plan, []))
-
-    assert hass.services.calls[-2:] == [
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_haeo_fallback"},
-        ),
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_ev_infeasible"},
-        ),
-    ]
-
-
 def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> None:
     now = datetime.now(UTC)
     plan = EnergyPlan(
@@ -964,7 +824,7 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
         estimated_daily_cost=None,
         actions=[],
         preview=[],
-        input_issues=["input_health_unsafe", "haeo_service_failed:ServiceValidationError"],
+        input_issues=["input_health_unsafe", "daikin_climate_unavailable"],
     )
     store = FakeStore()
     hass = FakeHass()
@@ -986,12 +846,12 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
         (
             "persistent_notification",
             "dismiss",
-            {"notification_id": "ha_energy_planner_haeo_fallback"},
+            {"notification_id": "ha_energy_planner_ev_infeasible"},
         ),
         (
             "persistent_notification",
             "dismiss",
-            {"notification_id": "ha_energy_planner_ev_infeasible"},
+            {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
     ]
 
@@ -1010,7 +870,6 @@ def test_executor_preserves_first_ev_pre_takeover_state() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -1072,7 +931,6 @@ def test_executor_rate_limits_repeated_device_command() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -1137,7 +995,6 @@ def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> No
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     store = FakeStore()
     store.data["execution_audit"] = [
@@ -1209,7 +1066,6 @@ def test_executor_ev_conflict_uses_actual_command_and_feedback_entities() -> Non
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     keep_on_entry_data = {
         CONF_EV_CHARGER: "switch.ev_control",
@@ -1264,7 +1120,6 @@ def test_executor_ev_conflict_uses_actual_command_and_feedback_entities() -> Non
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     button_store = FakeStore()
     button_store.data["execution_audit"] = [
@@ -1357,7 +1212,6 @@ def test_executor_detects_recent_enphase_external_conflict() -> None:
         reason_codes=[],
         expected_cost_delta=1.0,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     store = FakeStore()
     store.data["execution_audit"] = [
@@ -1396,7 +1250,6 @@ def test_executor_conflict_helpers_cover_defensive_branches() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     store_without_pause_method = SimpleNamespace(data={})
     asyncio.run(
@@ -1469,7 +1322,6 @@ def test_executor_rejects_and_pauses_on_observed_conflict() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -1588,7 +1440,6 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 [],
                 None,
                 1.0,
-                None,
             ),
             {
                 "ev_smart_charging_start_entity": "input_boolean.ev_start",
@@ -1610,7 +1461,6 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 [],
                 None,
                 1.0,
-                None,
             ),
             {"daikin_climate_entity": "climate.daikin"},
             {"climate.daikin": "heat"},
@@ -1629,7 +1479,6 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 [],
                 1.0,
                 1.0,
-                None,
             ),
             {
                 "enphase_profile_entity": "input_select.enphase",
@@ -1693,7 +1542,6 @@ def test_executor_rejects_active_command_when_production_gate_not_armed() -> Non
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -1736,7 +1584,6 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
     assert _pause_rejection_reason({}, action, now) is None
@@ -1825,7 +1672,6 @@ def test_executor_blocks_armed_control_when_entity_or_policy_contract_changes() 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_start"}
     options = {**DEFAULT_OPTIONS, CONF_EV_CONTROL_ENABLED: True}
@@ -1861,7 +1707,6 @@ def test_executor_ignores_malformed_command_rate_limit_timestamp() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -1928,7 +1773,6 @@ def test_executor_restore_ai_releases_enphase_ownership() -> None:
         reason_codes=[],
         expected_cost_delta=0.0,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-1",
@@ -1998,7 +1842,6 @@ def test_executor_returns_without_outcome_for_no_or_not_due_action() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     future_plan = EnergyPlan(
         "plan-1",
@@ -2043,7 +1886,6 @@ def test_executor_records_mode_rejections_without_hass() -> None:
         [],
         None,
         1.0,
-        None,
     )
     for mode, expected_result, expected_reason in [
         (PlannerMode.DRY_RUN, "skipped", "dry_run"),
@@ -2071,7 +1913,6 @@ def test_executor_reports_dry_run_as_skipped_before_plan_violations() -> None:
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1", now, 24, 5, "unsafe", InputHealth.UNSAFE, PlannerMode.DRY_RUN, "test", 0.0, None, [action], []
@@ -2137,7 +1978,6 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2219,7 +2059,6 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2294,7 +2133,6 @@ def test_persisted_preconditioning_reaches_no_change_check_after_limits(
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2391,7 +2229,6 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2481,7 +2318,6 @@ def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
         [],
         0.0,
         1.0,
-        None,
     )
     competing_action = PlanAction(
         "ev-start",
@@ -2495,7 +2331,6 @@ def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2540,7 +2375,6 @@ def test_blocked_owned_hvac_continuation_releases_before_competing_action() -> N
         [],
         None,
         1.0,
-        None,
     )
     continuation = PlanAction(
         "hvac-peak",
@@ -2554,7 +2388,6 @@ def test_blocked_owned_hvac_continuation_releases_before_competing_action() -> N
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2753,7 +2586,6 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2888,7 +2720,6 @@ def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -2963,7 +2794,6 @@ def test_executor_retains_uncertain_enphase_command_until_safe_restore(monkeypat
         [],
         1.0,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "plan-1",
@@ -3425,10 +3255,10 @@ def test_executor_notification_helpers_skip_when_unavailable() -> None:
 
 def test_executor_message_and_service_target_helpers_cover_edge_cases() -> None:
     now = datetime.now(UTC)
-    ev_stop = PlanAction("ev-stop", "plan-1", now, now, ActionAsset.EV, ActionKind.EV_STOP, {}, [], [], None, 1.0, None)
-    hvac = PlanAction("hvac", "plan-1", now, now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {}, [], [], None, 1.0, None)
+    ev_stop = PlanAction("ev-stop", "plan-1", now, now, ActionAsset.EV, ActionKind.EV_STOP, {}, [], [], None, 1.0)
+    hvac = PlanAction("hvac", "plan-1", now, now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {}, [], [], None, 1.0)
     enphase = PlanAction(
-        "enphase", "plan-1", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0, None
+        "enphase", "plan-1", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0
     )
 
     assert _service_target_for_action(ev_stop, {CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop"}) == "switch.ev_stop"
@@ -3516,7 +3346,6 @@ def test_multiple_ev_entries_share_atomic_grid_capacity_reservations() -> None:
             reason_codes=[],
             expected_cost_delta=None,
             confidence=1.0,
-            requires_haeo_plan_id=None,
         )
         return EnergyPlan(
             plan_id=action.plan_id,
@@ -4497,7 +4326,6 @@ def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="plan-stop",
@@ -4581,7 +4409,6 @@ def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="regular-owned-stop-plan",
@@ -4690,7 +4517,6 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
         [],
         None,
         1.0,
-        None,
     )
     plan = EnergyPlan(
         "regular-unconfirmed-plan",
@@ -4848,7 +4674,6 @@ def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="grid-degraded-plan",
@@ -4941,7 +4766,6 @@ def test_disabling_ev_control_stops_owned_power_before_honouring_gate() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="ev-control-disabled-plan",
@@ -5347,7 +5171,6 @@ def test_recovered_reservation_stops_provisional_topology_before_new_start() -> 
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="recovered-reservation",
@@ -5457,7 +5280,6 @@ def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan = EnergyPlan(
         plan_id="multi-ev-over-limit",
@@ -5732,7 +5554,6 @@ def test_ev_grid_reservation_reconciles_failed_commands(monkeypatch: object) -> 
             [],
             None,
             1.0,
-            None,
         )
         plan = EnergyPlan(
             "plan",
@@ -5803,7 +5624,6 @@ def test_ev_grid_reservation_defensive_branches() -> None:
         [],
         None,
         1.0,
-        None,
     )
     previous = {"load_kw": 6.0, "limit_kw": 10.0, "reserved_at": now.isoformat()}
     other = {"load_kw": 3.0, "limit_kw": 10.0, "reserved_at": now.isoformat()}

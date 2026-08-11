@@ -1,6 +1,6 @@
 {
   "kind": "forecast_state",
-  "name": "pv_hafo_nested_forecast",
+  "name": "pv_nested_forecast",
   "issued_at": "2026-06-27T00:00:00+00:00",
   "horizon_hours": 1,
   "interval_minutes": 15,
@@ -12,15 +12,11 @@
       "data": [
         {
           "period_start": "2026-06-27T00:00:00+00:00",
-          "prediction": {
-            "watts": 500
-          }
+          "prediction": {"watts": 500}
         },
         {
           "period_start": "2026-06-27T00:30:00+00:00",
-          "prediction": {
-            "watts": 1200
-          }
+          "prediction": {"watts": 1200}
         }
       ]
     }

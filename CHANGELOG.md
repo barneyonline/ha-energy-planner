@@ -1,9 +1,32 @@
 # Changelog
 
-## Unreleased
+## 0.9.3 - 2026-08-11
+
+### Changed
+
+- Household-load training now accepts local days with at least 80% valid
+  cleaned 15-minute buckets. Bounded historical negative readings, excluded EV
+  charging, and brief source outages no longer discard an otherwise usable
+  day. The model and forecast contracts are version 2 and 3 respectively, so
+  existing models retrain and production review evidence is intentionally
+  renewed after upgrade.
+- Removed HAEO and HAFO support, including optimizer configuration, service
+  calls, response parsing, planner dependencies, telemetry, fixtures, and
+  validation tooling. Legacy optimizer settings are discarded during migration.
+- Preflight readiness continues to require only the individual EV, Climate,
+  and Enphase control surfaces that are enabled; configured surfaces may remain
+  off without blocking the enabled areas.
 
 ### Fixed
 
+- Upgrades now persistently remove every retired optimizer config alias and
+  stored run/action metadata, including entries that have no legacy
+  subentries, and dismiss fallback notifications created by older releases.
+- Removed the retired optimizer fields from runtime planning models, replay
+  contracts, newly serialized actions, and the normative architecture spec.
+- Forecast models with recurring clock-time gaps no longer report ready unless
+  every production bucket can be resolved within the bounded interpolation
+  policy.
 - A mapped household-load entity that has not yet been restored during Home
   Assistant startup no longer records a failed training attempt or starts the
   six-hour retry backoff. Energy Planner remains fail-closed and retries on the

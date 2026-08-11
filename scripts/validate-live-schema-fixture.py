@@ -7,7 +7,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,14 +15,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from custom_components.ha_energy_planner.forecasts import forecast_series_from_state  # noqa: E402
-from custom_components.ha_energy_planner.haeo_adapter import apply_haeo_response_to_context  # noqa: E402
-from custom_components.ha_energy_planner.models import (  # noqa: E402
-    DecisionContext,
-    DecisionSlot,
-    HAEOStatus,
-    InputHealth,
-    OccupancyState,
-)
 
 V1_REAL_PROFILE_REQUIREMENTS = {
     "real_amber_import": {"kind": "forecast_state", "value_kind": "price"},
@@ -46,14 +38,11 @@ class FixtureState:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description=(
-            "Validate forecast_state and haeo_response JSON fixtures. "
-            "Use this with sanitized exports from real Home Assistant entities/services."
-        )
+        description="Validate forecast_state JSON fixtures exported from real Home Assistant entities."
     )
     parser.add_argument(
         "--profile",
-        choices=("ha-energy-planner-v1-real", "ha-energy-planner-haeo-value-v1-real"),
+        choices=("ha-energy-planner-v1-real",),
         help="Require a named fixture coverage profile in addition to parsing each fixture.",
     )
     parser.add_argument("fixtures", nargs="+", type=Path)
@@ -94,8 +83,6 @@ def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     kind = fixture.get("kind")
     if kind == "forecast_state":
         return _validate_forecast_fixture(fixture)
-    if kind == "haeo_response":
-        return _validate_haeo_fixture(fixture)
     raise ValueError(f"Unsupported fixture kind: {kind!r}")
 
 
@@ -104,8 +91,6 @@ def _profile_missing_names(profile: str, fixtures: list[dict[str, Any]]) -> list
 
 
 def _profile_errors(profile: str, fixtures: list[dict[str, Any]]) -> dict[str, Any]:
-    if profile == "ha-energy-planner-haeo-value-v1-real":
-        return _haeo_value_profile_errors(fixtures)
     if profile != "ha-energy-planner-v1-real":
         raise ValueError(f"Unsupported profile: {profile!r}")
     by_name = {str(fixture.get("name", "")): fixture for fixture in fixtures}
@@ -134,46 +119,6 @@ def _profile_errors(profile: str, fixtures: list[dict[str, Any]]) -> dict[str, A
     return errors
 
 
-def _haeo_value_profile_errors(fixtures: list[dict[str, Any]]) -> dict[str, Any]:
-    by_name = {str(fixture.get("name", "")): fixture for fixture in fixtures}
-    fixture = by_name.get("real_haeo_response")
-    errors: dict[str, Any] = {}
-    if fixture is None:
-        errors["missing_fixture_names"] = ["real_haeo_response"]
-        return errors
-    if fixture.get("kind") != "haeo_response":
-        errors["mismatched_fixtures"] = [
-            {
-                "name": "real_haeo_response",
-                "expected": {"kind": "haeo_response"},
-                "actual": {"kind": fixture.get("kind")},
-            }
-        ]
-        return errors
-    if not _has_profile_source_field(fixture, "source_service"):
-        errors["missing_source_fields"] = [{"name": "real_haeo_response", "missing_fields": ["source_service"]}]
-    try:
-        summary = _validate_haeo_fixture(fixture)
-    except Exception as err:  # noqa: BLE001 - profile should report validation failures compactly.
-        errors["haeo_validation_error"] = str(err)
-        return errors
-    counts = dict(summary.get("evidence_counts", {}))
-    required_counts = {
-        "haeo_grid_import_forecast_kw": 1,
-        "haeo_grid_export_forecast_kw": 1,
-        "haeo_battery_charge_forecast_kw": 1,
-        "haeo_battery_discharge_forecast_kw": 1,
-    }
-    missing_evidence = {
-        field: {"expected_min": expected, "actual": int(counts.get(field, 0))}
-        for field, expected in required_counts.items()
-        if int(counts.get(field, 0)) < expected
-    }
-    if missing_evidence:
-        errors["missing_haeo_value_evidence"] = missing_evidence
-    return errors
-
-
 def _has_profile_source_field(fixture: dict[str, Any], field: str) -> bool:
     value = fixture.get(field)
     return isinstance(value, str) and bool(value.strip()) and value.strip() != "<redacted>"
@@ -199,51 +144,6 @@ def _validate_forecast_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         "name": fixture.get("name"),
         "point_count": len(series),
         "first_values": series[:4],
-    }
-
-
-def _validate_haeo_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
-    issued_at = _parse_datetime(fixture["issued_at"])
-    interval = int(fixture["interval_minutes"])
-    expected_slots = list(fixture.get("expected_slots", []))
-    slot_count = max(len(expected_slots), int(fixture.get("slot_count", 0)), 1)
-    context = DecisionContext(
-        created_at=issued_at,
-        plan_id="schema-fixture",
-        slots=[
-            DecisionSlot(
-                valid_at=issued_at + timedelta(minutes=offset),
-                import_price=0.2,
-                export_price=0.05,
-                pv_forecast_kw=1.0,
-                baseline_load_forecast_kw=2.0,
-            )
-            for offset in range(0, slot_count * interval, interval)
-        ],
-        current_battery_soc_percent=50,
-        current_ev_soc_percent=None,
-        occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.READY,
-        input_health=InputHealth.HEALTHY,
-    )
-
-    counts = apply_haeo_response_to_context(context, fixture.get("response"))
-    expected_counts = fixture.get("expected_counts")
-    if expected_counts is not None and counts != expected_counts:
-        raise ValueError(f"{fixture.get('name', 'haeo_response')} expected counts {expected_counts!r}, got {counts!r}")
-    for index, expected in enumerate(expected_slots):
-        for key, value in expected.items():
-            actual = getattr(context.slots[index], key)
-            if actual != value:
-                raise ValueError(
-                    f"{fixture.get('name', 'haeo_response')} slot {index} {key} expected {value!r}, got {actual!r}"
-                )
-    if not counts:
-        raise ValueError(f"{fixture.get('name', 'haeo_response')} did not produce HAEO evidence counts")
-    return {
-        "kind": "haeo_response",
-        "name": fixture.get("name"),
-        "evidence_counts": counts,
     }
 
 

@@ -52,7 +52,6 @@ real_fixtures=(tests/fixtures/live_schema/real_*.json)
 shopt -u nullglob
 if (( ${#real_fixtures[@]} > 0 )); then
   run python3 scripts/validate-live-schema-fixture.py --profile ha-energy-planner-v1-real "${real_fixtures[@]}"
-  run python3 scripts/validate-live-schema-fixture.py --profile ha-energy-planner-haeo-value-v1-real "${real_fixtures[@]}"
 else
   printf '\n==> python3 scripts/validate-live-schema-fixture.py --profile ha-energy-planner-v1-real tests/fixtures/live_schema/*.json (expected synthetic-fixture failure)\n'
   set +e
@@ -61,15 +60,6 @@ else
   set -e
   if [[ "$status" -eq 0 ]]; then
     echo "Expected the real live-schema profile to fail when no real_* fixtures are present." >&2
-    exit 1
-  fi
-  printf '\n==> python3 scripts/validate-live-schema-fixture.py --profile ha-energy-planner-haeo-value-v1-real tests/fixtures/live_schema/*.json (expected synthetic-fixture failure)\n'
-  set +e
-  python3 scripts/validate-live-schema-fixture.py --profile ha-energy-planner-haeo-value-v1-real tests/fixtures/live_schema/*.json
-  status=$?
-  set -e
-  if [[ "$status" -eq 0 ]]; then
-    echo "Expected the real HAEO value-evidence profile to fail when no real_haeo_response fixture is present." >&2
     exit 1
   fi
 fi

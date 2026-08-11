@@ -10,8 +10,8 @@ from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-MODEL_VERSION = 1
-FORECAST_CONTRACT_VERSION = 2
+MODEL_VERSION = 2
+FORECAST_CONTRACT_VERSION = 3
 HISTORY_LOOKBACK = timedelta(days=28)
 TRAIN_INTERVAL = timedelta(hours=6)
 HEALTHY_MODEL_AGE = timedelta(hours=24)
@@ -166,26 +166,31 @@ def build_load_forecast_model_from_buckets(
         end=now_utc,
         zone=zone,
     )
-    complete_days = [day for day in all_days if len(day.values) == BUCKETS_PER_DAY]
+    fully_observed_days = [day for day in all_days if len(day.values) == BUCKETS_PER_DAY]
+    training_days = [
+        day
+        for day in all_days
+        if len(day.values) / BUCKETS_PER_DAY >= MIN_DAY_COVERAGE
+    ]
     history_coverage = (
         sum(len(day.values) for day in all_days) / (eligible_day_count * BUCKETS_PER_DAY)
         if eligible_day_count
         else 0.0
     )
-    validation = _rolling_validation(complete_days, comparison_days=all_days)
+    validation = _rolling_validation(training_days, comparison_days=all_days)
     uncertainty_buffer = float(validation.get("positive_residual_p90_kw") or 0.0)
     profiles = {
-        day_type: _profile_for_day_type(complete_days, day_type, uncertainty_buffer)
+        day_type: _profile_for_day_type(training_days, day_type, uncertainty_buffer)
         for day_type in ("weekday", "weekend")
     }
     quality_failures = _quality_failures(
-        complete_days=len(complete_days),
+        training_days=len(training_days),
         history_coverage=history_coverage,
         validation=validation,
         profiles=profiles,
     )
     insufficient_history = any(
-        failure in {"insufficient_complete_days", "insufficient_history_coverage", "insufficient_holdout_samples"}
+        failure in {"insufficient_training_days", "insufficient_history_coverage", "insufficient_holdout_samples"}
         for failure in quality_failures
     )
     status = "ready" if not quality_failures else "learning" if insufficient_history else "failed"
@@ -206,7 +211,12 @@ def build_load_forecast_model_from_buckets(
         "history_started_on": first_day.isoformat() if first_day else None,
         "history_ended_on": last_day.isoformat() if last_day else None,
         "history_days": len(all_days),
-        "complete_days": len(complete_days),
+        "training_days": len(training_days),
+        # Preserve the original public meaning for dashboards and support
+        # bundles: complete days contain all 96 expected clock buckets.
+        "complete_days": len(fully_observed_days),
+        "fully_observed_days": len(fully_observed_days),
+        "minimum_training_day_coverage": MIN_DAY_COVERAGE,
         "history_coverage": round(history_coverage, 6),
         "uncertainty_buffer_kw": round(uncertainty_buffer, 6),
         "cleaning": {
@@ -604,14 +614,14 @@ def _leave_one_out_buffer(
 
 def _quality_failures(
     *,
-    complete_days: int,
+    training_days: int,
     history_coverage: float,
     validation: dict[str, Any],
     profiles: dict[str, Any],
 ) -> list[str]:
     failures: list[str] = []
-    if complete_days < MIN_COMPLETE_DAYS:
-        failures.append("insufficient_complete_days")
+    if training_days < MIN_COMPLETE_DAYS:
+        failures.append("insufficient_training_days")
     if history_coverage < MIN_DAY_COVERAGE:
         failures.append("insufficient_history_coverage")
     if validation.get("origin_count", 0) < HOLDOUT_ORIGINS or validation.get("sample_count", 0) < MIN_HOLDOUT_SAMPLES:
@@ -624,9 +634,22 @@ def _quality_failures(
     coverage = validation.get("upper_coverage")
     if isinstance(coverage, int | float) and coverage < MIN_UPPER_COVERAGE:
         failures.append("conservative_bound_coverage_below_gate")
-    if any(all(value is None for value in profile.get("expected", [])) for profile in profiles.values()):
+    if any(not _profile_is_forecastable(profile) for profile in profiles.values()):
         failures.append("forecast_profile_unavailable")
     return failures
+
+
+def _profile_is_forecastable(profile: Any) -> bool:
+    """Return whether every production clock bucket can be resolved safely."""
+    if not isinstance(profile, dict):
+        return False
+    for key in ("expected", "upper"):
+        values = profile.get(key)
+        if not isinstance(values, list) or len(values) != BUCKETS_PER_DAY:
+            return False
+        if any(_nearest_profile_value(values, index) is None for index in range(BUCKETS_PER_DAY)):
+            return False
+    return True
 
 
 def _validated_model(
@@ -667,21 +690,30 @@ def _validated_model(
     status = model.get("status")
     if status not in {"learning", "ready", "failed"}:
         return None
+    training_days = model.get("training_days")
     complete_days = model.get("complete_days")
+    fully_observed_days = model.get("fully_observed_days")
     history_coverage = model.get("history_coverage")
     validation = model.get("validation")
     if status == "ready" and (
         model.get("quality_ready") is not True
         or model.get("quality_failures") not in ([], None)
+        or not isinstance(training_days, int)
+        or isinstance(training_days, bool)
         or not isinstance(complete_days, int)
         or isinstance(complete_days, bool)
+        or complete_days != fully_observed_days
+        or not isinstance(fully_observed_days, int)
+        or isinstance(fully_observed_days, bool)
+        or fully_observed_days < 0
+        or fully_observed_days > training_days
         or not _valid_fraction(history_coverage)
         or not isinstance(validation, dict)
         or not _valid_validation_metrics(validation)
         or _quality_failures(
-            complete_days=(
-                complete_days
-                if isinstance(complete_days, int) and not isinstance(complete_days, bool)
+            training_days=(
+                training_days
+                if isinstance(training_days, int) and not isinstance(training_days, bool)
                 else 0
             ),
             history_coverage=float(history_coverage) if _valid_fraction(history_coverage) else 0.0,
@@ -822,7 +854,10 @@ def _model_details(model: dict[str, Any] | None, status: str, age_hours: float) 
         "history_started_on": source.get("history_started_on"),
         "history_ended_on": source.get("history_ended_on"),
         "history_days": source.get("history_days", 0),
+        "training_days": source.get("training_days", source.get("complete_days", 0)),
         "complete_days": source.get("complete_days", 0),
+        "fully_observed_days": source.get("fully_observed_days", 0),
+        "minimum_training_day_coverage": source.get("minimum_training_day_coverage", MIN_DAY_COVERAGE),
         "history_coverage": source.get("history_coverage", 0.0),
         "quality_failures": list(source.get("quality_failures", []))[:8]
         if isinstance(source.get("quality_failures", []), list)

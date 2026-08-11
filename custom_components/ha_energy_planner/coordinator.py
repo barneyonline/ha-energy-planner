@@ -49,7 +49,6 @@ from .const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
-    CONF_HAEO_OPTIMIZE_SERVICE,
     CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -60,7 +59,6 @@ from .const import (
     CONF_PV_FORECAST_SECONDARY,
     CONF_WEATHER,
     DEBOUNCE_SECONDS,
-    DEFAULT_HAEO_OPTIMIZE_SERVICE,
     DEFAULT_OPTIONS,
     DOMAIN,
     MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS,
@@ -72,14 +70,11 @@ from .ev import update_trip_history_from_values
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
-from .haeo_adapter import HAEOAdapter, apply_haeo_response_to_context
 from .inputs import InputManager
 from .models import (
     ActionOutcome,
     DecisionContext,
     EnergyPlan,
-    HAEOSolvePhase,
-    HAEOStatus,
     InputHealth,
     OutcomeResult,
     Override,
@@ -267,7 +262,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._refresh_completed_times: list[float] = []
         self._refresh_trigger_counts: dict[str, int] = {}
         self._last_phase_durations: dict[str, float] = {}
-        self._haeo_adapter: HAEOAdapter | None = None
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._ai_advice_fingerprint: str | None = None
         self._ai_advice_pending_fingerprint: str | None = None
@@ -625,69 +619,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if thermal_model_changed:
             await self.store.async_save_thermal_model(thermal_model)
         preparation_ms = round((perf_counter() - preparation_started) * 1000, 3)
-        haeo = self._get_haeo_adapter(entry_data)
-        haeo_started = perf_counter()
-        baseline_result = await haeo.async_solve_baseline(context)
-        haeo_ms = (perf_counter() - haeo_started) * 1000
-        baseline_call_metadata = dict(getattr(haeo, "last_call_metadata", {}))
-        context.haeo_status = baseline_result.status
-        baseline_evidence_counts = apply_haeo_response_to_context(context, baseline_result.response)
         planner = DryRunPlanner(options, thermal_model=thermal_model)
         planner_started = perf_counter()
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)
         planner_ms = (perf_counter() - planner_started) * 1000
-        projections = planner.project_flexible_loads(context)
-        second_pass_result = None
-        second_pass_skipped_reason = None
-        second_pass_call_metadata: dict[str, Any] = {}
-        second_pass_evidence_counts: dict[str, int] = {}
-        if baseline_result.status != HAEOStatus.READY:
-            plan.input_issues.append(baseline_result.reason)
-        elif projections:
-            if not bool(getattr(haeo, "supports_flexible_second_pass", True)):
-                second_pass_skipped_reason = "haeo_flexible_projection_unsupported"
-            else:
-                second_pass_result = await haeo.async_solve_with_flexible_load(context, projections)
-                haeo_ms += float(getattr(haeo, "last_call_metadata", {}).get("duration_ms", 0.0) or 0.0)
-                second_pass_call_metadata = dict(getattr(haeo, "last_call_metadata", {}))
-                if second_pass_result.status != HAEOStatus.READY:
-                    context.haeo_status = second_pass_result.status
-                    plan.input_issues.append(second_pass_result.reason)
-                else:
-                    second_pass_evidence_counts = _apply_flexible_haeo_response(
-                        context,
-                        second_pass_result.response,
-                    )
-                    _reset_flexible_load_projections(context)
-                    planner_started = perf_counter()
-                    plan = await self.hass.async_add_executor_job(planner.create_plan, context)
-                    planner_ms += (perf_counter() - planner_started) * 1000
-        baseline_run = _haeo_phase_metadata(
-            baseline_result,
-            baseline_evidence_counts,
-            baseline_call_metadata,
-        )
-        if second_pass_skipped_reason is not None:
-            second_pass_run = _haeo_skipped_phase_metadata(second_pass_skipped_reason, haeo)
-        elif second_pass_result is None:
-            second_pass_run = None
-        else:
-            second_pass_run = _haeo_phase_metadata(
-                second_pass_result,
-                second_pass_evidence_counts,
-                second_pass_call_metadata,
-            )
         persistence_started = perf_counter()
-        await self.store.async_add_haeo_run(
-            {
-                "created_at": context.created_at,
-                "plan_id": context.plan_id,
-                "baseline": baseline_run,
-                "second_pass": second_pass_run,
-                "flexible_projection_count": len(projections),
-                "capabilities": _haeo_capability_metadata(haeo),
-            }
-        )
         violations = ConstraintValidator(options).validate_plan(context, plan)
         if violations:
             plan.input_issues.extend(violations)
@@ -701,13 +637,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "created_at": context.created_at,
                 "plan_id": context.plan_id,
                 "input_health": context.input_health,
-                "haeo_status": context.haeo_status,
-                "haeo": {
-                    "baseline": baseline_run,
-                    "second_pass": second_pass_run,
-                    "flexible_projection_count": len(projections),
-                    "capabilities": _haeo_capability_metadata(haeo),
-                },
                 "slot_count": len(context.slots),
                 "actions": _snapshot_actions(plan),
                 "preview": plan.preview[:12],
@@ -741,7 +670,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._increment_refresh_counter("computed")
         self._last_phase_durations = {
             "inputs_ms": preparation_ms,
-            "haeo_ms": round(haeo_ms, 3),
             "planner_ms": round(planner_ms, 3),
             "persistence_and_execution_ms": round((perf_counter() - persistence_started) * 1000, 3),
         }
@@ -749,24 +677,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_decision_fingerprint = decision_fingerprint
             self._sync_ai_request_to_plan(plan)
         return result
-
-    def _get_haeo_adapter(self, entry_data: dict[str, Any]) -> HAEOAdapter:
-        """Reuse the HAEO adapter so unchanged solves can use its bounded cache."""
-        service = entry_data.get(CONF_HAEO_OPTIMIZE_SERVICE) or DEFAULT_HAEO_OPTIMIZE_SERVICE
-        configured_entry_id = entry_data.get("haeo_config_entry_id") or entry_data.get("haeo_entry_id")
-        adapter = getattr(self, "_haeo_adapter", None)
-        if (
-            adapter is None
-            or not isinstance(adapter, HAEOAdapter)
-            or getattr(adapter, "optimize_service", service) != service
-            or getattr(adapter, "haeo_config_entry_id", configured_entry_id) != configured_entry_id
-        ):
-            if configured_entry_id:
-                adapter = HAEOAdapter(self.hass, service, str(configured_entry_id))
-            else:
-                adapter = HAEOAdapter(self.hass, service)
-            self._haeo_adapter = adapter
-        return adapter
 
     async def async_request_replan(self) -> None:
         """Request immediate refresh."""
@@ -1662,38 +1572,6 @@ def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     return sorted(entity_ids)
 
 
-def _apply_flexible_haeo_response(
-    context: DecisionContext,
-    response: dict[str, Any] | None,
-) -> dict[str, int]:
-    """Apply flexible-pass evidence without losing uncovered baseline slots."""
-    baseline_grid_evidence = [
-        (
-            slot.haeo_grid_import_forecast_kw,
-            slot.haeo_grid_export_forecast_kw,
-        )
-        for slot in context.slots
-    ]
-    for slot in context.slots:
-        slot.haeo_grid_import_forecast_kw = None
-        slot.haeo_grid_export_forecast_kw = None
-        slot.haeo_grid_includes_flexible_loads = False
-    counts = apply_haeo_response_to_context(
-        context,
-        response,
-        grid_includes_flexible_loads=True,
-    )
-    for slot, (baseline_import, baseline_export) in zip(
-        context.slots,
-        baseline_grid_evidence,
-        strict=True,
-    ):
-        if not slot.haeo_grid_includes_flexible_loads:
-            slot.haeo_grid_import_forecast_kw = baseline_import
-            slot.haeo_grid_export_forecast_kw = baseline_export
-    return counts
-
-
 def _decision_input_fingerprint(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
@@ -1828,59 +1706,6 @@ def _calibration_summary(model: dict[str, Any], field: str) -> dict[str, Any]:
     }
 
 
-def _haeo_phase_metadata(
-    result: Any,
-    evidence_counts: dict[str, int],
-    call_metadata: dict[str, Any],
-) -> dict[str, Any]:
-    """Return solve outcome, latency, cache, capability, and evidence metadata."""
-    if evidence_counts:
-        evidence_status = "available"
-    elif getattr(result, "response", None) is not None:
-        evidence_status = "response_without_forecast_evidence"
-    else:
-        evidence_status = "not_returned"
-    return {
-        "phase": result.phase,
-        "status": result.status,
-        "reason": result.reason,
-        "service_called": result.service_called,
-        "evidence_counts": evidence_counts,
-        "evidence_status": evidence_status,
-        "duration_ms": call_metadata.get("duration_ms"),
-        "cache_hit": call_metadata.get("cache_hit"),
-        "input_fingerprint": call_metadata.get("input_fingerprint"),
-        "response_received": call_metadata.get("response_received"),
-        "capabilities": call_metadata.get("capabilities", {}),
-    }
-
-
-def _haeo_skipped_phase_metadata(reason: str, adapter: Any) -> dict[str, Any]:
-    """Return explicit metadata when a capability-safe second pass is skipped."""
-    return {
-        "phase": HAEOSolvePhase.FLEXIBLE_LOAD,
-        "status": "skipped",
-        "reason": reason,
-        "service_called": getattr(adapter, "optimize_service", None),
-        "evidence_counts": {},
-        "evidence_status": "not_requested",
-        "duration_ms": 0.0,
-        "cache_hit": False,
-        "input_fingerprint": None,
-        "response_received": False,
-        "capabilities": _haeo_capability_metadata(adapter),
-    }
-
-
-def _haeo_capability_metadata(adapter: Any) -> dict[str, Any]:
-    """Return diagnostic-safe adapter capabilities with fake-adapter compatibility."""
-    capabilities = getattr(adapter, "capabilities", None)
-    as_dict = getattr(capabilities, "as_dict", None)
-    if callable(as_dict):
-        return dict(as_dict())
-    return dict(capabilities) if isinstance(capabilities, dict) else {}
-
-
 def _snapshot_actions(plan: EnergyPlan) -> list[dict[str, Any]]:
     """Return bounded action metadata for forecast/audit snapshots."""
     return [_snapshot_action(action) for action in plan.actions[:8]]
@@ -1928,7 +1753,6 @@ def _snapshot_action(action: Any) -> dict[str, Any]:
         "reason_codes": action.reason_codes[:8],
         "expected_cost_delta": action.expected_cost_delta,
         "confidence": action.confidence,
-        "requires_haeo_plan_id": action.requires_haeo_plan_id,
     }
 
 
@@ -2171,15 +1995,6 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
-
-
-def _reset_flexible_load_projections(context: Any) -> None:
-    """Clear planner-derived loads before regenerating a plan."""
-    for slot in context.slots:
-        slot.projected_ev_load_kw = 0.0
-        slot.projected_hvac_load_kw = 0.0
-
-
 def _is_ev_history_state_change(entry_data: dict[str, Any], event: Any) -> bool:
     entity_id = event.data.get("entity_id")
     return entity_id in {

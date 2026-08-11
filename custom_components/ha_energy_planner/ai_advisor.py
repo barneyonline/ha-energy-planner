@@ -32,7 +32,6 @@ AI_ACTION_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "daikin_climate_entity": ("Climate control", ("daikin_", "climate_")),
     "climate_comfort": ("Climate comfort settings", ("comfort", "occupancy_", "person_")),
     "enphase_profile_entity": ("Enphase profile control", ("enphase_", "battery_profile")),
-    "haeo_optimize_service": ("HAEO optimization service", ("haeo_",)),
     "automatic_control": ("Automatic control", ("production_", "control_", "planner_")),
 }
 
@@ -314,7 +313,6 @@ def _build_prompt(context: DecisionContext, plan: EnergyPlan) -> str:
         },
         "context": {
             "input_health": str(context.input_health),
-            "haeo_status": str(context.haeo_status),
             "occupancy_known": str(context.occupancy_state) != "unknown",
             "battery_soc_band": _battery_soc_band(context.current_battery_soc_percent),
             "ev_soc_known": context.current_ev_soc_percent is not None,

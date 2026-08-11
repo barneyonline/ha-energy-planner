@@ -35,14 +35,12 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
-    CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
 from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
     _active_control_not_ready_reason,
-    _apply_flexible_haeo_response,
     _bool_state_value,
     _configured_entity_ids,
     _decision_input_fingerprint,
@@ -72,9 +70,6 @@ from custom_components.ha_energy_planner.models import (
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
-    HAEOSolvePhase,
-    HAEOSolveResult,
-    HAEOStatus,
     InputHealth,
     OccupancyState,
     OutcomeResult,
@@ -1007,20 +1002,6 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     assert coordinator.dry_run is True
 
 
-def test_coordinator_builds_configured_haeo_adapter_and_capability_metadata() -> None:
-    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-    coordinator.hass = FakeHass()
-    coordinator._haeo_adapter = None
-
-    adapter = coordinator._get_haeo_adapter(
-        {"haeo_optimize_service": "custom.optimize", "haeo_config_entry_id": "entry-1"}
-    )
-
-    assert adapter.optimize_service == "custom.optimize"
-    assert adapter.haeo_config_entry_id == "entry-1"
-    assert coordinator_module._haeo_capability_metadata(adapter) == adapter.capabilities.as_dict()
-
-
 def test_async_update_data_uses_lock_and_delay_save() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator._planner_lock = asyncio.Lock()
@@ -1292,7 +1273,6 @@ def test_current_plan_evaluates_each_coordinated_action() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     ev_action = PlanAction(
         action_id="ev",
@@ -1306,7 +1286,6 @@ def test_current_plan_evaluates_each_coordinated_action() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan.actions = [higher_priority, ev_action]
     context = object()
@@ -1337,7 +1316,6 @@ def test_current_plan_skips_safety_action_consumed_ahead_of_next_action() -> Non
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     plan.actions = [ev_action, release_action]
     context = object()
@@ -2257,65 +2235,6 @@ def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
     assert _parse_datetime_or_none(123) is None
 
 
-def test_flexible_haeo_response_restores_baseline_for_uncovered_slots(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = SimpleNamespace(
-        slots=[
-            DecisionSlot(
-                valid_at=now,
-                import_price=0.2,
-                export_price=0.08,
-                pv_forecast_kw=1.0,
-                baseline_load_forecast_kw=0.5,
-                haeo_grid_import_forecast_kw=1.0,
-                haeo_grid_export_forecast_kw=2.0,
-            ),
-            DecisionSlot(
-                valid_at=now + timedelta(minutes=5),
-                import_price=0.2,
-                export_price=0.08,
-                pv_forecast_kw=1.0,
-                baseline_load_forecast_kw=0.5,
-                haeo_grid_import_forecast_kw=3.0,
-                haeo_grid_export_forecast_kw=4.0,
-            ),
-        ]
-    )
-
-    def fake_apply(
-        built_context: object,
-        response: object,
-        *,
-        grid_includes_flexible_loads: bool,
-    ) -> dict[str, int]:
-        assert built_context is context
-        assert response == {"flexible": True}
-        assert grid_includes_flexible_loads is True
-        context.slots[0].haeo_grid_import_forecast_kw = 8.0
-        context.slots[0].haeo_grid_export_forecast_kw = 0.0
-        context.slots[0].haeo_grid_includes_flexible_loads = True
-        context.slots[1].haeo_grid_import_forecast_kw = 9.0
-        return {"haeo_grid_import_forecast_kw": 2}
-
-    monkeypatch.setattr(coordinator_module, "apply_haeo_response_to_context", fake_apply)
-
-    counts = _apply_flexible_haeo_response(context, {"flexible": True})
-
-    assert counts == {"haeo_grid_import_forecast_kw": 2}
-    assert (
-        context.slots[0].haeo_grid_import_forecast_kw,
-        context.slots[0].haeo_grid_export_forecast_kw,
-        context.slots[0].haeo_grid_includes_flexible_loads,
-    ) == (8.0, 0.0, True)
-    assert (
-        context.slots[1].haeo_grid_import_forecast_kw,
-        context.slots[1].haeo_grid_export_forecast_kw,
-        context.slots[1].haeo_grid_includes_flexible_loads,
-    ) == (3.0, 4.0, False)
-
-
 def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
 
@@ -2357,455 +2276,6 @@ def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> N
     )
 
 
-def test_update_data_locked_records_haeo_ai_snapshot_and_executes(monkeypatch: object) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = SimpleNamespace(
-        created_at=now,
-        plan_id="plan-refresh",
-        slots=[
-            DecisionSlot(
-                valid_at=now,
-                import_price=0.20,
-                export_price=0.08,
-                pv_forecast_kw=1.0,
-                baseline_load_forecast_kw=0.5,
-                projected_ev_load_kw=0.0,
-            )
-        ],
-        input_health=InputHealth.HEALTHY,
-        haeo_status=HAEOStatus.READY,
-        input_issues=[],
-        occupancy_state=OccupancyState.OCCUPIED,
-    )
-
-    class FakeDiscovery:
-        def __init__(self, hass: object, entry_data: dict[str, object]) -> None:
-            pass
-
-        def inspect(self) -> SimpleNamespace:
-            return SimpleNamespace(
-                as_dict=lambda: {"ok": True},
-                climate=SimpleNamespace(issues=["climate_zone_unavailable"]),
-            )
-
-    class FakeInputManager:
-        forecast_training_slots = [{"slot": 1}]
-
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.forecast_calibration = {}
-
-        def current_forecast_observations(self) -> dict[str, float]:
-            return {"pv_forecast_kw": 1.0}
-
-        def thermal_sample(self, built_context: object) -> dict[str, object]:
-            assert built_context is context
-            return {"sampled_at": now}
-
-        def build_context(self, overrides: list[object]) -> object:
-            assert overrides == []
-            return context
-
-    class FakeHAEOAdapter:
-        def __init__(self, hass: object, service_name: str) -> None:
-            self.service_name = service_name
-            self.supports_flexible_second_pass = True
-            self.second_pass_calls = 0
-            self.capabilities = {
-                "supports_response": True,
-                "supports_flexible_projections": True,
-                "supports_flexible_second_pass": True,
-                "source": "test",
-            }
-            self.last_call_metadata: dict[str, object] = {}
-
-        async def async_solve_baseline(self, built_context: object) -> HAEOSolveResult:
-            assert built_context is context
-            self.last_call_metadata = {
-                "duration_ms": 12.5,
-                "cache_hit": False,
-                "input_fingerprint": "baseline-fingerprint",
-                "response_received": True,
-                "capabilities": self.capabilities,
-            }
-            return HAEOSolveResult(
-                phase=HAEOSolvePhase.BASELINE,
-                status=HAEOStatus.READY,
-                reason="haeo_baseline_ready",
-                plan_id="plan-refresh",
-                service_called="haeo.optimize",
-                response={"baseline": True},
-            )
-
-        async def async_solve_with_flexible_load(
-            self,
-            built_context: object,
-            projections: list[object],
-        ) -> HAEOSolveResult:
-            assert built_context is context
-            assert projections == ["projection"]
-            self.second_pass_calls += 1
-            self.last_call_metadata = {
-                "duration_ms": 7.25,
-                "cache_hit": True,
-                "input_fingerprint": "flex-fingerprint",
-                "response_received": True,
-                "capabilities": self.capabilities,
-            }
-            return HAEOSolveResult(
-                phase=HAEOSolvePhase.FLEXIBLE_LOAD,
-                status=HAEOStatus.READY,
-                reason="haeo_flexible_ready",
-                plan_id="plan-refresh",
-                service_called="haeo.optimize",
-                response={"flexible": True},
-            )
-
-    class FakePlanner:
-        initial_projected_loads: list[tuple[float, float]] = []
-
-        def __init__(self, options: dict[str, object], thermal_model: dict[str, object]) -> None:
-            assert thermal_model == {"last_sample": {"sampled_at": now}, "enabled": True}
-
-        def create_plan(self, built_context: object) -> EnergyPlan:
-            assert built_context is context
-            slot = context.slots[0]
-            self.initial_projected_loads.append((slot.projected_ev_load_kw, slot.projected_hvac_load_kw))
-            slot.projected_ev_load_kw = 7.0
-            slot.projected_hvac_load_kw = 1.0
-            plan = _plan("plan-refresh")
-            plan.created_at = now
-            plan.preview = [{"slot": 1}]
-            plan.summary = str(getattr(context, "last_haeo_response", None))
-            return plan
-
-        def project_flexible_loads(self, built_context: object) -> list[str]:
-            assert built_context is context
-            return ["projection"]
-
-    class FakeConstraintValidator:
-        def __init__(self, options: dict[str, object]) -> None:
-            pass
-
-        def validate_plan(self, built_context: object, plan: EnergyPlan) -> list[str]:
-            assert built_context is context
-            assert plan.plan_id == "plan-refresh"
-            return ["input_health_unsafe"]
-
-    async def fake_import_trip_history(
-        hass: object,
-        entry_data: dict[str, object],
-        trip_history: dict[str, object],
-        *,
-        now: datetime,
-    ) -> tuple[dict[str, object], bool, str]:
-        return {"records": [{"soc": 80}]}, True, "imported"
-
-    async def fake_update_load_forecast(*args: object, **kwargs: object) -> tuple[dict[str, object], bool, str]:
-        return {"status": "learning", "source_entity_id": "sensor.house"}, True, "load_forecast_learning"
-
-    async def fake_ai_advice(
-        self: EnergyPlannerCoordinator,
-        built_context: object,
-        plan: EnergyPlan,
-        entry_data: dict[str, object],
-        options: dict[str, object],
-    ) -> tuple[AIAdviceResult, bool]:
-        assert built_context is context
-        assert plan.plan_id == "plan-refresh"
-        return (
-            AIAdviceResult(
-                status="accepted",
-                accepted={"confidence": 0.8, "reasoning_summary": "Looks good"},
-                rejected_reason=None,
-                rejected_detail={},
-                service_called="ai_task.generate_data",
-                ai_task_entity="ai_task.local",
-            ),
-            True,
-        )
-
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.CapabilityDiscovery", FakeDiscovery)
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder",
-        fake_import_trip_history,
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_update_builtin_load_forecast",
-        fake_update_load_forecast,
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.InputManager", FakeInputManager)
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_forecast_calibration",
-        lambda model, snapshots, observations, *, now: ({"pv_forecast_kw": {"enabled": True}}, True),
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_thermal_model",
-        lambda model, previous, sample: ({"last_sample": sample, "enabled": True}, True),
-    )
-
-    def fake_apply_haeo_response(
-        built_context: object,
-        response: object,
-        *,
-        grid_includes_flexible_loads: bool = False,
-    ) -> dict[str, int]:
-        assert built_context is context
-        context.last_haeo_response = response
-        context.slots[0].haeo_grid_import_forecast_kw = 8.0 if response == {"flexible": True} else 1.0
-        context.slots[0].haeo_grid_export_forecast_kw = 0.0
-        context.slots[0].haeo_grid_includes_flexible_loads = grid_includes_flexible_loads
-        return {"evidence": len(response or {})}
-
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.apply_haeo_response_to_context",
-        fake_apply_haeo_response,
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", FakeHAEOAdapter)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", FakePlanner)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.ConstraintValidator", FakeConstraintValidator)
-    monkeypatch.setattr(EnergyPlannerCoordinator, "_async_get_throttled_ai_advice", fake_ai_advice)
-
-    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-    coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry(
-        {
-            "haeo_optimize_service": "haeo.optimize",
-            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override",
-        },
-        {"ai_enabled": True},
-    )
-    coordinator.store = FakeStore(
-        {
-            "trip_history": {},
-            "forecast_snapshots": [],
-            "overrides": [
-                {
-                    "kind": "manual_hvac",
-                    "expires_at": "2000-01-01T00:00:00+00:00",
-                }
-            ],
-            "ownership": {
-                "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
-                "hvac_release_hold_until": now + timedelta(hours=1),
-            },
-        }
-    )
-    coordinator.executor = FakeExecutor()
-    coordinator.overrides = [
-        Override(
-            "manual_ev_charging",
-            "button",
-            datetime(2000, 1, 1, tzinfo=UTC),
-            "manual_start",
-        )
-    ]
-    coordinator.ready_by = "07:00"
-    coordinator._refresh_generation = 0
-
-    result = asyncio.run(coordinator._async_update_data_locked())
-
-    assert context.hvac_control["released_until"] == now + timedelta(hours=1)
-    assert context.hvac_control["required_evidence_lost"] == "climate_zone_unavailable"
-
-    assert result.plan_id == "plan-refresh"
-    assert result.summary == "{'flexible': True}"
-    assert FakePlanner.initial_projected_loads == [(0.0, 0.0), (0.0, 0.0)]
-    assert (context.slots[0].projected_ev_load_kw, context.slots[0].projected_hvac_load_kw) == (7.0, 1.0)
-    assert context.slots[0].haeo_grid_import_forecast_kw == 8.0
-    assert context.slots[0].haeo_grid_includes_flexible_loads is True
-    assert result.status == "unsafe"
-    assert result.mode == PlannerMode.ACTIVE_DEGRADED
-    assert result.input_issues == ["input_health_unsafe"]
-    assert coordinator.store.discovery == [{"ok": True}]
-    assert coordinator.store.trip_history == [{"records": [{"soc": 80}]}]
-    assert coordinator.store.forecast_calibrations == [{"pv_forecast_kw": {"enabled": True}}]
-    assert coordinator.store.load_forecasts == [{"status": "learning", "source_entity_id": "sensor.house"}]
-    assert coordinator.store.thermal_models == [{"last_sample": {"sampled_at": now}, "enabled": True}]
-    assert coordinator.store.haeo_runs[0]["flexible_projection_count"] == 1
-    assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == HAEOStatus.READY
-    assert coordinator.store.haeo_runs[0]["baseline"]["duration_ms"] == 12.5
-    assert coordinator.store.haeo_runs[0]["baseline"]["evidence_status"] == "available"
-    assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 7.25
-    assert coordinator.store.haeo_runs[0]["second_pass"]["cache_hit"] is True
-    assert coordinator.store.haeo_runs[0]["capabilities"]["supports_flexible_second_pass"] is True
-    assert coordinator.store.ai_recommendations == []
-    assert coordinator.store.forecast_snapshots[0]["ai"] is None
-    assert coordinator.store.forecast_snapshots[0]["trip_history"]["recorder_import_reason"] == "imported"
-    assert coordinator.overrides == []
-    assert coordinator.store.data["overrides"] == []
-    assert coordinator.store.data["ownership"] == {"hvac_release_hold_until": now + timedelta(hours=1)}
-    assert coordinator.hass.services.calls == [
-        (
-            "input_boolean",
-            "turn_off",
-            {"entity_id": "input_boolean.manual_override"},
-            True,
-        )
-    ]
-    assert coordinator.store.saved_plans == [result]
-    assert coordinator.executor.evaluated == [(result, context)]
-
-    adapter = coordinator._haeo_adapter
-    adapter.supports_flexible_second_pass = False
-    adapter.capabilities["supports_flexible_second_pass"] = False
-    context.slots[0].projected_ev_load_kw = 0.0
-    context.slots[0].projected_hvac_load_kw = 0.0
-    coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
-    coordinator.executor = FakeExecutor()
-
-    asyncio.run(coordinator._async_update_data_locked())
-
-    assert adapter.second_pass_calls == 1
-    assert coordinator.store.haeo_runs[0]["second_pass"]["status"] == "skipped"
-    assert coordinator.store.haeo_runs[0]["second_pass"]["reason"] == "haeo_flexible_projection_unsupported"
-    assert coordinator.store.haeo_runs[0]["second_pass"]["duration_ms"] == 0.0
-
-
-def test_update_data_locked_does_not_record_successful_haeo_baseline_as_issue(monkeypatch: object) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    context = SimpleNamespace(
-        created_at=now,
-        plan_id="plan-no-flex",
-        slots=[
-            DecisionSlot(
-                valid_at=now,
-                import_price=0.20,
-                export_price=0.08,
-                pv_forecast_kw=1.0,
-                baseline_load_forecast_kw=0.5,
-            )
-        ],
-        input_health=InputHealth.HEALTHY,
-        haeo_status=HAEOStatus.READY,
-        input_issues=[],
-        occupancy_state=OccupancyState.OCCUPIED,
-    )
-
-    class FakeDiscovery:
-        def __init__(self, hass: object, entry_data: dict[str, object]) -> None:
-            pass
-
-        def inspect(self) -> SimpleNamespace:
-            return SimpleNamespace(as_dict=lambda: {"ok": True})
-
-    class FakeInputManager:
-        forecast_training_slots: list[dict[str, object]] = []
-        forecast_confidence_details: list[dict[str, object]] = []
-
-        def __init__(self, *args: object, **kwargs: object) -> None:
-            self.forecast_calibration = {}
-
-        def current_forecast_observations(self) -> dict[str, float]:
-            return {}
-
-        def thermal_sample(self, built_context: object) -> dict[str, object]:
-            assert built_context is context
-            return {}
-
-        def build_context(self, overrides: list[object]) -> object:
-            assert overrides == []
-            return context
-
-    class FakeHAEOAdapter:
-        def __init__(self, hass: object, service_name: str) -> None:
-            pass
-
-        async def async_solve_baseline(self, built_context: object) -> HAEOSolveResult:
-            assert built_context is context
-            return HAEOSolveResult(
-                phase=HAEOSolvePhase.BASELINE,
-                status=HAEOStatus.READY,
-                reason="haeo_service_called",
-                plan_id="plan-no-flex",
-                service_called="haeo.optimize",
-                response={},
-            )
-
-        async def async_solve_with_flexible_load(
-            self,
-            built_context: object,
-            projections: list[object],
-        ) -> HAEOSolveResult:
-            raise AssertionError("second HAEO pass should not run without projections")
-
-    class FakePlanner:
-        def __init__(self, options: dict[str, object], thermal_model: dict[str, object]) -> None:
-            pass
-
-        def create_plan(self, built_context: object) -> EnergyPlan:
-            assert built_context is context
-            plan = _plan("plan-no-flex")
-            plan.created_at = now
-            return plan
-
-        def project_flexible_loads(self, built_context: object) -> list[object]:
-            assert built_context is context
-            return []
-
-    class FakeConstraintValidator:
-        def __init__(self, options: dict[str, object]) -> None:
-            pass
-
-        def validate_plan(self, built_context: object, plan: EnergyPlan) -> list[str]:
-            assert built_context is context
-            assert plan.plan_id == "plan-no-flex"
-            return []
-
-    async def fake_import_trip_history(
-        hass: object,
-        entry_data: dict[str, object],
-        trip_history: dict[str, object],
-        *,
-        now: datetime,
-    ) -> tuple[dict[str, object], bool, str]:
-        return trip_history, False, "unchanged"
-
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.CapabilityDiscovery", FakeDiscovery)
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder",
-        fake_import_trip_history,
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.InputManager", FakeInputManager)
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_forecast_calibration",
-        lambda model, snapshots, observations, *, now: (model, False),
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_thermal_model",
-        lambda model, previous, sample: (model, False),
-    )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.apply_haeo_response_to_context",
-        lambda built_context, response: {},
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", FakeHAEOAdapter)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", FakePlanner)
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.ConstraintValidator", FakeConstraintValidator)
-
-    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-    coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry(
-        {"haeo_optimize_service": "haeo.optimize"},
-        {
-            "ai_enabled": False,
-            CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED: False,
-        },
-    )
-    coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
-    coordinator.executor = FakeExecutor()
-    coordinator.overrides = []
-    coordinator.ready_by = "07:00"
-    coordinator._refresh_generation = 0
-
-    result = asyncio.run(coordinator._async_update_data_locked())
-
-    assert result.input_issues == []
-    assert coordinator.store.haeo_runs[0]["flexible_projection_count"] == 0
-    assert coordinator.store.haeo_runs[0]["second_pass"] is None
-    assert coordinator.executor.fallback == (result, [])
-    assert coordinator.executor.fallback_options[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is False
-
-
 def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = SimpleNamespace(
@@ -2813,37 +2283,21 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         plan_id="plan-dry",
         slots=[DecisionSlot(now, 0.2, 0.05, 0, 1)],
         input_health=InputHealth.HEALTHY,
-        haeo_status=HAEOStatus.READY,
         input_issues=[],
         occupancy_state=OccupancyState.OCCUPIED,
     )
 
-    class FakeHAEOAdapter:
-        def __init__(self, hass: object, service_name: str) -> None:
-            pass
-
-        async def async_solve_baseline(self, built_context: object) -> HAEOSolveResult:
-            return HAEOSolveResult(HAEOSolvePhase.BASELINE, HAEOStatus.READY, "baseline", "plan-dry")
-
-        async def async_solve_with_flexible_load(
-            self,
-            built_context: object,
-            projections: list[object],
-        ) -> HAEOSolveResult:
-            return HAEOSolveResult(HAEOSolvePhase.FLEXIBLE_LOAD, HAEOStatus.READY, "flexible", "plan-dry")
-
     class FakePlanner:
+        mode = PlannerMode.DRY_RUN
+
         def __init__(self, options: dict[str, object], thermal_model: dict[str, object]) -> None:
             pass
 
         def create_plan(self, built_context: object) -> EnergyPlan:
             plan = _plan("plan-dry")
             plan.created_at = now
-            plan.mode = PlannerMode.DRY_RUN
+            plan.mode = self.mode
             return plan
-
-        def project_flexible_loads(self, built_context: object) -> list[str]:
-            return []
 
     async def fake_import_trip_history(
         hass: object,
@@ -2852,11 +2306,31 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         *,
         now: datetime,
     ) -> tuple[dict[str, object], bool, str]:
-        return history, False, "unchanged"
+        return {"records": [{"soc": 80}]}, True, "imported"
+
+    async def fake_update_load_forecast(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[dict[str, object], bool, str]:
+        return {"status": "ready"}, True, "trained"
+
+    class FakeConstraintValidator:
+        violations: list[str] = []
+
+        def __init__(self, options: dict[str, object]) -> None:
+            pass
+
+        def validate_plan(self, built_context: object, plan: EnergyPlan) -> list[str]:
+            return list(self.violations)
 
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
-        lambda hass, data: SimpleNamespace(inspect=lambda: SimpleNamespace(as_dict=lambda: {})),
+        lambda hass, data: SimpleNamespace(
+            inspect=lambda: SimpleNamespace(
+                as_dict=lambda: {},
+                climate=SimpleNamespace(issues=["climate_zone_unavailable"]),
+            )
+        ),
     )
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.InputManager",
@@ -2873,30 +2347,43 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         fake_import_trip_history,
     )
     monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_update_builtin_load_forecast",
+        fake_update_load_forecast,
+    )
+    monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.update_forecast_calibration",
-        lambda *args, **kwargs: ({}, False),
+        lambda *args, **kwargs: ({"enabled": True}, True),
     )
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.update_thermal_model",
-        lambda *args, **kwargs: ({}, False),
+        lambda *args, **kwargs: ({"enabled": True}, True),
     )
-    monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.apply_haeo_response_to_context",
-        lambda built_context, response: {},
-    )
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.HAEOAdapter", FakeHAEOAdapter)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", FakePlanner)
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.ConstraintValidator",
-        lambda options: SimpleNamespace(validate_plan=lambda built_context, plan: []),
+        FakeConstraintValidator,
     )
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
     coordinator.entry = FakeEntry({}, {"ai_enabled": False})
-    coordinator.store = FakeStore({"trip_history": {}, "forecast_snapshots": []})
+    coordinator.store = FakeStore(
+        {
+            "trip_history": {},
+            "forecast_snapshots": [],
+            "overrides": [{"kind": "other"}],
+            "ownership": {"hvac_control": {"phase": "preconditioning"}},
+        }
+    )
     coordinator.executor = FakeExecutor()
-    coordinator.overrides = []
+    coordinator.overrides = [
+        Override(
+            kind="manual_hvac",
+            source="service",
+            expires_at=now - timedelta(minutes=1),
+            reason="expired",
+        )
+    ]
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0
 
@@ -2904,6 +2391,21 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
 
     assert result.mode == PlannerMode.DRY_RUN
     assert coordinator.store.dry_run_comparisons[0]["plan_id"] == "plan-dry"
+    assert coordinator.store.trip_history
+    assert coordinator.store.load_forecasts
+    assert coordinator.store.forecast_calibrations
+    assert coordinator.store.thermal_models
+    assert context.hvac_control["required_evidence_lost"] == "climate_zone_unavailable"
+
+    FakePlanner.mode = PlannerMode.ACTIVE_HEALTHY
+    FakeConstraintValidator.violations = ["input_health_unsafe"]
+    context.plan_id = "plan-active"
+    coordinator._force_next_refresh = True
+
+    active_result = asyncio.run(coordinator._async_update_data_locked())
+
+    assert active_result.status == "unsafe"
+    assert active_result.mode == PlannerMode.ACTIVE_DEGRADED
 
 
 def test_snapshot_actions_are_bounded_and_auditable() -> None:
@@ -2930,7 +2432,6 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
         reason_codes=["ev_soc_below_target", "fallback_target"],
         expected_cost_delta=None,
         confidence=0.93,
-        requires_haeo_plan_id="plan-1",
     )
     plan = _plan("plan-1")
     plan.actions = [action]
@@ -3003,7 +2504,6 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
             "reason_codes": ["ev_soc_below_target", "fallback_target"],
             "expected_cost_delta": None,
             "confidence": 0.93,
-            "requires_haeo_plan_id": "plan-1",
         }
     ]
 
@@ -3023,7 +2523,6 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
         current_battery_soc_percent=50,
         current_ev_soc_percent=50,
         occupancy_state=OccupancyState.OCCUPIED,
-        haeo_status=HAEOStatus.STALE,
         input_health=InputHealth.HEALTHY,
     )
     assert _snapshot_action_load_forecasts(plan, context) == [
@@ -3370,6 +2869,17 @@ def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> N
 
     assert "manual_hvac_override_expires_at" in coordinator.store.data["ownership"]
     assert coordinator._manual_override_helper_guard is None
+
+
+def test_expired_manual_hvac_state_removes_persisted_expiry() -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.store.data["ownership"] = {
+        "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+        "unrelated": True,
+    }
+
+    assert asyncio.run(coordinator._async_clear_expired_manual_hvac_state()) is True
+    assert coordinator.store.data["ownership"] == {"unrelated": True}
 
 
 def test_expired_manual_hvac_cleanup_keeps_override_until_helper_turns_off() -> None:
@@ -3883,7 +3393,6 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
     coordinator = _coordinator_for_runtime_services(
         store_data={"execution_audit": [{"result": "applied", "action_id": "previous"}]}
@@ -4073,7 +3582,6 @@ def _coordinated_action(
         reason_codes=[],
         expected_cost_delta=None,
         confidence=1.0,
-        requires_haeo_plan_id=None,
     )
 
 
