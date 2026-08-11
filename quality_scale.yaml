@@ -112,7 +112,7 @@ rules:
         - tests/test_ev_control_entities.py
   config-flow-test-coverage:
     status: done
-    comment: The central Configure flow covers all input mappings and policy constraints; schema exclusions keep native entity-managed settings out of the forms, and regression coverage verifies that Add device subentry flows are not exposed.
+    comment: The central Configure flow covers all input mappings and policy constraints, including settings-only ready-by and opportunistic EV controls, and regression coverage verifies that Add device subentry flows are not exposed.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -299,7 +299,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging and earliest-start boundary tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh.
+    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh.
     references:
       tests:
         - tests/test_planner.py
@@ -326,7 +326,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   diagnostics:
     status: done
-    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice while recorder-facing sensor attributes use compact summaries.
+    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice. The Explain control also publishes bounded pending, accepted, rejected, and failure notifications while recorder-facing sensor attributes use compact summaries.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -334,6 +334,7 @@ rules:
         - custom_components/ha_energy_planner/sensor.py
       tests:
         - tests/test_diagnostics.py
+        - tests/test_coordinator.py
         - tests/test_sensor.py
         - scripts/docker-ha-smoke.sh
   discovery-update-info:
@@ -426,7 +427,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Automatic control remains the sole master activation switch and the three visible device switches select its control areas.
+    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master activation switch, and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -435,7 +436,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including Armed, Current state, Next actions, Plan calendar, Automatic control, the three device control selectors, and the remaining day-to-day EV controls, use translation keys mirrored across bundled English translations.
+    comment: Planner entities, including Armed, Current state, Next actions, the Plan calendar with complete EV charging windows, Automatic control, the three device control selectors grouped under Controls, and the remaining day-to-day EV controls, use translation keys mirrored across bundled English translations.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json
