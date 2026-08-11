@@ -405,7 +405,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: The three device control selectors and remaining adjustable day-to-day device settings use the Home Assistant config entity category, while fallback Target SOC is central configuration and the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
+    comment: The three device control selectors remain in Controls; EV policy such as Keep charger on is central configuration, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -427,7 +427,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, long-pause, and resume buttons are disabled by default; Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master activation switch, and the three visible device switches select its control areas.
+    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master activation switch, and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -436,7 +436,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including Armed, Current state, Next actions, the Plan calendar with complete EV charging windows, Automatic control, the three device control selectors grouped under Controls, and the remaining day-to-day EV controls, use translation keys mirrored across bundled English translations.
+    comment: Planner entities, including Armed, Current state, Next actions, the Plan calendar with complete EV charging windows, Automatic control, and the three device control selectors grouped under Controls, use translation keys mirrored across bundled English translations; retired pause and Keep charger on entities are removed from registries.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json

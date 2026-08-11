@@ -7,7 +7,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from homeassistant.const import EntityCategory
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import button as button_module
@@ -19,7 +18,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
-    CONF_EV_KEEP_CHARGER_ON,
     CONF_PLANNER_ENABLED,
 )
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -64,9 +62,7 @@ class FakeCoordinator:
         self.restore_calls: list[tuple[str, bool]] = []
         self.arm_calls: list[str] = []
         self.disarm_calls: list[str] = []
-        self.pause_calls: list[tuple[int, str, str]] = []
         self.resume_calls: list[str] = []
-        self.ev_keep_on_calls: list[bool] = []
         self.ai_advice_requests = 0
         self.entry_data: dict[str, object] = {}
         self.active_control_calls: list[bool] = []
@@ -130,17 +126,8 @@ class FakeCoordinator:
     async def async_disarm_production_control(self, reason: str) -> None:
         self.disarm_calls.append(reason)
 
-    async def async_pause_control(self, duration_minutes: int, reason: str, asset: str) -> None:
-        self.pause_calls.append((duration_minutes, reason, asset))
-
     async def async_resume_control(self, reason: str) -> None:
         self.resume_calls.append(reason)
-
-    async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
-        self.ev_keep_on_calls.append(enabled)
-        options = self.options
-        options[CONF_EV_KEEP_CHARGER_ON] = enabled
-        self.hass.config_entries.async_update_entry(self.entry, options=options)
 
 
 def test_automatic_control_switch_uses_combined_coordinator_path() -> None:
@@ -165,12 +152,11 @@ def test_switches_expose_one_master_and_three_device_controls() -> None:
     descriptions = {description.key: description for description in SWITCHES}
     keys = set(descriptions)
 
-    assert {"active_control", "climate_control", "ev_control", "enphase_control"} <= keys
+    assert keys == {"active_control", "climate_control", "ev_control", "enphase_control"}
     assert all(
         descriptions[key].entity_category is None
         for key in ("active_control", "climate_control", "ev_control", "enphase_control")
     )
-    assert descriptions["ev_keep_charger_on"].entity_category == EntityCategory.CONFIG
     assert keys.isdisjoint(
         {
             "enabled",
@@ -247,30 +233,8 @@ def test_switch_setup_and_constructor(monkeypatch: object) -> None:
         "switch.entry-1_enphase_control_enabled",
         "switch.entry-1_ev_connected_helper",
         "switch.entry-1_ev_opportunistic_charging",
+        "switch.entry-1_ev_keep_charger_on",
     ]
-
-
-def test_keep_on_switch_uses_coordinator_validation_path() -> None:
-    coordinator = FakeCoordinator({CONF_EV_KEEP_CHARGER_ON: False})
-    switch = SimpleNamespace(
-        coordinator=coordinator,
-        entity_description=next(
-            description for description in SWITCHES if description.option_key == CONF_EV_KEEP_CHARGER_ON
-        ),
-        write_count=0,
-    )
-    switch._async_set_option = lambda value: PlannerSwitch._async_set_option(switch, value)
-    switch.async_write_ha_state = lambda: setattr(
-        switch,
-        "write_count",
-        switch.write_count + 1,
-    )
-
-    asyncio.run(PlannerSwitch.async_turn_on(switch))
-
-    assert coordinator.ev_keep_on_calls == [True]
-    assert coordinator.entry.options[CONF_EV_KEEP_CHARGER_ON] is True
-    assert switch.write_count == 1
 
 
 def test_button_setup_and_constructor(monkeypatch: object) -> None:
@@ -297,7 +261,12 @@ def test_button_setup_and_constructor(monkeypatch: object) -> None:
 
     assert len(added) == len(BUTTONS)
     assert button.unique_id == "entry-1_replan"
-    assert removed == ["button.entry-1_ev_start_charging", "button.entry-1_ev_stop_charging"]
+    assert removed == [
+        "button.entry-1_ev_start_charging",
+        "button.entry-1_ev_stop_charging",
+        "button.entry-1_pause_control_1h",
+        "button.entry-1_pause_control_4h",
+    ]
 
 
 def test_replan_button_requests_replan() -> None:
@@ -347,6 +316,8 @@ def test_removed_manual_ev_buttons_are_not_exposed() -> None:
 
     assert "ev_start_charging" not in descriptions
     assert "ev_stop_charging" not in descriptions
+    assert "pause_control_1h" not in descriptions
+    assert "pause_control_4h" not in descriptions
     assert descriptions["request_ai_advice"].icon == "mdi:comment-question-outline"
 
 
@@ -452,8 +423,6 @@ def test_production_control_buttons_call_coordinator() -> None:
     for key in (
         "arm_production_control",
         "disarm_production_control",
-        "pause_control_1h",
-        "pause_control_4h",
         "resume_control",
     ):
         button = SimpleNamespace(
@@ -464,8 +433,4 @@ def test_production_control_buttons_call_coordinator() -> None:
 
     assert coordinator.arm_calls == ["button_pressed"]
     assert coordinator.disarm_calls == ["button_pressed"]
-    assert coordinator.pause_calls == [
-        (60, "button_pressed", "all"),
-        (240, "button_pressed", "all"),
-    ]
     assert coordinator.resume_calls == ["button_pressed"]
