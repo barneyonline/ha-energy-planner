@@ -13,6 +13,7 @@ from typing import Any
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_ENPHASE_CONTROL_ENABLED,
@@ -1277,13 +1278,14 @@ class Executor:
             production = parse_production_state(self.store.data.get("production"))
             if not production.armed:
                 return "production_gate_not_armed"
-            if production.dry_run_evidence_fingerprint != production_evidence_fingerprint(
-                self.entry_data,
-                self.options,
-            ):
-                return "production_evidence_contract_changed"
-            if production.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
-                return "production_dry_run_evidence_incomplete"
+            if not strict_bool(self.options.get(CONF_BYPASS_SAFETY_GATES), default=False):
+                if production.dry_run_evidence_fingerprint != production_evidence_fingerprint(
+                    self.entry_data,
+                    self.options,
+                ):
+                    return "production_evidence_contract_changed"
+                if production.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
+                    return "production_dry_run_evidence_incomplete"
             device_reason = _device_control_disabled_reason(action.asset, self.options)
             if device_reason is not None:
                 return device_reason

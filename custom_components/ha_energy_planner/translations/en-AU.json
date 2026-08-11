@@ -93,11 +93,11 @@
     "step": {
       "init": {
         "title": "Energy Planner settings",
-        "description": "Expand only the sections you need. Connected inputs and planner policy are saved together.",
+        "description": "Configure each area in one place. Expand only the sections you need; connected inputs and planner policy are saved together.",
         "sections": {
           "energy_inputs": {
-            "name": "Energy inputs",
-            "description": "Configure tariff, forecast, and battery inputs.",
+            "name": "Energy, battery, grid, and data",
+            "description": "Configure tariffs, forecasts, household load, battery and grid limits, and data-health thresholds.",
             "data": {
               "amber_import_price_entity": "Amber import price sensor",
               "amber_export_price_entity": "Amber export price sensor",
@@ -106,121 +106,7 @@
               "household_load_entity": "Household load sensor",
               "carbon_intensity_forecast_entity": "Grid carbon intensity forecast sensor",
               "pv_observed_entity": "Observed PV power sensor",
-              "battery_soc_entity": "Battery SOC sensor"
-            },
-            "data_description": {
-              "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
-              "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
-              "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
-              "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timezone-aware timestamped values after Forecast Today.",
-              "household_load_entity": "Measured whole-home power sensor in W, kW, or MW. Energy Planner learns a local load forecast from Recorder history and excludes known EV charging and measured HVAC power where possible.",
-              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
-              "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
-              "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value."
-            }
-          },
-          "climate_inputs": {
-            "name": "Climate inputs",
-            "description": "Configure climate control, weather context, and comfort targets.",
-            "data": {
-              "daikin_climate_entity": "Daikin Climate",
-              "daikin_power_entity": "Daikin Power Sensor",
-              "weather_entity": "Weather Forecast",
-              "climate_automation_entities": "Climate Automations",
-              "climate_zone_entities": "Climate Zones",
-              "climate_change_from_scheduler_entity": "Scheduler Change Helper",
-              "climate_manual_override_entity": "Manual Override Helper",
-              "climate_target_low_entity": "Occupied Low Temperature",
-              "climate_target_high_entity": "Occupied High Temperature"
-            },
-            "data_description": {
-              "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
-              "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
-              "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
-              "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
-              "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
-              "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
-              "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
-              "climate_target_low_entity": "Input number containing the occupied low comfort target.",
-              "climate_target_high_entity": "Input number containing the occupied high comfort target."
-            }
-          },
-          "presence_inputs": {
-            "name": "Presence inputs",
-            "description": "Configure household presence inputs used for comfort and EV planning.",
-            "data": {
-              "person_entities": "People"
-            },
-            "data_description": {
-              "person_entities": "Person entities used to infer occupied or away state."
-            }
-          },
-          "enphase_inputs": {
-            "name": "Enphase inputs",
-            "description": "Configure Enphase profile monitoring and profile control.",
-            "data": {
-              "enphase_profile_entity": "Enphase Profile",
-              "enphase_ai_profile": "Enphase Restore Profile",
-              "enphase_self_consumption_profile": "Enphase Consume Battery Profile",
-              "enphase_full_backup_profile": "Enphase Charge Battery Profile"
-            },
-            "data_description": {
-              "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
-              "enphase_ai_profile": "Profile name to restore when planner ownership ends, normally AI Optimisation.",
-              "enphase_self_consumption_profile": "Profile name used when the planner wants the battery to serve local load or export, normally Self-Consumption.",
-              "enphase_full_backup_profile": "Profile name used when the planner wants to charge or preserve the battery, normally Full Backup."
-            }
-          },
-          "ai_inputs": {
-            "name": "AI inputs",
-            "description": "Configure an optional AI Task provider for the on-demand Explain or troubleshoot button. It cannot control devices or change settings.",
-            "data": {
-              "ai_task_entity": "AI task provider"
-            },
-            "data_description": {
-              "ai_task_entity": "Select an AI Task entity for on-demand plan explanation and troubleshooting. Energy Planner accepts only complete actions tied to current planner evidence."
-            }
-          },
-          "ev_inputs": {
-            "name": "EV inputs",
-            "description": "Configure vehicle state and the charger controls Energy Planner will operate directly.",
-            "data": {
-              "ev_soc_entity": "EV SOC sensor",
-              "ev_charging_entity": "EV charging state entity",
-              "ev_connected_entity": "EV connected entity",
-              "ev_smart_charging_target_soc_entity": "Vehicle target SOC entity",
-              "ev_charger_entity": "EV charger control",
-              "ev_charger_start_entity": "EV charger start control",
-              "ev_charger_stop_entity": "EV charger stop control"
-            },
-            "data_description": {
-              "ev_soc_entity": "EV state-of-charge sensor.",
-              "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
-              "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
-              "ev_smart_charging_target_soc_entity": "Optional vehicle or charger target-SOC entity. Its live percentage overrides the native fallback target.",
-              "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
-              "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
-              "ev_charger_stop_entity": "Optional separate switch or button used to stop charging."
-            }
-          },
-          "schedule": {
-            "name": "Scheduling",
-            "description": "Set the planning window and fallback EV ready-by time.",
-            "data": {
-              "planning_horizon_hours": "Planning horizon",
-              "planning_interval_minutes": "Planning interval",
-              "default_ready_by": "Default EV ready-by time"
-            },
-            "data_description": {
-              "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
-              "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
-              "default_ready_by": "Local completion time exposed by the native EV Ready by entity."
-            }
-          },
-          "ev_battery_grid": {
-            "name": "EV, battery, and grid",
-            "description": "Set battery reserve, EV charging assumptions, and grid power limits.",
-            "data": {
+              "battery_soc_entity": "Battery SOC sensor",
               "battery_min_soc_percent": "Minimum battery SOC",
               "battery_usable_capacity_kwh": "Usable battery capacity (kWh)",
               "battery_round_trip_efficiency_percent": "Battery round-trip efficiency (%)",
@@ -241,9 +127,27 @@
               "ev_confirmation_timeout_seconds": "Charging confirmation timeout",
               "ev_confirmation_retries": "Charging confirmation retries",
               "grid_import_limit_kw": "Grid import limit",
-              "grid_export_limit_kw": "Grid export limit"
+              "grid_export_limit_kw": "Grid export limit",
+              "bypass_safety_gates": "Bypass safety gates",
+              "price_freshness_minutes": "Price freshness window",
+              "forecast_freshness_minutes": "Forecast freshness window",
+              "material_change_threshold_percent": "Material change threshold",
+              "minimum_tariff_confidence": "Minimum tariff confidence",
+              "minimum_solar_confidence": "Minimum solar confidence",
+              "minimum_load_confidence": "Minimum load confidence",
+              "minimum_climate_confidence": "Minimum climate confidence",
+              "minimum_ev_confidence": "Minimum EV confidence",
+              "minimum_enphase_confidence": "Minimum Enphase confidence"
             },
             "data_description": {
+              "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
+              "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
+              "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
+              "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timezone-aware timestamped values after Forecast Today.",
+              "household_load_entity": "Measured whole-home power sensor in W, kW, or MW. Energy Planner learns a local load forecast from Recorder history and excludes known EV charging and measured HVAC power where possible.",
+              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
+              "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
+              "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value.",
               "battery_min_soc_percent": "Minimum home battery state of charge the planner tries to preserve.",
               "battery_usable_capacity_kwh": "Usable home battery capacity available for planning decisions.",
               "battery_round_trip_efficiency_percent": "Estimated battery round-trip efficiency used when valuing stored solar or tariff arbitrage.",
@@ -264,13 +168,33 @@
               "ev_confirmation_timeout_seconds": "Seconds to wait for the mapped charging-state entity to confirm each start or stop command. Set to 0 for an immediate check.",
               "ev_confirmation_retries": "Additional bounded command attempts when charging feedback does not confirm the requested state.",
               "grid_import_limit_kw": "Maximum grid import power allowed in planned actions.",
-              "grid_export_limit_kw": "Maximum grid export power allowed in planned actions."
+              "grid_export_limit_kw": "Maximum grid export power allowed in planned actions.",
+              "bypass_safety_gates": "Waives the 90% household-load coverage threshold and all production preflight requirements so Automatic control can arm. This reduces protection against unsafe inputs and unexpected demand; leave it off unless you accept that risk.",
+              "price_freshness_minutes": "Maximum age for price inputs before they are treated as stale.",
+              "forecast_freshness_minutes": "Maximum age for forecast inputs before they are treated as stale.",
+              "material_change_threshold_percent": "Minimum plan-change percentage before a new plan is considered materially different.",
+              "minimum_tariff_confidence": "Lowest tariff confidence allowed before tariff-driven decisions should be treated as degraded.",
+              "minimum_solar_confidence": "Lowest solar forecast confidence allowed before solar-driven decisions should be treated as degraded.",
+              "minimum_load_confidence": "Lowest load forecast confidence allowed before load-driven decisions should be treated as degraded.",
+              "minimum_climate_confidence": "Lowest climate confidence allowed before climate decisions should be treated as degraded.",
+              "minimum_ev_confidence": "Lowest EV confidence allowed before EV charging decisions should be treated as degraded.",
+              "minimum_enphase_confidence": "Lowest Enphase confidence allowed before battery profile decisions should be treated as degraded."
             }
           },
-          "climate": {
-            "name": "Climate",
-            "description": "Set comfort tolerance, HVAC price triggers, and manual override behavior.",
+          "climate_inputs": {
+            "name": "Climate and presence",
+            "description": "Configure climate inputs, presence, comfort, and HVAC policy.",
             "data": {
+              "daikin_climate_entity": "Daikin Climate",
+              "daikin_power_entity": "Daikin Power Sensor",
+              "weather_entity": "Weather Forecast",
+              "climate_automation_entities": "Climate Automations",
+              "climate_zone_entities": "Climate Zones",
+              "climate_change_from_scheduler_entity": "Scheduler Change Helper",
+              "climate_manual_override_entity": "Manual Override Helper",
+              "climate_target_low_entity": "Occupied Low Temperature",
+              "climate_target_high_entity": "Occupied High Temperature",
+              "person_entities": "People",
               "occupied_temperature_tolerance_percent": "Occupied temperature tolerance",
               "hvac_suppression_min_price_delta": "HVAC suppression price delta",
               "hvac_precondition_lead_minutes": "HVAC precondition lead time",
@@ -279,6 +203,16 @@
               "manual_hvac_override_minutes": "Manual HVAC override duration"
             },
             "data_description": {
+              "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
+              "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
+              "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
+              "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
+              "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
+              "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
+              "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
+              "climate_target_low_entity": "Input number containing the occupied low comfort target.",
+              "climate_target_high_entity": "Input number containing the occupied high comfort target.",
+              "person_entities": "Person entities used to infer occupied or away state.",
               "occupied_temperature_tolerance_percent": "Allowed comfort-band widening while the home is occupied.",
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
               "hvac_precondition_lead_minutes": "How far ahead HVAC may precondition before an expensive or comfort-sensitive period.",
@@ -287,22 +221,31 @@
               "manual_hvac_override_minutes": "How long manual HVAC changes block planner-owned HVAC control."
             }
           },
-          "enphase": {
+          "enphase_inputs": {
             "name": "Enphase",
-            "description": "Set Enphase profile hold time and the savings threshold for profile ownership.",
+            "description": "Configure Enphase profile monitoring, control, and policy.",
             "data": {
+              "enphase_profile_entity": "Enphase Profile",
+              "enphase_ai_profile": "Enphase Restore Profile",
+              "enphase_self_consumption_profile": "Enphase Consume Battery Profile",
+              "enphase_full_backup_profile": "Enphase Charge Battery Profile",
               "enphase_profile_min_hold_minutes": "Enphase profile minimum hold",
               "enphase_minimum_savings": "Minimum Enphase savings"
             },
             "data_description": {
+              "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
+              "enphase_ai_profile": "Profile name to restore when planner ownership ends, normally AI Optimisation.",
+              "enphase_self_consumption_profile": "Profile name used when the planner wants the battery to serve local load or export, normally Self-Consumption.",
+              "enphase_full_backup_profile": "Profile name used when the planner wants to charge or preserve the battery, normally Full Backup.",
               "enphase_profile_min_hold_minutes": "Minimum time to keep an Enphase profile before changing it again.",
               "enphase_minimum_savings": "Minimum estimated daily savings required before the planner takes Enphase profile ownership."
             }
           },
-          "ai_safety": {
+          "ai_inputs": {
             "name": "Safety and troubleshooting",
-            "description": "Configure actionable plan alerts, AI troubleshooting timeout, and command limits.",
+            "description": "Configure the optional AI troubleshooting provider and production-control safeguards.",
             "data": {
+              "ai_task_entity": "AI task provider",
               "planner_enabled": "Enable planner control",
               "dry_run": "Dry run only",
               "plan_fallback_notifications_enabled": "Enable plan fallback notifications",
@@ -316,6 +259,7 @@
               "max_daily_enphase_actions": "Maximum daily Enphase actions"
             },
             "data_description": {
+              "ai_task_entity": "Select an AI Task entity for on-demand plan explanation and troubleshooting. Energy Planner accepts only complete actions tied to current planner evidence.",
               "planner_enabled": "Turns on planner-owned device control. Leave off until preflight and dry-run behavior are reviewed.",
               "dry_run": "When enabled, the planner records decisions without calling device-control services.",
               "plan_fallback_notifications_enabled": "Shows persistent notifications only for problems that normally require user action, such as broken required mappings or a configured grid hard limit. Routine changes and successful recovery do not notify.",
@@ -329,35 +273,79 @@
               "max_daily_enphase_actions": "Maximum Enphase profile control attempts allowed in a rolling 24-hour window. Set to 0 for no cap."
             }
           },
-          "data_health": {
-            "name": "Data health",
-            "description": "Set freshness windows and the threshold for material plan changes.",
+          "ev_inputs": {
+            "name": "EV charging",
+            "description": "Configure EV inputs, charger controls, ready-by time, opportunistic charging, and charging policy.",
             "data": {
-              "price_freshness_minutes": "Price freshness window",
-              "forecast_freshness_minutes": "Forecast freshness window",
-              "material_change_threshold_percent": "Material change threshold",
-              "minimum_tariff_confidence": "Minimum tariff confidence",
-              "minimum_solar_confidence": "Minimum solar confidence",
-              "minimum_load_confidence": "Minimum load confidence",
-              "minimum_climate_confidence": "Minimum climate confidence",
-              "minimum_ev_confidence": "Minimum EV confidence",
-              "minimum_enphase_confidence": "Minimum Enphase confidence"
+              "ev_soc_entity": "EV SOC sensor",
+              "ev_charging_entity": "EV charging state entity",
+              "ev_connected_entity": "EV connected entity",
+              "ev_smart_charging_target_soc_entity": "Vehicle target SOC entity",
+              "ev_charger_entity": "EV charger control",
+              "ev_charger_start_entity": "EV charger start control",
+              "ev_charger_stop_entity": "EV charger stop control",
+              "battery_min_soc_percent": "Minimum battery SOC",
+              "battery_usable_capacity_kwh": "Usable battery capacity (kWh)",
+              "battery_round_trip_efficiency_percent": "Battery round-trip efficiency (%)",
+              "battery_max_charge_kw": "Battery maximum charge power (kW)",
+              "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
+              "ev_min_soc_percent": "Minimum EV SOC",
+              "ev_max_soc_percent": "Maximum EV SOC",
+              "ev_fallback_target_soc_percent": "EV target SOC",
+              "ev_charge_rate_kw": "EV charge rate (kW)",
+              "ev_soc_per_kwh": "EV SOC gained per kWh",
+              "ev_continuous_charging": "Prefer one continuous charging session",
+              "ev_earliest_start": "Earliest charging start",
+              "ev_price_limit_enabled": "Apply maximum import price",
+              "ev_max_import_price": "Maximum import price",
+              "ev_low_price_charging_enabled": "Enable opportunistic charging",
+              "ev_low_price_threshold": "Opportunistic charging price threshold",
+              "ev_keep_charger_on": "Keep charger enabled after target SOC",
+              "ev_confirmation_timeout_seconds": "Charging confirmation timeout",
+              "ev_confirmation_retries": "Charging confirmation retries",
+              "grid_import_limit_kw": "Grid import limit",
+              "grid_export_limit_kw": "Grid export limit",
+              "planning_horizon_hours": "Planning horizon",
+              "planning_interval_minutes": "Planning interval",
+              "default_ready_by": "Default EV ready-by time"
             },
             "data_description": {
-              "price_freshness_minutes": "Maximum age for price inputs before they are treated as stale.",
-              "forecast_freshness_minutes": "Maximum age for forecast inputs before they are treated as stale.",
-              "material_change_threshold_percent": "Minimum plan-change percentage before a new plan is considered materially different.",
-              "minimum_tariff_confidence": "Lowest tariff confidence allowed before tariff-driven decisions should be treated as degraded.",
-              "minimum_solar_confidence": "Lowest solar forecast confidence allowed before solar-driven decisions should be treated as degraded.",
-              "minimum_load_confidence": "Lowest load forecast confidence allowed before load-driven decisions should be treated as degraded.",
-              "minimum_climate_confidence": "Lowest climate confidence allowed before climate decisions should be treated as degraded.",
-              "minimum_ev_confidence": "Lowest EV confidence allowed before EV charging decisions should be treated as degraded.",
-              "minimum_enphase_confidence": "Lowest Enphase confidence allowed before battery profile decisions should be treated as degraded."
+              "ev_soc_entity": "EV state-of-charge sensor.",
+              "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
+              "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
+              "ev_smart_charging_target_soc_entity": "Optional vehicle or charger target-SOC entity. Its live percentage overrides the native fallback target.",
+              "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
+              "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
+              "ev_charger_stop_entity": "Optional separate switch or button used to stop charging.",
+              "battery_min_soc_percent": "Minimum home battery state of charge the planner tries to preserve.",
+              "battery_usable_capacity_kwh": "Usable home battery capacity available for planning decisions.",
+              "battery_round_trip_efficiency_percent": "Estimated battery round-trip efficiency used when valuing stored solar or tariff arbitrage.",
+              "battery_max_charge_kw": "Maximum battery charge power used when estimating whether surplus solar can be absorbed.",
+              "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
+              "ev_min_soc_percent": "Lowest EV state of charge the planner treats as acceptable before charging is prioritised.",
+              "ev_max_soc_percent": "Upper EV state of charge limit used when planning smart charging.",
+              "ev_fallback_target_soc_percent": "Target state of charge exposed by the native EV target SOC entity.",
+              "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
+              "ev_soc_per_kwh": "Estimated EV battery percentage gained from each kWh added.",
+              "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
+              "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
+              "ev_price_limit_enabled": "Exclude charging intervals above the maximum import price, except an immediate minimum-SOC recovery interval.",
+              "ev_max_import_price": "Highest grid import price allowed for normal scheduled charging.",
+              "ev_low_price_charging_enabled": "Start opportunistic charging when the current price is at or below the configured threshold and the EV still needs charge, even before the configured earliest charging time.",
+              "ev_low_price_threshold": "Import price that triggers immediate opportunistic charging, including outside the configured charging hours.",
+              "ev_keep_charger_on": "Keep the charger enabled after the EV reaches target SOC so vehicle preconditioning can use grid power. Enable only when the vehicle enforces its own target SOC.",
+              "ev_confirmation_timeout_seconds": "Seconds to wait for the mapped charging-state entity to confirm each start or stop command. Set to 0 for an immediate check.",
+              "ev_confirmation_retries": "Additional bounded command attempts when charging feedback does not confirm the requested state.",
+              "grid_import_limit_kw": "Maximum grid import power allowed in planned actions.",
+              "grid_export_limit_kw": "Maximum grid export power allowed in planned actions.",
+              "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
+              "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
+              "default_ready_by": "Local completion time exposed by the native EV Ready by entity."
             }
           },
           "priorities": {
-            "name": "Planning priorities",
-            "description": "Choose the objective order used to compare otherwise valid plans.",
+            "name": "Planning and priorities",
+            "description": "Configure the planning window and objective order.",
             "data": {
               "planning_priority_1": "Priority 1",
               "planning_priority_2": "Priority 2",
@@ -365,7 +353,10 @@
               "planning_priority_4": "Priority 4",
               "planning_priority_5": "Priority 5",
               "planning_priority_6": "Priority 6",
-              "priority_weights": "Planning priority order"
+              "priority_weights": "Planning priority order",
+              "planning_horizon_hours": "Planning horizon",
+              "planning_interval_minutes": "Planning interval",
+              "default_ready_by": "Default EV ready-by time"
             },
             "data_description": {
               "planning_priority_1": "Highest-priority objective used when comparing otherwise valid plans.",
@@ -374,7 +365,10 @@
               "planning_priority_4": "Fourth objective used as a tie-breaker.",
               "planning_priority_5": "Fifth objective used as a tie-breaker.",
               "planning_priority_6": "Lowest-priority objective used last when comparing plans.",
-              "priority_weights": "Stored planning priority order."
+              "priority_weights": "Stored planning priority order.",
+              "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
+              "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
+              "default_ready_by": "Local completion time exposed by the native EV Ready by entity."
             }
           }
         }
@@ -432,6 +426,9 @@
       },
       "next_actions": {
         "name": "Next actions"
+      },
+      "load_forecast_coverage_score": {
+        "name": "Load forecast coverage score"
       }
     },
     "binary_sensor": {

@@ -5,13 +5,13 @@ from __future__ import annotations
 from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
-from math import isfinite, sqrt
+from math import ceil, isfinite, sqrt
 from statistics import median
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-MODEL_VERSION = 2
-FORECAST_CONTRACT_VERSION = 3
+MODEL_VERSION = 3
+FORECAST_CONTRACT_VERSION = 4
 HISTORY_LOOKBACK = timedelta(days=28)
 TRAIN_INTERVAL = timedelta(hours=6)
 HEALTHY_MODEL_AGE = timedelta(hours=24)
@@ -26,6 +26,7 @@ HOLDOUT_ORIGINS = 2
 MIN_HOLDOUT_SAMPLES = 144
 MAX_BASELINE_MAE_RATIO = 1.10
 MIN_UPPER_COVERAGE = 0.90
+UPPER_CALIBRATION_COVERAGE = 0.95
 MAX_INTERPOLATION_BUCKETS = 2
 RECENT_CORRECTION_MIN = 0.75
 RECENT_CORRECTION_MAX = 1.25
@@ -86,6 +87,7 @@ def build_load_forecast_model(
     ev_charging_states: list[Any] | None = None,
     hvac_power_states: list[Any] | None = None,
     hvac_power_unit: str = "",
+    bypass_conservative_bound_gate: bool = False,
 ) -> dict[str, Any]:
     """Build a compact deterministic model from Recorder state changes."""
     now_utc = _as_utc(now)
@@ -108,6 +110,7 @@ def build_load_forecast_model(
         history_start=effective_start or start,
         ev_intervals_excluded=ev_excluded,
         hvac_power_subtracted=hvac_subtracted,
+        bypass_conservative_bound_gate=bypass_conservative_bound_gate,
     )
 
 
@@ -155,6 +158,7 @@ def build_load_forecast_model_from_buckets(
     history_start: datetime,
     ev_intervals_excluded: bool = False,
     hvac_power_subtracted: bool = False,
+    bypass_conservative_bound_gate: bool = False,
 ) -> dict[str, Any]:
     """Build a compact model from already-cleaned 15-minute history buckets."""
     now_utc = _as_utc(now)
@@ -178,7 +182,7 @@ def build_load_forecast_model_from_buckets(
         else 0.0
     )
     validation = _rolling_validation(training_days, comparison_days=all_days)
-    uncertainty_buffer = float(validation.get("positive_residual_p90_kw") or 0.0)
+    uncertainty_buffer = float(validation.get("calibration_buffer_kw") or 0.0)
     profiles = {
         day_type: _profile_for_day_type(training_days, day_type, uncertainty_buffer)
         for day_type in ("weekday", "weekend")
@@ -188,6 +192,7 @@ def build_load_forecast_model_from_buckets(
         history_coverage=history_coverage,
         validation=validation,
         profiles=profiles,
+        bypass_conservative_bound_gate=bypass_conservative_bound_gate,
     )
     insufficient_history = any(
         failure in {"insufficient_training_days", "insufficient_history_coverage", "insufficient_holdout_samples"}
@@ -202,6 +207,7 @@ def build_load_forecast_model_from_buckets(
         "status": status,
         "quality_ready": status == "ready",
         "quality_failures": quality_failures,
+        "safety_gates_bypassed": bypass_conservative_bound_gate,
         "source_entity_id": source_entity_id,
         "trained_at": now_utc.isoformat(),
         "last_attempt_at": now_utc.isoformat(),
@@ -329,6 +335,7 @@ def training_due(
     now: datetime,
     source_entity_id: str,
     timezone: str | None = None,
+    bypass_conservative_bound_gate: bool = False,
 ) -> bool:
     """Return whether a new Recorder training pass is due."""
     if not isinstance(model, dict):
@@ -339,6 +346,7 @@ def training_due(
         or model.get("contract_version") != FORECAST_CONTRACT_VERSION
         or model.get("source_entity_id") != source_entity_id
         or (timezone is not None and model.get("timezone") != timezone)
+        or model.get("safety_gates_bypassed") is not bypass_conservative_bound_gate
     ):
         return True
     attempted_source = model.get("last_attempt_source_entity_id")
@@ -537,6 +545,7 @@ def _rolling_validation(
     squared_errors: list[float] = []
     baseline_errors: list[float] = []
     positive_residuals: list[float] = []
+    origin_residual_scores: list[float] = []
     upper_hits = 0
     samples = 0
     origins = 0
@@ -559,6 +568,7 @@ def _rolling_validation(
             minimum_samples=MIN_VALIDATION_TRAINING_DAYS,
         )
         origin_samples = 0
+        origin_positive_residuals: list[float] = []
         for index, actual in holdout.values.items():
             expected = profile["expected"][index]
             upper = profile["upper"][index]
@@ -567,7 +577,9 @@ def _rolling_validation(
                 continue
             error = abs(actual - expected)
             errors.append(error)
-            positive_residuals.append(max(actual - expected, 0.0))
+            positive_residual = max(actual - expected, 0.0)
+            positive_residuals.append(positive_residual)
+            origin_positive_residuals.append(positive_residual)
             squared_errors.append(error**2)
             baseline_errors.append(abs(actual - baseline))
             upper_hits += int(actual <= upper)
@@ -575,6 +587,9 @@ def _rolling_validation(
             origin_samples += 1
         if origin_samples:
             origins += 1
+            origin_residual_scores.append(
+                _finite_sample_upper_quantile(origin_positive_residuals, MIN_UPPER_COVERAGE)
+            )
     mae = sum(errors) / samples if samples else None
     rmse = sqrt(sum(squared_errors) / samples) if samples else None
     baseline_mae = sum(baseline_errors) / samples if samples else None
@@ -586,6 +601,13 @@ def _rolling_validation(
         "persistence_mae_kw": round(baseline_mae, 6) if baseline_mae is not None else None,
         "upper_coverage": round(upper_hits / samples, 6) if samples else None,
         "positive_residual_p90_kw": round(_percentile(positive_residuals, 0.90), 6),
+        "calibration_buffer_kw": round(
+            _finite_sample_upper_quantile(
+                origin_residual_scores,
+                UPPER_CALIBRATION_COVERAGE,
+            ),
+            6,
+        ),
     }
 
 
@@ -594,7 +616,7 @@ def _leave_one_out_buffer(
     *,
     minimum_samples: int = MIN_BUCKET_SAMPLES,
 ) -> float:
-    residuals: list[float] = []
+    daily_residual_scores: list[float] = []
     for target in days:
         training = [day for day in days if day.local_date != target.local_date]
         if len(training) < minimum_samples:
@@ -605,11 +627,19 @@ def _leave_one_out_buffer(
             0.0,
             minimum_samples=minimum_samples,
         )
+        target_residuals: list[float] = []
         for index, actual in target.values.items():
             expected = profile["expected"][index]
             if expected is not None:
-                residuals.append(max(actual - expected, 0.0))
-    return _percentile(residuals, 0.90) if residuals else 0.0
+                target_residuals.append(max(actual - expected, 0.0))
+        if target_residuals:
+            daily_residual_scores.append(
+                _finite_sample_upper_quantile(target_residuals, MIN_UPPER_COVERAGE)
+            )
+    return _finite_sample_upper_quantile(
+        daily_residual_scores,
+        UPPER_CALIBRATION_COVERAGE,
+    )
 
 
 def _quality_failures(
@@ -618,6 +648,7 @@ def _quality_failures(
     history_coverage: float,
     validation: dict[str, Any],
     profiles: dict[str, Any],
+    bypass_conservative_bound_gate: bool = False,
 ) -> list[str]:
     failures: list[str] = []
     if training_days < MIN_COMPLETE_DAYS:
@@ -632,7 +663,11 @@ def _quality_failures(
         if mae > float(baseline_mae) * MAX_BASELINE_MAE_RATIO:
             failures.append("forecast_accuracy_below_persistence_gate")
     coverage = validation.get("upper_coverage")
-    if isinstance(coverage, int | float) and coverage < MIN_UPPER_COVERAGE:
+    if (
+        not bypass_conservative_bound_gate
+        and isinstance(coverage, int | float)
+        and coverage < MIN_UPPER_COVERAGE
+    ):
         failures.append("conservative_bound_coverage_below_gate")
     if any(not _profile_is_forecastable(profile) for profile in profiles.values()):
         failures.append("forecast_profile_unavailable")
@@ -660,6 +695,8 @@ def _validated_model(
     if not isinstance(model, dict):
         return None
     if model.get("model_version") != MODEL_VERSION or model.get("contract_version") != FORECAST_CONTRACT_VERSION:
+        return None
+    if not isinstance(model.get("safety_gates_bypassed"), bool):
         return None
     if (
         model.get("source_entity_id") != source_entity_id
@@ -719,6 +756,7 @@ def _validated_model(
             history_coverage=float(history_coverage) if _valid_fraction(history_coverage) else 0.0,
             validation=validation if isinstance(validation, dict) else {},
             profiles=model["profiles"],
+            bypass_conservative_bound_gate=model["safety_gates_bypassed"],
         )
     ):
         return None
@@ -740,7 +778,13 @@ def _valid_validation_metrics(validation: dict[str, Any]) -> bool:
         and validation["sample_count"] >= 0
         and all(
             _valid_non_negative_number(validation.get(key))
-            for key in ("mae_kw", "rmse_kw", "persistence_mae_kw")
+            for key in (
+                "mae_kw",
+                "rmse_kw",
+                "persistence_mae_kw",
+                "positive_residual_p90_kw",
+                "calibration_buffer_kw",
+            )
         )
         and _valid_fraction(validation.get("upper_coverage"))
     )
@@ -862,6 +906,10 @@ def _model_details(model: dict[str, Any] | None, status: str, age_hours: float) 
         "quality_failures": list(source.get("quality_failures", []))[:8]
         if isinstance(source.get("quality_failures", []), list)
         else [],
+        "safety_gates_bypassed": source.get(
+            "safety_gates_bypassed",
+            False,
+        ),
         "validation": dict(source.get("validation", {})) if isinstance(source.get("validation"), dict) else {},
         "cleaning": dict(source.get("cleaning", {})) if isinstance(source.get("cleaning"), dict) else {},
     }
@@ -911,3 +959,12 @@ def _percentile(values: list[float], quantile: float) -> float:
     upper = min(lower + 1, len(ordered) - 1)
     fraction = position - lower
     return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _finite_sample_upper_quantile(values: list[float], quantile: float) -> float:
+    """Return a conservative finite-sample upper quantile."""
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    rank = min(ceil((len(ordered) + 1) * quantile), len(ordered))
+    return ordered[rank - 1]

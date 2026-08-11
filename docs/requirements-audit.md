@@ -317,6 +317,17 @@ Status as of 2026-08-09.
   only gaps of at most 30 minutes are interpolated. A bounded recent-load
   correction fades to neutral over two hours, and UTC planning slots are mapped
   through timezone-aware local timestamps for DST folds and gaps.
+- Conservative-bound calibration treats each local day as one dependent block:
+  it computes a finite-sample 90% positive-residual score per day and applies a
+  conservative 95% finite-sample upper quantile across those day scores. This
+  prevents correlated 15-minute samples from overstating independent evidence
+  while preserving the separate 90% leakage-free holdout coverage gate.
+- The default-off `bypass_safety_gates` option explicitly waives that coverage
+  failure, all production preflight checks, and dry-run evidence/fingerprint
+  checks. Automatic control still must be selected and armed, and runtime
+  service errors and feedback confirmation remain observable. The
+  `load_forecast_coverage_score` diagnostic sensor exposes the percentage,
+  required threshold, model status, and whether the combined bypass is active.
 - Readiness requires three training days with at least 80% valid buckets per
   day, 80% valid historical coverage, two
   leakage-free holdout origins with at least 144 aligned samples, MAE no more

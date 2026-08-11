@@ -12,6 +12,7 @@ import pytest
 
 from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner.const import (
+    CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
@@ -1642,6 +1643,12 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
     assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
     store.data["production"] = {"armed": True}
     assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
+    executor.options = {
+        CONF_BYPASS_SAFETY_GATES: True,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    assert executor._control_rejection_reason(action, now) is None
+    executor.options = {}
     store.data["production"] = {"armed": "true"}
     assert executor._control_rejection_reason(action, now) == "production_gate_not_armed"
     store.data["production"] = {"armed": True}
