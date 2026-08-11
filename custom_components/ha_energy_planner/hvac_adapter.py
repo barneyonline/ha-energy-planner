@@ -9,11 +9,19 @@ from typing import Any
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import HomeAssistant, State
 
-from .const import CONF_CLIMATE_AUTOMATIONS, CONF_CLIMATE_ZONES, CONF_DAIKIN_CLIMATE, STATE_UNKNOWN_VALUES
+from .const import (
+    CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
+    CONF_CLIMATE_ZONES,
+    CONF_DAIKIN_CLIMATE,
+    STATE_UNKNOWN_VALUES,
+)
 from .models import ActionKind, PlanAction
 
 _STATE_CONFIRMATION_TIMEOUT_SECONDS = 1.0
 _STATE_CONFIRMATION_POLL_SECONDS = 0.05
+_SCHEDULER_GUARD_DURATION = "00:00:30"
 
 
 @dataclass(slots=True)
@@ -75,6 +83,16 @@ class DaikinHVACAdapter:
                 self._snapshot(),
                 saved_automation_states,
                 True,
+                saved_zone_states,
+            )
+        if not await self._async_arm_scheduler_guard():
+            return HVACCommandResult(
+                False,
+                "climate_scheduler_guard_failed",
+                pre_state,
+                self._snapshot(),
+                saved_automation_states,
+                False,
                 saved_zone_states,
             )
         if (
@@ -223,6 +241,16 @@ class DaikinHVACAdapter:
         pre_state = self._snapshot()
         states = dict(saved_automation_states or {})
         zones = dict(saved_zone_states or {})
+        if (states or zones or self._automation_entities()) and not await self._async_arm_scheduler_guard():
+            return HVACCommandResult(
+                False,
+                "climate_scheduler_guard_failed",
+                pre_state,
+                self._snapshot(),
+                states,
+                False,
+                zones,
+            )
         zones_restored, unresolved_zones = await self._async_restore_zone_states(zones)
         restored, unresolved_states = await self._async_enable_automation_entities(states)
         reason = "no_hvac_automation_state_saved"
@@ -239,6 +267,83 @@ class DaikinHVACAdapter:
             rollback_succeeded=restored and zones_restored,
             saved_zone_states=unresolved_zones,
         )
+
+    async def _async_arm_scheduler_guard(self) -> bool:
+        """Arm and confirm the classifier guard before planner-owned mutations."""
+        guard_entity = self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
+        timer_entity = self.entry_data.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER)
+        if not guard_entity and not timer_entity:
+            return True
+        if not guard_entity or not timer_entity:
+            return False
+
+        timer_was_active = self._state_value(timer_entity) == "active"
+        guard_was_on = self._state_value(guard_entity) == "on"
+        try:
+            await self.hass.services.async_call(
+                "timer",
+                "start",
+                {
+                    ATTR_ENTITY_ID: timer_entity,
+                    "duration": _SCHEDULER_GUARD_DURATION,
+                },
+                blocking=True,
+            )
+            if not await self._async_confirm_state(timer_entity, "active"):
+                await self._async_restore_failed_guard(
+                    guard_entity,
+                    timer_entity,
+                    guard_was_on=guard_was_on,
+                    timer_was_active=timer_was_active,
+                )
+                return False
+            await self.hass.services.async_call(
+                "input_boolean",
+                SERVICE_TURN_ON,
+                {ATTR_ENTITY_ID: guard_entity},
+                blocking=True,
+            )
+            if await self._async_confirm_state(guard_entity, "on"):
+                return True
+        except Exception:  # noqa: BLE001 - a missing guard must prevent actuator commands.
+            pass
+        await self._async_restore_failed_guard(
+            guard_entity,
+            timer_entity,
+            guard_was_on=guard_was_on,
+            timer_was_active=timer_was_active,
+        )
+        return False
+
+    async def _async_restore_failed_guard(
+        self,
+        guard_entity: str,
+        timer_entity: str,
+        *,
+        guard_was_on: bool,
+        timer_was_active: bool,
+    ) -> None:
+        """Best-effort rollback of guard state changed by a failed arm."""
+        if not guard_was_on:
+            try:
+                await self.hass.services.async_call(
+                    "input_boolean",
+                    SERVICE_TURN_OFF,
+                    {ATTR_ENTITY_ID: guard_entity},
+                    blocking=True,
+                )
+            except Exception:  # noqa: BLE001 - original guard state is best-effort cleanup.
+                pass
+        if not timer_was_active:
+            try:
+                await self.hass.services.async_call(
+                    "timer",
+                    "cancel",
+                    {ATTR_ENTITY_ID: timer_entity},
+                    blocking=True,
+                )
+            except Exception:  # noqa: BLE001 - original guard state is best-effort cleanup.
+                pass
 
     async def _async_enable_automation_entities(
         self,
@@ -397,6 +502,12 @@ class DaikinHVACAdapter:
             snapshot[automation_id] = self._state_value(automation_id)
         for zone_id in self._zone_entities():
             snapshot[zone_id] = self._state_value(zone_id)
+        for guard_id in (
+            self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER),
+            self.entry_data.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER),
+        ):
+            if guard_id:
+                snapshot[guard_id] = self._state_value(guard_id)
         return snapshot
 
     def _state(self, entity_id: str | None) -> State | None:

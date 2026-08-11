@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-08-09.
+Status as of 2026-08-12.
 
 ## Covered
 
@@ -46,9 +46,11 @@ Status as of 2026-08-09.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
   Fallback Target SOC, Ready by, and opportunistic-charging policy are configured
-  centrally. Their retired number, time, and switch entities, along with the
-  manual EV start/stop buttons and connected helper, are removed from the entity
-  registry during setup.
+  centrally. Their retired number, time, and switch entities, the duplicate
+  keep-charger-on switch, the fixed-duration pause buttons, the manual EV
+  start/stop buttons, and the connected helper are removed from the entity
+  registry during setup. Keep charger on remains editable in EV settings and
+  arbitrary pauses remain available through the pause service.
 - The planner builds a 24-hour, five-minute decision context and keeps compact
   plan, forecast, bounded action, AI, ownership, override, and outcome
   records.
@@ -118,8 +120,8 @@ Status as of 2026-08-09.
   control-state confirmation path, that path requires the persistent direct
   charger control rather than an optional start command, and the current slot
   reserves the full configured charger rate for grid and battery evaluation.
-  EV reconfiguration, preflight, and the integration-created keep-on switch
-  reject keep-on without that persistent switch/input-boolean control.
+  EV settings validation and preflight reject keep-on without that persistent
+  switch/input-boolean control.
   Keep-on also requires the authoritative target to be available and remain
   within configured SOC policy bounds, preventing an external vehicle target
   from bypassing the hard planner maximum.
@@ -450,6 +452,11 @@ Status as of 2026-08-09.
   selection, zone takeover/rollback, helper overrides, comfort handoff, peak
   continuation, production/pause-blocked safety release, persisted tariff
   thresholds, and release evidence.
+  Installations with an external schedule-versus-manual classifier can map its
+  scheduler-change boolean and timer as a required pair. The adapter starts and
+  confirms both before takeover, zone/climate commands, compensation, or
+  release; incomplete, unavailable, or unconfirmed guard helpers fail closed so
+  planner commands cannot engage the authoritative manual-override path.
 - Enphase execution, verification, hold, minimum-savings gates, and profile
   action generation are implemented. The planner can set a configured
   arbitrage profile when deterministic forecast solar-export value exceeds the

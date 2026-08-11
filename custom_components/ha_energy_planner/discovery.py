@@ -11,7 +11,9 @@ from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_MANUAL_OVERRIDE,
+    CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
@@ -156,6 +158,15 @@ class CapabilityDiscovery:
         manual_override = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override and _state_missing(self.hass, manual_override):
             issues.append("climate_manual_override_unavailable")
+        scheduler_guard = self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
+        scheduler_timer = self.entry_data.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER)
+        if bool(scheduler_guard) != bool(scheduler_timer):
+            issues.append("climate_scheduler_guard_incomplete")
+        elif scheduler_guard and (
+            _state_missing(self.hass, scheduler_guard)
+            or _state_missing(self.hass, scheduler_timer)
+        ):
+            issues.append("climate_scheduler_guard_unavailable")
         return CapabilityEvidence(
             not issues,
             issues,
@@ -166,6 +177,8 @@ class CapabilityDiscovery:
                 "zone_entities": zones,
                 "unavailable_zones": unavailable_zones,
                 "manual_override_entity": manual_override,
+                "scheduler_guard_entity": scheduler_guard,
+                "scheduler_guard_timer_entity": scheduler_timer,
             },
         )
 

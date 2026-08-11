@@ -80,14 +80,6 @@ async def _disarm(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_disarm_production_control("button_pressed")
 
 
-async def _pause_one_hour(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_pause_control(60, "button_pressed", "all")
-
-
-async def _pause_four_hours(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_pause_control(240, "button_pressed", "all")
-
-
 async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_resume_control("button_pressed")
 
@@ -140,21 +132,6 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
         press_fn=_disarm,
     ),
     PlannerButtonDescription(
-        key="pause_control_1h",
-        translation_key="pause_control_1h",
-        icon="mdi:pause-circle-outline",
-        entity_category=EntityCategory.CONFIG,
-        press_fn=_pause_one_hour,
-    ),
-    PlannerButtonDescription(
-        key="pause_control_4h",
-        translation_key="pause_control_4h",
-        icon="mdi:pause-octagon-outline",
-        entity_category=EntityCategory.CONFIG,
-        entity_registry_enabled_default=False,
-        press_fn=_pause_four_hours,
-    ),
-    PlannerButtonDescription(
         key="resume_control",
         translation_key="resume_control",
         icon="mdi:play-circle-outline",
@@ -164,7 +141,12 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     ),
 )
 
-_RETIRED_BUTTON_KEYS = ("ev_start_charging", "ev_stop_charging")
+_RETIRED_BUTTON_KEYS = (
+    "ev_start_charging",
+    "ev_stop_charging",
+    "pause_control_1h",
+    "pause_control_4h",
+)
 
 
 async def async_setup_entry(
@@ -181,7 +163,7 @@ async def async_setup_entry(
 
 
 def _remove_retired_buttons(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Remove retired manual EV command buttons from the entity registry."""
+    """Remove retired command buttons from the entity registry."""
     registry = er.async_get(hass)
     for key in _RETIRED_BUTTON_KEYS:
         entity_id = registry.async_get_entity_id("button", DOMAIN, f"{entry.entry_id}_{key}")

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.9.6 - 2026-08-12
+
+### Changed
+
+- Retired the **Pause control 1 hour** and **Pause control 4 hours** buttons.
+  The flexible `ha_energy_planner.pause_control` service remains available for
+  automations.
+- Retired the duplicate **Keep charger on** switch while preserving **Keep
+  charger enabled after target SOC** in EV settings and retaining its stored
+  value during upgrade.
+
+### Fixed
+
+- Added a paired climate scheduler guard timer mapping. When the external
+  schedule-versus-manual classifier helpers are configured, Energy Planner now
+  starts and confirms the timer and scheduler-change boolean before any HVAC
+  takeover, climate command, zone command, rollback, or release. Missing or
+  unavailable guard state blocks the actuator path so planner activity cannot
+  be misclassified as a manual override.
+
 ## 0.9.5 - 2026-08-11
 
 ### Fixed

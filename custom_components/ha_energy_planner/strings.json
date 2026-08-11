@@ -23,6 +23,7 @@
           "climate_automation_entities": "Climate Automations",
           "climate_zone_entities": "Climate Zones",
           "climate_change_from_scheduler_entity": "Scheduler Change Helper",
+          "climate_scheduler_guard_timer_entity": "Scheduler Guard Timer",
           "climate_manual_override_entity": "Manual Override Helper",
           "climate_target_low_entity": "Occupied Low Temperature",
           "climate_target_high_entity": "Occupied High Temperature",
@@ -54,6 +55,7 @@
           "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
           "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
           "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
+          "climate_scheduler_guard_timer_entity": "Timer used with Scheduler Change Helper to keep planner-owned climate changes from being classified as manual. Configure both helpers or leave both empty.",
           "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
           "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
           "climate_target_low_entity": "Input number containing the occupied low comfort target.",
@@ -82,7 +84,8 @@
       "instance_name_required": "Enter a planner name.",
       "instance_name_in_use": "Choose a unique planner name.",
       "household_actuator_in_use": "This actuator is already controlled by another Energy Planner entry.",
-      "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean."
+      "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean.",
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -191,6 +194,7 @@
               "climate_automation_entities": "Climate Automations",
               "climate_zone_entities": "Climate Zones",
               "climate_change_from_scheduler_entity": "Scheduler Change Helper",
+              "climate_scheduler_guard_timer_entity": "Scheduler Guard Timer",
               "climate_manual_override_entity": "Manual Override Helper",
               "climate_target_low_entity": "Occupied Low Temperature",
               "climate_target_high_entity": "Occupied High Temperature",
@@ -208,6 +212,7 @@
               "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
               "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
               "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
+              "climate_scheduler_guard_timer_entity": "Timer used with Scheduler Change Helper to keep planner-owned climate changes from being classified as manual. Configure both helpers or leave both empty.",
               "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
               "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
               "climate_target_low_entity": "Input number containing the occupied low comfort target.",
@@ -378,7 +383,8 @@
       "ev_min_above_max": "EV minimum SOC must not be above EV maximum SOC.",
       "ev_fallback_outside_bounds": "EV fallback target SOC must be between the configured minimum and maximum SOC.",
       "invalid_ready_by": "Default ready-by must be a valid local time.",
-      "invalid_priority_weights": "Each planning priority must use a different objective."
+      "invalid_priority_weights": "Each planning priority must use a different objective.",
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
     }
   },
   "exceptions": {
@@ -453,9 +459,6 @@
       },
       "enphase_control": {
         "name": "Enphase control"
-      },
-      "ev_keep_charger_on": {
-        "name": "Keep charger on"
       }
     },
     "button": {
@@ -476,12 +479,6 @@
       },
       "disarm_production_control": {
         "name": "Advanced: Disarm safety gate"
-      },
-      "pause_control_1h": {
-        "name": "Pause control 1 hour"
-      },
-      "pause_control_4h": {
-        "name": "Advanced: Pause control 4 hours"
       },
       "resume_control": {
         "name": "Advanced: Resume control"
