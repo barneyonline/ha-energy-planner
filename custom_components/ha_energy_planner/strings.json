@@ -23,7 +23,7 @@
           "climate_automation_entities": "Climate Automations",
           "climate_zone_entities": "Climate Zones",
           "climate_change_from_scheduler_entity": "Scheduler Change Helper",
-          "climate_scheduler_guard_timer_entity": "Scheduler Guard Timer",
+          "climate_scheduler_guard_timer_entity": "Climate Scheduler Guard Timer",
           "climate_manual_override_entity": "Manual Override Helper",
           "climate_target_low_entity": "Occupied Low Temperature",
           "climate_target_high_entity": "Occupied High Temperature",
@@ -55,7 +55,7 @@
           "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
           "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
           "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
-          "climate_scheduler_guard_timer_entity": "Timer used with Scheduler Change Helper to keep planner-owned climate changes from being classified as manual. Configure both helpers or leave both empty.",
+          "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
           "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
           "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
           "climate_target_low_entity": "Input number containing the occupied low comfort target.",
@@ -194,7 +194,7 @@
               "climate_automation_entities": "Climate Automations",
               "climate_zone_entities": "Climate Zones",
               "climate_change_from_scheduler_entity": "Scheduler Change Helper",
-              "climate_scheduler_guard_timer_entity": "Scheduler Guard Timer",
+              "climate_scheduler_guard_timer_entity": "Climate Scheduler Guard Timer",
               "climate_manual_override_entity": "Manual Override Helper",
               "climate_target_low_entity": "Occupied Low Temperature",
               "climate_target_high_entity": "Occupied High Temperature",
@@ -212,7 +212,7 @@
               "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
               "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
               "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
-              "climate_scheduler_guard_timer_entity": "Timer used with Scheduler Change Helper to keep planner-owned climate changes from being classified as manual. Configure both helpers or leave both empty.",
+              "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
               "climate_manual_override_entity": "Authoritative input_boolean: on immediately releases and blocks planner HVAC control until turned off.",
               "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
               "climate_target_low_entity": "Input number containing the occupied low comfort target.",
@@ -435,6 +435,13 @@
       },
       "load_forecast_coverage_score": {
         "name": "Load forecast coverage score"
+      },
+      "mode": {
+        "name": "Mode",
+        "state": {
+          "review": "Review",
+          "active": "Active"
+        }
       }
     },
     "binary_sensor": {

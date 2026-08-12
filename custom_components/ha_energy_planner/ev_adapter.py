@@ -218,6 +218,19 @@ class EVChargerAdapter:
         return await self._async_control_with_confirmation(start_entity, enabled=True)
 
     async def _async_stop(self) -> EVCommandResult:
+        initial_pre_state = self._snapshot()
+        if await self._async_existing_state_proves_safe():
+            return await self._async_finalize_stop(
+                EVCommandResult(
+                    True,
+                    "already_in_desired_state",
+                    initial_pre_state,
+                    self._snapshot(),
+                    command_sent=False,
+                    safe_state_confirmed=True,
+                ),
+                self._keep_on_entity() or "",
+            )
         stop_entity = self._stop_entity(separate_only=True)
         if stop_entity:
             result = await self._async_control_with_confirmation(
@@ -385,6 +398,24 @@ class EVChargerAdapter:
             )
             == "confirmed"
         )
+
+    async def _async_existing_state_proves_safe(self) -> bool:
+        """Return whether inactive feedback plus an off control proves safety."""
+        persistent_control = self._keep_on_entity()
+        if not await self._async_control_proves_safe(persistent_control):
+            return False
+
+        connected_entity = self.entry_data.get(CONF_EV_CONNECTED)
+        connected_state = self._state(connected_entity) if connected_entity else None
+        disconnected = self.connected_override is False or (
+            connected_state is not None and not _truthy_state(connected_state)
+        )
+        if disconnected:
+            return True
+
+        charging_entity = self.entry_data.get(CONF_EV_CHARGING)
+        charging_state = self._state(charging_entity) if charging_entity else None
+        return charging_state is not None and ev_charging_state(charging_state.state) is False
 
     def _charging_feedback_proves_safe(self, entity_id: str) -> bool:
         """Return whether charging feedback proves more than disconnection."""

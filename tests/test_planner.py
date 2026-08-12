@@ -873,6 +873,12 @@ def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> Non
     assert planner_module._timeline_card_rows({"bad": "value"}) == []
 
     context.slots = [DecisionSlot(context.created_at, 0.2, 0.05, None, 1.0)]
+    rejected = planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)
+    assert rejected["reason"] == (
+        "No climate preconditioning was selected because the forecast contained no price window "
+        "that both met the configured price difference and could be shifted within the thermal limits. "
+        "This is a normal no-action planning outcome."
+    )
     assert planner_module._forecast_surplus_kwh(context, 5) == 0.0
 
     action = PlanAction(

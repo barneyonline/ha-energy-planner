@@ -219,7 +219,7 @@ rules:
         - tests/test_storage.py
   action-exceptions:
     status: done
-    comment: Automated execution remains fail-closed and auditable, mapped EV charging feedback must confirm bounded start/stop attempts, and explicit services and buttons raise translated Home Assistant errors for missing or ambiguous runtime state and rejected device commands.
+    comment: Automated execution remains fail-closed and auditable; device control selectors persist disable before a best-effort restore and report incomplete recovery without re-enabling control, mapped EV charging feedback must confirm bounded start/stop attempts, and explicit action services and buttons raise translated Home Assistant errors for missing or ambiguous runtime state and rejected device commands.
     references:
       code:
         - custom_components/ha_energy_planner/__init__.py

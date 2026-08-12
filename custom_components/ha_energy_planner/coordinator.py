@@ -77,7 +77,6 @@ from .models import (
     DecisionContext,
     EnergyPlan,
     InputHealth,
-    OutcomeResult,
     Override,
     PlannerMode,
     to_jsonable,
@@ -722,38 +721,43 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_control_mode_state = current_mode
             planner_disabled = previous_enabled and not current_mode[0]
             dry_run_enabled = not previous_dry_run and current_mode[1]
-            climate_control_disabled = bool(
-                isinstance(previous_option_state, dict)
-                and strict_bool(
-                    {**DEFAULT_OPTIONS, **previous_option_state}.get(CONF_CLIMATE_CONTROL_ENABLED),
-                    default=False,
-                )
-                and not strict_bool(
-                    current_options.get(CONF_CLIMATE_CONTROL_ENABLED),
-                    default=False,
-                )
+            previous_options = (
+                {**DEFAULT_OPTIONS, **previous_option_state}
+                if isinstance(previous_option_state, dict)
+                else None
             )
+            disabled_device_controls = [
+                (area, executor_asset)
+                for option_key, area, executor_asset in (
+                    (CONF_EV_CONTROL_ENABLED, "ev", "ev"),
+                    (CONF_CLIMATE_CONTROL_ENABLED, "hvac", "daikin"),
+                    (CONF_ENPHASE_CONTROL_ENABLED, "enphase", "enphase"),
+                )
+                if previous_options is not None
+                and strict_bool(previous_options.get(option_key), default=False)
+                and not strict_bool(current_options.get(option_key), default=False)
+            ]
             if planner_disabled or dry_run_enabled:
                 reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
                 await self.async_restore_safe_state(reason, refresh=False)
-            elif climate_control_disabled:
+            elif disabled_device_controls:
                 async with self._planner_lock:
-                    ownership = dict(self.store.data.get("ownership", {}))
-                    stored_hvac_control = ownership.get("hvac_control")
-                    hvac_control = dict(stored_hvac_control) if isinstance(stored_hvac_control, dict) else {}
-                    has_hvac_ownership = bool(
-                        hvac_control
-                        or ownership.get("climate_automations")
-                        or ownership.get("planner_takeover_started_at")
-                        or ownership.get("planner_hvac_action_expires_at")
-                    )
-                    if has_hvac_ownership:
-                        hvac_control["required_evidence_lost"] = "climate_control_disabled"
-                        ownership["hvac_control"] = hvac_control
-                        await self.store.async_save_ownership(ownership)
-                        await self.executor.async_release_hvac_control("climate_control_disabled")
-            await self.async_request_replan()
+                    for area, executor_asset in disabled_device_controls:
+                        try:
+                            await self.executor.async_restore_device_control(
+                                executor_asset,
+                                f"{area}_control_disabled",
+                            )
+                        except Exception:  # noqa: BLE001 - persisted disabled controls remain authoritative.
+                            _LOGGER.exception(
+                                "Unexpected error while restoring %s after its control selector was disabled",
+                                area,
+                            )
+            # The option transition and any required restoration are complete.
+            # Mark this snapshot handled before replanning so a refresh failure
+            # cannot replay device restore commands through the update listener.
             self._last_handled_options = option_state
+            await self.async_request_replan()
 
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Persist the native EV ready-by setting and replan."""
@@ -1069,16 +1073,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def _async_set_device_control(self, option_key: str, enabled: bool) -> None:
         """Apply one serialized device control transition."""
         control_areas = {
-            CONF_EV_CONTROL_ENABLED: ("ev", "ev"),
-            CONF_CLIMATE_CONTROL_ENABLED: ("hvac", "daikin"),
-            CONF_ENPHASE_CONTROL_ENABLED: ("enphase", "enphase"),
+            CONF_EV_CONTROL_ENABLED: "ev",
+            CONF_CLIMATE_CONTROL_ENABLED: "hvac",
+            CONF_ENPHASE_CONTROL_ENABLED: "enphase",
         }
         if option_key not in control_areas:
             raise ValueError(f"Unsupported device control option: {option_key}")
         if strict_bool(self.options.get(option_key), default=False) is enabled:
             return
 
-        area, executor_asset = control_areas[option_key]
+        area = control_areas[option_key]
         proposed_options = {**self.options, option_key: enabled}
         area_report = _control_area_report(self.entry_data, proposed_options)
         if enabled and not area_report["details"][area]["configured"]:
@@ -1100,17 +1104,26 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
 
         if not enabled:
-            async with self._planner_lock:
-                outcome = await self.executor.async_restore_device_control(
-                    executor_asset,
-                    f"{area}_control_disabled",
+            # Disabling control is an operator stop boundary. Persist it before
+            # touching the device so an unavailable or unconfirmable actuator
+            # can never leave the control selector enabled. Restoration remains
+            # best-effort and the executor records/notifies any incomplete work.
+            self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
+            try:
+                await self.async_handle_options_update()
+            except Exception:  # noqa: BLE001 - the persisted off selector remains authoritative.
+                # An options listener can fail independently of the device
+                # restore (for example while persisting diagnostics). Do not
+                # turn a successfully persisted operator stop into a failed
+                # switch service call; the listener can retry on the next
+                # update and refreshes read the current entry options directly.
+                self.executor.options = self.options
+                _LOGGER.exception(
+                    "Unexpected error while applying the disabled %s control option",
+                    area,
                 )
-            if outcome.result == OutcomeResult.FAILED:
-                raise HomeAssistantError(
-                    "The selected device could not be restored, so its control switch remains on",
-                    translation_domain=DOMAIN,
-                    translation_key="device_control_restore_failed",
-                )
+                self.async_update_listeners()
+            return
 
         self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
         await self.async_handle_options_update()
