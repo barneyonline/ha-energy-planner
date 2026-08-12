@@ -307,6 +307,14 @@ LEGACY_SENSOR_DESCRIPTIONS: tuple[PlannerSensorDescription, ...] = (
 
 SENSORS: tuple[PlannerSensorDescription, ...] = (
     PlannerSensorDescription(
+        key="mode",
+        translation_key="mode",
+        icon="mdi:state-machine",
+        device_class=SensorDeviceClass.ENUM,
+        options=["review", "active"],
+        value_fn=lambda coordinator: "active" if coordinator.active_control else "review",
+    ),
+    PlannerSensorDescription(
         key="current_state",
         translation_key="system_current_state",
         icon="mdi:home-lightning-bolt-outline",
@@ -1516,7 +1524,28 @@ def _load_forecast_coverage_score(
 ) -> float | None:
     """Return the current conservative-bound holdout coverage percentage."""
     model = coordinator.store.data.get("built_in_load_forecast", {})
-    validation = model.get("validation", {}) if isinstance(model, dict) else {}
+    score, _source, _evaluated_at = _load_forecast_coverage_details(model)
+    return score
+
+
+def _load_forecast_coverage_details(
+    model: Any,
+) -> tuple[float | None, str, Any]:
+    """Return the latest evaluated coverage score and its provenance."""
+    if not isinstance(model, dict):
+        return None, "unavailable", None
+    latest_validation = model.get("last_training_validation", {})
+    latest_score = _coverage_percent(latest_validation)
+    if latest_score is not None:
+        return latest_score, "latest_training_attempt", model.get("last_attempt_at")
+    active_score = _coverage_percent(model.get("validation", {}))
+    if active_score is not None:
+        return active_score, "active_model", model.get("trained_at")
+    return None, "unavailable", model.get("last_attempt_at") or model.get("trained_at")
+
+
+def _coverage_percent(validation: Any) -> float | None:
+    """Normalize a model validation coverage fraction to a percentage."""
     coverage = validation.get("upper_coverage") if isinstance(validation, dict) else None
     if not isinstance(coverage, int | float) or isinstance(coverage, bool):
         return None
@@ -1531,7 +1560,8 @@ def _load_forecast_coverage_attrs(
     """Return the safety threshold and explicit bypass state."""
     model = coordinator.store.data.get("built_in_load_forecast", {})
     model = model if isinstance(model, dict) else {}
-    score = _load_forecast_coverage_score(coordinator)
+    score, score_source, score_evaluated_at = _load_forecast_coverage_details(model)
+    active_model_score = _coverage_percent(model.get("validation", {}))
     bypass_enabled = strict_bool(
         coordinator.options.get(CONF_BYPASS_SAFETY_GATES),
         default=False,
@@ -1539,6 +1569,9 @@ def _load_forecast_coverage_attrs(
     return {
         "required_threshold_percent": MIN_UPPER_COVERAGE * 100,
         "meets_threshold": None if score is None else score >= MIN_UPPER_COVERAGE * 100,
+        "score_source": score_source,
+        "score_evaluated_at": score_evaluated_at,
+        "active_model_score_percent": active_model_score,
         "bypass_enabled": bypass_enabled,
         "bypass_applied_to_model": model.get("safety_gates_bypassed") is True,
         "model_status": model.get("status", "unknown"),

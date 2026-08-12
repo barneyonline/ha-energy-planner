@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.9.7 - 2026-08-12
+
+### Added
+
+- Added a dedicated **Mode** enum sensor with stable `review` and `active`
+  states, exposing the operational mode previously available only as an
+  attribute of **Armed**.
+
+### Fixed
+
+- **Explain** no longer misclassifies a normal absence of a worthwhile and
+  thermally feasible climate-preconditioning window as a Climate settings
+  fault. Climate recommendations now require specific input evidence.
+- The **Load forecast coverage score** sensor now publishes the latest evaluated
+  retraining score instead of appearing frozen on a retained model's older
+  score. Its attributes distinguish the latest attempt from the active model.
+- Device control selectors now turn off unconditionally before attempting a
+  single serialized best-effort restore. An unavailable or unconfirmable device
+  can retain recovery evidence and create a notification, but it can no longer
+  force its control selector back on or permit new start/schedule commands after disable.
+  Interrupted EV restores remain eligible only for bounded safe-stop recovery.
+- A disconnected EV with inactive charging feedback and a confirmed-off
+  persistent charger control is now accepted as safely stopped. Automatic
+  safety-stop failures use ten-minute backoff and a maximum of three attempts
+  per rolling day instead of repeatedly pressing a momentary Stop control.
+  Dedicated persisted retry timestamps prevent unrelated asset pauses or audit
+  rotation from erasing those limits.
+- Climate takeover now explicitly cancels in-flight climate automation actions,
+  confirms thermostat turn-on and mode before sending target temperature, and
+  reasserts the full target once when an already-running schedule overwrites
+  preconditioning.
+- Renamed the guard setting to **Climate Scheduler Guard Timer** and added an
+  explanatory field description consistent with the other Climate settings.
+
 ## 0.9.6 - 2026-08-12
 
 ### Changed

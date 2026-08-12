@@ -1426,8 +1426,9 @@ def _rejected_climate_decision(
         reason = "Skipped comfort preconditioning because no tariff forecast slots are available."
     else:
         reason = (
-            "Skipped comfort preconditioning because no qualifying thermally feasible tariff period "
-            "was found in the configured horizon."
+            "No climate preconditioning was selected because the forecast contained no price window "
+            "that both met the configured price difference and could be shifted within the thermal limits. "
+            "This is a normal no-action planning outcome."
         )
     return {"device": "Climate", "action": "Precondition", "reason": reason}
 

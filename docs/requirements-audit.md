@@ -94,10 +94,14 @@ Status as of 2026-08-12.
   Restore, automated safety-stop, and manual-stop paths use that persisted
   topology after EV mapping changes rather than clearing ownership through a
   replacement actuator. Command
-  acceptance is tracked separately from proven-safe stop confirmation. Neither
-  disconnected feedback nor the state of a separate stop command helper can
-  release safety ownership; meaningful charging feedback, the persistent EV
-  charger control, or rollback must prove the safe state. A compensating stop
+  acceptance is tracked separately from proven-safe stop confirmation. A
+  separate stop command helper cannot release safety ownership by itself;
+  meaningful inactive charging feedback together with a confirmed-off
+  persistent charger control, a stateful control, or rollback must prove the
+  safe state. Failed automatic safety stops back off for ten minutes and stop
+  after three attempts per rolling day. Dedicated command metadata preserves
+  the backoff and retry block independently of shared pause updates and bounded
+  audit retention. A compensating stop
   that does prove the safe state is recorded as a successful recovery and
   clears ownership and household capacity. Manual compensation follows the same
   success contract and creates the normal stop override, while unconfirmed owned
@@ -201,8 +205,11 @@ Status as of 2026-08-12.
   needed** or one complete action anchored to a current planner issue/rejection
   target, including the affected configured entity or setting, problem, exact
   next step, expected benefit, and verification. Generic tuning suggestions are
-  rejected, and AI cannot call services, change settings, or bypass hard
-  constraints. The result and pending state are published in **Next actions**
+  rejected. Expected no-action decisions, including the absence of a tariff
+  window that is both worthwhile and thermally feasible for climate shifting,
+  cannot be promoted to settings faults without specific input evidence. AI
+  cannot call services, change settings, or bypass hard constraints. The result
+  and pending state are published in **Next actions**
   attributes instead of a separate status entity. Home Assistant's AI Task
   structured-output schema is supplied to the provider. Pressing the button
   immediately publishes pending feedback, then replaces it with the accepted,
@@ -260,7 +267,7 @@ Status as of 2026-08-12.
   pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant
   `check_config`, and the smoke test in one repeatable sequence. The smoke test
   now verifies coordinator refresh, entity
-  registry entries, the Armed/Current state/Next actions/Plan calendar surface,
+  registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
   forecast snapshot training slots sourced from Home Assistant PV template
   attributes and the persisted built-in household-load model, Amber cent/kWh forecast attributes reflected in compact plan
@@ -339,7 +346,9 @@ Status as of 2026-08-12.
   failure, all production preflight checks, and dry-run evidence/fingerprint
   checks. Automatic control still must be selected and armed, and runtime
   service errors and feedback confirmation remain observable. The
-  `load_forecast_coverage_score` diagnostic sensor exposes the percentage,
+  `load_forecast_coverage_score` diagnostic sensor exposes the latest evaluated
+  percentage (including a failed retraining score when the prior safe model is
+  retained), its evaluation time, the active-model score,
   required threshold, model status, and whether the combined bypass is active.
 - Readiness requires three training days with at least 80% valid buckets per
   day, 80% valid historical coverage, two
@@ -426,7 +435,8 @@ Status as of 2026-08-12.
   implemented. Takeover snapshots configured switch/input-boolean zones,
   disables mapped automations, enables zones, explicitly turns on the climate
   entity, and preserves the original snapshot across peak transitions. Release
-  restores zones, enables every automation, retains unresolved ownership for
+  restores zones, re-enables only automations that were active before takeover,
+  retains unresolved ownership for
   retry, and never restores the prior climate mode or setpoint. Comfort-boundary
   release of planner-owned control is held through the recorded peak end to
   prevent reacquisition. An unowned comfort-boundary state still scans future

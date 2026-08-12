@@ -48,6 +48,10 @@ from custom_components.ha_energy_planner.executor import (
     _daily_action_cap_reason,
     _device_control_disabled_reason,
     _ev_command_entity_for_action,
+    _ev_safety_stop_attempt_limit_reached,
+    _ev_safety_stop_backoff_active,
+    _ev_safety_stop_block_active,
+    _ev_safety_stop_failure_pause,
     _pause_rejection_reason,
     _plan_fallback_message,
     _profile_control_service_for_target,
@@ -79,6 +83,157 @@ def test_only_actionable_load_forecast_failures_request_notifications() -> None:
     assert _actionable_input_issues(["household_load_entity_forecast_stale"]) == [
         "household_load_entity_forecast_stale"
     ]
+
+
+def test_failed_ev_safety_stop_retries_are_bounded_over_a_rolling_day() -> None:
+    now = datetime.now(UTC)
+    failed_stop = {
+        "asset": "ev",
+        "kind": "ev_stop",
+        "result": "failed",
+        "attempted_at": now,
+        "desired_state": {"ev_safety_stop": True},
+    }
+
+    assert _ev_safety_stop_attempt_limit_reached([failed_stop, failed_stop], now) is False
+    assert (
+        _ev_safety_stop_attempt_limit_reached(
+            [failed_stop, failed_stop],
+            now,
+            additional_failures=1,
+        )
+        is True
+    )
+    assert _ev_safety_stop_attempt_limit_reached([failed_stop] * 3, now) is True
+    assert (
+        _ev_safety_stop_attempt_limit_reached(
+            [{**failed_stop, "attempted_at": now - timedelta(days=2)}] * 3,
+            now,
+        )
+        is False
+    )
+    assert _ev_safety_stop_attempt_limit_reached("invalid", now) is False
+    assert _ev_safety_stop_attempt_limit_reached("invalid", now, additional_failures=3) is True
+    assert _ev_safety_stop_attempt_limit_reached(
+        [{**failed_stop, "attempted_at": now.replace(tzinfo=None).isoformat()}] * 3,
+        now,
+    )
+    assert _ev_safety_stop_attempt_limit_reached(
+        [{**failed_stop, "attempted_at": "invalid"}] * 3,
+        now,
+    ) is False
+    assert _ev_safety_stop_attempt_limit_reached(["invalid", {"asset": "climate"}], now) is False
+    assert _ev_safety_stop_failure_pause(None) is False
+    assert _ev_safety_stop_failure_pause({"reason": "ev_stop_not_confirmed"}) is False
+    assert _ev_safety_stop_failure_pause(
+        {"reason": "ev_stop_not_confirmed", "safety_stop_failure": True}
+    ) is True
+
+
+def test_failed_ev_safety_stop_backoff_survives_unrelated_pause_overwrite() -> None:
+    now = datetime.now(UTC)
+    failed_stop = {
+        "asset": "ev",
+        "kind": "ev_stop",
+        "result": "failed",
+        "attempted_at": now - timedelta(minutes=5),
+        "desired_state": {"ev_safety_stop": True},
+    }
+    store = FakeStore()
+    store.data["execution_audit"] = [failed_stop]
+    store.data["ownership"] = {"ev_smart_charging_state": {"switch.ev": "on"}}
+    store.data["control_pause"] = {
+        "active": True,
+        "assets": ["climate"],
+        "until": now + timedelta(minutes=2),
+        "reason": "hvac_state_confirmation_failed",
+    }
+    executor = Executor(store, options={CONF_EV_CONTROL_ENABLED: True})
+    action = SimpleNamespace(
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_STOP,
+        desired_state={"ev_safety_stop": True},
+    )
+
+    assert _ev_safety_stop_backoff_active([failed_stop], now) is True
+    assert executor._control_rejection_reason(action, now) == "ev_control_paused"
+    context = SimpleNamespace(
+        active_overrides=[],
+        ev_connected=False,
+        input_health=InputHealth.HEALTHY,
+        slots=[],
+    )
+    assert executor._owned_ev_safety_stop(SimpleNamespace(created_at=now), context) is None
+    assert _ev_safety_stop_backoff_active(
+        [{**failed_stop, "attempted_at": now - timedelta(minutes=11)}],
+        now,
+    ) is False
+    assert _ev_safety_stop_backoff_active("invalid", now) is False
+    assert _ev_safety_stop_backoff_active(
+        ["invalid", {**failed_stop, "attempted_at": "invalid"}],
+        now,
+    ) is False
+
+
+def test_persisted_ev_safety_stop_block_survives_audit_rotation() -> None:
+    now = datetime.now(UTC)
+    limits = {"ev_safety_stop_blocked_until": now + timedelta(hours=23)}
+
+    assert _ev_safety_stop_block_active(limits, now) is True
+    assert _ev_safety_stop_block_active(
+        {"ev_safety_stop_blocked_until": now - timedelta(seconds=1)},
+        now,
+    ) is False
+    assert _ev_safety_stop_block_active(
+        {"ev_safety_stop_blocked_until": "invalid"},
+        now,
+    ) is False
+    assert _ev_safety_stop_block_active(None, now) is False
+
+
+def test_owned_ev_safety_stop_is_rejected_after_retry_limit() -> None:
+    now = datetime.now(UTC)
+    store = FakeStore()
+    store.data["execution_audit"] = [
+        {
+            "asset": "ev",
+            "kind": "ev_stop",
+            "result": "failed",
+            "attempted_at": now,
+            "desired_state": {"ev_safety_stop": True},
+        }
+    ] * 3
+    executor = Executor(store, options={CONF_EV_CONTROL_ENABLED: True})
+    action = SimpleNamespace(
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_STOP,
+        desired_state={"ev_safety_stop": True},
+    )
+
+    assert executor._control_rejection_reason(action, now) == "ev_safety_stop_retry_limit_reached"
+    assert executor._owned_ev_safety_stop(SimpleNamespace(created_at=now), None) is None
+
+
+def test_failed_start_pause_does_not_block_owned_ev_safety_stop() -> None:
+    now = datetime.now(UTC)
+    store = FakeStore()
+    store.data["control_pause"] = {
+        "active": True,
+        "assets": ["ev"],
+        "until": now + timedelta(minutes=10),
+        "reason": "ev_charging_confirmation_timeout",
+    }
+    executor = Executor(store, options={CONF_EV_CONTROL_ENABLED: True})
+    action = SimpleNamespace(
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_STOP,
+        desired_state={"ev_safety_stop": True},
+    )
+
+    assert executor._control_rejection_reason(action, now) is None
+
+    store.data["control_pause"]["safety_stop_failure"] = True
+    assert executor._control_rejection_reason(action, now) == "ev_control_paused"
 
 
 class FakeStore:
@@ -2098,8 +2253,14 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
     assert isinstance(away_control["started_at"], datetime)
 
 
-def test_persisted_preconditioning_reaches_no_change_check_after_limits(
+@pytest.mark.parametrize(
+    ("command_sent", "expected_result"),
+    [(False, OutcomeResult.SKIPPED), (True, OutcomeResult.APPLIED)],
+)
+def test_persisted_preconditioning_accounts_for_commands_after_limits(
     monkeypatch: object,
+    command_sent: bool,
+    expected_result: OutcomeResult,
 ) -> None:
     class FakeDaikinAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -2116,6 +2277,7 @@ def test_persisted_preconditioning_reaches_no_change_check_after_limits(
                 post_state={"climate.daikin": "heat"},
                 saved_automation_states={"automation.hvac": "off"},
                 saved_zone_states={"switch.zone": "on"},
+                command_sent=command_sent,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -2194,7 +2356,7 @@ def test_persisted_preconditioning_reaches_no_change_check_after_limits(
 
     asyncio.run(executor.async_evaluate(plan, context))
 
-    assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+    assert store.data["outcomes"][-1].result == expected_result
     assert store.data["outcomes"][-1].reason == "already_in_desired_hvac_state"
     assert store.data["ownership"]["hvac_control"]["precondition_min_price_delta"] == 0.20
     assert store.data["ownership"]["hvac_control"]["suppression_min_price_delta"] == 0.15
@@ -2924,8 +3086,8 @@ def test_executor_restore_device_control_restores_only_selected_asset(monkeypatc
         def __init__(self, hass: object, entry_data: dict[str, Any], **kwargs: Any) -> None:
             pass
 
-        async def async_restore(self, state: dict[str, Any]) -> object:
-            restored.append(state)
+        async def async_restore(self, state: dict[str, Any] | None = None) -> object:
+            restored.append(dict(state or {}))
             return SimpleNamespace(
                 applied=True,
                 reason="ev_restored",
@@ -2949,22 +3111,33 @@ def test_executor_restore_device_control_restores_only_selected_asset(monkeypatc
         "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
     }
     hass = FakeHass()
-    executor = Executor(store, hass=hass)
+    hass.data = {
+        "ha_energy_planner": {
+            "ev_grid_reservations": {
+                "ev-a": {
+                    "load_kw": 7.0,
+                    "limit_kw": 10.0,
+                }
+            }
+        }
+    }
+    executor = Executor(store, hass=hass, entry_id="ev-a")
 
     outcome = asyncio.run(executor.async_restore_device_control("ev", "ev_control_disabled"))
 
     assert outcome.result == OutcomeResult.RESTORED
-    assert restored == [{"switch.ev": "on"}]
+    assert restored == [{}]
     assert store.data["ownership"] == {
         "climate_automations": {"automation.hvac": "off"},
         "hvac_control": {"phase": "preconditioning"},
         "enphase_profile": "AI Optimisation",
         "enphase_profile_changed_at": "2026-01-01T00:00:00+00:00",
     }
+    assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
     assert hass.services.calls[-1] == (
         "persistent_notification",
         "dismiss",
-        {"notification_id": "ha_energy_planner_restore_safe_state_ev"},
+        {"notification_id": "ha_energy_planner_restore_safe_state_ev_ev-a"},
     )
 
 
@@ -4709,7 +4882,7 @@ def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:
     assert store.data["outcomes"][-1].desired_state["charging_reason"] == "ev_grid_import_limit_exceeded_safety_stop"
 
 
-def test_disabling_ev_control_stops_owned_power_before_honouring_gate() -> None:
+def test_disabled_ev_control_safely_reconciles_interrupted_restore() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(
         {
@@ -4863,6 +5036,16 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
         "ev_smart_charging_command_entity_id": "button.ev_start",
     }
     store.data["ownership"] = ownership
+    store.data["execution_audit"] = [
+        {
+            "asset": "ev",
+            "kind": "ev_stop",
+            "result": "failed",
+            "attempted_at": now - timedelta(minutes=20 - index),
+            "desired_state": {"ev_safety_stop": True},
+        }
+        for index in range(2)
+    ]
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -4900,7 +5083,18 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
     assert retained["retain_when_unloaded"] is True
     assert store.data["ownership"] == ownership
     assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    pause_until = store.data["control_pause"]["until"]
+    assert store.data["control_pause"]["safety_stop_failure"] is True
+    assert pause_until - datetime.now(UTC) > timedelta(hours=23)
+    retry_limits = store.data["command_rate_limits"]
+    assert isinstance(retry_limits["ev_safety_stop_failed_at"], datetime)
+    assert retry_limits["ev_safety_stop_blocked_until"] - datetime.now(UTC) > timedelta(hours=23)
     assert "ev_grid_shedding_entry_id" not in hass.data["ha_energy_planner"]
+
+    outcome_count = len(store.data["outcomes"])
+    retry_plan = replace(plan, plan_id="disconnected-stop-paused")
+    asyncio.run(executor.async_evaluate(retry_plan, context))
+    assert len(store.data["outcomes"]) == outcome_count
 
     executor_b = Executor(FakeStore(), hass=hass, entry_id="ev-b")
     context_b = _context(now)
