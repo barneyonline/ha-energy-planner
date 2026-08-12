@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from custom_components.ha_energy_planner import hvac_adapter as hvac_adapter_module
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_AUTOMATIONS,
@@ -123,7 +125,7 @@ def test_hvac_action_disables_automation_then_controls_climate() -> None:
     assert result.applied is True
     assert result.saved_automation_states == {"automation.climate": "on"}
     assert hass.services.calls == [
-        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 20}),
     ]
 
@@ -159,7 +161,7 @@ def test_hvac_action_arms_scheduler_classifier_guard_before_actuators() -> None:
             {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
         ),
         ("input_boolean", "turn_on", {"entity_id": "input_boolean.scheduler_change"}),
-        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 20}),
     ]
 
@@ -329,10 +331,12 @@ def test_hvac_action_only_calls_services_for_fields_that_differ() -> None:
 
     assert target_result.applied is True
     assert target_hass.services.calls == [
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 19})
     ]
     assert mode_result.applied is True
     assert mode_hass.services.calls == [
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("climate", "set_hvac_mode", {"entity_id": "climate.daikin", "hvac_mode": "cool"})
     ]
 
@@ -417,7 +421,9 @@ def test_hvac_action_still_acquires_automation_when_climate_already_matches() ->
     assert result.applied is True
     assert result.reason == "hvac_action_applied"
     assert result.saved_automation_states == {"automation.climate": "on"}
-    assert hass.services.calls == [("automation", "turn_off", {"entity_id": "automation.climate"})]
+    assert hass.services.calls == [
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True})
+    ]
 
 
 def test_hvac_action_fails_when_automation_does_not_confirm_disabled(monkeypatch: object) -> None:
@@ -442,7 +448,7 @@ def test_hvac_action_fails_when_automation_does_not_confirm_disabled(monkeypatch
     assert result.reason == "hvac_automation_service_failed"
     assert result.rollback_succeeded is True
     assert hass.services.calls == [
-        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
     ]
 
 
@@ -497,6 +503,7 @@ def test_hvac_action_waits_for_delayed_climate_state_confirmation() -> None:
             CONF_CLIMATE_AUTOMATIONS: "automation.climate",
         },
     )
+    original_call = hass.services.async_call
 
     async def delayed_mode_change(
         domain: str,
@@ -504,6 +511,9 @@ def test_hvac_action_waits_for_delayed_climate_state_confirmation() -> None:
         data: dict[str, Any],
         blocking: bool = False,
     ) -> None:
+        if domain != "climate" or service != "set_hvac_mode":
+            await original_call(domain, service, data, blocking)
+            return
         hass.services.calls.append((domain, service, data))
         asyncio.get_running_loop().call_later(
             0.02,
@@ -518,6 +528,228 @@ def test_hvac_action_waits_for_delayed_climate_state_confirmation() -> None:
 
     assert result.applied is True
     assert result.reason == "hvac_action_applied"
+
+
+def test_hvac_action_reasserts_target_overwritten_by_inflight_schedule(monkeypatch: object) -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 19}),
+            "automation.climate": "off",
+            "input_boolean.scheduler_change": "off",
+            "timer.scheduler_guard": "idle",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+        },
+    )
+    original_call = hass.services.async_call
+    temperature_calls = 0
+
+    async def overwrite_first_target(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        nonlocal temperature_calls
+        await original_call(domain, service, data, blocking)
+        if domain == "climate" and service == "set_temperature":
+            temperature_calls += 1
+            if temperature_calls == 1:
+                hass.states.values[data["entity_id"]] = FakeState("heat", {"temperature": 19})
+
+    hass.services.async_call = overwrite_first_target
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0.0)
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "target_temperature": 24}))
+    )
+
+    assert result.applied is True
+    assert temperature_calls == 2
+    assert hass.states.get("climate.daikin") == FakeState("heat", {"temperature": 24})
+    assert [
+        call
+        for call in hass.services.calls
+        if call[:2] == ("timer", "start")
+    ] == [
+        ("timer", "start", {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"}),
+        ("timer", "start", {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"}),
+    ]
+
+
+def test_hvac_action_audits_command_after_initially_matching_state_drifts() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 24}),
+            "automation.climate": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+        },
+    )
+    original_call = hass.services.async_call
+
+    async def finish_inflight_schedule(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+    ) -> None:
+        await original_call(domain, service, data, blocking)
+        if domain == "automation" and service == "turn_off":
+            hass.states.values["climate.daikin"] = FakeState("heat", {"temperature": 19})
+
+    hass.services.async_call = finish_inflight_schedule
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "target_temperature": 24}))
+    )
+
+    assert result.applied is True
+    assert result.reason == "hvac_action_applied"
+    assert result.command_sent is True
+    assert hass.states.get("climate.daikin") == FakeState("heat", {"temperature": 24})
+    assert hass.services.calls == [
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
+        ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 24}),
+    ]
+
+
+def test_hvac_retry_reports_guard_failure(monkeypatch: object) -> None:
+    hass = FakeHass({"climate.daikin": FakeState("heat", {"temperature": 19})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    guard_calls = 0
+
+    async def arm_guard_once() -> bool:
+        nonlocal guard_calls
+        guard_calls += 1
+        return guard_calls == 1
+
+    async def never_confirm(entity_id: str, desired_state: dict[str, Any]) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_async_arm_scheduler_guard", arm_guard_once)
+    monkeypatch.setattr(adapter, "_async_confirm_hvac_state", never_confirm)
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "target_temperature": 24}))
+    )
+
+    assert result.applied is False
+    assert result.reason == "climate_scheduler_guard_failed"
+
+
+def test_hvac_retry_reports_service_failure(monkeypatch: object) -> None:
+    hass = FakeHass({"climate.daikin": FakeState("heat", {"temperature": 19})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    original_apply = adapter._async_apply_hvac_state
+
+    async def never_confirm(entity_id: str, desired_state: dict[str, Any]) -> bool:
+        return False
+
+    async def fail_forced_apply(
+        entity_id: str,
+        desired_state: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> None:
+        if force:
+            raise RuntimeError("retry failed")
+        await original_apply(entity_id, desired_state)
+
+    monkeypatch.setattr(adapter, "_async_confirm_hvac_state", never_confirm)
+    monkeypatch.setattr(adapter, "_async_apply_hvac_state", fail_forced_apply)
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "target_temperature": 24}))
+    )
+
+    assert result.applied is False
+    assert result.reason == "hvac_control_service_failed"
+
+
+def test_hvac_on_confirmation_waits_and_apply_rejects_missing_state(
+    monkeypatch: object,
+) -> None:
+    hass = FakeHass({"climate.daikin": "off"})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+
+    async def exercise() -> None:
+        asyncio.get_running_loop().call_later(
+            0.01,
+            hass.states.values.__setitem__,
+            "climate.daikin",
+            "heat",
+        )
+        assert await adapter._async_confirm_hvac_on("climate.daikin") is True
+        with pytest.raises(RuntimeError, match="climate state unavailable"):
+            await adapter._async_apply_hvac_state("climate.missing", {"hvac_mode": "heat"})
+
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0.1)
+    asyncio.run(exercise())
+
+
+def test_hvac_apply_does_not_send_mode_before_turn_on_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hass = FakeHass({"climate.daikin": "off"})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+
+    async def never_confirms_on(entity_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_async_confirm_hvac_on", never_confirms_on)
+
+    with pytest.raises(RuntimeError, match="turn-on was not confirmed"):
+        asyncio.run(
+            adapter._async_apply_hvac_state(
+                "climate.daikin",
+                {"hvac_mode": "heat", "target_temperature": 24},
+            )
+        )
+
+    assert hass.services.calls == [
+        ("climate", "turn_on", {"entity_id": "climate.daikin"})
+    ]
+
+
+def test_hvac_apply_does_not_send_target_before_mode_is_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hass = FakeHass({"climate.daikin": FakeState("cool", {"temperature": 19})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+
+    async def never_confirms_mode(entity_id: str, desired_state: dict[str, Any]) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter, "_async_confirm_hvac_state", never_confirms_mode)
+
+    with pytest.raises(RuntimeError, match="HVAC mode was not confirmed"):
+        asyncio.run(
+            adapter._async_apply_hvac_state(
+                "climate.daikin",
+                {"hvac_mode": "heat", "target_temperature": 24},
+            )
+        )
+
+    assert hass.services.calls == [
+        (
+            "climate",
+            "set_hvac_mode",
+            {"entity_id": "climate.daikin", "hvac_mode": "heat"},
+        )
+    ]
 
 
 def test_hvac_away_off_does_not_enable_takeover_zones() -> None:
@@ -559,11 +791,11 @@ def test_hvac_suppression_disables_automations_without_climate_call() -> None:
     assert result.reason == "hvac_automations_suppressed"
     assert result.saved_automation_states == {"automation.climate": "on"}
     assert hass.services.calls == [
-        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
     ]
 
 
-def test_hvac_suppression_skips_when_no_automation_enabled() -> None:
+def test_hvac_suppression_stops_actions_when_automation_is_already_off() -> None:
     hass = FakeHass({"climate.daikin": "heat", "automation.climate": "off"})
     adapter = DaikinHVACAdapter(
         hass,
@@ -574,9 +806,12 @@ def test_hvac_suppression_skips_when_no_automation_enabled() -> None:
     )
     result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
     assert result.applied is True
-    assert result.reason == "already_in_desired_hvac_state"
+    assert result.reason == "hvac_automations_suppressed"
     assert result.saved_automation_states == {}
-    assert hass.services.calls == []
+    assert result.command_sent is True
+    assert hass.services.calls == [
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
+    ]
 
 
 def test_hvac_action_fails_closed_when_automation_service_fails() -> None:
@@ -616,7 +851,7 @@ def test_hvac_action_fails_closed_when_climate_service_fails() -> None:
     assert result.reason == "hvac_control_service_failed"
     assert result.rollback_succeeded is True
     assert hass.states.values["climate.daikin"] == "heat"
-    assert hass.states.values["automation.climate"] == "on"
+    assert hass.states.values["automation.climate"] == "off"
 
 
 def test_hvac_partial_automation_failure_restores_every_changed_automation() -> None:
@@ -813,7 +1048,7 @@ def test_hvac_release_action_routes_through_transactional_restore() -> None:
 
     assert result.applied is True
     assert result.reason == "hvac_control_released"
-    assert hass.states.values["automation.climate"] == "on"
+    assert hass.states.values["automation.climate"] == "off"
 
 
 def test_hvac_zone_acquisition_failure_compensates_automation_and_zone() -> None:
@@ -971,8 +1206,8 @@ def test_hvac_action_rejects_unsupported_kind_and_empty_desired_state() -> None:
     assert empty_result.reason == "hvac_desired_state_empty"
 
 
-def test_hvac_release_enables_configured_automation_even_if_saved_off() -> None:
-    hass = FakeHass({"automation.climate": "on"})
+def test_hvac_release_preserves_automation_that_was_saved_off() -> None:
+    hass = FakeHass({"automation.climate": "off"})
     adapter = DaikinHVACAdapter(hass, {CONF_CLIMATE_AUTOMATIONS: "automation.climate"})
 
     restored = asyncio.run(adapter.async_restore({"automation.climate": "off"}))
@@ -983,6 +1218,7 @@ def test_hvac_release_enables_configured_automation_even_if_saved_off() -> None:
     assert empty.applied is True
     assert empty.reason == "hvac_control_released"
     assert ("automation", "turn_on", {"entity_id": "automation.climate"}) not in hass.services.calls
+    assert hass.states.values["automation.climate"] == "off"
 
 
 def test_hvac_takeover_turns_on_climate_and_zones_then_release_restores_zones() -> None:
@@ -1018,7 +1254,7 @@ def test_hvac_takeover_turns_on_climate_and_zones_then_release_restores_zones() 
 
     assert acquired.saved_zone_states == {"switch.living": "off", "input_boolean.study": "on"}
     assert hass.services.calls[:5] == [
-        ("automation", "turn_off", {"entity_id": "automation.climate"}),
+        ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("switch", "turn_on", {"entity_id": "switch.living"}),
         ("climate", "turn_on", {"entity_id": "climate.daikin"}),
         ("climate", "set_hvac_mode", {"entity_id": "climate.daikin", "hvac_mode": "heat"}),

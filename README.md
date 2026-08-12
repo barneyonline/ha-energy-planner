@@ -17,7 +17,7 @@ Energy Planner is a local-first Home Assistant custom integration for coordinati
 
 - One Energy Planner device containing all status, controls, and troubleshooting entities
 - One central **Configure** page with sections for Energy, Climate, Presence, Enphase, AI, and EV inputs
-- **Armed**, **Current state**, **Next actions**, and **Plan** calendar entities
+- **Armed**, **Mode**, **Current state**, **Next actions**, and **Plan** calendar entities
 - A guarded **Automatic control** switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
 - A built-in household-load forecast trained from Home Assistant Recorder
 - Native EV scheduling and tariff-aware climate preconditioning
@@ -97,7 +97,7 @@ The model requires:
 
 **History days** means Recorder data exists for those dates. **Training days** may contain bounded gaps: EV charging, historical negative readings, unavailable states, or missing HVAC alignment can remove up to 20% of a day's buckets without discarding the entire day. The model still requires rolling holdout validation and three observations for every production-profile clock bucket.
 
-The diagnostic **Load forecast coverage score** sensor shows the current holdout coverage percentage and required 90% threshold. The default-off **Bypass safety gates** setting waives this threshold, production preflight, and dry-run evidence requirements when an operator explicitly accepts reduced protection. It does not hide service failures or device feedback results.
+The diagnostic **Load forecast coverage score** sensor shows the latest evaluated holdout coverage percentage and required 90% threshold. If a retraining attempt fails the threshold and the prior safe model is retained, the sensor shows the new attempted score while its attributes identify the active model score and evaluation time. The default-off **Bypass safety gates** setting waives this threshold, production preflight, and dry-run evidence requirements when an operator explicitly accepts reduced protection. It does not hide service failures or device feedback results.
 
 Training runs at startup, after a source change, and at most every six hours. Replanning cannot create missing history. While the status is `learning`, plans remain visible but forecast-dependent active commands are blocked. Models are `ready` through 24 hours old, `degraded` from 24 to 72 hours, and `stale` after 72 hours.
 
@@ -108,6 +108,7 @@ Changing the load mapping disarms production control and requires fresh review c
 | Entity | Purpose |
 | --- | --- |
 | **Armed** | Whether Energy Planner may currently issue commands and why |
+| **Mode** | `review` while observing and `active` when automatic control is fully active |
 | **Current state** | Live state of every configured controlled area |
 | **Next actions** | Next state for every area, planned actions, and decision evidence |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
@@ -118,6 +119,10 @@ Changing the load mapping disarms production control and requires fresh review c
 
 The advanced **Run safety check** button always returns a Home Assistant notification, including when every check passes.
 
+**Explain** treats an uneconomic or thermally unsuitable climate-preconditioning window as a normal no-action plan result. It recommends changing Climate settings only when the current plan contains a specific comfort, presence, or climate-control input fault.
+
+Turning off a device control selector always takes effect immediately. Energy Planner then makes one serialized best-effort safe-state restore; if confirmation is unavailable, it retains diagnostic recovery evidence and notifies without turning the selector back on or permitting new start/schedule commands. Unresolved EV ownership remains eligible for bounded safe-stop recovery after interruption or restart, with ten-minute backoff and a maximum of three failed attempts per rolling day. Dedicated EV retry timestamps keep those limits intact if another control area later updates the shared pause state or execution-audit rows rotate out.
+
 Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy. Ready by, both opportunistic-charging values, and Keep charger on are settings-only; obsolete native entities for those values are removed on upgrade. The one- and four-hour pause buttons are also retired; automations can still call `ha_energy_planner.pause_control` with any supported duration.
 
 Mapped EV start and stop controls are planner actuators. Energy Planner does not expose separate manual Start charging or Stop charging buttons. Target SOC is configured centrally or read from an optional external target sensor; it is not exposed as an Energy Planner number entity.
@@ -126,7 +131,7 @@ Mapped EV start and stop controls are planner actuators. Energy Planner does not
 
 EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. After three observed trip days it can derive a conservative target from local history; until then it uses the configured fallback Target SOC. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
-Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and guard `timer` under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual.
+Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. It can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, inputs become unsafe, or a manual override occurs. Takeover stops already-running configured automation actions even when an automation is already off, while release re-enables only automations that were active before takeover. It confirms the complete thermostat target and reasserts it once if a concurrent schedule overwrites the first command. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and **Climate Scheduler Guard Timer** under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual.
 
 Enphase planning can select configured self-consumption, backup, or AI profiles using local tariff, PV, household-load, battery, and policy evidence.
 

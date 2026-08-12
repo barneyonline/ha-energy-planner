@@ -761,6 +761,14 @@ def test_central_input_sections_have_readable_translation_labels() -> None:
             assert labels[key] != key
             assert "_" not in labels[key]
 
+    climate_section = strings["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE]
+    assert climate_section["data"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == (
+        "Climate Scheduler Guard Timer"
+    )
+    assert climate_section["data_description"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER].startswith(
+        "Select the timer paired with Scheduler Change Helper."
+    )
+
 
 def test_english_locale_files_include_central_input_section_labels() -> None:
     integration_dir = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner"

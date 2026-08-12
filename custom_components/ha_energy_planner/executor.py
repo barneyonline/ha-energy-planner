@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from math import isfinite
 from types import SimpleNamespace
 from typing import Any
@@ -77,10 +77,14 @@ _PLAN_FALLBACK_NOTIFICATION_IDS = (
 )
 PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
 ACTION_BACKOFF_DURATION = timedelta(minutes=10)
+EV_SAFETY_STOP_RETRY_WINDOW = timedelta(hours=24)
+MAX_EV_SAFETY_STOP_ATTEMPTS_PER_24H = 3
 CONFLICT_DETECTION_WINDOW = timedelta(minutes=2)
 _MISSING = object()
 _EV_COMMAND_ENTITY_OWNERSHIP_KEY = "ev_smart_charging_command_entity_id"
 _EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY = "ev_smart_charging_control_topology"
+_EV_SAFETY_STOP_FAILED_AT_KEY = "ev_safety_stop_failed_at"
+_EV_SAFETY_STOP_BLOCKED_UNTIL_KEY = "ev_safety_stop_blocked_until"
 _EV_GRID_SHEDDING_CLAIM_KEY = "ev_grid_shedding_entry_id"
 _EV_CONTROL_TOPOLOGY_KEYS = (
     CONF_EV_CHARGER,
@@ -592,7 +596,29 @@ class Executor:
             if not no_change:
                 await self._async_record_command_attempt(action, now)
             if not action_applied:
-                await self._async_pause_asset_control(action.asset, now, result_reason, ACTION_BACKOFF_DURATION)
+                pause_duration = ACTION_BACKOFF_DURATION
+                retry_limit_reached = planner_owned_stop and _ev_safety_stop_attempt_limit_reached(
+                    self.store.data.get("execution_audit"),
+                    now,
+                    additional_failures=1,
+                )
+                if planner_owned_stop:
+                    await self._async_record_ev_safety_stop_failure(
+                        now,
+                        retry_limit_reached=retry_limit_reached,
+                    )
+                if retry_limit_reached:
+                    # Persist the full retry window independently of the
+                    # bounded audit list. Otherwise repeated rejected plans can
+                    # evict the failures and resume device commands too early.
+                    pause_duration = EV_SAFETY_STOP_RETRY_WINDOW
+                await self._async_pause_asset_control(
+                    action.asset,
+                    now,
+                    result_reason,
+                    pause_duration,
+                    safety_stop_failure=planner_owned_stop,
+                )
             self._reconcile_ev_grid_reservation(action, result, previous_reservation)
             if planner_owned_stop and not action_applied and self.entry_id:
                 # Let another controllable EV shed load after this claimant
@@ -689,7 +715,10 @@ class Executor:
                 result = await adapter.async_execute(action)
             finally:
                 self.pending_hvac_desired_state = None
-            no_change = result.reason == "already_in_desired_hvac_state"
+            no_change = (
+                result.reason == "already_in_desired_hvac_state"
+                and not bool(getattr(result, "command_sent", False))
+            )
             if not no_change:
                 await self._async_record_command_attempt(action, now)
             if not result.applied:
@@ -818,6 +847,38 @@ class Executor:
         context: DecisionContext | None,
     ) -> Any | None:
         """Return a stop when planner-owned EV power must be made safe."""
+        manual_start_override = bool(
+            context is not None
+            and any(
+                override.kind == "manual_ev_charging" and override.reason == "manual_start"
+                for override in context.active_overrides
+            )
+        )
+        pause = self.store.data.get("control_pause")
+        if (
+            _ev_safety_stop_failure_pause(pause)
+            and control_pause_reason(
+                pause,
+                plan.created_at,
+                asset=str(ActionAsset.EV),
+            )
+            is not None
+        ):
+            return None
+        if _ev_safety_stop_attempt_limit_reached(
+            self.store.data.get("execution_audit"),
+            plan.created_at,
+        ) or _ev_safety_stop_block_active(
+            self.store.data.get("command_rate_limits"),
+            plan.created_at,
+        ):
+            return None
+        if _ev_safety_stop_backoff_active(
+            self.store.data.get("execution_audit"),
+            plan.created_at,
+            limits=self.store.data.get("command_rate_limits"),
+        ):
+            return None
         ownership = self.store.data.get("ownership")
         has_owned_ev_state = isinstance(ownership, dict) and bool(ownership.get("ev_smart_charging_state"))
         reservations = self._ev_grid_reservations()
@@ -830,13 +891,6 @@ class Executor:
         disconnected = context is not None and context.ev_connected is False
         unhealthy_inputs = context is not None and context.input_health != InputHealth.HEALTHY
         recovered_reservation = has_ev_reservation and not has_owned_ev_state
-        manual_start_override = bool(
-            context is not None
-            and any(
-                override.kind == "manual_ev_charging" and override.reason == "manual_start"
-                for override in context.active_overrides
-            )
-        )
         ev_control_disabled = (
             has_ev_reservation
             and not manual_start_override
@@ -1070,7 +1124,12 @@ class Executor:
                         confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                         confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
                     )
-                    if isinstance(ev_command_entity_id, str) and ev_command_entity_id:
+                    ev_control_disabled = assets == {"ev"} and reason == "ev_control_disabled"
+                    if ev_control_disabled:
+                        # An explicit control disable requests a safe stop, not
+                        # restoration of a previously-on charger baseline.
+                        ev_result = await ev_adapter.async_restore()
+                    elif isinstance(ev_command_entity_id, str) and ev_command_entity_id:
                         ev_result = await ev_adapter.async_restore(
                             ev_state,
                             command_entity_id=ev_command_entity_id,
@@ -1093,7 +1152,7 @@ class Executor:
                         remaining_ownership.pop("ev_smart_charging_state", None)
                         remaining_ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
                         remaining_ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
-                        if _restored_ev_baseline_is_active(ev_state):
+                        if not ev_control_disabled and _restored_ev_baseline_is_active(ev_state):
                             self._retain_external_ev_grid_reservation()
                         else:
                             self._release_ev_grid_reservation()
@@ -1266,14 +1325,30 @@ class Executor:
         """Return production-control rejection reason for active device commands."""
         safety_ev_stop = _ev_action_is_safety_stop(action)
         owned_safety_stop = _ev_action_is_owned_safety_stop(action)
-        if not safety_ev_stop:
-            pause_reason = _pause_rejection_reason(
-                self.store.data.get("control_pause"),
-                action,
+        pause = self.store.data.get("control_pause")
+        pause_reason = _pause_rejection_reason(pause, action, now)
+        if pause_reason is not None and (
+            not safety_ev_stop
+            or (owned_safety_stop and _ev_safety_stop_failure_pause(pause))
+        ):
+            return pause_reason
+        if owned_safety_stop and (
+            _ev_safety_stop_attempt_limit_reached(
+                self.store.data.get("execution_audit"),
                 now,
             )
-            if pause_reason is not None:
-                return pause_reason
+            or _ev_safety_stop_block_active(
+                self.store.data.get("command_rate_limits"),
+                now,
+            )
+        ):
+            return "ev_safety_stop_retry_limit_reached"
+        if owned_safety_stop and _ev_safety_stop_backoff_active(
+            self.store.data.get("execution_audit"),
+            now,
+            limits=self.store.data.get("command_rate_limits"),
+        ):
+            return "ev_control_paused"
         if not owned_safety_stop:
             production = parse_production_state(self.store.data.get("production"))
             if not production.armed:
@@ -1311,12 +1386,29 @@ class Executor:
         limits[_command_rate_limit_key(action)] = attempted_at
         await self.store.async_save_command_rate_limits(limits)
 
+    async def _async_record_ev_safety_stop_failure(
+        self,
+        attempted_at: datetime,
+        *,
+        retry_limit_reached: bool,
+    ) -> None:
+        """Persist EV safety-stop backoff independently of shared pause and bounded audit state."""
+        limits = dict(self.store.data.get("command_rate_limits", {}))
+        limits[_EV_SAFETY_STOP_FAILED_AT_KEY] = attempted_at
+        if retry_limit_reached:
+            limits[_EV_SAFETY_STOP_BLOCKED_UNTIL_KEY] = (
+                attempted_at + EV_SAFETY_STOP_RETRY_WINDOW
+            )
+        await self.store.async_save_command_rate_limits(limits)
+
     async def _async_pause_asset_control(
         self,
         asset: ActionAsset,
         now: datetime,
         reason: str,
         duration: timedelta,
+        *,
+        safety_stop_failure: bool = False,
     ) -> None:
         """Pause one asset after failed or conflicting active control."""
         pause = {
@@ -1325,6 +1417,8 @@ class Executor:
             "until": now + duration,
             "reason": reason,
         }
+        if safety_stop_failure:
+            pause["safety_stop_failure"] = True
         save_pause = getattr(self.store, "async_save_control_pause", None)
         if callable(save_pause):
             await save_pause(pause)
@@ -2088,6 +2182,118 @@ def _latest_applied_audit_for_asset(audit: Any, asset: ActionAsset, now: datetim
 def _pause_rejection_reason(value: Any, action: Any, now: datetime) -> str | None:
     """Return shared fail-closed pause reason for an action."""
     return control_pause_reason(value, now, asset=str(action.asset))
+
+
+def _ev_safety_stop_failure_pause(value: Any) -> bool:
+    """Return whether a pause was created by a failed EV safety stop."""
+    return isinstance(value, dict) and value.get("safety_stop_failure") is True
+
+
+def _ev_safety_stop_attempt_limit_reached(
+    audit: Any,
+    now: datetime,
+    *,
+    additional_failures: int = 0,
+) -> bool:
+    """Bound failed automatic EV safety-stop commands over a rolling day."""
+    if not isinstance(audit, list):
+        return additional_failures >= MAX_EV_SAFETY_STOP_ATTEMPTS_PER_24H
+    normalized_now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    cutoff = normalized_now - EV_SAFETY_STOP_RETRY_WINDOW
+    failures = max(int(additional_failures), 0)
+    for item in audit:
+        if not isinstance(item, dict):
+            continue
+        desired_state = item.get("desired_state")
+        if (
+            item.get("asset") != str(ActionAsset.EV)
+            or item.get("kind") != str(ActionKind.EV_STOP)
+            or item.get("result") != str(OutcomeResult.FAILED)
+            or not isinstance(desired_state, dict)
+            or desired_state.get("ev_safety_stop") is not True
+        ):
+            continue
+        attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
+        if attempted_at is None:
+            continue
+        normalized_attempted_at = (
+            attempted_at.replace(tzinfo=UTC)
+            if attempted_at.tzinfo is None
+            else attempted_at.astimezone(UTC)
+        )
+        if normalized_attempted_at >= cutoff:
+            failures += 1
+    return failures >= MAX_EV_SAFETY_STOP_ATTEMPTS_PER_24H
+
+
+def _ev_safety_stop_backoff_active(
+    audit: Any,
+    now: datetime,
+    *,
+    limits: Any = None,
+) -> bool:
+    """Retain EV safety-stop backoff even if another asset overwrites the shared pause."""
+    persisted_failure = (
+        _parse_datetime_or_none(limits.get(_EV_SAFETY_STOP_FAILED_AT_KEY))
+        if isinstance(limits, dict)
+        else None
+    )
+    latest_failure = persisted_failure or _latest_ev_safety_stop_failure_at(audit)
+    if latest_failure is None:
+        return False
+    normalized_now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    normalized_failure = (
+        latest_failure.replace(tzinfo=UTC)
+        if latest_failure.tzinfo is None
+        else latest_failure.astimezone(UTC)
+    )
+    return normalized_now < normalized_failure + ACTION_BACKOFF_DURATION
+
+
+def _ev_safety_stop_block_active(limits: Any, now: datetime) -> bool:
+    """Return whether the dedicated persisted EV safety-stop retry block is active."""
+    if not isinstance(limits, dict):
+        return False
+    blocked_until = _parse_datetime_or_none(limits.get(_EV_SAFETY_STOP_BLOCKED_UNTIL_KEY))
+    if blocked_until is None:
+        return False
+    normalized_now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    normalized_until = (
+        blocked_until.replace(tzinfo=UTC)
+        if blocked_until.tzinfo is None
+        else blocked_until.astimezone(UTC)
+    )
+    return normalized_now < normalized_until
+
+
+def _latest_ev_safety_stop_failure_at(audit: Any) -> datetime | None:
+    """Return the latest persisted failed automatic EV safety-stop time."""
+    if not isinstance(audit, list):
+        return None
+    latest: datetime | None = None
+    for item in audit:
+        if not isinstance(item, dict):
+            continue
+        desired_state = item.get("desired_state")
+        if (
+            item.get("asset") != str(ActionAsset.EV)
+            or item.get("kind") != str(ActionKind.EV_STOP)
+            or item.get("result") != str(OutcomeResult.FAILED)
+            or not isinstance(desired_state, dict)
+            or desired_state.get("ev_safety_stop") is not True
+        ):
+            continue
+        attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
+        if attempted_at is None:
+            continue
+        normalized = (
+            attempted_at.replace(tzinfo=UTC)
+            if attempted_at.tzinfo is None
+            else attempted_at.astimezone(UTC)
+        )
+        if latest is None or normalized > latest:
+            latest = normalized
+    return latest
 
 
 def _device_control_disabled_reason(asset: ActionAsset, options: dict[str, Any]) -> str | None:

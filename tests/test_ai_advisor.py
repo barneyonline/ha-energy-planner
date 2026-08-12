@@ -9,6 +9,8 @@ from typing import Any
 
 from custom_components.ha_energy_planner.ai_advisor import (
     LocalAIAdvisor,
+    _actionable_target_evidence,
+    _actionable_targets,
     _battery_soc_band,
     _build_instructions,
     _build_prompt,
@@ -67,6 +69,38 @@ def test_ai_response_accepts_no_action_needed_without_suggestion_fields() -> Non
         "outcome": "no_action_needed",
         "summary": "The current plan is healthy and no user action is needed.",
     }
+
+
+def test_normal_climate_no_action_rejection_is_not_an_actionable_settings_fault() -> None:
+    plan = _plan()
+    plan.rejected_actions = [
+        {
+            "device": "Climate",
+            "action": "Precondition",
+            "reason": (
+                "No climate preconditioning was selected because the forecast contained no price window "
+                "that both met the configured price difference and could be shifted within the thermal limits. "
+                "This is a normal no-action planning outcome."
+            ),
+        }
+    ]
+
+    assert _actionable_targets(plan) == set()
+    assert _actionable_target_evidence(plan) == []
+
+
+def test_climate_input_issues_map_to_the_specific_actionable_setting() -> None:
+    plan = _plan()
+    plan.input_issues = ["climate_target_low_entity_unavailable"]
+
+    assert _actionable_targets(plan) == {"climate_comfort"}
+    assert _actionable_target_evidence(plan) == [
+        {
+            "id": "climate_comfort",
+            "name": "Climate comfort settings",
+            "evidence": ["climate_target_low_entity_unavailable"],
+        }
+    ]
 
 
 def test_ai_response_rejects_unsupported_or_forbidden_fields() -> None:

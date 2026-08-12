@@ -29,8 +29,14 @@ AI_ACTION_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "ev_charger_entity": ("EV charger control", ("ev_charger", "charger_control")),
     "ev_ready_by": ("EV Ready by", ("ready_by", "ev_infeasible")),
     "ev_target_soc": ("EV Target SOC", ("target_soc",)),
-    "daikin_climate_entity": ("Climate control", ("daikin_", "climate_")),
-    "climate_comfort": ("Climate comfort settings", ("comfort", "occupancy_", "person_")),
+    "daikin_climate_entity": (
+        "Climate control",
+        ("daikin_climate", "climate_control"),
+    ),
+    "climate_comfort": (
+        "Climate comfort settings",
+        ("climate_target_", "occupancy_unknown", "person_"),
+    ),
     "enphase_profile_entity": ("Enphase profile control", ("enphase_", "battery_profile")),
     "automatic_control": ("Automatic control", ("production_", "control_", "planner_")),
 }
@@ -339,7 +345,8 @@ def _build_instructions(context: DecisionContext, plan: EnergyPlan, *, structure
     task = (
         "Explain or troubleshoot this Energy Planner plan. Do not provide general optimization tips. No tools, "
         "device commands, service calls, setting changes, hard-constraint changes, credentials, entity IDs, or "
-        "location history. Use outcome action_required only when one actionable_targets item is directly supported "
+        "location history. A rejected action can be an expected no-op and is not by itself a fault. Use outcome "
+        "action_required only when one actionable_targets item is directly supported "
         "by the supplied issue or rejection evidence. For action_required, return that target ID as affected_item "
         "and provide a specific problem, exact user next_step, expected_benefit, and verification. If there is no "
         "material user action, use outcome no_action_needed and a short summary, omitting all action fields. Planner "

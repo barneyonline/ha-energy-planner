@@ -1292,6 +1292,93 @@ def test_ev_restore_without_saved_state_stops_as_fallback() -> None:
     assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.ev_stop"})]
 
 
+def test_disconnected_ev_with_off_persistent_control_is_already_safely_stopped() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "off",
+            "sensor.ev_connector": "AVAILABLE",
+            "switch.ev_charger": "off",
+            "button.ev_start": "unknown",
+            "button.ev_stop": "unknown",
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGING: "sensor.ev_connector",
+            CONF_EV_CHARGER: "switch.ev_charger",
+            CONF_EV_CHARGER_START: "button.ev_start",
+            CONF_EV_CHARGER_STOP: "button.ev_stop",
+        },
+        confirmation_timeout_seconds=0,
+        confirmation_retries=0,
+    )
+
+    result = asyncio.run(adapter.async_set_charging(False))
+
+    assert result.applied is True
+    assert result.reason == "already_in_desired_state"
+    assert result.safe_state_confirmed is True
+    assert result.command_sent is False
+    assert hass.services.calls == []
+
+
+def test_inactive_connected_ev_with_off_persistent_control_is_already_safe() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "sensor.ev_connector": "SUSPENDED_EV",
+            "switch.ev_charger": "off",
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGING: "sensor.ev_connector",
+            CONF_EV_CHARGER: "switch.ev_charger",
+        },
+        confirmation_timeout_seconds=0,
+    )
+
+    result = asyncio.run(adapter.async_set_charging(False))
+
+    assert result.safe_state_confirmed is True
+    assert hass.services.calls == []
+
+
+def test_existing_safe_ev_state_still_neutralizes_separate_start_switch() -> None:
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "off",
+            "sensor.ev_connector": "AVAILABLE",
+            "switch.ev_charger": "off",
+            "switch.ev_start": "on",
+        }
+    )
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGING: "sensor.ev_connector",
+            CONF_EV_CHARGER: "switch.ev_charger",
+            CONF_EV_CHARGER_START: "switch.ev_start",
+        },
+        confirmation_timeout_seconds=0,
+    )
+
+    result = asyncio.run(adapter.async_set_charging(False))
+
+    assert result.applied is True
+    assert result.reason == "ev_charging_stopped_and_start_reset"
+    assert result.command_sent is True
+    assert result.safe_state_confirmed is True
+    assert hass.services.calls == [
+        ("switch", "turn_off", {"entity_id": "switch.ev_start"})
+    ]
+
+
 def test_ev_restore_momentary_takeover_uses_configured_safe_stop() -> None:
     hass = FakeHass({"button.ev_start": "unknown", "button.ev_stop": "unknown"})
     adapter = EVSmartChargingAdapter(

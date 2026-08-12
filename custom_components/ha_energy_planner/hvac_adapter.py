@@ -19,9 +19,13 @@ from .const import (
 )
 from .models import ActionKind, PlanAction
 
-_STATE_CONFIRMATION_TIMEOUT_SECONDS = 1.0
+_STATE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
 _STATE_CONFIRMATION_POLL_SECONDS = 0.05
 _SCHEDULER_GUARD_DURATION = "00:00:30"
+
+
+class _HVACStateConfirmationError(RuntimeError):
+    """Raised when command ordering cannot be confirmed safely."""
 
 
 @dataclass(slots=True)
@@ -35,6 +39,7 @@ class HVACCommandResult:
     saved_automation_states: dict[str, str]
     rollback_succeeded: bool | None = None
     saved_zone_states: dict[str, str] = field(default_factory=dict)
+    command_sent: bool = False
 
 
 class DaikinHVACAdapter:
@@ -47,15 +52,20 @@ class DaikinHVACAdapter:
 
     def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
         """Return automation and zone state that must survive a takeover crash."""
-        return self._automation_states(), self._zone_states()
+        return self._enabled_automation_states(), self._zone_states()
 
     async def async_execute(self, action: PlanAction) -> HVACCommandResult:
         """Execute a supported HVAC action."""
         pre_state = self._snapshot()
         saved_automation_states = self._automation_states()
+        restorable_automation_states = {
+            entity_id: state
+            for entity_id, state in saved_automation_states.items()
+            if state == "on"
+        }
         captured_zone_states = self._zone_states()
         if action.kind == ActionKind.RELEASE_HVAC:
-            return await self.async_restore(saved_automation_states, captured_zone_states)
+            return await self.async_restore(restorable_automation_states, captured_zone_states)
         saved_zone_states = captured_zone_states if action.desired_state.get("enable_zones") else {}
         if action.kind != ActionKind.SET_HVAC:
             return HVACCommandResult(False, "unsupported_hvac_action", pre_state, self._snapshot(), {}, True)
@@ -81,7 +91,7 @@ class DaikinHVACAdapter:
                 "climate_zone_unavailable",
                 pre_state,
                 self._snapshot(),
-                saved_automation_states,
+                restorable_automation_states,
                 True,
                 saved_zone_states,
             )
@@ -91,7 +101,7 @@ class DaikinHVACAdapter:
                 "climate_scheduler_guard_failed",
                 pre_state,
                 self._snapshot(),
-                saved_automation_states,
+                restorable_automation_states,
                 False,
                 saved_zone_states,
             )
@@ -101,12 +111,10 @@ class DaikinHVACAdapter:
             and action.desired_state.get("target_temperature") is None
             and not action.desired_state.get("enable_zones")
         ):
-            if not any(state == "on" for state in saved_automation_states.values()):
-                return HVACCommandResult(True, "already_in_desired_hvac_state", pre_state, self._snapshot(), {})
-            disabled, _changed_states = await self._async_disable_automations(saved_automation_states)
+            disabled, changed_states = await self._async_disable_automations(saved_automation_states)
             if not disabled:
                 rollback_succeeded, unresolved_states = await self._async_enable_automation_entities(
-                    saved_automation_states
+                    changed_states
                 )
                 return HVACCommandResult(
                     False,
@@ -116,13 +124,19 @@ class DaikinHVACAdapter:
                     unresolved_states,
                     rollback_succeeded,
                 )
+            command_sent = bool(saved_automation_states)
             return HVACCommandResult(
-                True, "hvac_automations_suppressed", pre_state, self._snapshot(), saved_automation_states
+                True,
+                "hvac_automations_suppressed" if command_sent else "already_in_desired_hvac_state",
+                pre_state,
+                self._snapshot(),
+                changed_states,
+                command_sent=command_sent,
             )
-        disabled, _changed_states = await self._async_disable_automations(saved_automation_states)
+        disabled, changed_automations = await self._async_disable_automations(saved_automation_states)
         if not disabled:
             rollback_succeeded, unresolved_states = await self._async_enable_automation_entities(
-                saved_automation_states
+                changed_automations
             )
             return HVACCommandResult(
                 False,
@@ -136,7 +150,7 @@ class DaikinHVACAdapter:
         zones_enabled, changed_zones = await self._async_enable_zones(saved_zone_states)
         if not zones_enabled:
             rollback_succeeded, unresolved_states, unresolved_zones = await self._async_rollback_takeover(
-                saved_automation_states,
+                changed_automations,
                 changed_zones,
             )
             return HVACCommandResult(
@@ -148,49 +162,18 @@ class DaikinHVACAdapter:
                 rollback_succeeded,
                 unresolved_zones,
             )
-        desired_mode = action.desired_state.get("hvac_mode")
-        desired_temperature = action.desired_state.get("target_temperature")
-        target_low = action.desired_state.get("target_temp_low")
-        target_high = action.desired_state.get("target_temp_high")
-        mode_matches = _mode_matches(climate_state, desired_mode)
-        temperature_matches = _temperature_matches(climate_state, desired_temperature)
-        range_matches = _temperature_range_matches(climate_state, target_low, target_high)
-        no_climate_change = mode_matches and temperature_matches and range_matches
+        command_sent = bool(saved_automation_states or changed_zones)
 
         try:
-            if not mode_matches and desired_mode == "off":
-                await self.hass.services.async_call(
-                    "climate", SERVICE_TURN_OFF, {ATTR_ENTITY_ID: climate_entity}, blocking=True
-                )
-            elif desired_mode and desired_mode != "off":
-                if climate_state.state == "off":
-                    await self.hass.services.async_call(
-                        "climate", SERVICE_TURN_ON, {ATTR_ENTITY_ID: climate_entity}, blocking=True
-                    )
-                if not mode_matches:
-                    await self.hass.services.async_call(
-                        "climate",
-                        "set_hvac_mode",
-                        {ATTR_ENTITY_ID: climate_entity, "hvac_mode": desired_mode},
-                        blocking=True,
-                    )
-            if desired_temperature is not None and not temperature_matches:
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_temperature",
-                    {ATTR_ENTITY_ID: climate_entity, "temperature": desired_temperature},
-                    blocking=True,
-                )
-            elif target_low is not None and target_high is not None and not range_matches:
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_temperature",
-                    {ATTR_ENTITY_ID: climate_entity, "target_temp_low": target_low, "target_temp_high": target_high},
-                    blocking=True,
-                )
+            command_sent = (
+                await self._async_apply_hvac_state(climate_entity, action.desired_state)
+                or command_sent
+            )
+        except _HVACStateConfirmationError:
+            state_confirmed = False
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
             rollback_succeeded, unresolved_states, unresolved_zones = await self._async_rollback_takeover(
-                saved_automation_states,
+                changed_automations,
                 changed_zones,
             )
             return HVACCommandResult(
@@ -202,25 +185,51 @@ class DaikinHVACAdapter:
                 rollback_succeeded,
                 unresolved_zones,
             )
-        if not await self._async_confirm_hvac_state(climate_entity, action.desired_state):
+        else:
+            state_confirmed = await self._async_confirm_hvac_state(climate_entity, action.desired_state)
+        confirmation_reason = "hvac_state_confirmation_failed"
+        if not state_confirmed:
+            # A schedule action can already be running when its automation is
+            # disabled. Re-arm the classifier guard and reassert the complete
+            # desired state once after that action has settled.
+            if not await self._async_arm_scheduler_guard():
+                confirmation_reason = "climate_scheduler_guard_failed"
+            else:
+                try:
+                    command_sent = (
+                        await self._async_apply_hvac_state(
+                            climate_entity,
+                            action.desired_state,
+                            force=True,
+                        )
+                        or command_sent
+                    )
+                except _HVACStateConfirmationError:
+                    confirmation_reason = "hvac_state_confirmation_failed"
+                except Exception:  # noqa: BLE001 - retry remains inside the same rollback boundary.
+                    confirmation_reason = "hvac_control_service_failed"
+                else:
+                    state_confirmed = await self._async_confirm_hvac_state(
+                        climate_entity,
+                        action.desired_state,
+                    )
+        if not state_confirmed:
             rollback_succeeded, unresolved_states, unresolved_zones = await self._async_rollback_takeover(
-                saved_automation_states,
+                changed_automations,
                 changed_zones,
             )
             return HVACCommandResult(
                 False,
-                "hvac_state_confirmation_failed" if rollback_succeeded else "hvac_acquisition_rollback_failed",
+                confirmation_reason if rollback_succeeded else "hvac_acquisition_rollback_failed",
                 pre_state,
                 self._snapshot(),
                 unresolved_states,
                 rollback_succeeded,
                 unresolved_zones,
             )
-        changed_automation = any(state == "on" for state in saved_automation_states.values())
-        changed_zone = any(state != "on" for state in saved_zone_states.values())
         reason = (
             "already_in_desired_hvac_state"
-            if no_climate_change and not changed_automation and not changed_zone
+            if not command_sent
             else "hvac_action_applied"
         )
         return HVACCommandResult(
@@ -228,8 +237,9 @@ class DaikinHVACAdapter:
             reason,
             pre_state,
             self._snapshot(),
-            saved_automation_states,
+            changed_automations,
             saved_zone_states=saved_zone_states,
+            command_sent=command_sent,
         )
 
     async def async_restore(
@@ -349,9 +359,13 @@ class DaikinHVACAdapter:
         self,
         saved_states: dict[str, str] | None = None,
     ) -> tuple[bool, dict[str, str]]:
-        """Enable all configured climate automations."""
+        """Enable climate automations that were active before takeover."""
         unresolved: dict[str, str] = {}
-        entity_ids = list(dict.fromkeys([*self._automation_entities(), *(saved_states or {})]))
+        entity_ids = [
+            entity_id
+            for entity_id, state in (saved_states or {}).items()
+            if state == "on"
+        ]
         for entity_id in entity_ids:
             state = self._state(entity_id)
             if state is not None and state.state == "on":
@@ -441,25 +455,117 @@ class DaikinHVACAdapter:
                 return False
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
+    async def _async_confirm_hvac_on(self, entity_id: str) -> bool:
+        """Wait for the thermostat to leave its off state."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
+        while True:
+            observed = self._state(entity_id)
+            if observed is not None and observed.state != "off":
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
+
+    async def _async_apply_hvac_state(
+        self,
+        entity_id: str,
+        desired_state: dict[str, Any],
+        *,
+        force: bool = False,
+    ) -> bool:
+        """Apply thermostat mode before its target and report whether a command was sent."""
+        desired_mode = desired_state.get("hvac_mode")
+        desired_temperature = desired_state.get("target_temperature")
+        target_low = desired_state.get("target_temp_low")
+        target_high = desired_state.get("target_temp_high")
+        observed = self._state(entity_id)
+        if observed is None:
+            raise RuntimeError("climate state unavailable")
+        command_sent = False
+
+        if desired_mode == "off":
+            if force or observed.state != "off":
+                command_sent = True
+                await self.hass.services.async_call(
+                    "climate",
+                    SERVICE_TURN_OFF,
+                    {ATTR_ENTITY_ID: entity_id},
+                    blocking=True,
+                )
+            return command_sent
+
+        if desired_mode:
+            if observed.state == "off":
+                command_sent = True
+                await self.hass.services.async_call(
+                    "climate",
+                    SERVICE_TURN_ON,
+                    {ATTR_ENTITY_ID: entity_id},
+                    blocking=True,
+                )
+                if not await self._async_confirm_hvac_on(entity_id):
+                    raise _HVACStateConfirmationError("climate turn-on was not confirmed")
+                observed = self._state(entity_id) or observed
+            if force or not _mode_matches(observed, desired_mode):
+                command_sent = True
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_hvac_mode",
+                    {ATTR_ENTITY_ID: entity_id, "hvac_mode": desired_mode},
+                    blocking=True,
+                )
+                if not await self._async_confirm_hvac_state(
+                    entity_id,
+                    {"hvac_mode": desired_mode},
+                ):
+                    raise _HVACStateConfirmationError("climate HVAC mode was not confirmed")
+
+        observed = self._state(entity_id) or observed
+        if desired_temperature is not None and (force or not _temperature_matches(observed, desired_temperature)):
+            command_sent = True
+            await self.hass.services.async_call(
+                "climate",
+                "set_temperature",
+                {ATTR_ENTITY_ID: entity_id, "temperature": desired_temperature},
+                blocking=True,
+            )
+        elif (
+            target_low is not None
+            and target_high is not None
+            and (force or not _temperature_range_matches(observed, target_low, target_high))
+        ):
+            command_sent = True
+            await self.hass.services.async_call(
+                "climate",
+                "set_temperature",
+                {ATTR_ENTITY_ID: entity_id, "target_temp_low": target_low, "target_temp_high": target_high},
+                blocking=True,
+            )
+        return command_sent
+
     async def _async_disable_automations(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
-        """Disable enabled automations and return the states actually changed."""
+        """Stop configured automations and return the states actually changed."""
         changed_states: dict[str, str] = {}
         for automation_id, state in states.items():
             if state == "on":
                 # Treat the boundary as uncertain: a service handler can apply
                 # the state change before propagating an exception.
                 changed_states[automation_id] = state
-                try:
-                    await self.hass.services.async_call(
-                        "automation",
-                        SERVICE_TURN_OFF,
-                        {ATTR_ENTITY_ID: automation_id},
-                        blocking=True,
-                    )
-                except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-                    return False, changed_states
-                if not await self._async_confirm_state(automation_id, "off"):
-                    return False, changed_states
+            try:
+                # Home Assistant can report an automation as off while an
+                # action sequence started earlier is still running.
+                await self.hass.services.async_call(
+                    "automation",
+                    SERVICE_TURN_OFF,
+                    {ATTR_ENTITY_ID: automation_id, "stop_actions": True},
+                    blocking=True,
+                )
+            except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
+                return False, changed_states
+            if not await self._async_confirm_state(automation_id, "off"):
+                return False, changed_states
         return True, changed_states
 
     def _automation_states(self) -> dict[str, str]:
@@ -469,6 +575,14 @@ class DaikinHVACAdapter:
             if state is not None:
                 states[entity_id] = state.state
         return states
+
+    def _enabled_automation_states(self) -> dict[str, str]:
+        """Return configured automations that must be re-enabled on release."""
+        return {
+            entity_id: state
+            for entity_id, state in self._automation_states().items()
+            if state == "on"
+        }
 
     def _automation_entities(self) -> list[str]:
         configured = self.entry_data.get(CONF_CLIMATE_AUTOMATIONS, "")
