@@ -362,7 +362,7 @@ def test_options_update_handles_each_option_snapshot_once() -> None:
     coordinator.async_request_replan.assert_awaited_once_with()
 
 
-def test_options_update_releases_only_hvac_when_climate_control_is_disabled() -> None:
+def test_options_update_restores_only_hvac_when_climate_control_is_disabled() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = FakeEntry(
         {},
@@ -394,14 +394,14 @@ def test_options_update_releases_only_hvac_when_climate_control_is_disabled() ->
 
     asyncio.run(coordinator.async_handle_options_update())
 
-    assert coordinator.executor.hvac_releases == ["climate_control_disabled"]
-    assert coordinator.store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "climate_control_disabled"
+    assert coordinator.executor.device_restores == [("daikin", "hvac_control_disabled")]
+    assert coordinator.executor.hvac_releases == []
     assert coordinator.store.data["ownership"]["ev_smart_charging_state"] == "off"
     coordinator.async_restore_safe_state.assert_not_awaited()
     coordinator.async_request_replan.assert_awaited_once_with()
 
 
-def test_options_update_does_not_release_unowned_hvac_when_climate_control_is_disabled() -> None:
+def test_options_update_runs_one_idempotent_restore_for_unowned_disabled_hvac() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = FakeEntry(
         {},
@@ -432,10 +432,44 @@ def test_options_update_does_not_release_unowned_hvac_when_climate_control_is_di
 
     asyncio.run(coordinator.async_handle_options_update())
 
+    assert coordinator.executor.device_restores == [("daikin", "hvac_control_disabled")]
     assert coordinator.executor.hvac_releases == []
     assert coordinator.store.data["ownership"] == {"ev_smart_charging_state": "off"}
     coordinator.async_restore_safe_state.assert_not_awaited()
     coordinator.async_request_replan.assert_awaited_once_with()
+
+
+def test_options_update_does_not_repeat_device_restore_when_replan_fails() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.entry = FakeEntry(
+        {},
+        {
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: False,
+        },
+    )
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator._last_handled_options = {
+        CONF_PLANNER_ENABLED: True,
+        CONF_DRY_RUN: False,
+        CONF_EV_CONTROL_ENABLED: True,
+    }
+    coordinator._last_control_mode_state = (True, False)
+    coordinator.executor = FakeExecutor()
+    coordinator.async_restore_safe_state = AsyncMock()
+
+    async def fail_replan() -> None:
+        raise RuntimeError("replan failed")
+
+    coordinator.async_request_replan = fail_replan
+
+    with pytest.raises(RuntimeError, match="replan failed"):
+        asyncio.run(coordinator.async_handle_options_update())
+    asyncio.run(coordinator.async_handle_options_update())
+
+    assert coordinator.executor.device_restores == [("ev", "ev_control_disabled")]
 
 
 def test_options_update_surfaces_restore_error_after_safe_option_is_applied() -> None:
@@ -3247,7 +3281,7 @@ def test_device_control_disable_while_active_restores_only_selected_asset(
     assert coordinator.active_control is True
 
 
-def test_device_control_restore_failure_keeps_switch_on_and_master_armed() -> None:
+def test_device_control_restore_failure_still_turns_switch_off_and_keeps_master_armed() -> None:
     class ConfigEntries:
         def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
             entry.options = options
@@ -3266,18 +3300,20 @@ def test_device_control_restore_failure_keeps_switch_on_and_master_armed() -> No
     coordinator._last_control_mode_state = (True, False)
     coordinator.executor.device_restore_result = SimpleNamespace(result=OutcomeResult.FAILED)
 
-    with pytest.raises(HomeAssistantError) as error:
-        asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
+    asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
 
-    assert error.value.translation_key == "device_control_restore_failed"
-    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is True
+    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is False
     assert coordinator.entry.options[CONF_DRY_RUN] is False
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.executor.device_restores == [("enphase", "enphase_control_disabled")]
-    assert coordinator.refresh_requested == 0
+    assert coordinator.refresh_requested == 1
 
 
-def test_device_control_disable_retries_restore_while_master_is_off() -> None:
+def test_device_control_disable_remains_off_when_restore_fails_while_master_is_off() -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_ENPHASE_PROFILE: "select.profile"},
         options={
@@ -3287,15 +3323,77 @@ def test_device_control_disable_retries_restore_while_master_is_off() -> None:
         },
         store_data={"production": {"armed": False}},
     )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (True, True)
     coordinator.executor.device_restore_result = SimpleNamespace(result=OutcomeResult.FAILED)
 
-    with pytest.raises(HomeAssistantError) as error:
-        asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
+    asyncio.run(coordinator.async_set_device_control(CONF_ENPHASE_CONTROL_ENABLED, False))
 
-    assert error.value.translation_key == "device_control_restore_failed"
-    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is True
+    assert coordinator.entry.options[CONF_ENPHASE_CONTROL_ENABLED] is False
     assert coordinator.executor.device_restores == [("enphase", "enphase_control_disabled")]
-    assert coordinator.refresh_requested == 0
+    assert coordinator.refresh_requested == 1
+
+
+def test_device_control_disable_remains_off_after_unexpected_restore_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev"},
+        options={CONF_EV_CONTROL_ENABLED: True},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    coordinator._options_update_lock = asyncio.Lock()
+    coordinator._last_control_mode_state = (False, True)
+
+    async def fail_restore(asset: str, reason: str) -> object:
+        raise RuntimeError(f"{asset}:{reason}")
+
+    coordinator.executor.async_restore_device_control = fail_restore
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, False))
+
+    assert coordinator.entry.options[CONF_EV_CONTROL_ENABLED] is False
+    assert coordinator.refresh_requested == 1
+    assert "Unexpected error while restoring ev" in caplog.text
+
+
+def test_device_control_disable_remains_successful_when_options_listener_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev"},
+        options={CONF_EV_CONTROL_ENABLED: True},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    listener_updates = 0
+
+    async def fail_options_update() -> None:
+        raise RuntimeError("options listener failed")
+
+    def update_listeners() -> None:
+        nonlocal listener_updates
+        listener_updates += 1
+
+    coordinator.async_handle_options_update = fail_options_update
+    coordinator.async_update_listeners = update_listeners
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, False))
+
+    assert coordinator.entry.options[CONF_EV_CONTROL_ENABLED] is False
+    assert coordinator.executor.options[CONF_EV_CONTROL_ENABLED] is False
+    assert listener_updates == 1
+    assert "Unexpected error while applying the disabled ev control option" in caplog.text
 
 
 def test_concurrent_device_control_changes_preserve_every_selector() -> None:
@@ -3738,7 +3836,10 @@ def _coordinator_for_runtime_services(
     coordinator.store = FakeStore(store_data or {})
     coordinator.executor = FakeExecutor()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._options_update_lock = asyncio.Lock()
     coordinator._device_control_lock = asyncio.Lock()
+    coordinator._last_handled_options = dict(options or {})
+    coordinator._last_control_mode_state = (coordinator.planner_enabled, coordinator.dry_run)
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0

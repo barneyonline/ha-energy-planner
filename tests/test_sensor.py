@@ -9,6 +9,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from homeassistant.components.sensor import SensorDeviceClass
+
 from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
 from custom_components.ha_energy_planner.models import (
@@ -28,6 +30,7 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     attrs = {description.key: description.attrs_fn(coordinator) for description in SENSORS}
 
     assert values == {
+        "mode": "review",
         "current_state": "No controls configured",
         "next_actions": "Unknown",
         "load_forecast_coverage_score": None,
@@ -41,6 +44,9 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     assert attrs["load_forecast_coverage_score"] == {
         "required_threshold_percent": 90.0,
         "meets_threshold": None,
+        "score_source": "unavailable",
+        "score_evaluated_at": None,
+        "active_model_score_percent": None,
         "bypass_enabled": False,
         "bypass_applied_to_model": False,
         "model_status": "unknown",
@@ -53,7 +59,31 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     )
 
 
+def test_mode_sensor_exposes_operational_control_mode() -> None:
+    description = next(item for item in SENSORS if item.key == "mode")
+    review = _coordinator(
+        _plan(),
+        options={"planner_enabled": True, "dry_run": True},
+        store_data={"production": {"armed": True}},
+    )
+    active = _coordinator(
+        _plan(),
+        options={"planner_enabled": True, "dry_run": False},
+        store_data={"production": {"armed": True}},
+    )
+
+    assert description.device_class == SensorDeviceClass.ENUM
+    assert description.options == ["review", "active"]
+    assert description.value_fn(review) == "review"
+    assert description.value_fn(active) == "active"
+
+
 def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> None:
+    assert sensor_module._load_forecast_coverage_details("invalid") == (
+        None,
+        "unavailable",
+        None,
+    )
     coordinator = _coordinator(
         None,
         options={"bypass_safety_gates": True},
@@ -74,6 +104,9 @@ def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> N
     assert description.attrs_fn(coordinator) == {
         "required_threshold_percent": 90.0,
         "meets_threshold": False,
+        "score_source": "active_model",
+        "score_evaluated_at": None,
+        "active_model_score_percent": 86.4,
         "bypass_enabled": True,
         "bypass_applied_to_model": True,
         "model_status": "ready",
@@ -81,6 +114,39 @@ def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> N
     }
     coordinator.store.data["built_in_load_forecast"]["validation"]["upper_coverage"] = 1.1
     assert description.value_fn(coordinator) is None
+
+
+def test_load_forecast_coverage_sensor_uses_latest_retained_training_score() -> None:
+    coordinator = _coordinator(
+        None,
+        store_data={
+            "built_in_load_forecast": {
+                "status": "ready",
+                "trained_at": "2026-08-12T00:00:00+00:00",
+                "last_attempt_at": "2026-08-12T06:00:00+00:00",
+                "last_training_status": "failed",
+                "validation": {"upper_coverage": 0.94},
+                "last_training_validation": {"upper_coverage": 0.8736},
+                "quality_failures": [],
+            }
+        },
+    )
+    description = next(
+        item for item in SENSORS if item.key == "load_forecast_coverage_score"
+    )
+
+    assert description.value_fn(coordinator) == 87.4
+    assert description.attrs_fn(coordinator) == {
+        "required_threshold_percent": 90.0,
+        "meets_threshold": False,
+        "score_source": "latest_training_attempt",
+        "score_evaluated_at": "2026-08-12T06:00:00+00:00",
+        "active_model_score_percent": 94.0,
+        "bypass_enabled": False,
+        "bypass_applied_to_model": False,
+        "model_status": "ready",
+        "quality_failures": [],
+    }
 
 
 def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> None:
@@ -1870,6 +1936,12 @@ def _coordinator(
         entry_data=configured_entry_data,
         entry=SimpleNamespace(entry_id="test_entry"),
         hass=hass,
+        active_control=(
+            configured_options.get("planner_enabled") is True
+            and configured_options.get("dry_run") is False
+            and isinstance(stored.get("production"), dict)
+            and stored["production"].get("armed") is True
+        ),
     )
 
 

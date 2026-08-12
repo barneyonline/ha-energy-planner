@@ -287,6 +287,11 @@ input_boolean:
     name: EV charger stop
     initial: true
 
+timer:
+  climate_scheduler_guard:
+    name: Climate scheduler guard
+    duration: "00:00:30"
+
 input_datetime:
   ev_ready_by:
     name: EV ready by
@@ -721,7 +726,8 @@ automation:
       - action: ha_energy_planner.resume_control
         data:
           reason: docker_smoke_automatic_control
-      - delay: "00:00:01"
+      - action: ha_energy_planner.replan
+      - delay: "00:00:05"
       - action: fake_planner_test.seed_production_evidence
       - action: switch.turn_on
         data:
@@ -729,7 +735,7 @@ automation:
       - delay: "00:00:02"
       - action: button.press
         data:
-          entity_id: button.energy_planner_explain_or_troubleshoot
+          entity_id: button.energy_planner_explain
       - delay: "00:00:05"
       - action: ha_energy_planner.replan
       - delay: "00:00:05"
@@ -873,6 +879,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "climate_automation_entities": "automation.fake_climate_conflict",
               "climate_zone_entities": ["input_boolean.fake_climate_zone"],
               "climate_change_from_scheduler_entity": "input_boolean.climate_change_from_scheduler",
+              "climate_scheduler_guard_timer_entity": "timer.climate_scheduler_guard",
               "climate_manual_override_entity": "input_boolean.climate_manual_override",
               "climate_target_low_entity": "input_number.climate_target_low",
               "climate_target_high_entity": "input_number.climate_target_high",
@@ -962,8 +969,8 @@ trained_at = datetime.now(UTC).isoformat()
 expected = [1.2] * 96
 upper = [1.5] * 96
 payload["data"]["built_in_load_forecast"] = {
-    "model_version": 2,
-    "contract_version": 3,
+    "model_version": 3,
+    "contract_version": 4,
     "status": "ready",
     "quality_ready": True,
     "quality_failures": [],
@@ -971,7 +978,9 @@ payload["data"]["built_in_load_forecast"] = {
     "trained_at": trained_at,
     "last_attempt_at": trained_at,
     "last_attempt_source_entity_id": "input_number.baseline_load",
+    "last_attempt_timezone": "UTC",
     "timezone": "UTC",
+    "safety_gates_bypassed": False,
     "history_started_on": "2026-06-01",
     "history_ended_on": "2026-06-27",
     "history_days": 26,
@@ -985,7 +994,9 @@ payload["data"]["built_in_load_forecast"] = {
         "sample_count": 192,
         "mae_kw": 0.1,
         "rmse_kw": 0.12,
-        "persistence_mae_kw": 0.1,
+        "persistence_mae_kw": 0.2,
+        "positive_residual_p90_kw": 0.2,
+        "calibration_buffer_kw": 0.3,
         "upper_coverage": 0.95,
     },
     "cleaning": {"ev_intervals_excluded": True, "hvac_power_subtracted": True},
@@ -1047,6 +1058,7 @@ entities = {
     if entry.get("platform") == "ha_energy_planner"
 }
 expected_entities = {
+    "sensor.energy_planner_mode",
     "sensor.energy_planner_current_state",
     "sensor.energy_planner_next_actions",
     "binary_sensor.energy_planner_armed",
@@ -1055,9 +1067,7 @@ expected_entities = {
     "switch.energy_planner_climate_control",
     "switch.energy_planner_ev_control",
     "switch.energy_planner_enphase_control",
-    "button.energy_planner_explain_or_troubleshoot",
-    "switch.energy_planner_opportunistic_charging",
-    "number.energy_planner_opportunistic_charging_price_threshold",
+    "button.energy_planner_explain",
     "button.energy_planner_restore_safe_state",
 }
 missing = expected_entities - entities
@@ -1068,6 +1078,8 @@ retired_entities = {
     "button.energy_planner_stop_charging",
     "number.energy_planner_target_soc",
     "switch.energy_planner_ev_connected_helper",
+    "switch.energy_planner_opportunistic_charging",
+    "number.energy_planner_opportunistic_charging_price_threshold",
 }
 unexpected_retired = retired_entities & entities
 if unexpected_retired:
