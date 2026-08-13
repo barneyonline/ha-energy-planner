@@ -336,6 +336,9 @@ input_text:
   diagnostics_option_token_seen:
     name: Diagnostics option token seen
     initial: unknown
+  manual_override_release_seen:
+    name: Manual override release seen
+    initial: unknown
 
 input_select:
   fake_person:
@@ -460,7 +463,14 @@ automation:
           value: 0.10
       - delay: "00:00:02"
       - action: ha_energy_planner.replan
-      - delay: "00:00:07"
+      # Restore only after the coordinated HVAC action and its ownership
+      # snapshot have reached the observable actuator state. A fixed delay can
+      # race a serialized startup refresh on slower Docker hosts.
+      - wait_template: >-
+          {{ is_state('automation.fake_climate_conflict', 'off')
+             and is_state('input_boolean.fake_climate_zone', 'on') }}
+        timeout: "00:00:30"
+        continue_on_timeout: false
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_hvac_precondition_restore
@@ -494,6 +504,12 @@ automation:
         data:
           entity_id: input_boolean.climate_manual_override
       - delay: "00:00:03"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.manual_override_release_seen
+        data:
+          value: >-
+            {{ states('automation.fake_climate_conflict') }}|{{ states('input_boolean.fake_climate_zone') }}
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_manual_override
@@ -1322,29 +1338,18 @@ heating_takeover_indices = [
     and item.get("post_state", {}).get("automation.fake_climate_conflict") == "off"
     and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "on"
 ]
-first_takeover_index = next(
-    (index for index in heating_takeover_indices if index < precondition_restore_index),
-    None,
-)
-if first_takeover_index is None or not any(
-    first_takeover_index < index <= precondition_restore_index
-    and "hvac_control_released" in item.get("reason", "")
-    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
-    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "off"
-    for index, item in enumerate(outcomes)
+precondition_restore = outcomes[precondition_restore_index]
+if not (
+    "hvac_control_released" in precondition_restore.get("reason", "")
+    and precondition_restore.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
+    and precondition_restore.get("post_state", {}).get("input_boolean.fake_climate_zone") == "off"
 ):
-    raise SystemExit("Heating lifecycle restore did not restore the mapped automation and zone")
+    raise SystemExit(
+        "Heating lifecycle restore did not restore the mapped automation and zone: "
+        f"{precondition_restore}"
+    )
 if not any(index > precondition_restore_index for index in heating_takeover_indices):
     raise SystemExit("Second heating lifecycle takeover did not reacquire automation and zone ownership")
-if not any(
-    item.get("action_id") == "release_hvac_control"
-    and item.get("result") == "restored"
-    and item.get("desired_state", {}).get("release_reason") == "manual_override_helper_on"
-    and item.get("post_state", {}).get("automation.fake_climate_conflict") == "on"
-    and item.get("post_state", {}).get("input_boolean.fake_climate_zone") == "off"
-    for item in outcomes
-):
-    raise SystemExit("External manual-override helper did not release only HVAC automation and zone ownership")
 if not any(
     item.get("result") == "applied"
     and str(item.get("action_id", "")).endswith("-hvac-away-off")
@@ -1439,6 +1444,7 @@ expected_helper_states = {
     "input_text.diagnostics_data_token_seen": "**REDACTED**",
     "input_text.diagnostics_data_address_seen": "**REDACTED**",
     "input_text.diagnostics_option_token_seen": "**REDACTED**",
+    "input_text.manual_override_release_seen": "on|off",
 }
 for entity_id, expected_state in expected_helper_states.items():
     actual_state = restored_entity_state(entity_id)

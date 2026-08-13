@@ -245,6 +245,7 @@ rules:
         - tests/test_lifecycle.py
   docs-configuration-parameters:
     status: done
+    comment: Central settings document climate away-preconditioning opt-in, immediate away-off behavior, source-specific confidence gates, comfort/minimum-cycle safeguards, and bounded manual-override helper behavior.
     references:
       docs:
         - README.md

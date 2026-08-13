@@ -164,11 +164,17 @@ def _action_from_fixture(data: dict[str, Any], plan_id: str) -> PlanAction:
 
 
 def _ownership_from_fixture(data: dict[str, Any]) -> OwnershipState:
+    hvac_control = data.get("hvac_control")
     return OwnershipState(
         enphase_profile=data.get("enphase_profile"),
         enphase_profile_changed_at=_parse_datetime_or_none(data.get("enphase_profile_changed_at")),
         climate_automations=dict(data.get("climate_automations", {})),
         ev_smart_charging_state=dict(data.get("ev_smart_charging_state", {})),
+        hvac_control_phase=(
+            str(hvac_control.get("phase"))
+            if isinstance(hvac_control, dict) and hvac_control.get("phase") is not None
+            else None
+        ),
         planner_takeover_started_at=_parse_datetime_or_none(data.get("planner_takeover_started_at")),
         manual_hvac_override_expires_at=_parse_datetime_or_none(data.get("manual_hvac_override_expires_at")),
     )

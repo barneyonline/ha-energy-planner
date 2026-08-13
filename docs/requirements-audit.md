@@ -186,8 +186,9 @@ Status as of 2026-08-12.
   overwrite or dismiss another planner's alert.
 - Manual Daikin or planner-owned zone changes create a temporary override,
   persist across restart, and release only HVAC ownership. An externally
-  enabled manual-override helper creates an authoritative indefinite override;
-  helper feedback from integration-created timed overrides is guarded.
+  enabled manual-override helper uses the same configured timeout; legacy
+  indefinite helper state is bounded during startup, and helper feedback from
+  integration-created timed overrides is guarded.
 - Automatic notifications are limited to conditions that normally require user
   action: broken required mappings/capabilities, failed safe-state restoration,
   infeasible EV readiness, and configured grid hard-limit conflicts. Explicitly
@@ -220,7 +221,8 @@ Status as of 2026-08-12.
   Core and verifies accepted bounded advice in Store recommendations.
 - Replay fixtures cover stale inputs, battery floor rejection, EV infeasible
   ready-by evidence, negative-price EV scheduling, HVAC occupancy/manual
-  override rules, and Enphase holds.
+  override rules, bounded helper overrides, opt-in away preconditioning, and
+  Enphase holds.
 - Executable live-schema fixtures cover representative Amber price, external
   PV, and optional weather payload shapes through `scripts/validate-live-schema-fixture.py`,
   so sanitized real Home Assistant exports can be validated outside pytest.
@@ -494,6 +496,22 @@ Status as of 2026-08-12.
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare
   timestamps, so their duration is independent of planning interval.
+- Planner contexts retain per-source forecast confidence. The plan-wide
+  production score is capped by required tariff, PV, and household-load
+  sources, while tariff, solar, load, climate, EV, and Enphase action gates use
+  only their relevant source and device evidence. A low optional carbon source
+  therefore cannot suppress climate control, but low weather confidence still
+  blocks climate preconditioning at its configured threshold. When an opted-in
+  away preconditioning period begins later, the plan includes both an immediate
+  away-off command and a future lifecycle only when the latter remains feasible
+  after the resulting minimum rest period, so HVAC cannot remain running in the
+  gap or receive an inevitably rejected restart. Existing away-off ownership is
+  retained when no candidate qualifies. Away HVAC-on execution additionally
+  requires complete timestamped, numeric, reason-coded lifecycle evidence, and
+  minimum-cycle continuation is limited to the same persisted mode and period
+  timestamps. Malformed legacy away-off start evidence uses a valid takeover
+  timestamp as its conservative fallback. An active lifecycle releases
+  ownership when its relevant confidence falls below threshold.
 - Dry-run actions are recorded as intentionally skipped with the stable
   `dry_run` reason. Plan-wide violations remain on plan health instead of being
   copied to unrelated action rejections, including neutral Enphase restores,

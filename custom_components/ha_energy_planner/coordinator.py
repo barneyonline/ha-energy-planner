@@ -210,6 +210,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.store = store
         now = dt_util.utcnow()
         self.overrides: list[Override] = _overrides_from_store(store.data, now)
+        helper_override_expiry = now + timedelta(
+            minutes=int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES])
+        )
+        self.overrides = [
+            Override(
+                kind=override.kind,
+                source=override.source,
+                expires_at=helper_override_expiry,
+                reason=override.reason,
+            )
+            if (
+                override.kind == "manual_hvac"
+                and override.source == "helper"
+                and override.expires_at is None
+                and override.reason == "manual_override_helper_on"
+            )
+            else override
+            for override in self.overrides
+        ]
         manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         manual_override_state = hass.states.get(manual_override_entity) if manual_override_entity else None
         if (
@@ -220,12 +239,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         ):
             # Setup performs its first refresh before listeners are registered.
             # Seed an externally enabled helper now so that refresh cannot cross
-            # the authoritative manual-override boundary and acquire HVAC.
+            # the manual-override boundary and acquire HVAC. Helper-driven
+            # overrides use the same configured timeout as detected changes.
             self.overrides.append(
                 Override(
                     kind="manual_hvac",
                     source="helper",
-                    expires_at=None,
+                    expires_at=helper_override_expiry,
                     reason="manual_override_helper_on",
                 )
             )
@@ -938,13 +958,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.store.async_save_overrides(self.overrides)
 
     async def _async_handle_manual_override_helper(self, enabled: bool) -> None:
-        """Apply an authoritative external manual-override helper change."""
+        """Apply an external manual-override helper change with a bounded timeout."""
         if enabled:
             await self.async_set_manual_hvac_override(
-                0,
+                int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES]),
                 "manual_override_helper_on",
                 source="helper",
-                expires=False,
             )
             return
         async with self._planner_lock:
@@ -1912,6 +1931,10 @@ def _hvac_control_from_ownership(ownership: dict[str, Any]) -> dict[str, Any]:
     hold_until = ownership.get("hvac_release_hold_until")
     if hold_until is not None:
         control.setdefault("released_until", hold_until)
+    if control.get("phase") == "away_off" and _parse_datetime_or_none(control.get("started_at")) is None:
+        takeover_started_at = ownership.get("planner_takeover_started_at")
+        if _parse_datetime_or_none(takeover_started_at) is not None:
+            control["started_at"] = takeover_started_at
     return control
 
 
