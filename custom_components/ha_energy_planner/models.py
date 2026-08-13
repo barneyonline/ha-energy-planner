@@ -142,6 +142,7 @@ class DecisionContext:
     climate_zone_entities: list[str] = field(default_factory=list)
     input_issues: list[str] = field(default_factory=list)
     forecast_confidence: float = 1.0
+    forecast_confidence_by_source: dict[str, float] = field(default_factory=dict)
     local_timezone: str = "UTC"
 
 

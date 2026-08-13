@@ -1176,7 +1176,7 @@ def test_input_manager_converts_weather_current_temperature_from_fahrenheit() ->
 
     assert context.current_outdoor_temperature_c == 20.0
     assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, None, None, None]
-    assert context.input_health == InputHealth.DEGRADED
+    assert context.input_health == InputHealth.HEALTHY
 
 
 def test_input_manager_parses_camel_case_current_weather_temperature() -> None:
@@ -1213,7 +1213,7 @@ def test_input_manager_parses_camel_case_current_weather_temperature() -> None:
 
     assert context.current_outdoor_temperature_c == 20.0
     assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, None, None, None]
-    assert context.input_health == InputHealth.DEGRADED
+    assert context.input_health == InputHealth.HEALTHY
 
 
 def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() -> None:
@@ -1385,6 +1385,75 @@ def test_input_manager_normalizes_optional_carbon_forecast_without_making_it_req
     assert not any("carbon_intensity" in issue for issue in context.input_issues)
 
 
+def test_unavailable_optional_forecasts_are_advisory_and_keep_source_confidence() -> None:
+    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon",
+        CONF_BATTERY_SOC: "sensor.battery",
+        CONF_WEATHER: "weather.home",
+        CONF_PERSON_ENTITIES: "person.james",
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
+            "sensor.carbon": FakeState("unavailable"),
+            "sensor.battery": FakeState("55"),
+            "weather.home": FakeState("unavailable"),
+            "person.james": FakeState("home"),
+        }
+    )
+
+    context = InputManager(hass, entry_data, options).build_context()
+
+    assert context.input_health == InputHealth.HEALTHY
+    assert f"advisory_{CONF_CARBON_INTENSITY_FORECAST}_unavailable" in context.input_issues
+    assert f"advisory_{CONF_WEATHER}_unavailable" in context.input_issues
+    assert context.forecast_confidence_by_source[CONF_CARBON_INTENSITY_FORECAST] == 0.0
+    assert context.forecast_confidence_by_source[CONF_WEATHER] == 0.0
+
+
+def test_stale_optional_carbon_forecast_is_advisory() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planning_horizon_hours": 1,
+        "planning_interval_minutes": 15,
+        "forecast_freshness_minutes": 30,
+    }
+    old = datetime.now(UTC) - timedelta(hours=2)
+    entry_data = {
+        CONF_AMBER_IMPORT_PRICE: "sensor.import",
+        CONF_AMBER_EXPORT_PRICE: "sensor.export",
+        CONF_PV_FORECAST: "sensor.pv",
+        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
+        CONF_CARBON_INTENSITY_FORECAST: "sensor.carbon",
+        CONF_BATTERY_SOC: "sensor.battery",
+        CONF_PERSON_ENTITIES: "person.james",
+    }
+    hass = FakeHass(
+        {
+            "sensor.import": FakeState("0.20", {"forecast": [0.20] * 4}),
+            "sensor.export": FakeState("0.05", {"forecast": [0.05] * 4}),
+            "sensor.pv": FakeState("1.0", {"forecast": [1.0] * 4}),
+            "sensor.load": FakeState("2.0", {"forecast": [2.0] * 4}),
+            "sensor.carbon": FakeState("300", last_updated=old),
+            "sensor.battery": FakeState("55"),
+            "person.james": FakeState("home"),
+        }
+    )
+
+    context = InputManager(hass, entry_data, options).build_context()
+
+    assert context.input_health == InputHealth.HEALTHY
+    assert f"advisory_{CONF_CARBON_INTENSITY_FORECAST}_stale" in context.input_issues
+
+
 def test_forecast_source_issue_time_accepts_datetime_and_naive_fallback() -> None:
     fallback = datetime(2026, 6, 27, 12, 0)
     issued = datetime(2026, 6, 27, 9, 0, tzinfo=UTC)
@@ -1422,8 +1491,15 @@ def test_input_manager_combines_forecast_confidence_metadata() -> None:
     manager = InputManager(hass, entry_data, options)
     context = manager.build_context()
 
-    assert context.input_health == InputHealth.DEGRADED
+    assert context.input_health == InputHealth.HEALTHY
     assert context.forecast_confidence == 0.44
+    assert context.forecast_confidence_by_source == {
+        CONF_AMBER_IMPORT_PRICE: 0.91,
+        CONF_AMBER_EXPORT_PRICE: 0.84,
+        CONF_PV_FORECAST: 0.62,
+        CONF_BASELINE_LOAD_FORECAST: 1.0,
+        CONF_WEATHER: 0.44,
+    }
     assert manager.forecast_confidence_details == [
         {
             "config_key": CONF_AMBER_IMPORT_PRICE,

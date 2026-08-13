@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+## 0.9.8 - 2026-08-13
+
+### Added
+
+- Added an opt-in **Precondition while away** Climate policy. It permits only
+  the tariff preconditioning/coast lifecycle while occupancy is known to be
+  away; ordinary HVAC-on commands remain blocked and comfort target bounds are
+  still enforced immediately before execution. Moving from planner-owned
+  away-off state into preconditioning also respects the configured HVAC
+  minimum cycle/rest period.
+
+### Fixed
+
+- When away preconditioning is enabled but its tariff window starts later, the
+  planner now turns unowned HVAC off immediately and keeps the future
+  preconditioning lifecycle. Previously the future action could suppress the
+  immediate away-off action and leave HVAC running until the window began.
+  Candidate selection now accounts for the rest period created by away-off,
+  and existing away-off ownership cannot be released merely because the
+  temperature reaches a comfort boundary while no tariff window qualifies.
+- Forecast confidence is now evaluated by source and subsystem. Optional
+  carbon or weather confidence no longer caps the required-source plan score or
+  unrelated device actions, while climate actions still enforce weather,
+  tariff, and load confidence independently and explain the limiting score. An
+  active climate lifecycle is explicitly released if its relevant confidence
+  later falls below threshold.
+- Away HVAC-on commands must carry a complete, internally marked tariff
+  lifecycle before the execution constraint can apply the away-preconditioning
+  opt-in; a phase label alone is insufficient. Minimum-cycle continuation also
+  requires the action to match the persisted lifecycle mode and timestamps.
+  Malformed legacy away-off start evidence falls back to the valid takeover
+  timestamp instead of indefinitely restarting the rest window.
+- External Climate Manual Override helper changes now use the configured
+  manual override duration instead of creating a permanent block. Legacy
+  non-expiring helper overrides are bounded on startup and the helper is
+  cleared when the timeout expires.
+
 ## 0.9.7 - 2026-08-12
 
 ### Added
