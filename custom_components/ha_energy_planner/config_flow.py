@@ -94,6 +94,7 @@ from .const import (
     CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
+    CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_INSTANCE_NAME,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -392,6 +393,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_LEAD_MINUTES,
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
+        CONF_HVAC_PRECONDITION_WHILE_AWAY,
         CONF_HVAC_MIN_CYCLE_MINUTES,
         CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     ),
@@ -597,6 +599,7 @@ def _option_selector(field: str) -> Any:
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
         ),
+        CONF_HVAC_PRECONDITION_WHILE_AWAY: BooleanSelector(),
         CONF_HVAC_MIN_CYCLE_MINUTES: NumberSelector(
             NumberSelectorConfig(min=0, max=240, step=5, mode=NumberSelectorMode.BOX)
         ),

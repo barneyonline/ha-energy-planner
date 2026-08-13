@@ -9,6 +9,8 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .const import (
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_AMBER_IMPORT_PRICE,
     CONF_BATTERY_MAX_CHARGE_KW,
     CONF_BATTERY_MAX_DISCHARGE_KW,
     CONF_BATTERY_MIN_SOC_PERCENT,
@@ -30,8 +32,11 @@ from .const import (
     CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SOC_PER_KWH,
+    CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
+    CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_MIN_CLIMATE_CONFIDENCE,
     CONF_MIN_ENPHASE_CONFIDENCE,
@@ -44,6 +49,8 @@ from .const import (
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_PRIORITY_WEIGHTS,
+    CONF_PV_FORECAST,
+    CONF_WEATHER,
 )
 from .ev import EVTripSummary, allocate_least_cost_charging, calculate_ev_target
 from .models import (
@@ -212,33 +219,68 @@ class DryRunPlanner:
         execute_not_before = context.created_at
         execute_not_after = context.created_at + timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
         away_control_active = context.hvac_control.get("phase") == "away_off"
+        away_preconditioning_enabled = strict_bool(
+            self.options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False),
+            default=False,
+        )
         if context.occupancy_state == OccupancyState.AWAY and away_control_active and away_off_release_reason is None:
-            pass
+            if away_preconditioning_enabled:
+                actions.extend(
+                    self._hvac_lifecycle_actions(
+                        context,
+                        execute_not_before,
+                        execute_not_after,
+                        ownership_free_release_allowed=ownership_free_hvac_release_allowed,
+                    )
+                )
         elif context.occupancy_state == OccupancyState.AWAY and context.hvac_control:
-            actions.append(
-                self._hvac_release_action(
+            if away_preconditioning_enabled and context.hvac_control.get("phase") in {
+                "preconditioning",
+                "pre_peak_coast",
+                "peak_coast",
+            }:
+                actions.extend(
+                    self._hvac_lifecycle_actions(
+                        context,
+                        execute_not_before,
+                        execute_not_after,
+                        ownership_free_release_allowed=ownership_free_hvac_release_allowed,
+                    )
+                )
+            else:
+                actions.append(
+                    self._hvac_release_action(
+                        context,
+                        execute_not_before,
+                        execute_not_after,
+                        away_off_release_reason or "hvac_required_evidence_lost",
+                    )
+                )
+        elif context.occupancy_state == OccupancyState.AWAY:
+            away_actions = (
+                self._hvac_lifecycle_actions(
                     context,
                     execute_not_before,
                     execute_not_after,
-                    away_off_release_reason or "hvac_required_evidence_lost",
+                    ownership_free_release_allowed=ownership_free_hvac_release_allowed,
                 )
+                if away_preconditioning_enabled
+                else []
             )
-        elif context.occupancy_state == OccupancyState.AWAY:
-            actions.append(
-                PlanAction(
-                    action_id=f"{context.plan_id}-hvac-away-off",
-                    plan_id=context.plan_id,
-                    execute_not_before=execute_not_before,
-                    execute_not_after=execute_not_after,
-                    asset=ActionAsset.DAIKIN,
-                    kind=ActionKind.SET_HVAC,
-                    desired_state={"hvac_mode": "off"},
-                    hard_constraints=["occupancy_away", "manual_hvac_override_inactive"],
-                    reason_codes=["away_hvac_policy"],
-                    expected_cost_delta=None,
-                    confidence=confidence_from_context(context),
-                )
+            preconditioning_action = next(
+                (
+                    action
+                    for action in away_actions
+                    if action.desired_state.get("phase") == "preconditioning"
+                ),
+                None,
             )
+            if preconditioning_action is not None:
+                if preconditioning_action.execute_not_before > execute_not_before:
+                    actions.append(self._hvac_away_off_action(context, execute_not_before, execute_not_after))
+                actions.extend(away_actions)
+            else:
+                actions.append(self._hvac_away_off_action(context, execute_not_before, execute_not_after))
         else:
             actions.extend(
                 self._hvac_lifecycle_actions(
@@ -416,9 +458,31 @@ class DryRunPlanner:
             action
             for action in actions
             if action.kind == ActionKind.RELEASE_HVAC
+            or _is_hvac_away_off_action(action)
             or _action_meets_confidence_threshold(action, context, self.options)
         ]
         return sorted(actions, key=lambda action: _action_score(action, context, self.options)["score"], reverse=True)
+
+    @staticmethod
+    def _hvac_away_off_action(
+        context: DecisionContext,
+        execute_not_before: datetime,
+        execute_not_after: datetime,
+    ) -> PlanAction:
+        """Return the conservative immediate away HVAC action."""
+        return PlanAction(
+            action_id=f"{context.plan_id}-hvac-away-off",
+            plan_id=context.plan_id,
+            execute_not_before=execute_not_before,
+            execute_not_after=execute_not_after,
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.SET_HVAC,
+            desired_state={"hvac_mode": "off"},
+            hard_constraints=["occupancy_away", "manual_hvac_override_inactive"],
+            reason_codes=["away_hvac_policy"],
+            expected_cost_delta=None,
+            confidence=confidence_from_context(context),
+        )
 
     def _enphase_action(
         self,
@@ -506,7 +570,40 @@ class DryRunPlanner:
                 )
             ]
 
-        if low is None or high is None or current is None or context.occupancy_state != OccupancyState.OCCUPIED:
+        if (
+            active.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"}
+            and _confidence_rejection_reason(ActionAsset.DAIKIN, context, self.options) is not None
+        ):
+            return [
+                self._hvac_release_action(
+                    context,
+                    now,
+                    now + interval,
+                    "hvac_confidence_below_threshold",
+                )
+            ]
+
+        precondition_while_away = strict_bool(
+            self.options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False),
+            default=False,
+        )
+        away_off_ownership_active = bool(
+            active.get("phase") == "away_off"
+            and context.occupancy_state == OccupancyState.AWAY
+        )
+        away_off_started_at = _datetime_value(active.get("started_at")) if away_off_ownership_active else None
+        if (
+            away_off_ownership_active
+            and precondition_while_away
+        ):
+            # Away-off is stable planner ownership, not an active tariff
+            # lifecycle. Keep it when no candidate exists, but allow a newly
+            # qualifying away-preconditioning window to replace it directly.
+            active = {}
+        occupancy_allows_preconditioning = context.occupancy_state == OccupancyState.OCCUPIED or (
+            context.occupancy_state == OccupancyState.AWAY and precondition_while_away
+        )
+        if low is None or high is None or current is None or not occupancy_allows_preconditioning:
             return (
                 [self._hvac_release_action(context, now, now + interval, "hvac_required_evidence_lost")]
                 if active
@@ -662,9 +759,29 @@ class DryRunPlanner:
             )
             return actions
 
-        candidate = self._next_hvac_period(context)
+        earliest_start = None
+        allow_immediate_start = False
+        if context.occupancy_state == OccupancyState.AWAY:
+            minimum_cycle = timedelta(minutes=int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES]))
+            if away_off_ownership_active:
+                earliest_start = (away_off_started_at or now) + minimum_cycle
+            else:
+                # This plan will first acquire away-off ownership now, so a
+                # later start must respect the rest period that action creates;
+                # an immediate start does not issue the away-off action.
+                earliest_start = now + minimum_cycle
+                allow_immediate_start = True
+        candidate = self._next_hvac_period(
+            context,
+            earliest_start=earliest_start,
+            allow_immediate_start=allow_immediate_start,
+        )
         if candidate is None:
-            if comfort_boundary_breached and ownership_free_release_allowed:
+            if (
+                comfort_boundary_breached
+                and ownership_free_release_allowed
+                and not away_off_ownership_active
+            ):
                 return [
                     self._hvac_release_action(
                         context,
@@ -735,7 +852,13 @@ class DryRunPlanner:
         )
         return actions
 
-    def _next_hvac_period(self, context: DecisionContext) -> dict[str, Any] | None:
+    def _next_hvac_period(
+        self,
+        context: DecisionContext,
+        *,
+        earliest_start: datetime | None = None,
+        allow_immediate_start: bool = False,
+    ) -> dict[str, Any] | None:
         """Return the earliest thermally feasible relative-price period."""
         if len(context.slots) < 2:
             return None
@@ -794,6 +917,13 @@ class DryRunPlanner:
             best_cost: float | None = None
             passive_drift = _effective_passive_drift_c_per_hour(context, mode, self.thermal_model)
             for possible_start in range(window_start, index):
+                possible_start_at = context.slots[possible_start].valid_at
+                if (
+                    earliest_start is not None
+                    and possible_start_at < earliest_start
+                    and not (allow_immediate_start and possible_start_at <= context.created_at)
+                ):
+                    continue
                 if rate is None or rate <= 0:
                     required_slots = lead_slots
                 else:
@@ -921,7 +1051,15 @@ class DryRunPlanner:
                 "active_cool_rate_c_per_hour": thermal_summary["active_cool_rate_c_per_hour"],
                 "passive_indoor_drift_c_per_hour": thermal_summary["passive_indoor_drift_c_per_hour"],
             },
-            hard_constraints=["occupied_comfort_within_bounds", "manual_hvac_override_inactive", "hvac_min_cycle"],
+            hard_constraints=[
+                (
+                    "away_preconditioning_enabled"
+                    if context.occupancy_state == OccupancyState.AWAY
+                    else "occupied_comfort_within_bounds"
+                ),
+                "manual_hvac_override_inactive",
+                "hvac_min_cycle",
+            ],
             reason_codes=[f"hvac_{phase}"],
             expected_cost_delta=float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
             confidence=confidence_from_context(context),
@@ -1098,29 +1236,73 @@ def confidence_from_health(input_health: InputHealth) -> float:
 
 
 def confidence_from_context(context: DecisionContext) -> float:
-    """Return confidence scalar capped by health and forecast/source confidence."""
-    return round(min(confidence_from_health(context.input_health), context.forecast_confidence), 4)
+    """Return confidence capped by health and required forecast sources."""
+    return _forecast_source_confidence(
+        context,
+        CONF_AMBER_IMPORT_PRICE,
+        CONF_AMBER_EXPORT_PRICE,
+        CONF_PV_FORECAST,
+        CONF_HOUSEHOLD_LOAD,
+    )
 
 
 def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
     """Return confidence by planning subsystem."""
     base = confidence_from_context(context)
+    health = confidence_from_health(context.input_health)
     issue_text = " ".join(issue for issue in context.input_issues if not issue.startswith("advisory_"))
     breakdown = {
         "overall": base,
-        "tariff": _subsystem_confidence(base, issue_text, ("amber_", "price_")),
-        "solar": _subsystem_confidence(base, issue_text, ("pv_forecast", "solar")),
-        "load": _subsystem_confidence(base, issue_text, ("baseline_load", "load_forecast")),
-        "climate": _subsystem_confidence(base, issue_text, ("daikin_", "climate_", "weather_")),
-        "ev": _subsystem_confidence(base, issue_text, ("ev_",)),
-        "enphase": _subsystem_confidence(base, issue_text, ("enphase_", "battery_soc")),
+        "tariff": _subsystem_confidence(
+            _forecast_source_confidence(context, CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE),
+            issue_text,
+            ("amber_", "price_"),
+        ),
+        "solar": _subsystem_confidence(
+            _forecast_source_confidence(context, CONF_PV_FORECAST),
+            issue_text,
+            ("pv_forecast", "solar"),
+        ),
+        "load": _subsystem_confidence(
+            _forecast_source_confidence(context, CONF_HOUSEHOLD_LOAD),
+            issue_text,
+            ("baseline_load", "household_load", "load_forecast"),
+        ),
+        "climate": _subsystem_confidence(
+            _forecast_source_confidence(context, CONF_WEATHER),
+            issue_text,
+            ("daikin_", "climate_", "weather_"),
+        ),
+        "ev": _subsystem_confidence(health, issue_text, ("ev_",)),
+        "enphase": _subsystem_confidence(health, issue_text, ("enphase_", "battery_soc")),
     }
     assets_with_actions = {str(action.asset) for action in actions}
+    subsystem_breakdown = {key: value for key, value in breakdown.items() if key != "overall"}
     return {
         **breakdown,
         "action_assets": sorted(assets_with_actions),
-        "limited_by": min(breakdown, key=lambda key: breakdown[key]),
+        "limited_by": min(subsystem_breakdown, key=lambda key: subsystem_breakdown[key]),
     }
+
+
+def _forecast_source_confidence(context: DecisionContext, *config_keys: str) -> float:
+    """Return health-capped confidence for relevant configured forecast sources."""
+    health = confidence_from_health(context.input_health)
+    by_source = context.forecast_confidence_by_source
+    if not by_source:
+        return round(min(health, context.forecast_confidence), 4)
+    relevant = [float(by_source[key]) for key in config_keys if key in by_source]
+    return round(min([health, *relevant]), 4)
+
+
+def _is_hvac_away_off_action(action: PlanAction) -> bool:
+    """Return whether an action conservatively turns unoccupied HVAC off."""
+    return bool(
+        action.asset == ActionAsset.DAIKIN
+        and action.kind == ActionKind.SET_HVAC
+        and action.desired_state.get("hvac_mode") == "off"
+        and "away_hvac_policy" in action.reason_codes
+    )
 
 
 def _subsystem_confidence(base: float, issue_text: str, issue_markers: tuple[str, ...]) -> float:
@@ -1137,18 +1319,23 @@ def _action_meets_confidence_threshold(
 ) -> bool:
     """Return whether an action clears tariff and device confidence thresholds."""
     breakdown = _confidence_breakdown(context, [action])
-    checks = [("tariff", CONF_MIN_TARIFF_CONFIDENCE)]
-    if action.asset == ActionAsset.DAIKIN:
-        checks.extend([("climate", CONF_MIN_CLIMATE_CONFIDENCE), ("load", CONF_MIN_LOAD_CONFIDENCE)])
-    elif action.asset == ActionAsset.EV:
-        checks.extend([("ev", CONF_MIN_EV_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
-    elif action.asset == ActionAsset.ENPHASE:
-        checks.extend([("enphase", CONF_MIN_ENPHASE_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
-    for key, option in checks:
+    for key, option in _confidence_checks(action.asset):
         threshold = float(options.get(option, 0.0) or 0.0) / 100.0
         if float(breakdown.get(key, 0.0) or 0.0) < threshold:
             return False
     return True
+
+
+def _confidence_checks(asset: ActionAsset) -> list[tuple[str, str]]:
+    """Return confidence components and threshold settings for an asset."""
+    checks = [("tariff", CONF_MIN_TARIFF_CONFIDENCE)]
+    if asset == ActionAsset.DAIKIN:
+        checks.extend([("climate", CONF_MIN_CLIMATE_CONFIDENCE), ("load", CONF_MIN_LOAD_CONFIDENCE)])
+    elif asset == ActionAsset.EV:
+        checks.extend([("ev", CONF_MIN_EV_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
+    elif asset == ActionAsset.ENPHASE:
+        checks.extend([("enphase", CONF_MIN_ENPHASE_CONFIDENCE), ("solar", CONF_MIN_SOLAR_CONFIDENCE)])
+    return checks
 
 
 def _confidence_rejection_reason(
@@ -1173,10 +1360,13 @@ def _confidence_rejection_reason(
     if _action_meets_confidence_threshold(fake_action, context, options):
         return None
     breakdown = _confidence_breakdown(context, [])
-    return (
-        "Skipped because tariff or device confidence is below the configured threshold. "
-        f"Current confidence: {round(float(breakdown.get('overall', 0.0)) * 100, 1)}%."
-    )
+    failures = []
+    for key, option in _confidence_checks(asset):
+        actual = float(breakdown.get(key, 0.0) or 0.0)
+        threshold = float(options.get(option, 0.0) or 0.0) / 100.0
+        if actual < threshold:
+            failures.append(f"{key} {round(actual * 100, 1)}% (requires {round(threshold * 100, 1)}%)")
+    return "Skipped because confidence is below the configured threshold: " + ", ".join(failures) + "."
 
 
 def _decision_audit(
@@ -1418,7 +1608,10 @@ def _rejected_climate_decision(
     confidence_reason = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
     if confidence_reason is not None:
         reason = confidence_reason
-    elif context.occupancy_state != OccupancyState.OCCUPIED:
+    elif context.occupancy_state != OccupancyState.OCCUPIED and not (
+        context.occupancy_state == OccupancyState.AWAY
+        and strict_bool(options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False), default=False)
+    ):
         reason = "Skipped comfort preconditioning because nobody is currently home."
     elif not _comfort_valid(context, float(options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT])):
         reason = "Skipped comfort preconditioning because climate comfort inputs are incomplete."
@@ -1493,14 +1686,17 @@ def _time_range(item: Mapping[str, Any]) -> str:
 
 def _datetime_value(value: Any) -> datetime | None:
     """Return a timezone-aware lifecycle timestamp when valid."""
+    parsed: datetime | None = None
     if isinstance(value, datetime):
-        return value
-    if isinstance(value, str):
+        parsed = value
+    elif isinstance(value, str):
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError:
             return None
-    return None
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _finite_number(value: Any) -> float | None:

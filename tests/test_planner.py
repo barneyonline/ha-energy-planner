@@ -5,7 +5,15 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner import planner as planner_module
-from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
+from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_AMBER_IMPORT_PRICE,
+    CONF_CARBON_INTENSITY_FORECAST,
+    CONF_HOUSEHOLD_LOAD,
+    CONF_PV_FORECAST,
+    CONF_WEATHER,
+    DEFAULT_OPTIONS,
+)
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -276,6 +284,59 @@ def test_plan_confidence_is_capped_by_forecast_confidence() -> None:
 
     assert plan.confidence == 0.62
     assert plan.actions[0].confidence == 0.62
+
+
+def test_optional_forecast_confidence_does_not_cap_required_plan_or_unrelated_action() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    context = _context()
+    context.occupancy_state = OccupancyState.AWAY
+    context.forecast_confidence = 0.1
+    context.forecast_confidence_by_source = {
+        CONF_AMBER_IMPORT_PRICE: 0.9,
+        CONF_AMBER_EXPORT_PRICE: 0.8,
+        CONF_PV_FORECAST: 0.7,
+        CONF_HOUSEHOLD_LOAD: 1.0,
+        CONF_WEATHER: 0.9,
+        CONF_CARBON_INTENSITY_FORECAST: 0.1,
+    }
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.confidence == 0.7
+    assert plan.confidence_breakdown["climate"] == 0.9
+    assert plan.confidence_breakdown["limited_by"] == "solar"
+    assert any("away_hvac_policy" in action.reason_codes for action in plan.actions)
+
+
+def test_climate_confidence_uses_weather_source_instead_of_unrelated_global_minimum() -> None:
+    context = _context()
+    context.forecast_confidence = 0.1
+    context.forecast_confidence_by_source = {
+        CONF_AMBER_IMPORT_PRICE: 0.9,
+        CONF_AMBER_EXPORT_PRICE: 0.8,
+        CONF_PV_FORECAST: 0.7,
+        CONF_HOUSEHOLD_LOAD: 1.0,
+        CONF_WEATHER: 0.4,
+        CONF_CARBON_INTENSITY_FORECAST: 0.1,
+    }
+    action = PlanAction(
+        action_id="climate-confidence",
+        plan_id=context.plan_id,
+        execute_not_before=context.created_at,
+        execute_not_after=context.created_at,
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={"hvac_mode": "heat"},
+        hard_constraints=[],
+        reason_codes=[],
+        expected_cost_delta=None,
+        confidence=1.0,
+    )
+
+    assert not planner_module._action_meets_confidence_threshold(action, context, DEFAULT_OPTIONS)
+    reason = planner_module._confidence_rejection_reason(ActionAsset.DAIKIN, context, DEFAULT_OPTIONS)
+    assert reason is not None
+    assert "climate 40.0%" in reason
 
 
 def test_active_plan_turns_hvac_off_when_away() -> None:
@@ -1400,6 +1461,248 @@ def test_active_plan_preconditions_from_comfort_boundary_before_price_rise() -> 
     assert plan.actions[1].desired_state["phase"] == "peak_coast"
 
 
+def test_active_plan_can_precondition_while_away_when_explicitly_enabled() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+        "hvac_precondition_while_away": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.current_hvac_temperature_c = 18.0
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [
+            (0, 0.10),
+            (5, 0.12),
+            (10, 0.15),
+            (15, 0.14),
+            (20, 0.13),
+            (25, 0.11),
+            (30, 0.45),
+        ]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    assert plan.actions[0].asset == ActionAsset.DAIKIN
+    assert plan.actions[0].desired_state["phase"] == "preconditioning"
+    assert plan.actions[0].desired_state["target_temperature"] == 24.0
+    assert plan.actions[0].hard_constraints[0] == "away_preconditioning_enabled"
+    assert plan.actions[1].desired_state["phase"] == "peak_coast"
+
+
+def test_future_away_preconditioning_keeps_hvac_off_until_window_starts() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+        "hvac_precondition_while_away": True,
+    }
+    thermal_model = {
+        "enabled": True,
+        "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 12.0},
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 23.0
+    context.occupied_temperature_low_c = 18.0
+    context.occupied_temperature_high_c = 24.0
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [
+            (0, 0.10),
+            (5, 0.12),
+            (10, 0.15),
+            (15, 0.14),
+            (20, 0.13),
+            (25, 0.11),
+            (30, 0.45),
+        ]
+    ]
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options, thermal_model=thermal_model).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+    away_off = next(action for action in climate_actions if "away_hvac_policy" in action.reason_codes)
+    preconditioning = next(
+        action for action in climate_actions if action.desired_state.get("phase") == "preconditioning"
+    )
+
+    assert away_off.execute_not_before == context.created_at
+    assert away_off.desired_state == {"hvac_mode": "off"}
+    assert preconditioning.execute_not_before > context.created_at
+
+
+def test_future_away_preconditioning_omits_window_inside_new_away_off_rest_period() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+        "hvac_precondition_while_away": True,
+        "hvac_min_cycle_minutes": 20,
+    }
+    thermal_model = {
+        "enabled": True,
+        "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 12.0},
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 23.0
+    context.occupied_temperature_low_c = 18.0
+    context.occupied_temperature_high_c = 24.0
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [(0, 0.30), (5, 0.20), (10, 0.10), (15, 0.45), (20, 0.10)]
+    ]
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options, thermal_model=thermal_model).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert len(climate_actions) == 1
+    assert climate_actions[0].desired_state == {"hvac_mode": "off"}
+    assert climate_actions[0].reason_codes == ["away_hvac_policy"]
+    assert all(slot.projected_hvac_load_kw == 0.0 for slot in context.slots)
+
+
+def test_away_off_ownership_transitions_to_opted_in_preconditioning() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+        "hvac_precondition_while_away": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.current_hvac_temperature_c = 18.0
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    context.hvac_control = {
+        "phase": "away_off",
+        "started_at": context.created_at - timedelta(minutes=30),
+    }
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [
+            (0, 0.10),
+            (5, 0.12),
+            (10, 0.15),
+            (15, 0.14),
+            (20, 0.13),
+            (25, 0.11),
+            (30, 0.45),
+        ]
+    ]
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert climate_actions[0].kind == ActionKind.SET_HVAC
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].desired_state["target_temperature"] == 24.0
+
+
+def test_away_off_ownership_remains_stable_without_preconditioning_candidate() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_precondition_while_away": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.hvac_control = {"phase": "away_off"}
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert climate_actions == []
+
+
+def test_away_off_ownership_does_not_release_at_comfort_boundary_without_candidate() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_while_away": True,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.current_hvac_temperature_c = 18.0
+    context.occupied_temperature_low_c = 18.0
+    context.occupied_temperature_high_c = 24.0
+    context.hvac_control = {"phase": "away_off"}
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert climate_actions == []
+
+
 def test_active_plan_does_not_precondition_further_past_mode_target_boundary() -> None:
     options = {
         **DEFAULT_OPTIONS,
@@ -2047,9 +2350,11 @@ def test_active_hvac_lifecycle_uses_persisted_tariff_thresholds() -> None:
         "dry_run": False,
         "hvac_precondition_min_price_delta": 0.50,
         "hvac_suppression_min_price_delta": 0.50,
+        "hvac_precondition_while_away": True,
     }
     context = _context()
     context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
     context.current_hvac_temperature_c = 21
     context.occupied_temperature_low_c = 19
     context.occupied_temperature_high_c = 23
@@ -2275,6 +2580,39 @@ def test_hvac_release_bypasses_low_forecast_confidence() -> None:
     assert climate_actions[0].kind == ActionKind.RELEASE_HVAC
 
 
+def test_active_hvac_lifecycle_releases_when_weather_confidence_falls() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    context.forecast_confidence_by_source = {
+        CONF_AMBER_IMPORT_PRICE: 1.0,
+        CONF_AMBER_EXPORT_PRICE: 1.0,
+        CONF_PV_FORECAST: 1.0,
+        CONF_HOUSEHOLD_LOAD: 1.0,
+        CONF_WEATHER: 0.0,
+    }
+    context.hvac_control = {
+        "phase": "preconditioning",
+        "period_start": context.created_at + timedelta(minutes=15),
+        "period_end": context.created_at + timedelta(minutes=30),
+        "baseline_price": 0.10,
+        "mode": "heat",
+    }
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert len(climate_actions) == 1
+    assert climate_actions[0].kind == ActionKind.RELEASE_HVAC
+    assert climate_actions[0].desired_state["release_reason"] == "hvac_confidence_below_threshold"
+
+
 def test_away_transition_releases_active_hvac_lifecycle() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     context = _context()
@@ -2439,6 +2777,7 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5})
 
     assert planner_module._datetime_value("2026-06-27T01:00:00Z") == datetime(2026, 6, 27, 1, tzinfo=UTC)
+    assert planner_module._datetime_value(datetime(2026, 6, 27, 1)) == datetime(2026, 6, 27, 1, tzinfo=UTC)
     assert planner_module._datetime_value("bad") is None
     assert planner._next_hvac_period(context) is None
 
