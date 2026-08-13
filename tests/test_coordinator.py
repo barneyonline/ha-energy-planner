@@ -1008,17 +1008,43 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
 
     helper_coordinator = EnergyPlannerCoordinator(
         FakeHass({"input_boolean.override": "on"}),
-        FakeEntry({CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"}),
+        FakeEntry(
+            {CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+            {"manual_hvac_override_minutes": 45},
+        ),
         FakeStore(),
     )
-    assert helper_coordinator.overrides == [
-        Override(
-            kind="manual_hvac",
-            source="helper",
-            expires_at=None,
-            reason="manual_override_helper_on",
-        )
-    ]
+    assert len(helper_coordinator.overrides) == 1
+    helper_override = helper_coordinator.overrides[0]
+    assert helper_override.kind == "manual_hvac"
+    assert helper_override.source == "helper"
+    assert helper_override.reason == "manual_override_helper_on"
+    assert timedelta(minutes=44) < helper_override.expires_at - datetime.now(UTC) <= timedelta(minutes=45)
+
+    legacy_helper_coordinator = EnergyPlannerCoordinator(
+        FakeHass({"input_boolean.override": "on"}),
+        FakeEntry(
+            {CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+            {"manual_hvac_override_minutes": 30},
+        ),
+        FakeStore(
+            {
+                "overrides": [
+                    {
+                        "kind": "manual_hvac",
+                        "source": "helper",
+                        "expires_at": None,
+                        "reason": "manual_override_helper_on",
+                    }
+                ]
+            }
+        ),
+    )
+    assert len(legacy_helper_coordinator.overrides) == 1
+    assert legacy_helper_coordinator.overrides[0].expires_at is not None
+    assert timedelta(minutes=29) < (
+        legacy_helper_coordinator.overrides[0].expires_at - datetime.now(UTC)
+    ) <= timedelta(minutes=30)
 
     expired_helper_coordinator = EnergyPlannerCoordinator(
         FakeHass({"input_boolean.override": "on"}),
@@ -2901,17 +2927,23 @@ def test_manual_hvac_override_releases_control_when_helper_service_fails() -> No
     assert coordinator._manual_override_helper_guard is None
 
 
-def test_authoritative_manual_override_helper_latches_until_turned_off() -> None:
+def test_manual_override_helper_uses_configured_timeout_and_can_be_cleared() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        options={"manual_hvac_override_minutes": 45},
     )
+    before = datetime.now(UTC)
 
     asyncio.run(coordinator._async_handle_manual_override_helper(True))
 
     assert coordinator.overrides[0].source == "helper"
-    assert coordinator.overrides[0].expires_at is None
+    assert before + timedelta(minutes=45) <= coordinator.overrides[0].expires_at <= datetime.now(UTC) + timedelta(
+        minutes=45
+    )
     assert coordinator.executor.hvac_releases == ["manual_override_helper_on"]
-    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] is None
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] == (
+        coordinator.overrides[0].expires_at
+    )
 
     coordinator.store.data["ownership"]["ev_smart_charging_state"] = "off"
     original_save_overrides = coordinator.store.async_save_overrides
@@ -2966,7 +2998,7 @@ def test_detected_manual_override_does_not_replace_authoritative_helper() -> Non
     helper_override = Override(
         kind="manual_hvac",
         source="helper",
-        expires_at=None,
+        expires_at=datetime.now(UTC) + timedelta(minutes=30),
         reason="manual_override_helper_on",
     )
     coordinator.overrides = [helper_override]
@@ -2981,7 +3013,7 @@ def test_detected_manual_override_does_not_replace_authoritative_helper() -> Non
     assert coordinator.overrides[0] == helper_override
     assert coordinator.overrides[1].source == "service"
     assert coordinator.overrides[1].expires_at is not None
-    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] is None
+    assert coordinator.store.data["ownership"]["manual_hvac_override_expires_at"] == helper_override.expires_at
 
     asyncio.run(coordinator._async_handle_manual_override_helper(False))
 
@@ -3006,6 +3038,12 @@ def test_hvac_control_from_ownership_normalizes_legacy_records() -> None:
             "hvac_release_hold_until": started_at,
         }
     ) == {"phase": "peak_coast", "released_until": started_at}
+    assert _hvac_control_from_ownership(
+        {
+            "hvac_control": {"phase": "away_off", "started_at": "not-a-date"},
+            "planner_takeover_started_at": started_at,
+        }
+    ) == {"phase": "away_off", "started_at": started_at}
 
 
 def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> None:

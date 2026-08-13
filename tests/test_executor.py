@@ -334,10 +334,12 @@ def test_executor_loads_hvac_takeover_timestamp_from_store() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     store = FakeStore()
     store.data["ownership"]["planner_takeover_started_at"] = now.isoformat()
+    store.data["ownership"]["hvac_control"] = {"phase": "away_off"}
 
     ownership = Executor(store)._ownership_from_store()
 
     assert ownership.planner_takeover_started_at == now
+    assert ownership.hvac_control_phase == "away_off"
 
 
 def test_executor_ignores_malformed_ownership_timestamps_from_store() -> None:
@@ -346,6 +348,7 @@ def test_executor_ignores_malformed_ownership_timestamps_from_store() -> None:
         "enphase_profile_changed_at": "not-a-date",
         "planner_takeover_started_at": "also-not-a-date",
         "manual_hvac_override_expires_at": "still-not-a-date",
+        "hvac_control": "not-a-mapping",
     }
 
     ownership = Executor(store)._ownership_from_store()
@@ -353,6 +356,7 @@ def test_executor_ignores_malformed_ownership_timestamps_from_store() -> None:
     assert ownership.enphase_profile_changed_at is None
     assert ownership.planner_takeover_started_at is None
     assert ownership.manual_hvac_override_expires_at is None
+    assert ownership.hvac_control_phase is None
 
 
 def test_executor_rejects_ev_action_when_discovery_fails() -> None:
@@ -2282,6 +2286,9 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
     now = datetime.now(UTC)
+    period_start = now + timedelta(minutes=30)
+    period_end = now + timedelta(hours=2)
+    precondition_end = period_start
     action = PlanAction(
         "hvac-preconditioning",
         "plan-1",
@@ -2291,7 +2298,11 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
         ActionKind.SET_HVAC,
         {
             "phase": "preconditioning",
+            "mode": "heat",
             "hvac_mode": "heat",
+            "period_start": period_start,
+            "period_end": period_end,
+            "precondition_end": precondition_end,
             "target_temperature": 23.0,
             "precondition_min_price_delta": 0.20,
             "suppression_min_price_delta": 0.15,
@@ -2330,6 +2341,10 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
         "climate_automations": {"automation.hvac": "on"},
         "hvac_control": {
             "phase": "preconditioning",
+            "mode": "heat",
+            "period_start": period_start.isoformat(),
+            "period_end": period_end.isoformat(),
+            "precondition_end": precondition_end.isoformat(),
             "zone_states": {"switch.zone": "off"},
         },
         "planner_takeover_started_at": now - timedelta(minutes=1),
@@ -2353,6 +2368,13 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
     context.current_hvac_temperature_c = 21
     context.occupied_temperature_low_c = 19
     context.occupied_temperature_high_c = 23
+    context.hvac_control = {
+        "phase": "preconditioning",
+        "mode": "heat",
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "precondition_end": precondition_end.isoformat(),
+    }
 
     asyncio.run(executor.async_evaluate(plan, context))
 

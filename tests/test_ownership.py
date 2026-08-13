@@ -11,8 +11,10 @@ def test_hvac_ownership_restores_saved_states_once() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     ownership = OwnershipState()
     ownership.begin_hvac_takeover({"automation.climate": "on"}, now)
+    ownership.hvac_control_phase = "preconditioning"
     assert ownership.takeover_active is True
     assert ownership.restore_hvac() == {"automation.climate": "on"}
+    assert ownership.hvac_control_phase is None
     assert ownership.restore_hvac() == {}
     assert ownership.takeover_active is False
 

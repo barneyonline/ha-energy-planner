@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
@@ -173,6 +175,105 @@ def test_hvac_off_allowed_while_away() -> None:
     assert "occupancy_unknown_for_hvac" not in violations
 
 
+@pytest.mark.parametrize("phase", ["preconditioning", "pre_peak_coast", "peak_coast"])
+def test_tariff_preconditioning_can_be_explicitly_allowed_while_away(phase: str) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "hvac_mode": "heat",
+            "mode": "heat",
+            "phase": phase,
+            "target_temperature": 24,
+            "suppress_automations": True,
+            "period_start": now + timedelta(minutes=5),
+            "period_end": now + timedelta(minutes=15),
+            "precondition_end": now + timedelta(minutes=5),
+            "baseline_price": 0.10,
+            "precondition_min_price_delta": 0.20,
+            "suppression_min_price_delta": 0.20,
+        },
+    )
+    action.hard_constraints = ["away_preconditioning_enabled"]
+    action.reason_codes = [f"hvac_{phase}"]
+    context = _context(now)
+    context.occupancy_state = OccupancyState.AWAY
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_precondition_while_away": True,
+    }
+
+    violations = ConstraintValidator(options).validate_action(context, _plan(now, action), action, now=now)
+
+    assert "hvac_action_not_allowed_while_away" not in violations
+
+
+def test_away_preconditioning_opt_in_does_not_allow_other_or_out_of_bounds_hvac_actions() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    context = _context(now)
+    context.occupancy_state = OccupancyState.AWAY
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_precondition_while_away": True,
+        "occupied_temperature_tolerance_percent": 10,
+    }
+    ordinary_action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat"})
+    unsafe_preconditioning = _action(
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "hvac_mode": "heat",
+            "mode": "heat",
+            "phase": "preconditioning",
+            "target_temperature": 30,
+            "suppress_automations": True,
+            "period_start": now + timedelta(minutes=5),
+            "period_end": now + timedelta(minutes=15),
+            "precondition_end": now + timedelta(minutes=5),
+            "baseline_price": 0.10,
+            "precondition_min_price_delta": 0.20,
+            "suppression_min_price_delta": 0.20,
+        },
+    )
+    unsafe_preconditioning.hard_constraints = ["away_preconditioning_enabled"]
+    unsafe_preconditioning.reason_codes = ["hvac_preconditioning"]
+
+    ordinary_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, ordinary_action),
+        ordinary_action,
+        now=now,
+    )
+    unsafe_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, unsafe_preconditioning),
+        unsafe_preconditioning,
+        now=now,
+    )
+
+    assert "hvac_action_not_allowed_while_away" in ordinary_violations
+    assert "hvac_action_not_allowed_while_away" not in unsafe_violations
+    assert "hvac_target_outside_comfort_bounds" in unsafe_violations
+
+    unsafe_preconditioning.desired_state["period_end"] = datetime(2026, 6, 27, 0, 15)
+    malformed_window_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, unsafe_preconditioning),
+        unsafe_preconditioning,
+        now=now,
+    )
+    assert "hvac_action_not_allowed_while_away" in malformed_window_violations
+
+
 def test_hvac_min_cycle_rejects_planner_comfort_action() -> None:
     now = datetime(2026, 6, 27, 0, 10, tzinfo=UTC)
     action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat", "target_temperature": 18})
@@ -231,14 +332,34 @@ def test_hvac_min_cycle_does_not_block_persisted_preconditioning() -> None:
         ActionKind.SET_HVAC,
         {
             "hvac_mode": "heat",
+            "mode": "heat",
             "target_temperature": 24,
             "phase": "preconditioning",
+            "suppress_automations": True,
+            "period_start": now + timedelta(minutes=5),
+            "period_end": now + timedelta(minutes=15),
+            "precondition_end": now + timedelta(minutes=5),
+            "baseline_price": 0.10,
+            "precondition_min_price_delta": 0.20,
+            "suppression_min_price_delta": 0.20,
         },
     )
+    action.hard_constraints = ["occupied_comfort_within_bounds"]
+    action.reason_codes = ["hvac_preconditioning"]
     context = _context(now)
     context.occupied_temperature_low_c = 18
     context.occupied_temperature_high_c = 24
-    ownership = OwnershipState(planner_takeover_started_at=now - timedelta(minutes=10))
+    context.hvac_control = {
+        "phase": "preconditioning",
+        "mode": "heat",
+        "period_start": (now + timedelta(minutes=5)).isoformat(),
+        "period_end": (now + timedelta(minutes=15)).isoformat(),
+        "precondition_end": (now + timedelta(minutes=5)).replace(tzinfo=None),
+    }
+    ownership = OwnershipState(
+        hvac_control_phase="preconditioning",
+        planner_takeover_started_at=now - timedelta(minutes=10),
+    )
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -255,6 +376,86 @@ def test_hvac_min_cycle_does_not_block_persisted_preconditioning() -> None:
     )
 
     assert "hvac_min_cycle_active" not in violations
+
+    context.hvac_control["period_end"] = (now + timedelta(minutes=20)).isoformat()
+    different_lifecycle_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+        ownership=ownership,
+    )
+    assert "hvac_min_cycle_active" in different_lifecycle_violations
+
+    context.hvac_control["period_end"] = "not-a-date"
+    malformed_lifecycle_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+        ownership=ownership,
+    )
+    assert "hvac_min_cycle_active" in malformed_lifecycle_violations
+
+    context.hvac_control["period_end"] = 123
+    unsupported_lifecycle_violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+        ownership=ownership,
+    )
+    assert "hvac_min_cycle_active" in unsupported_lifecycle_violations
+
+
+def test_hvac_min_cycle_blocks_away_off_transition_to_preconditioning() -> None:
+    now = datetime(2026, 6, 27, 0, 10, tzinfo=UTC)
+    action = _action(
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "hvac_mode": "heat",
+            "mode": "heat",
+            "target_temperature": 24,
+            "phase": "preconditioning",
+            "suppress_automations": True,
+            "period_start": now + timedelta(minutes=5),
+            "period_end": now + timedelta(minutes=15),
+            "precondition_end": now + timedelta(minutes=5),
+            "baseline_price": 0.10,
+            "precondition_min_price_delta": 0.20,
+            "suppression_min_price_delta": 0.20,
+        },
+    )
+    action.hard_constraints = ["away_preconditioning_enabled"]
+    action.reason_codes = ["hvac_preconditioning"]
+    context = _context(now)
+    context.occupancy_state = OccupancyState.AWAY
+    context.occupied_temperature_low_c = 18
+    context.occupied_temperature_high_c = 24
+    ownership = OwnershipState(
+        hvac_control_phase="away_off",
+        planner_takeover_started_at=now - timedelta(minutes=1),
+    )
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "hvac_min_cycle_minutes": 20,
+        "hvac_precondition_while_away": True,
+    }
+
+    violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+        ownership=ownership,
+    )
+
+    assert "hvac_min_cycle_active" in violations
+    assert "hvac_action_not_allowed_while_away" not in violations
 
 
 def test_occupied_hvac_target_outside_comfort_bounds_is_rejected() -> None:

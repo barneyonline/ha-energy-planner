@@ -179,6 +179,7 @@ class InputManager:
             horizon,
             interval,
         )
+        carbon_issue = _advisory_issue(carbon_issue)
         training_indices = _forecast_training_indices(horizon, interval)
         self.forecast_training_slots = [
             {
@@ -233,6 +234,7 @@ class InputManager:
             horizon,
             interval,
         )
+        weather_issue = _advisory_issue(weather_issue)
         comfort_low, comfort_low_issue = self._optional_numeric_state(CONF_CLIMATE_TARGET_LOW)
         comfort_high, comfort_high_issue = self._optional_numeric_state(CONF_CLIMATE_TARGET_HIGH)
 
@@ -289,6 +291,11 @@ class InputManager:
 
         input_health = self._health_from_issues(issues)
         forecast_confidence = _combined_confidence(self._forecast_confidence_scores)
+        forecast_confidence_by_source = {
+            str(item["config_key"]): float(item["confidence"])
+            for item in self.forecast_confidence_details
+            if item.get("config_key") is not None
+        }
         return DecisionContext(
             created_at=now,
             plan_id=uuid4().hex,
@@ -333,6 +340,7 @@ class InputManager:
             climate_zone_entities=_split_entity_values(self.entry_data.get(CONF_CLIMATE_ZONES)),
             input_issues=issues,
             forecast_confidence=forecast_confidence,
+            forecast_confidence_by_source=forecast_confidence_by_source,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
         )
 
@@ -628,7 +636,17 @@ class InputManager:
         """Return an optional forecast series without penalizing absent configuration."""
         if not self.entry_data.get(config_key):
             return [None] * int((horizon * 60) / interval), None
-        return self._required_series(config_key, value_keys, value_kind, now, horizon, interval)
+        values, issue = self._required_series(config_key, value_keys, value_kind, now, horizon, interval)
+        if issue is not None and not any(
+            detail.get("config_key") == config_key for detail in self.forecast_confidence_details
+        ):
+            self._record_forecast_confidence(
+                0.0,
+                config_key=config_key,
+                entity_id=str(self.entry_data[config_key]),
+                source="unavailable_state",
+            )
+        return values, issue
 
     def _optional_numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
         entity_id = self.entry_data.get(config_key)
@@ -746,6 +764,12 @@ class InputManager:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
         if not self._valid_state(state):
+            self._record_forecast_confidence(
+                0.0,
+                config_key=config_key,
+                entity_id=str(entity_id),
+                source="unavailable_state",
+            )
             return None, [None] * slot_count, f"{config_key}_unavailable"
         attributes = getattr(state, "attributes", {}) or {}
         value = _attribute_value(attributes, "temperature", "native_temperature", "current_temperature", "temp")
@@ -815,7 +839,8 @@ class InputManager:
                     _FORECAST_VALUE_KEYS_BY_CONFIG[key],
                 )
             ):
-                issues.append(f"{key}_stale")
+                issue = f"{key}_stale"
+                issues.append(_advisory_issue(issue) if key == CONF_CARBON_INTENSITY_FORECAST else issue)
         load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)
         load_state = self._state(load_entity) if load_entity else None
         if load_state and now - load_state.last_updated > forecast_timeout:
@@ -925,6 +950,13 @@ class InputManager:
                         **dict(details),
                     }
                 )
+
+
+def _advisory_issue(issue: str | None) -> str | None:
+    """Mark an optional-source issue as advisory without double-prefixing."""
+    if issue is None or issue.startswith("advisory_"):
+        return issue
+    return f"advisory_{issue}"
 
 
 def _series_value(series: list[float | None], index: int) -> float | None:

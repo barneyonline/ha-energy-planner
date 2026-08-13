@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from math import isfinite
 from typing import Any
 
 from .const import (
@@ -17,6 +18,7 @@ from .const import (
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HVAC_MIN_CYCLE_MINUTES,
+    CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PLANNER_ENABLED,
 )
@@ -264,7 +266,16 @@ class ConstraintValidator:
                     "HVAC action cannot run while occupancy is unknown.",
                 )
             ]
-        if context.occupancy_state == OccupancyState.AWAY and desired_mode != "off":
+        away_preconditioning_allowed = (
+            context.occupancy_state == OccupancyState.AWAY
+            and strict_bool(self.options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False), default=False)
+            and _is_verified_away_preconditioning_action(action)
+        )
+        if (
+            context.occupancy_state == OccupancyState.AWAY
+            and desired_mode != "off"
+            and not away_preconditioning_allowed
+        ):
             violations.append(
                 _action_violation(
                     action,
@@ -272,11 +283,7 @@ class ConstraintValidator:
                     "HVAC comfort action cannot run while all configured people are away.",
                 )
             )
-        lifecycle_continuation = bool(
-            ownership.planner_takeover_started_at is not None
-            and action.desired_state.get("phase")
-            in {"preconditioning", "pre_peak_coast", "peak_coast"}
-        )
+        lifecycle_continuation = _is_same_hvac_lifecycle(context, action, ownership)
         if desired_mode != "off" and not lifecycle_continuation and _hvac_min_cycle_active(
             now,
             ownership,
@@ -301,7 +308,7 @@ class ConstraintValidator:
                 )
             )
         target = action.desired_state.get("target_temperature")
-        if context.occupancy_state == OccupancyState.OCCUPIED and target is not None:
+        if (context.occupancy_state == OccupancyState.OCCUPIED or away_preconditioning_allowed) and target is not None:
             if context.occupied_temperature_low_c is None or context.occupied_temperature_high_c is None:
                 violations.append(
                     _action_violation(
@@ -340,6 +347,86 @@ def _action_violation(action: PlanAction, code: str, message: str) -> Constraint
         asset=action.asset,
         action_id=action.action_id,
     )
+
+
+def _is_verified_away_preconditioning_action(action: PlanAction) -> bool:
+    """Return whether an HVAC-on action carries a complete tariff lifecycle."""
+    desired = action.desired_state
+    phase = desired.get("phase")
+    mode = desired.get("mode")
+    period_start = desired.get("period_start")
+    period_end = desired.get("period_end")
+    precondition_end = desired.get("precondition_end")
+    lifecycle_numbers = (
+        desired.get("target_temperature"),
+        desired.get("baseline_price"),
+        desired.get("precondition_min_price_delta"),
+        desired.get("suppression_min_price_delta"),
+    )
+    valid_numbers = all(
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        for value in lifecycle_numbers
+    )
+    valid_window = False
+    if all(
+        isinstance(value, datetime) and value.tzinfo is not None
+        for value in (period_start, period_end, precondition_end)
+    ):
+        valid_window = precondition_end <= period_start < period_end
+    return bool(
+        phase in {"preconditioning", "pre_peak_coast", "peak_coast"}
+        and desired.get("hvac_mode") == mode
+        and mode in {"heat", "cool"}
+        and valid_numbers
+        and desired.get("suppress_automations") is True
+        and valid_window
+        and "away_preconditioning_enabled" in action.hard_constraints
+        and f"hvac_{phase}" in action.reason_codes
+    )
+
+
+def _is_same_hvac_lifecycle(
+    context: DecisionContext,
+    action: PlanAction,
+    ownership: OwnershipState,
+) -> bool:
+    """Return whether an action continues the exact persisted tariff lifecycle."""
+    persisted = context.hvac_control
+    desired = action.desired_state
+    lifecycle_phases = {"preconditioning", "pre_peak_coast", "peak_coast"}
+    if not (
+        ownership.planner_takeover_started_at is not None
+        and ownership.hvac_control_phase in lifecycle_phases
+        and desired.get("phase") in lifecycle_phases
+        and persisted.get("phase") in lifecycle_phases
+        and persisted.get("mode") in {"heat", "cool"}
+        and desired.get("mode") == persisted.get("mode")
+        and desired.get("hvac_mode") == persisted.get("mode")
+    ):
+        return False
+    return all(
+        _lifecycle_datetime(persisted.get(key)) == _lifecycle_datetime(desired.get(key)) is not None
+        for key in ("period_start", "period_end", "precondition_end")
+    )
+
+
+def _lifecycle_datetime(value: Any) -> datetime | None:
+    """Normalize stored and in-memory lifecycle timestamps for comparison."""
+    parsed: datetime | None = None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 def _action_window_contains(action: PlanAction, now: datetime) -> bool:

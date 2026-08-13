@@ -14,6 +14,7 @@ class OwnershipState:
     enphase_profile_changed_at: datetime | None = None
     climate_automations: dict[str, str] = field(default_factory=dict)
     ev_smart_charging_state: dict[str, str] = field(default_factory=dict)
+    hvac_control_phase: str | None = None
     planner_takeover_started_at: datetime | None = None
     manual_hvac_override_expires_at: datetime | None = None
 
@@ -41,6 +42,7 @@ class OwnershipState:
         """Return saved automation states and clear HVAC ownership."""
         states = dict(self.climate_automations)
         self.climate_automations = {}
+        self.hvac_control_phase = None
         self.planner_takeover_started_at = None
         return states
 
