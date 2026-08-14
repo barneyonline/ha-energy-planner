@@ -513,6 +513,13 @@ Status as of 2026-08-12.
   timestamps. Malformed legacy away-off start evidence uses a valid takeover
   timestamp as its conservative fallback. An active lifecycle releases
   ownership when its relevant confidence falls below threshold.
+- Every integration-owned sensor and binary-sensor attribute payload passes
+  through a shared UTF-8 byte budget below Recorder's hard state-attribute
+  limit. Oversized nested evidence is compacted deterministically while
+  retaining the entity's top-level attribute contract and publishing an
+  `attributes_truncated` marker. Calendar summaries, descriptions, locations,
+  and UIDs have explicit byte bounds; adversarial Unicode and nested-payload
+  tests cover each dynamic entity metadata path.
 - Dry-run actions are recorded as intentionally skipped with the stable
   `dry_run` reason. Plan-wide violations remain on plan health instead of being
   copied to unrelated action rejections, including neutral Enphase restores,

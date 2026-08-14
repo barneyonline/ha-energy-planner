@@ -17,7 +17,12 @@ from .const import (
     CONF_EV_CONTROL_ENABLED,
 )
 from .coordinator import EnergyPlannerCoordinator
-from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .entity import (
+    EnergyPlannerEntity,
+    async_add_planner_entities,
+    recorder_safe_identifier,
+    recorder_safe_text,
+)
 from .models import ActionAsset, ActionKind, PlanAction
 from .safety import strict_bool
 from .sensor import (
@@ -173,10 +178,10 @@ def _ev_charging_event(
     return CalendarEvent(
         start=start,
         end=end,
-        summary="EV: Charging window",
-        description="\n".join(description_lines),
-        location="EV",
-        uid=f"{action.action_id}-window-{index}",
+        summary=recorder_safe_text("EV: Charging window", max_bytes=255),
+        description=recorder_safe_text("\n".join(description_lines), max_bytes=4_096),
+        location=recorder_safe_text("EV", max_bytes=255),
+        uid=recorder_safe_identifier(f"{action.action_id}-window-{index}", max_bytes=255),
     )
 
 
@@ -215,10 +220,10 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
     return CalendarEvent(
         start=action.execute_not_before,
         end=action.execute_not_after,
-        summary=f"{_asset_name(action.asset)}: {details['action']}",
-        description="\n".join(description_lines),
-        location=_asset_name(action.asset),
-        uid=action.action_id,
+        summary=recorder_safe_text(f"{_asset_name(action.asset)}: {details['action']}", max_bytes=255),
+        description=recorder_safe_text("\n".join(description_lines), max_bytes=4_096),
+        location=recorder_safe_text(_asset_name(action.asset), max_bytes=255),
+        uid=recorder_safe_identifier(action.action_id, max_bytes=255),
     )
 
 

@@ -13,6 +13,7 @@ from homeassistant.components.sensor import SensorDeviceClass
 
 from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
+from custom_components.ha_energy_planner.entity import RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -840,6 +841,44 @@ def test_planner_sensor_delegates_value_and_attributes() -> None:
     assert sensor.native_value == "Current"
     assert sensor.native_unit_of_measurement is None
     assert sensor.extra_state_attributes["plan_id"] == "plan-1"
+
+
+def test_next_actions_entity_attributes_stay_below_recorder_budget() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    huge_text = "decision evidence ⚡ " * 2_000
+    actions = [
+        PlanAction(
+            action_id=f"action-{index}-{huge_text}",
+            plan_id="plan-1",
+            execute_not_before=now + timedelta(minutes=index * 5),
+            execute_not_after=now + timedelta(minutes=(index + 1) * 5),
+            asset=ActionAsset.EV,
+            kind=ActionKind.EV_START,
+            desired_state={"detail": huge_text},
+            hard_constraints=[huge_text] * 8,
+            reason_codes=[huge_text] * 8,
+            expected_cost_delta=0.1,
+            confidence=0.9,
+        )
+        for index in range(12)
+    ]
+    plan = _plan(actions=actions)
+    plan.decision_audit = {
+        "summary": huge_text,
+        "policy_order": [huge_text] * 12,
+        "accepted": [
+            {"action_id": action.action_id, **{f"evidence-{field}": huge_text for field in range(20)}}
+            for action in actions
+        ],
+    }
+    description = next(item for item in SENSORS if item.key == "next_actions")
+
+    attrs = PlannerSensor(_coordinator(plan), description).extra_state_attributes
+    encoded_size = len(json.dumps(attrs, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    assert encoded_size <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
+    assert attrs["attributes_truncated"] is True
+    assert attrs["action_count"] == 12
 
 
 def test_estimated_cost_sensor_uses_home_assistant_currency_and_horizon() -> None:
