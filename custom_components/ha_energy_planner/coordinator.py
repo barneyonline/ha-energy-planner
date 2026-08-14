@@ -97,6 +97,12 @@ _LOGGER = logging.getLogger(__name__)
 
 _AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 
+STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
+STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 5
+STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS = 30
+STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
+_STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset({"waiting", "restoring", "validating"})
+
 _LOAD_FORECAST_TRAINING_DEFERRED_REASONS = frozenset(
     {
         "load_forecast_household_load_not_configured",
@@ -159,6 +165,58 @@ def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
         if check.get("blocking") and not check.get("ok"):
             return str(check.get("message") or "a safety check failed")
     return str(report.get("current_plan", {}).get("message") or "a safety check failed")
+
+
+def _startup_auto_recovery_prerequisites(
+    report: dict[str, Any],
+    entry_data: dict[str, Any],
+) -> tuple[bool, str]:
+    """Return whether startup dependencies are ready without trusting bypasses."""
+    entities = dict(report.get("entities", {}))
+    if entities.get("missing") or entities.get("unavailable"):
+        return False, "configured_entities_unavailable"
+    services = dict(report.get("services", {}))
+    if services.get("missing") or services.get("unavailable"):
+        return False, "configured_services_unavailable"
+    control_areas = dict(report.get("control_areas", {}))
+    required = list(control_areas.get("required", []))
+    if not required:
+        return False, "no_required_control_areas"
+    discovery = dict(report.get("discovery", {}))
+    if any(not bool(dict(discovery.get(area, {})).get("supported")) for area in required):
+        return False, "required_control_area_unsupported"
+    if entry_data.get(CONF_HOUSEHOLD_LOAD) and not bool(dict(report.get("recorder", {})).get("available")):
+        return False, "recorder_unavailable"
+    checks = {str(item.get("check")): item for item in report.get("checks", []) if isinstance(item, dict)}
+    if not bool(checks.get("control_not_paused", {}).get("ok")):
+        return False, "control_paused"
+    return True, "startup_dependencies_ready"
+
+
+def _startup_auto_recovery_validation_ready(
+    report: dict[str, Any],
+    entry_data: dict[str, Any],
+) -> tuple[bool, str]:
+    """Return whether a committed recovery plan passes all non-production gates."""
+    ready, reason = _startup_auto_recovery_prerequisites(report, entry_data)
+    if not ready:
+        return ready, reason
+    if not bool(dict(report.get("current_plan", {})).get("safe")):
+        return False, "current_plan_unsafe"
+    return True, "validation_succeeded"
+
+
+def _action_outcome_failed(outcome: Any) -> bool:
+    """Return whether a restore outcome explicitly reports failure."""
+    result = getattr(outcome, "result", None)
+    return str(getattr(result, "value", result)).lower() == "failed"
+
+
+def _startup_auto_recovery_successful_runs(value: Any) -> int:
+    """Return a bounded fail-closed recovery progress counter."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return 0
+    return min(value, STARTUP_AUTO_RECOVERY_REQUIRED_RUNS)
 
 
 _HVAC_CONTROL_ATTRIBUTE_KEYS = frozenset(
@@ -291,6 +349,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._ai_advice_pending_reason: str | None = None
         self._ai_current_plan_fingerprint: str | None = None
         self._ai_current_plan_safe = False
+        self._startup_auto_recovery_authorized = False
+        self._startup_auto_recovery_deadline: float | None = None
+        self._startup_auto_recovery_task: asyncio.Task[None] | None = None
+        self._startup_auto_recovery_wakeup = asyncio.Event()
+        self._startup_auto_recovery_validation_active = False
+        self._last_startup_auto_recovery_validation: dict[str, Any] | None = None
         self.last_refresh_metadata: dict[str, Any] = {}
         super().__init__(
             hass,
@@ -361,6 +425,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         @callback
         def _handle_state_change(event: Any) -> None:
+            self._wake_startup_auto_recovery()
             entry_data = self.entry_data
             now = dt_util.utcnow()
             if _is_planner_owned_control_feedback(
@@ -404,6 +469,24 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass.async_create_task(self._async_handle_manual_override_helper(True))
         elif helper_value == "off" and helper_override_active:
             self.hass.async_create_task(self._async_handle_manual_override_helper(False))
+
+    def async_start_startup_auto_recovery(self) -> None:
+        """Start a bounded recovery task authorized during startup reconciliation."""
+        if not getattr(self, "_startup_auto_recovery_authorized", False):
+            return
+        task = getattr(self, "_startup_auto_recovery_task", None)
+        if task is not None and not task.done():
+            return
+        self._startup_auto_recovery_task = self.hass.async_create_task(
+            self._async_run_startup_auto_recovery()
+        )
+
+    @callback
+    def _wake_startup_auto_recovery(self) -> None:
+        """Wake a recovery task waiting for startup dependencies."""
+        event = getattr(self, "_startup_auto_recovery_wakeup", None)
+        if event is not None:
+            event.set()
 
     def _start_load_forecast_source_listener(self, entry_data: dict[str, Any]) -> None:
         """Retry startup training once when the mapped load source appears."""
@@ -459,6 +542,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if ai_task is not None and not ai_task.done():
             ai_task.cancel()
         self._ai_advice_task = None
+        recovery_task = getattr(self, "_startup_auto_recovery_task", None)
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+        self._startup_auto_recovery_task = None
+        self._startup_auto_recovery_authorized = False
+        self._startup_auto_recovery_deadline = None
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
 
@@ -656,6 +745,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 plan.status = "unsafe"
             if plan.mode == PlannerMode.ACTIVE_HEALTHY:
                 plan.mode = PlannerMode.ACTIVE_DEGRADED
+        self._record_startup_auto_recovery_validation_candidate(plan, violations)
         await self.executor.async_notify_plan_fallback(plan, violations)
         await self.store.async_add_forecast_snapshot(
             {
@@ -711,14 +801,370 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_reconcile_production_evidence_contract(self) -> bool:
         """Restore and disarm when the reviewed production contract changed."""
         production = parse_production_state(self.store.data.get("production"))
+        recovery = production.raw.get("startup_auto_recovery")
+        interrupted_recovery = bool(
+            isinstance(recovery, dict) and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+        )
+        if interrupted_recovery and isinstance(recovery, dict):
+            await self._async_update_startup_auto_recovery(
+                "interrupted",
+                successful_runs=_startup_auto_recovery_successful_runs(recovery.get("successful_runs")),
+                reason="startup_restarted_before_recovery_completed",
+                completed=True,
+            )
+            production = parse_production_state(self.store.data.get("production"))
+            if production.armed:
+                await self.async_disarm_production_control("startup_auto_recovery_interrupted")
+                await self.async_restore_safe_state("startup_auto_recovery_interrupted", refresh=False)
+                return True
         if not production.armed or production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
             self.entry_data,
             self.options,
         ):
             return False
+        was_active = self.active_control
+        if was_active:
+            self._startup_auto_recovery_authorized = True
+            self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+            await self._async_update_startup_auto_recovery(
+                "waiting",
+                successful_runs=0,
+                reason="production_evidence_contract_changed",
+                started=True,
+            )
         await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
         await self.async_disarm_production_control("production_evidence_contract_changed")
         return True
+
+    async def async_cancel_startup_auto_recovery(self, reason: str) -> None:
+        """Cancel startup recovery without treating persisted progress as authorization."""
+        store_data = getattr(getattr(self, "store", None), "data", None)
+        recovery = (
+            parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
+            if isinstance(store_data, dict)
+            else None
+        )
+        recovery_active = bool(
+            getattr(self, "_startup_auto_recovery_authorized", False)
+            or (isinstance(recovery, dict) and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES)
+        )
+        restore_interrupted = bool(
+            recovery_active and isinstance(recovery, dict) and recovery.get("status") == "restoring"
+        )
+        self._startup_auto_recovery_authorized = False
+        self._startup_auto_recovery_deadline = None
+        task = getattr(self, "_startup_auto_recovery_task", None)
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if not isinstance(store_data, dict):
+            return
+        production = parse_production_state(store_data.get("production"))
+        recovered_control_armed = bool(
+            recovery_active
+            and production.armed
+            and production.raw.get("armed_reason") == "startup_auto_recovered"
+        )
+        if recovered_control_armed:
+            await self.async_disarm_production_control(f"startup_auto_recovery_cancelled:{reason}")
+        if restore_interrupted or recovered_control_armed:
+            try:
+                await self.async_restore_safe_state(
+                    f"startup_auto_recovery_cancelled:{reason}",
+                    refresh=False,
+                )
+            except Exception:  # noqa: BLE001 - the production gate is already disarmed.
+                _LOGGER.exception("Could not restore safe state after startup recovery cancellation")
+        recovery = parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
+        if not recovery_active or not isinstance(recovery, dict):
+            return
+        await self._async_update_startup_auto_recovery(
+            "cancelled",
+            successful_runs=_startup_auto_recovery_successful_runs(recovery.get("successful_runs")),
+            reason=reason,
+            completed=True,
+        )
+
+    async def _async_run_startup_auto_recovery(self) -> None:
+        """Wait for startup dependencies and validate before restoring active control."""
+        deadline = getattr(self, "_startup_auto_recovery_deadline", None)
+        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+            recovery = parse_production_state(self.store.data.get("production")).raw.get(
+                "startup_auto_recovery"
+            )
+            persisted_deadline = _parse_datetime_or_none(
+                recovery.get("deadline") if isinstance(recovery, dict) else None
+            )
+            remaining = STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+            if persisted_deadline is not None and getattr(persisted_deadline, "tzinfo", None) is not None:
+                remaining = min(
+                    max((persisted_deadline - dt_util.utcnow()).total_seconds(), 0.0),
+                    STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS,
+                )
+            deadline = monotonic() + remaining
+            self._startup_auto_recovery_deadline = deadline
+        successful_runs = 0
+        try:
+            while self._startup_auto_recovery_authorized:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    await self._async_update_startup_auto_recovery(
+                        "timed_out",
+                        successful_runs=successful_runs,
+                        reason="startup_dependencies_not_ready",
+                        completed=True,
+                    )
+                    return
+                report = build_preflight_report(self.hass, self)
+                ready, reason = _startup_auto_recovery_prerequisites(report, self.entry_data)
+                if ready:
+                    break
+                await self._async_update_startup_auto_recovery(
+                    "waiting",
+                    successful_runs=0,
+                    reason=reason,
+                )
+                await self._async_wait_for_startup_auto_recovery_wakeup(
+                    min(remaining, STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS)
+                )
+
+            if not self._startup_auto_recovery_authorized:
+                return
+            await self._async_update_startup_auto_recovery(
+                "restoring",
+                successful_runs=0,
+                reason="startup_dependencies_ready",
+            )
+            restore = await self.async_restore_safe_state("startup_auto_recovery", refresh=False)
+            if _action_outcome_failed(restore):
+                await self._async_update_startup_auto_recovery(
+                    "failed",
+                    successful_runs=0,
+                    reason=str(getattr(restore, "reason", "safe_state_restore_failed")),
+                    completed=True,
+                )
+                return
+
+            while self._startup_auto_recovery_authorized:
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    await self._async_update_startup_auto_recovery(
+                        "timed_out",
+                        successful_runs=successful_runs,
+                        reason="validation_deadline_expired",
+                        completed=True,
+                    )
+                    return
+                await self._async_update_startup_auto_recovery(
+                    "validating",
+                    successful_runs=successful_runs,
+                    reason="validation_in_progress",
+                )
+                validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
+                if not validation_ok:
+                    successful_runs = 0
+                    await self._async_update_startup_auto_recovery(
+                        "waiting",
+                        successful_runs=0,
+                        reason=reason,
+                    )
+                    await self._async_wait_for_startup_auto_recovery_wakeup(
+                        min(deadline - monotonic(), STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS)
+                    )
+                    continue
+                successful_runs += 1
+                await self._async_update_startup_auto_recovery(
+                    "validating",
+                    successful_runs=successful_runs,
+                    reason="validation_succeeded",
+                )
+                if successful_runs >= STARTUP_AUTO_RECOVERY_REQUIRED_RUNS:
+                    break
+                await asyncio.sleep(
+                    min(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS, max(deadline - monotonic(), 0))
+                )
+
+            if not self._startup_auto_recovery_authorized:
+                return
+            production = parse_production_state(self.store.data.get("production")).raw
+            production.update(
+                {
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                        self.entry_data,
+                        self.options,
+                    ),
+                    "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
+                    "last_dry_run_ready_at": dt_util.utcnow(),
+                }
+            )
+            await self._async_save_production(production)
+            report = build_preflight_report(self.hass, self)
+            final_ready, _final_reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
+            if not final_ready or not report.get("safe_to_activate_now"):
+                await self._async_update_startup_auto_recovery(
+                    "failed",
+                    successful_runs=successful_runs,
+                    reason="final_preflight_failed",
+                    completed=True,
+                )
+                return
+            await self.async_arm_production_control("startup_auto_recovered")
+            try:
+                await self.async_request_replan()
+            except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
+                _LOGGER.exception("Startup automatic-control activation refresh failed")
+                await self._async_fail_startup_auto_recovery_after_activation(
+                    "startup_auto_recovery_replan_failed",
+                    successful_runs=successful_runs,
+                    failure_reason="active_replan_failed",
+                )
+                return
+            final_report = build_preflight_report(self.hass, self)
+            final_ready, _final_reason = _startup_auto_recovery_validation_ready(
+                final_report,
+                self.entry_data,
+            )
+            if not final_ready or not final_report.get("active_control_ready"):
+                await self._async_fail_startup_auto_recovery_after_activation(
+                    "startup_auto_recovery_replan_unsafe",
+                    successful_runs=successful_runs,
+                    failure_reason="active_replan_unsafe",
+                )
+                return
+            self._startup_auto_recovery_authorized = False
+            await self._async_update_startup_auto_recovery(
+                "recovered",
+                successful_runs=successful_runs,
+                reason="automatic_control_reactivated",
+                completed=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - startup recovery is strictly fail closed.
+            _LOGGER.exception("Unexpected startup automatic-control recovery failure")
+            production = parse_production_state(self.store.data.get("production"))
+            if production.armed and production.raw.get("armed_reason") == "startup_auto_recovered":
+                await self._async_fail_startup_auto_recovery_after_activation(
+                    "startup_auto_recovery_unexpected_failure",
+                    successful_runs=successful_runs,
+                    failure_reason="unexpected_recovery_error",
+                )
+            else:
+                await self._async_update_startup_auto_recovery(
+                    "failed",
+                    successful_runs=successful_runs,
+                    reason="unexpected_recovery_error",
+                    completed=True,
+                )
+
+    async def _async_fail_startup_auto_recovery_after_activation(
+        self,
+        disarm_reason: str,
+        *,
+        successful_runs: int,
+        failure_reason: str,
+    ) -> None:
+        """Disarm and restore every planner-owned asset after activation fails."""
+        await self.async_disarm_production_control(disarm_reason)
+        try:
+            await self.async_restore_safe_state(disarm_reason, refresh=False)
+        except Exception:  # noqa: BLE001 - disarming remains authoritative.
+            _LOGGER.exception("Could not restore safe state after startup recovery activation failed")
+        await self._async_update_startup_auto_recovery(
+            "failed",
+            successful_runs=successful_runs,
+            reason=failure_reason,
+            completed=True,
+        )
+
+    async def _async_run_startup_auto_recovery_validation(self) -> tuple[bool, str]:
+        """Run one forced refresh while suppressing every device action."""
+        self._startup_auto_recovery_validation_active = True
+        self._last_startup_auto_recovery_validation = None
+        try:
+            self._mark_forced_refresh("startup_auto_recovery_validation")
+            await self.async_request_refresh()
+        except Exception:  # noqa: BLE001 - one failed validation resets the sequence.
+            _LOGGER.exception("Startup automatic-control validation refresh failed")
+            return False, "validation_refresh_failed"
+        finally:
+            self._startup_auto_recovery_validation_active = False
+        validation = self._last_startup_auto_recovery_validation
+        if not isinstance(validation, dict) or validation.get("committed") is not True:
+            return False, "validation_plan_not_committed"
+        if validation.get("healthy") is not True or validation.get("violations"):
+            return False, "validation_plan_unsafe"
+        report = build_preflight_report(self.hass, self)
+        ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
+        return (True, "validation_succeeded") if ready else (False, reason)
+
+    def _record_startup_auto_recovery_validation_candidate(
+        self,
+        plan: EnergyPlan,
+        violations: list[str],
+    ) -> None:
+        """Capture one validation candidate before the generation-safe commit."""
+        if not getattr(self, "_startup_auto_recovery_validation_active", False):
+            return
+        self._last_startup_auto_recovery_validation = {
+            "plan_id": plan.plan_id,
+            "healthy": plan.health == InputHealth.HEALTHY and plan.status != "unsafe",
+            "violations": list(violations),
+            "committed": False,
+        }
+
+    async def _async_wait_for_startup_auto_recovery_wakeup(self, delay: float) -> None:
+        """Wait for a relevant state change or a bounded readiness poll."""
+        if delay <= 0:
+            return
+        event = self._startup_auto_recovery_wakeup
+        event.clear()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=delay)
+        except TimeoutError:
+            pass
+
+    async def _async_update_startup_auto_recovery(
+        self,
+        status: str,
+        *,
+        successful_runs: int,
+        reason: str,
+        started: bool = False,
+        completed: bool = False,
+    ) -> None:
+        """Persist compact recovery progress for entities and diagnostics."""
+        production = parse_production_state(self.store.data.get("production")).raw
+        current = production.get("startup_auto_recovery")
+        recovery = dict(current) if isinstance(current, dict) else {}
+        now = dt_util.utcnow()
+        recovery.update(
+            {
+                "status": status,
+                "successful_runs": _startup_auto_recovery_successful_runs(successful_runs),
+                "required_runs": STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
+                "last_reason": str(reason)[:160],
+                "updated_at": now,
+            }
+        )
+        if started:
+            recovery.update(
+                {
+                    "started_at": now,
+                    "deadline": now + timedelta(seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS),
+                }
+            )
+            recovery.pop("completed_at", None)
+        if completed:
+            self._startup_auto_recovery_authorized = False
+            self._startup_auto_recovery_deadline = None
+            recovery["completed_at"] = now
+        production["startup_auto_recovery"] = recovery
+        await self._async_save_production(production)
+        self.async_update_listeners()
 
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
@@ -727,6 +1173,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             previous_option_state = getattr(self, "_last_handled_options", None)
             if option_state == previous_option_state:
                 return
+            await self.async_cancel_startup_auto_recovery("options_changed")
 
             current_options = {**DEFAULT_OPTIONS, **option_state}
             self.executor.options = current_options
@@ -1043,6 +1490,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.options
         options[CONF_PLANNER_ENABLED] = True
         if not enabled:
+            await self.async_cancel_startup_auto_recovery("automatic_control_disabled")
             options[CONF_DRY_RUN] = True
             self.hass.config_entries.async_update_entry(self.entry, options=options)
             await self.async_handle_options_update()
@@ -1316,6 +1764,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.store.async_save_plan(plan)
         self.executor.options = options
         self.executor.entry_data = self.entry_data
+        if getattr(self, "_startup_auto_recovery_validation_active", False):
+            validation = getattr(self, "_last_startup_auto_recovery_validation", None)
+            if isinstance(validation, dict) and validation.get("plan_id") == plan.plan_id:
+                validation["committed"] = True
+            # Recovery validation is deliberately non-commanding, including
+            # planner-owned safety-stop paths that may normally bypass arming.
+            return plan
         consumed_action = await self.executor.async_evaluate(plan, context)
         evaluated_action = consumed_action if consumed_action in plan.actions else plan.next_action
         for action in plan.actions:

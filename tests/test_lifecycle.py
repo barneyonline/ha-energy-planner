@@ -171,6 +171,8 @@ class FakeCoordinator:
         self.restore_calls: list[tuple[str, bool]] = []
         self.replan_count = 0
         self.disarm_calls: list[str] = []
+        self.auto_recovery_start_count = 0
+        self.auto_recovery_cancel_reasons: list[str] = []
         self.lifecycle_calls: list[str] = []
         self.restore_outcome = SimpleNamespace(result=OutcomeResult.RESTORED)
         FakeCoordinator.last_instance = self
@@ -180,6 +182,12 @@ class FakeCoordinator:
 
     async def async_reconcile_production_evidence_contract(self) -> bool:
         return False
+
+    def async_start_startup_auto_recovery(self) -> None:
+        self.auto_recovery_start_count += 1
+
+    async def async_cancel_startup_auto_recovery(self, reason: str) -> None:
+        self.auto_recovery_cancel_reasons.append(reason)
 
     def async_start_listeners(self) -> None:
         self.start_count += 1
@@ -225,6 +233,7 @@ def test_unload_restores_safe_state_without_refresh() -> None:
 
     assert result is True
     assert coordinator.shutdown_count == 1
+    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.lifecycle_calls == ["shutdown", "restore"]
     assert entry.runtime_data is None
@@ -246,6 +255,7 @@ def test_unload_stops_when_safe_state_restore_fails() -> None:
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.shutdown_count == 1
     assert coordinator.start_count == 1
+    assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
     assert coordinator.lifecycle_calls == ["shutdown", "restore", "start"]
     assert coordinator.replan_count == 0
     assert coordinator.disarm_calls == ["entry_unload_restore_failed"]
@@ -472,6 +482,8 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     assert coordinator is not None
     assert coordinator.first_refresh_count == 1
     assert coordinator.start_count == 1
+    assert coordinator.auto_recovery_start_count == 1
+    assert coordinator.auto_recovery_cancel_reasons == ["setup_entry_failed"]
     assert coordinator.shutdown_count == 1
     assert coordinator.restore_calls == [("setup_entry_failed", False)]
     assert entry.runtime_data is None

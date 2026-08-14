@@ -754,6 +754,33 @@ def test_production_readiness_supports_ev_only_installation() -> None:
     assert production.value_fn(coordinator) == "Armed"
 
 
+def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={"ev_control_enabled": True},
+        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        store_data={
+            "production": {
+                "startup_auto_recovery": {
+                    "status": "validating",
+                    "successful_runs": 2,
+                    "required_runs": 3,
+                    "deadline": "2026-08-14T12:10:00+00:00",
+                    "last_reason": "validation_succeeded",
+                }
+            }
+        },
+    )
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+
+    attrs = production.attrs_fn(coordinator)
+
+    assert attrs["startup_auto_recovery_status"] == "validating"
+    assert attrs["startup_auto_recovery_successful_runs"] == 2
+    assert attrs["startup_auto_recovery_required_runs"] == 3
+    assert attrs["startup_auto_recovery_last_reason"] == "validation_succeeded"
+
+
 def test_production_readiness_blocks_armed_mismatched_contract() -> None:
     coordinator = _coordinator(
         _plan(),
