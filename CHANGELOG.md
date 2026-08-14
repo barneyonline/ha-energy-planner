@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- The Plan calendar now omits actions and EV charging windows for device-control
+  areas whose Climate control, EV control, or Enphase control switch is off.
+
 ## 0.9.8 - 2026-08-13
 
 ### Added
