@@ -42,7 +42,7 @@ from .coordinator import (
     _ai_recommendation_fingerprint,
     _material_plan_fingerprint,
 )
-from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .entity import EnergyPlannerEntity, async_add_planner_entities, recorder_safe_attributes
 from .load_forecast import MIN_UPPER_COVERAGE
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .preflight import _control_area_report, production_evidence_fingerprint
@@ -392,7 +392,7 @@ class PlannerSensor(EnergyPlannerEntity, SensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return state attributes."""
-        return self.entity_description.attrs_fn(self.coordinator)
+        return recorder_safe_attributes(self.entity_description.attrs_fn(self.coordinator))
 
 
 def _controlled_state_summary(coordinator: EnergyPlannerCoordinator) -> str:

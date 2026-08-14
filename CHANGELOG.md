@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixed
+
+- Recorder-facing sensor and binary-sensor attributes now use a shared 12 KiB
+  byte budget with deterministic compaction, preventing oversized
+  `next_actions` decision evidence from exceeding Home Assistant's 16 KiB
+  state-attribute limit. Calendar event metadata is byte-bounded as well.
+
 ## 0.9.8 - 2026-08-13
 
 ### Added
