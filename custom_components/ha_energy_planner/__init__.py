@@ -336,11 +336,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
+        start_auto_recovery = getattr(coordinator, "async_start_startup_auto_recovery", None)
+        if callable(start_auto_recovery):
+            start_auto_recovery()
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         _async_sync_planner_device(hass, entry)
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
         entry.async_on_unload(coordinator.async_shutdown)
     except Exception:
+        cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
+        if callable(cancel_auto_recovery):
+            await cancel_auto_recovery("setup_entry_failed")
         coordinator.async_shutdown()
         await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
         entry.runtime_data = None
@@ -354,6 +360,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     # Stop new listener/timer work before waiting for any in-flight planner
     # execution. The coordinator's teardown marker also prevents an already
     # queued refresh from committing a new device command after restoration.
+    cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
+    if callable(cancel_auto_recovery):
+        await cancel_auto_recovery("entry_unload")
     coordinator.async_shutdown()
     unload_completed = False
     try:

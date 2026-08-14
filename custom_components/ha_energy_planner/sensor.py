@@ -38,6 +38,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import (
+    STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
     EnergyPlannerCoordinator,
     _ai_recommendation_fingerprint,
     _material_plan_fingerprint,
@@ -1734,6 +1735,8 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
     """Return production gate attributes."""
     production_state = parse_production_state(coordinator.store.data.get("production"))
     production = production_state.raw
+    startup_recovery = production.get("startup_auto_recovery")
+    startup_recovery = dict(startup_recovery) if isinstance(startup_recovery, dict) else {}
     device_controls = {
         "ev": strict_bool(coordinator.options.get(CONF_EV_CONTROL_ENABLED), default=False),
         "climate": strict_bool(coordinator.options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
@@ -1768,6 +1771,13 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "device_controls": device_controls,
         "required_control_areas": required_areas,
         "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
+        "startup_auto_recovery_status": startup_recovery.get("status", "inactive"),
+        "startup_auto_recovery_successful_runs": startup_recovery.get("successful_runs", 0),
+        "startup_auto_recovery_required_runs": startup_recovery.get(
+            "required_runs", STARTUP_AUTO_RECOVERY_REQUIRED_RUNS
+        ),
+        "startup_auto_recovery_deadline": startup_recovery.get("deadline"),
+        "startup_auto_recovery_last_reason": startup_recovery.get("last_reason"),
     }
 
 

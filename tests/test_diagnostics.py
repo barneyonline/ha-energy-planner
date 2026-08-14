@@ -68,6 +68,12 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
                 {
                     "discovery": {"longitude": 145.1, "status": "ok"},
                     "haeo_runs": [{"baseline": {"status": "stale"}}],
+                    "production": {
+                        "startup_auto_recovery": {
+                            "status": "validating",
+                            "successful_runs": 2,
+                        }
+                    },
                 }
             ),
         ),
@@ -81,6 +87,7 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
     assert diagnostics["entry"]["options"]["password"] == "**REDACTED**"
     assert diagnostics["store"]["discovery"]["longitude"] == "**REDACTED**"
     assert diagnostics["store"]["discovery"]["status"] == "ok"
+    assert diagnostics["startup_auto_recovery"] == {"status": "validating", "successful_runs": 2}
 
 
 def test_diagnostics_redacts_prompts_addresses_and_raw_model_payloads() -> None:

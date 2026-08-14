@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Added
+
+- Added bounded startup recovery for installations that were actively controlling
+  devices before a production-evidence contract transition. Energy Planner waits
+  up to ten minutes for required Home Assistant entities and services, retries
+  safe-state restoration, and reactivates automatic control only after three
+  consecutive non-commanding healthy plans five seconds apart. Recovery never
+  overrides an operator stop, a configuration change, or a later runtime outage.
+
 ### Fixed
 
 - Recorder-facing sensor and binary-sensor attributes now use a shared 12 KiB
