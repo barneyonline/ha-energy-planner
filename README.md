@@ -99,6 +99,8 @@ The model requires:
 
 The diagnostic **Load forecast coverage score** sensor shows the latest evaluated holdout coverage percentage and required 90% threshold. If a retraining attempt fails the threshold and the prior safe model is retained, the sensor shows the new attempted score while its attributes identify the active model score and evaluation time. The default-off **Bypass safety gates** setting waives this threshold, production preflight, and dry-run evidence requirements when an operator explicitly accepts reduced protection. It does not hide service failures or device feedback results.
 
+Energy Planner keeps all sensor, binary-sensor, and calendar metadata below Home Assistant Recorder's state-attribute limit. Exceptionally large decision evidence is compacted and marked with `attributes_truncated: true`; full operational evidence remains available through the support bundle instead of being written into every Recorder state row.
+
 Training runs at startup, after a source change, and at most every six hours. Replanning cannot create missing history. While the status is `learning`, plans remain visible but forecast-dependent active commands are blocked. Models are `ready` through 24 hours old, `degraded` from 24 to 72 hours, and `stale` after 72 hours.
 
 Changing the load mapping disarms production control and requires fresh review cycles. Routine retraining does not.
