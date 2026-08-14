@@ -246,6 +246,25 @@ def test_calendar_renders_missing_action_load_values_as_unknown() -> None:
     assert "expected unknown kW; conservative unknown kW" in description
 
 
+def test_calendar_event_metadata_is_bounded_for_recorder() -> None:
+    now = datetime.now(UTC)
+    huge_text = "calendar evidence ⚡ " * 2_000
+    action = replace(
+        _action(huge_text, now + timedelta(minutes=10), now + timedelta(minutes=15)),
+        desired_state={"detail": huge_text},
+        hard_constraints=[huge_text],
+        reason_codes=[huge_text],
+    )
+
+    event = EnergyPlannerCalendar(_coordinator(_plan([action]))).event
+
+    assert event is not None
+    assert len((event.summary or "").encode("utf-8")) <= 255
+    assert len((event.description or "").encode("utf-8")) <= 4_096
+    assert len((event.location or "").encode("utf-8")) <= 255
+    assert len((event.uid or "").encode("utf-8")) <= 255
+
+
 def test_calendar_platform_adds_one_system_calendar(monkeypatch: object) -> None:
     coordinator = _coordinator(_plan([]))
     entry = SimpleNamespace(runtime_data=coordinator)

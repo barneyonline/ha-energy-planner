@@ -19,7 +19,7 @@ from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, EV_RESERVATION_EXTERNAL_BASELINE
 from .coordinator import EnergyPlannerCoordinator
-from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .entity import EnergyPlannerEntity, async_add_planner_entities, recorder_safe_attributes
 from .models import InputHealth
 from .preflight import _control_area_report, production_evidence_fingerprint
 from .safety import DRY_RUN_READY_CYCLES_REQUIRED, control_pause_reason, parse_production_state
@@ -173,4 +173,4 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return binary sensor attributes."""
-        return self.entity_description.attrs_fn(self.coordinator)
+        return recorder_safe_attributes(self.entity_description.attrs_fn(self.coordinator))

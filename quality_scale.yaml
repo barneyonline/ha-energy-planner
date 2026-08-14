@@ -327,16 +327,22 @@ rules:
         - scripts/docker-ha-smoke.sh
   diagnostics:
     status: done
-    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice. The Explain control also publishes bounded pending, accepted, rejected, and failure notifications while recorder-facing sensor attributes use compact summaries.
+    comment: Redacted diagnostics include bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice. The Explain control also publishes bounded pending, accepted, rejected, and failure notifications. Every recorder-facing sensor and binary-sensor payload has a tested UTF-8 byte budget below Recorder's hard limit, and calendar event metadata is explicitly byte-bounded.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
         - custom_components/ha_energy_planner/diagnostics.py
+        - custom_components/ha_energy_planner/entity.py
         - custom_components/ha_energy_planner/sensor.py
+        - custom_components/ha_energy_planner/binary_sensor.py
+        - custom_components/ha_energy_planner/calendar.py
       tests:
         - tests/test_diagnostics.py
         - tests/test_coordinator.py
+        - tests/test_entity.py
         - tests/test_sensor.py
+        - tests/test_binary_sensor.py
+        - tests/test_calendar.py
         - scripts/docker-ha-smoke.sh
   discovery-update-info:
     status: n/a

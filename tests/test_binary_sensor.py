@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 from custom_components.ha_energy_planner import binary_sensor as binary_sensor_module
@@ -12,6 +14,7 @@ from custom_components.ha_energy_planner.binary_sensor import (
     PlannerBinarySensor,
     _planner_ownership_active,
 )
+from custom_components.ha_energy_planner.entity import RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
 from custom_components.ha_energy_planner.models import InputHealth
 
 
@@ -60,6 +63,20 @@ def test_binary_sensor_setup_and_entity_state(monkeypatch: object) -> None:
     assert entity.is_on is False
     assert entity.extra_state_attributes["mode"] == "review"
     assert len(removed) == len(LEGACY_BINARY_SENSOR_DESCRIPTIONS)
+
+
+def test_binary_sensor_attributes_use_shared_recorder_budget() -> None:
+    coordinator = SimpleNamespace(entry=SimpleNamespace(entry_id="entry-1"))
+    description = replace(
+        BINARY_SENSORS[0],
+        attrs_fn=lambda coordinator: {"evidence": ["⚡" * 10_000] * 20},
+    )
+
+    attrs = PlannerBinarySensor(coordinator, description).extra_state_attributes
+    encoded_size = len(json.dumps(attrs, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    assert encoded_size <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
+    assert attrs["attributes_truncated"] is True
 
 
 def test_armed_sensor_exposes_active_gate_and_pause_reason() -> None:
