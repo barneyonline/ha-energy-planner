@@ -17,7 +17,8 @@ Energy Planner is a local-first Home Assistant custom integration for coordinati
 
 - One Energy Planner device containing all status, controls, and troubleshooting entities
 - One central **Configure** page with sections for Energy, Climate, Presence, Enphase, AI, and EV inputs
-- **Armed**, **Mode**, **Current state**, **Next actions**, and **Plan** calendar entities
+- **Armed**, **Mode**, **Current state**, **Next actions**, and a **Plan** calendar
+  that shows actions only for enabled device-control areas
 - A guarded **Automatic control** switch plus individual **Climate control**, **EV control**, and **Enphase control** switches
 - A built-in household-load forecast trained from Home Assistant Recorder
 - Native EV scheduling and tariff-aware climate preconditioning

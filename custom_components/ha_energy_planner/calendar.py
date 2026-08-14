@@ -11,9 +11,15 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
+from .const import (
+    CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONTROL_ENABLED,
+)
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
-from .models import ActionKind, PlanAction
+from .models import ActionAsset, ActionKind, PlanAction
+from .safety import strict_bool
 from .sensor import (
     _action_load_forecast_attrs,
     _action_sentence,
@@ -70,11 +76,26 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
         return []
     events: list[CalendarEvent] = []
     for action in plan.actions:
+        if not _calendar_control_enabled(coordinator, action.asset):
+            continue
         if action.kind == ActionKind.EV_SCHEDULE:
             events.extend(_ev_charging_events(action, plan.interval_minutes))
         else:
             events.append(_calendar_event(action, coordinator))
     return sorted(events, key=lambda event: event.start)
+
+
+def _calendar_control_enabled(
+    coordinator: EnergyPlannerCoordinator,
+    asset: ActionAsset,
+) -> bool:
+    """Return whether the asset is selected for device control."""
+    option_by_asset = {
+        ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
+        ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
+        ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+    }
+    return strict_bool(coordinator.options.get(option_by_asset[asset]), default=False)
 
 
 def _ev_charging_events(
