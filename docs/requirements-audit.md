@@ -22,7 +22,8 @@ Status as of 2026-08-12.
   snapshots and ownership; Next actions mirrors the combined per-area state
   summary and exposes bounded decision evidence in attributes. The Plan calendar
   expands allocated EV slots into contiguous charging windows with explicit
-  start and stop times instead of showing the planner's short recheck interval.
+  start and stop times instead of showing the planner's short recheck interval,
+  and omits actions for device-control areas whose selector is off.
 - The integration creates one Energy Planner device and attaches every entity to
   it. Connected inputs and policy are configured on one central **Configure**
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
