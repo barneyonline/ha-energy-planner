@@ -9,6 +9,11 @@ from types import SimpleNamespace
 
 from custom_components.ha_energy_planner import calendar as calendar_module
 from custom_components.ha_energy_planner.calendar import EnergyPlannerCalendar
+from custom_components.ha_energy_planner.const import (
+    CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CONTROL_ENABLED,
+)
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -147,6 +152,52 @@ def test_calendar_omits_ev_schedule_without_allocated_charging() -> None:
     assert EnergyPlannerCalendar(coordinator).event is None
 
 
+def test_calendar_omits_actions_for_disabled_device_controls() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    ev_action = _action("ev-start", now, now + timedelta(minutes=5))
+    climate_action = replace(
+        ev_action,
+        action_id="climate-precondition",
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+    )
+    enphase_action = replace(
+        ev_action,
+        action_id="enphase-profile",
+        asset=ActionAsset.ENPHASE,
+        kind=ActionKind.SET_PROFILE,
+    )
+    coordinator = _coordinator(_plan([ev_action, climate_action, enphase_action]))
+    coordinator.options.update(
+        {
+            CONF_EV_CONTROL_ENABLED: False,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+            CONF_ENPHASE_CONTROL_ENABLED: False,
+        }
+    )
+
+    events = calendar_module._calendar_events(coordinator)
+
+    assert [event.uid for event in events] == ["climate-precondition"]
+
+
+def test_calendar_omits_ev_charging_windows_when_ev_control_is_disabled() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    action = replace(
+        _action("ev-schedule", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "allocated_slots": [
+                {"valid_at": (now + timedelta(minutes=30)).isoformat(), "charge_kw": 7},
+            ],
+        },
+    )
+    coordinator = _coordinator(_plan([action]))
+    coordinator.options[CONF_EV_CONTROL_ENABLED] = False
+
+    assert calendar_module._calendar_events(coordinator) == []
+
+
 def test_calendar_ignores_malformed_ev_slots() -> None:
     now = datetime.now(UTC).replace(microsecond=0)
     action = replace(
@@ -268,6 +319,11 @@ def _plan(actions: list[PlanAction]) -> EnergyPlan:
 def _coordinator(plan: EnergyPlan | None) -> SimpleNamespace:
     return SimpleNamespace(
         data=plan,
+        options={
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+            CONF_ENPHASE_CONTROL_ENABLED: True,
+        },
         store=SimpleNamespace(data={}),
         entry=SimpleNamespace(entry_id="entry-1"),
         hass=SimpleNamespace(),

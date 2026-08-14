@@ -412,7 +412,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: The three device control selectors remain in Controls; EV policy such as Keep charger on is central configuration, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary.
+    comment: The three device control selectors remain in Controls; EV policy such as Keep charger on is central configuration, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary. The Plan calendar follows those selectors and omits actions for disabled control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -420,9 +420,11 @@ rules:
         - custom_components/ha_energy_planner/switch.py
         - custom_components/ha_energy_planner/number.py
         - custom_components/ha_energy_planner/button.py
+        - custom_components/ha_energy_planner/calendar.py
       tests:
         - tests/test_switch_button.py
         - tests/test_ev_control_entities.py
+        - tests/test_calendar.py
   entity-device-class:
     status: done
     comment: Armed uses the running device class; the consolidated text status sensors and read-only action calendar have no applicable device class.
