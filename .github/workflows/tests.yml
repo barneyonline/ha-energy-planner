@@ -95,18 +95,15 @@ jobs:
           tests/scripts/test_validate_quality_scale.py
           tests/test_manifest.py
 
-  docker-validate:
+  validation-extras:
     runs-on: ubuntu-latest
-    needs:
-      - pytest-coverage
-      - quality-scale
     permissions:
       contents: read
-      checks: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v6
-      - name: Run Docker validation
+      - name: Run lint, fixture, and Home Assistant config validation
         env:
           HEP_SKIP_HA_SMOKE: "1"
+          HEP_SKIP_PYTEST: "1"
+          HEP_SKIP_QUALITY_SCALE: "1"
         run: scripts/docker-validate.sh
