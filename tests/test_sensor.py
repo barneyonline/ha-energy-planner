@@ -757,7 +757,7 @@ def test_production_readiness_supports_ev_only_installation() -> None:
 def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
     coordinator = _coordinator(
         _plan(),
-        options={"ev_control_enabled": True},
+        options={"ev_control_enabled": True, "planner_enabled": True, "dry_run": False},
         entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
         store_data={
             "production": {
@@ -765,6 +765,7 @@ def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
                     "status": "validating",
                     "successful_runs": 2,
                     "required_runs": 3,
+                    "started_at": "2026-08-14T12:00:00+00:00",
                     "deadline": "2026-08-14T12:10:00+00:00",
                     "last_reason": "validation_succeeded",
                 }
@@ -778,7 +779,10 @@ def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
     assert attrs["startup_auto_recovery_status"] == "validating"
     assert attrs["startup_auto_recovery_successful_runs"] == 2
     assert attrs["startup_auto_recovery_required_runs"] == 3
+    assert attrs["startup_auto_recovery_grace_started_at"] == "2026-08-14T12:00:00+00:00"
     assert attrs["startup_auto_recovery_last_reason"] == "validation_succeeded"
+    assert attrs["automatic_control_requested"] is True
+    assert attrs["automatic_control_running"] is False
 
 
 def test_production_readiness_blocks_armed_mismatched_contract() -> None:
@@ -2007,6 +2011,10 @@ def _coordinator(
             and configured_options.get("dry_run") is False
             and isinstance(stored.get("production"), dict)
             and stored["production"].get("armed") is True
+        ),
+        automatic_control_requested=(
+            configured_options.get("planner_enabled") is True
+            and configured_options.get("dry_run") is False
         ),
     )
 

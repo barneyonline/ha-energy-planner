@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.core import CoreState
 
 from custom_components.ha_energy_planner import (
     _async_migrate_duplicate_entity_ids,
@@ -82,6 +83,7 @@ class FakeHass:
 
     config_entries: FakeConfigEntries
     data: dict[str, Any] = field(default_factory=dict)
+    state: CoreState = CoreState.running
 
 
 @dataclass(slots=True)
@@ -166,6 +168,7 @@ class FakeCoordinator:
         self.entry = entry
         self.store = store
         self.first_refresh_count = 0
+        self.reconcile_count = 0
         self.start_count = 0
         self.shutdown_count = 0
         self.restore_calls: list[tuple[str, bool]] = []
@@ -173,6 +176,8 @@ class FakeCoordinator:
         self.disarm_calls: list[str] = []
         self.auto_recovery_start_count = 0
         self.auto_recovery_cancel_reasons: list[str] = []
+        self.auto_recovery_preserve_flags: list[bool] = []
+        self.automatic_control_requested = False
         self.lifecycle_calls: list[str] = []
         self.restore_outcome = SimpleNamespace(result=OutcomeResult.RESTORED)
         FakeCoordinator.last_instance = self
@@ -181,13 +186,21 @@ class FakeCoordinator:
         self.first_refresh_count += 1
 
     async def async_reconcile_production_evidence_contract(self) -> bool:
+        self.reconcile_count += 1
         return False
 
     def async_start_startup_auto_recovery(self) -> None:
         self.auto_recovery_start_count += 1
 
-    async def async_cancel_startup_auto_recovery(self, reason: str) -> None:
+    async def async_cancel_startup_auto_recovery(
+        self,
+        reason: str,
+        *,
+        preserve_control: bool = False,
+        restore_owned_state: bool = True,
+    ) -> None:
         self.auto_recovery_cancel_reasons.append(reason)
+        self.auto_recovery_preserve_flags.append(preserve_control)
 
     def async_start_listeners(self) -> None:
         self.start_count += 1
@@ -215,6 +228,7 @@ class FakeRuntimeCoordinator:
     def __init__(self) -> None:
         self.replan_count = 0
         self.options_update_count = 0
+        self.prepare_reload_count = 0
 
     async def async_request_replan(self) -> None:
         self.replan_count += 1
@@ -222,6 +236,9 @@ class FakeRuntimeCoordinator:
     async def async_handle_options_update(self) -> None:
         self.options_update_count += 1
         await self.async_request_replan()
+
+    async def async_prepare_configuration_reload(self) -> None:
+        self.prepare_reload_count += 1
 
 
 def test_unload_restores_safe_state_without_refresh() -> None:
@@ -235,9 +252,79 @@ def test_unload_restores_safe_state_without_refresh() -> None:
     assert coordinator.shutdown_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
     assert coordinator.restore_calls == [("entry_unload", False)]
+    assert coordinator.disarm_calls == ["entry_unload"]
     assert coordinator.lifecycle_calls == ["shutdown", "restore"]
     assert entry.runtime_data is None
     assert len(hass.config_entries.unloaded) == 1
+
+
+def test_whole_system_shutdown_preserves_automatic_ownership_and_arming() -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator.automatic_control_requested = True
+    coordinator.store.data.update(
+        {
+            "ownership": {"ev_smart_charging_state": {"state": "on"}},
+            "production": {"armed": True},
+            "ev_grid_reservation": {"active": True, "load_kw": 7.2},
+        }
+    )
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries(), state=CoreState.stopping)
+
+    result = asyncio.run(async_unload_entry(hass, entry))
+
+    assert result is True
+    assert coordinator.auto_recovery_cancel_reasons == ["home_assistant_shutdown"]
+    assert coordinator.auto_recovery_preserve_flags == [True]
+    assert coordinator.restore_calls == []
+    assert coordinator.disarm_calls == []
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.store.data["ownership"]
+    assert coordinator.store.data["ev_grid_reservation"]["active"] is True
+
+
+def test_configuration_reload_handoff_is_not_cancelled_during_unload() -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator.automatic_control_requested = True
+    coordinator._configuration_reload_handoff = True
+    coordinator.store.data["production"] = {
+        "armed": False,
+        "startup_auto_recovery": {"status": "waiting_for_safe", "successful_runs": 0},
+    }
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries())
+
+    result = asyncio.run(async_unload_entry(hass, entry))
+
+    assert result is True
+    assert coordinator.auto_recovery_cancel_reasons == ["configuration_reload"]
+    assert coordinator.auto_recovery_preserve_flags == [True]
+    assert coordinator.restore_calls == []
+    assert coordinator.disarm_calls == []
+
+
+def test_failed_configuration_reload_handoff_restarts_safe_recovery() -> None:
+    coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
+    coordinator.automatic_control_requested = True
+    coordinator._configuration_reload_handoff = True
+    coordinator.store.data["production"] = {
+        "armed": False,
+        "startup_auto_recovery": {
+            "status": "waiting_for_safe",
+            "successful_runs": 0,
+        },
+    }
+    entry = FakeEntry(runtime_data=coordinator)
+    hass = FakeHass(FakeConfigEntries(unload_ok=False))
+
+    result = asyncio.run(async_unload_entry(hass, entry))
+
+    assert result is False
+    assert coordinator._configuration_reload_handoff is False
+    assert coordinator.reconcile_count == 1
+    assert coordinator.auto_recovery_start_count == 1
+    assert coordinator.start_count == 1
+    assert entry.runtime_data is coordinator
 
 
 def test_unload_stops_when_safe_state_restore_fails() -> None:
@@ -258,7 +345,7 @@ def test_unload_stops_when_safe_state_restore_fails() -> None:
     assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
     assert coordinator.lifecycle_calls == ["shutdown", "restore", "start"]
     assert coordinator.replan_count == 0
-    assert coordinator.disarm_calls == ["entry_unload_restore_failed"]
+    assert coordinator.disarm_calls == ["entry_unload", "entry_unload_restore_failed"]
     assert entry.runtime_data is coordinator
     assert hass.config_entries.unloaded == []
 
@@ -274,7 +361,7 @@ def test_unload_continues_after_unowned_best_effort_restore_failure() -> None:
     assert result is True
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.shutdown_count == 1
-    assert coordinator.disarm_calls == []
+    assert coordinator.disarm_calls == ["entry_unload"]
     assert entry.runtime_data is None
     assert len(hass.config_entries.unloaded) == 1
 
@@ -291,7 +378,7 @@ def test_unload_stops_when_failed_restore_retains_ev_reservation() -> None:
     assert result is False
     assert coordinator.shutdown_count == 1
     assert coordinator.start_count == 1
-    assert coordinator.disarm_calls == ["entry_unload_restore_failed"]
+    assert coordinator.disarm_calls == ["entry_unload", "entry_unload_restore_failed"]
     assert entry.runtime_data is coordinator
     assert hass.config_entries.unloaded == []
 
@@ -309,7 +396,7 @@ def test_failed_platform_unload_keeps_coordinator_running() -> None:
     assert coordinator.start_count == 1
     assert entry.runtime_data is coordinator
     assert coordinator.replan_count == 0
-    assert coordinator.disarm_calls == ["entry_platform_unload_failed"]
+    assert coordinator.disarm_calls == ["entry_unload", "entry_platform_unload_failed"]
 
 
 def test_unload_restarts_coordinator_when_restore_raises() -> None:
@@ -485,6 +572,7 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     assert coordinator.auto_recovery_start_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["setup_entry_failed"]
     assert coordinator.shutdown_count == 1
+    assert coordinator.disarm_calls == ["setup_entry_failed"]
     assert coordinator.restore_calls == [("setup_entry_failed", False)]
     assert entry.runtime_data is None
 
@@ -525,6 +613,7 @@ def test_subentry_update_listener_reloads_when_topology_changes() -> None:
 
     assert hass.config_entries.reloads == ["test_entry"]
     assert coordinator.replan_count == 0
+    assert coordinator.prepare_reload_count == 1
 
 
 def test_update_listener_supports_legacy_replan_runtime() -> None:

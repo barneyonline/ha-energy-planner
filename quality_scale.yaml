@@ -74,7 +74,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   appropriate-polling:
     status: done
-    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, skips unchanged input fingerprints instead of fixed blind polling, and bounds startup-only automatic-control recovery behind dependency readiness, safe-state restoration, and three non-commanding healthy validation plans.
+    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, skips unchanged input fingerprints instead of fixed blind polling, starts the ten-minute startup grace at Core RUNNING, awaits a non-debounced deadline refresh, and retries disarmed recovery every 30 seconds until three consecutive healthy checks permit re-arming.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -436,7 +436,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master activation switch, and the three visible device switches select its control areas.
+    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master intent switch while Armed exposes command authority, and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py

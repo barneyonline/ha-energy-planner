@@ -17,6 +17,7 @@ from typing import Any, Never
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
@@ -89,7 +90,12 @@ from .recorder_import import (
     async_update_builtin_load_forecast,
     load_forecast_source_available,
 )
-from .safety import DRY_RUN_READY_CYCLES_REQUIRED, parse_production_state, strict_bool
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
 from .type_defs import EnergyPlannerConfigEntry
@@ -99,10 +105,18 @@ _LOGGER = logging.getLogger(__name__)
 _AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 
 STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
-STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 5
-STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS = 30
+STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
-_STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset({"waiting", "restoring", "validating"})
+_STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
+    {
+        "waiting",
+        "waiting_for_home_assistant",
+        "grace",
+        "waiting_for_safe",
+        "restoring",
+        "validating",
+    }
+)
 
 _LOAD_FORECAST_TRAINING_DEFERRED_REASONS = frozenset(
     {
@@ -353,6 +367,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._startup_auto_recovery_authorized = False
         self._startup_auto_recovery_deadline: float | None = None
         self._startup_auto_recovery_task: asyncio.Task[None] | None = None
+        self._startup_auto_recovery_start_unsub: Callable[[], None] | None = None
         self._startup_auto_recovery_wakeup = asyncio.Event()
         self._startup_auto_recovery_validation_active = False
         self._last_startup_auto_recovery_validation: dict[str, Any] | None = None
@@ -390,10 +405,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         return strict_bool(self.options.get(CONF_DRY_RUN), default=True)
 
     @property
+    def automatic_control_requested(self) -> bool:
+        """Return whether the operator intends automatic control to run."""
+        return self.planner_enabled and not self.dry_run
+
+    @property
     def active_control(self) -> bool:
         """Return whether automatic device control is fully active."""
         production = parse_production_state(self.store.data.get("production"))
-        return self.planner_enabled and not self.dry_run and production.armed
+        return self.automatic_control_requested and production.armed
 
     @property
     def refresh_metrics(self) -> dict[str, Any]:
@@ -472,16 +492,51 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass.async_create_task(self._async_handle_manual_override_helper(False))
 
     def async_start_startup_auto_recovery(self) -> None:
-        """Start a bounded recovery task authorized during startup reconciliation."""
+        """Start recovery only after Home Assistant has fully started."""
         if not getattr(self, "_startup_auto_recovery_authorized", False):
             return
         task = getattr(self, "_startup_auto_recovery_task", None)
         if task is not None and not task.done():
             return
-        self._startup_auto_recovery_task = self.entry.async_create_background_task(
+        if getattr(self, "_startup_auto_recovery_start_unsub", None) is not None:
+            return
+
+        async def _async_start_recovery(_hass: HomeAssistant) -> None:
+            self._startup_auto_recovery_start_unsub = None
+            if not self._startup_auto_recovery_authorized:
+                return
+            store_data = getattr(getattr(self, "store", None), "data", {})
+            production = parse_production_state(
+                store_data.get("production") if isinstance(store_data, dict) else None
+            )
+            if production.armed:
+                self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+                self.executor.notification_grace_until = dt_util.utcnow() + timedelta(
+                    seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+                )
+                await self._async_update_startup_auto_recovery(
+                    "grace",
+                    successful_runs=0,
+                    required_runs=1,
+                    reason="startup_grace_in_progress",
+                    started=True,
+                )
+            else:
+                self._startup_auto_recovery_deadline = None
+                await self._async_update_startup_auto_recovery(
+                    "waiting_for_safe",
+                    successful_runs=0,
+                    reason="startup_safe_recovery_resumed",
+                )
+            self._startup_auto_recovery_task = self.entry.async_create_background_task(
+                self.hass,
+                self._async_run_startup_auto_recovery(),
+                f"{DOMAIN} startup automatic-control recovery",
+            )
+
+        self._startup_auto_recovery_start_unsub = async_at_started(
             self.hass,
-            self._async_run_startup_auto_recovery(),
-            f"{DOMAIN} startup automatic-control recovery",
+            _async_start_recovery,
         )
 
     @callback
@@ -549,8 +604,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if recovery_task is not None and not recovery_task.done():
             recovery_task.cancel()
         self._startup_auto_recovery_task = None
+        recovery_start_unsub = getattr(self, "_startup_auto_recovery_start_unsub", None)
+        if recovery_start_unsub is not None:
+            recovery_start_unsub()
+        self._startup_auto_recovery_start_unsub = None
         self._startup_auto_recovery_authorized = False
         self._startup_auto_recovery_deadline = None
+        if hasattr(self, "executor"):
+            self.executor.notification_grace_until = None
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
 
@@ -802,44 +863,88 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_request_refresh()
 
     async def async_reconcile_production_evidence_contract(self) -> bool:
-        """Restore and disarm when the reviewed production contract changed."""
+        """Prepare startup control without discarding prior active intent."""
         production = parse_production_state(self.store.data.get("production"))
+        pause_reason = control_pause_reason(self.store.data.get("control_pause"), dt_util.utcnow())
         recovery = production.raw.get("startup_auto_recovery")
+        recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
+        recovery_pending_while_disarmed = bool(
+            self.automatic_control_requested
+            and not production.armed
+            and recovery_status in {"waiting_for_safe", "validating", "restoring"}
+        )
+
+        if self.active_control and pause_reason is None:
+            # A previously running installation resumes immediately. Runtime
+            # action gates still reject unsafe work while the startup grace
+            # observes the fully started Home Assistant instance.
+            current = production.raw
+            current.update(
+                {
+                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                        self.entry_data,
+                        self.options,
+                    ),
+                    "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
+                }
+            )
+            await self._async_save_production(current)
+            self._startup_auto_recovery_authorized = True
+            self._startup_auto_recovery_deadline = None
+            self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_home_assistant",
+                successful_runs=0,
+                required_runs=1,
+                reason="previously_active_control_preserved",
+            )
+            return True
+
+        if self.active_control and pause_reason is not None:
+            await self.async_disarm_production_control("startup_control_paused")
+            await self.async_restore_safe_state("startup_control_paused", refresh=False)
+            return True
+
+        if recovery_pending_while_disarmed:
+            self._startup_auto_recovery_authorized = True
+            self._startup_auto_recovery_deadline = None
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_home_assistant",
+                successful_runs=0,
+                reason="startup_safe_recovery_pending",
+            )
+            return True
+
         interrupted_recovery = bool(
-            isinstance(recovery, dict) and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+            isinstance(recovery, dict) and recovery_status in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
         )
         if interrupted_recovery and isinstance(recovery, dict):
             await self._async_update_startup_auto_recovery(
                 "interrupted",
                 successful_runs=_startup_auto_recovery_successful_runs(recovery.get("successful_runs")),
-                reason="startup_restarted_before_recovery_completed",
+                reason="startup_restarted_without_active_control",
                 completed=True,
             )
-            production = parse_production_state(self.store.data.get("production"))
-            if production.armed:
-                await self.async_disarm_production_control("startup_auto_recovery_interrupted")
-                await self.async_restore_safe_state("startup_auto_recovery_interrupted", refresh=False)
-                return True
-        if not production.armed or production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
-            self.entry_data,
-            self.options,
-        ):
-            return False
-        was_active = self.active_control
-        if was_active:
-            self._startup_auto_recovery_authorized = True
-            self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-            await self._async_update_startup_auto_recovery(
-                "waiting",
-                successful_runs=0,
-                reason="production_evidence_contract_changed",
-                started=True,
+            store_data = getattr(getattr(self, "store", None), "data", {})
+            production = parse_production_state(
+                store_data.get("production") if isinstance(store_data, dict) else None
             )
+
+        expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
+        if not production.armed or production.dry_run_evidence_fingerprint == expected_fingerprint:
+            return interrupted_recovery
+
         await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
         await self.async_disarm_production_control("production_evidence_contract_changed")
         return True
 
-    async def async_cancel_startup_auto_recovery(self, reason: str) -> None:
+    async def async_cancel_startup_auto_recovery(
+        self,
+        reason: str,
+        *,
+        preserve_control: bool = False,
+        restore_owned_state: bool = True,
+    ) -> None:
         """Cancel startup recovery without treating persisted progress as authorization."""
         store_data = getattr(getattr(self, "store", None), "data", None)
         recovery = (
@@ -851,11 +956,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             getattr(self, "_startup_auto_recovery_authorized", False)
             or (isinstance(recovery, dict) and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES)
         )
-        restore_interrupted = bool(
-            recovery_active and isinstance(recovery, dict) and recovery.get("status") == "restoring"
-        )
         self._startup_auto_recovery_authorized = False
         self._startup_auto_recovery_deadline = None
+        if hasattr(self, "executor"):
+            self.executor.notification_grace_until = None
+        start_unsub = getattr(self, "_startup_auto_recovery_start_unsub", None)
+        if start_unsub is not None:
+            start_unsub()
+        self._startup_auto_recovery_start_unsub = None
         task = getattr(self, "_startup_auto_recovery_task", None)
         if task is not None and task is not asyncio.current_task() and not task.done():
             task.cancel()
@@ -863,17 +971,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 await task
             except asyncio.CancelledError:
                 pass
+        self._startup_auto_recovery_task = None
         if not isinstance(store_data, dict):
             return
         production = parse_production_state(store_data.get("production"))
-        recovered_control_armed = bool(
+        cancel_requires_restore = bool(
             recovery_active
             and production.armed
-            and production.raw.get("armed_reason") == "startup_auto_recovered"
+            and restore_owned_state
+            and not preserve_control
+            and reason not in {"automatic_control_disabled", "entry_unload", "setup_entry_failed"}
         )
-        if recovered_control_armed:
+        if cancel_requires_restore:
             await self.async_disarm_production_control(f"startup_auto_recovery_cancelled:{reason}")
-        if restore_interrupted or recovered_control_armed:
             try:
                 await self.async_restore_safe_state(
                     f"startup_auto_recovery_cancelled:{reason}",
@@ -884,100 +994,130 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         recovery = parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
         if not recovery_active or not isinstance(recovery, dict):
             return
+        if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload"}:
+            # Persist the current grace/recovery state verbatim so the next
+            # process can distinguish an armed restart from disarmed recovery.
+            return
         await self._async_update_startup_auto_recovery(
-            "cancelled",
+            "interrupted" if preserve_control else "cancelled",
             successful_runs=_startup_auto_recovery_successful_runs(recovery.get("successful_runs")),
             reason=reason,
             completed=True,
         )
+        await self.executor.async_dismiss_startup_recovery_notification()
 
     async def _async_run_startup_auto_recovery(self) -> None:
-        """Wait for startup dependencies and validate before restoring active control."""
-        deadline = getattr(self, "_startup_auto_recovery_deadline", None)
-        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
-            recovery = parse_production_state(self.store.data.get("production")).raw.get(
-                "startup_auto_recovery"
-            )
-            persisted_deadline = _parse_datetime_or_none(
-                recovery.get("deadline") if isinstance(recovery, dict) else None
-            )
-            remaining = STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-            if persisted_deadline is not None and getattr(persisted_deadline, "tzinfo", None) is not None:
-                remaining = min(
-                    max((persisted_deadline - dt_util.utcnow()).total_seconds(), 0.0),
-                    STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS,
-                )
-            deadline = monotonic() + remaining
-            self._startup_auto_recovery_deadline = deadline
-        successful_runs = 0
+        """Apply the armed startup grace, then recover indefinitely if unsafe."""
         try:
-            while self._startup_auto_recovery_authorized:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    await self._async_update_startup_auto_recovery(
-                        "timed_out",
-                        successful_runs=successful_runs,
-                        reason="startup_dependencies_not_ready",
-                        completed=True,
-                    )
+            production = parse_production_state(self.store.data.get("production"))
+            if production.armed:
+                grace_safe, reason = await self._async_complete_startup_grace()
+                if grace_safe or not self._startup_auto_recovery_authorized:
                     return
-                report = build_preflight_report(self.hass, self)
-                ready, reason = _startup_auto_recovery_prerequisites(report, self.entry_data)
-                if ready:
-                    break
+                await self._async_enter_startup_safe_recovery(reason)
+            await self._async_retry_startup_safe_recovery()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - startup recovery is strictly fail closed.
+            _LOGGER.exception("Unexpected startup automatic-control recovery failure")
+            if self.automatic_control_requested:
+                try:
+                    await self._async_enter_startup_safe_recovery("unexpected_recovery_error")
+                except Exception:  # noqa: BLE001 - keep the production gate fail closed.
+                    _LOGGER.exception("Could not persist the startup recovery failure state")
+                    try:
+                        await self.async_disarm_production_control("unexpected_recovery_error")
+                    except Exception:  # noqa: BLE001 - persistence may itself be unavailable.
+                        _LOGGER.exception("Could not persist startup recovery disarming")
+                self._startup_auto_recovery_authorized = True
+                self._startup_auto_recovery_task = self.entry.async_create_background_task(
+                    self.hass,
+                    self._async_run_startup_auto_recovery(),
+                    f"{DOMAIN} startup automatic-control recovery",
+                )
+
+    async def _async_complete_startup_grace(self) -> tuple[bool, str]:
+        """Wait for the full grace period and evaluate one fresh committed plan."""
+        deadline = self._startup_auto_recovery_deadline
+        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+            deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+            self._startup_auto_recovery_deadline = deadline
+        remaining = max(deadline - monotonic(), 0.0)
+        if remaining:
+            await asyncio.sleep(remaining)
+        if not self._startup_auto_recovery_authorized:
+            return False, "startup_recovery_cancelled"
+        # Keep ordinary transient fallback notifications suppressed while the
+        # awaited deadline refresh is in flight. The result below either clears
+        # this suppression silently or replaces it with one recovery warning.
+        self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
+        validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
+        if not validation_ok:
+            return False, reason
+        self._startup_auto_recovery_authorized = False
+        await self._async_update_startup_auto_recovery(
+            "recovered",
+            successful_runs=1,
+            required_runs=1,
+            reason="startup_grace_completed_healthy",
+            completed=True,
+        )
+        self.executor.notification_grace_until = None
+        await self.executor.async_dismiss_startup_recovery_notification()
+        return True, "startup_grace_completed_healthy"
+
+    async def _async_enter_startup_safe_recovery(self, reason: str) -> None:
+        """Disarm an unsafe startup while preserving automatic-control intent."""
+        self._startup_auto_recovery_authorized = True
+        self._startup_auto_recovery_deadline = None
+        # Persist a restart-resumable transition before the first operation
+        # that changes command authority. If shutdown cancels the subsequent
+        # restore, the next process must still recognize this as disarmed
+        # recovery rather than a previously operator-disarmed installation.
+        await self._async_update_startup_auto_recovery(
+            "restoring",
+            successful_runs=0,
+            reason=reason,
+        )
+        await self.async_disarm_production_control("startup_grace_unsafe")
+        restore_reason = reason
+        try:
+            restore = await self.async_restore_safe_state("startup_grace_unsafe", refresh=False)
+            if _action_outcome_failed(restore):
+                restore_reason = str(getattr(restore, "reason", "safe_state_restore_failed"))
+        except Exception:  # noqa: BLE001 - the production gate is already disarmed.
+            _LOGGER.exception("Could not restore safe state after unsafe startup grace")
+            restore_reason = "safe_state_restore_failed"
+        await self._async_update_startup_auto_recovery(
+            "waiting_for_safe",
+            successful_runs=0,
+            reason=restore_reason or reason,
+        )
+        await self.executor.async_notify_startup_recovery_unsafe(restore_reason or reason)
+        self.executor.notification_grace_until = None
+
+    async def _async_retry_startup_safe_recovery(self) -> None:
+        """Retry indefinitely until three fresh healthy plans can reactivate control."""
+        successful_runs = 0
+        while self._startup_auto_recovery_authorized and self.automatic_control_requested:
+            await asyncio.sleep(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS)
+            if not self._startup_auto_recovery_authorized or not self.automatic_control_requested:
+                return
+            await self._async_update_startup_auto_recovery(
+                "validating",
+                successful_runs=successful_runs,
+                reason="validation_in_progress",
+            )
+            validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
+            if not validation_ok:
+                successful_runs = 0
                 await self._async_update_startup_auto_recovery(
-                    "waiting",
+                    "waiting_for_safe",
                     successful_runs=0,
                     reason=reason,
                 )
-                await self._async_wait_for_startup_auto_recovery_wakeup(
-                    min(remaining, STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS)
-                )
-
-            if not self._startup_auto_recovery_authorized:
-                return
-            await self._async_update_startup_auto_recovery(
-                "restoring",
-                successful_runs=0,
-                reason="startup_dependencies_ready",
-            )
-            restore = await self.async_restore_safe_state("startup_auto_recovery", refresh=False)
-            if _action_outcome_failed(restore):
-                await self._async_update_startup_auto_recovery(
-                    "failed",
-                    successful_runs=0,
-                    reason=str(getattr(restore, "reason", "safe_state_restore_failed")),
-                    completed=True,
-                )
-                return
-
-            while self._startup_auto_recovery_authorized:
-                remaining = deadline - monotonic()
-                if remaining <= 0:
-                    await self._async_update_startup_auto_recovery(
-                        "timed_out",
-                        successful_runs=successful_runs,
-                        reason="validation_deadline_expired",
-                        completed=True,
-                    )
-                    return
-                await self._async_update_startup_auto_recovery(
-                    "validating",
-                    successful_runs=successful_runs,
-                    reason="validation_in_progress",
-                )
-                validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
-                if not validation_ok:
-                    successful_runs = 0
-                    await self._async_update_startup_auto_recovery(
-                        "waiting",
-                        successful_runs=0,
-                        reason=reason,
-                    )
-                    await self._async_wait_for_startup_auto_recovery_wakeup(
-                        min(deadline - monotonic(), STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS)
-                    )
-                    continue
+                await self.executor.async_notify_startup_recovery_unsafe(reason)
+            else:
                 successful_runs += 1
                 await self._async_update_startup_auto_recovery(
                     "validating",
@@ -985,103 +1125,92 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     reason="validation_succeeded",
                 )
                 if successful_runs >= STARTUP_AUTO_RECOVERY_REQUIRED_RUNS:
-                    break
-                await asyncio.sleep(
-                    min(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS, max(deadline - monotonic(), 0))
-                )
+                    recovered, reason = await self._async_reactivate_after_startup_recovery(
+                        successful_runs
+                    )
+                    if recovered:
+                        return
+                    successful_runs = 0
+                    await self._async_update_startup_auto_recovery(
+                        "waiting_for_safe",
+                        successful_runs=0,
+                        reason=reason,
+                    )
+                    await self.executor.async_notify_startup_recovery_unsafe(reason)
 
-            if not self._startup_auto_recovery_authorized:
-                return
-            production = parse_production_state(self.store.data.get("production")).raw
-            production.update(
-                {
-                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-                        self.entry_data,
-                        self.options,
-                    ),
-                    "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
-                    "last_dry_run_ready_at": dt_util.utcnow(),
-                }
-            )
-            await self._async_save_production(production)
-            report = build_preflight_report(self.hass, self)
-            final_ready, _final_reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
-            if not final_ready or not report.get("safe_to_activate_now"):
-                await self._async_update_startup_auto_recovery(
-                    "failed",
-                    successful_runs=successful_runs,
-                    reason="final_preflight_failed",
-                    completed=True,
-                )
-                return
-            await self.async_arm_production_control("startup_auto_recovered")
-            try:
-                await self.async_request_replan()
-            except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
-                _LOGGER.exception("Startup automatic-control activation refresh failed")
-                await self._async_fail_startup_auto_recovery_after_activation(
-                    "startup_auto_recovery_replan_failed",
-                    successful_runs=successful_runs,
-                    failure_reason="active_replan_failed",
-                )
-                return
-            final_report = build_preflight_report(self.hass, self)
-            final_ready, _final_reason = _startup_auto_recovery_validation_ready(
-                final_report,
-                self.entry_data,
-            )
-            if not final_ready or not final_report.get("active_control_ready"):
-                await self._async_fail_startup_auto_recovery_after_activation(
-                    "startup_auto_recovery_replan_unsafe",
-                    successful_runs=successful_runs,
-                    failure_reason="active_replan_unsafe",
-                )
-                return
-            self._startup_auto_recovery_authorized = False
-            await self._async_update_startup_auto_recovery(
-                "recovered",
-                successful_runs=successful_runs,
-                reason="automatic_control_reactivated",
-                completed=True,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - startup recovery is strictly fail closed.
-            _LOGGER.exception("Unexpected startup automatic-control recovery failure")
-            production = parse_production_state(self.store.data.get("production"))
-            if production.armed and production.raw.get("armed_reason") == "startup_auto_recovered":
-                await self._async_fail_startup_auto_recovery_after_activation(
-                    "startup_auto_recovery_unexpected_failure",
-                    successful_runs=successful_runs,
-                    failure_reason="unexpected_recovery_error",
-                )
-            else:
-                await self._async_update_startup_auto_recovery(
-                    "failed",
-                    successful_runs=successful_runs,
-                    reason="unexpected_recovery_error",
-                    completed=True,
-                )
-
-    async def _async_fail_startup_auto_recovery_after_activation(
+    async def _async_reactivate_after_startup_recovery(
         self,
-        disarm_reason: str,
-        *,
         successful_runs: int,
-        failure_reason: str,
-    ) -> None:
-        """Disarm and restore every planner-owned asset after activation fails."""
-        await self.async_disarm_production_control(disarm_reason)
-        try:
-            await self.async_restore_safe_state(disarm_reason, refresh=False)
-        except Exception:  # noqa: BLE001 - disarming remains authoritative.
-            _LOGGER.exception("Could not restore safe state after startup recovery activation failed")
+    ) -> tuple[bool, str]:
+        """Restore, arm, and verify a recovered startup installation."""
         await self._async_update_startup_auto_recovery(
-            "failed",
+            "restoring",
             successful_runs=successful_runs,
-            reason=failure_reason,
+            reason="healthy_validation_sequence_complete",
+        )
+        try:
+            restore = await self.async_restore_safe_state("startup_auto_recovery", refresh=False)
+        except Exception:  # noqa: BLE001 - recovery remains disarmed and retries.
+            _LOGGER.exception("Could not restore safe state before startup reactivation")
+            return False, "safe_state_restore_failed"
+        if _action_outcome_failed(restore):
+            return False, str(getattr(restore, "reason", "safe_state_restore_failed"))
+
+        production = parse_production_state(self.store.data.get("production")).raw
+        production.update(
+            {
+                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                    self.entry_data,
+                    self.options,
+                ),
+                "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
+                "last_dry_run_ready_at": dt_util.utcnow(),
+            }
+        )
+        await self._async_save_production(production)
+        report = build_preflight_report(self.hass, self)
+        final_ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
+        if not final_ready or not report.get("safe_to_activate_now"):
+            return False, reason if not final_ready else "final_preflight_failed"
+
+        await self.async_arm_production_control("startup_auto_recovered")
+        try:
+            self._mark_forced_refresh("startup_auto_recovery_activation")
+            await self.async_refresh()
+        except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
+            _LOGGER.exception("Startup automatic-control activation refresh failed")
+            await self.async_disarm_production_control("startup_auto_recovery_replan_failed")
+            try:
+                await self.async_restore_safe_state(
+                    "startup_auto_recovery_replan_failed",
+                    refresh=False,
+                )
+            except Exception:  # noqa: BLE001 - the production gate remains disarmed.
+                _LOGGER.exception("Could not restore safe state after failed recovery refresh")
+            return False, "active_replan_failed"
+
+        final_report = build_preflight_report(self.hass, self)
+        final_ready, reason = _startup_auto_recovery_validation_ready(final_report, self.entry_data)
+        if not final_ready or not final_report.get("active_control_ready"):
+            await self.async_disarm_production_control("startup_auto_recovery_replan_unsafe")
+            try:
+                await self.async_restore_safe_state(
+                    "startup_auto_recovery_replan_unsafe",
+                    refresh=False,
+                )
+            except Exception:  # noqa: BLE001 - the production gate remains disarmed.
+                _LOGGER.exception("Could not restore safe state after unsafe recovery replan")
+            return False, reason if not final_ready else "active_replan_unsafe"
+
+        self._startup_auto_recovery_authorized = False
+        await self._async_update_startup_auto_recovery(
+            "recovered",
+            successful_runs=successful_runs,
+            reason="automatic_control_reactivated",
             completed=True,
         )
+        await self.executor.async_dismiss_startup_recovery_notification()
+        return True, "automatic_control_reactivated"
 
     async def _async_run_startup_auto_recovery_validation(self) -> tuple[bool, str]:
         """Run one forced refresh while suppressing every device action."""
@@ -1089,7 +1218,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_startup_auto_recovery_validation = None
         try:
             self._mark_forced_refresh("startup_auto_recovery_validation")
-            await self.async_request_refresh()
+            # This check is a safety boundary: it must await a newly committed
+            # plan instead of returning after the coordinator debounce accepts
+            # a refresh request.
+            await self.async_refresh()
         except Exception:  # noqa: BLE001 - one failed validation resets the sequence.
             _LOGGER.exception("Startup automatic-control validation refresh failed")
             return False, "validation_refresh_failed"
@@ -1119,23 +1251,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             "committed": False,
         }
 
-    async def _async_wait_for_startup_auto_recovery_wakeup(self, delay: float) -> None:
-        """Wait for a relevant state change or a bounded readiness poll."""
-        if delay <= 0:
-            return
-        event = self._startup_auto_recovery_wakeup
-        event.clear()
-        try:
-            await asyncio.wait_for(event.wait(), timeout=delay)
-        except TimeoutError:
-            pass
-
     async def _async_update_startup_auto_recovery(
         self,
         status: str,
         *,
         successful_runs: int,
         reason: str,
+        required_runs: int = STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
         started: bool = False,
         completed: bool = False,
     ) -> None:
@@ -1148,11 +1270,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             {
                 "status": status,
                 "successful_runs": _startup_auto_recovery_successful_runs(successful_runs),
-                "required_runs": STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
+                "required_runs": required_runs,
                 "last_reason": str(reason)[:160],
                 "updated_at": now,
             }
         )
+        if status == "waiting_for_home_assistant":
+            recovery.pop("started_at", None)
+            recovery.pop("deadline", None)
+            recovery.pop("completed_at", None)
         if started:
             recovery.update(
                 {
@@ -1176,9 +1302,60 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             previous_option_state = getattr(self, "_last_handled_options", None)
             if option_state == previous_option_state:
                 return
-            await self.async_cancel_startup_auto_recovery("options_changed")
-
+            previous_options = (
+                {**DEFAULT_OPTIONS, **previous_option_state}
+                if isinstance(previous_option_state, dict)
+                else None
+            )
             current_options = {**DEFAULT_OPTIONS, **option_state}
+            changed_option_keys = {
+                key
+                for key in set(previous_options or {}) | set(current_options)
+                if (previous_options or {}).get(key) != current_options.get(key)
+            }
+            device_control_only_change = bool(changed_option_keys) and changed_option_keys <= {
+                CONF_EV_CONTROL_ENABLED,
+                CONF_CLIMATE_CONTROL_ENABLED,
+                CONF_ENPHASE_CONTROL_ENABLED,
+            }
+            store_data = getattr(getattr(self, "store", None), "data", {})
+            production = parse_production_state(
+                store_data.get("production") if isinstance(store_data, dict) else None
+            )
+            recovery = production.raw.get("startup_auto_recovery")
+            recovery_was_pending = bool(
+                previous_options is not None
+                and strict_bool(previous_options.get(CONF_PLANNER_ENABLED), default=False)
+                and not strict_bool(previous_options.get(CONF_DRY_RUN), default=True)
+                and (
+                    getattr(self, "_startup_auto_recovery_authorized", False)
+                    or (
+                        isinstance(recovery, dict)
+                        and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+                    )
+                )
+            )
+            was_running = bool(
+                previous_options is not None
+                and strict_bool(previous_options.get(CONF_PLANNER_ENABLED), default=False)
+                and not strict_bool(previous_options.get(CONF_DRY_RUN), default=True)
+                and production.armed
+            )
+            automatic_lifecycle_was_active = was_running or recovery_was_pending
+            await self.async_cancel_startup_auto_recovery("options_changed")
+            automatic_control_still_requested = bool(
+                strict_bool(current_options.get(CONF_PLANNER_ENABLED), default=False)
+                and not strict_bool(current_options.get(CONF_DRY_RUN), default=True)
+            )
+            if (
+                was_running
+                and automatic_control_still_requested
+                and not device_control_only_change
+                and parse_production_state(self.store.data.get("production")).armed
+            ):
+                await self.async_disarm_production_control("configuration_changed")
+                await self.async_restore_safe_state("configuration_changed", refresh=False)
+
             self.executor.options = current_options
             self.executor.entry_data = self.entry_data
             self.executor.sync_ev_grid_reservation()
@@ -1191,11 +1368,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_control_mode_state = current_mode
             planner_disabled = previous_enabled and not current_mode[0]
             dry_run_enabled = not previous_dry_run and current_mode[1]
-            previous_options = (
-                {**DEFAULT_OPTIONS, **previous_option_state}
-                if isinstance(previous_option_state, dict)
-                else None
-            )
             disabled_device_controls = [
                 (area, executor_asset)
                 for option_key, area, executor_asset in (
@@ -1228,6 +1400,86 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # cannot replay device restore commands through the update listener.
             self._last_handled_options = option_state
             await self.async_request_replan()
+            if automatic_lifecycle_was_active and self.automatic_control_requested:
+                if device_control_only_change:
+                    production = parse_production_state(self.store.data.get("production")).raw
+                    production.update(
+                        {
+                            "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                                self.entry_data,
+                                self.options,
+                            ),
+                            "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
+                        }
+                    )
+                    await self._async_save_production(production)
+                self._startup_auto_recovery_authorized = True
+                await self._async_update_startup_auto_recovery(
+                    "waiting_for_home_assistant",
+                    successful_runs=0,
+                    reason="configuration_changed",
+                )
+                self.async_start_startup_auto_recovery()
+
+    async def async_prepare_configuration_reload(self) -> None:
+        """Persist a disarmed recovery handoff for a changed entity topology."""
+        self._configuration_reload_handoff = False
+        production = parse_production_state(self.store.data.get("production"))
+        recovery = production.raw.get("startup_auto_recovery")
+        automatic_lifecycle_was_active = bool(
+            self.active_control
+            or (
+                self.automatic_control_requested
+                and (
+                    getattr(self, "_startup_auto_recovery_authorized", False)
+                    or (
+                        isinstance(recovery, dict)
+                        and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+                    )
+                )
+            )
+        )
+        await self.async_cancel_startup_auto_recovery("configuration_changed")
+        if automatic_lifecycle_was_active:
+            if parse_production_state(self.store.data.get("production")).armed:
+                await self.async_disarm_production_control("configuration_changed")
+            restore = await self.async_restore_safe_state(
+                "configuration_changed",
+                refresh=False,
+            )
+            store_data = getattr(getattr(self, "store", None), "data", {})
+            ownership = store_data.get("ownership") if isinstance(store_data, dict) else None
+            reservation = (
+                store_data.get("ev_grid_reservation")
+                if isinstance(store_data, dict)
+                else None
+            )
+            unresolved_restore = bool(ownership) or bool(
+                isinstance(reservation, dict) and reservation.get("active") is True
+            )
+            if _action_outcome_failed(restore) and unresolved_restore:
+                failure_reason = str(
+                    getattr(restore, "reason", "configuration_restore_failed")
+                )
+                await self._async_update_startup_auto_recovery(
+                    "failed",
+                    successful_runs=0,
+                    reason=failure_reason,
+                    completed=True,
+                )
+                raise HomeAssistantError(
+                    f"Energy Planner could not fully restore safe state: {failure_reason}",
+                    translation_domain=DOMAIN,
+                    translation_key="restore_safe_state_failed",
+                    translation_placeholders={"reason": failure_reason},
+                )
+        if automatic_lifecycle_was_active and self.automatic_control_requested:
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_safe",
+                successful_runs=0,
+                reason="configuration_changed",
+            )
+            self._configuration_reload_handoff = True
 
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Persist the native EV ready-by setting and replan."""
@@ -1485,6 +1737,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self._async_save_production(production)
         self.async_update_listeners()
 
+    async def async_operator_arm_production_control(
+        self,
+        reason: str = "user_acknowledged",
+    ) -> None:
+        """Cancel startup recovery and apply an explicit operator arm."""
+        try:
+            await self.async_cancel_startup_auto_recovery(
+                "operator_armed",
+                restore_owned_state=False,
+            )
+        finally:
+            await self.async_arm_production_control(reason)
+
     async def async_set_active_control(self, enabled: bool) -> None:
         """Enable or safely return from automatic device control as one operation."""
         if enabled and self.active_control:
@@ -1619,6 +1884,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ):
                 await self.executor.async_release_hvac_control("production_control_disarmed")
         self.async_update_listeners()
+
+    async def async_operator_disarm_production_control(
+        self,
+        reason: str = "user_requested",
+    ) -> None:
+        """Cancel startup recovery and apply an explicit operator disarm."""
+        try:
+            await self.async_cancel_startup_auto_recovery(
+                "operator_disarmed",
+                restore_owned_state=False,
+            )
+        finally:
+            await self.async_disarm_production_control(reason)
 
     async def async_pause_control(self, duration_minutes: int, reason: str, asset: str = "all") -> None:
         """Pause planner-owned active control for all devices or one asset."""

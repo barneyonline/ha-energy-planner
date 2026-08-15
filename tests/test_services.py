@@ -986,7 +986,9 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     coordinator.async_set_ev_target_soc = target_soc
     coordinator.async_set_manual_hvac_override = manual_override
     coordinator.async_arm_production_control = arm
+    coordinator.async_operator_arm_production_control = arm
     coordinator.async_disarm_production_control = disarm
+    coordinator.async_operator_disarm_production_control = disarm
     coordinator.async_pause_control = pause
     coordinator.async_resume_control = resume
     return coordinator
