@@ -17,6 +17,7 @@ from .const import DOMAIN
 from .coordinator import EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import OutcomeResult
+from .notifications import defer_persistent_notification
 from .preflight import build_preflight_report
 from .type_defs import EnergyPlannerConfigEntry
 
@@ -55,11 +56,33 @@ def _ai_advice_available(coordinator: EnergyPlannerCoordinator) -> bool:
 
 
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
-    report = build_preflight_report(coordinator.hass, coordinator)
     entry = coordinator.entry
     title = getattr(entry, "title", None) or "Energy Planner"
     entry_id = getattr(entry, "entry_id", None)
     notification_id = f"{_PREFLIGHT_NOTIFICATION_ID}_{entry_id}" if entry_id else _PREFLIGHT_NOTIFICATION_ID
+    if defer_persistent_notification(
+        coordinator.hass,
+        notification_id,
+        lambda: _run_preflight(coordinator),
+    ):
+        return
+    report = build_preflight_report(coordinator.hass, coordinator)
+    await _async_publish_preflight_notification(
+        coordinator,
+        report,
+        title=title,
+        notification_id=notification_id,
+    )
+
+
+async def _async_publish_preflight_notification(
+    coordinator: EnergyPlannerCoordinator,
+    report: dict[str, Any],
+    *,
+    title: str,
+    notification_id: str,
+) -> None:
+    """Publish one preflight result after Home Assistant startup."""
     await coordinator.hass.services.async_call(
         "persistent_notification",
         "create",

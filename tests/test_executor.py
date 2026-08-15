@@ -9,8 +9,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.core import CoreState
 
 from custom_components.ha_energy_planner import executor as executor_module
+from custom_components.ha_energy_planner import notifications as notifications_module
 from custom_components.ha_energy_planner.const import (
     CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -595,6 +597,65 @@ def test_failed_restore_notification_is_actionable_and_deduplicated() -> None:
             },
         )
     ]
+
+
+def test_failed_restore_notification_waits_for_home_assistant_startup(monkeypatch: object) -> None:
+    hass = FakeHass()
+    hass.data = {}
+    hass.state = CoreState.starting
+    executor = Executor(FakeStore(), hass=hass)
+    outcome = SimpleNamespace(result=OutcomeResult.FAILED, reason="enphase_profile_entity_unavailable")
+    start_callbacks: list[Any] = []
+    monkeypatch.setattr(
+        notifications_module,
+        "async_at_started",
+        lambda hass_arg, callback: start_callbacks.append(callback) or (lambda: None),
+    )
+
+    asyncio.run(executor._async_notify_restore(outcome))
+
+    assert hass.services.calls == []
+    assert len(start_callbacks) == 1
+    assert executor._plan_fallback_notification_signatures == {}
+
+    hass.state = CoreState.running
+    asyncio.run(start_callbacks[0](hass))
+
+    assert len(hass.services.calls) == 1
+    assert hass.services.calls[0][0:2] == ("persistent_notification", "create")
+    assert executor._plan_fallback_notification_signatures
+
+
+def test_recovered_restore_cancels_deferred_startup_notification(monkeypatch: object) -> None:
+    hass = FakeHass()
+    hass.data = {}
+    hass.state = CoreState.starting
+    executor = Executor(FakeStore(), hass=hass)
+    start_callbacks: list[Any] = []
+    listener_cancelled: list[bool] = []
+    monkeypatch.setattr(
+        notifications_module,
+        "async_at_started",
+        lambda hass_arg, callback: (
+            start_callbacks.append(callback) or (lambda: listener_cancelled.append(True))
+        ),
+    )
+
+    asyncio.run(
+        executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="enphase_profile_entity_unavailable")
+        )
+    )
+    asyncio.run(
+        executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.RESTORED, reason="enphase_profile_applied")
+        )
+    )
+
+    assert listener_cancelled == [True]
+    hass.state = CoreState.running
+    asyncio.run(start_callbacks[0](hass))
+    assert all(call[1] != "create" for call in hass.services.calls)
 
 
 def test_restore_safe_state_attempts_configured_enphase_without_ownership() -> None:
