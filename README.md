@@ -112,10 +112,10 @@ Changing the load mapping disarms production control and requires fresh review c
 | --- | --- |
 | **Armed** | Whether Energy Planner may currently issue commands and why; stale or incomplete reviewed evidence keeps it off even if an earlier arm request was persisted |
 | **Mode** | `review` while observing and `active` when automatic control is fully active |
-| **Current state** | Live state of every configured controlled area |
-| **Next actions** | Next state for every area, planned actions, and decision evidence |
+| **Current state** | Live state of every configured area whose device-control switch is on |
+| **Next actions** | Next state, planned actions, and decision evidence for enabled control areas |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
-| **Plan** | Calendar view of upcoming controlled actions, with complete EV charging start/stop windows |
+| **Plan** | Calendar view of upcoming controlled actions, with readable evidence sections, local timestamps, and complete EV charging windows |
 | **Automatic control** | Retains the operator's request for automatic control, including while startup safety is temporarily disarmed |
 | Device control switches | Select whether Climate, EV, or Enphase may participate; grouped under Controls |
 | **Explain** | Requests one evidence-based AI explanation and returns it as a Home Assistant notification |
@@ -126,7 +126,7 @@ Energy Planner queues persistent notifications until Home Assistant has complete
 
 **Explain** treats an uneconomic or thermally unsuitable climate-preconditioning window as a normal no-action plan result. It recommends changing Climate settings only when the current plan contains a specific comfort, presence, or climate-control input fault.
 
-Turning off a device control selector always takes effect immediately. Energy Planner then makes one serialized best-effort safe-state restore; if confirmation is unavailable, it retains diagnostic recovery evidence and notifies without turning the selector back on or permitting new start/schedule commands. Unresolved EV ownership remains eligible for bounded safe-stop recovery after interruption or restart, with ten-minute backoff and a maximum of three failed attempts per rolling day. Dedicated EV retry timestamps keep those limits intact if another control area later updates the shared pause state or execution-audit rows rotate out.
+Turning off a device control selector always takes effect immediately. The disabled area disappears from **Current state** and **Next actions**, including the latter's action attributes and count. Energy Planner then makes one serialized best-effort safe-state restore; if confirmation is unavailable, it retains diagnostic recovery evidence and notifies without turning the selector back on or permitting new start/schedule commands. Unresolved EV ownership remains eligible for bounded safe-stop recovery after interruption or restart, with ten-minute backoff and a maximum of three failed attempts per rolling day. Dedicated EV retry timestamps keep those limits intact if another control area later updates the shared pause state or execution-audit rows rotate out.
 
 Settings are grouped into six areas: Energy/battery/grid/data, Climate and presence, Enphase, Safety and troubleshooting, EV charging, and Planning and priorities. EV charging contains its mapped entities plus Ready by, Opportunistic charging, the opportunistic price threshold, Keep charger on, and charging policy. Ready by, both opportunistic-charging values, and Keep charger on are settings-only; obsolete native entities for those values are removed on upgrade. The one- and four-hour pause buttons are also retired; automations can still call `ha_energy_planner.pause_control` with any supported duration.
 
