@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from custom_components.ha_energy_planner.safety import (
     control_pause_reason,
     parse_production_state,
+    partition_control_areas_by_pause,
     strict_bool,
 )
 
@@ -55,3 +56,21 @@ def test_control_pause_parser_handles_current_and_legacy_shapes() -> None:
         now,
         asset="ev",
     ) == "planner_paused"
+
+
+def test_control_area_pause_partition_preserves_unpaused_assets_and_fails_closed() -> None:
+    now = datetime(2026, 7, 12, tzinfo=UTC)
+    areas = ["ev", "hvac", "enphase"]
+
+    assert partition_control_areas_by_pause(
+        {"active": True, "assets": ["ev"]},
+        now,
+        areas,
+    ) == (["hvac", "enphase"], ["ev"])
+    assert partition_control_areas_by_pause("corrupt", now, areas) == ([], areas)
+    assert partition_control_areas_by_pause(
+        {"active": True, "assets": ["unknown"]},
+        now,
+        areas,
+    ) == ([], areas)
+    assert partition_control_areas_by_pause({}, now, ["unknown"]) == ([], ["unknown"])

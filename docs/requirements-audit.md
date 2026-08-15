@@ -17,16 +17,19 @@ Status as of 2026-08-15.
   malformed persisted execution timestamps are ignored instead of raising
   through safety-gate evaluation.
 - The user-facing status surface is limited to **Armed**, **Current state**,
-  **Next actions**, and the read-only **Plan** calendar. Armed is tied to
-  persisted production state; Current state publishes actual configured entity
-  snapshots and ownership only for enabled control areas; Next actions mirrors
-  that enabled-area summary and excludes disabled-area actions from its bounded
-  decision evidence and action count. The Plan calendar expands allocated EV
-  slots into contiguous charging windows with explicit start and stop times
-  instead of showing the planner's short recheck interval, groups event evidence
-  into readable bulleted sections, renders embedded timestamps in Home
-  Assistant's local timezone, and omits actions for device-control areas whose
-  selector is off.
+  **Next actions**, and the read-only **Plan** calendar. Armed reports effective
+  command authority: a persisted arm request remains visible in attributes but
+  stale or incomplete reviewed production evidence keeps the entity off with a
+  stable blocking reason. Manual arming re-runs preflight and cannot cancel safe
+  recovery or grant apparent authority while that evidence is invalid. Current
+  state publishes actual configured entity snapshots and ownership only for
+  enabled control areas; Next actions mirrors that enabled-area summary and
+  excludes disabled-area actions from its bounded decision evidence and action
+  count. The Plan calendar expands allocated EV slots into contiguous charging
+  windows with explicit start and stop times instead of showing the planner's
+  short recheck interval, groups event evidence into readable bulleted sections,
+  renders embedded timestamps in Home Assistant's local timezone, and omits
+  actions for device-control areas whose selector is off.
 - The integration creates one Energy Planner device and attaches every entity to
   it. Connected inputs and policy are configured on one central **Configure**
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
@@ -396,7 +399,9 @@ Status as of 2026-08-15.
   production evidence fingerprint includes the measured mapping and built-in
   forecast contract version, but excludes routine model values and retraining
   timestamps. A mismatch restores safe state and explicitly disarms production
-  control before new dry-run review cycles. Relevant evidence is exposed through
+  control before new dry-run review cycles. Explicit operator arming also
+  requires current preflight and matching evidence rather than merely setting
+  the persisted armed flag. Relevant evidence is exposed through
   the existing Current state, Next actions, calendar, diagnostics, and support
   surfaces without adding an entity. Tests cover normalization, cleaning,
   quality gates, correction,
@@ -443,12 +448,16 @@ Status as of 2026-08-15.
   deltas persisted at acquisition, contiguous peak boundaries, weather-led heat/cool selection, exact
   high/low comfort targets, least-cost thermally feasible runs, comfort coast,
   conservative maintenance load, and tariff-change fail-safe release are
-  implemented. Takeover snapshots configured switch/input-boolean zones,
+  implemented. A missed preferred start can use the remaining contiguous
+  lower-price slots before the peak; catch-up cannot cross a tariff gap or run
+  beyond the applicable comfort target. Takeover snapshots configured switch/input-boolean zones,
   disables mapped automations, enables zones, explicitly turns on the climate
   entity, and preserves the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,
   retains unresolved ownership for
-  retry, and never restores the prior climate mode or setpoint. Comfort-boundary
+  retry, and never restores the prior climate mode or setpoint. An ownership-free
+  release is a no-op, and only actual `set_hvac` attempts consume the daily
+  climate command allowance. Comfort-boundary
   release of planner-owned control is held through the recorded peak end to
   prevent reacquisition. An unowned comfort-boundary state still scans future
   tariff evidence so a pre-peak takeover is not lost while existing automations
@@ -470,7 +479,7 @@ Status as of 2026-08-15.
   automation suppression, and restoration through Home Assistant services.
   Planner, adapter, coordinator, executor, configuration, discovery, service,
   replay, and diagnostic tests cover full-horizon detection, cold/hot target
-  selection, zone takeover/rollback, helper overrides, comfort handoff, peak
+  selection, catch-up starts, zone takeover/rollback, helper overrides, owned comfort handoff, peak
   continuation, production/pause-blocked safety release, persisted tariff
   thresholds, and release evidence.
   Installations with an external schedule-versus-manual classifier can map its
@@ -529,11 +538,17 @@ Status as of 2026-08-15.
   sources, while tariff, solar, load, climate, EV, and Enphase action gates use
   only their relevant source and device evidence. A low optional carbon source
   therefore cannot suppress climate control, but low weather confidence still
-  blocks climate preconditioning at its configured threshold. When an opted-in
+  blocks climate preconditioning at its configured threshold. Degraded input
+  issues, capability failures, and scoped pauses are isolated to their control
+  area, including startup reconciliation and command-authority reporting;
+  occupancy availability is scoped to climate. Unsafe or unrecognized shared
+  planning health remains a global fail-closed boundary.
+  Heating below the comfort range and cooling above it are directionally safe
+  takeover operations when their targets remain within configured bounds. When an opted-in
   away preconditioning period begins later, the plan includes both an immediate
-  away-off command and a future lifecycle only when the latter remains feasible
-  after the resulting minimum rest period, so HVAC cannot remain running in the
-  gap or receive an inevitably rejected restart. Existing away-off ownership is
+  away-off command and a future lifecycle when the latter remains feasible
+  after the resulting minimum rest period. If the lifecycle is already due, it
+  can start directly without first creating an away-off rest period. Existing away-off ownership is
   retained when no candidate qualifies. Away HVAC-on execution additionally
   requires complete timestamped, numeric, reason-coded lifecycle evidence, and
   minimum-cycle continuation is limited to the same persisted mode and period

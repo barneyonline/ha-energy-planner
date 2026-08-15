@@ -39,7 +39,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.10.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.11.
 
 ## Installation
 
@@ -110,7 +110,7 @@ Changing the load mapping disarms production control and requires fresh review c
 
 | Entity | Purpose |
 | --- | --- |
-| **Armed** | Whether Energy Planner may currently issue commands and why |
+| **Armed** | Whether Energy Planner may currently issue commands and why; stale or incomplete reviewed evidence keeps it off even if an earlier arm request was persisted |
 | **Mode** | `review` while observing and `active` when automatic control is fully active |
 | **Current state** | Live state of every configured area whose device-control switch is on |
 | **Next actions** | Next state, planned actions, and decision evidence for enabled control areas |
@@ -136,13 +136,13 @@ Mapped EV start and stop controls are planner actuators. Energy Planner does not
 
 EV planning considers target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. After three observed trip days it can derive a conservative target from local history; until then it uses the configured fallback Target SOC. It supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
-Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. Preconditioning requires somebody home by default. **Precondition while away** can explicitly permit only a complete planner-generated tariff preconditioning/coast lifecycle when occupancy is known to be away; it does not permit unrelated HVAC-on commands, unknown occupancy, targets outside the configured comfort bounds, or restarting HVAC before the configured minimum cycle/rest period has elapsed. Only an action matching the persisted lifecycle mode and timestamps qualifies as a continuation that can bypass a redundant rest check. If an away preconditioning window begins in the future, unowned HVAC is turned off immediately and remains off until that window begins. Windows that cannot fit after the resulting rest period are omitted rather than scheduled for later rejection. The planner can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, relevant confidence falls below threshold, inputs become unsafe, or a manual override occurs. Takeover stops already-running configured automation actions even when an automation is already off, while release re-enables only automations that were active before takeover. It confirms the complete thermostat target and reasserts it once if a concurrent schedule overwrites the first command. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and **Climate Scheduler Guard Timer** under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual. External Manual Override helper changes use the configured manual override duration and are automatically cleared when it expires.
+Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. Preconditioning requires somebody home by default. **Precondition while away** can explicitly permit only a complete planner-generated tariff preconditioning/coast lifecycle when occupancy is known to be away; it does not permit unrelated HVAC-on commands, unknown occupancy, targets outside the configured comfort bounds, or restarting planner-owned HVAC before the configured minimum cycle/rest period has elapsed. Only an action matching the persisted lifecycle mode and timestamps qualifies as a continuation that can bypass a redundant rest check. If an away preconditioning window begins in the future, unowned HVAC is turned off immediately and remains off until that window begins. If a refresh or temporary block misses the preferred start, the planner can use the remaining contiguous lower-price slots rather than discarding the entire opportunity. It never crosses a tariff-data gap or continues heating/cooling past the applicable comfort target. The planner can temporarily take ownership of configured climate automations and zones, then restores them when the period ends, comfort is reached, relevant confidence falls below threshold, inputs become unsafe, or a manual override occurs. It does not call the release adapter when no HVAC ownership exists, and releases do not consume the daily climate command cap. Takeover stops already-running configured automation actions even when an automation is already off, while release re-enables only automations that were active before takeover. It confirms the complete thermostat target and reasserts it once if a concurrent schedule overwrites the first command. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and **Climate Scheduler Guard Timer** under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual. External Manual Override helper changes use the configured manual override duration and are automatically cleared when it expires.
 
 Enphase planning can select configured self-consumption, backup, or AI profiles using local tariff, PV, household-load, battery, and policy evidence.
 
 ## Safety and recovery
 
-- Device commands require healthy inputs, current plans, matching review evidence, production arming, and enabled device controls.
+- Device commands require explicitly healthy or degraded shared inputs, an eligible asset-specific confidence/capability result, a current plan, matching review evidence, production arming, and the relevant device control. Unknown health classifications fail closed. A degraded or paused device area does not stop an independent ready area, including after restart; occupancy readiness applies only to climate control.
 - Hard constraints are checked again immediately before every command.
 - Unsafe, missing, stale, or invalid inputs fail closed.
 - Confidence gates use only the forecast sources relevant to each device. The

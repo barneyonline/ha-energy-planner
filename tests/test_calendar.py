@@ -276,7 +276,7 @@ def test_calendar_description_uses_readable_sections_and_local_time(monkeypatch:
         },
     )
 
-    description = EnergyPlannerCalendar(_coordinator(_plan([action]))).event.description or ""
+    description = calendar_module._calendar_events(_coordinator(_plan([action])))[0].description or ""
 
     assert (
         "Schedule\n"

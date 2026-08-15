@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.11 - 2026-08-15
+
 ### Changed
 
 - **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
@@ -10,6 +12,32 @@
 - Plan calendar descriptions now group action evidence into short bulleted
   sections and render embedded schedule and forecast timestamps in Home
   Assistant's local timezone instead of exposing raw UTC ISO values.
+
+### Fixed
+
+- Manual safety-gate arming now requires the current preflight and reviewed
+  production evidence to pass. The Armed entity reports effective command
+  authority and exposes stale reviewed evidence as
+  `production_evidence_contract_changed` instead of appearing armed while the
+  executor rejects every command. Missing or unrecognized plan-health values
+  also fail closed during preflight.
+- Climate comfort handoff no longer calls the release adapter when Energy
+  Planner owns no HVAC state. Release/no-op audit rows no longer consume the
+  daily climate command allowance, so repeated replans cannot exhaust the cap
+  before a real preconditioning start.
+- A missed preconditioning start now uses the remaining contiguous lower-price
+  window instead of abandoning the whole lifecycle. Catch-up does not cross
+  tariff gaps or continue heating/cooling after the applicable comfort target
+  is already reached, and peak-period load is projected from the temperature
+  the shortened run can actually achieve.
+- Degraded issues and scoped pauses are isolated by control area. An EV-only
+  fault or pause no longer prevents an otherwise eligible climate action, while
+  unsafe shared inputs and per-device capability/confidence checks still fail
+  closed. Scoped pauses retain unaffected authority across restart and status
+  reporting, and occupancy availability is scoped to climate control.
+- Direct HVAC takeover may recover toward comfort from below the heating range
+  or above the cooling range. Opposite-direction commands and targets outside
+  the configured comfort bounds remain blocked.
 
 ## 0.9.10 - 2026-08-15
 
