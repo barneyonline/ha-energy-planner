@@ -245,7 +245,7 @@ rules:
         - tests/test_lifecycle.py
   docs-configuration-parameters:
     status: done
-    comment: Central settings document climate away-preconditioning opt-in, immediate away-off behavior, source-specific confidence gates, comfort/minimum-cycle safeguards, and bounded manual-override helper behavior.
+    comment: Central settings document climate away-preconditioning opt-in, catch-up windows, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards, and bounded manual-override helper behavior.
     references:
       docs:
         - README.md
@@ -436,7 +436,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master intent switch while Armed exposes command authority, and the three visible device switches select its control areas.
+    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master intent switch while Armed exposes effective command authority and manual arming cannot bypass stale reviewed evidence, and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py

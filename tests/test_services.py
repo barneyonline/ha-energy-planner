@@ -529,7 +529,7 @@ def test_run_preflight_no_control_dry_run_treats_discovery_as_advisory() -> None
     assert "advisory" in checks["required_control_areas_supported"]["message"]
 
 
-def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
+def test_run_preflight_isolates_a_mixed_unsupported_enabled_area() -> None:
     coordinator = _partial_coordinator(
         {
             "ev_smart_charging_start_entity": "input_boolean.ev_start",
@@ -541,12 +541,14 @@ def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
     )
     response = _run_preflight(coordinator)
 
-    assert response["ok"] is False
+    assert response["ok"] is True
     assert response["control_areas"]["required"] == ["ev", "hvac"]
+    assert response["control_areas"]["ready"] == ["ev"]
+    assert response["control_areas"]["blocked"] == ["hvac"]
     assert response["discovery"]["ev"]["supported"] is True
     assert response["discovery"]["hvac"]["supported"] is False
     checks = {check["check"]: check for check in response["checks"]}
-    assert checks["required_control_areas_supported"]["ok"] is False
+    assert checks["required_control_areas_supported"]["ok"] is True
     assert "hvac" in checks["required_control_areas_supported"]["message"]
 
 
@@ -577,6 +579,75 @@ def test_run_preflight_separates_historical_evidence_from_current_safety() -> No
     assert response["safe_to_activate_now"] is False
     assert response["active_control_ready"] is False
     assert response["current_plan"]["healthy"] is False
+
+
+def test_run_preflight_accepts_degraded_plan_for_asset_specific_execution() -> None:
+    coordinator = _coordinator()
+    coordinator.data.health = InputHealth.DEGRADED
+    coordinator.data.input_issues = ["ev_soc_unavailable"]
+    coordinator.data.confidence = 0.65
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["healthy"] is False
+    assert response["current_plan"]["input_health_safe"] is True
+    assert response["current_plan"]["safe"] is True
+    assert response["safe_to_activate_now"] is True
+
+
+def test_run_preflight_requires_a_confidence_eligible_ready_area() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+        },
+        ev_control_enabled=True,
+    )
+    coordinator.data.health = InputHealth.DEGRADED
+    coordinator.data.confidence = 0.4
+    coordinator.data.confidence_breakdown = {
+        "tariff": 0.8,
+        "solar": 0.4,
+        "load": 0.8,
+        "climate": 0.8,
+        "ev": 0.8,
+        "enphase": 0.8,
+    }
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["safe"] is True
+    assert response["control_areas"]["ready"] == ["ev"]
+    assert response["control_areas"]["confidence_eligible"] == []
+    assert response["control_areas"]["confidence_blocked"] == ["ev"]
+    assert response["safe_to_activate_now"] is False
+    checks = {check["check"]: check for check in response["checks"]}
+    assert checks["control_area_confidence_eligible"]["ok"] is False
+
+
+def test_run_preflight_rejects_unclassified_plan_health() -> None:
+    coordinator = _coordinator()
+    coordinator.data.health = "mystery"
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["input_health_safe"] is False
+    assert response["current_plan"]["safe"] is False
+    assert response["safe_to_activate_now"] is False
+
+
+def test_run_preflight_scopes_unavailable_occupancy_to_hvac() -> None:
+    coordinator = _coordinator()
+    hass = FakeHass(coordinator)
+    hass.states.values["person.home"] = "unavailable"
+    asyncio.run(async_setup(hass, {}))
+
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    response = asyncio.run(handler(FakeCall({})))
+
+    assert response["control_areas"]["ready"] == ["ev", "enphase"]
+    assert response["control_areas"]["blocked"] == ["hvac"]
+    assert response["safe_to_activate_now"] is True
 
 
 def test_run_preflight_combined_safety_bypass_waives_all_prechecks() -> None:
@@ -636,7 +707,7 @@ def test_run_preflight_rejects_stale_or_unconfirmed_plan() -> None:
     assert failed["current_plan"]["last_refresh_succeeded"] is False
 
 
-def test_run_preflight_rejects_pause_but_preserves_evidence_across_device_selection() -> None:
+def test_run_preflight_isolates_asset_pause_and_preserves_evidence_across_device_selection() -> None:
     coordinator = _coordinator()
     coordinator.store.data["control_pause"] = {
         "active": True,
@@ -648,8 +719,10 @@ def test_run_preflight_rejects_pause_but_preserves_evidence_across_device_select
     coordinator.entry.options["climate_control_enabled"] = False
     changed = _run_preflight(coordinator)
 
-    assert paused["safe_to_activate_now"] is False
-    assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is False
+    assert paused["safe_to_activate_now"] is True
+    assert paused["control_areas"]["paused"] == ["ev"]
+    assert paused["control_areas"]["available"] == ["hvac", "enphase"]
+    assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is True
     assert changed["production"]["dry_run_evidence_complete"] is True
     assert changed["production"]["dry_run_evidence_fingerprint_matches"] is True
     assert changed["safe_to_activate_now"] is True
@@ -913,6 +986,14 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
         mode=PlannerMode.DRY_RUN,
         summary="healthy dry-run",
         confidence=0.9,
+        confidence_breakdown={
+            "tariff": 0.9,
+            "solar": 0.9,
+            "load": 0.9,
+            "climate": 0.9,
+            "ev": 0.9,
+            "enphase": 0.9,
+        },
         estimated_daily_cost=2.0,
         estimated_cost_horizon_hours=12.0,
         actions=[],

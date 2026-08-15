@@ -35,6 +35,7 @@ class FakeCoordinator:
     refresh_metrics: dict[str, Any] | None = None
     automatic_control_requested: bool = False
     active_control: bool = False
+    effective_control: bool = False
 
 
 @dataclass(slots=True)
@@ -193,7 +194,8 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
                 "coalesced_count": 4,
             },
             automatic_control_requested=True,
-            active_control=False,
+            active_control=True,
+            effective_control=False,
         ),
     )
 

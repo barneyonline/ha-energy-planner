@@ -84,7 +84,12 @@ from .models import (
 )
 from .notifications import defer_persistent_notification
 from .planner import DryRunPlanner
-from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
+from .preflight import (
+    _control_area_report,
+    _runtime_control_area_report,
+    build_preflight_report,
+    production_evidence_fingerprint,
+)
 from .recorder_import import (
     async_import_ev_trip_history_from_recorder,
     async_update_builtin_load_forecast,
@@ -94,6 +99,7 @@ from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
     parse_production_state,
+    partition_control_areas_by_pause,
     strict_bool,
 )
 from .storage import PlannerStore
@@ -187,24 +193,18 @@ def _startup_auto_recovery_prerequisites(
     entry_data: dict[str, Any],
 ) -> tuple[bool, str]:
     """Return whether startup dependencies are ready without trusting bypasses."""
-    entities = dict(report.get("entities", {}))
-    if entities.get("missing") or entities.get("unavailable"):
-        return False, "configured_entities_unavailable"
-    services = dict(report.get("services", {}))
-    if services.get("missing") or services.get("unavailable"):
-        return False, "configured_services_unavailable"
     control_areas = dict(report.get("control_areas", {}))
     required = list(control_areas.get("required", []))
     if not required:
         return False, "no_required_control_areas"
-    discovery = dict(report.get("discovery", {}))
-    if any(not bool(dict(discovery.get(area, {})).get("supported")) for area in required):
-        return False, "required_control_area_unsupported"
+    if not control_areas.get("ready"):
+        return False, "no_ready_control_area"
+    if not control_areas.get("available"):
+        return False, "control_paused"
+    if not control_areas.get("confidence_eligible"):
+        return False, "no_confidence_eligible_control_area"
     if entry_data.get(CONF_HOUSEHOLD_LOAD) and not bool(dict(report.get("recorder", {})).get("available")):
         return False, "recorder_unavailable"
-    checks = {str(item.get("check")): item for item in report.get("checks", []) if isinstance(item, dict)}
-    if not bool(checks.get("control_not_paused", {}).get("ok")):
-        return False, "control_paused"
     return True, "startup_dependencies_ready"
 
 
@@ -414,6 +414,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Return whether automatic device control is fully active."""
         production = parse_production_state(self.store.data.get("production"))
         return self.automatic_control_requested and production.armed
+
+    @property
+    def effective_control(self) -> bool:
+        """Return whether current evidence permits automatic device commands."""
+        if not self.active_control:
+            return False
+        return bool(build_preflight_report(self.hass, self).get("active_control_ready"))
 
     @property
     def refresh_metrics(self) -> dict[str, Any]:
@@ -865,7 +872,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_reconcile_production_evidence_contract(self) -> bool:
         """Prepare startup control without discarding prior active intent."""
         production = parse_production_state(self.store.data.get("production"))
-        pause_reason = control_pause_reason(self.store.data.get("control_pause"), dt_util.utcnow())
+        pause = self.store.data.get("control_pause")
+        now = dt_util.utcnow()
+        required_control_areas = list(_control_area_report(self.entry_data, self.options)["required"])
+        unpaused_control_areas, _paused_control_areas = partition_control_areas_by_pause(
+            pause,
+            now,
+            required_control_areas,
+        )
+        pause_blocks_all_control = bool(
+            control_pause_reason(pause, now) is not None
+            and (not required_control_areas or not unpaused_control_areas)
+        )
         recovery = production.raw.get("startup_auto_recovery")
         recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
         recovery_pending_while_disarmed = bool(
@@ -873,22 +891,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             and not production.armed
             and recovery_status in {"waiting_for_safe", "validating", "restoring"}
         )
+        expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
-        if self.active_control and pause_reason is None:
+        if self.active_control and pause_blocks_all_control:
+            await self.async_disarm_production_control("startup_control_paused")
+            await self.async_restore_safe_state("startup_control_paused", refresh=False)
+            return True
+
+        if self.active_control and production.dry_run_evidence_fingerprint != expected_fingerprint:
+            await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+            await self.async_disarm_production_control("production_evidence_contract_changed")
+            return True
+
+        if self.active_control and not pause_blocks_all_control:
             # A previously running installation resumes immediately. Runtime
             # action gates still reject unsafe work while the startup grace
             # observes the fully started Home Assistant instance.
-            current = production.raw
-            current.update(
-                {
-                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-                        self.entry_data,
-                        self.options,
-                    ),
-                    "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
-                }
-            )
-            await self._async_save_production(current)
             self._startup_auto_recovery_authorized = True
             self._startup_auto_recovery_deadline = None
             self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
@@ -898,11 +916,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 required_runs=1,
                 reason="previously_active_control_preserved",
             )
-            return True
-
-        if self.active_control and pause_reason is not None:
-            await self.async_disarm_production_control("startup_control_paused")
-            await self.async_restore_safe_state("startup_control_paused", refresh=False)
             return True
 
         if recovery_pending_while_disarmed:
@@ -930,7 +943,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 store_data.get("production") if isinstance(store_data, dict) else None
             )
 
-        expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
         if not production.armed or production.dry_run_evidence_fingerprint == expected_fingerprint:
             return interrupted_recovery
 
@@ -1230,7 +1242,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         validation = self._last_startup_auto_recovery_validation
         if not isinstance(validation, dict) or validation.get("committed") is not True:
             return False, "validation_plan_not_committed"
-        if validation.get("healthy") is not True or validation.get("violations"):
+        if validation.get("safe") is not True or validation.get("violations"):
             return False, "validation_plan_unsafe"
         report = build_preflight_report(self.hass, self)
         ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
@@ -1247,6 +1259,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_startup_auto_recovery_validation = {
             "plan_id": plan.plan_id,
             "healthy": plan.health == InputHealth.HEALTHY and plan.status != "unsafe",
+            "safe": plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+            and plan.status == "current",
             "violations": list(violations),
             "committed": False,
         }
@@ -1741,7 +1755,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self,
         reason: str = "user_acknowledged",
     ) -> None:
-        """Cancel startup recovery and apply an explicit operator arm."""
+        """Apply an explicit operator arm only after current safety validation."""
+        report = build_preflight_report(self.hass, self)
+        if not report.get("safe_to_activate_now"):
+            rejection_reason = _active_control_not_ready_reason(report)
+            raise HomeAssistantError(
+                f"Production control is not ready: {rejection_reason}",
+                translation_domain=DOMAIN,
+                translation_key="active_control_not_ready",
+                translation_placeholders={"reason": rejection_reason},
+            )
         try:
             await self.async_cancel_startup_auto_recovery(
                 "operator_armed",
@@ -1829,8 +1852,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         if self.active_control and enabled:
             report = build_preflight_report(self.hass, self, options_override=proposed_options)
-            if not report.get("safe_to_activate_now"):
-                reason = _active_control_not_ready_reason(report)
+            raw_area_state = report.get("control_areas")
+            proposed_area_state = raw_area_state if isinstance(raw_area_state, dict) else {}
+            area_ready = area in proposed_area_state.get("ready", [])
+            area_available = area in proposed_area_state.get("available", [])
+            area_confidence_eligible = area in proposed_area_state.get(
+                "confidence_eligible",
+                [],
+            )
+            if not report.get("safe_to_activate_now") or not (
+                area_ready and area_available and area_confidence_eligible
+            ):
+                if not report.get("safe_to_activate_now"):
+                    reason = _active_control_not_ready_reason(report)
+                elif not area_ready:
+                    reason = f"the selected {area} control area is not ready"
+                elif not area_available:
+                    reason = f"the selected {area} control area is paused"
+                else:
+                    reason = f"the selected {area} control area does not meet confidence thresholds"
                 raise HomeAssistantError(
                     f"Device control is not ready: {reason}",
                     translation_domain=DOMAIN,
@@ -1927,7 +1967,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Track dry-run readiness evidence for the production gate."""
         production_state = parse_production_state(self.store.data.get("production"))
         production = production_state.raw
-        if plan.mode == PlannerMode.DRY_RUN and plan.health.value == "healthy" and not violations:
+        control_areas, _discovery = _runtime_control_area_report(
+            self.hass,
+            self.entry_data,
+            self.options,
+            plan=plan,
+            pause=self.store.data.get("control_pause"),
+            now=plan.created_at,
+        )
+        review_safe = bool(
+            plan.mode == PlannerMode.DRY_RUN
+            and plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+            and plan.status == "current"
+            and (
+                plan.health == InputHealth.HEALTHY
+                or control_areas.get("confidence_eligible")
+            )
+            and not violations
+        )
+        if review_safe:
             evidence_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
             ready_cycles = production_state.dry_run_ready_cycles
             if production.get("dry_run_evidence_fingerprint") != evidence_fingerprint:
@@ -1938,7 +1996,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 DRY_RUN_READY_CYCLES_REQUIRED,
             )
             production["last_dry_run_ready_at"] = plan.created_at
-        elif plan.health.value == "unsafe":
+        elif plan.health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             production["last_blocking_reason"] = "input_health_unsafe"
         await self._async_save_production(production)
 
