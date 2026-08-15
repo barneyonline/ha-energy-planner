@@ -41,8 +41,16 @@ run bash -n scripts/docker-ha-smoke.sh scripts/docker-validate.sh scripts/export
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run
 run scripts/export-real-validation-bundle.sh --dry-run
-run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable python3 scripts/validate_quality_scale.py
-run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable sh -c 'python3 -m coverage run -m pytest -q && python3 -m coverage report -m'
+if [[ "${HEP_SKIP_QUALITY_SCALE:-0}" == "1" ]]; then
+  printf '\n==> scripts/validate_quality_scale.py (skipped: HEP_SKIP_QUALITY_SCALE=1)\n'
+else
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable python3 scripts/validate_quality_scale.py
+fi
+if [[ "${HEP_SKIP_PYTEST:-0}" == "1" ]]; then
+  printf '\n==> pytest with coverage (skipped: HEP_SKIP_PYTEST=1)\n'
+else
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable sh -c 'python3 -m coverage run -m pytest -q && python3 -m coverage report -m'
+fi
 run python3 scripts/replay-fixture.py tests/fixtures/replay/*.json
 run python3 scripts/validate-live-schema-fixture.py tests/fixtures/live_schema/*.json
 run python3 scripts/validate-real-history-fixture.py tests/fixtures/history/*.json
