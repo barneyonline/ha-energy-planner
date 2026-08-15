@@ -920,29 +920,36 @@ def test_startup_auto_recovery_task_start_wakeup_and_shutdown() -> None:
         def cancel(self) -> None:
             self.cancelled = True
 
-    class Hass:
+    class Entry:
         def __init__(self) -> None:
             self.created = 0
+            self.hass: object | None = None
+            self.task_name: str | None = None
             self.task = Task()
 
-        def async_create_task(self, coroutine: object) -> Task:
+        def async_create_background_task(self, hass: object, coroutine: object, name: str) -> Task:
             self.created += 1
+            self.hass = hass
+            self.task_name = name
             coroutine.close()
             return self.task
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-    coordinator.hass = Hass()
+    coordinator.hass = object()
+    coordinator.entry = Entry()
     coordinator._startup_auto_recovery_authorized = False
     coordinator._startup_auto_recovery_task = None
     coordinator._startup_auto_recovery_wakeup = asyncio.Event()
 
     coordinator.async_start_startup_auto_recovery()
-    assert coordinator.hass.created == 0
+    assert coordinator.entry.created == 0
 
     coordinator._startup_auto_recovery_authorized = True
     coordinator.async_start_startup_auto_recovery()
     coordinator.async_start_startup_auto_recovery()
-    assert coordinator.hass.created == 1
+    assert coordinator.entry.created == 1
+    assert coordinator.entry.hass is coordinator.hass
+    assert coordinator.entry.task_name == "ha_energy_planner startup automatic-control recovery"
 
     coordinator._wake_startup_auto_recovery()
     assert coordinator._startup_auto_recovery_wakeup.is_set()
@@ -953,7 +960,7 @@ def test_startup_auto_recovery_task_start_wakeup_and_shutdown() -> None:
     coordinator._ai_advice_task = None
     coordinator._unsub_listeners = []
     coordinator.async_shutdown()
-    assert coordinator.hass.task.cancelled is True
+    assert coordinator.entry.task.cancelled is True
     assert coordinator._startup_auto_recovery_authorized is False
 
 
