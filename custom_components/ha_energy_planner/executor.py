@@ -71,6 +71,7 @@ _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
 _RETIRED_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
+_STARTUP_RECOVERY_NOTIFICATION_ID = "ha_energy_planner_startup_recovery"
 _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _PLAN_UNSAFE_NOTIFICATION_ID,
     _GRID_LIMIT_NOTIFICATION_ID,
@@ -1557,6 +1558,25 @@ class Executor:
             await self._async_dismiss_plan_fallback_notification(
                 self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID)
             )
+
+    async def async_notify_startup_recovery_unsafe(self, reason: str) -> None:
+        """Notify once when startup safety disarms retained automatic intent."""
+        await self._async_create_plan_fallback_notification(
+            title=self._notification_title("automatic control paused after startup"),
+            message=(
+                "Automatic control remains requested, but command authority was disarmed because "
+                f"the startup safety check was not healthy ({reason}). Energy Planner restored its "
+                "owned devices toward safe state and will retry automatically every 30 seconds. "
+                "It will re-arm after three consecutive healthy checks."
+            ),
+            notification_id=self._notification_id(_STARTUP_RECOVERY_NOTIFICATION_ID),
+        )
+
+    async def async_dismiss_startup_recovery_notification(self) -> None:
+        """Dismiss the deduplicated startup safety notification."""
+        await self._async_dismiss_plan_fallback_notification(
+            self._notification_id(_STARTUP_RECOVERY_NOTIFICATION_ID)
+        )
 
     def _in_notification_grace_period(self) -> bool:
         """Return whether startup warm-up should suppress fallback notifications."""

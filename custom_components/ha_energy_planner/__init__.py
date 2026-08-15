@@ -166,12 +166,12 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_arm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_acknowledged"))
         coordinator = await _require_coordinator(call)
-        await coordinator.async_arm_production_control(reason)
+        await coordinator.async_operator_arm_production_control(reason)
 
     async def handle_disarm_production(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
         coordinator = await _require_coordinator(call)
-        await coordinator.async_disarm_production_control(reason)
+        await coordinator.async_operator_disarm_production_control(reason)
 
     async def handle_pause_control(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
@@ -348,6 +348,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         if callable(cancel_auto_recovery):
             await cancel_auto_recovery("setup_entry_failed")
         coordinator.async_shutdown()
+        await coordinator.async_disarm_production_control("setup_entry_failed")
         await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
         entry.runtime_data = None
         raise
@@ -356,16 +357,52 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Unload a config entry."""
+    from homeassistant.core import CoreState
+
     coordinator = entry.runtime_data
+    whole_system_shutdown = getattr(hass, "state", CoreState.running) in {
+        CoreState.stopping,
+        CoreState.final_write,
+        CoreState.stopped,
+    }
+    configuration_reload_handoff = bool(
+        getattr(coordinator, "_configuration_reload_handoff", False)
+    )
+    preserve_automatic_state = bool(
+        configuration_reload_handoff
+        or (
+            whole_system_shutdown
+            and getattr(coordinator, "automatic_control_requested", False)
+        )
+    )
     # Stop new listener/timer work before waiting for any in-flight planner
     # execution. The coordinator's teardown marker also prevents an already
     # queued refresh from committing a new device command after restoration.
     cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
     if callable(cancel_auto_recovery):
-        await cancel_auto_recovery("entry_unload")
+        if preserve_automatic_state:
+            await cancel_auto_recovery(
+                "configuration_reload"
+                if configuration_reload_handoff
+                else "home_assistant_shutdown",
+                preserve_control=True,
+            )
+        else:
+            await cancel_auto_recovery("entry_unload")
     coordinator.async_shutdown()
     unload_completed = False
     try:
+        if preserve_automatic_state:
+            unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+            if unload_ok:
+                entry.runtime_data = None
+                unload_completed = True
+            elif configuration_reload_handoff:
+                coordinator._configuration_reload_handoff = False
+                await coordinator.async_reconcile_production_evidence_contract()
+                coordinator.async_start_startup_auto_recovery()
+            return unload_ok
+        await coordinator.async_disarm_production_control("entry_unload")
         restore_outcome = await coordinator.async_restore_safe_state("entry_unload", refresh=False)
         store_data = getattr(getattr(coordinator, "store", None), "data", {})
         remaining_ownership = store_data.get("ownership") if isinstance(store_data, Mapping) else None
@@ -387,7 +424,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
             await coordinator.async_disarm_production_control("entry_platform_unload_failed")
         return unload_ok
     finally:
-        if not unload_completed and entry.runtime_data is coordinator:
+        if not unload_completed and entry.runtime_data is coordinator and not whole_system_shutdown:
             coordinator.async_start_listeners()
 
 
@@ -485,6 +522,9 @@ async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfig
     topology_signature = _entry_topology_signature(entry)
     previous_topology_signature = getattr(coordinator, "entry_topology_signature", None)
     if previous_topology_signature is not None and topology_signature != previous_topology_signature:
+        prepare_reload = getattr(coordinator, "async_prepare_configuration_reload", None)
+        if callable(prepare_reload):
+            await prepare_reload()
         await hass.config_entries.async_reload(entry.entry_id)
         return
     handle_options_update = getattr(coordinator, "async_handle_options_update", None)

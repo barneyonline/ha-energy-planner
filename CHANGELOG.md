@@ -8,6 +8,29 @@
   preventing its bounded dependency wait from delaying bootstrap or producing a
   setup-timeout warning.
 
+### Changed
+
+- Previously active installations now resume **Automatic control** and
+  **Armed** immediately after restart. The ten-minute startup safety grace
+  begins only when Home Assistant reaches `RUNNING`; ordinary runtime safety
+  gates continue to apply throughout it.
+- **Automatic control** now represents retained operator intent, while
+  **Armed** remains the authoritative command-permission state. If the startup
+  deadline is unsafe, Energy Planner disarms and restores its devices while
+  leaving Automatic control on for automatic recovery.
+
+### Fixed
+
+- Startup safety validation now awaits a fresh non-debounced coordinator
+  refresh. Unsafe startup recovery retries every 30 seconds, resets progress on
+  any unhealthy check, and re-arms after three consecutive healthy checks.
+  Whole-system shutdown preserves active ownership and EV capacity reservations;
+  integration reload and removal continue to restore them.
+- Explicit production-gate arming or disarming now cancels the superseded
+  startup recovery and dismisses its stale warning. A failed
+  configuration-reload handoff resumes disarmed safety recovery on the
+  still-loaded coordinator.
+
 ## 0.9.9 - 2026-08-15
 
 ### Added

@@ -115,7 +115,13 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
     def is_on(self) -> bool:
         """Return switch state."""
         if self.entity_description.active_control:
-            return bool(self.coordinator.active_control)
+            return bool(
+                getattr(
+                    self.coordinator,
+                    "automatic_control_requested",
+                    self.coordinator.active_control,
+                )
+            )
         assert self.entity_description.option_key is not None
         return bool(self.coordinator.options.get(self.entity_description.option_key, self.entity_description.default))
 
