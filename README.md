@@ -39,7 +39,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.10.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.11.
 
 ## Installation
 

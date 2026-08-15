@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.11 - 2026-08-15
+
 ### Changed
 
 - **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
