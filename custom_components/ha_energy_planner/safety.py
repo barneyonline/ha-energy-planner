@@ -9,6 +9,7 @@ from typing import Any
 
 DRY_RUN_READY_CYCLES_REQUIRED = 3
 _MAX_REASONABLE_LEGACY_READY_CYCLES = 10_000
+_CONTROL_AREA_ASSETS = {"ev": "ev", "hvac": "daikin", "enphase": "enphase"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +82,36 @@ def control_pause_reason(value: Any, now: datetime, *, asset: str | None = None)
     if "all" in asset_values:
         return "planner_paused"
     return f"{asset}_control_paused" if asset in asset_values else None
+
+
+def partition_control_areas_by_pause(
+    value: Any,
+    now: datetime,
+    areas: list[str],
+) -> tuple[list[str], list[str]]:
+    """Return available and paused control areas using runtime asset semantics."""
+    raw_reason = control_pause_reason(value, now)
+    configured_assets = value.get("assets") if isinstance(value, dict) else None
+    if raw_reason is not None and configured_assets is not None:
+        asset_values = (
+            {configured_assets}
+            if isinstance(configured_assets, str)
+            else set(configured_assets)
+            if isinstance(configured_assets, list) and all(isinstance(item, str) for item in configured_assets)
+            else set()
+        )
+        known_assets = {"all", *_CONTROL_AREA_ASSETS.values()}
+        if not asset_values or not asset_values <= known_assets:
+            return [], list(areas)
+    available: list[str] = []
+    paused: list[str] = []
+    for area in areas:
+        asset = _CONTROL_AREA_ASSETS.get(area)
+        if asset is None or control_pause_reason(value, now, asset=asset) is not None:
+            paused.append(area)
+        else:
+            available.append(area)
+    return available, paused
 
 
 def _datetime_or_none(value: Any) -> datetime | None:

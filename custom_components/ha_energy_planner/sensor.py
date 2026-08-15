@@ -51,6 +51,7 @@ from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
     parse_production_state,
+    partition_control_areas_by_pause,
     strict_bool,
 )
 from .type_defs import EnergyPlannerConfigEntry
@@ -313,7 +314,7 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         icon="mdi:state-machine",
         device_class=SensorDeviceClass.ENUM,
         options=["review", "active"],
-        value_fn=lambda coordinator: "active" if coordinator.active_control else "review",
+        value_fn=lambda coordinator: "active" if coordinator.effective_control else "review",
     ),
     PlannerSensorDescription(
         key="current_state",
@@ -1749,7 +1750,19 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
     evidence_matches = production_state.dry_run_evidence_fingerprint == production_evidence_fingerprint(
         dict(coordinator.entry_data), coordinator.options
     )
-    pause_reason = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow())
+    pause = coordinator.store.data.get("control_pause")
+    now = dt_util.utcnow()
+    available_control_areas, paused_control_areas = partition_control_areas_by_pause(
+        pause,
+        now,
+        required_areas,
+    )
+    raw_pause_reason = control_pause_reason(pause, now)
+    pause_reason = (
+        raw_pause_reason
+        if raw_pause_reason is not None and (not required_areas or not available_control_areas)
+        else None
+    )
     dry_run_evidence_complete = (
         dry_run_ready_cycles >= DRY_RUN_READY_CYCLES_REQUIRED
         and bool(required_areas)
@@ -1763,7 +1776,7 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
             "automatic_control_requested",
             coordinator.active_control,
         ),
-        "automatic_control_running": coordinator.active_control,
+        "automatic_control_running": coordinator.effective_control,
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
@@ -1776,6 +1789,8 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "ready_to_arm": dry_run_evidence_complete,
         "device_controls": device_controls,
         "required_control_areas": required_areas,
+        "available_control_areas": available_control_areas,
+        "paused_control_areas": paused_control_areas,
         "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
         "startup_auto_recovery_status": startup_recovery.get("status", "inactive"),
         "startup_auto_recovery_successful_runs": startup_recovery.get("successful_runs", 0),
@@ -1799,6 +1814,12 @@ def _control_block_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any
     reasons: list[str] = []
     production_state = parse_production_state(coordinator.store.data.get("production"))
     pause = coordinator.store.data.get("control_pause")
+    required_areas = list(_control_area_report(dict(coordinator.entry_data), coordinator.options)["required"])
+    available_areas, paused_areas = partition_control_areas_by_pause(
+        pause,
+        dt_util.utcnow(),
+        required_areas,
+    )
     if not production_state.armed:
         reasons.append("production_gate_not_armed")
     elif production_state.dry_run_evidence_fingerprint != production_evidence_fingerprint(
@@ -1807,7 +1828,7 @@ def _control_block_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any
         reasons.append("production_evidence_contract_changed")
     elif production_state.dry_run_ready_cycles < DRY_RUN_READY_CYCLES_REQUIRED:
         reasons.append("production_dry_run_evidence_incomplete")
-    if _pause_active(pause):
+    if _pause_active(pause) and (not required_areas or not available_areas):
         reasons.append("planner_paused")
     if not strict_bool(coordinator.options.get(CONF_EV_CONTROL_ENABLED), default=False):
         reasons.append("ev_control_disabled")
@@ -1822,6 +1843,8 @@ def _control_block_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any
         "reasons": reasons[:12],
         "armed": production_state.armed,
         "pause": _bounded_json(pause),
+        "available_control_areas": available_areas,
+        "paused_control_areas": paused_areas,
     }
 
 

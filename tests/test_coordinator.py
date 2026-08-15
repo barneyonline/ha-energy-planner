@@ -132,7 +132,12 @@ def test_startup_auto_recovery_preflight_helpers_cover_every_blocker() -> None:
     base = {
         "entities": {"missing": [], "unavailable": []},
         "services": {"missing": [], "unavailable": []},
-        "control_areas": {"required": ["ev"]},
+        "control_areas": {
+            "required": ["ev"],
+            "ready": ["ev"],
+            "available": ["ev"],
+            "confidence_eligible": ["ev"],
+        },
         "discovery": {"ev": {"supported": True}},
         "recorder": {"available": True},
         "checks": [{"check": "control_not_paused", "ok": True}],
@@ -142,16 +147,51 @@ def test_startup_auto_recovery_preflight_helpers_cover_every_blocker() -> None:
     assert _startup_auto_recovery_validation_ready(base, {}) == (True, "validation_succeeded")
 
     cases = (
-        ({**base, "entities": {"missing": ["sensor.a"], "unavailable": []}}, {}, "configured_entities_unavailable"),
         (
-            {**base, "services": {"missing": ["select.select_option"], "unavailable": []}},
+            {**base, "control_areas": {"required": []}},
             {},
-            "configured_services_unavailable",
+            "no_required_control_areas",
         ),
-        ({**base, "control_areas": {"required": []}}, {}, "no_required_control_areas"),
-        ({**base, "discovery": {"ev": {"supported": False}}}, {}, "required_control_area_unsupported"),
+        (
+            {
+                **base,
+                "control_areas": {
+                    "required": ["ev"],
+                    "ready": [],
+                    "available": [],
+                    "confidence_eligible": [],
+                },
+            },
+            {},
+            "no_ready_control_area",
+        ),
+        (
+            {
+                **base,
+                "control_areas": {
+                    "required": ["ev"],
+                    "ready": ["ev"],
+                    "available": [],
+                    "confidence_eligible": [],
+                },
+            },
+            {},
+            "control_paused",
+        ),
+        (
+            {
+                **base,
+                "control_areas": {
+                    "required": ["ev"],
+                    "ready": ["ev"],
+                    "available": ["ev"],
+                    "confidence_eligible": [],
+                },
+            },
+            {},
+            "no_confidence_eligible_control_area",
+        ),
         ({**base, "recorder": {"available": False}}, {CONF_HOUSEHOLD_LOAD: "sensor.load"}, "recorder_unavailable"),
-        ({**base, "checks": [{"check": "control_not_paused", "ok": False}]}, {}, "control_paused"),
     )
     for report, entry_data, reason in cases:
         assert _startup_auto_recovery_prerequisites(report, entry_data) == (False, reason)
@@ -159,6 +199,24 @@ def test_startup_auto_recovery_preflight_helpers_cover_every_blocker() -> None:
 
     unsafe = {**base, "current_plan": {"safe": False}}
     assert _startup_auto_recovery_validation_ready(unsafe, {}) == (False, "current_plan_unsafe")
+    isolated = {
+        **base,
+        "entities": {"missing": [], "unavailable": ["switch.ev"]},
+        "control_areas": {
+            "required": ["ev", "hvac"],
+            "ready": ["hvac"],
+            "available": ["hvac"],
+            "confidence_eligible": ["hvac"],
+        },
+        "discovery": {
+            "ev": {"supported": False},
+            "hvac": {"supported": True},
+        },
+    }
+    assert _startup_auto_recovery_validation_ready(isolated, {}) == (
+        True,
+        "validation_succeeded",
+    )
     assert _startup_auto_recovery_successful_runs("invalid") == 0
 
 
@@ -1441,6 +1499,7 @@ def test_startup_recovery_validation_commits_without_executing() -> None:
     coordinator._last_startup_auto_recovery_validation = {
         "plan_id": plan.plan_id,
         "healthy": True,
+        "safe": True,
         "violations": [],
         "committed": False,
     }
@@ -1473,6 +1532,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
     assert coordinator._last_startup_auto_recovery_validation == {
         "plan_id": "candidate",
         "healthy": True,
+        "safe": True,
         "violations": ["unsafe"],
         "committed": False,
     }
@@ -1500,6 +1560,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
         coordinator._last_startup_auto_recovery_validation = {
             "committed": True,
             "healthy": False,
+            "safe": False,
             "violations": ["unsafe"],
         }
 
@@ -1513,6 +1574,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
         coordinator._last_startup_auto_recovery_validation = {
             "committed": True,
             "healthy": True,
+            "safe": True,
             "violations": [],
         }
 
@@ -1520,7 +1582,12 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
     blocked = {
         "entities": {"missing": [], "unavailable": []},
         "services": {"missing": [], "unavailable": []},
-        "control_areas": {"required": ["ev"]},
+        "control_areas": {
+            "required": ["ev"],
+            "ready": ["ev"],
+            "available": ["ev"],
+            "confidence_eligible": ["ev"],
+        },
         "discovery": {"ev": {"supported": True}},
         "recorder": {"available": True},
         "checks": [{"check": "control_not_paused", "ok": True}],
@@ -3454,6 +3521,28 @@ def test_combined_active_control_respects_selected_areas_and_arms(monkeypatch: o
     assert coordinator.active_control is True
 
 
+def test_effective_control_requires_active_intent_and_current_preflight(monkeypatch: object) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        store_data={"production": {"armed": True}},
+    )
+    report = {"active_control_ready": True}
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: report,
+    )
+
+    assert coordinator.effective_control is True
+
+    report["active_control_ready"] = False
+    assert coordinator.effective_control is False
+
+    coordinator.entry.options[CONF_DRY_RUN] = True
+    report["active_control_ready"] = True
+    assert coordinator.effective_control is False
+
+
 def test_combined_active_control_stays_in_review_until_evidence_is_ready(monkeypatch: object) -> None:
     class ConfigEntries:
         def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
@@ -3761,7 +3850,14 @@ def test_device_control_enable_while_active_preflights_without_disarming(monkeyp
 
     def preflight(hass: object, coordinator_arg: object, *, options_override: dict[str, object]) -> dict[str, object]:
         reports.append(options_override)
-        return {"safe_to_activate_now": True}
+        return {
+            "safe_to_activate_now": True,
+            "control_areas": {
+                "ready": ["ev", "hvac"],
+                "available": ["ev", "hvac"],
+                "confidence_eligible": ["ev", "hvac"],
+            },
+        }
 
     monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
 
@@ -3773,6 +3869,69 @@ def test_device_control_enable_while_active_preflights_without_disarming(monkeyp
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.executor.device_restores == []
     assert coordinator.active_control is True
+
+
+@pytest.mark.parametrize(
+    ("control_areas", "reason_fragment"),
+    [
+        (
+            {
+                "ready": ["ev"],
+                "available": ["ev"],
+                "confidence_eligible": ["ev"],
+            },
+            "not ready",
+        ),
+        (
+            {
+                "ready": ["ev", "hvac"],
+                "available": ["ev"],
+                "confidence_eligible": ["ev"],
+            },
+            "paused",
+        ),
+        (
+            {
+                "ready": ["ev", "hvac"],
+                "available": ["ev", "hvac"],
+                "confidence_eligible": ["ev"],
+            },
+            "does not meet confidence thresholds",
+        ),
+    ],
+)
+def test_device_control_enable_while_active_requires_selected_area_readiness(
+    monkeypatch: object,
+    control_areas: dict[str, list[str]],
+    reason_fragment: str,
+) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_DAIKIN_CLIMATE: "climate.home"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: False,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": True,
+            "control_areas": control_areas,
+        },
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, True))
+
+    assert error.value.translation_key == "device_control_not_ready"
+    assert reason_fragment in str(error.value)
+    assert coordinator.entry.options[CONF_CLIMATE_CONTROL_ENABLED] is False
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.refresh_requested == 0
 
 
 def test_device_control_enable_while_active_rejects_failed_preflight(monkeypatch: object) -> None:
@@ -3946,6 +4105,35 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
     assert comparison["recent_outcome_count"] == 1
 
 
+def test_asset_safe_degraded_plan_records_production_evidence() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev"},
+        options={CONF_EV_CONTROL_ENABLED: True},
+        hass=FakeHass({"switch.ev": "off"}),
+    )
+    plan = _plan("degraded-review")
+    plan.mode = PlannerMode.DRY_RUN
+    plan.health = InputHealth.DEGRADED
+    plan.confidence = 0.65
+    plan.confidence_breakdown = {
+        "tariff": 0.65,
+        "solar": 0.65,
+        "load": 0.65,
+        "climate": 0.4,
+        "ev": 0.65,
+        "enphase": 0.4,
+    }
+
+    asyncio.run(coordinator._async_update_production_evidence(plan, []))
+
+    production = coordinator.store.data["production"]
+    assert production["dry_run_ready_cycles"] == 1
+    assert production["dry_run_evidence_fingerprint"] == production_evidence_fingerprint(
+        coordinator.entry_data,
+        coordinator.options,
+    )
+
+
 def test_production_evidence_resets_when_control_contract_changes() -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
@@ -4003,7 +4191,10 @@ def test_previously_active_startup_preserves_arming_and_intent() -> None:
             "production": {
                 "armed": True,
                 "dry_run_ready_cycles": 3,
-                "dry_run_evidence_fingerprint": "prior-startup-contract",
+                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                    entry_data,
+                    options,
+                ),
                 "startup_auto_recovery": {
                     "status": "grace",
                     "successful_runs": 0,
@@ -4015,6 +4206,10 @@ def test_previously_active_startup_preserves_arming_and_intent() -> None:
         },
     )
     coordinator._startup_auto_recovery_authorized = False
+    coordinator.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+        coordinator.entry_data,
+        coordinator.options,
+    )
 
     assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
 
@@ -4051,6 +4246,89 @@ def test_paused_startup_does_not_preserve_active_arming() -> None:
     assert coordinator.store.data["production"]["disarmed_reason"] == "startup_control_paused"
     assert coordinator.executor.restored == ["startup_control_paused"]
     assert coordinator._startup_auto_recovery_authorized is False
+
+
+def test_scoped_pause_preserves_unaffected_control_area_at_startup() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+        },
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+        },
+        store_data={
+            "production": {"armed": True},
+            "control_pause": {
+                "active": True,
+                "until": datetime.now(UTC) + timedelta(hours=1),
+                "assets": ["ev"],
+                "reason": "ev_backoff",
+            },
+        },
+    )
+    coordinator._startup_auto_recovery_authorized = False
+    coordinator.store.data["production"].update(
+        {
+            "dry_run_ready_cycles": 3,
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                coordinator.entry_data,
+                coordinator.options,
+            ),
+        }
+    )
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.executor.restored == []
+    assert coordinator._startup_auto_recovery_authorized is True
+
+
+def test_scoped_pause_does_not_approve_a_changed_production_contract() -> None:
+    entry_data = {
+        CONF_EV_CHARGER: "switch.ev_new",
+        CONF_DAIKIN_CLIMATE: "climate.daikin",
+    }
+    options = {
+        CONF_PLANNER_ENABLED: True,
+        CONF_DRY_RUN: False,
+        CONF_EV_CONTROL_ENABLED: True,
+        CONF_CLIMATE_CONTROL_ENABLED: True,
+    }
+    coordinator = _coordinator_for_runtime_services(
+        entry_data=entry_data,
+        options=options,
+        store_data={
+            "production": {
+                "armed": True,
+                "dry_run_ready_cycles": 3,
+                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                    {
+                        CONF_EV_CHARGER: "switch.ev_old",
+                        CONF_DAIKIN_CLIMATE: "climate.daikin",
+                    },
+                    options,
+                ),
+            },
+            "control_pause": {
+                "active": True,
+                "until": datetime.now(UTC) + timedelta(hours=1),
+                "assets": ["ev"],
+                "reason": "ev_backoff",
+            },
+        },
+    )
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["disarmed_reason"] == "production_evidence_contract_changed"
+    assert coordinator.executor.restored == ["production_evidence_contract_changed"]
 
 
 @pytest.mark.parametrize(
@@ -4129,6 +4407,41 @@ def test_safe_startup_grace_keeps_control_armed_and_silent() -> None:
     assert coordinator.executor.startup_recovery_notifications == []
     assert coordinator.executor.startup_recovery_dismissals == 1
     assert coordinator.executor.notification_grace_until is None
+
+
+def test_degraded_ready_area_passes_complete_startup_grace(monkeypatch: object) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._startup_auto_recovery_authorized = True
+    coordinator._startup_auto_recovery_deadline = coordinator_module.monotonic()
+    plan = _plan("degraded-startup")
+    plan.health = InputHealth.DEGRADED
+
+    async def commit_degraded_refresh() -> None:
+        coordinator._record_startup_auto_recovery_validation_candidate(plan, [])
+        coordinator._last_startup_auto_recovery_validation["committed"] = True
+
+    coordinator.async_refresh = commit_degraded_refresh
+    report = {
+        "control_areas": {
+            "required": ["ev", "hvac"],
+            "ready": ["hvac"],
+            "available": ["hvac"],
+            "confidence_eligible": ["hvac"],
+        },
+        "recorder": {"available": True},
+        "current_plan": {"safe": True},
+    }
+    monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda hass, item: report)
+
+    assert asyncio.run(coordinator._async_complete_startup_grace()) == (
+        True,
+        "startup_grace_completed_healthy",
+    )
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.executor.restored == []
 
 
 def test_unsafe_startup_grace_disarms_restores_notifies_and_retains_intent() -> None:
@@ -4322,13 +4635,20 @@ def test_operator_disarm_cancels_recovery_without_rearming_or_restoring() -> Non
     assert coordinator.executor.startup_recovery_dismissals == 1
 
 
-def test_operator_arm_cancels_disarmed_recovery_before_granting_authority() -> None:
+def test_operator_arm_cancels_disarmed_recovery_before_granting_authority(
+    monkeypatch: object,
+) -> None:
     coordinator = _startup_recovery_test_coordinator()
     coordinator.store.data["production"]["startup_auto_recovery"] = {
         "status": "waiting_for_safe",
         "successful_runs": 1,
     }
     coordinator._startup_auto_recovery_task = None
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"safe_to_activate_now": True},
+    )
 
     asyncio.run(coordinator.async_operator_arm_production_control("button_pressed"))
 
@@ -4339,6 +4659,46 @@ def test_operator_arm_cancels_disarmed_recovery_before_granting_authority() -> N
     assert coordinator._startup_auto_recovery_authorized is False
     assert coordinator.executor.restored == []
     assert coordinator.executor.startup_recovery_dismissals == 1
+
+
+def test_operator_arm_rejects_stale_evidence_without_cancelling_recovery(
+    monkeypatch: object,
+) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"].update(
+        {
+            "armed": False,
+            "dry_run_ready_cycles": 3,
+            "dry_run_evidence_fingerprint": "stale-contract",
+            "startup_auto_recovery": {
+                "status": "waiting_for_safe",
+                "successful_runs": 1,
+            },
+        }
+    )
+    coordinator._startup_auto_recovery_task = None
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "safe_to_activate_now": False,
+            "production": {
+                "dry_run_ready_cycles": 3,
+                "dry_run_evidence_complete": False,
+            },
+            "checks": [],
+        },
+    )
+
+    with pytest.raises(HomeAssistantError) as error:
+        asyncio.run(coordinator.async_operator_arm_production_control("button_pressed"))
+
+    production = coordinator.store.data["production"]
+    assert error.value.translation_key == "active_control_not_ready"
+    assert production["armed"] is False
+    assert production["startup_auto_recovery"]["status"] == "waiting_for_safe"
+    assert coordinator._startup_auto_recovery_authorized is True
+    assert coordinator.executor.startup_recovery_dismissals == 0
 
 
 def test_home_assistant_shutdown_preserves_persisted_recovery_state() -> None:
@@ -4973,7 +5333,12 @@ def _startup_recovery_report(coordinator: EnergyPlannerCoordinator) -> dict[str,
     return {
         "entities": {"missing": [], "unavailable": []},
         "services": {"missing": [], "unavailable": []},
-        "control_areas": {"required": ["ev"]},
+        "control_areas": {
+            "required": ["ev"],
+            "ready": ["ev"],
+            "available": ["ev"],
+            "confidence_eligible": ["ev"],
+        },
         "discovery": {"ev": {"supported": True}},
         "recorder": {"available": True},
         "checks": [{"check": "control_not_paused", "ok": True}],

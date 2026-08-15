@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -17,12 +18,26 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
-from .const import DOMAIN, EV_RESERVATION_EXTERNAL_BASELINE
+from .const import (
+    CONF_BYPASS_SAFETY_GATES,
+    CONF_PLANNER_ENABLED,
+    DOMAIN,
+    EV_RESERVATION_EXTERNAL_BASELINE,
+)
 from .coordinator import STARTUP_AUTO_RECOVERY_REQUIRED_RUNS, EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities, recorder_safe_attributes
 from .models import InputHealth
-from .preflight import _control_area_report, production_evidence_fingerprint
-from .safety import DRY_RUN_READY_CYCLES_REQUIRED, control_pause_reason, parse_production_state
+from .preflight import (
+    _current_plan_report,
+    _runtime_control_area_report,
+    production_evidence_fingerprint,
+)
+from .safety import (
+    DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_reason,
+    parse_production_state,
+    strict_bool,
+)
 from .type_defs import EnergyPlannerConfigEntry
 
 
@@ -59,7 +74,7 @@ BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
         translation_key="armed",
         icon="mdi:shield-check-outline",
         device_class=BinarySensorDeviceClass.RUNNING,
-        value_fn=lambda coordinator: parse_production_state(coordinator.store.data.get("production")).armed,
+        value_fn=lambda coordinator: _armed_attrs(coordinator)["armed"],
         attrs_fn=lambda coordinator: _armed_attrs(coordinator),
     ),
 )
@@ -121,8 +136,28 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     production = parse_production_state(coordinator.store.data.get("production"))
     startup_recovery = production.raw.get("startup_auto_recovery")
     startup_recovery = dict(startup_recovery) if isinstance(startup_recovery, dict) else {}
-    pause_reason = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow())
-    control_areas = _control_area_report(dict(coordinator.entry_data), coordinator.options)
+    pause = coordinator.store.data.get("control_pause")
+    now = dt_util.utcnow()
+    plan = getattr(coordinator, "data", None)
+    control_areas, _discovery = _runtime_control_area_report(
+        coordinator.hass,
+        dict(coordinator.entry_data),
+        coordinator.options,
+        plan=plan,
+        pause=pause,
+        now=now,
+    )
+    required_control_areas = list(control_areas["required"])
+    ready_control_areas = list(control_areas.get("ready", []))
+    blocked_control_areas = [area for area in required_control_areas if area not in ready_control_areas]
+    available_control_areas = list(control_areas.get("available", []))
+    paused_control_areas = list(control_areas.get("paused", []))
+    raw_pause_reason = control_pause_reason(pause, now)
+    pause_reason = (
+        raw_pause_reason
+        if raw_pause_reason is not None and (not required_control_areas or not available_control_areas)
+        else None
+    )
     evidence_matches = production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
         dict(coordinator.entry_data), coordinator.options
     )
@@ -131,30 +166,69 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         and bool(control_areas["required"])
         and evidence_matches
     )
+    safety_bypassed = strict_bool(
+        coordinator.options.get(CONF_BYPASS_SAFETY_GATES),
+        default=False,
+    )
+    planner_enabled = strict_bool(
+        coordinator.options.get(CONF_PLANNER_ENABLED),
+        default=False,
+    )
+    current_plan_reason = _current_plan_block_reason(
+        plan,
+        now=now,
+        last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
+    )
+    confidence_eligible_areas = list(control_areas.get("confidence_eligible", []))
     if pause_reason:
         reason = pause_reason
     elif coordinator.dry_run:
         reason = "review_mode"
+    elif not planner_enabled:
+        reason = "planner_disabled"
     elif not production.armed:
         reason = "safety_gate_not_armed"
+    elif not safety_bypassed and not evidence_matches:
+        reason = "production_evidence_contract_changed"
+    elif not safety_bypassed and not evidence_complete:
+        reason = "production_dry_run_evidence_incomplete"
+    elif not safety_bypassed and current_plan_reason is not None:
+        reason = current_plan_reason
+    elif not safety_bypassed and not available_control_areas:
+        reason = "no_ready_control_area"
+    elif not safety_bypassed and not confidence_eligible_areas:
+        reason = "no_confidence_eligible_control_area"
     else:
         reason = "armed"
+    effective_armed = bool(getattr(coordinator, "effective_control", reason == "armed"))
+    if effective_armed:
+        reason = "armed"
+    elif reason == "armed":
+        reason = "active_control_not_ready"
     return {
-        "armed": production.armed,
-        "automatic_control": coordinator.active_control,
+        "armed": effective_armed,
+        "arming_requested": production.armed,
+        "automatic_control": effective_armed,
         "automatic_control_requested": getattr(
             coordinator,
             "automatic_control_requested",
             coordinator.active_control,
         ),
-        "mode": "active" if coordinator.active_control else "review",
+        "mode": "active" if effective_armed else "review",
         "reason": reason,
         "control_paused": pause_reason is not None,
-        "required_control_areas": list(control_areas["required"]),
+        "required_control_areas": required_control_areas,
+        "ready_control_areas": ready_control_areas,
+        "blocked_control_areas": blocked_control_areas,
+        "available_control_areas": available_control_areas,
+        "paused_control_areas": paused_control_areas,
+        "confidence_eligible_control_areas": confidence_eligible_areas,
+        "current_plan_safe": current_plan_reason is None and bool(confidence_eligible_areas),
         "dry_run_ready_cycles": production.dry_run_ready_cycles,
         "dry_run_cycles_required": DRY_RUN_READY_CYCLES_REQUIRED,
         "dry_run_evidence_complete": evidence_complete,
         "dry_run_evidence_matches_configuration": evidence_matches,
+        "safety_gates_bypassed": safety_bypassed,
         "startup_auto_recovery_status": startup_recovery.get("status", "inactive"),
         "startup_auto_recovery_successful_runs": startup_recovery.get("successful_runs", 0),
         "startup_auto_recovery_required_runs": startup_recovery.get(
@@ -164,6 +238,37 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "startup_auto_recovery_deadline": startup_recovery.get("deadline"),
         "startup_auto_recovery_last_reason": startup_recovery.get("last_reason"),
     }
+
+
+def _current_plan_block_reason(
+    plan: Any,
+    *,
+    now: datetime | None = None,
+    last_refresh_metadata: dict[str, Any] | None = None,
+) -> str | None:
+    """Return a stable reason when the current plan cannot issue normal commands."""
+    if plan is None:
+        return "current_plan_unavailable"
+    if getattr(plan, "health", None) not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
+        return "input_health_unsafe"
+    if str(getattr(plan, "status", "")) != "current":
+        return "current_plan_not_current"
+    if float(getattr(plan, "confidence", 0.0) or 0.0) <= 0:
+        return "current_plan_confidence_zero"
+    if now is None:
+        return None
+    report = _current_plan_report(
+        plan,
+        now=now,
+        last_refresh_metadata=last_refresh_metadata,
+    )
+    if not report.get("fresh"):
+        return "current_plan_stale"
+    if not report.get("last_refresh_succeeded"):
+        return "current_plan_refresh_unconfirmed"
+    if not report.get("adequate_coverage"):
+        return "current_plan_coverage_inadequate"
+    return None
 
 
 class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):

@@ -16,7 +16,6 @@ from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
     CONF_BATTERY_USABLE_CAPACITY_KWH,
-    CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
@@ -51,6 +50,7 @@ from .const import (
     CONF_PRIORITY_WEIGHTS,
     CONF_PV_FORECAST,
     CONF_WEATHER,
+    DEFAULT_OPTIONS,
 )
 from .ev import EVTripSummary, allocate_least_cost_charging, calculate_ev_target
 from .models import (
@@ -101,7 +101,7 @@ class DryRunPlanner:
             summary = "Dry-run plan generated; no device actions will be sent"
         elif mode == PlannerMode.ACTIVE_HEALTHY:
             summary = f"Active plan generated with {len(actions)} eligible candidate action(s)"
-        elif context.input_health == InputHealth.UNSAFE:
+        elif context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             summary = "Plan unsafe; required inputs are stale or unavailable"
 
         return EnergyPlan(
@@ -109,7 +109,11 @@ class DryRunPlanner:
             created_at=context.created_at,
             horizon_hours=int(self.options[CONF_PLANNING_HORIZON_HOURS]),
             interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
-            status="current" if context.input_health != InputHealth.UNSAFE else "unsafe",
+            status=(
+                "current"
+                if context.input_health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+                else "unsafe"
+            ),
             health=context.input_health,
             mode=mode,
             summary=summary,
@@ -129,7 +133,7 @@ class DryRunPlanner:
     def _mode(self, context: DecisionContext) -> PlannerMode:
         planner_enabled = strict_bool(self.options.get(CONF_PLANNER_ENABLED), default=False)
         dry_run = strict_bool(self.options.get(CONF_DRY_RUN), default=True)
-        if context.input_health == InputHealth.UNSAFE:
+        if context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             return PlannerMode.ACTIVE_DEGRADED if planner_enabled else PlannerMode.DISABLED
         if not planner_enabled:
             return PlannerMode.DISABLED
@@ -159,11 +163,6 @@ class DryRunPlanner:
 
     def _actions(self, context: DecisionContext, mode: PlannerMode) -> list[PlanAction]:
         """Create conservative immediate candidate actions."""
-        ownership_free_hvac_release_allowed = bool(
-            mode != PlannerMode.DISABLED
-            and not strict_bool(self.options.get(CONF_DRY_RUN), default=True)
-            and strict_bool(self.options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False)
-        )
         manual_hvac_override_active = any(
             override.kind == "manual_hvac" and (override.expires_at is None or context.created_at < override.expires_at)
             for override in getattr(context, "active_overrides", [])
@@ -175,19 +174,10 @@ class DryRunPlanner:
             if context.hvac_control.get("required_evidence_lost")
             else None
         )
-        ownership_free_comfort_handoff = bool(
-            ownership_free_hvac_release_allowed
-            and not context.hvac_control
-            and context.occupancy_state == OccupancyState.OCCUPIED
-            and context.current_hvac_temperature_c is not None
-            and context.occupied_temperature_low_c is not None
-            and context.occupied_temperature_high_c is not None
-            and (
-                float(context.current_hvac_temperature_c) <= float(context.occupied_temperature_low_c)
-                or float(context.current_hvac_temperature_c) >= float(context.occupied_temperature_high_c)
-            )
-        )
-        if mode not in {PlannerMode.ACTIVE_HEALTHY, PlannerMode.DRY_RUN} or context.input_health != InputHealth.HEALTHY:
+        if (
+            mode not in {PlannerMode.ACTIVE_HEALTHY, PlannerMode.DRY_RUN}
+            or context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+        ):
             if (
                 context.hvac_control.get("phase") == "away_off"
                 and context.occupancy_state == OccupancyState.AWAY
@@ -202,16 +192,6 @@ class DryRunPlanner:
                         context.created_at,
                         context.created_at + interval,
                         away_off_release_reason or "hvac_required_evidence_lost",
-                    )
-                ]
-            if ownership_free_comfort_handoff:
-                interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
-                return [
-                    self._hvac_release_action(
-                        context,
-                        context.created_at,
-                        context.created_at + interval,
-                        "hvac_comfort_handoff",
                     )
                 ]
             return []
@@ -230,7 +210,6 @@ class DryRunPlanner:
                         context,
                         execute_not_before,
                         execute_not_after,
-                        ownership_free_release_allowed=ownership_free_hvac_release_allowed,
                     )
                 )
         elif context.occupancy_state == OccupancyState.AWAY and context.hvac_control:
@@ -244,7 +223,6 @@ class DryRunPlanner:
                         context,
                         execute_not_before,
                         execute_not_after,
-                        ownership_free_release_allowed=ownership_free_hvac_release_allowed,
                     )
                 )
             else:
@@ -262,7 +240,6 @@ class DryRunPlanner:
                     context,
                     execute_not_before,
                     execute_not_after,
-                    ownership_free_release_allowed=ownership_free_hvac_release_allowed,
                 )
                 if away_preconditioning_enabled
                 else []
@@ -287,7 +264,6 @@ class DryRunPlanner:
                     context,
                     execute_not_before,
                     execute_not_after,
-                    ownership_free_release_allowed=ownership_free_hvac_release_allowed,
                 )
             )
         ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
@@ -543,8 +519,6 @@ class DryRunPlanner:
         context: DecisionContext,
         execute_not_before: datetime,
         execute_not_after: datetime,
-        *,
-        ownership_free_release_allowed: bool,
     ) -> list[PlanAction]:
         """Plan precondition, peak-coast, and release lifecycle actions."""
         active = dict(context.hvac_control or {})
@@ -680,6 +654,11 @@ class DryRunPlanner:
             )
             precondition_target = float(high if mode == "heat" else low)
             coast_target = float(low if mode == "heat" else high)
+            projected_precondition_end_temperature = _finite_number(
+                active.get("projected_precondition_end_temperature")
+            )
+            if projected_precondition_end_temperature is None:
+                projected_precondition_end_temperature = precondition_target
             if phase == "preconditioning":
                 self._project_active_hvac_slots(
                     context,
@@ -693,7 +672,7 @@ class DryRunPlanner:
                     mode=mode,
                     coast_started_at=precondition_end,
                     active_until=period_end,
-                    starting_temperature=precondition_target,
+                    starting_temperature=projected_precondition_end_temperature,
                     comfort_boundary=coast_target,
                 )
             else:
@@ -713,6 +692,7 @@ class DryRunPlanner:
                 "suppression_min_price_delta": suppression_delta,
                 "precondition_target": _finite_number(active.get("precondition_target")) or precondition_target,
                 "coast_target": _finite_number(active.get("coast_target")) or coast_target,
+                "projected_precondition_end_temperature": projected_precondition_end_temperature,
             }
             actions = [
                 self._hvac_control_action(
@@ -777,19 +757,6 @@ class DryRunPlanner:
             allow_immediate_start=allow_immediate_start,
         )
         if candidate is None:
-            if (
-                comfort_boundary_breached
-                and ownership_free_release_allowed
-                and not away_off_ownership_active
-            ):
-                return [
-                    self._hvac_release_action(
-                        context,
-                        now,
-                        now + interval,
-                        "hvac_comfort_handoff",
-                    )
-                ]
             return []
         precondition_start = candidate["precondition_start"]
         precondition_end = candidate["precondition_end"]
@@ -807,6 +774,9 @@ class DryRunPlanner:
             "suppression_min_price_delta": candidate["suppression_min_price_delta"],
             "precondition_target": precondition_target,
             "coast_target": coast_target,
+            "projected_precondition_end_temperature": candidate[
+                "projected_precondition_end_temperature"
+            ],
         }
         actions = [
             self._hvac_control_action(
@@ -907,13 +877,11 @@ class DryRunPlanner:
                 continue
             target = high if mode == "heat" else low
             rate = thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode)
-            available_slots = index - window_start
-            if rate is None or rate <= 0:
-                if available_slots < lead_slots:
-                    index = end_index
-                    continue
             best_start: int | None = None
             best_required_slots: int | None = None
+            best_projected_end_temperature = target
+            best_baseline = baseline
+            best_end_index = end_index
             best_cost: float | None = None
             passive_drift = _effective_passive_drift_c_per_hour(context, mode, self.thermal_model)
             for possible_start in range(window_start, index):
@@ -947,6 +915,9 @@ class DryRunPlanner:
                 run = context.slots[possible_start : possible_start + required_slots]
                 if any(item.import_price is None for item in run):
                     continue
+                run_baseline = min(float(item.import_price) for item in run)
+                if float(slot.import_price) < run_baseline + start_delta:
+                    continue
                 completion = possible_start + required_slots
                 coast_hours = (index - completion) * interval_minutes / 60
                 if coast_hours > 0:
@@ -964,10 +935,76 @@ class DryRunPlanner:
                     best_cost = cost
                     best_start = possible_start
                     best_required_slots = required_slots
+                    best_baseline = run_baseline
+                    best_end_index = index + 1
+                    while (
+                        best_end_index < len(context.slots)
+                        and context.slots[best_end_index].import_price is not None
+                        and float(context.slots[best_end_index].import_price)
+                        >= run_baseline + suppression_delta
+                    ):
+                        best_end_index += 1
+            if best_start is None:
+                # A missed refresh or temporarily blocked command must not make
+                # the remainder of an otherwise valuable preconditioning
+                # window unusable. Start at the earliest allowed priced slot
+                # and use all remaining time before the expensive period.
+                for possible_start in range(window_start, index):
+                    possible_start_at = context.slots[possible_start].valid_at
+                    if (
+                        earliest_start is not None
+                        and possible_start_at < earliest_start
+                        and not (allow_immediate_start and possible_start_at <= context.created_at)
+                    ):
+                        continue
+                    hours_to_start = max(
+                        (possible_start_at - context.created_at).total_seconds() / 3600,
+                        0.0,
+                    )
+                    projected_start_temperature = current
+                    if passive_drift is not None:
+                        projected_start_temperature += passive_drift * hours_to_start
+                    if mode == "heat" and projected_start_temperature >= high:
+                        continue
+                    if mode == "cool" and projected_start_temperature <= low:
+                        continue
+                    run = context.slots[possible_start:index]
+                    if not run or any(item.import_price is None for item in run):
+                        continue
+                    tail_baseline = min(float(item.import_price) for item in run)
+                    if float(slot.import_price) < tail_baseline + start_delta:
+                        continue
+                    tail_end_index = index + 1
+                    while (
+                        tail_end_index < len(context.slots)
+                        and context.slots[tail_end_index].import_price is not None
+                        and float(context.slots[tail_end_index].import_price)
+                        >= tail_baseline + suppression_delta
+                    ):
+                        tail_end_index += 1
+                    best_start = possible_start
+                    best_required_slots = len(run)
+                    best_baseline = tail_baseline
+                    best_end_index = tail_end_index
+                    if rate is None or rate <= 0:
+                        # A shortened fallback without a learned active rate
+                        # cannot claim any thermal reserve. Project peak load
+                        # from the comfort boundary instead.
+                        best_projected_end_temperature = low if mode == "heat" else high
+                    else:
+                        active_delta = rate * len(run) * interval_minutes / 60
+                        best_projected_end_temperature = (
+                            min(projected_start_temperature + active_delta, target)
+                            if mode == "heat"
+                            else max(projected_start_temperature - active_delta, target)
+                        )
+                    break
             if best_start is None or best_required_slots is None:
                 index = end_index
                 continue
             required_slots = best_required_slots
+            baseline = best_baseline
+            end_index = best_end_index
             projected_load = thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW)
             for projected in context.slots[best_start : best_start + required_slots]:
                 projected.projected_hvac_load_kw = max(projected.projected_hvac_load_kw, projected_load)
@@ -981,7 +1018,7 @@ class DryRunPlanner:
                 mode=mode,
                 coast_started_at=context.slots[best_start + required_slots].valid_at,
                 active_until=period_end,
-                starting_temperature=target,
+                starting_temperature=best_projected_end_temperature,
                 comfort_boundary=low if mode == "heat" else high,
             )
             return {
@@ -997,6 +1034,7 @@ class DryRunPlanner:
                 "precondition_min_price_delta": float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
                 "suppression_min_price_delta": suppression_delta,
                 "mode": mode,
+                "projected_precondition_end_temperature": best_projected_end_temperature,
             }
         return None
 
@@ -1017,6 +1055,7 @@ class DryRunPlanner:
         suppression_min_price_delta: float,
         precondition_target: float | None = None,
         coast_target: float | None = None,
+        projected_precondition_end_temperature: float | None = None,
     ) -> PlanAction:
         """Build one lifecycle HVAC control action."""
         thermal_summary = thermal_model_summary(self.thermal_model)
@@ -1041,6 +1080,11 @@ class DryRunPlanner:
                 "mode": mode,
                 "precondition_target": precondition_target if precondition_target is not None else target,
                 "coast_target": coast_target if coast_target is not None else target,
+                "projected_precondition_end_temperature": (
+                    projected_precondition_end_temperature
+                    if projected_precondition_end_temperature is not None
+                    else target
+                ),
                 "suppress_automations": True,
                 "enable_zones": True,
                 "controlled_zones": list(context.climate_zone_entities),
@@ -1318,10 +1362,60 @@ def _action_meets_confidence_threshold(
     options: Mapping[str, Any],
 ) -> bool:
     """Return whether an action clears tariff and device confidence thresholds."""
-    breakdown = _confidence_breakdown(context, [action])
-    for key, option in _confidence_checks(action.asset):
-        threshold = float(options.get(option, 0.0) or 0.0) / 100.0
-        if float(breakdown.get(key, 0.0) or 0.0) < threshold:
+    return asset_meets_confidence_threshold(action.asset, context, options)
+
+
+def asset_meets_confidence_threshold(
+    asset: ActionAsset,
+    context: DecisionContext,
+    options: Mapping[str, Any],
+) -> bool:
+    """Return whether an asset clears its relevant confidence thresholds."""
+    breakdown = _confidence_breakdown(context, [])
+    return _confidence_values_meet_threshold(asset, breakdown, options)
+
+
+def plan_asset_meets_confidence_threshold(
+    asset: ActionAsset,
+    plan: EnergyPlan | Any,
+    options: Mapping[str, Any],
+) -> bool:
+    """Return whether a current plan proves confidence eligibility for an asset."""
+    breakdown = getattr(plan, "confidence_breakdown", None)
+    if not isinstance(breakdown, Mapping):
+        return False
+    return _confidence_values_meet_threshold(asset, breakdown, options)
+
+
+def confidence_eligible_control_areas(
+    plan: EnergyPlan | Any,
+    control_areas: list[str],
+    options: Mapping[str, Any],
+) -> list[str]:
+    """Return control areas whose current plan clears asset confidence gates."""
+    asset_by_area = {
+        "ev": ActionAsset.EV,
+        "hvac": ActionAsset.DAIKIN,
+        "enphase": ActionAsset.ENPHASE,
+    }
+    return [
+        area
+        for area in control_areas
+        if area in asset_by_area
+        and plan_asset_meets_confidence_threshold(asset_by_area[area], plan, options)
+    ]
+
+
+def _confidence_values_meet_threshold(
+    asset: ActionAsset,
+    breakdown: Mapping[str, Any],
+    options: Mapping[str, Any],
+) -> bool:
+    """Return whether confidence evidence clears every gate for an asset."""
+    for key, option in _confidence_checks(asset):
+        threshold = float(options.get(option, DEFAULT_OPTIONS.get(option, 0.0)) or 0.0) / 100.0
+        actual = _finite_number(breakdown.get(key))
+        if actual is None or actual < threshold:
             return False
     return True
 

@@ -514,6 +514,61 @@ def test_hvac_suppression_rejected_when_comfort_not_valid() -> None:
     assert "hvac_comfort_not_valid_for_suppression" in violations
 
 
+def test_hvac_suppression_allows_commands_that_recover_toward_comfort() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "occupied_temperature_tolerance_percent": 10,
+    }
+    for mode, current, target in (("heat", 15, 24), ("cool", 29, 18)):
+        action = _action(
+            now,
+            ActionAsset.DAIKIN,
+            ActionKind.SET_HVAC,
+            {
+                "hvac_mode": mode,
+                "target_temperature": target,
+                "suppress_automations": True,
+            },
+        )
+        context = _context(now)
+        context.current_hvac_temperature_c = current
+        context.occupied_temperature_low_c = 18
+        context.occupied_temperature_high_c = 24
+
+        violations = ConstraintValidator(options).validate_action(
+            context,
+            _plan(now, action),
+            action,
+            now=now,
+        )
+
+        assert "hvac_comfort_not_valid_for_suppression" not in violations
+
+    away_off = _action(
+        now,
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"hvac_mode": "off", "suppress_automations": True},
+    )
+    away_context = _context(now)
+    away_context.occupancy_state = OccupancyState.AWAY
+    away_context.current_hvac_temperature_c = 30
+    away_context.occupied_temperature_low_c = 18
+    away_context.occupied_temperature_high_c = 24
+
+    away_violations = ConstraintValidator(options).validate_action(
+        away_context,
+        _plan(now, away_off),
+        away_off,
+        now=now,
+    )
+
+    assert "hvac_comfort_not_valid_for_suppression" not in away_violations
+
+
 def test_plan_validation_reports_config_and_grid_limit_issues() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     ev_action = _action(now, ActionAsset.EV, ActionKind.EV_START, {})
@@ -559,7 +614,7 @@ def test_action_validation_reports_global_and_time_window_issues() -> None:
     action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 70})
     action.execute_not_before = now + timedelta(minutes=5)
     context = _context(now)
-    context.input_health = InputHealth.DEGRADED
+    context.input_health = InputHealth.UNSAFE
     plan = _plan(now - timedelta(hours=25), action)
     options = {**DEFAULT_OPTIONS, "planner_enabled": False, "dry_run": True}
 
@@ -570,6 +625,40 @@ def test_action_validation_reports_global_and_time_window_issues() -> None:
     assert "input_health_not_healthy" in violations
     assert "action_outside_execution_window" in violations
     assert "plan_expired" in violations
+
+
+def test_action_validation_allows_degraded_inputs_for_asset_specific_planning() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat"})
+    context = _context(now)
+    context.input_health = InputHealth.DEGRADED
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+
+    violations = ConstraintValidator(options).validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+    )
+
+    assert "input_health_not_healthy" not in violations
+
+
+def test_plan_and_action_validation_reject_unclassified_input_health() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = _action(now, ActionAsset.DAIKIN, ActionKind.SET_HVAC, {"hvac_mode": "heat"})
+    context = _context(now)
+    context.input_health = "mystery"  # type: ignore[assignment]
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    validator = ConstraintValidator(options)
+
+    assert "input_health_unsafe" in validator.validate_plan(context, _plan(now, action))
+    assert "input_health_not_healthy" in validator.validate_action(
+        context,
+        _plan(now, action),
+        action,
+        now=now,
+    )
 
 
 def test_action_validation_rejects_truthy_string_safety_options() -> None:

@@ -36,7 +36,7 @@ async def async_get_config_entry_diagnostics(
     store_data = dict(coordinator.store.data)
     plan = coordinator.data
     entry_data = combined_entry_data(entry)
-    automatic_control_running = bool(getattr(coordinator, "active_control", False))
+    automatic_control_running = bool(getattr(coordinator, "effective_control", False))
     automatic_control_requested = bool(
         getattr(coordinator, "automatic_control_requested", automatic_control_running)
     )
