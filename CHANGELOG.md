@@ -2,11 +2,7 @@
 
 ## Unreleased
 
-### Fixed
-
-- Startup automatic-control recovery now runs as Home Assistant background work,
-  preventing its bounded dependency wait from delaying bootstrap or producing a
-  setup-timeout warning.
+## 0.9.10 - 2026-08-15
 
 ### Changed
 
@@ -21,6 +17,12 @@
 
 ### Fixed
 
+- Startup automatic-control recovery now runs as Home Assistant background work,
+  preventing its bounded dependency wait from delaying bootstrap or producing a
+  setup-timeout warning.
+- Persistent notifications raised during startup are now deferred until Home
+  Assistant reaches `RUNNING`. Recovered conditions cancel their queued alerts,
+  and repeated alerts for the same condition are collapsed to the latest one.
 - Startup safety validation now awaits a fresh non-debounced coordinator
   refresh. Unsafe startup recovery retries every 30 seconds, resets progress on
   any unhealthy check, and re-arms after three consecutive healthy checks.
