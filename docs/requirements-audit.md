@@ -493,6 +493,16 @@ Status as of 2026-08-12.
   change replans. Non-hour-divisor intervals therefore neither drift nor share a
   stale fingerprint bucket. Planner cost previews use the configured planning
   interval rather than assuming a fixed slot duration.
+- A production-evidence contract transition captures whether automatic control
+  was active before startup disarms it. That startup-only authorization waits a
+  bounded ten minutes for required entities, services, capabilities, Recorder,
+  and pause state; retries safe-state restoration once; and suppresses all
+  executor actions through three consecutive forced healthy validation plans
+  five seconds apart. Unsafe or uncommitted plans reset progress. Re-arming is
+  followed by a fresh active replan, while restore failure, timeout, unload,
+  operator disable, and configuration changes remain fail-closed. Persisted
+  recovery progress is diagnostic evidence only and cannot authorize recovery
+  after an interrupted restart.
 - EV ready-by wall times are resolved in Home Assistant's configured timezone,
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare

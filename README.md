@@ -39,7 +39,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.8.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.9.
 
 ## Installation
 
@@ -149,6 +149,14 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   unrelated actions.
 - Learning and ordinary plan changes remain silent; actionable mapping, restoration, EV-readiness, and grid-limit problems can notify once.
 - AI advice cannot call services, change settings, or bypass constraints.
+- If a startup production-evidence transition disarms an installation that was
+  previously in automatic control, Energy Planner can recover that prior intent
+  without issuing validation commands. It waits up to ten minutes for required
+  entities and services, retries safe-state restoration once, then requires
+  three consecutive healthy validation plans five seconds apart before re-arming
+  and running a fresh active plan. Any operator stop, configuration change,
+  timeout, failed restore, or unsafe validation leaves control disarmed. Progress
+  is visible on **Production readiness**, **Armed**, and diagnostics.
 
 If control behaves unexpectedly:
 
