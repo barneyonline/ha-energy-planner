@@ -77,6 +77,11 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "refresh_performance": _redact(_refresh_performance(coordinator)),
+        "startup_auto_recovery": _redact(
+            dict(store_data.get("production", {})).get("startup_auto_recovery", {})
+            if isinstance(store_data.get("production"), dict)
+            else {}
+        ),
         "recent_outcomes": _redact(_recent_items(store_data, "outcomes", limit=10)),
         "recent_audit": _redact(_recent_items(store_data, "execution_audit", limit=20)),
         "recent_dry_run_comparisons": _redact(_recent_items(store_data, "dry_run_comparisons", limit=10)),

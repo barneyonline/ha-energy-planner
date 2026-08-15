@@ -101,6 +101,34 @@ def test_armed_sensor_exposes_active_gate_and_pause_reason() -> None:
     assert attrs["required_control_areas"] == ["ev"]
 
 
+def test_armed_sensor_exposes_startup_auto_recovery_progress() -> None:
+    coordinator = SimpleNamespace(
+        store=SimpleNamespace(
+            data={
+                "production": {
+                    "armed": False,
+                    "startup_auto_recovery": {
+                        "status": "waiting",
+                        "successful_runs": 1,
+                        "required_runs": 3,
+                        "last_reason": "configured_entities_unavailable",
+                    },
+                }
+            }
+        ),
+        entry_data={"ev_charger_entity": "switch.ev"},
+        options={"ev_control_enabled": True},
+        dry_run=False,
+        active_control=False,
+    )
+
+    attrs = BINARY_SENSORS[0].attrs_fn(coordinator)
+
+    assert attrs["startup_auto_recovery_status"] == "waiting"
+    assert attrs["startup_auto_recovery_successful_runs"] == 1
+    assert attrs["startup_auto_recovery_last_reason"] == "configured_entities_unavailable"
+
+
 def test_armed_sensor_explains_disarmed_and_armed_active_states() -> None:
     coordinator = SimpleNamespace(
         store=SimpleNamespace(data={"production": {"armed": False}}),

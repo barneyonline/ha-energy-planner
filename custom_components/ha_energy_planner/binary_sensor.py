@@ -18,7 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .const import DOMAIN, EV_RESERVATION_EXTERNAL_BASELINE
-from .coordinator import EnergyPlannerCoordinator
+from .coordinator import STARTUP_AUTO_RECOVERY_REQUIRED_RUNS, EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, async_add_planner_entities, recorder_safe_attributes
 from .models import InputHealth
 from .preflight import _control_area_report, production_evidence_fingerprint
@@ -119,6 +119,8 @@ def _remove_retired_binary_sensors(hass: HomeAssistant, entry: EnergyPlannerConf
 def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the complete but compact automatic-control gate state."""
     production = parse_production_state(coordinator.store.data.get("production"))
+    startup_recovery = production.raw.get("startup_auto_recovery")
+    startup_recovery = dict(startup_recovery) if isinstance(startup_recovery, dict) else {}
     pause_reason = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow())
     control_areas = _control_area_report(dict(coordinator.entry_data), coordinator.options)
     evidence_matches = production.dry_run_evidence_fingerprint == production_evidence_fingerprint(
@@ -148,6 +150,13 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "dry_run_cycles_required": DRY_RUN_READY_CYCLES_REQUIRED,
         "dry_run_evidence_complete": evidence_complete,
         "dry_run_evidence_matches_configuration": evidence_matches,
+        "startup_auto_recovery_status": startup_recovery.get("status", "inactive"),
+        "startup_auto_recovery_successful_runs": startup_recovery.get("successful_runs", 0),
+        "startup_auto_recovery_required_runs": startup_recovery.get(
+            "required_runs", STARTUP_AUTO_RECOVERY_REQUIRED_RUNS
+        ),
+        "startup_auto_recovery_deadline": startup_recovery.get("deadline"),
+        "startup_auto_recovery_last_reason": startup_recovery.get("last_reason"),
     }
 
 
