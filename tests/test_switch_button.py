@@ -7,9 +7,11 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import button as button_module
+from custom_components.ha_energy_planner import notifications as notifications_module
 from custom_components.ha_energy_planner import switch as switch_module
 from custom_components.ha_energy_planner.button import BUTTONS, PlannerButton
 from custom_components.ha_energy_planner.const import (
@@ -378,6 +380,40 @@ def test_preflight_button_creates_notification(monkeypatch: object) -> None:
             False,
         )
     ]
+
+
+def test_preflight_notification_is_deferred_during_startup(monkeypatch: object) -> None:
+    coordinator = FakeCoordinator()
+    coordinator.hass.data = {}
+    coordinator.hass.state = CoreState.starting
+    report_ok = False
+    button = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in BUTTONS if description.key == "run_preflight"),
+    )
+
+    def preflight_report(hass: object, coordinator_arg: object) -> dict[str, object]:
+        return {"ok": report_ok, "active_control_ready": report_ok, "checks": []}
+
+    monkeypatch.setattr(
+        button_module,
+        "build_preflight_report",
+        preflight_report,
+    )
+    start_callbacks: list[Any] = []
+    monkeypatch.setattr(
+        notifications_module,
+        "async_at_started",
+        lambda hass_arg, callback: start_callbacks.append(callback) or (lambda: None),
+    )
+
+    asyncio.run(PlannerButton.async_press(button))
+
+    assert coordinator.hass.services.calls == []
+    report_ok = True
+    coordinator.hass.state = CoreState.running
+    asyncio.run(start_callbacks[0](coordinator.hass))
+    assert coordinator.hass.services.calls[0][2]["title"] == "Garage EV: preflight passed"
 
 
 def test_preflight_notification_message_reports_success() -> None:

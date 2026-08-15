@@ -81,6 +81,7 @@ from .models import (
     PlannerMode,
     to_jsonable,
 )
+from .notifications import defer_persistent_notification
 from .planner import DryRunPlanner
 from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
 from .recorder_import import (
@@ -2059,13 +2060,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def _async_notify_ai_advice(self, message: str) -> None:
         """Publish bounded button feedback without affecting planner operation."""
+        entry = getattr(self, "entry", None)
+        entry_id = getattr(entry, "entry_id", None)
+        notification_id = f"{_AI_ADVICE_NOTIFICATION_ID}_{entry_id}" if entry_id else _AI_ADVICE_NOTIFICATION_ID
+        if defer_persistent_notification(
+            self.hass,
+            notification_id,
+            lambda: self._async_notify_ai_advice(message),
+        ):
+            return
         services = getattr(getattr(self, "hass", None), "services", None)
         async_call = getattr(services, "async_call", None)
         if not callable(async_call):
             return
-        entry = getattr(self, "entry", None)
-        entry_id = getattr(entry, "entry_id", None)
-        notification_id = f"{_AI_ADVICE_NOTIFICATION_ID}_{entry_id}" if entry_id else _AI_ADVICE_NOTIFICATION_ID
         title = getattr(entry, "title", None) or "Energy Planner"
         try:
             await async_call(

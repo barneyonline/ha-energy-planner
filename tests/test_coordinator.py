@@ -12,9 +12,11 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
 
 from custom_components.ha_energy_planner import coordinator as coordinator_module
+from custom_components.ha_energy_planner import notifications as notifications_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ENABLED,
@@ -1765,6 +1767,27 @@ def test_ai_advice_notification_failure_does_not_discard_result(caplog: pytest.L
         asyncio.run(coordinator._async_notify_ai_advice("Still preserve the result."))
 
     assert "Could not publish the Energy Planner explanation notification" in caplog.text
+
+
+def test_ai_advice_notification_is_deferred_during_startup(monkeypatch: object) -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass()
+    coordinator.hass.data = {}
+    coordinator.hass.state = CoreState.starting
+    coordinator.entry = FakeEntry({})
+    start_callbacks: list[Any] = []
+    monkeypatch.setattr(
+        notifications_module,
+        "async_at_started",
+        lambda hass_arg, callback: start_callbacks.append(callback) or (lambda: None),
+    )
+
+    asyncio.run(coordinator._async_notify_ai_advice("Startup result."))
+
+    assert coordinator.hass.services.calls == []
+    coordinator.hass.state = CoreState.running
+    asyncio.run(start_callbacks[0](coordinator.hass))
+    assert coordinator.hass.services.calls[0][2]["message"] == "Startup result."
 
 
 def test_manual_ai_advice_button_schedules_fresh_current_plan(monkeypatch: object) -> None:

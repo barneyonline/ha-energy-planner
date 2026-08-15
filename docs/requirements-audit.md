@@ -198,7 +198,11 @@ Status as of 2026-08-12.
   changes, and stale data remain silent. Stable IDs and content signatures
   deduplicate repeated alerts; the actionable plan-alert group can be disabled
   without changing plan health or fail-closed execution. User-provided reason
-  fields are compacted and redacted before they can be shown.
+  fields are compacted and redacted before they can be shown. Persistent
+  notification creation is queued until Home Assistant reaches its running
+  state, after every integration has had a chance to load. Each stable ID keeps
+  only its latest queued alert, and recovery dismissals cancel that alert before
+  startup completes.
 - Discovery records non-commanding capability evidence for EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
 - AI explanation and troubleshooting is on-demand, minimized, structured, and
