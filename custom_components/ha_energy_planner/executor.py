@@ -56,6 +56,7 @@ from .models import (
     PlanAction,
     PlannerMode,
 )
+from .notifications import cancel_deferred_persistent_notification, defer_persistent_notification
 from .ownership import OwnershipState
 from .preflight import production_evidence_fingerprint
 from .safety import (
@@ -1635,6 +1636,16 @@ class Executor:
         """Create a persistent notification if the service is available."""
         if self.hass is None:
             return False
+        if defer_persistent_notification(
+            self.hass,
+            notification_id,
+            lambda: self._async_create_deferred_notification(
+                title=title,
+                message=message,
+                notification_id=notification_id,
+            ),
+        ):
+            return False
         services = getattr(self.hass, "services", None)
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "create"):
@@ -1654,6 +1665,22 @@ class Executor:
             return False
         return True
 
+    async def _async_create_deferred_notification(
+        self,
+        *,
+        title: str,
+        message: str,
+        notification_id: str,
+    ) -> None:
+        """Create a queued notification and record its signature on success."""
+        created = await self._async_create_notification(
+            title=title,
+            message=message,
+            notification_id=notification_id,
+        )
+        if created:
+            self._plan_fallback_notification_signatures[notification_id] = (title, message)
+
     async def _async_dismiss_notifications(self, notification_ids: tuple[str, ...]) -> None:
         """Dismiss persistent notifications if the service is available."""
         for notification_id in notification_ids:
@@ -1663,6 +1690,7 @@ class Executor:
         """Dismiss a persistent notification if the service is available."""
         if self.hass is None:
             return
+        cancel_deferred_persistent_notification(self.hass, notification_id)
         services = getattr(self.hass, "services", None)
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "dismiss"):
