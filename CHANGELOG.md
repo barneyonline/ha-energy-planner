@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+
+- Startup automatic-control recovery now runs as Home Assistant background work,
+  preventing its bounded dependency wait from delaying bootstrap or producing a
+  setup-timeout warning.
+
 ## 0.9.9 - 2026-08-15
 
 ### Added
