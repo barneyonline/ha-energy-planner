@@ -117,6 +117,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def seed_production_evidence(call: ServiceCall) -> None:
         """Bind smoke review evidence to the integration's current production contract."""
+        from custom_components.ha_energy_planner.entry_data import combined_entry_data
         from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
@@ -127,10 +128,28 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             production = dict(store.data.get("production", {}))
             production["dry_run_ready_cycles"] = 3
             production["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
-                coordinator.entry_data,
+                combined_entry_data(coordinator.entry),
                 coordinator.options,
             )
             await store.async_save_production(production)
+
+    async def assert_unsafe_arm_rejected(call: ServiceCall) -> None:
+        """Verify an unsafe manual arm fails without emitting an expected HA error log."""
+        from homeassistant.exceptions import HomeAssistantError
+
+        coordinators = [
+            getattr(entry, "runtime_data", None)
+            for entry in hass.config_entries.async_entries("ha_energy_planner")
+        ]
+        coordinators = [coordinator for coordinator in coordinators if coordinator is not None]
+        if not coordinators:
+            raise RuntimeError("Energy planner coordinator was not loaded")
+        for coordinator in coordinators:
+            try:
+                await coordinator.async_operator_arm_production_control("docker_smoke_reject_unsafe_arm")
+            except HomeAssistantError:
+                continue
+            raise RuntimeError("Unsafe production arm unexpectedly succeeded")
 
     async def capture_persistent_notification(call: ServiceCall) -> None:
         """Capture persistent notification calls for smoke validation."""
@@ -181,6 +200,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "seed_thermal_model_sample", seed_thermal_model_sample)
     hass.services.async_register(DOMAIN, "seed_enphase_command_rate_limit", seed_enphase_command_rate_limit)
     hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
+    hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -435,6 +455,17 @@ automation:
         event: start
     actions:
       - delay: "00:00:08"
+      # Explicit arming must not turn a persisted request into apparent command
+      # authority before the current plan and reviewed evidence are healthy.
+      - action: fake_planner_test.assert_unsafe_arm_rejected
+      - condition: state
+        entity_id: binary_sensor.energy_planner_armed
+        state: "off"
+      - action: ha_energy_planner.replan
+      - wait_template: >-
+          {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
+        timeout: "00:00:30"
+        continue_on_timeout: false
       - action: fake_planner_test.seed_production_evidence
       - action: ha_energy_planner.arm_production_control
         data:

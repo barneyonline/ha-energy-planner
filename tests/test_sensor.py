@@ -85,6 +85,10 @@ def test_mode_sensor_exposes_operational_control_mode() -> None:
     assert description.value_fn(review) == "review"
     assert description.value_fn(active) == "active"
 
+    active.effective_control = False
+    assert active.active_control is True
+    assert description.value_fn(active) == "review"
+
 
 def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> None:
     assert sensor_module._load_forecast_coverage_details("invalid") == (
@@ -467,16 +471,17 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
         "code": "pv_forecast_entity_unavailable",
         "description": "PV Forecast Entity Unavailable",
     }
-    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert production.value_fn(coordinator) == "Armed"
     assert production.attrs_fn(coordinator)["ready_to_arm"] is True
     assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is True
-    assert block.value_fn(coordinator) == "Planner Paused"
+    assert block.value_fn(coordinator) == "PV Forecast Entity Unavailable"
     assert block.attrs_fn(coordinator)["reasons"] == [
-        "planner_paused",
         "pv_forecast_entity_unavailable",
         "ev_soc_entity_unavailable",
         "weather_entity_unavailable",
     ]
+    assert block.attrs_fn(coordinator)["available_control_areas"] == ["hvac", "enphase"]
+    assert block.attrs_fn(coordinator)["paused_control_areas"] == ["ev"]
     assert audit.value_fn(coordinator) == "Rejected"
     assert audit.attrs_fn(coordinator)["outcome_count"] == 2
     assert comparison.value_fn(coordinator) == "2 Planned"
@@ -829,6 +834,39 @@ def test_production_readiness_supports_ev_only_installation() -> None:
 
     coordinator.store.data["production"]["armed"] = True
     assert production.value_fn(coordinator) == "Armed"
+
+
+def test_production_readiness_keeps_unpaused_control_area_available() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={
+            "ev_control_enabled": True,
+            "climate_control_enabled": True,
+            "planner_enabled": True,
+            "dry_run": False,
+        },
+        entry_data={
+            "ev_smart_charging_start_entity": "button.ev_start",
+            "daikin_climate_entity": "climate.home",
+        },
+        store_data={
+            "production": {"armed": True, "dry_run_ready_cycles": 3},
+            "control_pause": {"active": True, "assets": ["ev"]},
+        },
+    )
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+
+    attrs = production.attrs_fn(coordinator)
+
+    assert production.value_fn(coordinator) == "Armed"
+    assert attrs["control_paused"] is False
+    assert attrs["available_control_areas"] == ["hvac"]
+    assert attrs["paused_control_areas"] == ["ev"]
+
+    coordinator.store.data["control_pause"] = {"active": True, "assets": ["all"]}
+    block = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "control_block_reason")
+    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert block.attrs_fn(coordinator)["reason"] == "planner_paused"
 
 
 def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
@@ -2078,6 +2116,12 @@ def _coordinator(
             sensor_module.production_evidence_fingerprint(configured_entry_data, configured_options),
         )
         stored["production"] = production
+    active_control = (
+        configured_options.get("planner_enabled") is True
+        and configured_options.get("dry_run") is False
+        and isinstance(stored.get("production"), dict)
+        and stored["production"].get("armed") is True
+    )
     return SimpleNamespace(
         data=plan,
         store=SimpleNamespace(data=stored),
@@ -2085,12 +2129,8 @@ def _coordinator(
         entry_data=configured_entry_data,
         entry=SimpleNamespace(entry_id="test_entry"),
         hass=hass,
-        active_control=(
-            configured_options.get("planner_enabled") is True
-            and configured_options.get("dry_run") is False
-            and isinstance(stored.get("production"), dict)
-            and stored["production"].get("armed") is True
-        ),
+        active_control=active_control,
+        effective_control=active_control,
         automatic_control_requested=(
             configured_options.get("planner_enabled") is True
             and configured_options.get("dry_run") is False
