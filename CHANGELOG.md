@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
+  when their corresponding device-control switch is off. Disabled-area actions
+  are also excluded from the Next actions attributes and action count.
+- Plan calendar descriptions now group action evidence into short bulleted
+  sections and render embedded schedule and forecast timestamps in Home
+  Assistant's local timezone instead of exposing raw UTC ISO values.
+
 ## 0.9.10 - 2026-08-15
 
 ### Changed
