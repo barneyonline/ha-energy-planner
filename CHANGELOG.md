@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.9.9 - 2026-08-15
+
 ### Added
 
 - Added bounded startup recovery for installations that were actively controlling
