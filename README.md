@@ -122,6 +122,8 @@ Changing the load mapping disarms production control and requires fresh review c
 
 The advanced **Run safety check** button always returns a Home Assistant notification, including when every check passes.
 
+Energy Planner queues persistent notifications until Home Assistant has completed startup and every integration has had a chance to load. A queued alert is cancelled if the condition recovers first; otherwise, the latest alert for each condition is shown after startup.
+
 **Explain** treats an uneconomic or thermally unsuitable climate-preconditioning window as a normal no-action plan result. It recommends changing Climate settings only when the current plan contains a specific comfort, presence, or climate-control input fault.
 
 Turning off a device control selector always takes effect immediately. Energy Planner then makes one serialized best-effort safe-state restore; if confirmation is unavailable, it retains diagnostic recovery evidence and notifies without turning the selector back on or permitting new start/schedule commands. Unresolved EV ownership remains eligible for bounded safe-stop recovery after interruption or restart, with ten-minute backoff and a maximum of three failed attempts per rolling day. Dedicated EV retry timestamps keep those limits intact if another control area later updates the shared pause state or execution-audit rows rotate out.
