@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 from custom_components.ha_energy_planner import calendar as calendar_module
 from custom_components.ha_energy_planner.calendar import EnergyPlannerCalendar
@@ -68,11 +69,14 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     assert entity.event is not None
     assert entity.event.uid == "ev-start"
     assert entity.event.summary == "EV: Start EV charging"
-    assert "Why:" in (entity.event.description or "")
+    assert "Why\n• " in (entity.event.description or "")
     assert "Confidence:" not in (entity.event.description or "")
-    assert "Data quality:" in (entity.event.description or "")
-    assert "Constraints:" in (entity.event.description or "")
-    assert "Load forecast: ready; expected 1.4 kW; conservative 1.8 kW" in (entity.event.description or "")
+    assert "Data quality\n• " in (entity.event.description or "")
+    assert "Constraints\n• " in (entity.event.description or "")
+    assert (
+        "Load forecast\n• Status: Ready\n• Expected load: 1.40 kW\n"
+        "• Conservative load: 1.80 kW"
+    ) in (entity.event.description or "")
 
     events = asyncio.run(
         entity.async_get_events(
@@ -83,8 +87,10 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     )
 
     assert [event.uid for event in events] == ["ev-start", "climate-precondition"]
-    assert "Desired state:" in (events[1].description or "")
-    assert "expected 2.2 kW; conservative 2.7 kW" in (events[1].description or "")
+    assert "Planned state\n" in (events[1].description or "")
+    assert "• Expected load: 2.20 kW\n• Conservative load: 2.70 kW" in (
+        events[1].description or ""
+    )
 
 
 def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
@@ -94,7 +100,6 @@ def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
 
     assert entity.event is None
     assert asyncio.run(entity.async_get_events(coordinator.hass, now, now + timedelta(hours=1))) == []
-    assert calendar_module._compact_mapping("plain") == "plain"
 
 
 def test_calendar_expands_ev_schedule_into_complete_charging_windows() -> None:
@@ -133,11 +138,12 @@ def test_calendar_expands_ev_schedule_into_complete_charging_windows() -> None:
     assert "Start charging:" in (events[0].description or "")
     assert "Stop charging:" in (events[0].description or "")
     assert "+00:00" not in (events[0].description or "")
-    assert "Charging power: 6-7 kW" in (events[0].description or "")
+    assert "Schedule\n• Start charging:" in (events[0].description or "")
+    assert "Charging\n• Power: 6-7 kW" in (events[0].description or "")
     assert "Estimated energy: 1.08 kWh" in (events[0].description or "")
     assert "Target SOC: 80%" in (events[0].description or "")
     assert "Ready by: 07:00" in (events[0].description or "")
-    assert "Charging power: 7 kW" in (events[1].description or "")
+    assert "Power: 7 kW" in (events[1].description or "")
 
 
 def test_calendar_omits_ev_schedule_without_allocated_charging() -> None:
@@ -243,7 +249,64 @@ def test_calendar_renders_missing_action_load_values_as_unknown() -> None:
 
     description = EnergyPlannerCalendar(coordinator).event.description or ""
 
-    assert "expected unknown kW; conservative unknown kW" in description
+    assert "Expected load: Unknown" in description
+    assert "Conservative load: Unknown" in description
+
+
+def test_calendar_description_uses_readable_sections_and_local_time(monkeypatch: object) -> None:
+    local_zone = ZoneInfo("Australia/Melbourne")
+    monkeypatch.setattr(
+        calendar_module.dt_util,
+        "as_local",
+        lambda value: value.astimezone(local_zone),
+    )
+    period_start = datetime(2026, 8, 15, 11, 38, tzinfo=UTC)
+    action = replace(
+        _action("climate-precondition", period_start, period_start + timedelta(minutes=15)),
+        asset=ActionAsset.DAIKIN,
+        kind=ActionKind.SET_HVAC,
+        desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 24.0,
+            "period_start": period_start.isoformat(),
+            "period_end": (period_start + timedelta(hours=1)).isoformat(),
+            "enable_zones": True,
+            "controlled_zones": ["switch.bedrooms", "switch.main"],
+            "reason": "internal_duplicate_reason",
+        },
+    )
+
+    description = calendar_module._calendar_events(_coordinator(_plan([action])))[0].description or ""
+
+    assert (
+        "Schedule\n"
+        "• Period Start: Sat 15 Aug 2026, 9:38 PM AEST\n"
+        "• Period End: Sat 15 Aug 2026, 10:38 PM AEST"
+    ) in description
+    assert (
+        "Planned state\n"
+        "• Climate mode: Heat\n"
+        "• Target temperature: 24 °C\n"
+        "• Enable Zones: Yes\n"
+        "• Controlled Zones: switch.bedrooms, switch.main"
+    ) in description
+    assert "Internal Duplicate Reason" not in description
+    assert "+00:00" not in description
+    assert "2026-08-15T" not in description
+
+
+def test_calendar_detail_formatting_handles_units_and_nested_values() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+
+    assert calendar_module._calendar_detail("Projected HVAC load kW", 1.5) == (
+        "Projected HVAC load: 1.5 kW"
+    )
+    assert calendar_module._calendar_detail("Target SOC percent", 80) == "Target SOC: 80%"
+    assert calendar_module._calendar_value_text(False) == "No"
+    assert calendar_module._calendar_value_text({"enabled": True, "at": now}) == (
+        f"enabled: Yes; at: {calendar_module._local_datetime_text(now)}"
+    )
+    assert calendar_module._calendar_datetime(now.replace(tzinfo=None)) is None
 
 
 def test_calendar_event_metadata_is_bounded_for_recorder() -> None:

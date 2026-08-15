@@ -22,12 +22,14 @@ Status as of 2026-08-15.
   stale or incomplete reviewed production evidence keeps the entity off with a
   stable blocking reason. Manual arming re-runs preflight and cannot cancel safe
   recovery or grant apparent authority while that evidence is invalid. Current
-  state publishes actual configured entity snapshots and ownership; Next actions
-  mirrors the combined per-area state summary and exposes bounded decision
-  evidence in attributes. The Plan calendar
-  expands allocated EV slots into contiguous charging windows with explicit
-  start and stop times instead of showing the planner's short recheck interval,
-  and omits actions for device-control areas whose selector is off.
+  state publishes actual configured entity snapshots and ownership only for
+  enabled control areas; Next actions mirrors that enabled-area summary and
+  excludes disabled-area actions from its bounded decision evidence and action
+  count. The Plan calendar expands allocated EV slots into contiguous charging
+  windows with explicit start and stop times instead of showing the planner's
+  short recheck interval, groups event evidence into readable bulleted sections,
+  renders embedded timestamps in Home Assistant's local timezone, and omits
+  actions for device-control areas whose selector is off.
 - The integration creates one Energy Planner device and attaches every entity to
   it. Connected inputs and policy are configured on one central **Configure**
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
