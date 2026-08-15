@@ -502,7 +502,9 @@ Status as of 2026-08-12.
   followed by a fresh active replan, while restore failure, timeout, unload,
   operator disable, and configuration changes remain fail-closed. Persisted
   recovery progress is diagnostic evidence only and cannot authorize recovery
-  after an interrupted restart.
+  after an interrupted restart. The bounded recovery coroutine is registered as
+  Home Assistant background work so dependency and validation waits do not hold
+  bootstrap open.
 - EV ready-by wall times are resolved in Home Assistant's configured timezone,
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare
