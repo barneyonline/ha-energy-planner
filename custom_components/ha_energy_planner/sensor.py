@@ -1758,6 +1758,12 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
     )
     return {
         "armed": production_state.armed,
+        "automatic_control_requested": getattr(
+            coordinator,
+            "automatic_control_requested",
+            coordinator.active_control,
+        ),
+        "automatic_control_running": coordinator.active_control,
         "armed_at": production.get("armed_at"),
         "acknowledged_at": production.get("acknowledged_at"),
         "dry_run_ready_cycles": dry_run_ready_cycles,
@@ -1776,6 +1782,7 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "startup_auto_recovery_required_runs": startup_recovery.get(
             "required_runs", STARTUP_AUTO_RECOVERY_REQUIRED_RUNS
         ),
+        "startup_auto_recovery_grace_started_at": startup_recovery.get("started_at"),
         "startup_auto_recovery_deadline": startup_recovery.get("deadline"),
         "startup_auto_recovery_last_reason": startup_recovery.get("last_reason"),
     }

@@ -142,6 +142,11 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     return {
         "armed": production.armed,
         "automatic_control": coordinator.active_control,
+        "automatic_control_requested": getattr(
+            coordinator,
+            "automatic_control_requested",
+            coordinator.active_control,
+        ),
         "mode": "active" if coordinator.active_control else "review",
         "reason": reason,
         "control_paused": pause_reason is not None,
@@ -155,6 +160,7 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "startup_auto_recovery_required_runs": startup_recovery.get(
             "required_runs", STARTUP_AUTO_RECOVERY_REQUIRED_RUNS
         ),
+        "startup_auto_recovery_grace_started_at": startup_recovery.get("started_at"),
         "startup_auto_recovery_deadline": startup_recovery.get("deadline"),
         "startup_auto_recovery_last_reason": startup_recovery.get("last_reason"),
     }

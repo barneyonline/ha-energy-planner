@@ -116,7 +116,7 @@ Changing the load mapping disarms production control and requires fresh review c
 | **Next actions** | Next state for every area, planned actions, and decision evidence |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
 | **Plan** | Calendar view of upcoming controlled actions, with complete EV charging start/stop windows |
-| **Automatic control** | Runs preflight and enables or disables all planner-owned commands |
+| **Automatic control** | Retains the operator's request for automatic control, including while startup safety is temporarily disarmed |
 | Device control switches | Select whether Climate, EV, or Enphase may participate; grouped under Controls |
 | **Explain** | Requests one evidence-based AI explanation and returns it as a Home Assistant notification |
 
@@ -151,15 +151,28 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   unrelated actions.
 - Learning and ordinary plan changes remain silent; actionable mapping, restoration, EV-readiness, and grid-limit problems can notify once.
 - AI advice cannot call services, change settings, or bypass constraints.
-- If a startup production-evidence transition disarms an installation that was
-  previously in automatic control, Energy Planner can recover that prior intent
-  without issuing validation commands. It waits up to ten minutes for required
-  entities and services, retries safe-state restoration once, then requires
-  three consecutive healthy validation plans five seconds apart before re-arming
-  and running a fresh active plan. Any operator stop, configuration change,
-  timeout, failed restore, or unsafe validation leaves control disarmed. Progress
-  is visible on **Production readiness**, **Armed**, and diagnostics. The bounded
-  recovery runs as background work and does not delay Home Assistant startup.
+- An installation that was both requested-active and armed before restart
+  returns to **Armed / Running** immediately. Its fresh ten-minute startup grace
+  begins when Home Assistant reaches `RUNNING`, not when the config entry loads.
+  Ordinary input-health, constraint, capability, conflict, feedback, cooldown,
+  and rate-limit gates continue to protect every command during the grace.
+- At the deadline Energy Planner awaits a fresh, non-debounced plan and complete
+  preflight. A healthy result remains armed silently. An unsafe, unavailable,
+  failed, or uncommitted result disarms before one best-effort safe-state
+  restore and creates one notification. **Automatic control remains on** because
+  it represents retained intent; **Armed** is the actual command-authority gate,
+  and **Mode** reads `review` while safety has disarmed commands.
+- Disarmed startup recovery retries every 30 seconds indefinitely. Three
+  consecutive healthy awaited checks revalidate the production contract,
+  reconcile safe state, re-arm, and verify a fresh active plan. Any unhealthy
+  check resets the sequence. Success is silent and dismisses the prior warning.
+  Operator disable, explicit safety-gate arm or disarm, pause, or a
+  configuration change remains immediately authoritative. Terminal operator
+  cancellation dismisses the superseded recovery warning. Whole-Home-Assistant
+  shutdown preserves active ownership and EV reservations; runtime reload,
+  removal, and setup failure still restore.
+  Progress is visible on **Production readiness**, **Armed**, and diagnostics.
+  Recovery runs as Home Assistant background work and does not delay startup.
 
 If control behaves unexpectedly:
 

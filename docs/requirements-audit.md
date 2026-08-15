@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-08-12.
+Status as of 2026-08-15.
 
 ## Covered
 
@@ -29,8 +29,9 @@ Status as of 2026-08-12.
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
   sections; the former Add device/config-subentry surface is removed. Existing
   subentry mappings are folded into the main config entry during setup.
-- Automatic control is the sole master activation switch and combines preflight,
-  production arming, and active/review transitions. Separate Climate control,
+- Automatic control is the sole master intent switch. It can remain on while
+  startup safety temporarily disarms production command authority; Armed and
+  the stable active/review Mode sensor expose actual running state. Separate Climate control,
   EV control, and Enphase control switches select the participating areas and
   appear with Automatic control in the device's Controls section. A
   device-off transition while armed restores only that asset and fails without
@@ -497,18 +498,25 @@ Status as of 2026-08-12.
   change replans. Non-hour-divisor intervals therefore neither drift nor share a
   stale fingerprint bucket. Planner cost previews use the configured planning
   interval rather than assuming a fixed slot duration.
-- A production-evidence contract transition captures whether automatic control
-  was active before startup disarms it. That startup-only authorization waits a
-  bounded ten minutes for required entities, services, capabilities, Recorder,
-  and pause state; retries safe-state restoration once; and suppresses all
-  executor actions through three consecutive forced healthy validation plans
-  five seconds apart. Unsafe or uncommitted plans reset progress. Re-arming is
-  followed by a fresh active replan, while restore failure, timeout, unload,
-  operator disable, and configuration changes remain fail-closed. Persisted
-  recovery progress is diagnostic evidence only and cannot authorize recovery
-  after an interrupted restart. The bounded recovery coroutine is registered as
-  Home Assistant background work so dependency and validation waits do not hold
-  bootstrap open.
+- A previously requested-active and armed installation preserves production
+  arming, device ownership, and EV reservation on startup. Home Assistant's
+  `async_at_started` boundary begins a fresh ten-minute grace at Core `RUNNING`;
+  no startup-only gate suppresses ordinary planning or execution, while all
+  normal runtime safety gates remain authoritative. The deadline uses one
+  awaited `async_refresh()` and a complete preflight. A healthy result remains
+  armed silently. An unsafe or failed result disarms before best-effort restore,
+  retains automatic intent, notifies once, and persists `waiting_for_safe`.
+  Recovery then runs non-debounced checks every 30 seconds indefinitely and
+  requires three consecutive healthy committed plans before safe-state
+  reconciliation, evidence refresh, re-arm, active refresh, and final readiness
+  verification. Whole-system shutdown preserves control state; runtime unload,
+  operator disable, explicit safety-gate arm or disarm, pause, and configuration
+  changes retain precedence. Terminal operator cancellation dismisses the
+  superseded recovery warning. A failed configuration-reload platform unload
+  resumes the disarmed recovery lifecycle on the still-loaded coordinator. A
+  restarted disarmed recovery resumes with its counter reset.
+  Recovery is registered as Home Assistant background work so its grace and
+  validation waits cannot hold bootstrap open.
 - EV ready-by wall times are resolved in Home Assistant's configured timezone,
   normalized to UTC, and handle next-day rollover, DST folds, and nonexistent
   local times. HVAC suppression and precondition projection windows compare

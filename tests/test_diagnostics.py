@@ -33,6 +33,8 @@ class FakeCoordinator:
     store: FakeStore
     last_refresh_metadata: dict[str, Any] | None = None
     refresh_metrics: dict[str, Any] | None = None
+    automatic_control_requested: bool = False
+    active_control: bool = False
 
 
 @dataclass(slots=True)
@@ -88,6 +90,7 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
     assert diagnostics["store"]["discovery"]["longitude"] == "**REDACTED**"
     assert diagnostics["store"]["discovery"]["status"] == "ok"
     assert diagnostics["startup_auto_recovery"] == {"status": "validating", "successful_runs": 2}
+    assert diagnostics["automatic_control"] == {"requested": False, "running": False}
 
 
 def test_diagnostics_redacts_prompts_addresses_and_raw_model_payloads() -> None:
@@ -189,6 +192,8 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
                 "skipped_count": 3,
                 "coalesced_count": 4,
             },
+            automatic_control_requested=True,
+            active_control=False,
         ),
     )
 
@@ -221,6 +226,7 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
         "status": "ready",
         "source_entity_id": "sensor.house_load",
     }
+    assert diagnostics["automatic_control"] == {"requested": True, "running": False}
     assert len(diagnostics["recent_outcomes"]) == 10
     assert diagnostics["recent_outcomes"][0]["action_id"] == "old-2"
     assert _load_forecast_summary([]) == {}

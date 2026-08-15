@@ -70,6 +70,7 @@ class FakeCoordinator:
         self.active_control_calls: list[bool] = []
         self.device_control_calls: list[tuple[str, bool]] = []
         self.active_control_value = False
+        self.automatic_control_requested = False
         self.last_update_success = True
         self.restore_result = SimpleNamespace(result=OutcomeResult.RESTORED, reason="restored")
         self.last_control_mode = (
@@ -91,6 +92,7 @@ class FakeCoordinator:
 
     async def async_set_active_control(self, enabled: bool) -> None:
         self.active_control_calls.append(enabled)
+        self.automatic_control_requested = enabled
         self.active_control_value = enabled
 
     async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
@@ -125,7 +127,13 @@ class FakeCoordinator:
     async def async_arm_production_control(self, reason: str) -> None:
         self.arm_calls.append(reason)
 
+    async def async_operator_arm_production_control(self, reason: str) -> None:
+        self.arm_calls.append(reason)
+
     async def async_disarm_production_control(self, reason: str) -> None:
+        self.disarm_calls.append(reason)
+
+    async def async_operator_disarm_production_control(self, reason: str) -> None:
         self.disarm_calls.append(reason)
 
     async def async_resume_control(self, reason: str) -> None:
@@ -148,6 +156,18 @@ def test_automatic_control_switch_uses_combined_coordinator_path() -> None:
 
     assert coordinator.active_control_calls == [True, False]
     assert switch.write_count == 2
+
+
+def test_automatic_control_switch_retains_requested_intent_while_disarmed() -> None:
+    coordinator = FakeCoordinator()
+    coordinator.automatic_control_requested = True
+    coordinator.active_control_value = False
+    switch = SimpleNamespace(
+        coordinator=coordinator,
+        entity_description=next(description for description in SWITCHES if description.key == "active_control"),
+    )
+
+    assert PlannerSwitch.is_on.fget(switch) is True
 
 
 def test_switches_expose_one_master_and_three_device_controls() -> None:

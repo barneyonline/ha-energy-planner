@@ -1077,6 +1077,32 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
     ]
 
 
+def test_startup_recovery_notification_is_deduplicated_and_dismissed() -> None:
+    hass = FakeHass()
+    executor = Executor(
+        FakeStore(),
+        hass=hass,
+        entry_id="entry-1",
+        entry_title="Garage EV",
+    )
+
+    asyncio.run(executor.async_notify_startup_recovery_unsafe("entity_unavailable"))
+    asyncio.run(executor.async_notify_startup_recovery_unsafe("entity_unavailable"))
+    asyncio.run(executor.async_dismiss_startup_recovery_notification())
+
+    create_calls = [call for call in hass.services.calls if call[1] == "create"]
+    assert len(create_calls) == 1
+    assert create_calls[0][2]["notification_id"] == (
+        "ha_energy_planner_startup_recovery_entry-1"
+    )
+    assert "retry automatically every 30 seconds" in create_calls[0][2]["message"]
+    assert hass.services.calls[-1] == (
+        "persistent_notification",
+        "dismiss",
+        {"notification_id": "ha_energy_planner_startup_recovery_entry-1"},
+    )
+
+
 def test_executor_preserves_first_ev_pre_takeover_state() -> None:
     now = datetime.now(UTC)
     action = PlanAction(

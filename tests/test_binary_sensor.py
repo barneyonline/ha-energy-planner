@@ -111,6 +111,7 @@ def test_armed_sensor_exposes_startup_auto_recovery_progress() -> None:
                         "status": "waiting",
                         "successful_runs": 1,
                         "required_runs": 3,
+                        "started_at": "2026-08-15T12:00:00+00:00",
                         "last_reason": "configured_entities_unavailable",
                     },
                 }
@@ -120,12 +121,16 @@ def test_armed_sensor_exposes_startup_auto_recovery_progress() -> None:
         options={"ev_control_enabled": True},
         dry_run=False,
         active_control=False,
+        automatic_control_requested=True,
     )
 
     attrs = BINARY_SENSORS[0].attrs_fn(coordinator)
 
     assert attrs["startup_auto_recovery_status"] == "waiting"
+    assert attrs["automatic_control"] is False
+    assert attrs["automatic_control_requested"] is True
     assert attrs["startup_auto_recovery_successful_runs"] == 1
+    assert attrs["startup_auto_recovery_grace_started_at"] == "2026-08-15T12:00:00+00:00"
     assert attrs["startup_auto_recovery_last_reason"] == "configured_entities_unavailable"
 
 
