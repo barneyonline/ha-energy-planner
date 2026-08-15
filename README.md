@@ -156,7 +156,8 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   three consecutive healthy validation plans five seconds apart before re-arming
   and running a fresh active plan. Any operator stop, configuration change,
   timeout, failed restore, or unsafe validation leaves control disarmed. Progress
-  is visible on **Production readiness**, **Armed**, and diagnostics.
+  is visible on **Production readiness**, **Armed**, and diagnostics. The bounded
+  recovery runs as background work and does not delay Home Assistant startup.
 
 If control behaves unexpectedly:
 

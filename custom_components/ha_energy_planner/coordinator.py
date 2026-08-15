@@ -477,8 +477,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         task = getattr(self, "_startup_auto_recovery_task", None)
         if task is not None and not task.done():
             return
-        self._startup_auto_recovery_task = self.hass.async_create_task(
-            self._async_run_startup_auto_recovery()
+        self._startup_auto_recovery_task = self.entry.async_create_background_task(
+            self.hass,
+            self._async_run_startup_auto_recovery(),
+            f"{DOMAIN} startup automatic-control recovery",
         )
 
     @callback
