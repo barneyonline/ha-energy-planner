@@ -421,7 +421,7 @@ def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
 
 
 def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict[str, Any]]:
-    """Return current state and live entities for each configured actuator group."""
+    """Return current state and live entities for each enabled actuator group."""
     entry_data = dict(coordinator.entry_data)
     plan = coordinator.data
     groups: list[dict[str, Any]] = []
@@ -451,6 +451,8 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
         (ActionAsset.ENPHASE, [("profile", entry_data.get(CONF_ENPHASE_PROFILE))]),
     )
     for asset, configured_entities in configured:
+        if not _asset_control_enabled(coordinator, asset):
+            continue
         entity_rows = [
             _live_entity_snapshot(coordinator, entity_id, role)
             for role, value in configured_entities
@@ -472,6 +474,19 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
             }
         )
     return groups
+
+
+def _asset_control_enabled(
+    coordinator: EnergyPlannerCoordinator,
+    asset: ActionAsset,
+) -> bool:
+    """Return whether the asset's device-control switch is enabled."""
+    option_by_asset = {
+        ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
+        ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
+        ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+    }
+    return strict_bool(coordinator.options.get(option_by_asset[asset]), default=False)
 
 
 def _entity_id_values(value: Any) -> list[str]:
@@ -559,7 +574,10 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         return {"actions": []}
     audit = dict(plan.decision_audit or {})
     accepted = _accepted_decisions(plan)
-    actions = [_action_with_determination(action, accepted, audit) for action in _ordered_actions(plan)[:12]]
+    enabled_actions = [
+        action for action in _ordered_actions(plan) if _asset_control_enabled(coordinator, action.asset)
+    ]
+    actions = [_action_with_determination(action, accepted, audit) for action in enabled_actions[:12]]
     load_forecast = _built_in_load_forecast_attrs(coordinator)
     for action in actions:
         determination = action.get("determination")
@@ -580,7 +598,7 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "policy_order": _bounded_json(audit.get("policy_order", [])),
         "marginal_budget": _bounded_json(audit.get("marginal_budget", {})),
         "load_forecast": load_forecast,
-        "action_count": len(plan.actions),
+        "action_count": len(enabled_actions),
         "actions": actions,
         "ai_explanation": _ai_advice_attrs(coordinator),
     }

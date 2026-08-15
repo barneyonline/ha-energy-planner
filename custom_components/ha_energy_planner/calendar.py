@@ -158,23 +158,34 @@ def _ev_charging_event(
     rates = sorted(float(rate) for rate in window["charge_rates"])
     rate_text = f"{rates[0]:g} kW" if len(rates) == 1 else f"{rates[0]:g}-{rates[-1]:g} kW"
     details = _plain_action(action)
-    description_lines = [
-        "Planned EV charging window.",
-        f"Start charging: {_local_datetime_text(start)}",
-        f"Stop charging: {_local_datetime_text(end)}",
-        f"Charging power: {rate_text}",
+    description_lines = ["Planned EV charging window."]
+    _append_description_section(
+        description_lines,
+        "Schedule",
+        [
+            f"Start charging: {_local_datetime_text(start)}",
+            f"Stop charging: {_local_datetime_text(end)}",
+        ],
+    )
+    charging_details = [
+        f"Power: {rate_text}",
         f"Estimated energy: {window['energy_kwh']:.2f} kWh",
     ]
     target = action.desired_state.get("target_soc_percent")
     if target is not None:
-        description_lines.append(f"Target SOC: {target}%")
+        charging_details.append(f"Target SOC: {target}%")
     ready_by = action.desired_state.get("ready_by")
     if ready_by:
-        description_lines.append(f"Ready by: {ready_by}")
-    description_lines.append(f"Why: {details.get('why', 'No reason was recorded.')}")
+        charging_details.append(f"Ready by: {ready_by}")
+    _append_description_section(description_lines, "Charging", charging_details)
+    _append_description_section(
+        description_lines,
+        "Why",
+        [details.get("why", "No reason was recorded.")],
+    )
     constraints = details.get("constraints")
     if constraints:
-        description_lines.append(f"Constraints: {', '.join(str(item) for item in constraints)}")
+        _append_description_section(description_lines, "Constraints", constraints)
     return CalendarEvent(
         start=start,
         end=end,
@@ -187,35 +198,60 @@ def _ev_charging_event(
 
 def _local_datetime_text(value: datetime) -> str:
     """Format a calendar timestamp in Home Assistant's configured timezone."""
-    return dt_util.as_local(value).strftime("%Y-%m-%d %H:%M %Z")
+    local = dt_util.as_local(value)
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local:%a} {local.day} {local:%b %Y}, {clock} {local:%Z}"
 
 
 def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -> CalendarEvent:
     """Convert a controlled action to a Home Assistant calendar event."""
     details = _plain_action(action)
-    description_lines = [
-        _action_sentence(action),
-        f"Why: {details.get('why', 'No reason was recorded.')}",
-    ]
+    description_lines = [_action_sentence(action)]
+    _append_description_section(
+        description_lines,
+        "Why",
+        [details.get("why", "No reason was recorded.")],
+    )
     data_quality = _decision_data_quality_attrs(coordinator)
     if data_quality.get("status") != "Good":
-        description_lines.append(f"Data quality: {data_quality.get('summary', 'Limited input data.')}")
+        _append_description_section(
+            description_lines,
+            "Data quality",
+            [data_quality.get("summary", "Limited input data.")],
+        )
     constraints = details.get("constraints")
     if constraints:
-        description_lines.append(f"Constraints: {', '.join(str(item) for item in constraints)}")
+        _append_description_section(description_lines, "Constraints", constraints)
     desired_state = details.get("desired_state")
-    if desired_state:
-        description_lines.append(f"Desired state: {_compact_mapping(desired_state)}")
+    if isinstance(desired_state, dict):
+        schedule: list[str] = []
+        planned_state: list[str] = []
+        for key, value in desired_state.items():
+            if str(key).casefold().endswith("reason"):
+                continue
+            detail = _calendar_detail(str(key), value)
+            if _calendar_datetime(value) is not None:
+                schedule.append(detail)
+            else:
+                planned_state.append(detail)
+        _append_description_section(description_lines, "Schedule", schedule)
+        _append_description_section(description_lines, "Planned state", planned_state)
     load_forecast = _action_load_forecast_attrs(coordinator, action.action_id)
     if load_forecast:
         expected = load_forecast.get("expected_kw")
         conservative = load_forecast.get("conservative_kw")
-        description_lines.append(
-            "Load forecast: "
-            f"{load_forecast.get('status', 'unknown')}; "
-            f"expected {expected if expected is not None else 'unknown'} kW; "
-            f"conservative {conservative if conservative is not None else 'unknown'} kW "
-            f"at {load_forecast.get('valid_at', 'the action time')}."
+        forecast_details = [
+            f"Status: {_display_value(load_forecast.get('status', 'unknown'))}",
+            f"Expected load: {_power_text(expected)}",
+            f"Conservative load: {_power_text(conservative)}",
+        ]
+        valid_at = _calendar_datetime(load_forecast.get("valid_at"))
+        if valid_at is not None:
+            forecast_details.append(f"Forecast time: {_local_datetime_text(valid_at)}")
+        _append_description_section(
+            description_lines,
+            "Load forecast",
+            forecast_details,
         )
     return CalendarEvent(
         start=action.execute_not_before,
@@ -227,8 +263,61 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
     )
 
 
-def _compact_mapping(value: Any) -> str:
-    """Return compact user-facing key/value details for a calendar description."""
-    if not isinstance(value, dict):
-        return str(value)
-    return ", ".join(f"{key}: {item}" for key, item in value.items())
+def _append_description_section(lines: list[str], heading: str, items: list[Any]) -> None:
+    """Append a spaced, bulleted calendar-description section."""
+    visible_items = [str(item) for item in items if item not in (None, "")]
+    if not visible_items:
+        return
+    lines.extend(["", heading, *(f"• {item}" for item in visible_items)])
+
+
+def _calendar_detail(label: str, value: Any) -> str:
+    """Return one readable planned-state detail with units and local time."""
+    rendered_label = label
+    rendered_value = _calendar_value_text(value)
+    lower_label = label.casefold()
+    if lower_label.endswith(" c") and isinstance(value, int | float):
+        rendered_label = label[:-2]
+        rendered_value = f"{value:g} °C"
+    elif lower_label.endswith(" kw") and isinstance(value, int | float):
+        rendered_label = label[:-3]
+        rendered_value = f"{value:g} kW"
+    elif lower_label.endswith(" percent") and isinstance(value, int | float):
+        rendered_label = label[:-8]
+        rendered_value = f"{value:g}%"
+    return f"{rendered_label}: {rendered_value}"
+
+
+def _calendar_value_text(value: Any) -> str:
+    """Render a calendar detail without raw datetimes or Python containers."""
+    parsed = _calendar_datetime(value)
+    if parsed is not None:
+        return _local_datetime_text(parsed)
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if isinstance(value, list):
+        return ", ".join(_calendar_value_text(item) for item in value)
+    if isinstance(value, dict):
+        return "; ".join(f"{key}: {_calendar_value_text(item)}" for key, item in value.items())
+    return str(value)
+
+
+def _calendar_datetime(value: Any) -> datetime | None:
+    """Parse one timezone-aware calendar timestamp."""
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        parsed = dt_util.parse_datetime(value)
+    else:
+        return None
+    return parsed if parsed is not None and parsed.tzinfo is not None else None
+
+
+def _power_text(value: Any) -> str:
+    """Return a compact forecast-power label."""
+    return "Unknown" if not isinstance(value, int | float) else f"{value:.2f} kW"
+
+
+def _display_value(value: Any) -> str:
+    """Return a short title-cased calendar value."""
+    return str(value).replace("_", " ").title()

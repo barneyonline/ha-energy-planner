@@ -59,6 +59,13 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "No controls configured"
     )
 
+    enabled_without_actuator = _coordinator(
+        _plan(), options={"climate_control_enabled": True}
+    )
+    assert next(item for item in SENSORS if item.key == "current_state").value_fn(
+        enabled_without_actuator
+    ) == "No controls configured"
+
 
 def test_mode_sensor_exposes_operational_control_mode() -> None:
     description = next(item for item in SENSORS if item.key == "mode")
@@ -267,6 +274,10 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     }
     coordinator = _coordinator(
         plan,
+        options={
+            "climate_control_enabled": True,
+            "ev_control_enabled": True,
+        },
         entry_data={
             "daikin_climate_entity": "climate.home",
             "ev_charger_entity": "switch.ev",
@@ -326,6 +337,72 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert action_attrs["ai_explanation"] == {"available": False, "result": None}
     assert "plan_confidence" not in action_attrs
     assert "confidence" not in action_attrs["actions"][0]
+
+
+def test_operational_summaries_hide_disabled_controls() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    actions = [
+        PlanAction(
+            action_id="climate-1",
+            plan_id="plan-1",
+            execute_not_before=now,
+            execute_not_after=now + timedelta(minutes=5),
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.SET_HVAC,
+            desired_state={"hvac_mode": "heat"},
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=0.0,
+            confidence=1.0,
+        ),
+        PlanAction(
+            action_id="enphase-1",
+            plan_id="plan-1",
+            execute_not_before=now + timedelta(minutes=5),
+            execute_not_after=now + timedelta(minutes=10),
+            asset=ActionAsset.ENPHASE,
+            kind=ActionKind.SET_PROFILE,
+            desired_state={"profile": "self_consumption"},
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=0.0,
+            confidence=1.0,
+        ),
+    ]
+    coordinator = _coordinator(
+        _plan(
+            actions=actions,
+            device_plans={
+                "climate": {
+                    "current_state_label": "Heat (19 C)",
+                    "next_planned_state_label": "Heat to 21 C",
+                },
+                "enphase": {
+                    "current_state_label": "Self-Consumption",
+                    "next_planned_state_label": "AI Optimisation",
+                },
+            },
+        ),
+        options={
+            "climate_control_enabled": True,
+            "enphase_control_enabled": False,
+        },
+        entry_data={
+            "daikin_climate_entity": "climate.home",
+            "enphase_profile_entity": "select.enphase_profile",
+        },
+    )
+    current = next(item for item in SENSORS if item.key == "current_state")
+    next_actions = next(item for item in SENSORS if item.key == "next_actions")
+
+    assert current.value_fn(coordinator) == "Climate: Heat (19 C)"
+    assert [item["asset"] for item in current.attrs_fn(coordinator)["controlled_assets"]] == [
+        "Climate"
+    ]
+    assert next_actions.value_fn(coordinator) == "Climate: Heat to 21 C"
+    next_attrs = next_actions.attrs_fn(coordinator)
+    assert next_attrs["action_count"] == 1
+    assert [action["action_id"] for action in next_attrs["actions"]] == ["climate-1"]
 
 
 def test_operational_summary_sensors_expose_production_audit_and_support_context() -> None:
@@ -904,7 +981,9 @@ def test_next_actions_entity_attributes_stay_below_recorder_budget() -> None:
     }
     description = next(item for item in SENSORS if item.key == "next_actions")
 
-    attrs = PlannerSensor(_coordinator(plan), description).extra_state_attributes
+    attrs = PlannerSensor(
+        _coordinator(plan, options={"ev_control_enabled": True}), description
+    ).extra_state_attributes
     encoded_size = len(json.dumps(attrs, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     assert encoded_size <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
