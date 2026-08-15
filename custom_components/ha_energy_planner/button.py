@@ -96,11 +96,11 @@ async def _async_publish_preflight_notification(
 
 
 async def _arm(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_arm_production_control("button_pressed")
+    await coordinator.async_operator_arm_production_control("button_pressed")
 
 
 async def _disarm(coordinator: EnergyPlannerCoordinator) -> None:
-    await coordinator.async_disarm_production_control("button_pressed")
+    await coordinator.async_operator_disarm_production_control("button_pressed")
 
 
 async def _resume(coordinator: EnergyPlannerCoordinator) -> None:

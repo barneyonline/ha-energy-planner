@@ -65,6 +65,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _snapshot_actions,
     _split_entity_values,
     _startup_auto_recovery_prerequisites,
+    _startup_auto_recovery_successful_runs,
     _startup_auto_recovery_validation_ready,
     _unexpired_overrides,
     _updated_load_forecast_training_attempted,
@@ -158,6 +159,7 @@ def test_startup_auto_recovery_preflight_helpers_cover_every_blocker() -> None:
 
     unsafe = {**base, "current_plan": {"safe": False}}
     assert _startup_auto_recovery_validation_ready(unsafe, {}) == (False, "current_plan_unsafe")
+    assert _startup_auto_recovery_successful_runs("invalid") == 0
 
 
 @dataclass(slots=True)
@@ -183,6 +185,7 @@ class FakeHass:
     """Minimal HA object."""
 
     def __init__(self, values: dict[str, str] | None = None) -> None:
+        self.state = CoreState.running
         self.states = FakeStates(values or {})
         self.services = SimpleNamespace(calls=[], async_call=self._async_call_service)
         self.created_tasks: list[object] = []
@@ -192,6 +195,9 @@ class FakeHass:
         if callable(close):
             close()
         self.created_tasks.append(task)
+
+    def async_run_hass_job(self, job: object, *args: object) -> None:
+        self.async_create_task(job.target(*args))
 
     async def async_add_executor_job(self, func: object, *args: object) -> object:
         return func(*args)
@@ -299,6 +305,9 @@ class FakeExecutor:
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
+        self.startup_recovery_notifications: list[str] = []
+        self.startup_recovery_dismissals = 0
+        self.notification_grace_until: datetime | None = None
 
     async def async_evaluate(self, plan: EnergyPlan, context: object) -> PlanAction | None:
         self.evaluated.append((plan, context))
@@ -328,6 +337,12 @@ class FakeExecutor:
         self.fallback = (plan, violations)
         self.fallback_options = dict(self.options)
 
+    async def async_notify_startup_recovery_unsafe(self, reason: str) -> None:
+        self.startup_recovery_notifications.append(reason)
+
+    async def async_dismiss_startup_recovery_notification(self) -> None:
+        self.startup_recovery_dismissals += 1
+
 
 @dataclass(slots=True)
 class FakeEntry:
@@ -337,6 +352,12 @@ class FakeEntry:
     options: dict[str, object] = field(default_factory=dict)
     entry_id: str = "entry-1"
     title: str = "Energy Planner"
+
+    def async_create_background_task(
+        self, hass: object, coroutine: object, name: str
+    ) -> object:
+        """Create background work through the test Home Assistant instance."""
+        return hass.async_create_task(coroutine)
 
 
 def test_options_update_restores_when_direct_update_enables_safe_mode() -> None:
@@ -910,7 +931,7 @@ def test_start_listeners_schedules_configured_boundary_refresh_without_entities(
     assert coordinator._unsub_listeners == []
 
 
-def test_startup_auto_recovery_task_start_wakeup_and_shutdown() -> None:
+def test_startup_auto_recovery_begins_only_after_home_assistant_started(monkeypatch: object) -> None:
     class Task:
         def __init__(self, *, done: bool = False) -> None:
             self.completed = done
@@ -936,12 +957,25 @@ def test_startup_auto_recovery_task_start_wakeup_and_shutdown() -> None:
             coroutine.close()
             return self.task
 
+    callbacks: list[object] = []
+    unsubscribed: list[bool] = []
+
+    def at_started(hass: object, action: object) -> object:
+        callbacks.append(action)
+        return lambda: unsubscribed.append(True)
+
+    monkeypatch.setattr(coordinator_module, "async_at_started", at_started)
+
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = object()
     coordinator.entry = Entry()
     coordinator._startup_auto_recovery_authorized = False
     coordinator._startup_auto_recovery_task = None
+    coordinator._startup_auto_recovery_start_unsub = None
     coordinator._startup_auto_recovery_wakeup = asyncio.Event()
+    coordinator.store = FakeStore({"production": {"armed": True}})
+    coordinator.executor = FakeExecutor()
+    coordinator._async_update_startup_auto_recovery = AsyncMock()
 
     coordinator.async_start_startup_auto_recovery()
     assert coordinator.entry.created == 0
@@ -949,9 +983,14 @@ def test_startup_auto_recovery_task_start_wakeup_and_shutdown() -> None:
     coordinator._startup_auto_recovery_authorized = True
     coordinator.async_start_startup_auto_recovery()
     coordinator.async_start_startup_auto_recovery()
+    assert coordinator.entry.created == 0
+    assert len(callbacks) == 1
+
+    asyncio.run(callbacks[0](coordinator.hass))
     assert coordinator.entry.created == 1
     assert coordinator.entry.hass is coordinator.hass
     assert coordinator.entry.task_name == "ha_energy_planner startup automatic-control recovery"
+    coordinator._async_update_startup_auto_recovery.assert_awaited_once()
 
     coordinator._wake_startup_auto_recovery()
     assert coordinator._startup_auto_recovery_wakeup.is_set()
@@ -1441,7 +1480,8 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
     async def fail_refresh() -> None:
         raise RuntimeError("refresh failed")
 
-    coordinator.async_request_refresh = fail_refresh
+    coordinator.async_refresh = fail_refresh
+    coordinator.async_request_refresh = AsyncMock(side_effect=AssertionError("debounced refresh used"))
     assert asyncio.run(coordinator._async_run_startup_auto_recovery_validation()) == (
         False,
         "validation_refresh_failed",
@@ -1450,7 +1490,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
     async def no_commit() -> None:
         return None
 
-    coordinator.async_request_refresh = no_commit
+    coordinator.async_refresh = no_commit
     assert asyncio.run(coordinator._async_run_startup_auto_recovery_validation()) == (
         False,
         "validation_plan_not_committed",
@@ -1463,7 +1503,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
             "violations": ["unsafe"],
         }
 
-    coordinator.async_request_refresh = unsafe_commit
+    coordinator.async_refresh = unsafe_commit
     assert asyncio.run(coordinator._async_run_startup_auto_recovery_validation()) == (
         False,
         "validation_plan_unsafe",
@@ -1476,7 +1516,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
             "violations": [],
         }
 
-    coordinator.async_request_refresh = healthy_commit
+    coordinator.async_refresh = healthy_commit
     blocked = {
         "entities": {"missing": [], "unavailable": []},
         "services": {"missing": [], "unavailable": []},
@@ -1496,15 +1536,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
         True,
         "validation_succeeded",
     )
-
-
-def test_startup_recovery_wakeup_wait_covers_timeout() -> None:
-    coordinator = _coordinator_for_runtime_services()
-    coordinator._startup_auto_recovery_wakeup = asyncio.Event()
-
-    asyncio.run(coordinator._async_wait_for_startup_auto_recovery_wakeup(0.001))
-
-    assert coordinator._startup_auto_recovery_wakeup.is_set() is False
+    coordinator.async_request_refresh.assert_not_awaited()
 
 
 def test_teardown_discards_queued_current_planner_result() -> None:
@@ -3957,7 +3989,7 @@ def test_changed_production_contract_restores_and_disarms_before_rearming() -> N
     assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is False
 
 
-def test_changed_startup_contract_authorizes_recovery_only_when_previously_active() -> None:
+def test_previously_active_startup_preserves_arming_and_intent() -> None:
     entry_data = {CONF_EV_CHARGER: "switch.ev"}
     options = {
         CONF_PLANNER_ENABLED: True,
@@ -3971,572 +4003,791 @@ def test_changed_startup_contract_authorizes_recovery_only_when_previously_activ
             "production": {
                 "armed": True,
                 "dry_run_ready_cycles": 3,
-                "dry_run_evidence_fingerprint": "old-contract",
+                "dry_run_evidence_fingerprint": "prior-startup-contract",
+                "startup_auto_recovery": {
+                    "status": "grace",
+                    "successful_runs": 0,
+                    "deadline": "2026-08-15T01:00:00+00:00",
+                },
+            },
+            "ownership": {"ev_smart_charging_state": {"state": "on"}},
+            "ev_grid_reservation": {"active": True, "load_kw": 7.2},
+        },
+    )
+    coordinator._startup_auto_recovery_authorized = False
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    production = coordinator.store.data["production"]
+    assert coordinator.automatic_control_requested is True
+    assert coordinator.active_control is True
+    assert production["armed"] is True
+    assert production["startup_auto_recovery"]["status"] == "waiting_for_home_assistant"
+    assert production["startup_auto_recovery"]["required_runs"] == 1
+    assert "deadline" not in production["startup_auto_recovery"]
+    assert coordinator.executor.notification_grace_until == datetime.max.replace(tzinfo=UTC)
+    assert coordinator.executor.restored == []
+    assert coordinator.store.data["ownership"]["ev_smart_charging_state"]["state"] == "on"
+    assert coordinator.store.data["ev_grid_reservation"]["active"] is True
+
+
+def test_paused_startup_does_not_preserve_active_arming() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data={
+            "production": {"armed": True},
+            "control_pause": {
+                "active": True,
+                "until": datetime.now(UTC) + timedelta(hours=1),
+                "reason": "operator_pause",
+            },
+        },
+    )
+    coordinator._startup_auto_recovery_authorized = False
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    assert coordinator.store.data["production"]["armed"] is False
+    assert coordinator.store.data["production"]["disarmed_reason"] == "startup_control_paused"
+    assert coordinator.executor.restored == ["startup_control_paused"]
+    assert coordinator._startup_auto_recovery_authorized is False
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: True, CONF_EV_CONTROL_ENABLED: True},
+        {CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+    ],
+)
+def test_previously_non_active_startup_never_auto_arms(options: dict[str, object]) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGER: "switch.ev"},
+        options=options,
+        store_data={
+            "production": {
+                "armed": False,
+                "startup_auto_recovery": {"status": "grace", "successful_runs": 2},
             }
         },
     )
     coordinator._startup_auto_recovery_authorized = False
-    coordinator._startup_auto_recovery_task = None
-
-    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert coordinator._startup_auto_recovery_authorized is True
-    assert recovery["status"] == "waiting"
-    assert recovery["successful_runs"] == 0
-    assert coordinator.store.data["production"]["armed"] is False
-
-    review = _coordinator_for_runtime_services(
-        entry_data=entry_data,
-        options={**options, CONF_DRY_RUN: True},
-        store_data={
-            "production": {
-                "armed": True,
-                "dry_run_ready_cycles": 3,
-                "dry_run_evidence_fingerprint": "old-contract",
-            }
-        },
-    )
-    review._startup_auto_recovery_authorized = False
-    assert asyncio.run(review.async_reconcile_production_evidence_contract()) is True
-    assert review._startup_auto_recovery_authorized is False
-    assert "startup_auto_recovery" not in review.store.data["production"]
-
-
-def test_startup_reconcile_marks_stale_pending_recovery_interrupted() -> None:
-    coordinator = _coordinator_for_runtime_services(
-        store_data={
-            "production": {
-                "armed": False,
-                "startup_auto_recovery": {
-                    "status": "validating",
-                    "successful_runs": 2,
-                },
-            }
-        }
-    )
-
-    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is False
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "interrupted"
-    assert recovery["successful_runs"] == 2
-
-
-@pytest.mark.parametrize("evidence_matches", [False, True])
-def test_startup_reconcile_disarms_stale_pending_recovery_that_was_armed(
-    evidence_matches: bool,
-) -> None:
-    entry_data = {CONF_EV_CHARGER: "switch.ev"}
-    options = {
-        CONF_PLANNER_ENABLED: True,
-        CONF_DRY_RUN: False,
-        CONF_EV_CONTROL_ENABLED: True,
-    }
-    fingerprint = production_evidence_fingerprint(entry_data, options)
-    coordinator = _coordinator_for_runtime_services(
-        entry_data=entry_data,
-        options=options,
-        store_data={
-            "production": {
-                "armed": True,
-                "armed_reason": "startup_auto_recovered",
-                "dry_run_evidence_fingerprint": fingerprint if evidence_matches else "old-contract",
-                "startup_auto_recovery": {
-                    "status": "validating",
-                    "successful_runs": 3,
-                },
-            }
-        },
-    )
 
     assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
 
     production = coordinator.store.data["production"]
     assert production["armed"] is False
-    assert production["disarmed_reason"] == "startup_auto_recovery_interrupted"
     assert production["startup_auto_recovery"]["status"] == "interrupted"
     assert coordinator._startup_auto_recovery_authorized is False
-    assert coordinator.executor.restored == ["startup_auto_recovery_interrupted"]
 
 
-def test_startup_reconcile_treats_malformed_persisted_progress_as_zero() -> None:
+def test_disarmed_safe_recovery_resumes_after_restart_with_counter_reset() -> None:
     coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
         store_data={
             "production": {
                 "armed": False,
                 "startup_auto_recovery": {
-                    "status": "validating",
-                    "successful_runs": "corrupt",
+                    "status": "waiting_for_safe",
+                    "successful_runs": 2,
                 },
             }
-        }
+        },
+    )
+    coordinator._startup_auto_recovery_authorized = False
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_home_assistant"
+    assert recovery["successful_runs"] == 0
+    assert coordinator._startup_auto_recovery_authorized is True
+    assert coordinator.store.data["production"]["armed"] is False
+
+
+def test_safe_startup_grace_keeps_control_armed_and_silent() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._startup_auto_recovery_authorized = True
+    coordinator._startup_auto_recovery_deadline = coordinator_module.monotonic()
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(
+        return_value=(True, "validation_succeeded")
     )
 
-    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is False
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 0
+    assert asyncio.run(coordinator._async_complete_startup_grace()) == (
+        True,
+        "startup_grace_completed_healthy",
+    )
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is True
+    assert production["startup_auto_recovery"]["status"] == "recovered"
+    assert production["startup_auto_recovery"]["required_runs"] == 1
+    assert coordinator.executor.restored == []
+    assert coordinator.executor.startup_recovery_notifications == []
+    assert coordinator.executor.startup_recovery_dismissals == 1
+    assert coordinator.executor.notification_grace_until is None
 
 
-def test_startup_recovery_cancellation_cancels_running_task() -> None:
+def test_unsafe_startup_grace_disarms_restores_notifies_and_retains_intent() -> None:
     coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._startup_auto_recovery_authorized = True
+    coordinator._startup_auto_recovery_deadline = coordinator_module.monotonic()
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(
+        return_value=(False, "configured_entities_unavailable")
+    )
+
+    safe, reason = asyncio.run(coordinator._async_complete_startup_grace())
+    assert safe is False
+    asyncio.run(coordinator._async_enter_startup_safe_recovery(reason))
+
+    production = coordinator.store.data["production"]
+    assert coordinator.automatic_control_requested is True
+    assert coordinator.active_control is False
+    assert production["armed"] is False
+    assert production["startup_auto_recovery"]["status"] == "waiting_for_safe"
+    assert coordinator.executor.restored == ["startup_grace_unsafe"]
+    assert coordinator.executor.startup_recovery_notifications == [
+        "configured_entities_unavailable"
+    ]
+    assert coordinator.executor.notification_grace_until is None
+
+
+def test_interrupted_unsafe_transition_resumes_disarmed_recovery_after_restart() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
         store_data={
             "production": {
                 "armed": True,
-                "armed_reason": "startup_auto_recovered",
-                "startup_auto_recovery": {"status": "validating", "successful_runs": "corrupt"},
+                "startup_auto_recovery": {"status": "grace", "successful_runs": 0},
             }
-        }
+        },
     )
     coordinator._startup_auto_recovery_authorized = True
-    coordinator.async_restore_safe_state = AsyncMock(side_effect=RuntimeError("restore failed"))
+    coordinator.async_restore_safe_state = AsyncMock(side_effect=asyncio.CancelledError)
 
-    async def cancel_running_recovery() -> asyncio.Task[None]:
-        task = asyncio.create_task(asyncio.Event().wait())
-        coordinator._startup_auto_recovery_task = task
-        await coordinator.async_cancel_startup_auto_recovery("options_changed")
-        return task
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(coordinator._async_enter_startup_safe_recovery("current_plan_unsafe"))
 
-    task = asyncio.run(cancel_running_recovery())
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["startup_auto_recovery"]["status"] == "restoring"
 
-    assert task.cancelled() is True
-    assert coordinator.store.data["production"]["armed"] is False
-    coordinator.async_restore_safe_state.assert_awaited_once_with(
-        "startup_auto_recovery_cancelled:options_changed",
-        refresh=False,
+    coordinator._startup_auto_recovery_authorized = False
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_home_assistant"
+    assert coordinator._startup_auto_recovery_authorized is True
+
+
+def test_startup_safe_recovery_rearms_after_three_awaited_healthy_checks(
+    monkeypatch: object,
+) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    validations = AsyncMock(return_value=(True, "validation_succeeded"))
+    coordinator._async_run_startup_auto_recovery_validation = validations
+    coordinator.async_refresh = AsyncMock()
+    coordinator.async_restore_safe_state = AsyncMock(
+        return_value=SimpleNamespace(result=OutcomeResult.RESTORED)
     )
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "cancelled"
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 0
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+
+    asyncio.run(coordinator._async_retry_startup_safe_recovery())
+
+    production = coordinator.store.data["production"]
+    assert validations.await_count == 3
+    coordinator.async_refresh.assert_awaited_once_with()
+    assert production["armed"] is True
+    assert production["armed_reason"] == "startup_auto_recovered"
+    assert production["startup_auto_recovery"]["status"] == "recovered"
+    assert production["startup_auto_recovery"]["successful_runs"] == 3
+    assert coordinator.executor.startup_recovery_dismissals == 1
 
 
-def test_startup_recovery_cancellation_retries_interrupted_restore() -> None:
+def test_startup_safe_recovery_resets_consecutive_checks_on_unsafe(
+    monkeypatch: object,
+) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    results = iter(
+        (
+            (True, "validation_succeeded"),
+            (False, "validation_plan_unsafe"),
+            (True, "validation_succeeded"),
+            (True, "validation_succeeded"),
+            (True, "validation_succeeded"),
+        )
+    )
+    validations = AsyncMock(side_effect=lambda: next(results))
+    coordinator._async_run_startup_auto_recovery_validation = validations
+    coordinator.async_refresh = AsyncMock()
+    coordinator.async_restore_safe_state = AsyncMock(
+        return_value=SimpleNamespace(result=OutcomeResult.RESTORED)
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+
+    asyncio.run(coordinator._async_retry_startup_safe_recovery())
+
+    assert validations.await_count == 5
+    assert coordinator.executor.startup_recovery_notifications == [
+        "validation_plan_unsafe"
+    ]
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 3
+    assert coordinator.store.data["production"]["armed"] is True
+
+
+def test_reactivation_failure_stays_disarmed_then_retries_automatically(
+    monkeypatch: object,
+) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(
+        return_value=(True, "validation_succeeded")
+    )
+    coordinator.async_refresh = AsyncMock()
+    restore_results = iter(
+        (
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="restore_failed"),
+            SimpleNamespace(result=OutcomeResult.RESTORED),
+        )
+    )
+    coordinator.async_restore_safe_state = AsyncMock(side_effect=lambda *args, **kwargs: next(restore_results))
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+
+    asyncio.run(coordinator._async_retry_startup_safe_recovery())
+
+    assert coordinator._async_run_startup_auto_recovery_validation.await_count == 6
+    assert coordinator.executor.startup_recovery_notifications == ["restore_failed"]
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "recovered"
+
+
+def test_startup_recovery_cancellation_is_immediately_authoritative() -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"].update(
+        {
+            "armed": True,
+            "startup_auto_recovery": {"status": "grace", "successful_runs": 0},
+        }
+    )
+    coordinator._startup_auto_recovery_start_unsub = None
+    coordinator._startup_auto_recovery_task = None
+
+    asyncio.run(coordinator.async_cancel_startup_auto_recovery("options_changed"))
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["startup_auto_recovery"]["status"] == "cancelled"
+    assert coordinator.executor.restored == [
+        "startup_auto_recovery_cancelled:options_changed"
+    ]
+
+
+def test_operator_disarm_cancels_recovery_without_rearming_or_restoring() -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"].update(
+        {
+            "armed": True,
+            "startup_auto_recovery": {"status": "grace", "successful_runs": 0},
+        }
+    )
+    coordinator._startup_auto_recovery_task = None
+
+    asyncio.run(coordinator.async_operator_disarm_production_control("button_pressed"))
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["disarmed_reason"] == "button_pressed"
+    assert production["startup_auto_recovery"]["status"] == "cancelled"
+    assert coordinator._startup_auto_recovery_authorized is False
+    assert coordinator.executor.restored == []
+    assert coordinator.executor.startup_recovery_dismissals == 1
+
+
+def test_operator_arm_cancels_disarmed_recovery_before_granting_authority() -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["startup_auto_recovery"] = {
+        "status": "waiting_for_safe",
+        "successful_runs": 1,
+    }
+    coordinator._startup_auto_recovery_task = None
+
+    asyncio.run(coordinator.async_operator_arm_production_control("button_pressed"))
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is True
+    assert production["armed_reason"] == "button_pressed"
+    assert production["startup_auto_recovery"]["status"] == "cancelled"
+    assert coordinator._startup_auto_recovery_authorized is False
+    assert coordinator.executor.restored == []
+    assert coordinator.executor.startup_recovery_dismissals == 1
+
+
+def test_home_assistant_shutdown_preserves_persisted_recovery_state() -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["startup_auto_recovery"] = {
+        "status": "waiting_for_safe",
+        "successful_runs": 2,
+        "required_runs": 3,
+    }
+    coordinator._startup_auto_recovery_start_unsub = None
+    coordinator._startup_auto_recovery_task = None
+
+    asyncio.run(
+        coordinator.async_cancel_startup_auto_recovery(
+            "home_assistant_shutdown",
+            preserve_control=True,
+        )
+    )
+
+    assert coordinator.store.data["production"]["startup_auto_recovery"] == {
+        "status": "waiting_for_safe",
+        "successful_runs": 2,
+        "required_runs": 3,
+    }
+    assert coordinator.executor.restored == []
+
+
+def test_pause_preserves_disarmed_startup_recovery_until_resume() -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["startup_auto_recovery"] = {
+        "status": "waiting_for_safe",
+        "successful_runs": 0,
+        "required_runs": 3,
+    }
+
+    class RunningTask:
+        cancelled = False
+
+        def done(self) -> bool:
+            return False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    task = RunningTask()
+    coordinator._startup_auto_recovery_task = task
+
+    asyncio.run(coordinator.async_pause_control(30, "maintenance"))
+    asyncio.run(coordinator.async_resume_control("maintenance_complete"))
+
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert coordinator._startup_auto_recovery_authorized is True
+    assert coordinator._startup_auto_recovery_task is task
+    assert task.cancelled is False
+    assert recovery["status"] == "waiting_for_safe"
+    assert coordinator.store.data["control_pause"]["active"] is False
+
+
+def test_configuration_reload_persists_disarmed_recovery_handoff() -> None:
     coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._startup_auto_recovery_authorized = False
+    coordinator._startup_auto_recovery_task = None
+    coordinator._startup_auto_recovery_start_unsub = None
+
+    asyncio.run(coordinator.async_prepare_configuration_reload())
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["startup_auto_recovery"]["status"] == "waiting_for_safe"
+    assert production["startup_auto_recovery"]["successful_runs"] == 0
+    assert coordinator.executor.restored == ["configuration_changed"]
+    assert coordinator._configuration_reload_handoff is True
+
+
+def test_configuration_reload_restarts_an_existing_disarmed_recovery() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
         store_data={
             "production": {
                 "armed": False,
-                "startup_auto_recovery": {"status": "restoring", "successful_runs": 0},
+                "startup_auto_recovery": {
+                    "status": "waiting_for_safe",
+                    "successful_runs": 1,
+                },
             }
-        }
+        },
     )
     coordinator._startup_auto_recovery_authorized = True
-    restore_started = asyncio.Event()
-    restore_reasons: list[str] = []
+    coordinator._startup_auto_recovery_task = None
+    coordinator._startup_auto_recovery_start_unsub = None
 
-    async def restore(reason: str, *, refresh: bool = True) -> object:
-        restore_reasons.append(reason)
-        if len(restore_reasons) == 1:
-            restore_started.set()
-            await asyncio.Event().wait()
-        return SimpleNamespace(result=OutcomeResult.RESTORED)
+    asyncio.run(coordinator.async_prepare_configuration_reload())
 
-    coordinator.async_restore_safe_state = restore
-
-    async def cancel_during_restore() -> asyncio.Task[object]:
-        task = asyncio.create_task(coordinator.async_restore_safe_state("startup_auto_recovery", refresh=False))
-        coordinator._startup_auto_recovery_task = task
-        await restore_started.wait()
-        await coordinator.async_cancel_startup_auto_recovery("options_changed")
-        return task
-
-    task = asyncio.run(cancel_during_restore())
-
-    assert task.cancelled() is True
-    assert restore_reasons == [
-        "startup_auto_recovery",
-        "startup_auto_recovery_cancelled:options_changed",
-    ]
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "cancelled"
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_safe"
+    assert recovery["successful_runs"] == 0
+    assert coordinator.executor.restored == ["configuration_changed"]
+    assert coordinator._configuration_reload_handoff is True
 
 
-def test_startup_auto_recovery_rearms_after_three_consecutive_validations(monkeypatch: object) -> None:
+def test_configuration_reload_blocks_failed_restore_with_remaining_ownership() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_EV_CHARGER: "switch.ev"},
         options={
             CONF_PLANNER_ENABLED: True,
             CONF_DRY_RUN: False,
             CONF_EV_CONTROL_ENABLED: True,
         },
-        store_data={"production": {"armed": False}},
+        store_data={
+            "production": {"armed": True},
+            "ownership": {"ev_smart_charging_state": {"state": "on"}},
+            "ev_grid_reservation": {"active": True, "load_kw": 7.2},
+        },
     )
-    coordinator._startup_auto_recovery_authorized = True
-    coordinator._startup_auto_recovery_wakeup = asyncio.Event()
+    coordinator._startup_auto_recovery_authorized = False
     coordinator._startup_auto_recovery_task = None
-    coordinator._startup_auto_recovery_validation_active = False
-    validation_calls: list[str] = []
-    restore_calls: list[str] = []
-    replan_calls: list[str] = []
-
-    def preflight(hass: object, coordinator_arg: object) -> dict[str, object]:
-        production = coordinator.store.data.get("production", {})
-        ready = production.get("dry_run_ready_cycles") == 3
-        armed = production.get("armed") is True
-        return {
-            "entities": {"missing": [], "unavailable": []},
-            "services": {"missing": [], "unavailable": []},
-            "control_areas": {"required": ["ev"]},
-            "discovery": {"ev": {"supported": True}},
-            "recorder": {"available": True},
-            "checks": [{"check": "control_not_paused", "ok": True}],
-            "current_plan": {"safe": True},
-            "safe_to_activate_now": ready,
-            "active_control_ready": ready and armed,
-        }
-
-    async def restore(reason: str, *, refresh: bool = True) -> object:
-        restore_calls.append(reason)
-        return SimpleNamespace(result=OutcomeResult.RESTORED)
-
-    async def validate() -> tuple[bool, str]:
-        validation_calls.append("validation")
-        return True, "validation_succeeded"
-
-    async def replan() -> None:
-        replan_calls.append("replan")
-
-    monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
-    coordinator.async_restore_safe_state = restore
-    coordinator._async_run_startup_auto_recovery_validation = validate
-    coordinator.async_request_replan = replan
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert validation_calls == ["validation", "validation", "validation"]
-    assert restore_calls == ["startup_auto_recovery"]
-    assert replan_calls == ["replan"]
-    assert coordinator.store.data["production"]["armed"] is True
-    assert coordinator.store.data["production"]["armed_reason"] == "startup_auto_recovered"
-    assert recovery["status"] == "recovered"
-    assert recovery["successful_runs"] == 3
-
-
-def test_startup_auto_recovery_resets_failed_validation_sequence(monkeypatch: object) -> None:
-    coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_EV_CHARGER: "switch.ev"},
-        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
-        store_data={"production": {"armed": False}},
-    )
-    coordinator._startup_auto_recovery_authorized = True
-    coordinator._startup_auto_recovery_wakeup = asyncio.Event()
-    results = iter((True, False, True, True, True))
-    calls = 0
-
-    async def validate() -> tuple[bool, str]:
-        nonlocal calls
-        calls += 1
-        ok = next(results)
-        return ok, "validation_succeeded" if ok else "validation_plan_unsafe"
-
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, coordinator_arg: {
-            "entities": {"missing": [], "unavailable": []},
-            "services": {"missing": [], "unavailable": []},
-            "control_areas": {"required": ["ev"]},
-            "discovery": {"ev": {"supported": True}},
-            "recorder": {"available": True},
-            "checks": [{"check": "control_not_paused", "ok": True}],
-            "current_plan": {"safe": True},
-            "safe_to_activate_now": coordinator.store.data.get("production", {}).get("dry_run_ready_cycles") == 3,
-            "active_control_ready": coordinator.store.data.get("production", {}).get("armed") is True,
-        },
-    )
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_READINESS_POLL_SECONDS", 0)
-    coordinator.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
-    coordinator._async_run_startup_auto_recovery_validation = validate
-    coordinator.async_request_replan = AsyncMock()
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    assert calls == 5
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "recovered"
-
-
-def test_startup_auto_recovery_restore_failure_and_cancellation_fail_closed(monkeypatch: object) -> None:
-    coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_EV_CHARGER: "switch.ev"},
-        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
-        store_data={"production": {"armed": False}},
-    )
-    coordinator._startup_auto_recovery_authorized = True
-    coordinator._startup_auto_recovery_wakeup = asyncio.Event()
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, coordinator_arg: {
-            "entities": {"missing": [], "unavailable": []},
-            "services": {"missing": [], "unavailable": []},
-            "control_areas": {"required": ["ev"]},
-            "discovery": {"ev": {"supported": True}},
-            "recorder": {"available": True},
-            "checks": [{"check": "control_not_paused", "ok": True}],
-        },
-    )
+    coordinator._startup_auto_recovery_start_unsub = None
     coordinator.async_restore_safe_state = AsyncMock(
-        return_value=SimpleNamespace(result=OutcomeResult.FAILED, reason="enphase_profile_entity_unavailable")
-    )
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "failed"
-    assert recovery["last_reason"] == "enphase_profile_entity_unavailable"
-    assert coordinator.store.data["production"].get("armed") is not True
-    assert coordinator._startup_auto_recovery_authorized is False
-
-    coordinator._startup_auto_recovery_authorized = True
-    coordinator.store.data["production"]["startup_auto_recovery"]["status"] = "waiting"
-    asyncio.run(coordinator.async_cancel_startup_auto_recovery("automatic_control_disabled"))
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "cancelled"
-
-
-def test_startup_auto_recovery_times_out_without_rearming(monkeypatch: object) -> None:
-    coordinator = _coordinator_for_runtime_services(
-        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
-        store_data={"production": {"armed": False}},
-    )
-    coordinator._startup_auto_recovery_authorized = True
-    coordinator._startup_auto_recovery_wakeup = asyncio.Event()
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS", 0)
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "timed_out"
-    assert coordinator.store.data["production"].get("armed") is not True
-    assert coordinator._startup_auto_recovery_authorized is False
-
-    asyncio.run(coordinator.async_cancel_startup_auto_recovery("integration_unloaded"))
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "timed_out"
-
-
-def test_startup_auto_recovery_uses_original_authorization_deadline(monkeypatch: object) -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    coordinator._startup_auto_recovery_deadline = 5.0
-    monkeypatch.setattr(coordinator_module, "monotonic", lambda: 6.0)
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, item: (_ for _ in ()).throw(AssertionError("preflight ran after the deadline")),
-    )
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "timed_out"
-    assert coordinator._startup_auto_recovery_authorized is False
-
-    persisted = _startup_recovery_test_coordinator()
-    persisted.store.data["production"]["startup_auto_recovery"] = {
-        "status": "waiting",
-        "deadline": datetime.now(UTC) - timedelta(seconds=1),
-    }
-    if hasattr(persisted, "_startup_auto_recovery_deadline"):
-        del persisted._startup_auto_recovery_deadline
-
-    asyncio.run(persisted._async_run_startup_auto_recovery())
-
-    assert persisted.store.data["production"]["startup_auto_recovery"]["status"] == "timed_out"
-
-
-def test_startup_auto_recovery_waits_for_dependencies_then_honours_cancellation(monkeypatch: object) -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    report = _startup_recovery_report(coordinator)
-    report["entities"] = {"missing": ["select.enphase"], "unavailable": []}
-
-    async def cancel_while_waiting(delay: float) -> None:
-        coordinator._startup_auto_recovery_authorized = False
-
-    monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda hass, item: report)
-    coordinator._async_wait_for_startup_auto_recovery_wakeup = cancel_while_waiting
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "waiting"
-    assert recovery["last_reason"] == "configured_entities_unavailable"
-    assert coordinator.store.data["production"].get("armed") is not True
-
-
-def test_startup_auto_recovery_validation_deadline_is_fail_closed(monkeypatch: object) -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    times = iter((0.0, 0.0, 1.0))
-    monkeypatch.setattr(coordinator_module, "monotonic", lambda: next(times))
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS", 0.5)
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, item: _startup_recovery_report(coordinator),
-    )
-    coordinator.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "timed_out"
-    assert recovery["last_reason"] == "validation_deadline_expired"
-
-
-def test_startup_auto_recovery_stops_if_authorization_is_cancelled_after_validation(monkeypatch: object) -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, item: _startup_recovery_report(coordinator),
-    )
-    coordinator.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
-
-    async def cancel_during_validation() -> tuple[bool, str]:
-        coordinator._startup_auto_recovery_authorized = False
-        return True, "validation_succeeded"
-
-    coordinator._async_run_startup_auto_recovery_validation = cancel_during_validation
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 1
-    assert coordinator.store.data["production"].get("armed") is not True
-
-
-@pytest.mark.parametrize(
-    ("failure_mode", "expected_reason"),
-    [
-        ("final_preflight", "final_preflight_failed"),
-        ("final_preflight_bypassed", "final_preflight_failed"),
-        ("active_replan", "active_replan_failed"),
-        ("active_plan", "active_replan_unsafe"),
-        ("active_plan_bypassed", "active_replan_unsafe"),
-    ],
-)
-def test_startup_auto_recovery_final_activation_failures_disarm(
-    monkeypatch: object,
-    failure_mode: str,
-    expected_reason: str,
-) -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
-
-    def preflight(hass: object, item: object) -> dict[str, object]:
-        report = _startup_recovery_report(coordinator)
-        evidence_complete = coordinator.store.data.get("production", {}).get("dry_run_ready_cycles") == 3
-        if failure_mode == "final_preflight" and evidence_complete:
-            report["safe_to_activate_now"] = False
-        if failure_mode == "final_preflight_bypassed" and evidence_complete:
-            report["entities"] = {"missing": [], "unavailable": ["switch.ev"]}
-            report["safe_to_activate_now"] = True
-        if failure_mode == "active_plan" and coordinator.store.data.get("production", {}).get("armed") is True:
-            report["active_control_ready"] = False
-        if (
-            failure_mode == "active_plan_bypassed"
-            and coordinator.store.data.get("production", {}).get("armed") is True
-        ):
-            report["current_plan"] = {"safe": False}
-            report["active_control_ready"] = True
-        return report
-
-    async def replan() -> None:
-        if failure_mode == "active_replan":
-            raise RuntimeError("active replan failed")
-
-    monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
-    coordinator.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
-    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(
-        return_value=(True, "validation_succeeded")
-    )
-    coordinator.async_request_replan = replan
-
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
-
-    production = coordinator.store.data["production"]
-    assert production["startup_auto_recovery"]["status"] == "failed"
-    assert production["startup_auto_recovery"]["last_reason"] == expected_reason
-    assert production.get("armed") is not True
-    expected_restore_count = 1 if failure_mode.startswith("final_preflight") else 2
-    assert coordinator.async_restore_safe_state.await_count == expected_restore_count
-
-
-def test_startup_auto_recovery_failure_remains_disarmed_when_restore_raises() -> None:
-    coordinator = _startup_recovery_test_coordinator()
-    coordinator.store.data["production"].update(
-        {
-            "armed": True,
-            "armed_reason": "startup_auto_recovered",
-            "startup_auto_recovery": {"status": "validating"},
-        }
-    )
-    coordinator.async_restore_safe_state = AsyncMock(side_effect=RuntimeError("restore failed"))
-
-    asyncio.run(
-        coordinator._async_fail_startup_auto_recovery_after_activation(
-            "startup_auto_recovery_replan_failed",
-            successful_runs=3,
-            failure_reason="active_replan_failed",
+        return_value=SimpleNamespace(
+            result=OutcomeResult.FAILED,
+            reason="ev_restore_failed",
         )
     )
 
+    with pytest.raises(HomeAssistantError, match="ev_restore_failed"):
+        asyncio.run(coordinator.async_prepare_configuration_reload())
+
     production = coordinator.store.data["production"]
     assert production["armed"] is False
     assert production["startup_auto_recovery"]["status"] == "failed"
+    assert coordinator._configuration_reload_handoff is False
 
 
-def test_startup_auto_recovery_unexpected_error_fails_closed_and_cancellation_propagates(
-    monkeypatch: object,
-) -> None:
+def test_startup_recovery_start_callback_and_shutdown_edge_paths(monkeypatch: object) -> None:
+    callbacks: list[object] = []
+    unsubscribed: list[bool] = []
+
+    def at_started(hass: object, action: object) -> object:
+        callbacks.append(action)
+        return lambda: unsubscribed.append(True)
+
+    monkeypatch.setattr(coordinator_module, "async_at_started", at_started)
     coordinator = _startup_recovery_test_coordinator()
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, item: (_ for _ in ()).throw(RuntimeError("unexpected")),
-    )
+    coordinator._startup_auto_recovery_start_unsub = None
+    coordinator.executor.notification_grace_until = None
 
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
+    class RunningTask:
+        def done(self) -> bool:
+            return False
 
-    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
-    assert recovery["status"] == "failed"
-    assert recovery["last_reason"] == "unexpected_recovery_error"
+    coordinator._startup_auto_recovery_task = RunningTask()
+    coordinator.async_start_startup_auto_recovery()
+    assert callbacks == []
 
+    coordinator._startup_auto_recovery_task = None
+    coordinator.async_start_startup_auto_recovery()
+    coordinator._startup_auto_recovery_authorized = False
+    asyncio.run(callbacks[-1](coordinator.hass))
+
+    coordinator._startup_auto_recovery_authorized = True
+    coordinator.async_start_startup_auto_recovery()
+    asyncio.run(callbacks[-1](coordinator.hass))
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "waiting_for_safe"
+
+    coordinator._tearing_down = False
+    coordinator._debounce_cancel = None
+    coordinator._boundary_cancel = None
+    coordinator._ai_advice_task = None
+    coordinator._startup_auto_recovery_task = None
+    coordinator._startup_auto_recovery_start_unsub = lambda: unsubscribed.append(True)
+    coordinator._unsub_listeners = []
+    coordinator.async_shutdown()
+    assert unsubscribed
+
+
+def test_startup_recovery_cancellation_covers_task_and_restore_failure() -> None:
     coordinator = _startup_recovery_test_coordinator()
-    monkeypatch.setattr(
-        coordinator_module,
-        "build_preflight_report",
-        lambda hass, item: (_ for _ in ()).throw(asyncio.CancelledError()),
+    coordinator.store.data["production"].update(
+        {"armed": True, "startup_auto_recovery": {"status": "grace", "successful_runs": "bad"}}
     )
+    coordinator._startup_auto_recovery_start_unsub = lambda: None
+    coordinator.async_restore_safe_state = AsyncMock(side_effect=RuntimeError("restore failed"))
+
+    async def cancel() -> asyncio.Task[object]:
+        task = asyncio.create_task(asyncio.Event().wait())
+        coordinator._startup_auto_recovery_task = task
+        await coordinator.async_cancel_startup_auto_recovery("options_changed")
+        return task
+
+    task = asyncio.run(cancel())
+
+    assert task.cancelled() is True
+    assert coordinator.store.data["production"]["armed"] is False
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "cancelled"
+
+
+def test_startup_recovery_orchestration_safe_unsafe_cancelled_and_error_paths() -> None:
+    safe = _startup_recovery_test_coordinator()
+    safe.store.data["production"]["armed"] = True
+    safe._async_complete_startup_grace = AsyncMock(return_value=(True, "healthy"))
+    safe._async_retry_startup_safe_recovery = AsyncMock()
+    asyncio.run(safe._async_run_startup_auto_recovery())
+    safe._async_retry_startup_safe_recovery.assert_not_awaited()
+
+    unsafe = _startup_recovery_test_coordinator()
+    unsafe.store.data["production"]["armed"] = True
+    unsafe._async_complete_startup_grace = AsyncMock(return_value=(False, "unsafe"))
+    unsafe._async_enter_startup_safe_recovery = AsyncMock()
+    unsafe._async_retry_startup_safe_recovery = AsyncMock()
+    asyncio.run(unsafe._async_run_startup_auto_recovery())
+    unsafe._async_enter_startup_safe_recovery.assert_awaited_once_with("unsafe")
+    unsafe._async_retry_startup_safe_recovery.assert_awaited_once_with()
+
+    cancelled_after_check = _startup_recovery_test_coordinator()
+    cancelled_after_check.store.data["production"]["armed"] = True
+    cancelled_after_check._async_complete_startup_grace = AsyncMock(return_value=(False, "cancelled"))
+    cancelled_after_check._startup_auto_recovery_authorized = False
+    cancelled_after_check._async_enter_startup_safe_recovery = AsyncMock()
+    asyncio.run(cancelled_after_check._async_run_startup_auto_recovery())
+    cancelled_after_check._async_enter_startup_safe_recovery.assert_not_awaited()
+
+    propagates = _startup_recovery_test_coordinator()
+    propagates.store.data["production"]["armed"] = True
+    propagates._async_complete_startup_grace = AsyncMock(side_effect=asyncio.CancelledError())
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(coordinator._async_run_startup_auto_recovery())
+        asyncio.run(propagates._async_run_startup_auto_recovery())
+
+    unexpected = _startup_recovery_test_coordinator()
+    unexpected._async_retry_startup_safe_recovery = AsyncMock(side_effect=RuntimeError("unexpected"))
+    unexpected._async_enter_startup_safe_recovery = AsyncMock()
+    asyncio.run(unexpected._async_run_startup_auto_recovery())
+    unexpected._async_enter_startup_safe_recovery.assert_awaited_once_with("unexpected_recovery_error")
+    assert unexpected.hass.created_tasks
+
+    nested_failure = _startup_recovery_test_coordinator()
+    nested_failure._async_retry_startup_safe_recovery = AsyncMock(side_effect=RuntimeError("unexpected"))
+    nested_failure._async_enter_startup_safe_recovery = AsyncMock(side_effect=RuntimeError("persist failed"))
+    nested_failure.async_disarm_production_control = AsyncMock(side_effect=RuntimeError("disarm failed"))
+    asyncio.run(nested_failure._async_run_startup_auto_recovery())
+    nested_failure.async_disarm_production_control.assert_awaited_once_with("unexpected_recovery_error")
 
 
-def test_startup_auto_recovery_unexpected_error_after_arm_disarms_and_restores(
-    monkeypatch: object,
-) -> None:
+def test_startup_grace_default_deadline_sleep_and_cancel(monkeypatch: object) -> None:
     coordinator = _startup_recovery_test_coordinator()
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
-    preflight_calls = 0
-
-    def preflight(hass: object, item: object) -> dict[str, object]:
-        nonlocal preflight_calls
-        preflight_calls += 1
-        if preflight_calls == 3:
-            raise RuntimeError("final preflight failed")
-        return _startup_recovery_report(coordinator)
-
-    monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
-    coordinator.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
+    coordinator.store.data["production"]["armed"] = True
+    coordinator._startup_auto_recovery_deadline = None
     coordinator._async_run_startup_auto_recovery_validation = AsyncMock(
         return_value=(True, "validation_succeeded")
     )
-    coordinator.async_request_replan = AsyncMock()
+    sleep = AsyncMock()
+    monkeypatch.setattr(coordinator_module.asyncio, "sleep", sleep)
+    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS", 1)
 
-    asyncio.run(coordinator._async_run_startup_auto_recovery())
+    assert asyncio.run(coordinator._async_complete_startup_grace())[0] is True
+    sleep.assert_awaited_once()
 
-    production = coordinator.store.data["production"]
-    assert production["armed"] is False
-    assert production["disarmed_reason"] == "startup_auto_recovery_unexpected_failure"
-    assert production["startup_auto_recovery"]["status"] == "failed"
-    assert production["startup_auto_recovery"]["last_reason"] == "unexpected_recovery_error"
-    assert coordinator.async_restore_safe_state.await_count == 2
+    cancelled = _startup_recovery_test_coordinator()
+    cancelled._startup_auto_recovery_authorized = False
+    cancelled._startup_auto_recovery_deadline = coordinator_module.monotonic()
+    assert asyncio.run(cancelled._async_complete_startup_grace()) == (
+        False,
+        "startup_recovery_cancelled",
+    )
+
+
+def test_startup_safe_recovery_restore_failure_paths() -> None:
+    failed = _startup_recovery_test_coordinator()
+    failed.async_restore_safe_state = AsyncMock(
+        return_value=SimpleNamespace(result=OutcomeResult.FAILED, reason="restore_failed")
+    )
+    asyncio.run(failed._async_enter_startup_safe_recovery("unsafe"))
+    assert failed.executor.startup_recovery_notifications == ["restore_failed"]
+
+    raised = _startup_recovery_test_coordinator()
+    raised.async_restore_safe_state = AsyncMock(side_effect=RuntimeError("restore raised"))
+    asyncio.run(raised._async_enter_startup_safe_recovery("unsafe"))
+    assert raised.executor.startup_recovery_notifications == ["safe_state_restore_failed"]
+
+
+def test_startup_safe_recovery_stops_if_cancelled_during_interval(monkeypatch: object) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+
+    async def cancel_on_sleep(delay: float) -> None:
+        coordinator._startup_auto_recovery_authorized = False
+
+    monkeypatch.setattr(coordinator_module.asyncio, "sleep", cancel_on_sleep)
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock()
+
+    asyncio.run(coordinator._async_retry_startup_safe_recovery())
+
+    coordinator._async_run_startup_auto_recovery_validation.assert_not_awaited()
+
+
+def test_startup_reactivation_failure_branches(monkeypatch: object) -> None:
+    restore_raises = _startup_recovery_test_coordinator()
+    restore_raises.async_restore_safe_state = AsyncMock(side_effect=RuntimeError("restore raised"))
+    assert asyncio.run(restore_raises._async_reactivate_after_startup_recovery(3)) == (
+        False,
+        "safe_state_restore_failed",
+    )
+
+    blocked = _startup_recovery_test_coordinator()
+    blocked.async_restore_safe_state = AsyncMock(return_value=SimpleNamespace(result=OutcomeResult.RESTORED))
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: {
+            **_startup_recovery_report(item),
+            "current_plan": {"safe": False},
+        },
+    )
+    assert asyncio.run(blocked._async_reactivate_after_startup_recovery(3)) == (
+        False,
+        "current_plan_unsafe",
+    )
+
+    preflight_blocked = _startup_recovery_test_coordinator()
+    preflight_blocked.async_restore_safe_state = AsyncMock(
+        return_value=SimpleNamespace(result=OutcomeResult.RESTORED)
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: {**_startup_recovery_report(item), "safe_to_activate_now": False},
+    )
+    assert asyncio.run(preflight_blocked._async_reactivate_after_startup_recovery(3)) == (
+        False,
+        "final_preflight_failed",
+    )
+
+    refresh_failed = _startup_recovery_test_coordinator()
+    refresh_failed.async_restore_safe_state = AsyncMock(
+        side_effect=(SimpleNamespace(result=OutcomeResult.RESTORED), RuntimeError("second restore failed"))
+    )
+    refresh_failed.async_refresh = AsyncMock(side_effect=RuntimeError("refresh failed"))
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    assert asyncio.run(refresh_failed._async_reactivate_after_startup_recovery(3)) == (
+        False,
+        "active_replan_failed",
+    )
+    assert refresh_failed.store.data["production"]["armed"] is False
+
+    active_unsafe = _startup_recovery_test_coordinator()
+    active_unsafe.async_restore_safe_state = AsyncMock(
+        side_effect=(SimpleNamespace(result=OutcomeResult.RESTORED), RuntimeError("second restore failed"))
+    )
+    active_unsafe.async_refresh = AsyncMock()
+
+    def active_unsafe_preflight(hass: object, item: EnergyPlannerCoordinator) -> dict[str, object]:
+        report = _startup_recovery_report(item)
+        if item.store.data.get("production", {}).get("armed") is True:
+            report["active_control_ready"] = False
+        return report
+
+    monkeypatch.setattr(coordinator_module, "build_preflight_report", active_unsafe_preflight)
+    assert asyncio.run(active_unsafe._async_reactivate_after_startup_recovery(3)) == (
+        False,
+        "active_replan_unsafe",
+    )
+    assert active_unsafe.store.data["production"]["armed"] is False
+
+
+def test_startup_recovery_started_metadata_and_policy_change_lifecycle(monkeypatch: object) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["startup_auto_recovery"] = {"completed_at": "old"}
+    asyncio.run(
+        coordinator._async_update_startup_auto_recovery(
+            "grace",
+            successful_runs=0,
+            reason="started",
+            started=True,
+        )
+    )
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["started_at"]
+    assert recovery["deadline"]
+    assert "completed_at" not in recovery
+
+    policy = _coordinator_for_runtime_services(
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_PLANNING_INTERVAL_MINUTES: 15,
+        },
+        store_data={"production": {"armed": True}},
+    )
+    policy._last_handled_options = dict(policy.entry.options)
+    policy.entry.options = {**policy.entry.options, CONF_PLANNING_INTERVAL_MINUTES: 20}
+    policy._last_control_mode_state = (True, False)
+    policy._startup_auto_recovery_authorized = False
+    policy._startup_auto_recovery_task = None
+    policy._startup_auto_recovery_start_unsub = None
+    monkeypatch.setattr(policy, "async_start_startup_auto_recovery", lambda: None)
+
+    asyncio.run(policy.async_handle_options_update())
+
+    assert policy.store.data["production"]["armed"] is False
+    assert policy.executor.restored == ["configuration_changed"]
+    assert policy.store.data["production"]["startup_auto_recovery"]["status"] == (
+        "waiting_for_home_assistant"
+    )
+
+    recovering = _coordinator_for_runtime_services(
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+            CONF_PLANNING_INTERVAL_MINUTES: 15,
+        },
+        store_data={
+            "production": {
+                "armed": False,
+                "startup_auto_recovery": {
+                    "status": "waiting_for_safe",
+                    "successful_runs": 2,
+                },
+            }
+        },
+    )
+    recovering._last_handled_options = dict(recovering.entry.options)
+    recovering.entry.options = {
+        **recovering.entry.options,
+        CONF_PLANNING_INTERVAL_MINUTES: 20,
+    }
+    recovering._last_control_mode_state = (True, False)
+    recovering._startup_auto_recovery_authorized = True
+    recovering._startup_auto_recovery_task = None
+    recovering._startup_auto_recovery_start_unsub = None
+    recovery_starts: list[bool] = []
+    monkeypatch.setattr(
+        recovering,
+        "async_start_startup_auto_recovery",
+        lambda: recovery_starts.append(True),
+    )
+
+    asyncio.run(recovering.async_handle_options_update())
+
+    recovery = recovering.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_home_assistant"
+    assert recovery["successful_runs"] == 0
+    assert recovering._startup_auto_recovery_authorized is True
+    assert recovery_starts == [True]
 
 
 def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:

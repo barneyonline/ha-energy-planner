@@ -36,6 +36,10 @@ async def async_get_config_entry_diagnostics(
     store_data = dict(coordinator.store.data)
     plan = coordinator.data
     entry_data = combined_entry_data(entry)
+    automatic_control_running = bool(getattr(coordinator, "active_control", False))
+    automatic_control_requested = bool(
+        getattr(coordinator, "automatic_control_requested", automatic_control_running)
+    )
     data = {
         "entry": {
             "data": _redact(entry_data),
@@ -77,6 +81,10 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "refresh_performance": _redact(_refresh_performance(coordinator)),
+        "automatic_control": {
+            "requested": automatic_control_requested,
+            "running": automatic_control_running,
+        },
         "startup_auto_recovery": _redact(
             dict(store_data.get("production", {})).get("startup_auto_recovery", {})
             if isinstance(store_data.get("production"), dict)
