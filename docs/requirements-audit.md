@@ -451,8 +451,9 @@ Status as of 2026-08-15.
   implemented. A missed preferred start can use the remaining contiguous
   lower-price slots before the peak; catch-up cannot cross a tariff gap or run
   beyond the applicable comfort target. Takeover snapshots configured switch/input-boolean zones,
-  disables mapped automations, enables zones, explicitly turns on the climate
-  entity, and preserves the original snapshot across peak transitions. Release
+  disables mapped automations, enables those zones, explicitly turns on the main climate
+  entity, applies and confirms its target on configured zone climate entities, and preserves
+  the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,
   retains unresolved ownership for
   retry, and never restores the prior climate mode or setpoint. An ownership-free

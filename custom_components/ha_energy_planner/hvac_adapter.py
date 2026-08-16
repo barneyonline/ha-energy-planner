@@ -85,7 +85,9 @@ class DaikinHVACAdapter:
                 True,
                 saved_zone_states,
             )
-        if action.desired_state.get("enable_zones") and set(saved_zone_states) != set(self._zone_entities()):
+        if action.desired_state.get("enable_zones") and any(
+            self._state(entity_id) is None for entity_id in self._zone_entities()
+        ):
             return HVACCommandResult(
                 False,
                 "climate_zone_unavailable",
@@ -186,7 +188,10 @@ class DaikinHVACAdapter:
                 unresolved_zones,
             )
         else:
-            state_confirmed = await self._async_confirm_hvac_state(climate_entity, action.desired_state)
+            state_confirmed = await self._async_confirm_complete_hvac_state(
+                climate_entity,
+                action.desired_state,
+            )
         confirmation_reason = "hvac_state_confirmation_failed"
         if not state_confirmed:
             # A schedule action can already be running when its automation is
@@ -209,7 +214,7 @@ class DaikinHVACAdapter:
                 except Exception:  # noqa: BLE001 - retry remains inside the same rollback boundary.
                     confirmation_reason = "hvac_control_service_failed"
                 else:
-                    state_confirmed = await self._async_confirm_hvac_state(
+                    state_confirmed = await self._async_confirm_complete_hvac_state(
                         climate_entity,
                         action.desired_state,
                     )
@@ -455,6 +460,24 @@ class DaikinHVACAdapter:
                 return False
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
+    async def _async_confirm_complete_hvac_state(
+        self,
+        entity_id: str,
+        desired_state: dict[str, Any],
+    ) -> bool:
+        """Confirm the main thermostat and every configured zone target."""
+        if not await self._async_confirm_hvac_state(entity_id, desired_state):
+            return False
+        if not desired_state.get("enable_zones"):
+            return True
+        zone_target = _temperature_desired_state(desired_state)
+        if not zone_target:
+            return True
+        for zone_entity in self._zone_climate_entities():
+            if not await self._async_confirm_hvac_state(zone_entity, zone_target):
+                return False
+        return True
+
     async def _async_confirm_hvac_on(self, entity_id: str) -> bool:
         """Wait for the thermostat to leave its off state."""
         loop = asyncio.get_running_loop()
@@ -543,6 +566,17 @@ class DaikinHVACAdapter:
                 {ATTR_ENTITY_ID: entity_id, "target_temp_low": target_low, "target_temp_high": target_high},
                 blocking=True,
             )
+        if desired_state.get("enable_zones"):
+            zone_target = _temperature_desired_state(desired_state)
+            for zone_entity in self._zone_climate_entities():
+                command_sent = (
+                    await self._async_apply_hvac_state(
+                        zone_entity,
+                        zone_target,
+                        force=force,
+                    )
+                    or command_sent
+                )
         return command_sent
 
     async def _async_disable_automations(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
@@ -595,9 +629,25 @@ class DaikinHVACAdapter:
     def _zone_states(self) -> dict[str, str]:
         return {
             entity_id: state.state
-            for entity_id in self._zone_entities()
+            for entity_id in self._zone_activation_entities()
             if (state := self._state(entity_id)) is not None
         }
+
+    def _zone_activation_entities(self) -> list[str]:
+        """Return zone controls whose on/off state must be restored."""
+        return [
+            entity_id
+            for entity_id in self._zone_entities()
+            if entity_id.split(".", 1)[0] in {"switch", "input_boolean"}
+        ]
+
+    def _zone_climate_entities(self) -> list[str]:
+        """Return subordinate zone thermostats that receive target setpoints."""
+        return [
+            entity_id
+            for entity_id in self._zone_entities()
+            if entity_id.split(".", 1)[0] == "climate"
+        ]
 
     def _zone_entities(self) -> list[str]:
         configured = self.entry_data.get(CONF_CLIMATE_ZONES, "")
@@ -647,6 +697,15 @@ def _already_in_desired_state(state: State, desired_state: dict[str, Any]) -> bo
             desired_state.get("target_temp_high"),
         )
     )
+
+
+def _temperature_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
+    """Return only target-temperature fields supported by subordinate zones."""
+    return {
+        key: desired_state[key]
+        for key in ("target_temperature", "target_temp_low", "target_temp_high")
+        if desired_state.get(key) is not None
+    }
 
 
 def _mode_matches(state: State, desired_mode: Any) -> bool:

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.9.12 - 2026-08-16
+
+### Changed
+
+- Climate Zones can now include subordinate `climate` entities. Planner HVAC
+  actions apply and confirm the main thermostat target on every configured zone
+  thermostat while retaining switch/helper takeover and restoration behavior.
+
+### Fixed
+
+- Zone thermostat target changes now participate in manual-override detection
+  without misclassifying changes protected by the configured scheduler guard.
+
 ## 0.9.11 - 2026-08-15
 
 ### Changed

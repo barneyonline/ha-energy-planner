@@ -245,7 +245,7 @@ rules:
         - tests/test_lifecycle.py
   docs-configuration-parameters:
     status: done
-    comment: Central settings document climate away-preconditioning opt-in, catch-up windows, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards, and bounded manual-override helper behavior.
+    comment: Central settings document climate away-preconditioning opt-in, catch-up windows, zone switch/helper restoration and zone-climate target propagation, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards, and bounded manual-override helper behavior.
     references:
       docs:
         - README.md
