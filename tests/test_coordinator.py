@@ -1425,17 +1425,51 @@ def test_manual_override_and_zone_change_helpers_cover_invalid_events() -> None:
     assert not _is_manual_override_helper_change(entry_data, FakeEvent("input_boolean.override", "on", "on"))
 
     zone_event = FakeEvent("switch.zone", "on", "off")
-    assert not _is_manual_hvac_zone_change(entry_data, {"ownership": {}}, zone_event)
+    assert not _is_manual_hvac_zone_change(FakeHass(), entry_data, {"ownership": {}}, zone_event)
     assert _is_manual_hvac_zone_change(
+        FakeHass(),
         entry_data,
         {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
         zone_event,
     )
+    assert not _is_manual_hvac_zone_change(
+        FakeHass(),
+        entry_data,
+        {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+        FakeEvent("switch.zone", "on", "on"),
+    )
     zone_event.data["new_state"] = None
     assert not _is_manual_hvac_zone_change(
+        FakeHass(),
         entry_data,
         {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
         zone_event,
+    )
+
+    climate_entry_data = {CONF_CLIMATE_ZONES: ["climate.zone_temperature"]}
+    climate_zone_event = FakeEvent(
+        "climate.zone_temperature",
+        "heat",
+        "heat",
+        old_attributes={"temperature": 21},
+        new_attributes={"temperature": 22},
+    )
+    assert _is_manual_hvac_zone_change(
+        FakeHass(),
+        climate_entry_data,
+        {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+        climate_zone_event,
+    )
+
+    guarded_climate_entry_data = {
+        **climate_entry_data,
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+    }
+    assert not _is_manual_hvac_zone_change(
+        FakeHass({"input_boolean.scheduler_change": "on"}),
+        guarded_climate_entry_data,
+        {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+        climate_zone_event,
     )
 
 
@@ -2247,9 +2281,43 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
     enphase_event = FakeEvent("select.enphase", "AI Optimisation", "Full Backup")
     entry_data = {
         "daikin_climate_entity": "climate.daikin",
-        "climate_zone_entities": ["switch.zone"],
+        "climate_zone_entities": ["switch.zone", "climate.zone_temperature"],
         "enphase_profile_entity": "select.enphase",
     }
+
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "off",
+            "heat",
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={"enable_zones": True, "target_temperature": 21},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {"enable_zones": True, "target_temperature": 21},
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
 
     assert _is_planner_owned_control_feedback(
         entry_data,

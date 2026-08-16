@@ -476,7 +476,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
                 return
-            if _is_manual_hvac_zone_change(entry_data, self.store.data, event):
+            if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("climate_zone_changed"))
                 return
             if _is_ev_history_state_change(entry_data, event):
@@ -2739,6 +2739,7 @@ def _hvac_control_from_ownership(ownership: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_manual_hvac_zone_change(
+    hass: HomeAssistant,
     entry_data: dict[str, Any],
     store_data: dict[str, Any],
     event: Any,
@@ -2752,7 +2753,25 @@ def _is_manual_hvac_zone_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    return bool(old_state is not None and new_state is not None and old_state.state != new_state.state)
+    if old_state is None or new_state is None:
+        return False
+    state_changed = old_state.state != new_state.state
+    control_attribute_changed = False
+    if str(entity_id).split(".", 1)[0] == "climate":
+        old_attributes = getattr(old_state, "attributes", {}) or {}
+        new_attributes = getattr(new_state, "attributes", {}) or {}
+        control_attribute_changed = any(
+            old_attributes.get(key) != new_attributes.get(key)
+            for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+        )
+    if not state_changed and not control_attribute_changed:
+        return False
+    guard_entity = entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
+    if guard_entity:
+        guard_state = hass.states.get(guard_entity)
+        if guard_state is not None and str(guard_state.state).lower() in {"on", "true", "1"}:
+            return False
+    return True
 
 
 def _is_planner_owned_control_feedback(
@@ -2789,6 +2808,8 @@ def _is_planner_owned_control_feedback(
         restored_zones = pending_hvac_desired_state.get("restore_zones")
         if isinstance(restored_zones, dict) and entity_id in restored_zones:
             return str(getattr(new_state, "state", "")).lower() == str(restored_zones[entity_id]).lower()
+        if str(entity_id).split(".", 1)[0] == "climate":
+            return True
         return bool(
             pending_hvac_desired_state.get("enable_zones") and str(getattr(new_state, "state", "")).lower() == "on"
         )
@@ -2810,6 +2831,8 @@ def _is_planner_owned_control_feedback(
         if asset == "enphase":
             return bool(desired.get("profile")) and observed == str(desired["profile"])
         if asset == "daikin_zone":
+            if str(entity_id).split(".", 1)[0] == "climate":
+                return _matches_hvac_command_feedback(desired, event)
             return bool(desired.get("enable_zones") and observed.lower() == "on")
         return _matches_hvac_command_feedback(desired, event)
     return False

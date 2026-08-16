@@ -245,7 +245,9 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
-        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(["switch", "input_boolean"], multiple=True),
+        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(
+            ["switch", "input_boolean", "climate"], multiple=True
+        ),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
         vol.Optional(CONF_CLIMATE_SCHEDULER_GUARD_TIMER): _entity_selector("timer"),
         vol.Optional(CONF_CLIMATE_MANUAL_OVERRIDE): _entity_selector("input_boolean"),
@@ -1052,7 +1054,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_DAIKIN_CLIMATE: {"climate"},
     CONF_DAIKIN_POWER: {"sensor"},
     CONF_CLIMATE_AUTOMATIONS: {"automation"},
-    CONF_CLIMATE_ZONES: {"switch", "input_boolean"},
+    CONF_CLIMATE_ZONES: {"switch", "input_boolean", "climate"},
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER: {"input_boolean"},
     CONF_CLIMATE_SCHEDULER_GUARD_TIMER: {"timer"},
     CONF_CLIMATE_MANUAL_OVERRIDE: {"input_boolean"},
