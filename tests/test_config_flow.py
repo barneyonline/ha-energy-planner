@@ -520,7 +520,7 @@ def test_climate_flow_uses_multi_entity_selector_for_automations() -> None:
         "reorder": False,
     }
     assert schema_fields[CONF_CLIMATE_ZONES].serialize()["selector"]["entity"] == {
-        "domain": ["switch", "input_boolean"],
+        "domain": ["switch", "input_boolean", "climate"],
         "multiple": True,
         "reorder": False,
     }
@@ -1685,6 +1685,18 @@ def test_validate_config_rejects_wrong_entity_domain() -> None:
     )
 
     assert errors[CONF_AMBER_IMPORT_PRICE] == "invalid_entity_domain"
+
+
+def test_validate_config_accepts_zone_climate_entity() -> None:
+    hass = _valid_hass()
+    hass.states.entity_ids.add("climate.zone_temperature")
+
+    errors = _validate_config(
+        hass,
+        _valid_input({CONF_CLIMATE_ZONES: ["climate.zone_temperature"]}),
+    )
+
+    assert CONF_CLIMATE_ZONES not in errors
 
 
 def test_validate_config_rejects_empty_ai_service_parts() -> None:
