@@ -26,6 +26,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
     CONF_EV_SOC_PER_KWH,
     CONF_HOUSEHOLD_LOAD,
     DEFAULT_OPTIONS,
@@ -166,6 +168,35 @@ def test_config_entry_migration_removes_obsolete_target_soc_fallback() -> None:
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
     assert manager.updated_entries[-1][1]["version"] == 4
     assert manager.updated_entries[-1][1]["options"] == {CONF_EV_SOC_PER_KWH: 1.9}
+
+
+def test_config_entry_migration_requires_vehicle_target_for_configured_ev() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=3,
+        data={CONF_EV_SOC: "sensor.ev_soc"},
+        options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
+    )
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
+    assert manager.updated_entries == []
+    assert entry.version == 3
+
+
+def test_config_entry_migration_accepts_vehicle_target_from_legacy_subentry() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=3,
+        data={CONF_EV_SOC: "sensor.ev_soc"},
+        options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
+    )
+    entry.subentries["ev"].data = {
+        CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target_soc"
+    }
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
+    assert manager.updated_entries[-1][1]["version"] == 4
+    assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT not in manager.updated_entries[-1][1]["options"]
 
 
 def test_config_entry_migration_rejects_unknown_future_version() -> None:

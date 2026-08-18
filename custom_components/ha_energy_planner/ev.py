@@ -273,8 +273,8 @@ def allocate_least_cost_charging(
     A forced current slot may bypass ``earliest_start`` for immediate minimum-
     SOC recovery or opportunistic low-price charging; all later slots continue
     to honour the configured charging window. An observed continuous charging
-    session anchors the current slot without bypassing the configured start or
-    maximum import price.
+    session may also retain its current pre-window slot, but it never bypasses
+    the maximum import price.
     """
     required = max(target_soc_percent - current_soc_percent, 0.0)
     if required == 0:
@@ -296,7 +296,7 @@ def allocate_least_cost_charging(
         if earliest_start is None or slot.valid_at >= earliest_start
     ]
     current_outside_window = bool(
-        force_current
+        (force_current or continue_current)
         and current_slot is not None
         and earliest_start is not None
         and current_slot.valid_at < earliest_start

@@ -9,7 +9,8 @@
   short start/stop bursts. Configured maximum import prices remain authoritative.
 - EV planning now uses the mapped vehicle target-SOC entity as its authoritative
   target. The obsolete fallback target option and `set_ev_target_soc` service
-  are removed by config-entry migration.
+  are removed by config-entry migration. A configured legacy EV must map its
+  vehicle target before that migration can complete.
 - EV SOC gained per kWh is now calibrated automatically from completed charging
   sessions in Home Assistant Recorder. The configured estimate remains a
   conservative bootstrap value until at least one hour of clean history is

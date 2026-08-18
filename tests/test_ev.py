@@ -109,6 +109,62 @@ def test_continuous_session_does_not_bypass_price_limit() -> None:
     ]
 
 
+def test_continuous_pre_window_session_stays_anchored_after_repricing() -> None:
+    now = datetime(2026, 8, 17, 18, 35, tzinfo=UTC)
+    earliest_start = now + timedelta(minutes=5)
+    slots = [
+        DecisionSlot(now + timedelta(minutes=offset), price, 0.05, 0, 1)
+        for offset, price in [(0, 0.15), (5, 0.10), (10, 0.10)]
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=64,
+        target_soc_percent=74,
+        ready_by=now + timedelta(minutes=15),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        earliest_start=earliest_start,
+        continuous=True,
+        continue_current=True,
+        max_import_price=0.20,
+    )
+
+    assert [allocation.valid_at for allocation in schedule.allocations] == [
+        now,
+        earliest_start,
+    ]
+
+
+def test_continuous_pre_window_session_still_honors_price_limit() -> None:
+    now = datetime(2026, 8, 17, 18, 35, tzinfo=UTC)
+    earliest_start = now + timedelta(minutes=5)
+    slots = [
+        DecisionSlot(now + timedelta(minutes=offset), price, 0.05, 0, 1)
+        for offset, price in [(0, 0.50), (5, 0.10), (10, 0.10)]
+    ]
+
+    schedule = allocate_least_cost_charging(
+        slots,
+        current_soc_percent=64,
+        target_soc_percent=74,
+        ready_by=now + timedelta(minutes=15),
+        charge_rate_kw=6,
+        soc_per_kwh=10,
+        interval_minutes=5,
+        earliest_start=earliest_start,
+        continuous=True,
+        continue_current=True,
+        max_import_price=0.20,
+    )
+
+    assert [allocation.valid_at for allocation in schedule.allocations] == [
+        earliest_start,
+        now + timedelta(minutes=10),
+    ]
+
+
 def test_allocate_least_cost_charging_prefers_solar_surplus_effective_cost() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     slots = [
