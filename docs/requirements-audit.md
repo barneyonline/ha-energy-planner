@@ -158,9 +158,9 @@ Status as of 2026-08-15.
   and enabled below-threshold opportunistic charging may claim the current slot
   before the configured earliest start, while any remaining continuous window
   stays within the configured hours. Once charging feedback confirms an active
-  continuous session, replanning anchors that session to the current eligible
-  slot so forecast repricing cannot fragment it; an earliest-start boundary and
-  configured maximum import price remain authoritative. Completed Recorder
+  continuous session, replanning may retain its current pre-window slot so
+  forecast repricing cannot fragment it; the configured maximum import price
+  remains authoritative. Completed Recorder
   charging sessions of at least 30 minutes calibrate effective SOC gained per
   kWh from SOC gain, configured charger power, and active duration. At least 60
   minutes and 3% gain are required; the learned rate carries a 10% conservative

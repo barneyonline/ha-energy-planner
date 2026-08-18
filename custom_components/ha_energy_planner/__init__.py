@@ -17,6 +17,7 @@ from .const import (
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
@@ -71,9 +72,28 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
     if version < 3 and uses_legacy_ev_rate:
         options[CONF_EV_SOC_PER_KWH] = DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
     if version < 4:
+        if _legacy_ev_configuration_requires_target(entry):
+            return False
         options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
     hass.config_entries.async_update_entry(entry, data=data, options=options, version=4)
     return True
+
+
+def _legacy_ev_configuration_requires_target(entry: EnergyPlannerConfigEntry) -> bool:
+    """Return whether a configured legacy EV is missing its vehicle target entity."""
+    sections = [dict(getattr(entry, "data", {}))]
+    sections.extend(
+        dict(getattr(subentry, "data", {}))
+        for subentry in getattr(entry, "subentries", {}).values()
+    )
+    target_configured = any(section.get(CONF_EV_SMART_CHARGING_TARGET_SOC) for section in sections)
+    ev_configured = any(
+        value
+        for section in sections
+        for key, value in section.items()
+        if str(key).startswith("ev_") and key != CONF_EV_SMART_CHARGING_TARGET_SOC
+    )
+    return ev_configured and not target_configured
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
