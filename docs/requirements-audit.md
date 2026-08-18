@@ -158,7 +158,12 @@ Status as of 2026-08-15.
   explicitly forced current slot is the bounded exception: minimum-SOC recovery
   and enabled below-threshold opportunistic charging may claim the current slot
   before the configured earliest start, while any remaining continuous window
-  stays within the configured hours.
+  stays within the configured hours. Once charging feedback confirms an active
+  continuous session, replanning anchors that session to the current eligible
+  slot so forecast repricing cannot fragment it; an earliest-start boundary and
+  configured maximum import price remain authoritative. The default SOC gain
+  estimate is a conservative 2% per kWh, and config-entry migration replaces
+  only the former 5% default while preserving custom estimates.
 - Multiple EVs are supported as separate named config entries. Entry-scoped
   storage isolates plans, history, production state, pauses, and audit records;
   services require `config_entry_id` when multiple runtimes are loaded. Each
