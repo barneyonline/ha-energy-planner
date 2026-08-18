@@ -128,7 +128,9 @@ DEFAULT_OPTIONS = {
     CONF_EV_MAX_SOC_PERCENT: 90.0,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 80.0,
     CONF_EV_CHARGE_RATE_KW: 7.0,
-    CONF_EV_SOC_PER_KWH: 5.0,
+    # Approximately a 50 kWh usable EV battery. The previous 5%/kWh default
+    # materially underestimated charging time for typical battery EVs.
+    CONF_EV_SOC_PER_KWH: 2.0,
     CONF_EV_CONTINUOUS_CHARGING: True,
     CONF_EV_EARLIEST_START: "None",
     CONF_EV_PRICE_LIMIT_ENABLED: False,

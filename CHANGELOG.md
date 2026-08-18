@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- Continuous EV charging now remains committed after charging is observed, so
+  tariff forecast revisions cannot split one continuous schedule into repeated
+  short start/stop bursts. Configured maximum import prices remain authoritative.
+- The default EV SOC gain estimate is now a conservative 2% per kWh (about a
+  50 kWh usable battery), and existing entries that still use the former 5%
+  default are migrated. Custom estimates are preserved.
+
 ## 0.9.12 - 2026-08-16
 
 ### Changed

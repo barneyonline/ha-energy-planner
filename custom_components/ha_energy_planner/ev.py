@@ -359,6 +359,7 @@ def allocate_least_cost_charging(
     earliest_start: datetime | None = None,
     continuous: bool = False,
     force_current: bool = False,
+    continue_current: bool = False,
     max_import_price: float | None = None,
 ) -> EVChargeSchedule:
     """Allocate EV charging to cheapest feasible slots before ready-by.
@@ -367,7 +368,9 @@ def allocate_least_cost_charging(
     price, and any remaining charge power is valued at the grid import price.
     A forced current slot may bypass ``earliest_start`` for immediate minimum-
     SOC recovery or opportunistic low-price charging; all later slots continue
-    to honour the configured charging window.
+    to honour the configured charging window. An observed continuous charging
+    session anchors the current slot without bypassing the configured start or
+    maximum import price.
     """
     required = max(target_soc_percent - current_soc_percent, 0.0)
     if required == 0:
@@ -406,6 +409,14 @@ def allocate_least_cost_charging(
         or float(slot.import_price) <= max_import_price
         or (force_current and slot is current_slot)
     ]
+    anchor_current = bool(
+        force_current
+        or (
+            continue_current
+            and current_slot is not None
+            and current_slot in price_eligible
+        )
+    )
     ranked = _rank_charging_slots(price_eligible, charge_rate_kw, carbon_weight)
     if continuous:
         required_slots = ceil(required / soc_per_slot)
@@ -428,7 +439,7 @@ def allocate_least_cost_charging(
                 ranked,
                 required_slots=required_slots,
                 interval_minutes=interval_minutes,
-                force_current=force_current,
+                force_current=anchor_current,
             )
     elif force_current and current_slot in ranked:
         ordered = [current_slot, *(slot for slot in ranked if slot is not current_slot)]

@@ -670,7 +670,7 @@ def _option_selector(field: str) -> Any:
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
-    VERSION = 2
+    VERSION = 3
 
     async def async_step_user(
         self,

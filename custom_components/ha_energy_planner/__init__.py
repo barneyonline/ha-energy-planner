@@ -17,6 +17,7 @@ from .const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
     CONF_INSTANCE_NAME,
@@ -47,18 +48,30 @@ if TYPE_CHECKING:
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _DUPLICATE_ENTITY_ID_MIGRATIONS = {"switch.ai_ai_enabled": "switch.ai_enabled"}
+_LEGACY_DEFAULT_EV_SOC_PER_KWH = 5.0
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Migrate measured-load configuration without trusting forecast entities."""
-    if getattr(entry, "version", 1) > 2:
+    version = getattr(entry, "version", 1)
+    if version > 3:
         return False
     data = dict(entry.data)
     if not data.get(CONF_HOUSEHOLD_LOAD) and data.get(CONF_BASELINE_LOAD_OBSERVED):
         data[CONF_HOUSEHOLD_LOAD] = data[CONF_BASELINE_LOAD_OBSERVED]
     data.pop(CONF_BASELINE_LOAD_FORECAST, None)
     data.pop(CONF_BASELINE_LOAD_OBSERVED, None)
-    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    options = dict(entry.options)
+    try:
+        uses_legacy_ev_rate = (
+            float(options.get(CONF_EV_SOC_PER_KWH, _LEGACY_DEFAULT_EV_SOC_PER_KWH))
+            == _LEGACY_DEFAULT_EV_SOC_PER_KWH
+        )
+    except (TypeError, ValueError):
+        uses_legacy_ev_rate = False
+    if version < 3 and uses_legacy_ev_rate:
+        options[CONF_EV_SOC_PER_KWH] = DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=3)
     return True
 
 

@@ -408,6 +408,41 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert timeline[0]["end"] == "2026-06-27T00:10:00+00:00"
 
 
+def test_active_plan_keeps_observed_continuous_ev_session_running() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "00:15",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+        "ev_fallback_target_soc_percent": 74,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 64
+    context.ev_charging = True
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset, price in [(0, 0.50), (5, 0.10), (10, 0.10)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["continued_active_session"] is True
+    assert action.desired_state["charging_reason"] == "ev_continuous_charging_in_progress"
+    assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0]
+
+
 def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
     context = _context()

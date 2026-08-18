@@ -318,6 +318,8 @@ class DryRunPlanner:
                 available_charge_hours=available_charge_hours,
                 charge_rate_percent_per_hour=charge_rate_kw * soc_per_kwh,
             )
+            continuous_charging = bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True))
+            continue_current_charging = continuous_charging and context.ev_charging is True
             schedule = allocate_least_cost_charging(
                 context.slots,
                 current_soc_percent=context.current_ev_soc_percent,
@@ -328,8 +330,9 @@ class DryRunPlanner:
                 interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
                 carbon_weight=_carbon_schedule_weight(self.options),
                 earliest_start=earliest_start,
-                continuous=bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True)),
+                continuous=continuous_charging,
                 force_current=emergency_charge or low_price_charge,
+                continue_current=continue_current_charging,
                 max_import_price=max_import_price,
             )
             allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
@@ -360,6 +363,8 @@ class DryRunPlanner:
                 charging_reason = "ev_keep_charger_on_for_preconditioning"
             elif emergency_charge and target.required_charge_percent > 0:
                 charging_reason = "ev_below_minimum_soc_charge_now"
+            elif continue_current_charging and charging_required_now:
+                charging_reason = "ev_continuous_charging_in_progress"
             elif low_price_charge and charging_required_now:
                 charging_reason = "ev_low_price_charge_now"
             elif charging_required_now:
@@ -397,7 +402,10 @@ class DryRunPlanner:
                         "configured_target_soc_percent": target_soc,
                         "required_charge_percent": target.required_charge_percent,
                         "max_attainable_soc_percent": target.max_attainable_soc_percent,
-                        "continuous_charging": bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True)),
+                        "continuous_charging": continuous_charging,
+                        "continued_active_session": bool(
+                            continue_current_charging and charging_required_now
+                        ),
                         "keep_charger_on": preconditioning_required_now,
                         "projected_load_kw_now": projected_load_kw_now,
                         "price_limit": float(self.options[CONF_EV_MAX_IMPORT_PRICE])
