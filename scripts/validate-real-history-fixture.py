@@ -14,10 +14,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from custom_components.ha_energy_planner.ev import (  # noqa: E402
-    import_trip_history_from_state_sequences,
-    summarize_stored_trip_history,
-)
+from custom_components.ha_energy_planner.ev import build_ev_charge_calibration  # noqa: E402
 from custom_components.ha_energy_planner.forecast_accuracy import (  # noqa: E402
     accuracy_threshold_errors,
     summarize_forecast_accuracy,
@@ -32,12 +29,12 @@ from custom_components.ha_energy_planner.thermal_model import (  # noqa: E402
 )
 
 REAL_HISTORY_PROFILE_REQUIREMENTS = {
-    "real_mini_trip_history": {"kind": "ev_trip_history"},
+    "real_ev_charge_calibration": {"kind": "ev_charge_calibration"},
     "real_daikin_thermal_history": {"kind": "thermal_history"},
     "real_pv_forecast_accuracy": {"kind": "forecast_accuracy"},
 }
 REAL_HISTORY_PROFILE_ENTITY_KEYS = {
-    "real_mini_trip_history": ("ev_connected", "ev_soc"),
+    "real_ev_charge_calibration": ("ev_charging", "ev_soc"),
     "real_daikin_thermal_history": ("indoor_temperature", "hvac_power"),
     "real_pv_forecast_accuracy": ("forecast", "actual"),
 }
@@ -56,7 +53,8 @@ class FixtureState:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Validate trip, thermal, and rolling-origin forecast-accuracy fixtures exported from Recorder history."
+            "Validate EV charge calibration, thermal, and rolling-origin "
+            "forecast-accuracy fixtures exported from Recorder history."
         )
     )
     parser.add_argument(
@@ -91,8 +89,8 @@ def main() -> int:
 
 def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     kind = fixture.get("kind")
-    if kind == "ev_trip_history":
-        return _validate_ev_trip_history_fixture(fixture)
+    if kind == "ev_charge_calibration":
+        return _validate_ev_charge_calibration_fixture(fixture)
     if kind == "thermal_history":
         return _validate_thermal_history_fixture(fixture)
     if kind == "forecast_accuracy":
@@ -131,35 +129,36 @@ def _profile_errors(profile: str, fixtures: list[dict[str, Any]]) -> dict[str, A
     return errors
 
 
-def _validate_ev_trip_history_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
+def _validate_ev_charge_calibration_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     sources = dict(fixture.get("source_entity_ids", {}))
-    connected_key = str(fixture.get("connected_key", "ev_connected"))
+    charging_key = str(fixture.get("charging_key", "ev_charging"))
     soc_key = str(fixture.get("soc_key", "ev_soc"))
-    connected_states = _states_for_key(fixture, connected_key)
+    charging_states = _states_for_key(fixture, charging_key)
     soc_states = _states_for_key(fixture, soc_key)
-    imported_at = _parse_datetime(str(fixture.get("exported_at") or fixture.get("end")))
-    history, _changed = import_trip_history_from_state_sequences(
-        {},
-        connected_states=connected_states,
-        soc_states=soc_states,
-        imported_at=imported_at,
+    trained_at = _parse_datetime(str(fixture.get("exported_at") or fixture.get("end")))
+    calibration = build_ev_charge_calibration(
+        charging_states,
+        soc_states,
+        charge_rate_kw=float(fixture.get("charge_rate_kw", 7.0)),
+        trained_at=trained_at,
+        charging_entity_id=str(sources.get(charging_key, "fixture.ev_charging")),
+        soc_entity_id=str(sources.get(soc_key, "fixture.ev_soc")),
     )
-    records = list(history.get("records", []))
-    min_records = int(fixture.get("expected_min_records", 1))
-    if len(records) < min_records:
+    min_samples = int(fixture.get("expected_min_samples", 1))
+    if int(calibration.get("sample_count", 0)) < min_samples:
         raise ValueError(
-            f"{fixture.get('name', 'ev_trip_history')} produced {len(records)} trip records, "
-            f"expected at least {min_records}"
+            f"{fixture.get('name', 'ev_charge_calibration')} produced "
+            f"{calibration.get('sample_count', 0)} calibration samples, expected at least {min_samples}"
         )
-    summary = summarize_stored_trip_history(history)
+    if calibration.get("status") != "ready":
+        raise ValueError(f"{fixture.get('name', 'ev_charge_calibration')} did not produce a ready model")
     return {
-        "kind": "ev_trip_history",
+        "kind": "ev_charge_calibration",
         "name": fixture.get("name"),
         "source_entities": sorted(sources),
-        "record_count": len(records),
-        "observed_days": summary.observed_days,
-        "max_daily_soc_percent": summary.max_daily_soc_percent,
-        "history_sufficient": summary.history_sufficient,
+        "sample_count": calibration["sample_count"],
+        "soc_per_kwh": calibration["soc_per_kwh"],
+        "status": calibration["status"],
     }
 
 

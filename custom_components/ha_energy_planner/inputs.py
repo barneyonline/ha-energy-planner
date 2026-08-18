@@ -29,7 +29,6 @@ from .const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
@@ -48,7 +47,7 @@ from .const import (
     DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import ev_charging_state, summarize_stored_trip_history
+from .ev import ev_charging_state
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     forecast_coverage_details,
@@ -110,7 +109,6 @@ class InputManager:
         hass: HomeAssistant,
         entry_data: Mapping[str, Any],
         options: Mapping[str, Any],
-        trip_history: Mapping[str, Any] | None = None,
         forecast_calibration: Mapping[str, Any] | None = None,
         load_forecast_model: Mapping[str, Any] | None = None,
         load_forecast_update_reason: str | None = None,
@@ -119,7 +117,6 @@ class InputManager:
         self.hass = hass
         self.entry_data = entry_data
         self.options = options
-        self.trip_history = dict(trip_history or {})
         self.forecast_calibration = dict(forecast_calibration or {})
         self.load_forecast_model = dict(load_forecast_model or {})
         self.load_forecast_update_reason = load_forecast_update_reason
@@ -203,22 +200,10 @@ class InputManager:
             ev_connected = None
             ev_connected_issue = None
         ev_charging, ev_charging_issue = self._optional_bool_state(CONF_EV_CHARGING)
-        ev_target_soc_fallback_active = False
         if self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC):
             ev_target_soc, ev_target_soc_issue = self._optional_soc_state(CONF_EV_SMART_CHARGING_TARGET_SOC)
-            if ev_target_soc is None:
-                ev_target_soc_fallback_active = True
-                native_target_soc = _finite_float_or_none(
-                    self.options.get(CONF_EV_FALLBACK_TARGET_SOC_PERCENT)
-                )
-                if native_target_soc is not None:
-                    ev_target_soc = native_target_soc
-                    if ev_target_soc_issue:
-                        ev_target_soc_issue = (
-                            f"advisory_{ev_target_soc_issue}_using_native_fallback"
-                        )
         else:
-            ev_target_soc = _finite_float_or_none(self.options.get(CONF_EV_FALLBACK_TARGET_SOC_PERCENT))
+            ev_target_soc = None
             ev_target_soc_issue = None
         if self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
             ev_ready_by, ev_ready_by_issue = self._optional_ready_by_state(CONF_EV_SMART_CHARGING_READY_BY)
@@ -287,8 +272,6 @@ class InputManager:
         occupancy_state = self._occupancy_state()
         if occupancy_state == OccupancyState.UNKNOWN:
             issues.append("occupancy_unknown")
-        ev_trip_summary = summarize_stored_trip_history(self.trip_history)
-
         input_health = self._health_from_issues(issues)
         forecast_confidence = _combined_confidence(self._forecast_confidence_scores)
         forecast_confidence_by_source = {
@@ -328,12 +311,7 @@ class InputManager:
             ev_connected=ev_connected,
             ev_charging=ev_charging,
             ev_target_soc_percent=ev_target_soc,
-            ev_target_soc_fallback_active=ev_target_soc_fallback_active,
             ev_ready_by=ev_ready_by,
-            ev_trip_observed_days=ev_trip_summary.observed_days,
-            ev_trip_max_daily_soc_percent=ev_trip_summary.max_daily_soc_percent,
-            ev_trip_average_daily_soc_percent=ev_trip_summary.average_daily_soc_percent,
-            ev_trip_history_sufficient=ev_trip_summary.history_sufficient,
             occupied_temperature_low_c=comfort_low,
             occupied_temperature_high_c=comfort_high,
             active_overrides=overrides or [],

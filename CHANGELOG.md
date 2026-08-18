@@ -7,9 +7,13 @@
 - Continuous EV charging now remains committed after charging is observed, so
   tariff forecast revisions cannot split one continuous schedule into repeated
   short start/stop bursts. Configured maximum import prices remain authoritative.
-- The default EV SOC gain estimate is now a conservative 2% per kWh (about a
-  50 kWh usable battery), and existing entries that still use the former 5%
-  default are migrated. Custom estimates are preserved.
+- EV planning now uses the mapped vehicle target-SOC entity as its authoritative
+  target. The obsolete fallback target option and `set_ev_target_soc` service
+  are removed by config-entry migration.
+- EV SOC gained per kWh is now calibrated automatically from completed charging
+  sessions in Home Assistant Recorder. The configured estimate remains a
+  conservative bootstrap value until at least one hour of clean history is
+  available, and learned rates include a 10% readiness margin.
 
 ## 0.9.12 - 2026-08-16
 

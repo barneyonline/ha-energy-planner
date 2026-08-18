@@ -1070,15 +1070,13 @@ def _timeline_state_label(state: dict[str, Any]) -> str:
 
 
 def _ev_plan_attrs(plan: EnergyPlan | None, store_data: dict[str, Any]) -> dict[str, Any]:
-    """Return EV plan details plus compact trip-history context."""
+    """Return EV plan details plus compact charging-calibration context."""
     attrs = _asset_plan_attrs(plan, ActionAsset.EV)
-    trip_history = dict(store_data.get("trip_history", {}))
-    records = trip_history.get("records")
-    if isinstance(records, list):
-        attrs["trip_history_record_count"] = len(records)
-    summary = trip_history.get("summary")
-    if isinstance(summary, dict):
-        attrs["trip_history_summary"] = _bounded_json(summary)
+    calibration = dict(store_data.get("ev_charge_calibration", {}))
+    if calibration:
+        attrs["charge_calibration"] = _bounded_json(
+            {key: value for key, value in calibration.items() if key != "samples"}
+        )
     return attrs
 
 

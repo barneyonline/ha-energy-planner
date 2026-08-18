@@ -118,7 +118,11 @@ def test_diagnostics_redacts_prompts_addresses_and_raw_model_payloads() -> None:
                 {
                     "discovery": {"raw_prompt": "full prompt"},
                     "outcomes": [{"raw_response": {"text": "model output"}}],
-                    "trip_history": {"location_history": ["home", "work"], "records": [{"distance": 1}]},
+                    "ev_charge_calibration": {
+                        "status": "ready",
+                        "soc_per_kwh": 1.8,
+                        "samples": [{"soc_gain_percent": 14}],
+                    },
                 }
             ),
         ),
@@ -131,8 +135,9 @@ def test_diagnostics_redacts_prompts_addresses_and_raw_model_payloads() -> None:
     assert diagnostics["entry"]["options"]["access_token"] == "**REDACTED**"
     assert diagnostics["store"]["discovery"]["raw_prompt"] == "**REDACTED**"
     assert diagnostics["recent_outcomes"][0]["raw_response"] == "**REDACTED**"
-    assert diagnostics["store"]["trip_history"]["location_history"] == "**REDACTED**"
-    assert diagnostics["store"]["trip_history"]["record_count"] == 1
+    assert diagnostics["store"]["ev_charge_calibration"]["status"] == "ready"
+    assert diagnostics["store"]["ev_charge_calibration"]["soc_per_kwh"] == 1.8
+    assert "samples" not in diagnostics["store"]["ev_charge_calibration"]
 
 
 def test_diagnostics_exposes_compact_operational_metadata() -> None:

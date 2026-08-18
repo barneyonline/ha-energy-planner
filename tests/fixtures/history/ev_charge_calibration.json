@@ -1,0 +1,45 @@
+{
+  "charge_rate_kw": 7.0,
+  "charging_key": "ev_charging",
+  "end": "2026-06-27T10:00:00+00:00",
+  "expected_min_samples": 1,
+  "exported_at": "2026-06-27T10:00:00+00:00",
+  "kind": "ev_charge_calibration",
+  "name": "ev_charge_calibration_replay",
+  "soc_key": "ev_soc",
+  "source_entity_ids": {
+    "ev_charging": "sensor.charger_connector_status",
+    "ev_soc": "sensor.vehicle_soc"
+  },
+  "start": "2026-06-27T08:00:00+00:00",
+  "states": {
+    "ev_charging": [
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T08:00:00+00:00",
+        "last_updated": "2026-06-27T08:00:00+00:00",
+        "state": "charging"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T09:00:00+00:00",
+        "last_updated": "2026-06-27T09:00:00+00:00",
+        "state": "idle"
+      }
+    ],
+    "ev_soc": [
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T08:00:00+00:00",
+        "last_updated": "2026-06-27T08:00:00+00:00",
+        "state": "50 %"
+      },
+      {
+        "attributes": {},
+        "last_changed": "2026-06-27T09:00:00+00:00",
+        "last_updated": "2026-06-27T09:00:00+00:00",
+        "state": "64 %"
+      }
+    ]
+  }
+}
