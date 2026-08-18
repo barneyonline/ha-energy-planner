@@ -1241,7 +1241,10 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
         confidence=0.8,
     )
     plan = _plan(actions=[climate_action, ev_action])
-    coordinator = _coordinator(plan, store_data={"trip_history": {"records": [{"soc": 10}, {"soc": 20}]}})
+    coordinator = _coordinator(
+        plan,
+        store_data={"ev_charge_calibration": {"status": "ready", "soc_per_kwh": 1.8}},
+    )
 
     climate = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_plan")
     ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
@@ -1253,7 +1256,7 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
     assert climate_attrs["planned_actions"][0]["desired_state"]["Target temperature C"] == 22
     assert ev.value_fn(coordinator) == "Schedule EV charging"
     ev_attrs = ev.attrs_fn(coordinator)
-    assert ev_attrs["trip_history_record_count"] == 2
+    assert ev_attrs["charge_calibration"] == {"status": "ready", "soc_per_kwh": 1.8}
     assert ev_attrs["planned_actions"][0]["desired_state"]["Charging windows"] == 20
 
 
@@ -1538,14 +1541,20 @@ def test_ev_charge_state_sensors_handle_live_and_plan_fallbacks() -> None:
     assert next_charge.value_fn(_coordinator(plan)) == "Charging"
 
 
-def test_ev_plan_attributes_include_trip_history_summary() -> None:
+def test_ev_plan_attributes_exclude_raw_charge_calibration_samples() -> None:
     coordinator = _coordinator(
         _plan(),
-        store_data={"trip_history": {"summary": {"observed_days": 3, "daily_soc": [10, 20]}}},
+        store_data={
+            "ev_charge_calibration": {
+                "status": "ready",
+                "soc_per_kwh": 1.8,
+                "samples": [{"soc_gain_percent": 14}],
+            }
+        },
     )
     ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
 
-    assert ev.attrs_fn(coordinator)["trip_history_summary"] == {"observed_days": 3, "daily_soc": [10, 20]}
+    assert ev.attrs_fn(coordinator)["charge_calibration"] == {"status": "ready", "soc_per_kwh": 1.8}
 
 
 def test_presence_sensor_exposes_inferred_occupancy_context() -> None:

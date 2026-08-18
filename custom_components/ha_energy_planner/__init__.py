@@ -13,10 +13,10 @@ from .const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
-    ATTR_TARGET_SOC,
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
@@ -38,7 +38,6 @@ from .const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
-    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .type_defs import EnergyPlannerConfigEntry
@@ -54,7 +53,7 @@ _LEGACY_DEFAULT_EV_SOC_PER_KWH = 5.0
 async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Migrate measured-load configuration without trusting forecast entities."""
     version = getattr(entry, "version", 1)
-    if version > 3:
+    if version > 4:
         return False
     data = dict(entry.data)
     if not data.get(CONF_HOUSEHOLD_LOAD) and data.get(CONF_BASELINE_LOAD_OBSERVED):
@@ -71,7 +70,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
         uses_legacy_ev_rate = False
     if version < 3 and uses_legacy_ev_rate:
         options[CONF_EV_SOC_PER_KWH] = DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
-    hass.config_entries.async_update_entry(entry, data=data, options=options, version=3)
+    if version < 4:
+        options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=4)
     return True
 
 
@@ -142,11 +143,6 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         ready_by = str(call.data[ATTR_READY_BY])
         coordinator = await _require_coordinator(call)
         await coordinator.async_set_ready_by(ready_by)
-
-    async def handle_target_soc(call: ServiceCall) -> None:
-        target_soc = float(call.data[ATTR_TARGET_SOC])
-        coordinator = await _require_coordinator(call)
-        await coordinator.async_set_ev_target_soc(target_soc)
 
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
@@ -223,20 +219,6 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             {
                 **_config_entry_field(),
                 vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time),
-            }
-        ),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_EV_TARGET_SOC,
-        handle_target_soc,
-        schema=vol.Schema(
-            {
-                **_config_entry_field(),
-                vol.Required(ATTR_TARGET_SOC): vol.All(
-                    vol.Coerce(float),
-                    vol.Range(min=0, max=100),
-                )
             }
         ),
     )

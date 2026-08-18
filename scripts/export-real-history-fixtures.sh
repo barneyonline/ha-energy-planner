@@ -28,8 +28,9 @@ done
 required_vars=(
   HOME_ASSISTANT_URL
   HOME_ASSISTANT_TOKEN
-  HEP_EV_CONNECTED_ENTITY
+  HEP_EV_CHARGING_ENTITY
   HEP_EV_SOC_ENTITY
+  HEP_EV_CHARGE_RATE_KW
   HEP_THERMAL_INDOOR_ENTITY
   HEP_DAIKIN_POWER_ENTITY
   HEP_PV_FORECAST_ENTITY
@@ -71,13 +72,14 @@ run() {
 mkdir -p "$OUT_DIR"
 
 run python3 scripts/export-real-history-fixture.py \
-  --out "$OUT_DIR/real_mini_trip_history.json" \
+  --out "$OUT_DIR/real_ev_charge_calibration.json" \
   --validate \
   "${redact_args[@]}" \
-  ev-trip-history \
-  --name real_mini_trip_history \
-  --connected-entity "$HEP_EV_CONNECTED_ENTITY" \
-  --soc-entity "$HEP_EV_SOC_ENTITY"
+  ev-charge-calibration \
+  --name real_ev_charge_calibration \
+  --charging-entity "$HEP_EV_CHARGING_ENTITY" \
+  --soc-entity "$HEP_EV_SOC_ENTITY" \
+  --charge-rate-kw "$HEP_EV_CHARGE_RATE_KW"
 
 thermal_args=(
   --out "$OUT_DIR/real_daikin_thermal_history.json"

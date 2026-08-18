@@ -54,6 +54,7 @@ def _context(health: InputHealth = InputHealth.HEALTHY) -> DecisionContext:
         ],
         current_battery_soc_percent=50,
         current_ev_soc_percent=60,
+        ev_target_soc_percent=80,
         occupancy_state=OccupancyState.OCCUPIED,
         input_health=health,
     )
@@ -238,11 +239,11 @@ def test_estimated_cost_includes_projected_flexible_load() -> None:
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -375,6 +376,7 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 70}
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -391,7 +393,6 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
         "default_ready_by": "00:20",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     plan = DryRunPlanner(options).create_plan(context)
@@ -416,12 +417,12 @@ def test_active_plan_keeps_observed_continuous_ev_session_running() -> None:
         "default_ready_by": "00:15",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 74,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.created_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
     context.current_ev_soc_percent = 64
+    context.ev_target_soc_percent = 74
     context.ev_charging = True
     context.slots = [
         DecisionSlot(
@@ -487,6 +488,7 @@ def test_keep_charger_on_policy_does_not_change_confirmation_for_normal_charging
     }
     context = _context()
     context.current_ev_soc_percent = 40
+    context.ev_target_soc_percent = 45
     context.ev_connected = True
 
     action = next(
@@ -517,29 +519,8 @@ def test_keep_charger_on_never_bypasses_external_target_policy_bounds() -> None:
 
     assert action.desired_state["charging_required_now"] is False
     assert action.desired_state["keep_charger_on"] is False
-    assert action.desired_state["configured_target_soc_percent"] == 100
-
-
-def test_keep_charger_on_is_suppressed_during_external_target_fallback() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "ev_keep_charger_on": True,
-    }
-    context = _context()
-    context.current_ev_soc_percent = 80
-    context.ev_connected = True
-    context.ev_target_soc_percent = 80
-    context.ev_target_soc_fallback_active = True
-
-    action = next(
-        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
-    )
-
-    assert action.desired_state["charging_required_now"] is False
-    assert action.desired_state["keep_charger_on"] is False
-    assert action.desired_state["configured_target_soc_percent"] == 80
+    assert action.desired_state["target_soc_percent"] == 90
+    assert action.desired_state["vehicle_target_soc_percent"] == 100
 
 
 def test_keep_charger_on_uses_bounded_target_when_current_soc_is_higher() -> None:
@@ -569,7 +550,6 @@ def test_native_ev_low_price_charging_starts_current_interval() -> None:
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
-        "ev_fallback_target_soc_percent": 80,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0,
         "ev_continuous_charging": False,
@@ -592,7 +572,6 @@ def test_native_ev_low_price_charging_bypasses_earliest_start() -> None:
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
-        "ev_fallback_target_soc_percent": 80,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0.05,
         "ev_earliest_start": "23:00",
@@ -729,11 +708,11 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
         "default_ready_by": "00:15",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 45,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 40
+    context.ev_target_soc_percent = 45
     context.current_hvac_temperature_c = None
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
@@ -756,7 +735,7 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
     allocation = plan.actions[0].desired_state["allocated_slots"][0]
     assert plan.actions[0].reason_codes == [
         "ev_outside_allocated_charging_window",
-        "fallback_until_history_sufficient",
+        "vehicle_target_soc",
         "continuous_charging_window_before_ready_by",
     ]
     assert allocation["valid_at"] == "2026-06-27T00:05:00+00:00"
@@ -909,12 +888,12 @@ def test_ev_schedule_preserves_absolute_ready_by_timestamp() -> None:
         "planner_enabled": True,
         "dry_run": True,
         "default_ready_by": "07:00",
-        "ev_fallback_target_soc_percent": 70,
     }
     context = _context()
     context.created_at = datetime(2026, 7, 11, 20, 30, tzinfo=UTC)
     context.local_timezone = "Australia/Melbourne"
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),
@@ -1089,11 +1068,11 @@ def test_active_plan_uses_runtime_ready_by_option_for_ev_schedule() -> None:
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -1120,7 +1099,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
         "dry_run": True,
         "ev_min_soc_percent": 40,
         "ev_max_soc_percent": 90,
-        "ev_fallback_target_soc_percent": 70,
         "default_ready_by": "07:00",
         "ev_charge_rate_kw": 7,
         "ev_soc_per_kwh": 5,
@@ -1132,8 +1110,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
     context.ev_connected = True
     context.ev_target_soc_percent = 80
     context.ev_ready_by = "08:00"
-    context.ev_trip_history_sufficient = True
-    context.ev_trip_max_daily_soc_percent = 5
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),
@@ -1150,7 +1126,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
     assert plan.mode == PlannerMode.DRY_RUN
     assert plan.actions[0].asset == ActionAsset.EV
     assert plan.actions[0].desired_state["target_soc_percent"] == 80
-    assert plan.actions[0].desired_state["configured_target_soc_percent"] == 80
     assert plan.actions[0].desired_state["ready_by"] == "08:00"
     assert plan.actions[0].desired_state["required_charge_percent"] == 8
     assert any(entry["state"] == "charging" for entry in plan.device_plans["ev"]["timeline"])
@@ -1167,14 +1142,13 @@ def test_active_plan_does_not_schedule_ev_when_disconnected() -> None:
     assert plan.actions == []
 
 
-def test_active_plan_uses_trip_history_for_ev_target() -> None:
+def test_active_plan_uses_vehicle_target_without_deriving_a_trip_target() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
         "ev_max_soc_percent": 90,
-        "ev_fallback_target_soc_percent": 80,
         "default_ready_by": "03:00",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -1182,6 +1156,7 @@ def test_active_plan_uses_trip_history_for_ev_target() -> None:
     }
     context = _context()
     context.current_ev_soc_percent = 50
+    context.ev_target_soc_percent = 65
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -1193,17 +1168,58 @@ def test_active_plan_uses_trip_history_for_ev_target() -> None:
         )
         for offset in range(0, 3 * 60, 5)
     ]
-    context.ev_trip_observed_days = 3
-    context.ev_trip_max_daily_soc_percent = 15
-    context.ev_trip_average_daily_soc_percent = 10
-    context.ev_trip_history_sufficient = True
-
     plan = DryRunPlanner(options).create_plan(context)
 
     assert plan.actions[0].asset == ActionAsset.EV
-    assert plan.actions[0].desired_state["target_soc_percent"] == 55.0
-    assert plan.actions[0].desired_state["trip_history_sufficient"] is True
-    assert "history_max_daily_consumption" in plan.actions[0].reason_codes
+    assert plan.actions[0].desired_state["target_soc_percent"] == 65.0
+    assert plan.actions[0].desired_state["target_soc_source"] == "vehicle_sensor"
+    assert "vehicle_target_soc" in plan.actions[0].reason_codes
+
+
+def test_active_plan_uses_recorder_calibrated_soc_per_kwh() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "03:00",
+        "ev_charge_rate_kw": 7,
+        "ev_soc_per_kwh": 5,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 74
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.20,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset in range(0, 3 * 60, 5)
+    ]
+    calibration = {
+        "model_version": 1,
+        "status": "ready",
+        "soc_per_kwh": 1.8,
+        "sample_count": 3,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(
+            options,
+            ev_charge_calibration=calibration,
+        ).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["soc_per_kwh"] == 1.8
+    assert action.desired_state["soc_per_kwh_source"] == "recorder_charging_history"
+    assert action.desired_state["charge_calibration_sample_count"] == 3
+    assert len(action.desired_state["allocated_slots"]) == 14
 
 
 def test_active_plan_sets_enphase_arbitrage_profile_when_forecast_solar_export_value_exceeds_threshold() -> None:

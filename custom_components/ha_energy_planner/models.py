@@ -129,12 +129,7 @@ class DecisionContext:
     ev_connected: bool | None = None
     ev_charging: bool | None = None
     ev_target_soc_percent: float | None = None
-    ev_target_soc_fallback_active: bool = False
     ev_ready_by: str | None = None
-    ev_trip_observed_days: int = 0
-    ev_trip_max_daily_soc_percent: float = 0.0
-    ev_trip_average_daily_soc_percent: float = 0.0
-    ev_trip_history_sufficient: bool = False
     occupied_temperature_low_c: float | None = None
     occupied_temperature_high_c: float | None = None
     active_overrides: list[Override] = field(default_factory=list)

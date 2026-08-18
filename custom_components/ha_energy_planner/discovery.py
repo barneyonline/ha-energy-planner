@@ -134,10 +134,18 @@ class CapabilityDiscovery:
             ),
         }
         details["controller"] = "ha_energy_planner"
-        for key in (CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_EV_SMART_CHARGING_READY_BY):
-            entity_id = self.entry_data.get(key)
-            if entity_id:
-                details[key] = {"entity_id": entity_id, "available": not _state_missing(self.hass, entity_id)}
+        target_soc_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
+        if target_soc_entity:
+            details[CONF_EV_SMART_CHARGING_TARGET_SOC] = {
+                "entity_id": target_soc_entity,
+                "available": not _state_missing(self.hass, target_soc_entity),
+            }
+        ready_by_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
+        if ready_by_entity:
+            details[CONF_EV_SMART_CHARGING_READY_BY] = {
+                "entity_id": ready_by_entity,
+                "available": not _state_missing(self.hass, ready_by_entity),
+            }
         return CapabilityEvidence(not issues, issues, details)
 
     def _inspect_hvac(self) -> CapabilityEvidence:

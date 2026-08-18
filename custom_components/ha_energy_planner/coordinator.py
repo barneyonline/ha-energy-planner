@@ -41,10 +41,10 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
+    CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
@@ -68,7 +68,6 @@ from .const import (
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
-from .ev import update_trip_history_from_values
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
@@ -91,8 +90,8 @@ from .preflight import (
     production_evidence_fingerprint,
 )
 from .recorder_import import (
-    async_import_ev_trip_history_from_recorder,
     async_update_builtin_load_forecast,
+    async_update_ev_charge_calibration,
     load_forecast_source_available,
 )
 from .safety import (
@@ -479,8 +478,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("climate_zone_changed"))
                 return
-            if _is_ev_history_state_change(entry_data, event):
-                self.hass.async_create_task(self._async_record_ev_trip_event())
             if not _is_material_state_change(event, self.options):
                 return
             self._schedule_debounced_refresh("state_change")
@@ -742,15 +739,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.entry_data = entry_data
         discovery = CapabilityDiscovery(self.hass, entry_data).inspect()
         await self.store.async_save_discovery(discovery.as_dict())
-        trip_history = dict(self.store.data.get("trip_history", {}))
-        trip_history, trip_import_changed, trip_import_reason = await async_import_ev_trip_history_from_recorder(
-            self.hass,
-            entry_data,
-            trip_history,
-            now=dt_util.utcnow(),
+        ev_charge_calibration = dict(self.store.data.get("ev_charge_calibration", {}))
+        ev_charge_calibration, ev_calibration_changed, ev_calibration_reason = (
+            await async_update_ev_charge_calibration(
+                self.hass,
+                entry_data,
+                ev_charge_calibration,
+                charge_rate_kw=float(options[CONF_EV_CHARGE_RATE_KW]),
+                now=dt_util.utcnow(),
+            )
         )
-        if trip_import_changed:
-            await self.store.async_save_trip_history(trip_history)
+        if ev_calibration_changed:
+            await self.store.async_save_ev_charge_calibration(ev_charge_calibration)
         load_forecast_model = dict(self.store.data.get("built_in_load_forecast", {}))
         load_forecast_model, load_forecast_changed, load_forecast_reason = await async_update_builtin_load_forecast(
             self.hass,
@@ -774,7 +774,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass,
             entry_data,
             options,
-            trip_history=trip_history,
             forecast_calibration=dict(self.store.data.get("forecast_calibration", {})),
             load_forecast_model=load_forecast_model,
             load_forecast_update_reason=load_forecast_reason,
@@ -804,7 +803,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if thermal_model_changed:
             await self.store.async_save_thermal_model(thermal_model)
         preparation_ms = round((perf_counter() - preparation_started) * 1000, 3)
-        planner = DryRunPlanner(options, thermal_model=thermal_model)
+        planner = DryRunPlanner(
+            options,
+            thermal_model=thermal_model,
+            ev_charge_calibration=ev_charge_calibration,
+        )
         planner_started = perf_counter()
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)
         planner_ms = (perf_counter() - planner_started) * 1000
@@ -826,9 +829,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "slot_count": len(context.slots),
                 "actions": _snapshot_actions(plan),
                 "preview": plan.preview[:12],
-                "trip_history": {
-                    "recorder_import_reason": trip_import_reason,
-                    "record_count": len(trip_history.get("records", [])),
+                "ev_charge_calibration": {
+                    "update_reason": ev_calibration_reason,
+                    "status": ev_charge_calibration.get("status"),
+                    "sample_count": ev_charge_calibration.get("sample_count", 0),
+                    "soc_per_kwh": ev_charge_calibration.get("soc_per_kwh"),
                 },
                 "thermal_model": thermal_model_summary(thermal_model),
                 "forecast_training_slots": manager.forecast_training_slots,
@@ -1509,17 +1514,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("ready_by_changed")
         await self.async_request_refresh()
 
-    async def async_set_ev_target_soc(self, target_soc: float) -> None:
-        """Persist the native EV target SOC setting and replan."""
-        options = self.options
-        options[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = float(target_soc)
-        config_entries = getattr(self.hass, "config_entries", None)
-        update_entry = getattr(config_entries, "async_update_entry", None)
-        if callable(update_entry):
-            update_entry(self.entry, options=options)
-        self._mark_forced_refresh("ev_target_soc_changed")
-        await self.async_request_refresh()
-
     async def async_set_ev_low_price_threshold(self, threshold: float) -> None:
         """Persist the opportunistic charging price threshold and replan."""
         options = self.options
@@ -1712,20 +1706,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES]),
             reason,
         )
-
-    async def _async_record_ev_trip_event(self) -> None:
-        """Record compact EV trip history from current connection/SOC states."""
-        entry_data = self.entry_data
-        connected = _bool_state_value(self.hass, entry_data.get(CONF_EV_CONNECTED))
-        soc_percent = _float_state_value(self.hass, entry_data.get(CONF_EV_SOC))
-        updated, changed = update_trip_history_from_values(
-            dict(self.store.data.get("trip_history", {})),
-            connected=connected,
-            soc_percent=soc_percent,
-            now=dt_util.utcnow(),
-        )
-        if changed:
-            await self.store.async_save_trip_history(updated)
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
         """Restore safe state and refresh."""
@@ -2652,7 +2632,7 @@ def _bounded_json(value: Any, *, depth: int = 0) -> Any:
         return "<truncated>"
     value = to_jsonable(value)
     if isinstance(value, dict):
-        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:20]}
+        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:24]}
     if isinstance(value, list):
         items = [_bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:
@@ -2912,14 +2892,6 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
-
-
-def _is_ev_history_state_change(entry_data: dict[str, Any], event: Any) -> bool:
-    entity_id = event.data.get("entity_id")
-    return entity_id in {
-        entry_data.get(CONF_EV_CONNECTED),
-        entry_data.get(CONF_EV_SOC),
-    }
 
 
 def _bool_state_value(hass: HomeAssistant, entity_id: Any) -> bool | None:
