@@ -14,7 +14,11 @@
 - EV SOC gained per kWh is now calibrated automatically from completed charging
   sessions in Home Assistant Recorder. The configured estimate remains a
   conservative bootstrap value until at least one hour of clean history is
-  available, and learned rates include a 10% readiness margin.
+  available, and learned rates include a 10% readiness margin. A learned model
+  is used only with the same charging sensor, SOC sensor, and configured charger
+  power that produced it.
+- Stop-only EV plans remain constraint-valid when the current SOC is already
+  above the authoritative vehicle target.
 
 ## 0.9.12 - 2026-08-16
 

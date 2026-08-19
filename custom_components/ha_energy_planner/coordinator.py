@@ -43,6 +43,7 @@ from .const import (
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
+    CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
@@ -807,6 +808,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             options,
             thermal_model=thermal_model,
             ev_charge_calibration=ev_charge_calibration,
+            ev_charging_entity_id=entry_data.get(CONF_EV_CHARGING),
+            ev_soc_entity_id=entry_data.get(CONF_EV_SOC),
         )
         planner_started = perf_counter()
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)

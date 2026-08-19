@@ -15,10 +15,7 @@ from .const import (
     CONF_HOUSEHOLD_LOAD,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import (
-    EV_CHARGE_CALIBRATION_MODEL_VERSION,
-    build_ev_charge_calibration,
-)
+from .ev import build_ev_charge_calibration, ev_charge_calibration_matches
 from .load_forecast import (
     FORECAST_CONTRACT_VERSION,
     HISTORY_LOOKBACK,
@@ -442,15 +439,11 @@ def _ev_charge_calibration_matches(
     soc_entity: str,
     charge_rate_kw: float,
 ) -> bool:
-    try:
-        stored_charge_rate = float(model.get("charge_rate_kw", 0.0))
-    except (TypeError, ValueError):
-        return False
-    return bool(
-        model.get("model_version") == EV_CHARGE_CALIBRATION_MODEL_VERSION
-        and model.get("charging_entity_id") == charging_entity
-        and model.get("soc_entity_id") == soc_entity
-        and abs(stored_charge_rate - float(charge_rate_kw)) < 0.0001
+    return ev_charge_calibration_matches(
+        model,
+        charging_entity_id=charging_entity,
+        soc_entity_id=soc_entity,
+        charge_rate_kw=charge_rate_kw,
     )
 
 

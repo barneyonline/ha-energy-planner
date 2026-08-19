@@ -122,7 +122,8 @@ Status as of 2026-08-15.
 - EV target SOC comes only from the required mapped vehicle sensor. Missing,
   unavailable, nonnumeric, or out-of-range target evidence blocks EV planning
   instead of substituting a planner-derived target. The target is bounded only
-  by the configured minimum and maximum SOC safety policy. The connected-state
+  by the configured minimum and maximum SOC safety policy. Stop-only schedules
+  remain valid when current SOC already exceeds that target. The connected-state
   entity remains optional because charging feedback independently confirms
   commanded power delivery.
 - The optional preconditioning policy keeps the charger control enabled after
@@ -294,8 +295,8 @@ Status as of 2026-08-15.
   previews, weather camelCase forecast attributes reflected in compact plan previews,
   PV forecast calibration updated from a time-aligned observed-power entity,
   built-in load health/evidence stored without raw history, HVAC thermal-model state updated from Home Assistant climate and
-  power entity samples, Recorder import metadata, and a compact EV trip
-  imported from Home Assistant Recorder state history. It also verifies
+  power entity samples, Recorder import metadata, and compact EV charge-rate
+  calibration state. It also verifies
   bounded forecast-snapshot action metadata for the active EV schedule with
   runtime ready-by override, an active EV schedule allocated to a negative
   import-price slot, and an Enphase arbitrage action backed by deterministic
@@ -430,20 +431,18 @@ Status as of 2026-08-15.
   only when Recorder is absent. Calibration accepts common charger and
   connector-status states plus SOC strings with percent units or comma decimals;
   only bounded session samples and aggregate model values are kept in `Store`.
+  Learned rates are accepted only when the stored charging entity, SOC entity,
+  and configured charger power match the current EV configuration; otherwise
+  planning uses the conservative bootstrap rate while retraining.
   Configured charging feedback also accepts connector-status sensors;
   `SUSPENDED_EV` and `SUSPENDED_EVSE` are normalized as connected but not
   actively charging, so momentary stop controls are not called after a vehicle
   has already suspended power delivery. Disconnection remains insufficient
   evidence for a safe momentary stop.
-  Summaries use max daily SOC consumption for the ready-by target when
-  sufficient. Persisted Recorder import timestamps tolerate malformed or
-  timezone-naive older values without raising through planner refresh. Docker
-  smoke coverage now validates one Recorder-imported EV trip from Home
-  Assistant state history, and real-history replay fixtures validate broader
-  MINI-like state names and SOC formats outside the running HA smoke container.
-- Live trip updates preserve Recorder import metadata and successful empty
-  imports advance it, so installations without recent trips do not repeat a
-  30-day Recorder query on every planner refresh.
+  Persisted Recorder import timestamps tolerate malformed or timezone-naive
+  older values without raising through planner refresh. Docker smoke coverage
+  validates the compact calibration lifecycle, and real-history replay fixtures
+  validate charging-state and SOC formats outside the running HA smoke container.
 - HVAC active planning is conservative: away mode off is preserved outside a
   persisted `precondition -> pre_peak_coast -> peak_coast -> release` tariff lifecycle. Every
   valid tariff slot in the configured 1-48 hour horizon is scanned, with the
