@@ -452,7 +452,34 @@ def test_charge_calibration_learns_conservative_soc_per_kwh_from_completed_sessi
     assert calibration["sample_count"] == 1
     assert calibration["raw_soc_per_kwh"] == 2.0
     assert calibration["soc_per_kwh"] == 1.8
-    assert effective_ev_soc_per_kwh(calibration, 2.0) == (1.8, "recorder_charging_history")
+    assert effective_ev_soc_per_kwh(
+        calibration,
+        2.0,
+        charging_entity_id="sensor.charger_status",
+        soc_entity_id="sensor.vehicle_soc",
+        charge_rate_kw=7,
+    ) == (1.8, "recorder_charging_history")
+    assert effective_ev_soc_per_kwh(
+        calibration,
+        2.0,
+        charging_entity_id="sensor.replacement_charger",
+        soc_entity_id="sensor.vehicle_soc",
+        charge_rate_kw=7,
+    ) == (2.0, "configured_fallback")
+    assert effective_ev_soc_per_kwh(
+        calibration,
+        2.0,
+        charging_entity_id="sensor.charger_status",
+        soc_entity_id="sensor.replacement_vehicle_soc",
+        charge_rate_kw=7,
+    ) == (2.0, "configured_fallback")
+    assert effective_ev_soc_per_kwh(
+        calibration,
+        2.0,
+        charging_entity_id="sensor.charger_status",
+        soc_entity_id="sensor.vehicle_soc",
+        charge_rate_kw=11,
+    ) == (2.0, "configured_fallback")
 
 
 def test_charge_calibration_rejects_short_or_stale_soc_sessions() -> None:
@@ -474,7 +501,13 @@ def test_charge_calibration_rejects_short_or_stale_soc_sessions() -> None:
 
     assert calibration["status"] == "insufficient_history"
     assert calibration["sample_count"] == 0
-    assert effective_ev_soc_per_kwh(calibration, 2.2) == (2.2, "configured_fallback")
+    assert effective_ev_soc_per_kwh(
+        calibration,
+        2.2,
+        charging_entity_id="sensor.charger_status",
+        soc_entity_id="sensor.vehicle_soc",
+        charge_rate_kw=7,
+    ) == (2.2, "configured_fallback")
 
 
 def test_charge_calibration_rejects_invalid_power_noise_and_implausible_gain() -> None:

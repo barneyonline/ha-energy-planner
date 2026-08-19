@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from math import ceil
+from math import ceil, isfinite
 from typing import Any
 
 EV_CHARGE_CALIBRATION_MODEL_VERSION = 1
@@ -155,12 +155,21 @@ def build_ev_charge_calibration(
 def effective_ev_soc_per_kwh(
     calibration: dict[str, Any] | None,
     fallback_soc_per_kwh: float,
+    *,
+    charging_entity_id: str | None,
+    soc_entity_id: str | None,
+    charge_rate_kw: float,
 ) -> tuple[float, str]:
     """Return the learned effective rate or the conservative bootstrap fallback."""
     model = calibration if isinstance(calibration, dict) else {}
     learned = _float_or_none(model.get("soc_per_kwh"))
     if (
-        model.get("model_version") == EV_CHARGE_CALIBRATION_MODEL_VERSION
+        ev_charge_calibration_matches(
+            model,
+            charging_entity_id=charging_entity_id,
+            soc_entity_id=soc_entity_id,
+            charge_rate_kw=charge_rate_kw,
+        )
         and model.get("status") == "ready"
         and learned is not None
         and learned > 0
@@ -168,6 +177,35 @@ def effective_ev_soc_per_kwh(
         return learned, "recorder_charging_history"
     fallback = _float_or_none(fallback_soc_per_kwh)
     return (fallback if fallback is not None and fallback > 0 else 2.0), "configured_fallback"
+
+
+def ev_charge_calibration_matches(
+    calibration: dict[str, Any] | None,
+    *,
+    charging_entity_id: str | None,
+    soc_entity_id: str | None,
+    charge_rate_kw: float,
+) -> bool:
+    """Return whether a learned model belongs to the current EV configuration."""
+    model = calibration if isinstance(calibration, dict) else {}
+    expected_charging_entity = str(charging_entity_id or "").strip()
+    expected_soc_entity = str(soc_entity_id or "").strip()
+    if not expected_charging_entity or not expected_soc_entity:
+        return False
+    stored_charge_rate = _float_or_none(model.get("charge_rate_kw"))
+    expected_charge_rate = _float_or_none(charge_rate_kw)
+    return bool(
+        model.get("model_version") == EV_CHARGE_CALIBRATION_MODEL_VERSION
+        and model.get("charging_entity_id") == expected_charging_entity
+        and model.get("soc_entity_id") == expected_soc_entity
+        and stored_charge_rate is not None
+        and expected_charge_rate is not None
+        and isfinite(stored_charge_rate)
+        and isfinite(expected_charge_rate)
+        and stored_charge_rate > 0
+        and expected_charge_rate > 0
+        and abs(stored_charge_rate - expected_charge_rate) < 0.0001
+    )
 
 
 def _ev_charge_calibration_samples(

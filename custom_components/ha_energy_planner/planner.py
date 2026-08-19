@@ -81,11 +81,15 @@ class DryRunPlanner:
         options: Mapping[str, Any],
         thermal_model: Mapping[str, Any] | None = None,
         ev_charge_calibration: Mapping[str, Any] | None = None,
+        ev_charging_entity_id: str | None = None,
+        ev_soc_entity_id: str | None = None,
     ) -> None:
         """Initialize planner."""
         self.options = options
         self.thermal_model = dict(thermal_model or {})
         self.ev_charge_calibration = dict(ev_charge_calibration or {})
+        self.ev_charging_entity_id = ev_charging_entity_id
+        self.ev_soc_entity_id = ev_soc_entity_id
 
     def create_plan(self, context: DecisionContext) -> EnergyPlan:
         """Create a dry-run plan from the current decision context."""
@@ -289,6 +293,9 @@ class DryRunPlanner:
             soc_per_kwh, soc_per_kwh_source = effective_ev_soc_per_kwh(
                 self.ev_charge_calibration,
                 float(self.options[CONF_EV_SOC_PER_KWH]),
+                charging_entity_id=self.ev_charging_entity_id,
+                soc_entity_id=self.ev_soc_entity_id,
+                charge_rate_kw=charge_rate_kw,
             )
             current_slot = context.slots[0] if context.slots else None
             emergency_charge = context.current_ev_soc_percent < ev_min

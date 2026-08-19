@@ -16,6 +16,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_WEATHER,
     DEFAULT_OPTIONS,
 )
+from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -448,13 +449,16 @@ def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> Non
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
     context = _context()
     context.current_ev_soc_percent = 80
+    context.ev_target_soc_percent = 70
 
     plan = DryRunPlanner(options).create_plan(context)
 
     action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
     assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["target_soc_percent"] == 70
     assert action.desired_state["allocated_slots"] == []
     assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
+    assert "ev_target_soc_below_current" not in ConstraintValidator(options).validate_plan(context, plan)
 
 
 def test_keep_charger_on_reserves_grid_power_for_preconditioning_after_target() -> None:
@@ -1203,6 +1207,9 @@ def test_active_plan_uses_recorder_calibrated_soc_per_kwh() -> None:
     calibration = {
         "model_version": 1,
         "status": "ready",
+        "charging_entity_id": "sensor.ev_charging",
+        "soc_entity_id": "sensor.ev_soc",
+        "charge_rate_kw": 7.0,
         "soc_per_kwh": 1.8,
         "sample_count": 3,
     }
@@ -1212,6 +1219,8 @@ def test_active_plan_uses_recorder_calibrated_soc_per_kwh() -> None:
         for action in DryRunPlanner(
             options,
             ev_charge_calibration=calibration,
+            ev_charging_entity_id="sensor.ev_charging",
+            ev_soc_entity_id="sensor.ev_soc",
         ).create_plan(context).actions
         if action.asset == ActionAsset.EV
     )

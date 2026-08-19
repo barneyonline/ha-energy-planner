@@ -2873,6 +2873,8 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
             options: dict[str, object],
             thermal_model: dict[str, object],
             ev_charge_calibration: dict[str, object],
+            ev_charging_entity_id: str | None,
+            ev_soc_entity_id: str | None,
         ) -> None:
             pass
 
