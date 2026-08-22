@@ -2344,6 +2344,31 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         ),
         now,
     )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {
+                        "enable_zones": True,
+                        "target_temperature": 21,
+                        "configured_zones_only": True,
+                    },
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
 
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -2406,6 +2431,88 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         },
         daikin_event,
         now,
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {
+                        "hvac_mode": "heat",
+                        "target_temperature": 21,
+                        "configured_zones_only": True,
+                    },
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.daikin",
+            "off",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {
+                        "target_temperature": 21,
+                        "configured_zones_only": True,
+                    },
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "target_temperature": 21,
+            "configured_zones_only": True,
+        },
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "off",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+            "configured_zones_only": True,
+        },
     )
     assert _is_planner_owned_control_feedback(
         entry_data,

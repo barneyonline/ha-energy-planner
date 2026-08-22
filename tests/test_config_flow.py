@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 import voluptuous as vol
 
 from custom_components.ha_energy_planner.config_flow import (
@@ -86,6 +87,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
@@ -200,6 +202,7 @@ def _valid_hass() -> FakeHass:
             "sensor.baseline_load",
             "sensor.battery_soc",
             "climate.daikin",
+            "climate.living_zone",
             "input_number.climate_low",
             "input_number.climate_high",
             "person.james",
@@ -1158,6 +1161,78 @@ def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     assert result["errors"] == {"base": "ev_keep_on_requires_persistent_control"}
 
 
+@pytest.mark.parametrize(
+    "zones",
+    [[], ["switch.living_zone"], ["switch.living_zone", "input_boolean.study_zone"]],
+)
+def test_options_flow_rejects_zone_only_preconditioning_without_zone_thermostat(
+    zones: list[str],
+) -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: zones,
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+        options={},
+        subentries={},
+    )
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_CLIMATE: {
+                CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
+            }
+        },
+    )
+
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "form"
+    assert result["errors"] == {
+        "base": "zone_only_preconditioning_requires_climate_zone"
+    }
+
+
+def test_options_flow_accepts_zone_only_preconditioning_with_zone_thermostat() -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["switch.living_zone", "climate.living_zone"],
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+        options={},
+        subentries={},
+    )
+    updates: list[dict[str, Any]] = []
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [entry],
+        async_update_entry=lambda entry_arg, **changes: updates.append(changes),
+    )
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_CLIMATE: {
+                CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
+            }
+        },
+    )
+
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] is True
+
+
 def test_options_flow_uses_ordered_priority_dropdowns() -> None:
     schema_fields = {
         str(getattr(key, "schema", key)): selector
@@ -1735,6 +1810,7 @@ def test_default_options_require_intentional_active_mode_enablement() -> None:
     assert DEFAULT_OPTIONS["planner_enabled"] is False
     assert DEFAULT_OPTIONS["dry_run"] is True
     assert DEFAULT_OPTIONS[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is True
+    assert DEFAULT_OPTIONS[CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] is False
 
 
 def test_validate_options_rejects_invalid_default_ready_by() -> None:

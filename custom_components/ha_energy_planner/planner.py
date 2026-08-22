@@ -32,6 +32,7 @@ from .const import (
     CONF_EV_SOC_PER_KWH,
     CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_MIN_CYCLE_MINUTES,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
@@ -1118,6 +1119,9 @@ class DryRunPlanner:
                 ),
                 "suppress_automations": True,
                 "enable_zones": True,
+                "configured_zones_only": bool(
+                    self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY, False)
+                ),
                 "controlled_zones": list(context.climate_zone_entities),
                 "projected_hvac_load_kw": thermal_hvac_load_kw(self.thermal_model, HVAC_PRECONDITION_PROJECTED_LOAD_KW),
                 "thermal_model_enabled": thermal_summary["enabled"],
@@ -1549,6 +1553,7 @@ def _action_score(action: PlanAction, context: DecisionContext, options: Mapping
                 "precondition_target",
                 "coast_target",
                 "controlled_zones",
+                "configured_zones_only",
                 "release_reason",
             )
             if action.desired_state.get(key) is not None
@@ -2064,6 +2069,7 @@ def _climate_action_state(action: PlanAction) -> dict[str, Any]:
         "coast_target",
         "release_reason",
         "controlled_zones",
+        "configured_zones_only",
     ):
         if desired.get(key) is not None:
             result[key] = desired.get(key)

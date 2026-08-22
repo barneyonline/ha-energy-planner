@@ -1385,6 +1385,85 @@ def test_hvac_zone_climate_snapshot_preserves_temperature_range() -> None:
     )
 
 
+def test_hvac_takeover_can_target_configured_zone_climates_only() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("off", {"temperature": 20}),
+            "climate.living_temperature": FakeState("heat", {"temperature": 21}),
+            "switch.living": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["switch.living", "climate.living_temperature"],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is True
+    assert hass.states.get("climate.living_temperature").attributes["temperature"] == 23
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.living"}),
+        ("climate", "turn_on", {"entity_id": "climate.daikin"}),
+        ("climate", "set_hvac_mode", {"entity_id": "climate.daikin", "hvac_mode": "heat"}),
+        (
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.living_temperature", "temperature": 23},
+        ),
+    ]
+
+
+def test_hvac_zone_only_targeting_fails_closed_without_zone_thermostat() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "switch.living": "off",
+            "automation.climate": "on",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: ["automation.climate"],
+            CONF_CLIMATE_ZONES: ["switch.living"],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is False
+    assert result.reason == "zone_only_preconditioning_requires_climate_zone"
+    assert result.rollback_succeeded is True
+    assert hass.services.calls == []
+
+
 def test_hvac_zone_climate_target_confirmation_failure_fails_closed(
     monkeypatch: object,
 ) -> None:
