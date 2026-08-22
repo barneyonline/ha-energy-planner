@@ -234,6 +234,8 @@ class FakeCoordinator:
         self.reconcile_count = 0
         self.start_count = 0
         self.shutdown_count = 0
+        self.execution_wait_count = 0
+        self.refresh_wait_count = 0
         self.restore_calls: list[tuple[str, bool]] = []
         self.replan_count = 0
         self.disarm_calls: list[str] = []
@@ -272,6 +274,14 @@ class FakeCoordinator:
     def async_shutdown(self) -> None:
         self.shutdown_count += 1
         self.lifecycle_calls.append("shutdown")
+
+    async def async_wait_for_plan_execution(self) -> None:
+        self.execution_wait_count += 1
+        self.lifecycle_calls.append("wait_execution")
+
+    async def async_wait_for_refresh_shutdown(self) -> None:
+        self.refresh_wait_count += 1
+        self.lifecycle_calls.append("wait_refresh")
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> Any:
         self.restore_calls.append((reason, refresh))
@@ -313,10 +323,17 @@ def test_unload_restores_safe_state_without_refresh() -> None:
 
     assert result is True
     assert coordinator.shutdown_count == 1
+    assert coordinator.execution_wait_count == 1
+    assert coordinator.refresh_wait_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.disarm_calls == ["entry_unload"]
-    assert coordinator.lifecycle_calls == ["shutdown", "restore"]
+    assert coordinator.lifecycle_calls == [
+        "shutdown",
+        "wait_execution",
+        "wait_refresh",
+        "restore",
+    ]
     assert entry.runtime_data is None
     assert len(hass.config_entries.unloaded) == 1
 
@@ -404,9 +421,17 @@ def test_unload_stops_when_safe_state_restore_fails() -> None:
     assert result is False
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.shutdown_count == 1
+    assert coordinator.execution_wait_count == 1
+    assert coordinator.refresh_wait_count == 1
     assert coordinator.start_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
-    assert coordinator.lifecycle_calls == ["shutdown", "restore", "start"]
+    assert coordinator.lifecycle_calls == [
+        "shutdown",
+        "wait_execution",
+        "wait_refresh",
+        "restore",
+        "start",
+    ]
     assert coordinator.replan_count == 0
     assert coordinator.disarm_calls == ["entry_unload", "entry_unload_restore_failed"]
     assert entry.runtime_data is coordinator
@@ -477,7 +502,13 @@ def test_unload_restarts_coordinator_when_restore_raises() -> None:
     with pytest.raises(RuntimeError, match="restore failed"):
         asyncio.run(async_unload_entry(hass, entry))
 
-    assert coordinator.lifecycle_calls == ["shutdown", "restore", "start"]
+    assert coordinator.lifecycle_calls == [
+        "shutdown",
+        "wait_execution",
+        "wait_refresh",
+        "restore",
+        "start",
+    ]
     assert coordinator.start_count == 1
     assert entry.runtime_data is coordinator
 
@@ -496,7 +527,13 @@ def test_unload_restarts_coordinator_when_platform_unload_raises() -> None:
     with pytest.raises(RuntimeError, match="platform unload failed"):
         asyncio.run(async_unload_entry(hass, entry))
 
-    assert coordinator.lifecycle_calls == ["shutdown", "restore", "start"]
+    assert coordinator.lifecycle_calls == [
+        "shutdown",
+        "wait_execution",
+        "wait_refresh",
+        "restore",
+        "start",
+    ]
     assert coordinator.start_count == 1
     assert entry.runtime_data is coordinator
 
@@ -635,6 +672,8 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     assert coordinator.auto_recovery_start_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["setup_entry_failed"]
     assert coordinator.shutdown_count == 1
+    assert coordinator.execution_wait_count == 1
+    assert coordinator.refresh_wait_count == 1
     assert coordinator.disarm_calls == ["setup_entry_failed"]
     assert coordinator.restore_calls == [("setup_entry_failed", False)]
     assert entry.runtime_data is None

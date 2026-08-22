@@ -36,6 +36,10 @@ _DICT_FIELDS = {
 }
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
+_FORECAST_SNAPSHOT_BUCKET_MINUTES = 30
+_FORECAST_SNAPSHOT_HARD_CAP = 128
+_DRY_RUN_COMPARISON_BUCKET_MINUTES = 30
+_DRY_RUN_COMPARISON_HARD_CAP = 384
 
 
 class PlannerStore:
@@ -45,9 +49,21 @@ class PlannerStore:
         """Initialize storage."""
         storage_key = STORE_KEY if entry_id is None else f"{STORE_KEY}_{entry_id}"
         self._entry_id = entry_id
-        self._store: Store[dict[str, Any]] = Store(hass, STORE_VERSION, storage_key)
+        self._store: Store[dict[str, Any]] = Store(
+            hass,
+            STORE_VERSION,
+            storage_key,
+            serialize_in_event_loop=False,
+        )
         self._legacy_store: Store[dict[str, Any]] | None = (
-            Store(hass, STORE_VERSION, STORE_KEY) if entry_id is not None and legacy_fallback else None
+            Store(
+                hass,
+                STORE_VERSION,
+                STORE_KEY,
+                serialize_in_event_loop=False,
+            )
+            if entry_id is not None and legacy_fallback
+            else None
         )
         self.data: dict[str, Any] = _default_data()
         self._save_delay_depth = 0
@@ -108,10 +124,25 @@ class PlannerStore:
     async def async_add_forecast_snapshot(self, snapshot: dict[str, Any]) -> None:
         """Persist a compact forecast snapshot for replay."""
         snapshots = list(self.data.get("forecast_snapshots", []))
-        snapshots.append(to_jsonable(snapshot))
-        # Time-based retention preserves day-ahead evidence across refresh
-        # storms; the hard cap bounds malformed/atypical records.
-        self.data["forecast_snapshots"] = _retain_by_time(snapshots, hours=48, hard_cap=2048)
+        item = _inherit_forecast_bucket_metadata(
+            snapshots,
+            to_jsonable(snapshot),
+            minutes=_FORECAST_SNAPSHOT_BUCKET_MINUTES,
+        )
+        snapshots = _upsert_latest_time_bucket(
+            snapshots,
+            item,
+            minutes=_FORECAST_SNAPSHOT_BUCKET_MINUTES,
+        )
+        # One snapshot per half-hour still provides complete five-minute
+        # calibration targets because each snapshot carries the first hour of
+        # five-minute training leads. It avoids rewriting hundreds of near-
+        # duplicate previews on every planner interval.
+        self.data["forecast_snapshots"] = _retain_by_time(
+            snapshots,
+            hours=48,
+            hard_cap=_FORECAST_SNAPSHOT_HARD_CAP,
+        )
         await self._async_save()
 
     async def async_add_dry_run_comparison(self, comparison: dict[str, Any]) -> None:
@@ -124,8 +155,16 @@ class PlannerStore:
             previous["last_created_at"] = item.get("created_at")
             comparisons[-1] = previous
         else:
-            comparisons.append(item)
-        self.data["dry_run_comparisons"] = _retain_by_time(comparisons, hours=24 * 7, hard_cap=1024)
+            comparisons = _upsert_latest_time_bucket(
+                comparisons,
+                item,
+                minutes=_DRY_RUN_COMPARISON_BUCKET_MINUTES,
+            )
+        self.data["dry_run_comparisons"] = _retain_by_time(
+            comparisons,
+            hours=24 * 7,
+            hard_cap=_DRY_RUN_COMPARISON_HARD_CAP,
+        )
         await self._async_save()
 
     async def async_save_forecast_calibration(self, model: dict[str, Any]) -> None:
@@ -148,10 +187,16 @@ class PlannerStore:
         snapshots = list(self.data.get("forecast_snapshots", []))
         for index in range(len(snapshots) - 1, -1, -1):
             snapshot = snapshots[index]
-            if not isinstance(snapshot, dict) or snapshot.get("plan_id") != plan_id:
+            if not isinstance(snapshot, dict):
+                continue
+            bucket_plan_ids = snapshot.get("bucket_plan_ids", [])
+            if snapshot.get("plan_id") != plan_id and not (
+                isinstance(bucket_plan_ids, list) and plan_id in bucket_plan_ids
+            ):
                 continue
             updated = dict(snapshot)
             updated["ai"] = to_jsonable(metadata)
+            updated["ai_plan_id"] = plan_id
             snapshots[index] = updated
             self.data["forecast_snapshots"] = snapshots
             await self._async_save()
@@ -222,7 +267,11 @@ class PlannerStore:
                 if self._save_delay_depth and not force:
                     return
                 generation = self._mutation_generation
-                await self._store.async_save(self.data)
+                # Every mutation in this wrapper replaces a top-level value.
+                # Capturing the root mapping therefore gives the Store executor
+                # an immutable generation while later event-loop mutations build
+                # and install new lists/dicts.
+                await self._store.async_save(dict(self.data))
                 # A writer may have mutated data while this save was in flight.
                 # Acknowledge only the generation captured before the await so
                 # the loop performs another write for any later mutation.
@@ -413,6 +462,165 @@ def _retain_by_time(records: list[Any], *, hours: int, hard_cap: int) -> list[di
         item for item, timestamp in zip(records, timestamps, strict=True) if timestamp is None or timestamp >= cutoff
     ]
     return retained[-hard_cap:]
+
+
+def _upsert_latest_time_bucket(
+    records: list[Any],
+    item: dict[str, Any],
+    *,
+    minutes: int,
+) -> list[Any]:
+    """Keep only the latest record in a fixed UTC time bucket."""
+    if not records:
+        return [item]
+    previous_timestamp = _record_timestamp(records[-1])
+    current_timestamp = _record_timestamp(item)
+    if previous_timestamp is None or current_timestamp is None:
+        return [*records, item]
+    bucket_seconds = max(int(minutes), 1) * 60
+    if int(previous_timestamp.timestamp()) // bucket_seconds != int(current_timestamp.timestamp()) // bucket_seconds:
+        return [*records, item]
+    return [*records[:-1], item]
+
+
+def _inherit_forecast_bucket_metadata(
+    records: list[Any],
+    item: dict[str, Any],
+    *,
+    minutes: int,
+) -> dict[str, Any]:
+    """Carry bounded plan provenance and completed AI data across bucket replacement."""
+    if not records or not isinstance(records[-1], dict):
+        return item
+    previous = records[-1]
+    previous_timestamp = _record_timestamp(previous)
+    current_timestamp = _record_timestamp(item)
+    if previous_timestamp is None or current_timestamp is None:
+        return item
+    bucket_seconds = max(int(minutes), 1) * 60
+    if int(previous_timestamp.timestamp()) // bucket_seconds != int(current_timestamp.timestamp()) // bucket_seconds:
+        return item
+
+    updated = dict(item)
+    current_plan_id = str(item.get("plan_id") or "")
+    previous_bucket_plan_ids = previous.get("bucket_plan_ids", [])
+    bucket_plan_ids = (
+        [
+            str(plan_id)
+            for plan_id in previous_bucket_plan_ids
+            if str(plan_id) and str(plan_id) != current_plan_id
+        ]
+        if isinstance(previous_bucket_plan_ids, list)
+        else []
+    )
+    previous_plan_id = str(previous.get("plan_id") or "")
+    if previous_plan_id and previous_plan_id != current_plan_id:
+        bucket_plan_ids.append(previous_plan_id)
+    if bucket_plan_ids:
+        updated["bucket_plan_ids"] = list(dict.fromkeys(bucket_plan_ids))[-12:]
+
+    bucket_actions = _merge_forecast_bucket_actions(
+        previous.get("actions"),
+        updated.get("actions"),
+    )
+    if bucket_actions:
+        updated["actions"] = bucket_actions
+
+    bucket_trip_history = _merge_forecast_bucket_trip_history(
+        previous.get("trip_history"),
+        updated.get("trip_history"),
+    )
+    if bucket_trip_history:
+        updated["trip_history"] = bucket_trip_history
+
+    previous_ai = previous.get("ai")
+    if not updated.get("ai") and isinstance(previous_ai, dict) and previous_ai:
+        updated["ai"] = previous_ai
+        updated["ai_plan_id"] = str(previous.get("ai_plan_id") or previous_plan_id)
+    return updated
+
+
+def _merge_forecast_bucket_actions(previous: Any, current: Any) -> list[dict[str, Any]]:
+    """Retain bounded, materially distinct action evidence within one forecast bucket."""
+    actions: list[dict[str, Any]] = []
+    signatures: list[dict[str, Any]] = []
+    previous_actions = previous if isinstance(previous, list) else []
+    current_actions = current if isinstance(current, list) else []
+    for raw_action in [*previous_actions, *current_actions]:
+        if not isinstance(raw_action, dict):
+            continue
+        action = dict(raw_action)
+        signature = {
+            key: action.get(key)
+            for key in (
+                "asset",
+                "kind",
+                "desired_state",
+                "hard_constraints",
+                "reason_codes",
+                "expected_cost_delta",
+                "confidence",
+            )
+        }
+        try:
+            existing_index = signatures.index(signature)
+        except ValueError:
+            signatures.append(signature)
+            actions.append(action)
+        else:
+            actions[existing_index] = action
+    if len(actions) <= 12:
+        return actions
+    selected_indexes = set(
+        sorted(
+            range(len(actions)),
+            key=lambda index: (_forecast_action_retention_priority(actions[index]), index),
+        )[-12:]
+    )
+    return [action for index, action in enumerate(actions) if index in selected_indexes]
+
+
+def _forecast_action_retention_priority(action: dict[str, Any]) -> int:
+    """Prioritize scarce or active EV allocation evidence during bucket compaction."""
+    desired_state = action.get("desired_state")
+    if not isinstance(desired_state, dict):
+        return 0
+    allocated_slots = desired_state.get("allocated_slots")
+    if not isinstance(allocated_slots, list):
+        return 0
+    if any(
+        isinstance(slot, dict)
+        and isinstance(slot.get("import_price"), int | float)
+        and not isinstance(slot.get("import_price"), bool)
+        and slot["import_price"] < 0
+        for slot in allocated_slots
+    ):
+        return 2
+    return 1 if desired_state.get("charging_required_now") and allocated_slots else 0
+
+
+def _merge_forecast_bucket_trip_history(previous: Any, current: Any) -> dict[str, Any]:
+    """Preserve one successful Recorder import summary across later bucket refreshes."""
+    previous_summary = dict(previous) if isinstance(previous, dict) else {}
+    current_summary = dict(current) if isinstance(current, dict) else {}
+    if not previous_summary:
+        return current_summary
+    if not current_summary:
+        return previous_summary
+    previous_imported = previous_summary.get("recorder_import_reason") == "recorder_imported"
+    current_imported = current_summary.get("recorder_import_reason") == "recorder_imported"
+    if previous_imported and not current_imported:
+        merged = previous_summary
+        merged["latest_recorder_import_reason"] = current_summary.get("recorder_import_reason")
+    else:
+        merged = current_summary
+    record_counts = [
+        value
+        for value in (previous_summary.get("record_count"), current_summary.get("record_count"))
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+    ]
+    merged["record_count"] = max(record_counts, default=0)
+    return merged
 
 
 def _record_timestamp(record: Any) -> datetime | None:
