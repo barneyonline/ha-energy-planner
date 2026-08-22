@@ -1265,6 +1265,276 @@ def test_hvac_takeover_turns_on_climate_and_zones_then_release_restores_zones() 
     assert hass.states.values["automation.climate"] == "on"
 
 
+def test_hvac_takeover_sets_main_and_zone_climate_targets() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "climate.living_temperature": FakeState("heat", {"temperature": 21}),
+            "climate.bedrooms_temperature": FakeState("heat", {"temperature": 22}),
+            "switch.living": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: [
+                "switch.living",
+                "climate.living_temperature",
+                "climate.bedrooms_temperature",
+            ],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is True
+    assert result.saved_zone_states == {
+        "switch.living": "off",
+        "climate.living_temperature": {"target_temperature": 21},
+        "climate.bedrooms_temperature": {"target_temperature": 22},
+    }
+    assert adapter.takeover_snapshot() == (
+        {},
+        {
+            "switch.living": "on",
+            "climate.living_temperature": {"target_temperature": 23},
+            "climate.bedrooms_temperature": {"target_temperature": 23},
+        },
+    )
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.living"}),
+        ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 23}),
+        (
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.living_temperature", "temperature": 23},
+        ),
+        (
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.bedrooms_temperature", "temperature": 23},
+        ),
+    ]
+
+    released = asyncio.run(adapter.async_restore({}, result.saved_zone_states))
+
+    assert released.reason == "hvac_control_released"
+    assert hass.states.get("climate.living_temperature").attributes["temperature"] == 21
+    assert hass.states.get("climate.bedrooms_temperature").attributes["temperature"] == 22
+
+
+def test_hvac_zone_climate_restore_retains_unresolved_targets(monkeypatch: object) -> None:
+    failed_hass = FakeHass({"climate.failed_zone": FakeState("heat", {"temperature": 23})})
+    failed_hass.services.fail_services.add(("climate", "set_temperature"))
+    failed = asyncio.run(
+        DaikinHVACAdapter(failed_hass, {}).async_restore(
+            {},
+            {"climate.failed_zone": {"target_temperature": 20}},
+        )
+    )
+
+    noop_hass = FakeHass({"climate.noop_zone": FakeState("heat", {"temperature": 23})})
+    noop_hass.services.noop_entities.add("climate.noop_zone")
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    unconfirmed = asyncio.run(
+        DaikinHVACAdapter(noop_hass, {}).async_restore(
+            {},
+            {"climate.noop_zone": {"target_temperature": 20}},
+        )
+    )
+
+    assert failed.reason == "hvac_release_failed"
+    assert failed.saved_zone_states == {
+        "climate.failed_zone": {"target_temperature": 20},
+    }
+    assert unconfirmed.reason == "hvac_release_failed"
+    assert unconfirmed.saved_zone_states == {
+        "climate.noop_zone": {"target_temperature": 20},
+    }
+
+
+def test_hvac_zone_climate_snapshot_preserves_temperature_range() -> None:
+    hass = FakeHass(
+        {
+            "climate.zone": FakeState(
+                "heat_cool",
+                {"target_temp_low": 19, "target_temp_high": 24},
+            )
+        }
+    )
+
+    snapshot = DaikinHVACAdapter(
+        hass,
+        {CONF_CLIMATE_ZONES: ["climate.zone"]},
+    ).takeover_snapshot()
+
+    assert snapshot == (
+        {},
+        {"climate.zone": {"target_temp_low": 19, "target_temp_high": 24}},
+    )
+
+
+def test_hvac_takeover_can_target_configured_zone_climates_only() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("off", {"temperature": 20}),
+            "climate.living_temperature": FakeState("heat", {"temperature": 21}),
+            "switch.living": "off",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["switch.living", "climate.living_temperature"],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is True
+    assert hass.states.get("climate.living_temperature").attributes["temperature"] == 23
+    assert hass.services.calls == [
+        ("switch", "turn_on", {"entity_id": "switch.living"}),
+        ("climate", "turn_on", {"entity_id": "climate.daikin"}),
+        ("climate", "set_hvac_mode", {"entity_id": "climate.daikin", "hvac_mode": "heat"}),
+        (
+            "climate",
+            "set_temperature",
+            {"entity_id": "climate.living_temperature", "temperature": 23},
+        ),
+    ]
+
+
+def test_hvac_zone_only_targeting_fails_closed_without_zone_thermostat() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "switch.living": "off",
+            "automation.climate": "on",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_AUTOMATIONS: ["automation.climate"],
+            CONF_CLIMATE_ZONES: ["switch.living"],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is False
+    assert result.reason == "zone_only_preconditioning_requires_climate_zone"
+    assert result.rollback_succeeded is True
+    assert hass.services.calls == []
+
+
+def test_hvac_zone_climate_target_confirmation_failure_fails_closed(
+    monkeypatch: object,
+) -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "climate.first_zone": FakeState("heat", {"temperature": 20}),
+            "climate.failed_zone": FakeState("heat", {"temperature": 20}),
+        }
+    )
+    hass.services.noop_entities.add("climate.failed_zone")
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.first_zone", "climate.failed_zone"],
+        },
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.hvac_adapter._STATE_CONFIRMATION_TIMEOUT_SECONDS",
+        0.0,
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                }
+            )
+        )
+    )
+
+    assert result.applied is False
+    assert result.reason == "hvac_state_confirmation_failed"
+    assert result.rollback_succeeded is True
+    first_zone_calls = [call for call in hass.services.calls if call[2]["entity_id"] == "climate.first_zone"]
+    assert first_zone_calls == [
+        ("climate", "set_temperature", {"entity_id": "climate.first_zone", "temperature": 23}),
+        ("climate", "set_temperature", {"entity_id": "climate.first_zone", "temperature": 23}),
+        ("climate", "set_temperature", {"entity_id": "climate.first_zone", "temperature": 20}),
+    ]
+    assert hass.states.get("climate.first_zone").attributes["temperature"] == 20
+
+
+def test_hvac_zone_climate_without_target_requires_only_availability() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "climate.zone_temperature": FakeState("heat", {"temperature": 21}),
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.zone_temperature"],
+        },
+    )
+
+    result = asyncio.run(
+        adapter.async_execute(_action({"hvac_mode": "heat", "enable_zones": True}))
+    )
+
+    assert result.applied is True
+    assert result.reason == "already_in_desired_hvac_state"
+    assert hass.services.calls == []
+
+
 def test_hvac_action_turns_off_climate_and_sets_temperature_range() -> None:
     off_hass = FakeHass({"climate.daikin": "heat", "automation.climate": "off"})
     off_adapter = DaikinHVACAdapter(

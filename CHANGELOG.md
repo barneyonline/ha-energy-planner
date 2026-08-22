@@ -2,6 +2,80 @@
 
 ## Unreleased
 
+### Added
+
+- Climate settings now include **Precondition configured zones only**. When
+  enabled, tariff preconditioning keeps main Daikin power and mode control but
+  applies temperature targets only to configured zone climate entities.
+
+### Fixed
+
+- Continuous EV charging now remains committed after charging is observed, so
+  tariff forecast revisions cannot split one continuous schedule into repeated
+  short start/stop bursts. Configured maximum import prices remain authoritative.
+- EV planning now uses the mapped vehicle target-SOC entity as its authoritative
+  target. The obsolete fallback target option and `set_ev_target_soc` service
+  are removed by config-entry migration. A configured legacy EV must map its
+  vehicle target before that migration can complete.
+- EV SOC gained per kWh is now calibrated automatically from completed charging
+  sessions in Home Assistant Recorder. The configured estimate remains a
+  conservative bootstrap value until at least one hour of clean history is
+  available, and learned rates include a 10% readiness margin. A learned model
+  is used only with the same charging sensor, SOC sensor, and configured charger
+  power that produced it.
+- Stop-only EV plans remain constraint-valid when the current SOC is already
+  above the authoritative vehicle target.
+
+## 0.9.12 - 2026-08-16
+
+### Changed
+
+- Climate Zones can now include subordinate `climate` entities. Planner HVAC
+  actions apply and confirm the main thermostat target on every configured zone
+  thermostat while retaining switch/helper takeover and restoration behavior.
+
+### Fixed
+
+- Zone thermostat target changes now participate in manual-override detection
+  without misclassifying changes protected by the configured scheduler guard.
+
+## 0.9.11 - 2026-08-15
+
+### Changed
+
+- **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
+  when their corresponding device-control switch is off. Disabled-area actions
+  are also excluded from the Next actions attributes and action count.
+- Plan calendar descriptions now group action evidence into short bulleted
+  sections and render embedded schedule and forecast timestamps in Home
+  Assistant's local timezone instead of exposing raw UTC ISO values.
+
+### Fixed
+
+- Manual safety-gate arming now requires the current preflight and reviewed
+  production evidence to pass. The Armed entity reports effective command
+  authority and exposes stale reviewed evidence as
+  `production_evidence_contract_changed` instead of appearing armed while the
+  executor rejects every command. Missing or unrecognized plan-health values
+  also fail closed during preflight.
+- Climate comfort handoff no longer calls the release adapter when Energy
+  Planner owns no HVAC state. Release/no-op audit rows no longer consume the
+  daily climate command allowance, so repeated replans cannot exhaust the cap
+  before a real preconditioning start.
+- A missed preconditioning start now uses the remaining contiguous lower-price
+  window instead of abandoning the whole lifecycle. Catch-up does not cross
+  tariff gaps or continue heating/cooling after the applicable comfort target
+  is already reached, and peak-period load is projected from the temperature
+  the shortened run can actually achieve.
+- Degraded issues and scoped pauses are isolated by control area. An EV-only
+  fault or pause no longer prevents an otherwise eligible climate action, while
+  unsafe shared inputs and per-device capability/confidence checks still fail
+  closed. Scoped pauses retain unaffected authority across restart and status
+  reporting, and occupancy availability is scoped to climate control.
+- Direct HVAC takeover may recover toward comfort from below the heating range
+  or above the cooling range. Opposite-direction commands and targets outside
+  the configured comfort bounds remain blocked.
+
 ## 0.9.10 - 2026-08-15
 
 ### Changed

@@ -1,14 +1,18 @@
-"""EV trip-history and target calculation helpers."""
+"""EV charging-state, calibration, and scheduling helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
-from math import ceil
+from datetime import datetime, timedelta
+from math import ceil, isfinite
 from typing import Any
 
-MAX_STORED_TRIPS = 120
-MIN_EV_TRIP_HISTORY_DAYS = 3
+EV_CHARGE_CALIBRATION_MODEL_VERSION = 1
+MIN_EV_CHARGE_CALIBRATION_MINUTES = 30
+MIN_EV_CHARGE_CALIBRATION_SOC_GAIN = 3.0
+MIN_EV_CHARGE_CALIBRATION_TOTAL_MINUTES = 60
+EV_CHARGE_CALIBRATION_SAFETY_FACTOR = 0.9
+MAX_EV_CHARGE_CALIBRATION_SAMPLES = 60
 
 _EV_ACTIVE_CHARGING_STATES = frozenset(
     {
@@ -76,43 +80,6 @@ def ev_charging_state_proves_safe(value: object) -> bool:
 
 
 @dataclass(slots=True)
-class EVTripRecord:
-    """A compact EV trip record."""
-
-    started_at: datetime
-    ended_at: datetime
-    start_soc_percent: float
-    end_soc_percent: float
-
-    @property
-    def consumed_soc_percent(self) -> float:
-        """Return consumed SOC for this trip."""
-        return max(self.start_soc_percent - self.end_soc_percent, 0.0)
-
-
-@dataclass(slots=True)
-class EVTripSummary:
-    """Summarized trip-history demand."""
-
-    observed_days: int
-    max_daily_soc_percent: float
-    average_daily_soc_percent: float
-    history_sufficient: bool
-
-
-@dataclass(slots=True)
-class EVTarget:
-    """Calculated EV charging target."""
-
-    current_soc_percent: float | None
-    target_soc_percent: float
-    required_charge_percent: float
-    max_attainable_soc_percent: float
-    infeasible: bool
-    reason: str
-
-
-@dataclass(slots=True)
 class EVChargeAllocation:
     """Allocated EV charging slot."""
 
@@ -139,211 +106,186 @@ class EVChargeSchedule:
     reason: str
 
 
-def summarize_trip_history(
-    trips: list[EVTripRecord],
-    *,
-    minimum_history_days: int = MIN_EV_TRIP_HISTORY_DAYS,
-) -> EVTripSummary:
-    """Summarize trips into conservative daily SOC consumption."""
-    daily: dict[str, float] = {}
-    for trip in trips:
-        day = trip.started_at.date().isoformat()
-        daily[day] = daily.get(day, 0.0) + trip.consumed_soc_percent
-    observed = len(daily)
-    values = list(daily.values())
-    max_daily = max(values, default=0.0)
-    average_daily = sum(values) / observed if observed else 0.0
-    return EVTripSummary(
-        observed_days=observed,
-        max_daily_soc_percent=round(max_daily, 3),
-        average_daily_soc_percent=round(average_daily, 3),
-        history_sufficient=observed >= minimum_history_days,
-    )
-
-
-def summarize_stored_trip_history(
-    history: dict[str, Any] | None,
-    *,
-    minimum_history_days: int = MIN_EV_TRIP_HISTORY_DAYS,
-) -> EVTripSummary:
-    """Summarize persisted compact trip history."""
-    return summarize_trip_history(
-        trip_records_from_store(history or {}),
-        minimum_history_days=minimum_history_days,
-    )
-
-
-def trip_records_from_store(history: dict[str, Any]) -> list[EVTripRecord]:
-    """Parse stored trip records."""
-    records: list[EVTripRecord] = []
-    for item in history.get("records", []):
-        if not isinstance(item, dict):
-            continue
-        try:
-            records.append(
-                EVTripRecord(
-                    started_at=_parse_datetime(item["started_at"]),
-                    ended_at=_parse_datetime(item["ended_at"]),
-                    start_soc_percent=float(item["start_soc_percent"]),
-                    end_soc_percent=float(item["end_soc_percent"]),
-                )
-            )
-        except (KeyError, TypeError, ValueError):
-            continue
-    return records
-
-
-def update_trip_history_from_values(
-    history: dict[str, Any] | None,
-    *,
-    connected: bool | None,
-    soc_percent: float | None,
-    now: datetime,
-) -> tuple[dict[str, Any], bool]:
-    """Update compact trip history from current EV connection/SOC state."""
-    updated = {
-        "active_trip": dict((history or {}).get("active_trip") or {}),
-        "records": list((history or {}).get("records") or []),
-        "recorder_imported_at": (history or {}).get("recorder_imported_at"),
-    }
-    if connected is None or soc_percent is None:
-        return updated, False
-
-    active_trip = dict(updated.get("active_trip") or {})
-    if connected is False:
-        if active_trip:
-            return updated, False
-        updated["active_trip"] = {
-            "started_at": now.isoformat(),
-            "start_soc_percent": round(float(soc_percent), 3),
-        }
-        return updated, True
-
-    if not active_trip:
-        return updated, False
-
-    start_soc = _float_or_none(active_trip.get("start_soc_percent"))
-    started_at = active_trip.get("started_at")
-    updated["active_trip"] = {}
-    if start_soc is None or started_at is None or start_soc <= float(soc_percent):
-        return updated, True
-
-    records = list(updated.get("records") or [])
-    records.append(
-        {
-            "started_at": str(started_at),
-            "ended_at": now.isoformat(),
-            "start_soc_percent": round(start_soc, 3),
-            "end_soc_percent": round(float(soc_percent), 3),
-        }
-    )
-    updated["records"] = records[-MAX_STORED_TRIPS:]
-    return updated, True
-
-
-def import_trip_history_from_state_sequences(
-    history: dict[str, Any] | None,
-    *,
-    connected_states: list[Any],
+def build_ev_charge_calibration(
+    charging_states: list[Any],
     soc_states: list[Any],
-    imported_at: datetime,
-) -> tuple[dict[str, Any], bool]:
-    """Import compact trip records from Recorder state sequences."""
-    updated = {
-        "active_trip": dict((history or {}).get("active_trip") or {}),
-        "records": list((history or {}).get("records") or []),
-        "recorder_imported_at": (history or {}).get("recorder_imported_at"),
-    }
-    events = _trip_history_events(connected_states, soc_states)
-    if not events:
-        imported_timestamp = imported_at.isoformat()
-        changed = updated.get("recorder_imported_at") != imported_timestamp
-        updated["recorder_imported_at"] = imported_timestamp
-        return updated, changed
-
-    records = list(updated.get("records") or [])
-    known_keys = {_record_key(record) for record in records if isinstance(record, dict)}
-    active_start: datetime | None = None
-    active_start_soc: float | None = None
-    last_soc: float | None = None
-    changed = False
-
-    for event_time, kind, value in events:
-        if kind == "soc":
-            last_soc = value
-            continue
-        connected = bool(value)
-        if not connected:
-            if active_start is None and last_soc is not None:
-                active_start = event_time
-                active_start_soc = last_soc
-            continue
-        if active_start is None or active_start_soc is None or last_soc is None:
-            active_start = None
-            active_start_soc = None
-            continue
-        if active_start_soc > last_soc:
-            record = {
-                "started_at": active_start.isoformat(),
-                "ended_at": event_time.isoformat(),
-                "start_soc_percent": round(active_start_soc, 3),
-                "end_soc_percent": round(last_soc, 3),
-                "source": "recorder",
-            }
-            key = _record_key(record)
-            if key not in known_keys:
-                records.append(record)
-                known_keys.add(key)
-                changed = True
-        active_start = None
-        active_start_soc = None
-
-    records = sorted(
-        [record for record in records if isinstance(record, dict)],
-        key=lambda record: str(record.get("started_at", "")),
-    )
-    updated["records"] = records[-MAX_STORED_TRIPS:]
-    updated["recorder_imported_at"] = imported_at.isoformat()
-    return updated, changed or updated["recorder_imported_at"] != (history or {}).get("recorder_imported_at")
-
-
-def calculate_ev_target(
     *,
-    current_soc_percent: float | None,
-    summary: EVTripSummary,
-    ev_min_soc_percent: float,
-    ev_max_soc_percent: float,
-    fallback_target_soc_percent: float,
-    available_charge_hours: float,
-    charge_rate_percent_per_hour: float,
-) -> EVTarget:
-    """Calculate a conservative ready-by target and feasibility."""
-    if ev_min_soc_percent > ev_max_soc_percent:
-        raise ValueError("ev_min_soc_percent must be <= ev_max_soc_percent")
-    if summary.history_sufficient:
-        desired = ev_min_soc_percent + summary.max_daily_soc_percent
-        reason = "history_max_daily_consumption"
-    else:
-        desired = fallback_target_soc_percent
-        reason = "fallback_until_history_sufficient"
+    charge_rate_kw: float,
+    trained_at: datetime,
+    charging_entity_id: str,
+    soc_entity_id: str,
+) -> dict[str, Any]:
+    """Build a conservative effective SOC-per-kWh model from charging sessions."""
+    samples = _ev_charge_calibration_samples(
+        charging_states,
+        soc_states,
+        charge_rate_kw=charge_rate_kw,
+    )
+    total_duration_minutes = sum(float(sample["duration_minutes"]) for sample in samples)
+    total_energy_kwh = sum(float(sample["estimated_energy_kwh"]) for sample in samples)
+    total_soc_gain = sum(float(sample["soc_gain_percent"]) for sample in samples)
+    ready = bool(
+        total_duration_minutes >= MIN_EV_CHARGE_CALIBRATION_TOTAL_MINUTES
+        and total_energy_kwh > 0
+        and total_soc_gain >= MIN_EV_CHARGE_CALIBRATION_SOC_GAIN
+    )
+    raw_soc_per_kwh = total_soc_gain / total_energy_kwh if total_energy_kwh > 0 else None
+    learned_soc_per_kwh = (
+        round(raw_soc_per_kwh * EV_CHARGE_CALIBRATION_SAFETY_FACTOR, 4)
+        if ready and raw_soc_per_kwh is not None
+        else None
+    )
+    return {
+        "model_version": EV_CHARGE_CALIBRATION_MODEL_VERSION,
+        "status": "ready" if ready else "insufficient_history",
+        "trained_at": trained_at.isoformat(),
+        "charging_entity_id": charging_entity_id,
+        "soc_entity_id": soc_entity_id,
+        "charge_rate_kw": round(float(charge_rate_kw), 4),
+        "sample_count": len(samples),
+        "total_duration_minutes": round(total_duration_minutes, 3),
+        "total_soc_gain_percent": round(total_soc_gain, 3),
+        "raw_soc_per_kwh": round(raw_soc_per_kwh, 4) if raw_soc_per_kwh is not None else None,
+        "soc_per_kwh": learned_soc_per_kwh,
+        "safety_factor": EV_CHARGE_CALIBRATION_SAFETY_FACTOR,
+        "samples": samples[-MAX_EV_CHARGE_CALIBRATION_SAMPLES:],
+    }
 
-    target = _clamp(desired, ev_min_soc_percent, ev_max_soc_percent)
-    current = current_soc_percent
-    starting_soc = current if current is not None else 0.0
-    max_attainable = min(
-        ev_max_soc_percent,
-        starting_soc + max(available_charge_hours, 0.0) * max(charge_rate_percent_per_hour, 0.0),
+
+def effective_ev_soc_per_kwh(
+    calibration: dict[str, Any] | None,
+    fallback_soc_per_kwh: float,
+    *,
+    charging_entity_id: str | None,
+    soc_entity_id: str | None,
+    charge_rate_kw: float,
+) -> tuple[float, str]:
+    """Return the learned effective rate or the conservative bootstrap fallback."""
+    model = calibration if isinstance(calibration, dict) else {}
+    learned = _float_or_none(model.get("soc_per_kwh"))
+    if (
+        ev_charge_calibration_matches(
+            model,
+            charging_entity_id=charging_entity_id,
+            soc_entity_id=soc_entity_id,
+            charge_rate_kw=charge_rate_kw,
+        )
+        and model.get("status") == "ready"
+        and learned is not None
+        and learned > 0
+    ):
+        return learned, "recorder_charging_history"
+    fallback = _float_or_none(fallback_soc_per_kwh)
+    return (fallback if fallback is not None and fallback > 0 else 2.0), "configured_fallback"
+
+
+def ev_charge_calibration_matches(
+    calibration: dict[str, Any] | None,
+    *,
+    charging_entity_id: str | None,
+    soc_entity_id: str | None,
+    charge_rate_kw: float,
+) -> bool:
+    """Return whether a learned model belongs to the current EV configuration."""
+    model = calibration if isinstance(calibration, dict) else {}
+    expected_charging_entity = str(charging_entity_id or "").strip()
+    expected_soc_entity = str(soc_entity_id or "").strip()
+    if not expected_charging_entity or not expected_soc_entity:
+        return False
+    stored_charge_rate = _float_or_none(model.get("charge_rate_kw"))
+    expected_charge_rate = _float_or_none(charge_rate_kw)
+    return bool(
+        model.get("model_version") == EV_CHARGE_CALIBRATION_MODEL_VERSION
+        and model.get("charging_entity_id") == expected_charging_entity
+        and model.get("soc_entity_id") == expected_soc_entity
+        and stored_charge_rate is not None
+        and expected_charge_rate is not None
+        and isfinite(stored_charge_rate)
+        and isfinite(expected_charge_rate)
+        and stored_charge_rate > 0
+        and expected_charge_rate > 0
+        and abs(stored_charge_rate - expected_charge_rate) < 0.0001
     )
-    feasible_target = min(target, max_attainable)
-    infeasible = feasible_target < target
-    return EVTarget(
-        current_soc_percent=current_soc_percent,
-        target_soc_percent=round(feasible_target, 3),
-        required_charge_percent=round(max(feasible_target - starting_soc, 0.0), 3),
-        max_attainable_soc_percent=round(max_attainable, 3),
-        infeasible=infeasible,
-        reason="infeasible_before_ready_by" if infeasible else reason,
+
+
+def _ev_charge_calibration_samples(
+    charging_states: list[Any],
+    soc_states: list[Any],
+    *,
+    charge_rate_kw: float,
+) -> list[dict[str, Any]]:
+    if charge_rate_kw <= 0:
+        return []
+    charging_events = sorted(
+        (
+            (timestamp, charging)
+            for state in charging_states
+            if (timestamp := _state_timestamp(state)) is not None
+            and (charging := ev_charging_state(getattr(state, "state", None))) is not None
+        ),
+        key=lambda item: item[0],
     )
+    soc_points = sorted(
+        (
+            (timestamp, soc)
+            for state in soc_states
+            if (timestamp := _state_timestamp(state)) is not None
+            and (soc := _float_or_none(getattr(state, "state", None))) is not None
+            and 0 <= soc <= 100
+        ),
+        key=lambda item: item[0],
+    )
+    active_start: datetime | None = None
+    samples: list[dict[str, Any]] = []
+    for timestamp, charging in charging_events:
+        if charging:
+            active_start = active_start or timestamp
+            continue
+        if active_start is None or timestamp <= active_start:
+            active_start = None
+            continue
+        duration_minutes = (timestamp - active_start).total_seconds() / 60.0
+        start_soc = _soc_at_or_before(soc_points, active_start)
+        end_soc = _soc_at_or_before(soc_points, timestamp)
+        active_start_value = active_start
+        active_start = None
+        if (
+            duration_minutes < MIN_EV_CHARGE_CALIBRATION_MINUTES
+            or duration_minutes > 12 * 60
+            or start_soc is None
+            or end_soc is None
+        ):
+            continue
+        soc_gain = end_soc - start_soc
+        if soc_gain < MIN_EV_CHARGE_CALIBRATION_SOC_GAIN:
+            continue
+        energy_kwh = charge_rate_kw * duration_minutes / 60.0
+        soc_per_kwh = soc_gain / energy_kwh if energy_kwh > 0 else 0.0
+        if not 0.1 <= soc_per_kwh <= 10.0:
+            continue
+        samples.append(
+            {
+                "started_at": active_start_value.isoformat(),
+                "ended_at": timestamp.isoformat(),
+                "duration_minutes": round(duration_minutes, 3),
+                "start_soc_percent": round(start_soc, 3),
+                "end_soc_percent": round(end_soc, 3),
+                "soc_gain_percent": round(soc_gain, 3),
+                "estimated_energy_kwh": round(energy_kwh, 4),
+                "soc_per_kwh": round(soc_per_kwh, 4),
+            }
+        )
+    return samples[-MAX_EV_CHARGE_CALIBRATION_SAMPLES:]
+
+
+def _soc_at_or_before(
+    points: list[tuple[datetime, float]],
+    timestamp: datetime,
+) -> float | None:
+    point = next(((instant, value) for instant, value in reversed(points) if instant <= timestamp), None)
+    if point is None or timestamp - point[0] > timedelta(minutes=15):
+        return None
+    return point[1]
 
 
 def allocate_least_cost_charging(
@@ -359,6 +301,7 @@ def allocate_least_cost_charging(
     earliest_start: datetime | None = None,
     continuous: bool = False,
     force_current: bool = False,
+    continue_current: bool = False,
     max_import_price: float | None = None,
 ) -> EVChargeSchedule:
     """Allocate EV charging to cheapest feasible slots before ready-by.
@@ -367,7 +310,9 @@ def allocate_least_cost_charging(
     price, and any remaining charge power is valued at the grid import price.
     A forced current slot may bypass ``earliest_start`` for immediate minimum-
     SOC recovery or opportunistic low-price charging; all later slots continue
-    to honour the configured charging window.
+    to honour the configured charging window. An observed continuous charging
+    session may also retain its current pre-window slot, but it never bypasses
+    the maximum import price.
     """
     required = max(target_soc_percent - current_soc_percent, 0.0)
     if required == 0:
@@ -389,7 +334,7 @@ def allocate_least_cost_charging(
         if earliest_start is None or slot.valid_at >= earliest_start
     ]
     current_outside_window = bool(
-        force_current
+        (force_current or continue_current)
         and current_slot is not None
         and earliest_start is not None
         and current_slot.valid_at < earliest_start
@@ -406,6 +351,14 @@ def allocate_least_cost_charging(
         or float(slot.import_price) <= max_import_price
         or (force_current and slot is current_slot)
     ]
+    anchor_current = bool(
+        force_current
+        or (
+            continue_current
+            and current_slot is not None
+            and current_slot in price_eligible
+        )
+    )
     ranked = _rank_charging_slots(price_eligible, charge_rate_kw, carbon_weight)
     if continuous:
         required_slots = ceil(required / soc_per_slot)
@@ -428,7 +381,7 @@ def allocate_least_cost_charging(
                 ranked,
                 required_slots=required_slots,
                 interval_minutes=interval_minutes,
-                force_current=force_current,
+                force_current=anchor_current,
             )
     elif force_current and current_slot in ranked:
         ordered = [current_slot, *(slot for slot in ranked if slot is not current_slot)]
@@ -621,14 +574,6 @@ def _solar_surplus_kw(slot: Any) -> float:
     return round(max(pv_kw - load_kw - existing_flexible_load_kw, 0.0), 6)
 
 
-def _clamp(value: float, low: float, high: float) -> float:
-    return min(max(value, low), high)
-
-
-def _parse_datetime(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
 def _float_or_none(value: Any) -> float | None:
     if isinstance(value, str):
         value = value.strip().removesuffix("%").strip()
@@ -640,79 +585,9 @@ def _float_or_none(value: Any) -> float | None:
         return None
 
 
-def _trip_history_events(connected_states: list[Any], soc_states: list[Any]) -> list[tuple[datetime, str, Any]]:
-    events: list[tuple[datetime, str, Any]] = []
-    for state in soc_states:
-        timestamp = _state_timestamp(state)
-        soc = _float_or_none(getattr(state, "state", None))
-        if timestamp is not None and soc is not None:
-            events.append((timestamp, "soc", soc))
-    for state in connected_states:
-        timestamp = _state_timestamp(state)
-        connected = _connected_bool(getattr(state, "state", None))
-        if timestamp is not None and connected is not None:
-            events.append((timestamp, "connected", connected))
-    return sorted(events, key=lambda event: (event[0], 0 if event[1] == "soc" else 1))
-
-
 def _state_timestamp(state: Any) -> datetime | None:
     for attr in ("last_changed", "last_updated"):
         value = getattr(state, attr, None)
         if isinstance(value, datetime):
             return value
     return None
-
-
-def _connected_bool(value: Any) -> bool | None:
-    normalized = str(value).lower().strip().replace(" ", "_").replace("-", "_")
-    if normalized in {
-        "on",
-        "true",
-        "1",
-        "connected",
-        "charging",
-        "home",
-        "yes",
-        "plugged_in",
-        "plugged",
-        "vehicle_connected",
-        "charger_connected",
-        "connected_not_charging",
-        "plugged_in_not_charging",
-        "fully_charged",
-        "charge_complete",
-        "charging_complete",
-        "ready",
-        "present",
-    }:
-        return True
-    if normalized in {
-        "off",
-        "false",
-        "0",
-        "disconnected",
-        "not_connected",
-        "not_home",
-        "idle",
-        "no",
-        "unplugged",
-        "plugged_out",
-        "vehicle_disconnected",
-        "charger_disconnected",
-        "vehicle_not_connected",
-        "charger_not_connected",
-        "not_plugged",
-        "not_plugged_in",
-        "away",
-    }:
-        return False
-    return None
-
-
-def _record_key(record: dict[str, Any]) -> tuple[str, str, float | None, float | None]:
-    return (
-        str(record.get("started_at", "")),
-        str(record.get("ended_at", "")),
-        _float_or_none(record.get("start_soc_percent")),
-        _float_or_none(record.get("end_soc_percent")),
-    )

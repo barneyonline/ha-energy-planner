@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import pytest
 import voluptuous as vol
 
 from custom_components.ha_energy_planner.config_flow import (
@@ -71,9 +72,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
+    CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
@@ -86,6 +87,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
@@ -200,6 +202,7 @@ def _valid_hass() -> FakeHass:
             "sensor.baseline_load",
             "sensor.battery_soc",
             "climate.daikin",
+            "climate.living_zone",
             "input_number.climate_low",
             "input_number.climate_high",
             "person.james",
@@ -213,6 +216,9 @@ def _valid_hass() -> FakeHass:
             "timer.scheduler_guard",
             "select.enphase_profile",
             "switch.shared_charger",
+            "sensor.ev_soc",
+            "binary_sensor.ev_charging",
+            "sensor.ev_target",
             "ai_task.extended_openai_ai_task",
         },
         {
@@ -400,7 +406,12 @@ def test_ev_subentry_allows_its_legacy_aliased_actuator_on_reconfigure() -> None
     errors = _validate_subentry_config(
         hass,
         current_entry,
-        {CONF_EV_SMART_CHARGING: "switch.shared_charger"},
+        {
+            CONF_EV_SMART_CHARGING: "switch.shared_charger",
+            CONF_EV_SOC: "sensor.ev_soc",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+        },
         subentry_type=SUBENTRY_EV,
     )
 
@@ -520,7 +531,7 @@ def test_climate_flow_uses_multi_entity_selector_for_automations() -> None:
         "reorder": False,
     }
     assert schema_fields[CONF_CLIMATE_ZONES].serialize()["selector"]["entity"] == {
-        "domain": ["switch", "input_boolean"],
+        "domain": ["switch", "input_boolean", "climate"],
         "multiple": True,
         "reorder": False,
     }
@@ -1006,7 +1017,7 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
         }
     )
 
-    assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT in schema_keys
+    assert "ev_fallback_target_soc_percent" not in schema_keys
     assert CONF_DEFAULT_READY_BY in schema_keys
     assert CONF_EV_LOW_PRICE_CHARGING_ENABLED in schema_keys
     assert CONF_EV_LOW_PRICE_THRESHOLD in schema_keys
@@ -1126,30 +1137,6 @@ def test_options_flow_rejects_incomplete_climate_scheduler_guard() -> None:
     assert result["errors"] == {"base": "climate_scheduler_guard_pair_required"}
 
 
-def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> None:
-    flow = OptionsFlow(
-        SimpleNamespace(
-            data={},
-            options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90},
-        )
-    )
-    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
-    submission = _settings_submission(
-        flow,
-        policy_overrides={
-            POLICY_STEP_EV_BATTERY_GRID: {
-                CONF_EV_MIN_SOC_PERCENT: 40,
-                CONF_EV_MAX_SOC_PERCENT: 80,
-            }
-        },
-    )
-
-    result = asyncio.run(flow.async_step_init(submission))
-
-    assert result["type"] == "form"
-    assert result["errors"] == {"base": "ev_fallback_outside_bounds"}
-
-
 def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     flow = OptionsFlow(
         SimpleNamespace(
@@ -1172,6 +1159,78 @@ def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "ev_keep_on_requires_persistent_control"}
+
+
+@pytest.mark.parametrize(
+    "zones",
+    [[], ["switch.living_zone"], ["switch.living_zone", "input_boolean.study_zone"]],
+)
+def test_options_flow_rejects_zone_only_preconditioning_without_zone_thermostat(
+    zones: list[str],
+) -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: zones,
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+        options={},
+        subentries={},
+    )
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_CLIMATE: {
+                CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
+            }
+        },
+    )
+
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "form"
+    assert result["errors"] == {
+        "base": "zone_only_preconditioning_requires_climate_zone"
+    }
+
+
+def test_options_flow_accepts_zone_only_preconditioning_with_zone_thermostat() -> None:
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["switch.living_zone", "climate.living_zone"],
+            CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
+            CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
+        },
+        options={},
+        subentries={},
+    )
+    updates: list[dict[str, Any]] = []
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [entry],
+        async_update_entry=lambda entry_arg, **changes: updates.append(changes),
+    )
+    submission = _settings_submission(
+        flow,
+        policy_overrides={
+            POLICY_STEP_CLIMATE: {
+                CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
+            }
+        },
+    )
+
+    result = asyncio.run(flow.async_step_init(submission))
+
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] is True
 
 
 def test_options_flow_uses_ordered_priority_dropdowns() -> None:
@@ -1355,7 +1414,12 @@ def test_central_settings_reject_cross_section_actuator_collisions() -> None:
                 CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
                 CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
             },
-            INPUT_STEP_EV: {CONF_EV_CHARGER: "switch.shared_charger"},
+            INPUT_STEP_EV: {
+                CONF_EV_CHARGER: "switch.shared_charger",
+                CONF_EV_SOC: "sensor.ev_soc",
+                CONF_EV_CHARGING: "binary_sensor.ev_charging",
+                CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+            },
         },
     )
 
@@ -1687,6 +1751,18 @@ def test_validate_config_rejects_wrong_entity_domain() -> None:
     assert errors[CONF_AMBER_IMPORT_PRICE] == "invalid_entity_domain"
 
 
+def test_validate_config_accepts_zone_climate_entity() -> None:
+    hass = _valid_hass()
+    hass.states.entity_ids.add("climate.zone_temperature")
+
+    errors = _validate_config(
+        hass,
+        _valid_input({CONF_CLIMATE_ZONES: ["climate.zone_temperature"]}),
+    )
+
+    assert CONF_CLIMATE_ZONES not in errors
+
+
 def test_validate_config_rejects_empty_ai_service_parts() -> None:
     assert _validate_config(
         _valid_hass(),
@@ -1734,19 +1810,7 @@ def test_default_options_require_intentional_active_mode_enablement() -> None:
     assert DEFAULT_OPTIONS["planner_enabled"] is False
     assert DEFAULT_OPTIONS["dry_run"] is True
     assert DEFAULT_OPTIONS[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is True
-
-
-def test_validate_options_rejects_ev_fallback_outside_soc_bounds() -> None:
-    errors = _validate_options(
-        {
-            **DEFAULT_OPTIONS,
-            CONF_EV_MIN_SOC_PERCENT: 50,
-            CONF_EV_MAX_SOC_PERCENT: 80,
-            CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90,
-        }
-    )
-
-    assert errors[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] == "ev_fallback_outside_bounds"
+    assert DEFAULT_OPTIONS[CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] is False
 
 
 def test_validate_options_rejects_invalid_default_ready_by() -> None:

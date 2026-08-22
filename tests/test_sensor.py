@@ -59,6 +59,13 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "No controls configured"
     )
 
+    enabled_without_actuator = _coordinator(
+        _plan(), options={"climate_control_enabled": True}
+    )
+    assert next(item for item in SENSORS if item.key == "current_state").value_fn(
+        enabled_without_actuator
+    ) == "No controls configured"
+
 
 def test_mode_sensor_exposes_operational_control_mode() -> None:
     description = next(item for item in SENSORS if item.key == "mode")
@@ -77,6 +84,10 @@ def test_mode_sensor_exposes_operational_control_mode() -> None:
     assert description.options == ["review", "active"]
     assert description.value_fn(review) == "review"
     assert description.value_fn(active) == "active"
+
+    active.effective_control = False
+    assert active.active_control is True
+    assert description.value_fn(active) == "review"
 
 
 def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> None:
@@ -267,6 +278,10 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     }
     coordinator = _coordinator(
         plan,
+        options={
+            "climate_control_enabled": True,
+            "ev_control_enabled": True,
+        },
         entry_data={
             "daikin_climate_entity": "climate.home",
             "ev_charger_entity": "switch.ev",
@@ -326,6 +341,72 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert action_attrs["ai_explanation"] == {"available": False, "result": None}
     assert "plan_confidence" not in action_attrs
     assert "confidence" not in action_attrs["actions"][0]
+
+
+def test_operational_summaries_hide_disabled_controls() -> None:
+    now = datetime(2026, 8, 15, tzinfo=UTC)
+    actions = [
+        PlanAction(
+            action_id="climate-1",
+            plan_id="plan-1",
+            execute_not_before=now,
+            execute_not_after=now + timedelta(minutes=5),
+            asset=ActionAsset.DAIKIN,
+            kind=ActionKind.SET_HVAC,
+            desired_state={"hvac_mode": "heat"},
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=0.0,
+            confidence=1.0,
+        ),
+        PlanAction(
+            action_id="enphase-1",
+            plan_id="plan-1",
+            execute_not_before=now + timedelta(minutes=5),
+            execute_not_after=now + timedelta(minutes=10),
+            asset=ActionAsset.ENPHASE,
+            kind=ActionKind.SET_PROFILE,
+            desired_state={"profile": "self_consumption"},
+            hard_constraints=[],
+            reason_codes=[],
+            expected_cost_delta=0.0,
+            confidence=1.0,
+        ),
+    ]
+    coordinator = _coordinator(
+        _plan(
+            actions=actions,
+            device_plans={
+                "climate": {
+                    "current_state_label": "Heat (19 C)",
+                    "next_planned_state_label": "Heat to 21 C",
+                },
+                "enphase": {
+                    "current_state_label": "Self-Consumption",
+                    "next_planned_state_label": "AI Optimisation",
+                },
+            },
+        ),
+        options={
+            "climate_control_enabled": True,
+            "enphase_control_enabled": False,
+        },
+        entry_data={
+            "daikin_climate_entity": "climate.home",
+            "enphase_profile_entity": "select.enphase_profile",
+        },
+    )
+    current = next(item for item in SENSORS if item.key == "current_state")
+    next_actions = next(item for item in SENSORS if item.key == "next_actions")
+
+    assert current.value_fn(coordinator) == "Climate: Heat (19 C)"
+    assert [item["asset"] for item in current.attrs_fn(coordinator)["controlled_assets"]] == [
+        "Climate"
+    ]
+    assert next_actions.value_fn(coordinator) == "Climate: Heat to 21 C"
+    next_attrs = next_actions.attrs_fn(coordinator)
+    assert next_attrs["action_count"] == 1
+    assert [action["action_id"] for action in next_attrs["actions"]] == ["climate-1"]
 
 
 def test_operational_summary_sensors_expose_production_audit_and_support_context() -> None:
@@ -390,16 +471,17 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
         "code": "pv_forecast_entity_unavailable",
         "description": "PV Forecast Entity Unavailable",
     }
-    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert production.value_fn(coordinator) == "Armed"
     assert production.attrs_fn(coordinator)["ready_to_arm"] is True
     assert production.attrs_fn(coordinator)["dry_run_evidence_complete"] is True
-    assert block.value_fn(coordinator) == "Planner Paused"
+    assert block.value_fn(coordinator) == "PV Forecast Entity Unavailable"
     assert block.attrs_fn(coordinator)["reasons"] == [
-        "planner_paused",
         "pv_forecast_entity_unavailable",
         "ev_soc_entity_unavailable",
         "weather_entity_unavailable",
     ]
+    assert block.attrs_fn(coordinator)["available_control_areas"] == ["hvac", "enphase"]
+    assert block.attrs_fn(coordinator)["paused_control_areas"] == ["ev"]
     assert audit.value_fn(coordinator) == "Rejected"
     assert audit.attrs_fn(coordinator)["outcome_count"] == 2
     assert comparison.value_fn(coordinator) == "2 Planned"
@@ -754,6 +836,39 @@ def test_production_readiness_supports_ev_only_installation() -> None:
     assert production.value_fn(coordinator) == "Armed"
 
 
+def test_production_readiness_keeps_unpaused_control_area_available() -> None:
+    coordinator = _coordinator(
+        _plan(),
+        options={
+            "ev_control_enabled": True,
+            "climate_control_enabled": True,
+            "planner_enabled": True,
+            "dry_run": False,
+        },
+        entry_data={
+            "ev_smart_charging_start_entity": "button.ev_start",
+            "daikin_climate_entity": "climate.home",
+        },
+        store_data={
+            "production": {"armed": True, "dry_run_ready_cycles": 3},
+            "control_pause": {"active": True, "assets": ["ev"]},
+        },
+    )
+    production = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "production_readiness")
+
+    attrs = production.attrs_fn(coordinator)
+
+    assert production.value_fn(coordinator) == "Armed"
+    assert attrs["control_paused"] is False
+    assert attrs["available_control_areas"] == ["hvac"]
+    assert attrs["paused_control_areas"] == ["ev"]
+
+    coordinator.store.data["control_pause"] = {"active": True, "assets": ["all"]}
+    block = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "control_block_reason")
+    assert production.value_fn(coordinator) == "Armed - Blocked"
+    assert block.attrs_fn(coordinator)["reason"] == "planner_paused"
+
+
 def test_production_readiness_exposes_startup_auto_recovery_progress() -> None:
     coordinator = _coordinator(
         _plan(),
@@ -904,7 +1019,9 @@ def test_next_actions_entity_attributes_stay_below_recorder_budget() -> None:
     }
     description = next(item for item in SENSORS if item.key == "next_actions")
 
-    attrs = PlannerSensor(_coordinator(plan), description).extra_state_attributes
+    attrs = PlannerSensor(
+        _coordinator(plan, options={"ev_control_enabled": True}), description
+    ).extra_state_attributes
     encoded_size = len(json.dumps(attrs, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     assert encoded_size <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
@@ -1124,7 +1241,10 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
         confidence=0.8,
     )
     plan = _plan(actions=[climate_action, ev_action])
-    coordinator = _coordinator(plan, store_data={"trip_history": {"records": [{"soc": 10}, {"soc": 20}]}})
+    coordinator = _coordinator(
+        plan,
+        store_data={"ev_charge_calibration": {"status": "ready", "soc_per_kwh": 1.8}},
+    )
 
     climate = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "climate_plan")
     ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
@@ -1136,7 +1256,7 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
     assert climate_attrs["planned_actions"][0]["desired_state"]["Target temperature C"] == 22
     assert ev.value_fn(coordinator) == "Schedule EV charging"
     ev_attrs = ev.attrs_fn(coordinator)
-    assert ev_attrs["trip_history_record_count"] == 2
+    assert ev_attrs["charge_calibration"] == {"status": "ready", "soc_per_kwh": 1.8}
     assert ev_attrs["planned_actions"][0]["desired_state"]["Charging windows"] == 20
 
 
@@ -1421,14 +1541,20 @@ def test_ev_charge_state_sensors_handle_live_and_plan_fallbacks() -> None:
     assert next_charge.value_fn(_coordinator(plan)) == "Charging"
 
 
-def test_ev_plan_attributes_include_trip_history_summary() -> None:
+def test_ev_plan_attributes_exclude_raw_charge_calibration_samples() -> None:
     coordinator = _coordinator(
         _plan(),
-        store_data={"trip_history": {"summary": {"observed_days": 3, "daily_soc": [10, 20]}}},
+        store_data={
+            "ev_charge_calibration": {
+                "status": "ready",
+                "soc_per_kwh": 1.8,
+                "samples": [{"soc_gain_percent": 14}],
+            }
+        },
     )
     ev = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ev_charging_plan")
 
-    assert ev.attrs_fn(coordinator)["trip_history_summary"] == {"observed_days": 3, "daily_soc": [10, 20]}
+    assert ev.attrs_fn(coordinator)["charge_calibration"] == {"status": "ready", "soc_per_kwh": 1.8}
 
 
 def test_presence_sensor_exposes_inferred_occupancy_context() -> None:
@@ -1999,6 +2125,12 @@ def _coordinator(
             sensor_module.production_evidence_fingerprint(configured_entry_data, configured_options),
         )
         stored["production"] = production
+    active_control = (
+        configured_options.get("planner_enabled") is True
+        and configured_options.get("dry_run") is False
+        and isinstance(stored.get("production"), dict)
+        and stored["production"].get("armed") is True
+    )
     return SimpleNamespace(
         data=plan,
         store=SimpleNamespace(data=stored),
@@ -2006,12 +2138,8 @@ def _coordinator(
         entry_data=configured_entry_data,
         entry=SimpleNamespace(entry_id="test_entry"),
         hass=hass,
-        active_control=(
-            configured_options.get("planner_enabled") is True
-            and configured_options.get("dry_run") is False
-            and isinstance(stored.get("production"), dict)
-            and stored["production"].get("armed") is True
-        ),
+        active_control=active_control,
+        effective_control=active_control,
         automatic_control_requested=(
             configured_options.get("planner_enabled") is True
             and configured_options.get("dry_run") is False

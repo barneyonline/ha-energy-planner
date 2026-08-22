@@ -51,7 +51,7 @@ class ConstraintValidator:
     def evaluate_plan(self, context: DecisionContext, plan: EnergyPlan) -> list[ConstraintViolation]:
         """Return hard-constraint violations for a plan."""
         violations: list[ConstraintViolation] = []
-        if context.input_health == InputHealth.UNSAFE:
+        if context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             violations.append(_violation("input_health_unsafe", "Required inputs are stale, missing, or invalid."))
         battery_floor = float(self.options[CONF_BATTERY_MIN_SOC_PERCENT])
         if context.current_battery_soc_percent is not None and context.current_battery_soc_percent < battery_floor:
@@ -137,8 +137,8 @@ class ConstraintValidator:
             violations.append(_action_violation(action, "planner_disabled", "Planner execution is disabled."))
         if strict_bool(self.options.get(CONF_DRY_RUN), default=True):
             violations.append(_action_violation(action, "dry_run_enabled", "Dry run is enabled."))
-        if context.input_health != InputHealth.HEALTHY:
-            violations.append(_action_violation(action, "input_health_not_healthy", "Inputs are not healthy."))
+        if context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
+            violations.append(_action_violation(action, "input_health_not_healthy", "Required inputs are unsafe."))
         if not _action_window_contains(action, now):
             violations.append(
                 _action_violation(action, "action_outside_execution_window", "Action is not currently due.")
@@ -237,6 +237,7 @@ class ConstraintValidator:
             )
         if (
             not action.desired_state.get("keep_charger_on")
+            and action.desired_state.get("charging_required_now") is not False
             and context.current_ev_soc_percent is not None
             and float(desired_soc) < context.current_ev_soc_percent
         ):
@@ -296,8 +297,9 @@ class ConstraintValidator:
                     "HVAC minimum cycle/rest period has not elapsed.",
                 )
             )
-        if action.desired_state.get("suppress_automations") and not _comfort_valid(
+        if action.desired_state.get("suppress_automations") and not _hvac_suppression_is_directionally_safe(
             context,
+            desired_mode,
             float(self.options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT]),
         ):
             violations.append(
@@ -443,7 +445,12 @@ def _hvac_min_cycle_active(now: datetime, ownership: OwnershipState, min_cycle: 
     return now < ownership.planner_takeover_started_at + min_cycle
 
 
-def _comfort_valid(context: DecisionContext, tolerance_percent: float) -> bool:
+def _hvac_suppression_is_directionally_safe(
+    context: DecisionContext,
+    desired_mode: Any,
+    tolerance_percent: float,
+) -> bool:
+    """Return whether direct HVAC control moves away from a dangerous extreme."""
     if (
         context.current_hvac_temperature_c is None
         or context.occupied_temperature_low_c is None
@@ -453,7 +460,14 @@ def _comfort_valid(context: DecisionContext, tolerance_percent: float) -> bool:
     tolerance = tolerance_percent / 100.0
     low = context.occupied_temperature_low_c * (1 - tolerance)
     high = context.occupied_temperature_high_c * (1 + tolerance)
-    return low <= context.current_hvac_temperature_c <= high
+    current = float(context.current_hvac_temperature_c)
+    if desired_mode == "heat":
+        return current <= high
+    if desired_mode == "cool":
+        return current >= low
+    if desired_mode == "off":
+        return context.occupancy_state == OccupancyState.AWAY
+    return low <= current <= high
 
 
 def _projected_grid_flows_kw(slot: Any) -> tuple[float | None, float | None]:

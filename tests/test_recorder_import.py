@@ -13,7 +13,6 @@ import custom_components.ha_energy_planner.recorder_import as recorder_import
 from custom_components.ha_energy_planner.const import (
     CONF_DAIKIN_POWER,
     CONF_EV_CHARGING,
-    CONF_EV_CONNECTED,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
 )
@@ -575,96 +574,119 @@ def test_household_forecast_builder_rejects_dense_chunk(monkeypatch: Any) -> Non
         raise AssertionError("dense Recorder history was not rejected")
 
 
-def test_recorder_import_skips_when_recent() -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-    history = {"recorder_imported_at": (now - timedelta(hours=1)).isoformat()}
+def test_ev_charge_calibration_trains_from_recorder_and_skips_recent_model(
+    monkeypatch: Any,
+) -> None:
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    start = now - timedelta(hours=2)
+    monkeypatch.setattr(
+        recorder_import,
+        "_load_recorder_states",
+        lambda *args: (
+            [RecorderState("charging", start), RecorderState("idle", start + timedelta(hours=1))],
+            [RecorderState("50", start), RecorderState("64", start + timedelta(hours=1))],
+        ),
+    )
+    entry_data = {
+        CONF_EV_CHARGING: "sensor.charger_status",
+        CONF_EV_SOC: "sensor.vehicle_soc",
+    }
 
-    updated, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
-            FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            history,
-            now=now,
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), entry_data, {}, charge_rate_kw=7, now=now
+        )
+    )
+    recent, recent_changed, recent_reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), entry_data, model, charge_rate_kw=7, now=now + timedelta(hours=1)
         )
     )
 
-    assert updated is history
-    assert changed is False
-    assert reason == "recorder_import_recent"
+    assert changed is True
+    assert reason == "ev_charge_calibration_ready"
+    assert model["soc_per_kwh"] == 1.8
+    assert recent is model
+    assert recent_changed is False
+    assert recent_reason == "ev_charge_calibration_recent"
 
 
-def test_recorder_import_handles_naive_persisted_timestamp_string() -> None:
+def test_ev_charge_calibration_retains_ready_model_when_retraining_is_insufficient(
+    monkeypatch: Any,
+) -> None:
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    history = {"recorder_imported_at": "2026-06-27T11:00:00"}
+    model = {
+        "model_version": 1,
+        "status": "ready",
+        "trained_at": (now - timedelta(days=2)).isoformat(),
+        "charging_entity_id": "sensor.charger_status",
+        "soc_entity_id": "sensor.vehicle_soc",
+        "charge_rate_kw": 7.0,
+        "soc_per_kwh": 1.8,
+    }
+    monkeypatch.setattr(recorder_import, "_load_recorder_states", lambda *args: ([], []))
 
-    updated, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
+    retained, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
             FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            history,
-            now=now,
-        )
-    )
-
-    assert updated is history
-    assert changed is False
-    assert reason == "recorder_import_recent"
-
-
-def test_recorder_import_handles_naive_persisted_datetime() -> None:
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    history = {"recorder_imported_at": datetime(2026, 6, 27, 11, 0)}
-
-    updated, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
-            FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            history,
-            now=now,
-        )
-    )
-
-    assert updated is history
-    assert changed is False
-    assert reason == "recorder_import_recent"
-
-
-def test_recorder_import_loads_and_compacts_history(monkeypatch: Any) -> None:
-    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
-    start = now - timedelta(hours=4)
-
-    def fake_load(*args: Any) -> tuple[list[RecorderState], list[RecorderState]]:
-        return (
-            [
-                RecorderState("on", start),
-                RecorderState("off", start + timedelta(hours=1)),
-                RecorderState("on", start + timedelta(hours=3)),
-            ],
-            [
-                RecorderState("80", start),
-                RecorderState("79", start + timedelta(hours=1)),
-                RecorderState("72", start + timedelta(hours=3)),
-            ],
-        )
-
-    monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
-
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
-            FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            {},
+            {
+                CONF_EV_CHARGING: "sensor.charger_status",
+                CONF_EV_SOC: "sensor.vehicle_soc",
+            },
+            model,
+            charge_rate_kw=7,
             now=now,
         )
     )
 
     assert changed is True
-    assert reason == "recorder_imported"
-    assert history["records"][0]["start_soc_percent"] == 79.0
-    assert history["records"][0]["end_soc_percent"] == 72.0
+    assert reason == "ev_charge_calibration_insufficient_history_retained"
+    assert retained["status"] == "ready"
+    assert retained["soc_per_kwh"] == 1.8
+    assert retained["last_attempt_status"] == "insufficient_history"
 
 
-def test_recorder_import_prefers_recorder_database_executor(monkeypatch: Any) -> None:
+def test_ev_charge_calibration_requires_inputs_and_retains_model_on_recorder_error(
+    monkeypatch: Any,
+) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {"status": "ready", "soc_per_kwh": 1.8}
+
+    missing = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), {}, existing, charge_rate_kw=7, now=now
+        )
+    )
+    invalid = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(),
+            {CONF_EV_CHARGING: "sensor.charger", CONF_EV_SOC: "sensor.soc"},
+            existing,
+            charge_rate_kw=0,
+            now=now,
+        )
+    )
+    monkeypatch.setattr(
+        recorder_import,
+        "_load_recorder_states",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("recorder down")),
+    )
+    failed = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(),
+            {CONF_EV_CHARGING: "sensor.charger", CONF_EV_SOC: "sensor.soc"},
+            existing,
+            charge_rate_kw=7,
+            now=now,
+        )
+    )
+
+    assert missing == (existing, False, "ev_charge_calibration_entities_not_configured")
+    assert invalid == (existing, False, "ev_charge_calibration_charge_rate_invalid")
+    assert failed == (existing, False, "ev_charge_calibration_unavailable:RuntimeError")
+
+
+def test_ev_calibration_prefers_recorder_database_executor(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     recorder_instance = FakeRecorderInstance()
     hass = FakeHass()
@@ -680,23 +702,24 @@ def test_recorder_import_prefers_recorder_database_executor(monkeypatch: Any) ->
     monkeypatch.setattr(recorder_import, "import_module", fake_import_module)
     monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
 
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
             hass,
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
+            {CONF_EV_CHARGING: "binary_sensor.ev_charging", CONF_EV_SOC: "sensor.ev_soc"},
             {},
+            charge_rate_kw=7,
             now=now,
         )
     )
 
     assert changed is True
-    assert reason == "recorder_imported"
-    assert history["recorder_imported_at"] == now.isoformat()
+    assert reason == "ev_charge_calibration_insufficient_history"
+    assert model["trained_at"] == now.isoformat()
     assert recorder_instance.calls == 1
     assert hass.generic_executor_calls == 0
 
 
-def test_recorder_import_falls_back_to_home_assistant_executor(monkeypatch: Any) -> None:
+def test_ev_calibration_falls_back_to_home_assistant_executor(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     hass = FakeHass()
 
@@ -711,75 +734,44 @@ def test_recorder_import_falls_back_to_home_assistant_executor(monkeypatch: Any)
     monkeypatch.setattr(recorder_import, "import_module", fake_import_module)
     monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
 
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
             hass,
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
+            {CONF_EV_CHARGING: "binary_sensor.ev_charging", CONF_EV_SOC: "sensor.ev_soc"},
             {},
+            charge_rate_kw=7,
             now=now,
         )
     )
 
     assert changed is True
-    assert reason == "recorder_imported"
-    assert history["recorder_imported_at"] == now.isoformat()
+    assert reason == "ev_charge_calibration_insufficient_history"
+    assert model["trained_at"] == now.isoformat()
     assert hass.generic_executor_calls == 1
 
 
-def test_recorder_import_requires_configured_ev_entities() -> None:
+def test_ev_calibration_reports_bounded_history_limit(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(FakeHass(), {}, {"existing": True}, now=now)
-    )
-
-    assert history == {"existing": True}
-    assert changed is False
-    assert reason == "recorder_ev_entities_not_configured"
-
-
-def test_recorder_import_reports_loader_errors(monkeypatch: Any) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
-
-    def fake_load(*args: Any) -> tuple[list[Any], list[Any]]:
-        raise RuntimeError("recorder down")
-
-    monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
-
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
-            FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            {"existing": True},
-            now=now,
-        )
-    )
-
-    assert history == {"existing": True}
-    assert changed is False
-    assert reason == "recorder_import_unavailable:RuntimeError"
-
-
-def test_recorder_import_reports_bounded_history_limit(monkeypatch: Any) -> None:
-    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {"status": "ready", "soc_per_kwh": 1.8}
 
     def fake_load(*args: Any) -> tuple[list[Any], list[Any]]:
         raise recorder_import.EVHistoryLimitError("sensor.ev_soc")
 
     monkeypatch.setattr(recorder_import, "_load_bounded_ev_history", fake_load)
 
-    history, changed, reason = asyncio.run(
-        recorder_import.async_import_ev_trip_history_from_recorder(
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
             FakeHass(),
-            {CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_SOC: "sensor.ev_soc"},
-            {"existing": True},
+            {CONF_EV_CHARGING: "binary_sensor.ev_charging", CONF_EV_SOC: "sensor.ev_soc"},
+            existing,
+            charge_rate_kw=7,
             now=now,
         )
     )
 
-    assert history == {"existing": True}
+    assert model == existing
     assert changed is False
-    assert reason == "recorder_import_history_limit_exceeded"
+    assert reason == "ev_charge_calibration_history_limit_exceeded"
 
 
 def test_bounded_ev_history_splits_dense_chunks_and_compacts(monkeypatch: Any) -> None:
@@ -789,7 +781,7 @@ def test_bounded_ev_history_splits_dense_chunks_and_compacts(monkeypatch: Any) -
 
     def fake_load(
         hass: Any,
-        connected_entity: str,
+        charging_entity: str,
         soc_entity: str,
         chunk_start: datetime,
         chunk_end: datetime,
@@ -798,33 +790,33 @@ def test_bounded_ev_history_splits_dense_chunks_and_compacts(monkeypatch: Any) -
         durations.append(duration)
         count = 4 if duration > timedelta(hours=1) else 3
         step = duration / max(count - 1, 1)
-        connected = [
-            RecorderState("off" if index % 2 == 0 else "on", chunk_start + step * index)
+        charging = [
+            RecorderState("idle" if index % 2 == 0 else "charging", chunk_start + step * index)
             for index in range(count)
         ]
         soc = [
             RecorderState(str(80 - index), chunk_start + step * index)
             for index in range(count)
         ]
-        return connected, soc
+        return charging, soc
 
     monkeypatch.setattr(recorder_import, "MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK", 4)
     monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
 
-    connected, soc = recorder_import._load_bounded_ev_history(
+    charging, soc = recorder_import._load_bounded_ev_history(
         object(),
-        "binary_sensor.ev_connected",
+        "binary_sensor.ev_charging",
         "sensor.ev_soc",
         start,
         end,
     )
 
     assert durations == [timedelta(hours=2), timedelta(hours=1), timedelta(hours=1)]
-    assert len(connected) == 5
+    assert len(charging) == 5
     assert len(soc) == 6
     assert all(
         earlier.last_changed <= later.last_changed
-        for earlier, later in zip(connected, connected[1:], strict=False)
+        for earlier, later in zip(charging, charging[1:], strict=False)
     )
 
 
@@ -834,7 +826,7 @@ def test_bounded_ev_history_reuses_proven_subday_chunk_span(monkeypatch: Any) ->
 
     def fake_load(
         hass: Any,
-        connected_entity: str,
+        charging_entity: str,
         soc_entity: str,
         chunk_start: datetime,
         chunk_end: datetime,
@@ -849,12 +841,12 @@ def test_bounded_ev_history_reuses_proven_subday_chunk_span(monkeypatch: Any) ->
     monkeypatch.setattr(
         recorder_import,
         "_compact_ev_history_chunk",
-        lambda connected, soc: ([], []),
+        lambda charging, soc: ([], []),
     )
 
     recorder_import._load_bounded_ev_history(
         object(),
-        "binary_sensor.ev_connected",
+        "binary_sensor.ev_charging",
         "sensor.ev_soc",
         start,
         start + timedelta(days=30),
@@ -878,13 +870,13 @@ def test_bounded_ev_history_rejects_excessive_compacted_rows(monkeypatch: Any) -
     monkeypatch.setattr(
         recorder_import,
         "_compact_ev_history_chunk",
-        lambda connected, soc: (connected, soc),
+        lambda charging, soc: (charging, soc),
     )
 
     with pytest.raises(recorder_import.EVHistoryLimitError, match="compacted_ev_history"):
         recorder_import._load_bounded_ev_history(
             object(),
-            "binary_sensor.ev_connected",
+            "binary_sensor.ev_charging",
             "sensor.ev_soc",
             start,
             start + timedelta(hours=1),
@@ -899,11 +891,11 @@ def test_bounded_ev_history_rejects_one_hour_chunk_at_query_limit(monkeypatch: A
 
     with pytest.raises(
         recorder_import.EVHistoryLimitError,
-        match="binary_sensor.ev_connected",
+        match="binary_sensor.ev_charging",
     ):
         recorder_import._load_bounded_ev_history(
             object(),
-            "binary_sensor.ev_connected",
+            "binary_sensor.ev_charging",
             "sensor.ev_soc",
             start,
             start + timedelta(hours=1),
@@ -919,7 +911,7 @@ def test_recorder_state_timestamp_rejects_rows_without_datetimes() -> None:
 
 def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> None:
     calls: list[dict[str, Any]] = []
-    connected_states = [object()]
+    charging_states = [object()]
     soc_states = [object()]
 
     def fake_import_module(name: str) -> Any:
@@ -944,7 +936,7 @@ def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> 
                 }
             )
             return {
-                "binary_sensor.ev_connected": connected_states,
+                "binary_sensor.ev_charging": charging_states,
                 "sensor.ev_soc": soc_states,
             }
 
@@ -952,31 +944,49 @@ def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> 
 
     monkeypatch.setattr(recorder_import, "import_module", fake_import_module)
 
-    connected, soc = recorder_import._load_recorder_states(
+    charging, soc = recorder_import._load_recorder_states(
         FakeHass(),
-        "binary_sensor.ev_connected",
+        "binary_sensor.ev_charging",
         "sensor.ev_soc",
         datetime(2026, 6, 1, tzinfo=UTC),
         datetime(2026, 6, 27, tzinfo=UTC),
     )
 
-    assert connected == connected_states
+    assert charging == charging_states
     assert soc == soc_states
-    assert [call["entity_id"] for call in calls] == ["binary_sensor.ev_connected", "sensor.ev_soc"]
+    assert [call["entity_id"] for call in calls] == ["binary_sensor.ev_charging", "sensor.ev_soc"]
     assert all(
         call["limit"] == recorder_import.MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
         for call in calls
     )
 
 
-def test_recorder_import_due_handles_invalid_and_naive_timestamps() -> None:
+def test_ev_calibration_due_handles_invalid_and_naive_timestamps() -> None:
     aware_now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     naive_now = datetime(2026, 6, 27, 12, 0)
+    kwargs = {
+        "charging_entity": "sensor.charger",
+        "soc_entity": "sensor.soc",
+        "charge_rate_kw": 7,
+    }
+    matching = {
+        "model_version": 1,
+        "charging_entity_id": "sensor.charger",
+        "soc_entity_id": "sensor.soc",
+        "charge_rate_kw": 7,
+    }
 
-    assert recorder_import._import_due({}, aware_now) is True
-    assert recorder_import._import_due({"recorder_imported_at": "bad"}, aware_now) is True
-    assert recorder_import._import_due({"recorder_imported_at": 123}, aware_now) is True
-    assert (
-        recorder_import._import_due({"recorder_imported_at": datetime(2026, 6, 26, 0, 0, tzinfo=UTC)}, naive_now)
-        is True
-    )
+    assert recorder_import._ev_charge_calibration_due({}, now=aware_now, **kwargs) is True
+    assert recorder_import._ev_charge_calibration_due(
+        {**matching, "trained_at": "bad"}, now=aware_now, **kwargs
+    ) is True
+    assert recorder_import._ev_charge_calibration_due(matching, now=aware_now, **kwargs) is True
+    assert recorder_import._ev_charge_calibration_due(
+        {**matching, "trained_at": "2026-06-26T00:00:00"}, now=aware_now, **kwargs
+    ) is True
+    assert recorder_import._ev_charge_calibration_due(
+        {**matching, "trained_at": "2026-06-26T00:00:00+00:00"}, now=naive_now, **kwargs
+    ) is True
+    assert recorder_import._ev_charge_calibration_matches(
+        {**matching, "charge_rate_kw": "bad"}, **kwargs
+    ) is False

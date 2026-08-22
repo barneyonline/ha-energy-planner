@@ -53,16 +53,17 @@ PLATFORMS: list[Platform] = []
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register smoke-test helper services."""
 
-    async def force_trip_import_due(call: ServiceCall) -> None:
-        """Mark HA Energy Planner trip Recorder import due for smoke validation."""
+    async def force_ev_calibration_due(call: ServiceCall) -> None:
+        """Mark HA Energy Planner EV calibration due for smoke validation."""
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = getattr(entry, "runtime_data", None)
             store = getattr(coordinator, "store", None)
             if store is None:
                 continue
-            history = dict(store.data.get("trip_history", {}))
-            history["recorder_imported_at"] = "1970-01-01T00:00:00+00:00"
-            await store.async_save_trip_history(history)
+            model = dict(store.data.get("ev_charge_calibration", {}))
+            model["trained_at"] = "1970-01-01T00:00:00+00:00"
+            model.pop("last_attempt_at", None)
+            await store.async_save_ev_charge_calibration(model)
 
     async def seed_due_forecast_snapshot(call: ServiceCall) -> None:
         """Seed one due forecast snapshot for smoke calibration validation."""
@@ -117,6 +118,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def seed_production_evidence(call: ServiceCall) -> None:
         """Bind smoke review evidence to the integration's current production contract."""
+        from custom_components.ha_energy_planner.entry_data import combined_entry_data
         from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
@@ -127,10 +129,28 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             production = dict(store.data.get("production", {}))
             production["dry_run_ready_cycles"] = 3
             production["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
-                coordinator.entry_data,
+                combined_entry_data(coordinator.entry),
                 coordinator.options,
             )
             await store.async_save_production(production)
+
+    async def assert_unsafe_arm_rejected(call: ServiceCall) -> None:
+        """Verify an unsafe manual arm fails without emitting an expected HA error log."""
+        from homeassistant.exceptions import HomeAssistantError
+
+        coordinators = [
+            getattr(entry, "runtime_data", None)
+            for entry in hass.config_entries.async_entries("ha_energy_planner")
+        ]
+        coordinators = [coordinator for coordinator in coordinators if coordinator is not None]
+        if not coordinators:
+            raise RuntimeError("Energy planner coordinator was not loaded")
+        for coordinator in coordinators:
+            try:
+                await coordinator.async_operator_arm_production_control("docker_smoke_reject_unsafe_arm")
+            except HomeAssistantError:
+                continue
+            raise RuntimeError("Unsafe production arm unexpectedly succeeded")
 
     async def capture_persistent_notification(call: ServiceCall) -> None:
         """Capture persistent notification calls for smoke validation."""
@@ -176,11 +196,12 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
     hass.states.async_set("ai_task.smoke_advisor", "ready")
-    hass.services.async_register(DOMAIN, "force_trip_import_due", force_trip_import_due)
+    hass.services.async_register(DOMAIN, "force_ev_calibration_due", force_ev_calibration_due)
     hass.services.async_register(DOMAIN, "seed_due_forecast_snapshot", seed_due_forecast_snapshot)
     hass.services.async_register(DOMAIN, "seed_thermal_model_sample", seed_thermal_model_sample)
     hass.services.async_register(DOMAIN, "seed_enphase_command_rate_limit", seed_enphase_command_rate_limit)
     hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
+    hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -435,6 +456,17 @@ automation:
         event: start
     actions:
       - delay: "00:00:08"
+      # Explicit arming must not turn a persisted request into apparent command
+      # authority before the current plan and reviewed evidence are healthy.
+      - action: fake_planner_test.assert_unsafe_arm_rejected
+      - condition: state
+        entity_id: binary_sensor.energy_planner_armed
+        state: "off"
+      - action: ha_energy_planner.replan
+      - wait_template: >-
+          {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
+        timeout: "00:00:30"
+        continue_on_timeout: false
       - action: fake_planner_test.seed_production_evidence
       - action: ha_energy_planner.arm_production_control
         data:
@@ -578,7 +610,7 @@ automation:
         data:
           entity_id: input_boolean.ev_connected
       - delay: "00:00:05"
-      - action: fake_planner_test.force_trip_import_due
+      - action: fake_planner_test.force_ev_calibration_due
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_number.set_value
@@ -933,6 +965,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "ev_soc_entity": "input_number.ev_soc",
               "ev_charging_entity": "input_boolean.ev_charging",
               "ev_connected_entity": "input_boolean.ev_connected",
+              "ev_smart_charging_target_soc_entity": "input_number.ev_target_soc",
               "ev_charger_start_entity": "input_boolean.ev_smart_charging_start",
               "ev_charger_stop_entity": "input_boolean.ev_smart_charging_stop"
             },
@@ -1218,28 +1251,17 @@ if load_forecast.get("status") not in {"ready", "degraded"} or load_forecast.get
     raise SystemExit(f"Forecast snapshot did not include healthy built-in load evidence: {load_forecast}")
 if "thermal_model" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include thermal model metadata")
-if latest_snapshot.get("trip_history", {}).get("recorder_import_reason") not in {
-    "recorder_ev_entities_not_configured",
-    "recorder_import_recent",
-    "recorder_imported",
-    "recorder_no_new_trips",
-} and not str(latest_snapshot.get("trip_history", {}).get("recorder_import_reason", "")).startswith("recorder_import_unavailable:"):
-    raise SystemExit(f"Unexpected Recorder import reason metadata: {latest_snapshot.get('trip_history')}")
-if not any(
-    snapshot.get("trip_history", {}).get("recorder_import_reason") == "recorder_imported"
-    and snapshot.get("trip_history", {}).get("record_count", 0) >= 1
-    for snapshot in snapshots
-):
-    raise SystemExit("Smoke run did not import a compact EV trip from Home Assistant Recorder")
-trip_records = store_data.get("trip_history", {}).get("records", [])
-if not any(
-    record.get("source") == "recorder"
-    and record.get("start_soc_percent") == 80.0
-    and record.get("end_soc_percent") == 72.0
-    for record in trip_records
-    if isinstance(record, dict)
-):
-    raise SystemExit(f"Recorder import did not persist the expected EV trip record: {trip_records}")
+ev_calibration = latest_snapshot.get("ev_charge_calibration", {})
+if ev_calibration.get("update_reason") not in {
+    "ev_charge_calibration_recent",
+    "ev_charge_calibration_insufficient_history",
+    "ev_charge_calibration_insufficient_history_retained",
+    "ev_charge_calibration_ready",
+} and not str(ev_calibration.get("update_reason", "")).startswith("ev_charge_calibration_unavailable:"):
+    raise SystemExit(f"Unexpected EV calibration metadata: {ev_calibration}")
+stored_ev_calibration = store_data.get("ev_charge_calibration", {})
+if stored_ev_calibration.get("status") not in {"ready", "insufficient_history"}:
+    raise SystemExit(f"Recorder EV calibration was not persisted: {stored_ev_calibration}")
 if "forecast_calibration" not in store_data:
     raise SystemExit("Planner Store did not initialize forecast calibration state")
 forecast_calibration = store_data.get("forecast_calibration", {})

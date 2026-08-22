@@ -34,14 +34,13 @@ from custom_components.ha_energy_planner.coordinator import (
     _bounded_json as coordinator_bounded_json,
 )
 from custom_components.ha_energy_planner.diagnostics import (
+    _ev_charge_calibration_summary,
     _recent_items,
     _store_summary,
-    _trip_history_summary,
 )
 from custom_components.ha_energy_planner.discovery import CapabilityEvidence, DiscoveryReport
 from custom_components.ha_energy_planner.discovery import _split_entity_values as discovery_split_entities
 from custom_components.ha_energy_planner.entity import planner_device_identifier
-from custom_components.ha_energy_planner.ev import update_trip_history_from_values
 from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter, _time_parts
 from custom_components.ha_energy_planner.executor import Executor, _profile_control_service_for_target
 from custom_components.ha_energy_planner.forecasts import _energy_items_as_average_power, _items_from_value, _parse_item
@@ -450,11 +449,13 @@ def test_remaining_ai_diagnostics_replay_and_system_health() -> None:
         "occupied": ["home"],
     }
 
-    assert _trip_history_summary("bad") == {}
+    assert _ev_charge_calibration_summary("bad") == {}
     assert _recent_items({"items": "bad"}, "items", limit=2) == []
-    summary = _store_summary({"trip_history": {"records": "bad"}, "outcomes": "bad"})
+    summary = _store_summary(
+        {"ev_charge_calibration": {"status": "ready", "samples": "bad"}, "outcomes": "bad"}
+    )
     assert summary["outcome_count"] == 0
-    assert summary["trip_history"]["record_count"] == 0
+    assert summary["ev_charge_calibration"] == {"status": "ready"}
 
     replay = ReplayResult(
         "fixture",
@@ -503,10 +504,6 @@ def test_remaining_config_and_adapter_tail_branches(monkeypatch: pytest.MonkeyPa
         "ai_advisor_service"
     ]
 
-    assert (
-        update_trip_history_from_values({"active_trip": {}}, connected=True, soc_percent=80, now=datetime.now(UTC))[1]
-        is False
-    )
     assert DaikinHVACAdapter(SimpleNamespace(states=States({}), services=Services()), {})._automation_entities() == []
 
 
@@ -665,6 +662,8 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert _profile_control_service_for_target({}, "input_select.profile") == "input_select.select_option"
     assert _latest_ai_service_call_at([{"service_called": False}, "bad"]) is None
     assert coordinator_bounded_json({"a": {"b": {"c": {"d": {"e": 1}}}}}) == {"a": {"b": {"c": {"d": "<truncated>"}}}}
+    complete_ev_schedule = {f"field_{index}": index for index in range(22)}
+    assert coordinator_bounded_json(complete_ev_schedule) == complete_ev_schedule
 
     # Input and planner small branches.
     assert InputManager(
