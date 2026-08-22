@@ -362,6 +362,7 @@ class FakeExecutor:
         self.device_restores: list[tuple[str, str]] = []
         self.device_restore_result = SimpleNamespace(result=OutcomeResult.RESTORED)
         self.hvac_releases: list[str] = []
+        self.hvac_release_preserved_zones: list[str | None] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
@@ -380,8 +381,14 @@ class FakeExecutor:
         self.device_restores.append((asset, reason))
         return self.device_restore_result
 
-    async def async_release_hvac_control(self, reason: str) -> None:
+    async def async_release_hvac_control(
+        self,
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> None:
         self.hvac_releases.append(reason)
+        self.hvac_release_preserved_zones.append(preserve_zone_entity_id)
 
     async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
         self.manual_ev_commands.append((enabled, context, dict(self.options), dict(self.entry_data)))
@@ -1372,9 +1379,26 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
     coordinator._manual_override_helper_guard = ("off", datetime.now(UTC) + timedelta(minutes=1))
     callback(FakeEvent("input_boolean.override", "on", "off"))
     assert coordinator._manual_override_helper_guard is None
+
+    manual_changes: list[tuple[str, str | None]] = []
+
+    def capture_manual_change(
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> object:
+        manual_changes.append((reason, preserve_zone_entity_id))
+
+        async def complete() -> None:
+            return None
+
+        return complete()
+
+    coordinator._async_handle_manual_hvac_change = capture_manual_change
     callback(FakeEvent("switch.zone", "on", "off"))
 
     assert len(coordinator.hass.created_tasks) == 2
+    assert manual_changes == [("climate_zone_changed", "switch.zone")]
 
     startup = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     startup.hass = FakeHass({"input_boolean.override": "on"})
@@ -2327,6 +2351,23 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         FakeEvent("switch.zone", "on", "off"),
         now,
         pending_hvac_desired_state={"restore_zones": {"switch.zone": "off"}},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 23},
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "restore_zones": {
+                "climate.zone_temperature": {"target_temperature": 20},
+            }
+        },
     )
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -3502,9 +3543,15 @@ def test_expired_manual_hvac_cleanup_keeps_override_until_helper_turns_off() -> 
 def test_manual_hvac_change_handler_uses_configured_duration() -> None:
     coordinator = _coordinator_for_runtime_services(options={"manual_hvac_override_minutes": 45})
 
-    asyncio.run(coordinator._async_handle_manual_hvac_change("daikin_state_changed"))
+    asyncio.run(
+        coordinator._async_handle_manual_hvac_change(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
+    )
 
-    assert coordinator.overrides[-1].reason == "daikin_state_changed"
+    assert coordinator.overrides[-1].reason == "climate_zone_changed"
+    assert coordinator.executor.hvac_release_preserved_zones == ["climate.bedrooms"]
     assert coordinator.refresh_requested == 1
 
 

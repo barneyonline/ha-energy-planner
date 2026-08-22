@@ -310,11 +310,21 @@ class DryRunPlanner:
                 and float(current_slot.import_price) <= float(self.options[CONF_EV_LOW_PRICE_THRESHOLD])
                 and (max_import_price is None or float(current_slot.import_price) <= max_import_price)
             )
+            continuous_charging = bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True))
+            continue_current_charging = continuous_charging and context.ev_charging is True
             available_charge_hours = max((ready_by - earliest_start).total_seconds() / 3600, 0.0)
             if (
-                (emergency_charge or low_price_charge)
-                and current_slot is not None
+                current_slot is not None
                 and current_slot.valid_at < earliest_start
+                and (
+                    emergency_charge
+                    or low_price_charge
+                    or (
+                        continue_current_charging
+                        and current_slot.import_price is not None
+                        and (max_import_price is None or float(current_slot.import_price) <= max_import_price)
+                    )
+                )
             ):
                 available_charge_hours += int(self.options[CONF_PLANNING_INTERVAL_MINUTES]) / 60.0
             requested_target_soc = float(context.ev_target_soc_percent)
@@ -334,8 +344,6 @@ class DryRunPlanner:
                 + available_charge_hours * charge_rate_kw * soc_per_kwh,
             )
             target_infeasible = max_attainable_soc_percent + 0.000001 < target_soc
-            continuous_charging = bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True))
-            continue_current_charging = continuous_charging and context.ev_charging is True
             schedule = allocate_least_cost_charging(
                 context.slots,
                 current_soc_percent=context.current_ev_soc_percent,
