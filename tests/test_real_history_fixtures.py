@@ -51,7 +51,7 @@ def test_real_history_profile_reports_missing_fixture_names() -> None:
 
     assert validator._profile_missing_names("ha-energy-planner-history-v1-real", _fixtures()) == [
         "real_daikin_thermal_history",
-        "real_mini_trip_history",
+        "real_ev_charge_calibration",
         "real_pv_forecast_accuracy",
     ]
 
@@ -60,11 +60,11 @@ def test_real_history_profile_accepts_required_source_entities() -> None:
     validator = _load_validator()
     fixtures = [
         {
-            "kind": "ev_trip_history",
-            "name": "real_mini_trip_history",
+            "kind": "ev_charge_calibration",
+            "name": "real_ev_charge_calibration",
             "source_entity_ids": {
-                "ev_connected": "binary_sensor.mini_connected",
-                "ev_soc": "sensor.mini_soc",
+                "ev_charging": "sensor.charger_status",
+                "ev_soc": "sensor.vehicle_soc",
             },
         },
         {
@@ -89,11 +89,11 @@ def test_real_history_profile_reports_missing_source_entities() -> None:
     validator = _load_validator()
     fixtures = [
         {
-            "kind": "ev_trip_history",
-            "name": "real_mini_trip_history",
+            "kind": "ev_charge_calibration",
+            "name": "real_ev_charge_calibration",
             "source_entity_ids": {
-                "ev_connected": "<redacted>",
-                "ev_soc": "sensor.mini_soc",
+                "ev_charging": "<redacted>",
+                "ev_soc": "sensor.vehicle_soc",
             },
         },
         {
@@ -109,19 +109,19 @@ def test_real_history_profile_reports_missing_source_entities() -> None:
 
     assert errors["missing_source_entities"] == [
         {"name": "real_daikin_thermal_history", "missing_source_entity_keys": ["indoor_temperature", "hvac_power"]},
-        {"name": "real_mini_trip_history", "missing_source_entity_keys": ["ev_connected"]},
+        {"name": "real_ev_charge_calibration", "missing_source_entity_keys": ["ev_charging"]},
     ]
 
 
-def test_ev_history_export_builds_sanitized_fixture(monkeypatch: Any) -> None:
+def test_ev_calibration_export_builds_sanitized_fixture(monkeypatch: Any) -> None:
     exporter = _load_exporter()
 
     def fake_request_json(*args: Any, **kwargs: Any) -> list[list[dict[str, Any]]]:
         return [
             [
                 {
-                    "entity_id": "binary_sensor.mini_connected",
-                    "state": "unplugged",
+                    "entity_id": "sensor.charger_status",
+                    "state": "charging",
                     "last_changed": "2026-06-27T01:00:00+00:00",
                     "last_updated": "2026-06-27T01:00:00+00:00",
                     "attributes": {"device_tracker_token": "secret"},
@@ -129,7 +129,7 @@ def test_ev_history_export_builds_sanitized_fixture(monkeypatch: Any) -> None:
             ],
             [
                 {
-                    "entity_id": "sensor.mini_soc",
+                    "entity_id": "sensor.vehicle_soc",
                     "state": "78%",
                     "last_changed": "2026-06-27T01:00:00+00:00",
                     "last_updated": "2026-06-27T01:00:00+00:00",
@@ -140,23 +140,24 @@ def test_ev_history_export_builds_sanitized_fixture(monkeypatch: Any) -> None:
 
     monkeypatch.setattr(exporter, "_request_json", fake_request_json)
 
-    fixture = exporter._ev_trip_history_fixture(
+    fixture = exporter._ev_charge_calibration_fixture(
         Namespace(
             ha_url="http://ha.local:8123",
             token="token",
-            connected_entity="binary_sensor.mini_connected",
-            soc_entity="sensor.mini_soc",
-            name="real_mini_trip_history",
-            expected_min_records=1,
+            charging_entity="sensor.charger_status",
+            soc_entity="sensor.vehicle_soc",
+            charge_rate_kw=7.0,
+            name="real_ev_charge_calibration",
+            expected_min_samples=1,
             redact_key=["serial"],
         ),
         exporter._parse_datetime("2026-06-27T00:00:00+00:00"),
         exporter._parse_datetime("2026-06-27T02:00:00+00:00"),
     )
 
-    assert fixture["kind"] == "ev_trip_history"
-    assert fixture["source_entity_ids"]["ev_connected"] == "binary_sensor.mini_connected"
-    assert fixture["states"]["ev_connected"][0]["attributes"] == {}
+    assert fixture["kind"] == "ev_charge_calibration"
+    assert fixture["source_entity_ids"]["ev_charging"] == "sensor.charger_status"
+    assert fixture["states"]["ev_charging"][0]["attributes"] == {}
     assert fixture["states"]["ev_soc"][0]["attributes"] == {}
 
 

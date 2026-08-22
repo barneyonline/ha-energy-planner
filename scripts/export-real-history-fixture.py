@@ -58,11 +58,12 @@ def main() -> int:
     )
     subparsers = parser.add_subparsers(dest="kind", required=True)
 
-    ev = subparsers.add_parser("ev-trip-history", help="Export MINI/EV SOC and connection history.")
-    ev.add_argument("--name", default="real_mini_trip_history")
-    ev.add_argument("--connected-entity", required=True)
+    ev = subparsers.add_parser("ev-charge-calibration", help="Export EV SOC and charging history.")
+    ev.add_argument("--name", default="real_ev_charge_calibration")
+    ev.add_argument("--charging-entity", required=True)
     ev.add_argument("--soc-entity", required=True)
-    ev.add_argument("--expected-min-records", type=int, default=1)
+    ev.add_argument("--charge-rate-kw", type=float, required=True)
+    ev.add_argument("--expected-min-samples", type=int, default=1)
 
     thermal = subparsers.add_parser("thermal-history", help="Export Daikin power and temperature history.")
     thermal.add_argument("--name", default="real_daikin_thermal_history")
@@ -119,8 +120,8 @@ def main() -> int:
 
 def _build_fixture(args: argparse.Namespace) -> dict[str, Any]:
     start, end = _history_window(args)
-    if args.kind == "ev-trip-history":
-        return _ev_trip_history_fixture(args, start, end)
+    if args.kind == "ev-charge-calibration":
+        return _ev_charge_calibration_fixture(args, start, end)
     if args.kind == "thermal-history":
         return _thermal_history_fixture(args, start, end)
     if args.kind == "forecast-accuracy":
@@ -128,22 +129,23 @@ def _build_fixture(args: argparse.Namespace) -> dict[str, Any]:
     raise ValueError(f"Unsupported fixture kind: {args.kind!r}")
 
 
-def _ev_trip_history_fixture(args: argparse.Namespace, start: datetime, end: datetime) -> dict[str, Any]:
+def _ev_charge_calibration_fixture(args: argparse.Namespace, start: datetime, end: datetime) -> dict[str, Any]:
     entity_map = {
-        "ev_connected": args.connected_entity,
+        "ev_charging": args.charging_entity,
         "ev_soc": args.soc_entity,
     }
     histories = _history_by_key(args, start, end, entity_map, {})
     return {
-        "kind": "ev_trip_history",
+        "kind": "ev_charge_calibration",
         "name": args.name,
         "exported_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
         "start": start.isoformat(),
         "end": end.isoformat(),
-        "connected_key": "ev_connected",
+        "charging_key": "ev_charging",
         "soc_key": "ev_soc",
+        "charge_rate_kw": args.charge_rate_kw,
         "source_entity_ids": entity_map,
-        "expected_min_records": args.expected_min_records,
+        "expected_min_samples": args.expected_min_samples,
         "states": histories,
     }
 

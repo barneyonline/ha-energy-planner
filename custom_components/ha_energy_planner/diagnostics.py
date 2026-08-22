@@ -153,10 +153,12 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         "ownership": store_data.get("ownership", {}),
         "production": store_data.get("production", {}),
         "control_pause": store_data.get("control_pause", {}),
+        "ev_charge_calibration": _ev_charge_calibration_summary(
+            store_data.get("ev_charge_calibration", {})
+        ),
         "forecast_calibration": store_data.get("forecast_calibration", {}),
         "built_in_load_forecast": _load_forecast_summary(store_data.get("built_in_load_forecast", {})),
         "thermal_model": store_data.get("thermal_model", {}),
-        "trip_history": _trip_history_summary(store_data.get("trip_history", {})),
     }
 
 
@@ -167,13 +169,10 @@ def _load_forecast_summary(value: Any) -> dict[str, Any]:
     return {key: item for key, item in value.items() if key != "profiles"}
 
 
-def _trip_history_summary(value: Any) -> dict[str, Any]:
+def _ev_charge_calibration_summary(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
-    records = value.get("records", [])
-    return {key: item for key, item in value.items() if key != "records"} | {
-        "record_count": len(records) if isinstance(records, list) else 0,
-    }
+    return {key: item for key, item in value.items() if key != "samples"}
 
 
 def _recent_items(store_data: dict[str, Any], key: str, *, limit: int) -> list[Any]:

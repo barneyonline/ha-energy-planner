@@ -53,8 +53,9 @@ Status as of 2026-08-15.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Fallback Target SOC, Ready by, and opportunistic-charging policy are configured
-  centrally. Their retired number, time, and switch entities, the duplicate
+  Ready by and opportunistic-charging policy are configured centrally. The EV
+  mapping requires SOC, charging feedback, and the authoritative vehicle target
+  SOC entity. Retired number, time, and switch entities, the duplicate
   keep-charger-on switch, the fixed-duration pause buttons, the manual EV
   start/stop buttons, and the connected helper are removed from the entity
   registry during setup. Keep charger on remains editable in EV settings and
@@ -118,14 +119,13 @@ Status as of 2026-08-15.
   serialized by the coordinator. Regular planner-owned schedule stops use the
   same proven-safe release contract as synthetic safety stops, and unowned stop
   commands cannot create a restorable takeover baseline.
-- EV target SOC can be sourced from an external vehicle sensor, with the native
-  number retained as the fallback. Unavailable, nonnumeric, and out-of-range
-  external values use that fallback without degrading active control while
-  remaining visible as advisory input evidence. Preconditioning keep-on is
-  suppressed while this fallback is active because the vehicle-enforced target
-  cannot be verified. When no connected-state entity
-  is mapped, a native EV-device helper switch provides connected state and
-  drives the same compact trip-history path.
+- EV target SOC comes only from the required mapped vehicle sensor. Missing,
+  unavailable, nonnumeric, or out-of-range target evidence blocks EV planning
+  instead of substituting a planner-derived target. The target is bounded only
+  by the configured minimum and maximum SOC safety policy. Stop-only schedules
+  remain valid when current SOC already exceeds that target. The connected-state
+  entity remains optional because charging feedback independently confirms
+  commanded power delivery.
 - The optional preconditioning policy keeps the charger control enabled after
   target SOC is reached while preserving manual-stop and execution safety-gate
   precedence. Only the actual after-target preconditioning action selects the
@@ -158,7 +158,14 @@ Status as of 2026-08-15.
   explicitly forced current slot is the bounded exception: minimum-SOC recovery
   and enabled below-threshold opportunistic charging may claim the current slot
   before the configured earliest start, while any remaining continuous window
-  stays within the configured hours.
+  stays within the configured hours. Once charging feedback confirms an active
+  continuous session, replanning may retain its current pre-window slot so
+  forecast repricing cannot fragment it; the configured maximum import price
+  remains authoritative. Completed Recorder
+  charging sessions of at least 30 minutes calibrate effective SOC gained per
+  kWh from SOC gain, configured charger power, and active duration. At least 60
+  minutes and 3% gain are required; the learned rate carries a 10% conservative
+  margin and the configured 2% estimate is used only while history is insufficient.
 - Multiple EVs are supported as separate named config entries. Entry-scoped
   storage isolates plans, history, production state, pauses, and audit records;
   services require `config_entry_id` when multiple runtimes are loaded. Each
@@ -247,13 +254,13 @@ Status as of 2026-08-15.
   fixture names, mismatched fixture kind/value-kind metadata, and missing
   exported source entity metadata before full live-schema completion is
   claimed.
-- Executable real-history fixtures cover Recorder-style MINI trip replay,
+- Executable real-history fixtures cover Recorder-style EV charge calibration,
   Daikin thermal-model replay, and rolling-origin external-PV forecast accuracy
   through `scripts/validate-real-history-fixture.py`. Forecast evidence is
   matched by issue/valid time, reports MAE and RMSE for near/day/long lead-time
   buckets, and must outperform a no-lookahead persistence baseline.
   `scripts/export-real-history-fixtures.sh` wraps sanitized Home Assistant
-  history export for the required `real_mini_trip_history`,
+  history export for the required `real_ev_charge_calibration`,
   `real_daikin_thermal_history` and `real_pv_forecast_accuracy` fixtures, and the
   `ha-energy-planner-history-v1-real` profile verifies exported source entity
   metadata before real-history completion is claimed.
@@ -288,8 +295,8 @@ Status as of 2026-08-15.
   previews, weather camelCase forecast attributes reflected in compact plan previews,
   PV forecast calibration updated from a time-aligned observed-power entity,
   built-in load health/evidence stored without raw history, HVAC thermal-model state updated from Home Assistant climate and
-  power entity samples, Recorder import metadata, and a compact EV trip
-  imported from Home Assistant Recorder state history. It also verifies
+  power entity samples, Recorder import metadata, and compact EV charge-rate
+  calibration state. It also verifies
   bounded forecast-snapshot action metadata for the active EV schedule with
   runtime ready-by override, an active EV schedule allocated to a negative
   import-price slot, and an Enphase arbitrage action backed by deterministic
@@ -390,9 +397,9 @@ Status as of 2026-08-15.
   startup leaves the persisted model and training cadence unchanged. The next
   coordinator refresh after the source appears can therefore train immediately
   while planning remains fail-closed during the transient absence.
-- EV trip-history targeting uses an explicit three-observed-day minimum. Before
-  that threshold, planning uses the configured fallback Target SOC and remains
-  otherwise operational.
+- EV charging calibration retrains from the latest 30 days of Recorder history
+  no more than daily. Failed or insufficient retraining retains the last ready
+  model, while entity or configured charger-power changes force retraining.
 - Config-entry version 2 migrates only the legacy measured-load mapping to
   `household_load_entity`; a legacy forecast-only mapping is removed and active
   control remains fail-closed until a real measured sensor is selected. The
@@ -418,29 +425,24 @@ Status as of 2026-08-15.
   a non-zero action score when the forecast varies, and EV allocation blends
   normalized effective cost with grid emissions according to configured
   priority order while accounting for conservative solar displacement.
-- EV next-day demand uses configured fallback until enough local trip history is
-  recorded. Future disconnected trips are compactly stored from EV connection
-  and SOC state transitions, and older trips are opportunistically imported
-  from Home Assistant Recorder when EV SOC and connection entities are mapped.
-  Recorder history reads use Recorder's database executor when available and
-  fall back to Home Assistant's generic executor only when Recorder is absent.
-  The Recorder compactor and current-state paths accept common MINI-like
-  connected/disconnected states, connected-not-charging states, and SOC strings
-  with percent units or comma decimals. Only compact trip records are kept in
-  `Store`. Configured charging feedback also accepts connector-status sensors;
+- EV energy demand uses the live vehicle target and a persisted compact
+  charge-rate calibration. Recorder history reads use Recorder's database
+  executor when available and fall back to Home Assistant's generic executor
+  only when Recorder is absent. Calibration accepts common charger and
+  connector-status states plus SOC strings with percent units or comma decimals;
+  only bounded session samples and aggregate model values are kept in `Store`.
+  Learned rates are accepted only when the stored charging entity, SOC entity,
+  and configured charger power match the current EV configuration; otherwise
+  planning uses the conservative bootstrap rate while retraining.
+  Configured charging feedback also accepts connector-status sensors;
   `SUSPENDED_EV` and `SUSPENDED_EVSE` are normalized as connected but not
   actively charging, so momentary stop controls are not called after a vehicle
   has already suspended power delivery. Disconnection remains insufficient
   evidence for a safe momentary stop.
-  Summaries use max daily SOC consumption for the ready-by target when
-  sufficient. Persisted Recorder import timestamps tolerate malformed or
-  timezone-naive older values without raising through planner refresh. Docker
-  smoke coverage now validates one Recorder-imported EV trip from Home
-  Assistant state history, and real-history replay fixtures validate broader
-  MINI-like state names and SOC formats outside the running HA smoke container.
-- Live trip updates preserve Recorder import metadata and successful empty
-  imports advance it, so installations without recent trips do not repeat a
-  30-day Recorder query on every planner refresh.
+  Persisted Recorder import timestamps tolerate malformed or timezone-naive
+  older values without raising through planner refresh. Docker smoke coverage
+  validates the compact calibration lifecycle, and real-history replay fixtures
+  validate charging-state and SOC formats outside the running HA smoke container.
 - HVAC active planning is conservative: away mode off is preserved outside a
   persisted `precondition -> pre_peak_coast -> peak_coast -> release` tariff lifecycle. Every
   valid tariff slot in the configured 1-48 hour horizon is scanned, with the
@@ -621,7 +623,6 @@ Status as of 2026-08-15.
   reason inputs are bounded and restricted to compact audit codes.
 - The `set_ev_ready_by` service validates local time input, normalizes accepted
   values to `HH:MM`, persists the central EV setting, and queues planner work.
-  The `set_ev_target_soc` service validates and persists a percentage target.
   Ready by, opportunistic charging, and its import-price threshold are exposed
   only in EV settings; setup removes their obsolete duplicate entities without
   changing the stored option values.

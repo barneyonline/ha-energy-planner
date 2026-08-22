@@ -72,7 +72,6 @@ from .const import (
     CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
@@ -375,7 +374,6 @@ _POLICY_SECTION_FIELDS = {
         CONF_BATTERY_MAX_DISCHARGE_KW,
         CONF_EV_MIN_SOC_PERCENT,
         CONF_EV_MAX_SOC_PERCENT,
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -472,7 +470,6 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
         CONF_DEFAULT_READY_BY,
         CONF_EV_MIN_SOC_PERCENT,
         CONF_EV_MAX_SOC_PERCENT,
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -555,9 +552,6 @@ def _option_selector(field: str) -> Any:
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_EV_MAX_SOC_PERCENT: NumberSelector(
-            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
-        ),
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_EV_CHARGE_RATE_KW: NumberSelector(
@@ -670,7 +664,7 @@ def _option_selector(field: str) -> Any:
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
-    VERSION = 2
+    VERSION = 4
 
     async def async_step_user(
         self,
@@ -890,11 +884,8 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     errors: dict[str, str] = {}
     ev_min = float(user_input[CONF_EV_MIN_SOC_PERCENT])
     ev_max = float(user_input[CONF_EV_MAX_SOC_PERCENT])
-    ev_fallback = float(user_input[CONF_EV_FALLBACK_TARGET_SOC_PERCENT])
     if ev_min > ev_max:
         errors["base"] = "ev_min_above_max"
-    elif not ev_min <= ev_fallback <= ev_max:
-        errors[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = "ev_fallback_outside_bounds"
     if not _ready_by_valid(str(user_input[CONF_DEFAULT_READY_BY])):
         errors[CONF_DEFAULT_READY_BY] = "invalid_ready_by"
     earliest_start = str(user_input[CONF_EV_EARLIEST_START])
@@ -973,6 +964,14 @@ def _validate_subentry_config(
         {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))},
     ):
         errors.setdefault("base", "ev_keep_on_requires_persistent_control")
+    if subentry_type == SUBENTRY_EV and any(user_input.values()):
+        for required_key in (
+            CONF_EV_SOC,
+            CONF_EV_CHARGING,
+            CONF_EV_SMART_CHARGING_TARGET_SOC,
+        ):
+            if not user_input.get(required_key):
+                errors.setdefault(required_key, "ev_planning_sensor_required")
     return errors
 
 

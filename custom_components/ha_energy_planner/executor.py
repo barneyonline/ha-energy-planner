@@ -1012,6 +1012,7 @@ class Executor:
         *,
         plan_id: str = "manual_hvac_release",
         action: Any | None = None,
+        preserve_zone_entity_id: str | None = None,
     ) -> ActionOutcome:
         """Release only planner-owned HVAC automation and zone state."""
         now = dt_util.utcnow()
@@ -1019,6 +1020,12 @@ class Executor:
         hvac_control = dict(ownership.get("hvac_control", {}))
         automation_states = dict(ownership.get("climate_automations", {}))
         zone_states = dict(hvac_control.get("zone_states", {}))
+        if preserve_zone_entity_id:
+            zone_states.pop(preserve_zone_entity_id, None)
+            # A failed release may retain unresolved ownership for a later retry.
+            # Do not retain the user-controlled zone or that retry would overwrite
+            # the manual target that caused this release.
+            hvac_control["zone_states"] = zone_states
         had_hvac_ownership = bool(
             automation_states
             or zone_states
