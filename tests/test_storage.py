@@ -156,7 +156,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
         "outcomes": None,
         "forecast_snapshots": {"bad": "shape"},
         "ownership": None,
-        "trip_history": [],
+        "ev_charge_calibration": [],
         "built_in_load_forecast": [],
         "future_metadata": {"kept": True},
     }
@@ -168,7 +168,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
     assert store.data["outcomes"] == []
     assert store.data["forecast_snapshots"] == []
     assert store.data["ownership"] == {}
-    assert store.data["trip_history"] == {}
+    assert store.data["ev_charge_calibration"] == {}
     assert store.data["built_in_load_forecast"] == {}
     assert store.data["future_metadata"] == {"kept": True}
 
@@ -269,7 +269,7 @@ def test_store_delay_save_batches_multiple_mutations(monkeypatch: object) -> Non
     async def mutate_store() -> None:
         async with store.async_delay_save():
             await store.async_save_ownership({"enphase_profile": "AI Optimisation"})
-            await store.async_save_trip_history({"records": [{"soc": 50}]})
+            await store.async_save_ev_charge_calibration({"status": "ready"})
             await store.async_save_discovery({"ok": True})
 
     asyncio.run(mutate_store())
@@ -277,7 +277,7 @@ def test_store_delay_save_batches_multiple_mutations(monkeypatch: object) -> Non
     assert FakeStore.save_count == 1
     assert FakeStore.saved is not None
     assert FakeStore.saved["ownership"] == {"enphase_profile": "AI Optimisation"}
-    assert FakeStore.saved["trip_history"] == {"records": [{"soc": 50}]}
+    assert FakeStore.saved["ev_charge_calibration"] == {"status": "ready"}
     assert FakeStore.saved["discovery"] == {"ok": True}
 
 
@@ -298,14 +298,14 @@ def test_store_forced_flush_persists_inside_delay_context(monkeypatch: object) -
             assert FakeStore.save_count == 1
             assert FakeStore.saved is not None
             assert FakeStore.saved["ownership"] == {"ev": "provisional"}
-            await store.async_save_trip_history({"records": [{"soc": 50}]})
+            await store.async_save_ev_charge_calibration({"status": "ready"})
             assert FakeStore.save_count == 1
 
     asyncio.run(mutate_store())
 
     assert FakeStore.save_count == 2
     assert FakeStore.saved is not None
-    assert FakeStore.saved["trip_history"] == {"records": [{"soc": 50}]}
+    assert FakeStore.saved["ev_charge_calibration"] == {"status": "ready"}
 
 
 def test_store_skips_unchanged_setter_writes(monkeypatch: object) -> None:
@@ -394,7 +394,7 @@ def test_store_flushes_mutation_that_arrives_during_inflight_save(monkeypatch: o
         store = PlannerStore(object())
         first = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
         await BarrierStore.started.wait()
-        second = asyncio.create_task(store.async_save_trip_history({"records": [{"soc": 50}]}))
+        second = asyncio.create_task(store.async_save_ev_charge_calibration({"status": "ready"}))
         await asyncio.sleep(0)
         BarrierStore.release.set()
         await asyncio.gather(first, second)
@@ -403,9 +403,9 @@ def test_store_flushes_mutation_that_arrives_during_inflight_save(monkeypatch: o
     snapshots = asyncio.run(save_concurrently())
 
     assert len(snapshots) == 2
-    assert snapshots[0]["trip_history"] == {}
+    assert snapshots[0]["ev_charge_calibration"] == {}
     assert snapshots[-1]["ownership"] == {"ev": "owned"}
-    assert snapshots[-1]["trip_history"] == {"records": [{"soc": 50}]}
+    assert snapshots[-1]["ev_charge_calibration"] == {"status": "ready"}
 
 
 def test_store_concurrent_failure_retains_later_generation_for_retry(monkeypatch: object) -> None:
@@ -437,7 +437,7 @@ def test_store_concurrent_failure_retains_later_generation_for_retry(monkeypatch
         first = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
         await BarrierFailsSecondStore.started.wait()
         second = asyncio.create_task(
-            store.async_save_trip_history({"records": [{"soc": 50}]})
+            store.async_save_ev_charge_calibration({"status": "ready"})
         )
         await asyncio.sleep(0)
         BarrierFailsSecondStore.release.set()
@@ -449,7 +449,7 @@ def test_store_concurrent_failure_retains_later_generation_for_retry(monkeypatch
     assert sum(isinstance(result, OSError) for result in results) == 1
     assert attempts == 3
     assert snapshots[-1]["ownership"] == {"ev": "owned"}
-    assert snapshots[-1]["trip_history"] == {"records": [{"soc": 50}]}
+    assert snapshots[-1]["ev_charge_calibration"] == {"status": "ready"}
 
 
 def test_store_defers_inflight_flush_while_delay_context_is_active(
@@ -484,7 +484,7 @@ def test_store_defers_inflight_flush_while_delay_context_is_active(
 
         async def delayed_writer() -> None:
             async with store.async_delay_save():
-                await store.async_save_trip_history({"records": [{"soc": 50}]})
+                await store.async_save_ev_charge_calibration({"status": "ready"})
                 BarrierStore.delayed_mutation_ready.set()
                 await BarrierStore.release_delay.wait()
 
@@ -499,8 +499,8 @@ def test_store_defers_inflight_flush_while_delay_context_is_active(
     snapshots = asyncio.run(save_with_overlapping_delay())
 
     assert len(snapshots) == 2
-    assert snapshots[0]["trip_history"] == {}
-    assert snapshots[1]["trip_history"] == {"records": [{"soc": 50}]}
+    assert snapshots[0]["ev_charge_calibration"] == {}
+    assert snapshots[1]["ev_charge_calibration"] == {"status": "ready"}
 
 
 def test_store_persists_command_rate_limits(monkeypatch: object) -> None:

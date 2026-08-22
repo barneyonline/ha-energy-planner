@@ -13,10 +13,12 @@ from .const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
-    ATTR_TARGET_SOC,
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
     CONF_INSTANCE_NAME,
@@ -37,7 +39,6 @@ from .const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
-    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .type_defs import EnergyPlannerConfigEntry
@@ -47,19 +48,52 @@ if TYPE_CHECKING:
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _DUPLICATE_ENTITY_ID_MIGRATIONS = {"switch.ai_ai_enabled": "switch.ai_enabled"}
+_LEGACY_DEFAULT_EV_SOC_PER_KWH = 5.0
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Migrate measured-load configuration without trusting forecast entities."""
-    if getattr(entry, "version", 1) > 2:
+    version = getattr(entry, "version", 1)
+    if version > 4:
         return False
     data = dict(entry.data)
     if not data.get(CONF_HOUSEHOLD_LOAD) and data.get(CONF_BASELINE_LOAD_OBSERVED):
         data[CONF_HOUSEHOLD_LOAD] = data[CONF_BASELINE_LOAD_OBSERVED]
     data.pop(CONF_BASELINE_LOAD_FORECAST, None)
     data.pop(CONF_BASELINE_LOAD_OBSERVED, None)
-    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    options = dict(entry.options)
+    try:
+        uses_legacy_ev_rate = (
+            float(options.get(CONF_EV_SOC_PER_KWH, _LEGACY_DEFAULT_EV_SOC_PER_KWH))
+            == _LEGACY_DEFAULT_EV_SOC_PER_KWH
+        )
+    except (TypeError, ValueError):
+        uses_legacy_ev_rate = False
+    if version < 3 and uses_legacy_ev_rate:
+        options[CONF_EV_SOC_PER_KWH] = DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
+    if version < 4:
+        if _legacy_ev_configuration_requires_target(entry):
+            return False
+        options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=4)
     return True
+
+
+def _legacy_ev_configuration_requires_target(entry: EnergyPlannerConfigEntry) -> bool:
+    """Return whether a configured legacy EV is missing its vehicle target entity."""
+    sections = [dict(getattr(entry, "data", {}))]
+    sections.extend(
+        dict(getattr(subentry, "data", {}))
+        for subentry in getattr(entry, "subentries", {}).values()
+    )
+    target_configured = any(section.get(CONF_EV_SMART_CHARGING_TARGET_SOC) for section in sections)
+    ev_configured = any(
+        value
+        for section in sections
+        for key, value in section.items()
+        if str(key).startswith("ev_") and key != CONF_EV_SMART_CHARGING_TARGET_SOC
+    )
+    return ev_configured and not target_configured
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
@@ -129,11 +163,6 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         ready_by = str(call.data[ATTR_READY_BY])
         coordinator = await _require_coordinator(call)
         await coordinator.async_set_ready_by(ready_by)
-
-    async def handle_target_soc(call: ServiceCall) -> None:
-        target_soc = float(call.data[ATTR_TARGET_SOC])
-        coordinator = await _require_coordinator(call)
-        await coordinator.async_set_ev_target_soc(target_soc)
 
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
@@ -210,20 +239,6 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             {
                 **_config_entry_field(),
                 vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time),
-            }
-        ),
-    )
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_SET_EV_TARGET_SOC,
-        handle_target_soc,
-        schema=vol.Schema(
-            {
-                **_config_entry_field(),
-                vol.Required(ATTR_TARGET_SOC): vol.All(
-                    vol.Coerce(float),
-                    vol.Range(min=0, max=100),
-                )
             }
         ),
     )

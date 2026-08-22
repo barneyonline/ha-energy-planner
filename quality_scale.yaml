@@ -112,7 +112,7 @@ rules:
         - tests/test_ev_control_entities.py
   config-flow-test-coverage:
     status: done
-    comment: The central Configure flow covers all input mappings and policy constraints, including settings-only ready-by and opportunistic EV controls, and regression coverage verifies that Add device subentry flows are not exposed.
+    comment: The central Configure flow covers all input mappings and policy constraints, including the required vehicle SOC, charging-feedback, and authoritative target-SOC mappings plus settings-only ready-by and opportunistic EV controls; EV SOC-per-kWh copy documents automatic Recorder calibration and its conservative bootstrap value, and regression coverage verifies that Add device subentry flows are not exposed.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py

@@ -11,12 +11,11 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONF_DAIKIN_POWER,
     CONF_EV_CHARGING,
-    CONF_EV_CONNECTED,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import import_trip_history_from_state_sequences
+from .ev import build_ev_charge_calibration, ev_charge_calibration_matches
 from .load_forecast import (
     FORECAST_CONTRACT_VERSION,
     HISTORY_LOOKBACK,
@@ -179,60 +178,82 @@ async def async_update_builtin_load_forecast(
     return updated, updated != model, reason
 
 
-async def async_import_ev_trip_history_from_recorder(
+async def async_update_ev_charge_calibration(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
-    history: dict[str, Any],
+    model: dict[str, Any],
     *,
+    charge_rate_kw: float,
     now: datetime,
 ) -> tuple[dict[str, Any], bool, str]:
-    """Import compact EV trip records from Recorder when available."""
-    connected_entity = entry_data.get(CONF_EV_CONNECTED)
-    soc_entity = entry_data.get(CONF_EV_SOC)
-    if not connected_entity or not soc_entity:
-        return history, False, "recorder_ev_entities_not_configured"
-    if not _import_due(history, now):
-        return history, False, "recorder_import_recent"
-
+    """Train effective EV SOC-per-kWh from Recorder charging history."""
+    charging_entity = str(entry_data.get(CONF_EV_CHARGING, "") or "").strip()
+    soc_entity = str(entry_data.get(CONF_EV_SOC, "") or "").strip()
+    if not charging_entity or not soc_entity:
+        return model, False, "ev_charge_calibration_entities_not_configured"
+    if charge_rate_kw <= 0:
+        return model, False, "ev_charge_calibration_charge_rate_invalid"
+    if not _ev_charge_calibration_due(
+        model,
+        now=now,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ):
+        return model, False, "ev_charge_calibration_recent"
     try:
         executor = _recorder_executor(hass)
-        connected_states, soc_states = await executor(
+        charging_states, soc_states = await executor(
             _load_recorder_states,
             hass,
-            str(connected_entity),
-            str(soc_entity),
+            charging_entity,
+            soc_entity,
             now - RECORDER_IMPORT_LOOKBACK,
             now,
         )
-    except Exception as err:  # noqa: BLE001 - Recorder is optional and must fail closed.
-        return history, False, f"recorder_import_unavailable:{err.__class__.__name__}"
-
-    updated, changed = import_trip_history_from_state_sequences(
-        history,
-        connected_states=connected_states,
-        soc_states=soc_states,
-        imported_at=now,
-    )
-    return updated, changed, "recorder_imported" if changed else "recorder_no_new_trips"
+        updated = build_ev_charge_calibration(
+            charging_states,
+            soc_states,
+            charge_rate_kw=charge_rate_kw,
+            trained_at=now,
+            charging_entity_id=charging_entity,
+            soc_entity_id=soc_entity,
+        )
+    except Exception as err:  # noqa: BLE001 - retain the last safe calibration.
+        return model, False, f"ev_charge_calibration_unavailable:{err.__class__.__name__}"
+    if updated.get("status") != "ready" and _ev_charge_calibration_matches(
+        model,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ) and model.get("status") == "ready":
+        retained = {
+            **model,
+            "last_attempt_at": now.isoformat(),
+            "last_attempt_status": updated.get("status"),
+            "last_attempt_sample_count": updated.get("sample_count", 0),
+        }
+        return retained, retained != model, "ev_charge_calibration_insufficient_history_retained"
+    return updated, updated != model, f"ev_charge_calibration_{updated.get('status', 'failed')}"
 
 
 def _load_recorder_states(
     hass: HomeAssistant,
-    connected_entity: str,
+    charging_entity: str,
     soc_entity: str,
     start_time: datetime,
     end_time: datetime,
 ) -> tuple[list[Any], list[Any]]:
     history = import_module("homeassistant.components.recorder.history")
     state_changes = history.state_changes_during_period
-    connected = state_changes(
+    charging = state_changes(
         hass,
         start_time,
         end_time,
-        entity_id=connected_entity,
+        entity_id=charging_entity,
         no_attributes=True,
         include_start_time_state=True,
-    ).get(connected_entity, [])
+    ).get(charging_entity, [])
     soc = state_changes(
         hass,
         start_time,
@@ -241,7 +262,7 @@ def _load_recorder_states(
         no_attributes=True,
         include_start_time_state=True,
     ).get(soc_entity, [])
-    return list(connected), list(soc)
+    return list(charging), list(soc)
 
 
 def _load_household_forecast_states(
@@ -386,19 +407,44 @@ def _state_unit(state: Any) -> str:
     return str(attributes.get("unit_of_measurement") or attributes.get("unit") or "")
 
 
-def _import_due(history: dict[str, Any], now: datetime) -> bool:
-    imported_at = history.get("recorder_imported_at")
-    if imported_at is None:
+def _ev_charge_calibration_due(
+    model: dict[str, Any],
+    *,
+    now: datetime,
+    charging_entity: str,
+    soc_entity: str,
+    charge_rate_kw: float,
+) -> bool:
+    if not _ev_charge_calibration_matches(
+        model,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ):
         return True
-    if isinstance(imported_at, datetime):
-        return now >= _align_timestamp(imported_at, now) + RECORDER_IMPORT_INTERVAL
-    if isinstance(imported_at, str):
-        try:
-            parsed = datetime.fromisoformat(imported_at.replace("Z", "+00:00"))
-        except ValueError:
-            return True
-        return now >= _align_timestamp(parsed, now) + RECORDER_IMPORT_INTERVAL
-    return True
+    trained_at = model.get("last_attempt_at") or model.get("trained_at")
+    if not isinstance(trained_at, str):
+        return True
+    try:
+        parsed = datetime.fromisoformat(trained_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return now >= _align_timestamp(parsed, now) + RECORDER_IMPORT_INTERVAL
+
+
+def _ev_charge_calibration_matches(
+    model: dict[str, Any],
+    *,
+    charging_entity: str,
+    soc_entity: str,
+    charge_rate_kw: float,
+) -> bool:
+    return ev_charge_calibration_matches(
+        model,
+        charging_entity_id=charging_entity,
+        soc_entity_id=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    )
 
 
 def _align_timestamp(value: datetime, now: datetime) -> datetime:
