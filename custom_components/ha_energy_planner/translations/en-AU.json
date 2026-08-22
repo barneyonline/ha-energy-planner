@@ -85,7 +85,8 @@
       "instance_name_in_use": "Choose a unique planner name.",
       "household_actuator_in_use": "This actuator is already controlled by another Energy Planner entry.",
       "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean.",
-      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
+      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -203,6 +204,7 @@
               "hvac_suppression_min_price_delta": "HVAC suppression price delta",
               "hvac_precondition_lead_minutes": "HVAC precondition lead time",
               "hvac_precondition_min_price_delta": "HVAC precondition price delta",
+              "hvac_precondition_configured_zones_only": "Precondition configured zones only",
               "hvac_precondition_while_away": "Precondition while away",
               "hvac_min_cycle_minutes": "HVAC minimum cycle time",
               "manual_hvac_override_minutes": "Manual HVAC override duration"
@@ -223,6 +225,7 @@
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
               "hvac_precondition_lead_minutes": "How far ahead HVAC may precondition before an expensive or comfort-sensitive period.",
               "hvac_precondition_min_price_delta": "Minimum price difference required before HVAC preconditioning is considered worthwhile.",
+              "hvac_precondition_configured_zones_only": "Apply tariff preconditioning and coast temperatures only to configured zone climate entities. The main Daikin entity is still turned on and set to the required HVAC mode.",
               "hvac_precondition_while_away": "Allow tariff-driven preconditioning while every configured person is away. Leave off to retain the conservative occupied-only policy.",
               "hvac_min_cycle_minutes": "Minimum time between planner HVAC mode changes.",
               "manual_hvac_override_minutes": "How long manual HVAC changes block planner-owned HVAC control."
@@ -386,7 +389,8 @@
       "ev_fallback_outside_bounds": "EV fallback target SOC must be between the configured minimum and maximum SOC.",
       "invalid_ready_by": "Default ready-by must be a valid local time.",
       "invalid_priority_weights": "Each planning priority must use a different objective.",
-      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
+      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
     }
   },
   "exceptions": {

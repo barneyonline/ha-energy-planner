@@ -452,7 +452,9 @@ Status as of 2026-08-15.
   lower-price slots before the peak; catch-up cannot cross a tariff gap or run
   beyond the applicable comfort target. Takeover snapshots configured switch/input-boolean zones,
   disables mapped automations, enables those zones, explicitly turns on the main climate
-  entity, applies and confirms its target on configured zone climate entities, and preserves
+  entity, and applies and confirms its target on configured zone climate entities. The
+  default-off configured-zones-only option leaves the main setpoint unchanged while retaining
+  its power and mode control, rejects configurations without a zone climate target, and preserves
   the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,
   retains unresolved ownership for
