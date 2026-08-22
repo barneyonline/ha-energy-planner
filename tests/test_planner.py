@@ -445,6 +445,41 @@ def test_active_plan_keeps_observed_continuous_ev_session_running() -> None:
     assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0]
 
 
+def test_continued_pre_window_slot_counts_toward_ev_target_feasibility() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "00:15",
+        "ev_earliest_start": "00:05",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 64
+    context.ev_target_soc_percent = 79
+    context.ev_charging = True
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.15,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset in (0, 5, 10)
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.desired_state["continued_active_session"] is True
+    assert action.desired_state["max_attainable_soc_percent"] == 79
+    assert action.desired_state["infeasible"] is False
+
+
 def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
     context = _context()

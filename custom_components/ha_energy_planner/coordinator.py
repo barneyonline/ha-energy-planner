@@ -477,7 +477,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
                 return
             if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
-                self.hass.async_create_task(self._async_handle_manual_hvac_change("climate_zone_changed"))
+                self.hass.async_create_task(
+                    self._async_handle_manual_hvac_change(
+                        "climate_zone_changed",
+                        preserve_zone_entity_id=str(event.data.get("entity_id") or ""),
+                    )
+                )
                 return
             if not _is_material_state_change(event, self.options):
                 return
@@ -1577,6 +1582,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         *,
         source: str = "service",
         expires: bool = True,
+        preserve_zone_entity_id: str | None = None,
     ) -> ActionOutcome | None:
         """Set a manual HVAC override."""
         self._mark_forced_refresh("manual_hvac_override")
@@ -1633,7 +1639,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     helper_error = err
             release_hvac = getattr(self.executor, "async_release_hvac_control", None)
             if callable(release_hvac):
-                release_outcome = await release_hvac(reason)
+                release_outcome = (
+                    await release_hvac(
+                        reason,
+                        preserve_zone_entity_id=preserve_zone_entity_id,
+                    )
+                    if preserve_zone_entity_id
+                    else await release_hvac(reason)
+                )
         await self.async_request_refresh()
         if helper_error is not None:
             raise helper_error
@@ -1703,11 +1716,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("manual_hvac_override_cleared")
         await self.async_request_refresh()
 
-    async def _async_handle_manual_hvac_change(self, reason: str) -> None:
+    async def _async_handle_manual_hvac_change(
+        self,
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> None:
         """Record manual HVAC override from observed Daikin state change."""
         await self.async_set_manual_hvac_override(
             int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES]),
             reason,
+            preserve_zone_entity_id=preserve_zone_entity_id,
         )
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
@@ -2790,6 +2809,8 @@ def _is_planner_owned_control_feedback(
     if asset == "daikin_zone" and pending_hvac_desired_state is not None:
         restored_zones = pending_hvac_desired_state.get("restore_zones")
         if isinstance(restored_zones, dict) and entity_id in restored_zones:
+            if str(entity_id).split(".", 1)[0] == "climate":
+                return True
             return str(getattr(new_state, "state", "")).lower() == str(restored_zones[entity_id]).lower()
         if str(entity_id).split(".", 1)[0] == "climate":
             return True
