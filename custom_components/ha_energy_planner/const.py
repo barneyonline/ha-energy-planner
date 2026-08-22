@@ -69,6 +69,7 @@ CONF_BATTERY_MAX_CHARGE_KW = "battery_max_charge_kw"
 CONF_BATTERY_MAX_DISCHARGE_KW = "battery_max_discharge_kw"
 CONF_EV_MIN_SOC_PERCENT = "ev_min_soc_percent"
 CONF_EV_MAX_SOC_PERCENT = "ev_max_soc_percent"
+# Legacy option removed in config-entry version 4. Keep the key for migration only.
 CONF_EV_FALLBACK_TARGET_SOC_PERCENT = "ev_fallback_target_soc_percent"
 CONF_EV_CHARGE_RATE_KW = "ev_charge_rate_kw"
 CONF_EV_SOC_PER_KWH = "ev_soc_per_kwh"
@@ -127,9 +128,10 @@ DEFAULT_OPTIONS = {
     CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
     CONF_EV_MIN_SOC_PERCENT: 40.0,
     CONF_EV_MAX_SOC_PERCENT: 90.0,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 80.0,
     CONF_EV_CHARGE_RATE_KW: 7.0,
-    CONF_EV_SOC_PER_KWH: 5.0,
+    # Approximately a 50 kWh usable EV battery. The previous 5%/kWh default
+    # materially underestimated charging time for typical battery EVs.
+    CONF_EV_SOC_PER_KWH: 2.0,
     CONF_EV_CONTINUOUS_CHARGING: True,
     CONF_EV_EARLIEST_START: "None",
     CONF_EV_PRICE_LIMIT_ENABLED: False,
@@ -186,7 +188,6 @@ STORE_KEY = f"{DOMAIN}_state"
 SERVICE_REPLAN = "replan"
 SERVICE_RESTORE_SAFE_STATE = "restore_safe_state"
 SERVICE_SET_EV_READY_BY = "set_ev_ready_by"
-SERVICE_SET_EV_TARGET_SOC = "set_ev_target_soc"
 SERVICE_SET_MANUAL_HVAC_OVERRIDE = "set_manual_hvac_override"
 SERVICE_EXPORT_DIAGNOSTICS = "export_diagnostics"
 SERVICE_EXPORT_SUPPORT_BUNDLE = "export_support_bundle"
@@ -198,7 +199,6 @@ SERVICE_RESUME_CONTROL = "resume_control"
 
 ATTR_REASON = "reason"
 ATTR_READY_BY = "ready_by"
-ATTR_TARGET_SOC = "target_soc"
 ATTR_DURATION_MINUTES = "duration_minutes"
 ATTR_ASSET = "asset"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"

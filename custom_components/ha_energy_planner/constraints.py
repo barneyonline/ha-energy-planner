@@ -237,6 +237,7 @@ class ConstraintValidator:
             )
         if (
             not action.desired_state.get("keep_charger_on")
+            and action.desired_state.get("charging_required_now") is not False
             and context.current_ev_soc_percent is not None
             and float(desired_soc) < context.current_ev_soc_percent
         ):

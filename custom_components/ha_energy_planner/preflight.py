@@ -29,7 +29,6 @@ from .const import (
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
-    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -413,9 +412,7 @@ def _entity_report(
         required_areas=required_areas,
         include_shared=include_shared,
     )
-    advisory_entities = set(
-        _split_entities(entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC))
-    )
+    advisory_entities: set[str] = set()
     missing: list[str] = []
     unavailable: list[str] = []
     advisory_missing: list[str] = []

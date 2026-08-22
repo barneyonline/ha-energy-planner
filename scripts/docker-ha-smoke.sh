@@ -53,16 +53,17 @@ PLATFORMS: list[Platform] = []
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register smoke-test helper services."""
 
-    async def force_trip_import_due(call: ServiceCall) -> None:
-        """Mark HA Energy Planner trip Recorder import due for smoke validation."""
+    async def force_ev_calibration_due(call: ServiceCall) -> None:
+        """Mark HA Energy Planner EV calibration due for smoke validation."""
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = getattr(entry, "runtime_data", None)
             store = getattr(coordinator, "store", None)
             if store is None:
                 continue
-            history = dict(store.data.get("trip_history", {}))
-            history["recorder_imported_at"] = "1970-01-01T00:00:00+00:00"
-            await store.async_save_trip_history(history)
+            model = dict(store.data.get("ev_charge_calibration", {}))
+            model["trained_at"] = "1970-01-01T00:00:00+00:00"
+            model.pop("last_attempt_at", None)
+            await store.async_save_ev_charge_calibration(model)
 
     async def seed_due_forecast_snapshot(call: ServiceCall) -> None:
         """Seed one due forecast snapshot for smoke calibration validation."""
@@ -195,7 +196,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         supports_response=SupportsResponse.ONLY,
     )
     hass.states.async_set("ai_task.smoke_advisor", "ready")
-    hass.services.async_register(DOMAIN, "force_trip_import_due", force_trip_import_due)
+    hass.services.async_register(DOMAIN, "force_ev_calibration_due", force_ev_calibration_due)
     hass.services.async_register(DOMAIN, "seed_due_forecast_snapshot", seed_due_forecast_snapshot)
     hass.services.async_register(DOMAIN, "seed_thermal_model_sample", seed_thermal_model_sample)
     hass.services.async_register(DOMAIN, "seed_enphase_command_rate_limit", seed_enphase_command_rate_limit)
@@ -609,7 +610,7 @@ automation:
         data:
           entity_id: input_boolean.ev_connected
       - delay: "00:00:05"
-      - action: fake_planner_test.force_trip_import_due
+      - action: fake_planner_test.force_ev_calibration_due
       - action: ha_energy_planner.replan
       - delay: "00:00:10"
       - action: input_number.set_value
@@ -964,6 +965,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "ev_soc_entity": "input_number.ev_soc",
               "ev_charging_entity": "input_boolean.ev_charging",
               "ev_connected_entity": "input_boolean.ev_connected",
+              "ev_smart_charging_target_soc_entity": "input_number.ev_target_soc",
               "ev_charger_start_entity": "input_boolean.ev_smart_charging_start",
               "ev_charger_stop_entity": "input_boolean.ev_smart_charging_stop"
             },
@@ -1249,28 +1251,17 @@ if load_forecast.get("status") not in {"ready", "degraded"} or load_forecast.get
     raise SystemExit(f"Forecast snapshot did not include healthy built-in load evidence: {load_forecast}")
 if "thermal_model" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include thermal model metadata")
-if latest_snapshot.get("trip_history", {}).get("recorder_import_reason") not in {
-    "recorder_ev_entities_not_configured",
-    "recorder_import_recent",
-    "recorder_imported",
-    "recorder_no_new_trips",
-} and not str(latest_snapshot.get("trip_history", {}).get("recorder_import_reason", "")).startswith("recorder_import_unavailable:"):
-    raise SystemExit(f"Unexpected Recorder import reason metadata: {latest_snapshot.get('trip_history')}")
-if not any(
-    snapshot.get("trip_history", {}).get("recorder_import_reason") == "recorder_imported"
-    and snapshot.get("trip_history", {}).get("record_count", 0) >= 1
-    for snapshot in snapshots
-):
-    raise SystemExit("Smoke run did not import a compact EV trip from Home Assistant Recorder")
-trip_records = store_data.get("trip_history", {}).get("records", [])
-if not any(
-    record.get("source") == "recorder"
-    and record.get("start_soc_percent") == 80.0
-    and record.get("end_soc_percent") == 72.0
-    for record in trip_records
-    if isinstance(record, dict)
-):
-    raise SystemExit(f"Recorder import did not persist the expected EV trip record: {trip_records}")
+ev_calibration = latest_snapshot.get("ev_charge_calibration", {})
+if ev_calibration.get("update_reason") not in {
+    "ev_charge_calibration_recent",
+    "ev_charge_calibration_insufficient_history",
+    "ev_charge_calibration_insufficient_history_retained",
+    "ev_charge_calibration_ready",
+} and not str(ev_calibration.get("update_reason", "")).startswith("ev_charge_calibration_unavailable:"):
+    raise SystemExit(f"Unexpected EV calibration metadata: {ev_calibration}")
+stored_ev_calibration = store_data.get("ev_charge_calibration", {})
+if stored_ev_calibration.get("status") not in {"ready", "insufficient_history"}:
+    raise SystemExit(f"Recorder EV calibration was not persisted: {stored_ev_calibration}")
 if "forecast_calibration" not in store_data:
     raise SystemExit("Planner Store did not initialize forecast calibration state")
 forecast_calibration = store_data.get("forecast_calibration", {})
