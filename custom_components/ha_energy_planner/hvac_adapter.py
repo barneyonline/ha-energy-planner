@@ -75,6 +75,16 @@ class DaikinHVACAdapter:
             return HVACCommandResult(False, "daikin_climate_unavailable", pre_state, self._snapshot(), {}, True)
         if not action.desired_state:
             return HVACCommandResult(False, "hvac_desired_state_empty", pre_state, self._snapshot(), {}, True)
+        if action.desired_state.get("configured_zones_only") and not self._zone_climate_entities():
+            return HVACCommandResult(
+                False,
+                "zone_only_preconditioning_requires_climate_zone",
+                pre_state,
+                self._snapshot(),
+                restorable_automation_states,
+                True,
+                saved_zone_states,
+            )
         if set(saved_automation_states) != set(self._automation_entities()):
             return HVACCommandResult(
                 False,
@@ -483,7 +493,10 @@ class DaikinHVACAdapter:
         desired_state: dict[str, Any],
     ) -> bool:
         """Confirm the main thermostat and every configured zone target."""
-        if not await self._async_confirm_hvac_state(entity_id, desired_state):
+        if not await self._async_confirm_hvac_state(
+            entity_id,
+            _main_hvac_desired_state(desired_state),
+        ):
             return False
         if not desired_state.get("enable_zones"):
             return True
@@ -516,10 +529,11 @@ class DaikinHVACAdapter:
         force: bool = False,
     ) -> bool:
         """Apply thermostat mode before its target and report whether a command was sent."""
-        desired_mode = desired_state.get("hvac_mode")
-        desired_temperature = desired_state.get("target_temperature")
-        target_low = desired_state.get("target_temp_low")
-        target_high = desired_state.get("target_temp_high")
+        main_desired_state = _main_hvac_desired_state(desired_state)
+        desired_mode = main_desired_state.get("hvac_mode")
+        desired_temperature = main_desired_state.get("target_temperature")
+        target_low = main_desired_state.get("target_temp_low")
+        target_high = main_desired_state.get("target_temp_high")
         observed = self._state(entity_id)
         if observed is None:
             raise RuntimeError("climate state unavailable")
@@ -719,6 +733,17 @@ def _temperature_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
         key: desired_state[key]
         for key in ("target_temperature", "target_temp_low", "target_temp_high")
         if desired_state.get(key) is not None
+    }
+
+
+def _main_hvac_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
+    """Return command fields intended for the main thermostat."""
+    if not desired_state.get("configured_zones_only"):
+        return desired_state
+    return {
+        key: value
+        for key, value in desired_state.items()
+        if key not in {"target_temperature", "target_temp_low", "target_temp_high"}
     }
 
 

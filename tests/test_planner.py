@@ -12,6 +12,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_AMBER_IMPORT_PRICE,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_PV_FORECAST,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
@@ -2530,6 +2531,7 @@ def test_hvac_lifecycle_scans_full_twenty_four_hour_horizon() -> None:
         "switch.living",
         "input_boolean.bedrooms",
     ]
+    assert actions[0].desired_state["configured_zones_only"] is False
     assert actions[0].execute_not_before == context.slots[18].valid_at
     assert actions[1].desired_state["phase"] == "peak_coast"
     assert actions[1].execute_not_before == context.slots[20].valid_at
@@ -3239,6 +3241,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
         "dry_run": False,
         "planning_interval_minutes": 5,
         "hvac_precondition_lead_minutes": 15,
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
     }
     thermal_model = {
         "enabled": True,
@@ -3251,6 +3254,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
     context.current_hvac_temperature_c = 22
     context.occupied_temperature_low_c = 19
     context.occupied_temperature_high_c = 23
+    context.climate_zone_entities = ["climate.living_zone"]
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=index * 5),
@@ -3274,6 +3278,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
         "pre_peak_coast",
         "peak_coast",
     ]
+    assert all(action.desired_state["configured_zones_only"] is True for action in actions[:-1])
     precondition_end = context.slots[2].valid_at
     assert actions[0].desired_state["precondition_end"] == precondition_end
     assert actions[1].execute_not_before == precondition_end

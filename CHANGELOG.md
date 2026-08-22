@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Climate settings now include **Precondition configured zones only**. When
+  enabled, tariff preconditioning keeps main Daikin power and mode control but
+  applies temperature targets only to configured zone climate entities.
+
 ### Fixed
 
 - Continuous EV charging now remains committed after charging is observed, so
