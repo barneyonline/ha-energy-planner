@@ -514,6 +514,7 @@ def test_options_update_restores_only_hvac_when_climate_control_is_disabled() ->
         }
     )
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator.async_restore_safe_state = AsyncMock()
     coordinator.async_request_replan = AsyncMock()
 
@@ -552,6 +553,7 @@ def test_options_update_runs_one_idempotent_restore_for_unowned_disabled_hvac() 
         }
     )
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator.async_restore_safe_state = AsyncMock()
     coordinator.async_request_replan = AsyncMock()
 
@@ -576,6 +578,7 @@ def test_options_update_does_not_repeat_device_restore_when_replan_fails() -> No
     )
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator._last_handled_options = {
         CONF_PLANNER_ENABLED: True,
         CONF_DRY_RUN: False,
@@ -675,7 +678,8 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     coordinator.store = FakeStore()
     expected = _plan("refresh-duration")
 
-    async def update_locked() -> EnergyPlan:
+    async def update_locked(*, defer_execution: bool = False) -> EnergyPlan:
+        assert defer_execution is True
         coordinator._pending_refresh_trigger = "newer_request"
         return expected
 
@@ -693,12 +697,54 @@ def test_coordinator_records_refresh_duration_in_memory() -> None:
     assert coordinator.refresh_metrics["succeeded"] == 1
 
 
+def test_queued_refresh_skips_work_after_teardown() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator._tearing_down = True
+    coordinator.data = _plan("last-committed")
+    coordinator._pending_refresh_trigger = "queued_before_teardown"
+    coordinator._async_update_data_locked = AsyncMock()
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result is coordinator.data
+    assert coordinator._async_update_data_locked.await_count == 0
+    assert coordinator.refresh_metrics["teardown_skipped"] == 1
+    assert coordinator.last_refresh_metadata["succeeded"] is True
+
+
+def test_wait_for_refresh_shutdown_reaches_planner_safe_boundary() -> None:
+    async def scenario() -> bool:
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator._planner_lock = asyncio.Lock()
+        release = asyncio.Event()
+        started = asyncio.Event()
+
+        async def active_refresh() -> None:
+            async with coordinator._planner_lock:
+                started.set()
+                await release.wait()
+
+        refresh_task = asyncio.create_task(active_refresh())
+        await started.wait()
+        waiter = asyncio.create_task(coordinator.async_wait_for_refresh_shutdown())
+        await asyncio.sleep(0)
+        waiting_before_release = not waiter.done()
+        release.set()
+        await waiter
+        await refresh_task
+        return waiting_before_release
+
+    assert asyncio.run(scenario()) is True
+
+
 def test_coordinator_records_failed_refresh() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
 
-    async def update_locked() -> EnergyPlan:
+    async def update_locked(*, defer_execution: bool = False) -> EnergyPlan:
+        assert defer_execution is True
         raise RuntimeError("failed refresh")
 
     coordinator._async_update_data_locked = update_locked
@@ -1269,7 +1315,8 @@ def test_async_update_data_uses_lock_and_delay_save() -> None:
     coordinator._planner_lock = asyncio.Lock()
     coordinator.store = FakeStore()
 
-    async def fake_locked() -> EnergyPlan:
+    async def fake_locked(*, defer_execution: bool = False) -> EnergyPlan:
+        assert defer_execution is True
         return _plan("locked")
 
     coordinator._async_update_data_locked = fake_locked
@@ -1279,6 +1326,136 @@ def test_async_update_data_uses_lock_and_delay_save() -> None:
     assert result.plan_id == "locked"
     assert coordinator.store.delay_entered is True
     assert coordinator.store.delay_exited is True
+
+
+def test_async_update_data_schedules_device_execution_after_refresh_scopes_exit() -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator.store = FakeStore()
+    plan = _plan("deferred-execution")
+    context = object()
+    request = (1, plan, context, {"planner_enabled": True})
+    scheduled: list[object] = []
+
+    async def fake_locked(*, defer_execution: bool = False) -> EnergyPlan:
+        assert defer_execution is True
+        assert coordinator._planner_lock.locked() is True
+        assert coordinator.store.delay_entered is True
+        assert not hasattr(coordinator.store, "delay_exited")
+        coordinator._deferred_plan_execution = request
+        return plan
+
+    def schedule(execution: object) -> None:
+        assert coordinator._planner_lock.locked() is False
+        assert coordinator.store.delay_exited is True
+        scheduled.append(execution)
+
+    coordinator._async_update_data_locked = fake_locked
+    coordinator._schedule_plan_execution = schedule
+
+    result = asyncio.run(coordinator._async_update_data())
+
+    assert result is plan
+    assert scheduled == [request]
+
+
+def test_plan_execution_releases_refresh_lock_and_coalesces_newer_plans() -> None:
+    async def scenario() -> list[str]:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class TaskHass(FakeHass):
+            def async_create_task(self, task: object) -> asyncio.Task[None]:
+                return asyncio.create_task(task)  # type: ignore[arg-type]
+
+        class BlockingExecutor(FakeExecutor):
+            async def async_evaluate(
+                self,
+                plan: EnergyPlan,
+                context: object,
+            ) -> PlanAction | None:
+                self.evaluated.append((plan, context))
+                if plan.plan_id == "first":
+                    started.set()
+                    await release.wait()
+                return None
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = TaskHass()
+        coordinator.entry = FakeEntry({})
+        coordinator.executor = BlockingExecutor()
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator._command_lock = asyncio.Lock()
+        coordinator._plan_execution_task = None
+        coordinator._pending_plan_execution = None
+        coordinator._tearing_down = False
+        coordinator._refresh_generation = 1
+        coordinator.async_update_listeners = lambda: None
+        first = _plan("first")
+        skipped = _plan("skipped")
+        newest = _plan("newest")
+
+        coordinator._schedule_plan_execution((1, first, object(), {}))
+        execution_task = coordinator._plan_execution_task
+        assert execution_task is not None
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        # Device confirmation may still be waiting, but input collection and
+        # planning can immediately acquire the independent refresh lock.
+        await asyncio.wait_for(coordinator._planner_lock.acquire(), timeout=0.1)
+        coordinator._planner_lock.release()
+
+        coordinator._refresh_generation = 2
+        coordinator._schedule_plan_execution((2, skipped, object(), {}))
+        coordinator._refresh_generation = 3
+        coordinator._schedule_plan_execution((3, newest, object(), {}))
+        release.set()
+        await asyncio.wait_for(execution_task, timeout=1)
+        return [plan.plan_id for plan, _context in coordinator.executor.evaluated]
+
+    assert asyncio.run(scenario()) == ["first", "newest"]
+
+
+def test_plan_execution_failure_does_not_strand_newer_plan_and_notifies() -> None:
+    async def scenario() -> tuple[list[str], list[str]]:
+        updates: list[str] = []
+
+        class FailingExecutor(FakeExecutor):
+            async def async_evaluate(
+                self,
+                plan: EnergyPlan,
+                context: object,
+            ) -> PlanAction | None:
+                self.evaluated.append((plan, context))
+                if plan.plan_id == "failed":
+                    coordinator._refresh_generation = 2
+                    coordinator._pending_plan_execution = (
+                        2,
+                        _plan("newer"),
+                        object(),
+                        {},
+                    )
+                    raise RuntimeError("unexpected executor failure")
+                return None
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.entry = FakeEntry({})
+        coordinator.executor = FailingExecutor()
+        coordinator._command_lock = asyncio.Lock()
+        coordinator._plan_execution_task = object()
+        coordinator._pending_plan_execution = (1, _plan("failed"), object(), {})
+        coordinator._tearing_down = False
+        coordinator._refresh_generation = 1
+        coordinator.async_update_listeners = lambda: updates.append("updated")
+
+        await coordinator._async_drain_plan_execution()
+        evaluated = [plan.plan_id for plan, _context in coordinator.executor.evaluated]
+        return evaluated, updates
+
+    evaluated, updates = asyncio.run(scenario())
+
+    assert evaluated == ["failed", "newer"]
+    assert updates == ["updated", "updated"]
 
 
 def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: object) -> None:
@@ -1549,6 +1726,67 @@ def test_current_planner_result_saves_and_executes() -> None:
     assert coordinator.executor.evaluated == [(plan, context)]
     assert coordinator.executor.options == {"planner_enabled": True}
     assert coordinator._last_decision_context is context
+
+
+def test_current_planner_result_can_defer_execution_until_refresh_scopes_exit() -> None:
+    plan = _plan("deferred-current")
+    context = object()
+    options = {"planner_enabled": True}
+    coordinator = _coordinator_for_commit(None, current_generation=3)
+
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(
+            3,
+            plan,
+            context,
+            options,
+            execute=False,
+        )
+    )
+
+    assert result is plan
+    assert coordinator.store.saved_plans == [plan]
+    assert coordinator.executor.evaluated == []
+    assert coordinator._deferred_plan_execution == (3, plan, context, options)
+
+
+def test_plan_execution_scheduler_handles_teardown_and_non_task_test_hass() -> None:
+    plan = _plan("scheduled")
+    request = (1, plan, object(), {})
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._plan_execution_task = None
+    coordinator._pending_plan_execution = None
+    coordinator._tearing_down = True
+
+    coordinator._schedule_plan_execution(request)
+    assert coordinator._pending_plan_execution is None
+
+    coordinator._tearing_down = False
+    coordinator._schedule_plan_execution(request)
+    assert coordinator._plan_execution_task is None
+    assert coordinator._pending_plan_execution is None
+
+
+def test_plan_execution_drain_and_executor_drop_stale_generations() -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._plan_execution_task = object()
+    coordinator._pending_plan_execution = (1, _plan("stale-drain"), object(), {})
+    coordinator._refresh_generation = 2
+
+    asyncio.run(coordinator._async_drain_plan_execution())
+
+    assert coordinator._plan_execution_task is None
+    assert coordinator.executor.evaluated == []
+
+    asyncio.run(
+        coordinator._async_execute_plan_if_current(
+            1,
+            _plan("stale-direct"),
+            object(),
+            {},
+        )
+    )
+    assert coordinator.executor.evaluated == []
 
 
 def test_startup_recovery_validation_commits_without_executing() -> None:
@@ -3307,38 +3545,54 @@ def test_restore_safe_state_can_skip_refresh_for_teardown() -> None:
     assert coordinator._refresh_generation == 0
 
 
-def test_manual_ev_and_restore_commands_share_planner_serialization_lock() -> None:
+def test_manual_ev_and_restore_share_command_lock_without_blocking_refresh_lock() -> None:
     async def scenario() -> None:
         coordinator = _coordinator_for_runtime_services()
-        lock_observations: list[tuple[str, bool]] = []
+        lock_observations: list[tuple[str, bool, bool]] = []
 
         async def save_overrides(overrides: list[object]) -> None:
-            lock_observations.append(("save_override", coordinator._planner_lock.locked()))
+            lock_observations.append(
+                (
+                    "save_override",
+                    coordinator._command_lock.locked(),
+                    coordinator._planner_lock.locked(),
+                )
+            )
 
         async def request_refresh() -> None:
-            lock_observations.append(("refresh", coordinator._planner_lock.locked()))
+            lock_observations.append(
+                (
+                    "refresh",
+                    coordinator._command_lock.locked(),
+                    coordinator._planner_lock.locked(),
+                )
+            )
 
         coordinator.store.async_save_overrides = save_overrides
         coordinator.async_request_refresh = request_refresh
 
-        await coordinator._planner_lock.acquire()
+        await coordinator._command_lock.acquire()
         manual_task = asyncio.create_task(coordinator.async_manual_ev_charging(True))
         await asyncio.sleep(0)
         assert coordinator.executor.manual_ev_commands == []
+        await asyncio.wait_for(coordinator._planner_lock.acquire(), timeout=0.1)
         coordinator._planner_lock.release()
+        coordinator._command_lock.release()
         await manual_task
 
-        await coordinator._planner_lock.acquire()
+        await coordinator._command_lock.acquire()
         restore_task = asyncio.create_task(coordinator.async_restore_safe_state("serialized_restore"))
         await asyncio.sleep(0)
         assert coordinator.executor.restored == []
+        await asyncio.wait_for(coordinator._planner_lock.acquire(), timeout=0.1)
         coordinator._planner_lock.release()
+        coordinator._command_lock.release()
         await restore_task
 
         assert lock_observations == [
-            ("save_override", True),
-            ("refresh", False),
-            ("refresh", False),
+            ("save_override", True, False),
+            ("refresh", False, False),
+            ("refresh", False, False),
         ]
 
     asyncio.run(scenario())
@@ -3399,6 +3653,7 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     coordinator._refresh_generation = 0
     coordinator._force_next_refresh = False
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._last_handled_options = {}
     coordinator._last_control_mode_state = (coordinator.planner_enabled, coordinator.dry_run)
@@ -3624,6 +3879,28 @@ def test_expired_manual_hvac_state_removes_persisted_expiry() -> None:
 
     assert asyncio.run(coordinator._async_clear_expired_manual_hvac_state()) is True
     assert coordinator.store.data["ownership"] == {"unrelated": True}
+
+
+def test_expired_manual_hvac_cleanup_preserves_ownership_added_during_helper_call() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+    )
+    coordinator.store.data["ownership"] = {
+        "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
+    }
+
+    async def helper_call(*args: object, **kwargs: object) -> None:
+        coordinator.store.data["ownership"] = {
+            **coordinator.store.data["ownership"],
+            "ev_smart_charging_state": {"switch.ev": "off"},
+        }
+
+    coordinator.hass.services.async_call = helper_call
+
+    assert asyncio.run(coordinator._async_clear_expired_manual_hvac_state()) is True
+    assert coordinator.store.data["ownership"] == {
+        "ev_smart_charging_state": {"switch.ev": "off"},
+    }
 
 
 def test_expired_manual_hvac_cleanup_keeps_override_until_helper_turns_off() -> None:
@@ -5400,7 +5677,7 @@ def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None
     assert production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options) == fingerprint
 
 
-def test_shutdown_cancels_pending_callbacks_and_listeners() -> None:
+def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution() -> None:
     calls: list[str] = []
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator._debounce_cancel = lambda: calls.append("debounce")
@@ -5409,6 +5686,13 @@ def test_shutdown_cancels_pending_callbacks_and_listeners() -> None:
         done=lambda: False,
         cancel=lambda: calls.append("ai"),
     )
+    execution_task = SimpleNamespace(
+        done=lambda: False,
+        cancel=lambda: calls.append("execution"),
+    )
+    coordinator._plan_execution_task = execution_task
+    coordinator._pending_plan_execution = (1, _plan("pending"), object(), {})
+    coordinator._deferred_plan_execution = (1, _plan("deferred"), object(), {})
     coordinator._unsub_listeners = [
         lambda: calls.append("listener_1"),
         lambda: calls.append("listener_2"),
@@ -5420,7 +5704,41 @@ def test_shutdown_cancels_pending_callbacks_and_listeners() -> None:
     assert coordinator._debounce_cancel is None
     assert coordinator._boundary_cancel is None
     assert coordinator._ai_advice_task is None
+    assert coordinator._plan_execution_task is execution_task
+    assert coordinator._pending_plan_execution is None
+    assert coordinator._deferred_plan_execution is None
     assert coordinator._unsub_listeners == []
+
+
+def test_wait_for_plan_execution_reaches_safe_boundary_and_handles_failure() -> None:
+    async def scenario() -> tuple[bool, bool]:
+        release = asyncio.Event()
+
+        async def complete_at_safe_boundary() -> None:
+            await release.wait()
+
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator._plan_execution_task = asyncio.create_task(complete_at_safe_boundary())
+        waiter = asyncio.create_task(coordinator.async_wait_for_plan_execution())
+        await asyncio.sleep(0)
+        waiting_before_release = not waiter.done()
+        release.set()
+        await waiter
+
+        async def fail() -> None:
+            raise RuntimeError("background failure")
+
+        coordinator._plan_execution_task = asyncio.create_task(fail())
+        await coordinator.async_wait_for_plan_execution()
+        failure_consumed = coordinator._plan_execution_task.done()
+        coordinator._plan_execution_task = None
+        await coordinator.async_wait_for_plan_execution()
+        return waiting_before_release, failure_consumed
+
+    waiting_before_release, failure_consumed = asyncio.run(scenario())
+
+    assert waiting_before_release is True
+    assert failure_consumed is True
 
 
 def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: object) -> None:
@@ -5490,6 +5808,7 @@ def _coordinator_for_restore() -> EnergyPlannerCoordinator:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.executor = FakeExecutor()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator._device_control_lock = asyncio.Lock()
     coordinator._refresh_generation = 0
     coordinator.refresh_requested = 0
@@ -5514,6 +5833,7 @@ def _coordinator_for_runtime_services(
     coordinator.store = FakeStore(store_data or {})
     coordinator.executor = FakeExecutor()
     coordinator._planner_lock = asyncio.Lock()
+    coordinator._command_lock = asyncio.Lock()
     coordinator._options_update_lock = asyncio.Lock()
     coordinator._device_control_lock = asyncio.Lock()
     coordinator._last_handled_options = dict(options or {})

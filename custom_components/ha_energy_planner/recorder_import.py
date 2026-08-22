@@ -27,12 +27,20 @@ from .load_forecast import (
 
 RECORDER_IMPORT_INTERVAL = timedelta(hours=24)
 RECORDER_IMPORT_LOOKBACK = timedelta(days=30)
+MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK = 50_000
+MAX_COMPACT_EV_HISTORY_STATES = 20_000
+INITIAL_EV_HISTORY_CHUNK_DAYS = 7
+MIN_EV_HISTORY_CHUNK = timedelta(hours=1)
 MAX_LOAD_FORECAST_STATES_PER_ENTITY_CHUNK = 100_000
 INITIAL_LOAD_FORECAST_CHUNK_DAYS = 7
 
 
 class LoadForecastHistoryLimitError(RuntimeError):
     """Raised when one bounded Recorder chunk is still too dense to process safely."""
+
+
+class EVHistoryLimitError(RuntimeError):
+    """Raised when EV Recorder history exceeds the bounded import contract."""
 
 
 class LoadForecastRecorderError(RuntimeError):
@@ -204,7 +212,7 @@ async def async_update_ev_charge_calibration(
     try:
         executor = _recorder_executor(hass)
         charging_states, soc_states = await executor(
-            _load_recorder_states,
+            _load_bounded_ev_history,
             hass,
             charging_entity,
             soc_entity,
@@ -220,6 +228,8 @@ async def async_update_ev_charge_calibration(
             soc_entity_id=soc_entity,
         )
     except Exception as err:  # noqa: BLE001 - retain the last safe calibration.
+        if isinstance(err, EVHistoryLimitError):
+            return model, False, "ev_charge_calibration_history_limit_exceeded"
         return model, False, f"ev_charge_calibration_unavailable:{err.__class__.__name__}"
     if updated.get("status") != "ready" and _ev_charge_calibration_matches(
         model,
@@ -253,6 +263,7 @@ def _load_recorder_states(
         entity_id=charging_entity,
         no_attributes=True,
         include_start_time_state=True,
+        limit=MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK,
     ).get(charging_entity, [])
     soc = state_changes(
         hass,
@@ -261,8 +272,113 @@ def _load_recorder_states(
         entity_id=soc_entity,
         no_attributes=True,
         include_start_time_state=True,
+        limit=MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK,
     ).get(soc_entity, [])
     return list(charging), list(soc)
+
+
+def _load_bounded_ev_history(
+    hass: HomeAssistant,
+    charging_entity: str,
+    soc_entity: str,
+    start_time: datetime,
+    end_time: datetime,
+) -> tuple[list[Any], list[Any]]:
+    """Load and compact EV history in bounded chunks before returning it."""
+    chunk_start = start_time
+    preferred_chunk_span = timedelta(days=INITIAL_EV_HISTORY_CHUNK_DAYS)
+    compact_charging: list[Any] = []
+    compact_soc: list[Any] = []
+    while chunk_start < end_time:
+        chunk_end = min(
+            chunk_start + max(preferred_chunk_span, MIN_EV_HISTORY_CHUNK),
+            end_time,
+        )
+        while True:
+            charging, soc = _load_recorder_states(
+                hass,
+                charging_entity,
+                soc_entity,
+                chunk_start,
+                chunk_end,
+            )
+            dense_entity = (
+                charging_entity
+                if len(charging) >= MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
+                else soc_entity
+                if len(soc) >= MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
+                else None
+            )
+            if dense_entity is None:
+                break
+            duration = chunk_end - chunk_start
+            if duration <= MIN_EV_HISTORY_CHUNK:
+                raise EVHistoryLimitError(dense_entity)
+            chunk_end = chunk_start + max(duration / 2, MIN_EV_HISTORY_CHUNK)
+            preferred_chunk_span = chunk_end - chunk_start
+        selected_charging, selected_soc = _compact_ev_history_chunk(charging, soc)
+        compact_charging.extend(selected_charging)
+        compact_soc.extend(selected_soc)
+        compact_charging = _deduplicate_states(compact_charging)
+        compact_soc = _deduplicate_states(compact_soc)
+        if (
+            len(compact_charging) > MAX_COMPACT_EV_HISTORY_STATES
+            or len(compact_soc) > MAX_COMPACT_EV_HISTORY_STATES
+        ):
+            raise EVHistoryLimitError("compacted_ev_history")
+        chunk_start = chunk_end
+    return compact_charging, compact_soc
+
+
+def _compact_ev_history_chunk(
+    charging_states: list[Any],
+    soc_states: list[Any],
+) -> tuple[list[Any], list[Any]]:
+    """Retain charging transitions and only SOC values needed around them."""
+    charging = sorted(
+        (state for state in charging_states if _recorder_state_timestamp(state) is not None),
+        key=_recorder_state_timestamp,
+    )
+    soc = sorted(
+        (state for state in soc_states if _recorder_state_timestamp(state) is not None),
+        key=_recorder_state_timestamp,
+    )
+    selected_soc: list[Any] = []
+    soc_index = 0
+    latest_soc: Any | None = None
+    for charging_state in charging:
+        charging_at = _recorder_state_timestamp(charging_state)
+        while soc_index < len(soc):
+            candidate = soc[soc_index]
+            candidate_at = _recorder_state_timestamp(candidate)
+            if candidate_at is None or charging_at is None or candidate_at > charging_at:
+                break
+            latest_soc = candidate
+            soc_index += 1
+        if latest_soc is not None:
+            selected_soc.append(latest_soc)
+    if soc:
+        selected_soc.append(soc[-1])
+    return _deduplicate_states(charging), _deduplicate_states(selected_soc)
+
+
+def _deduplicate_states(states: list[Any]) -> list[Any]:
+    """Return timestamp/state-distinct Recorder rows in chronological order."""
+    unique: dict[tuple[datetime, str], Any] = {}
+    for state in states:
+        timestamp = _recorder_state_timestamp(state)
+        if timestamp is not None:
+            unique[(timestamp, str(getattr(state, "state", "")))] = state
+    return [unique[key] for key in sorted(unique)]
+
+
+def _recorder_state_timestamp(state: Any) -> datetime | None:
+    """Return one timestamp from a Recorder state row."""
+    for attribute in ("last_changed", "last_updated"):
+        value = getattr(state, attribute, None)
+        if isinstance(value, datetime):
+            return value
+    return None
 
 
 def _load_household_forecast_states(

@@ -750,6 +750,165 @@ def test_ev_calibration_falls_back_to_home_assistant_executor(monkeypatch: Any) 
     assert hass.generic_executor_calls == 1
 
 
+def test_ev_calibration_reports_bounded_history_limit(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    existing = {"status": "ready", "soc_per_kwh": 1.8}
+
+    def fake_load(*args: Any) -> tuple[list[Any], list[Any]]:
+        raise recorder_import.EVHistoryLimitError("sensor.ev_soc")
+
+    monkeypatch.setattr(recorder_import, "_load_bounded_ev_history", fake_load)
+
+    model, changed, reason = asyncio.run(
+        recorder_import.async_update_ev_charge_calibration(
+            FakeHass(),
+            {CONF_EV_CHARGING: "binary_sensor.ev_charging", CONF_EV_SOC: "sensor.ev_soc"},
+            existing,
+            charge_rate_kw=7,
+            now=now,
+        )
+    )
+
+    assert model == existing
+    assert changed is False
+    assert reason == "ev_charge_calibration_history_limit_exceeded"
+
+
+def test_bounded_ev_history_splits_dense_chunks_and_compacts(monkeypatch: Any) -> None:
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    durations: list[timedelta] = []
+
+    def fake_load(
+        hass: Any,
+        charging_entity: str,
+        soc_entity: str,
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> tuple[list[RecorderState], list[RecorderState]]:
+        duration = chunk_end - chunk_start
+        durations.append(duration)
+        count = 4 if duration > timedelta(hours=1) else 3
+        step = duration / max(count - 1, 1)
+        charging = [
+            RecorderState("idle" if index % 2 == 0 else "charging", chunk_start + step * index)
+            for index in range(count)
+        ]
+        soc = [
+            RecorderState(str(80 - index), chunk_start + step * index)
+            for index in range(count)
+        ]
+        return charging, soc
+
+    monkeypatch.setattr(recorder_import, "MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK", 4)
+    monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
+
+    charging, soc = recorder_import._load_bounded_ev_history(
+        object(),
+        "binary_sensor.ev_charging",
+        "sensor.ev_soc",
+        start,
+        end,
+    )
+
+    assert durations == [timedelta(hours=2), timedelta(hours=1), timedelta(hours=1)]
+    assert len(charging) == 5
+    assert len(soc) == 6
+    assert all(
+        earlier.last_changed <= later.last_changed
+        for earlier, later in zip(charging, charging[1:], strict=False)
+    )
+
+
+def test_bounded_ev_history_reuses_proven_subday_chunk_span(monkeypatch: Any) -> None:
+    start = datetime(2026, 6, 1, tzinfo=UTC)
+    durations: list[timedelta] = []
+
+    def fake_load(
+        hass: Any,
+        charging_entity: str,
+        soc_entity: str,
+        chunk_start: datetime,
+        chunk_end: datetime,
+    ) -> tuple[list[object], list[object]]:
+        duration = chunk_end - chunk_start
+        durations.append(duration)
+        count = 2 if duration > timedelta(hours=1) else 1
+        return [object()] * count, [object()] * count
+
+    monkeypatch.setattr(recorder_import, "MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK", 2)
+    monkeypatch.setattr(recorder_import, "_load_recorder_states", fake_load)
+    monkeypatch.setattr(
+        recorder_import,
+        "_compact_ev_history_chunk",
+        lambda charging, soc: ([], []),
+    )
+
+    recorder_import._load_bounded_ev_history(
+        object(),
+        "binary_sensor.ev_charging",
+        "sensor.ev_soc",
+        start,
+        start + timedelta(days=30),
+    )
+
+    assert len(durations) == 728
+    assert sum(duration == timedelta(hours=1) for duration in durations) == 720
+    assert all(duration <= timedelta(hours=1) for duration in durations[8:])
+
+
+def test_bounded_ev_history_rejects_excessive_compacted_rows(monkeypatch: Any) -> None:
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+    states = [RecorderState("off", start + timedelta(minutes=index)) for index in range(3)]
+
+    monkeypatch.setattr(recorder_import, "MAX_COMPACT_EV_HISTORY_STATES", 2)
+    monkeypatch.setattr(
+        recorder_import,
+        "_load_recorder_states",
+        lambda *args: (states, states),
+    )
+    monkeypatch.setattr(
+        recorder_import,
+        "_compact_ev_history_chunk",
+        lambda charging, soc: (charging, soc),
+    )
+
+    with pytest.raises(recorder_import.EVHistoryLimitError, match="compacted_ev_history"):
+        recorder_import._load_bounded_ev_history(
+            object(),
+            "binary_sensor.ev_charging",
+            "sensor.ev_soc",
+            start,
+            start + timedelta(hours=1),
+        )
+
+
+def test_bounded_ev_history_rejects_one_hour_chunk_at_query_limit(monkeypatch: Any) -> None:
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+    dense = [RecorderState("off", start)] * 2
+    monkeypatch.setattr(recorder_import, "MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK", 2)
+    monkeypatch.setattr(recorder_import, "_load_recorder_states", lambda *args: (dense, []))
+
+    with pytest.raises(
+        recorder_import.EVHistoryLimitError,
+        match="binary_sensor.ev_charging",
+    ):
+        recorder_import._load_bounded_ev_history(
+            object(),
+            "binary_sensor.ev_charging",
+            "sensor.ev_soc",
+            start,
+            start + timedelta(hours=1),
+        )
+
+
+def test_recorder_state_timestamp_rejects_rows_without_datetimes() -> None:
+    assert recorder_import._recorder_state_timestamp(object()) is None
+    assert recorder_import._recorder_state_timestamp(
+        types.SimpleNamespace(last_changed="not-a-datetime", last_updated=1)
+    ) is None
+
+
 def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> None:
     calls: list[dict[str, Any]] = []
     charging_states = [object()]
@@ -766,12 +925,14 @@ def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> 
             entity_id: str,
             no_attributes: bool,
             include_start_time_state: bool,
+            limit: int,
         ) -> dict[str, list[Any]]:
             calls.append(
                 {
                     "entity_id": entity_id,
                     "no_attributes": no_attributes,
                     "include_start_time_state": include_start_time_state,
+                    "limit": limit,
                 }
             )
             return {
@@ -794,6 +955,10 @@ def test_recorder_load_states_uses_recorder_history_module(monkeypatch: Any) -> 
     assert charging == charging_states
     assert soc == soc_states
     assert [call["entity_id"] for call in calls] == ["binary_sensor.ev_charging", "sensor.ev_soc"]
+    assert all(
+        call["limit"] == recorder_import.MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
+        for call in calls
+    )
 
 
 def test_ev_calibration_due_handles_invalid_and_naive_timestamps() -> None:

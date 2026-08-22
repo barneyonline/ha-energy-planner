@@ -428,9 +428,15 @@ Status as of 2026-08-15.
 - EV energy demand uses the live vehicle target and a persisted compact
   charge-rate calibration. Recorder history reads use Recorder's database
   executor when available and fall back to Home Assistant's generic executor
-  only when Recorder is absent. Calibration accepts common charger and
-  connector-status states plus SOC strings with percent units or comma decimals;
-  only bounded session samples and aggregate model values are kept in `Store`.
+  only when Recorder is absent. The 30-day calibration import is split into
+  adaptive chunks beginning at seven days; each entity query has an explicit
+  50,000-state limit, dense chunks narrow to one hour, and the proven sub-day
+  span is reused for later chunks. Only charging transitions plus the SOC values
+  required around them cross back to the event loop, and a 20,000-row compacted
+  history cap fails closed with a stable reason instead of allowing query or
+  memory growth. Calibration accepts common charger and connector-status states
+  plus SOC strings with percent units or comma decimals; only bounded session
+  samples and aggregate model values are kept in `Store`.
   Learned rates are accepted only when the stored charging entity, SOC entity,
   and configured charger power match the current EV configuration; otherwise
   planning uses the conservative bootstrap rate while retraining.
@@ -439,7 +445,7 @@ Status as of 2026-08-15.
   actively charging, so momentary stop controls are not called after a vehicle
   has already suspended power delivery. Disconnection remains insufficient
   evidence for a safe momentary stop.
-  Persisted Recorder import timestamps tolerate malformed or timezone-naive
+  Persisted Recorder calibration timestamps tolerate malformed or timezone-naive
   older values without raising through planner refresh. Docker smoke coverage
   validates the compact calibration lifecycle, and real-history replay fixtures
   validate charging-state and SOC formats outside the running HA smoke container.
@@ -583,12 +589,21 @@ Status as of 2026-08-15.
   with an equivalent material signature. Changed plans show bounded pending
   metadata while provider work is in flight or rate-limited, and a single
   delayed retry runs when the provider-call window opens.
-- Forecast snapshots and dry-run comparisons use time-based
-  retention with defensive hard caps, preserving day-ahead training evidence
-  across manual refresh bursts without unbounded storage growth.
+- Forecast snapshots and dry-run comparisons use 30-minute UTC buckets,
+  time-based retention, and defensive hard caps. A forecast snapshot still
+  carries twelve five-minute near-term targets, so the calibration learner
+  retains dense target coverage while scanning and serializing at most 128
+  snapshots instead of every refresh in a two-day window. Each bucket keeps a
+  bounded list of superseded plan IDs and AI provenance so delayed explanation
+  metadata remains attachable, plus up to twelve materially distinct action
+  variants for operational replay, prioritizing negative-price and active EV
+  allocations at the cap, and one successful Recorder-import summary without
+  retaining duplicate forecast and training payloads.
 - Store persistence serializes concurrent writers and tracks mutation/saved
   generations. Transient failures remain dirty and retryable, including writes
-  arriving during an in-flight or delayed save.
+  arriving during an in-flight or delayed save. Home Assistant Store JSON
+  serialization runs in its executor, using a captured copy-on-write root so
+  large retained histories do not block the event loop.
 - Forecast calibration explicitly drops legacy models and rebuilds current
   model fields from bounded timestamped evidence when persisted raw or unique
   counters are inconsistent or implausibly large. Bounded processed-observation
@@ -617,8 +632,18 @@ Status as of 2026-08-15.
   remain paused rather than failing open.
   `active_control_ready` still requires the independent production arm.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
-  results are discarded before they can overwrite the active plan or execute
-  device actions when a newer replan request has arrived.
+  results are discarded before they can overwrite the active plan. Current
+  plans are committed while persistence is delayed, then device execution runs
+  through a separate command lock after the refresh and Store scopes exit.
+  Slow service-feedback confirmation therefore cannot block input collection or
+  planning; queued plans coalesce to the newest generation, and execution checks
+  staleness again between coordinated device actions. Each execution attempt
+  notifies Store-backed entities, unexpected per-plan failures do not strand a
+  newer queued safety plan, and unload clears queued work before awaiting the
+  current device transaction's confirmation, rollback, and ownership-persistence
+  boundary. Teardown also drains any refresh already inside the planner lock;
+  queued refreshes become no-ops, and ownership cleanup re-reads state after
+  helper-service waits so concurrent device ownership cannot be erased.
 - Non-response integration services queue coordinator work in the Home
   Assistant task loop so service calls return quickly; only the explicit
   `export_diagnostics` response service awaits and returns a payload. Service
