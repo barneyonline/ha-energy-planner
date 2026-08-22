@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Added
+
+- Climate settings now include **Precondition configured zones only**. When
+  enabled, tariff preconditioning keeps main Daikin power and mode control but
+  applies temperature targets only to configured zone climate entities.
+
 ## 0.9.12 - 2026-08-16
 
 ### Changed

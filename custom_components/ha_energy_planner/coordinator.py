@@ -2803,6 +2803,18 @@ def _is_planner_owned_control_feedback(
         # example turn_on restoring the previous mode before set_hvac_mode).
         # The bounded pending marker identifies the whole transaction as ours;
         # exact desired-state matching resumes once the transaction completes.
+        if pending_hvac_desired_state.get("configured_zones_only"):
+            old_state = event.data.get("old_state")
+            old_attributes = {} if old_state is None else (getattr(old_state, "attributes", {}) or {})
+            new_attributes = getattr(new_state, "attributes", {}) or {}
+            state_changed = old_state is None or str(getattr(old_state, "state", "")) != str(
+                getattr(new_state, "state", "")
+            )
+            if (
+                not state_changed
+                and old_attributes.get("temperature") != new_attributes.get("temperature")
+            ):
+                return False
         return True
     if asset == "daikin_zone" and pending_hvac_desired_state is not None:
         restored_zones = pending_hvac_desired_state.get("restore_zones")
@@ -2832,13 +2844,18 @@ def _is_planner_owned_control_feedback(
             return bool(desired.get("profile")) and observed == str(desired["profile"])
         if asset == "daikin_zone":
             if str(entity_id).split(".", 1)[0] == "climate":
-                return _matches_hvac_command_feedback(desired, event)
+                return _matches_hvac_command_feedback(desired, event, zone_entity=True)
             return bool(desired.get("enable_zones") and observed.lower() == "on")
         return _matches_hvac_command_feedback(desired, event)
     return False
 
 
-def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
+def _matches_hvac_command_feedback(
+    desired: dict[str, Any],
+    event: Any,
+    *,
+    zone_entity: bool = False,
+) -> bool:
     """Return whether changed HVAC controls match the planner's command."""
     new_state = event.data.get("new_state")
     old_state = event.data.get("old_state")
@@ -2855,11 +2872,15 @@ def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
     attributes = getattr(new_state, "attributes", {}) or {}
     if any(old_attributes.get(key) != attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS - {"temperature"}):
         return False
-    desired_temperature = desired.get("target_temperature")
+    desired_temperature = (
+        desired.get("target_temperature")
+        if zone_entity or not desired.get("configured_zones_only")
+        else None
+    )
     temperature_changed = old_state is None or old_attributes.get("temperature") != attributes.get("temperature")
     if temperature_changed:
         if desired_temperature is None:
-            return False
+            return matched_command_change
         observed_temperature = attributes.get("temperature")
         try:
             if float(observed_temperature) != float(desired_temperature):

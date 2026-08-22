@@ -92,6 +92,7 @@ from .const import (
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_MIN_CYCLE_MINUTES,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
@@ -395,6 +396,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_LEAD_MINUTES,
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
         CONF_HVAC_PRECONDITION_WHILE_AWAY,
         CONF_HVAC_MIN_CYCLE_MINUTES,
         CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -601,6 +603,7 @@ def _option_selector(field: str) -> Any:
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
         ),
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: BooleanSelector(),
         CONF_HVAC_PRECONDITION_WHILE_AWAY: BooleanSelector(),
         CONF_HVAC_MIN_CYCLE_MINUTES: NumberSelector(
             NumberSelectorConfig(min=0, max=240, step=5, mode=NumberSelectorMode.BOX)
@@ -783,6 +786,10 @@ class OptionsFlow(config_entries.OptionsFlow):
             option_errors = _validate_options(updated_options)
             if not _ev_keep_on_control_compatible(updated_data, updated_options):
                 option_errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
+            if not _zone_only_preconditioning_compatible(updated_data, updated_options):
+                option_errors[CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] = (
+                    "zone_only_preconditioning_requires_climate_zone"
+                )
             if option_errors:
                 errors.setdefault("base", next(iter(option_errors.values())))
 
@@ -1038,6 +1045,19 @@ def _ev_keep_on_control_compatible(
     return bool(
         entity_id
         and str(entity_id).split(".", 1)[0] in {"switch", "input_boolean"}
+    )
+
+
+def _zone_only_preconditioning_compatible(
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+) -> bool:
+    """Return whether zone-only targeting has at least one target thermostat."""
+    if options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is not True:
+        return True
+    return any(
+        entity_id.split(".", 1)[0] == "climate"
+        for entity_id in _entity_values(entry_data.get(CONF_CLIMATE_ZONES))
     )
 
 
