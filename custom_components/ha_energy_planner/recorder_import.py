@@ -11,12 +11,11 @@ from homeassistant.core import HomeAssistant
 from .const import (
     CONF_DAIKIN_POWER,
     CONF_EV_CHARGING,
-    CONF_EV_CONNECTED,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import import_trip_history_from_state_sequences
+from .ev import build_ev_charge_calibration, ev_charge_calibration_matches
 from .load_forecast import (
     FORECAST_CONTRACT_VERSION,
     HISTORY_LOOKBACK,
@@ -187,63 +186,85 @@ async def async_update_builtin_load_forecast(
     return updated, updated != model, reason
 
 
-async def async_import_ev_trip_history_from_recorder(
+async def async_update_ev_charge_calibration(
     hass: HomeAssistant,
     entry_data: dict[str, Any],
-    history: dict[str, Any],
+    model: dict[str, Any],
     *,
+    charge_rate_kw: float,
     now: datetime,
 ) -> tuple[dict[str, Any], bool, str]:
-    """Import compact EV trip records from Recorder when available."""
-    connected_entity = entry_data.get(CONF_EV_CONNECTED)
-    soc_entity = entry_data.get(CONF_EV_SOC)
-    if not connected_entity or not soc_entity:
-        return history, False, "recorder_ev_entities_not_configured"
-    if not _import_due(history, now):
-        return history, False, "recorder_import_recent"
-
+    """Train effective EV SOC-per-kWh from Recorder charging history."""
+    charging_entity = str(entry_data.get(CONF_EV_CHARGING, "") or "").strip()
+    soc_entity = str(entry_data.get(CONF_EV_SOC, "") or "").strip()
+    if not charging_entity or not soc_entity:
+        return model, False, "ev_charge_calibration_entities_not_configured"
+    if charge_rate_kw <= 0:
+        return model, False, "ev_charge_calibration_charge_rate_invalid"
+    if not _ev_charge_calibration_due(
+        model,
+        now=now,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ):
+        return model, False, "ev_charge_calibration_recent"
     try:
         executor = _recorder_executor(hass)
-        connected_states, soc_states = await executor(
+        charging_states, soc_states = await executor(
             _load_bounded_ev_history,
             hass,
-            str(connected_entity),
-            str(soc_entity),
+            charging_entity,
+            soc_entity,
             now - RECORDER_IMPORT_LOOKBACK,
             now,
         )
-    except Exception as err:  # noqa: BLE001 - Recorder is optional and must fail closed.
+        updated = build_ev_charge_calibration(
+            charging_states,
+            soc_states,
+            charge_rate_kw=charge_rate_kw,
+            trained_at=now,
+            charging_entity_id=charging_entity,
+            soc_entity_id=soc_entity,
+        )
+    except Exception as err:  # noqa: BLE001 - retain the last safe calibration.
         if isinstance(err, EVHistoryLimitError):
-            return history, False, "recorder_import_history_limit_exceeded"
-        return history, False, f"recorder_import_unavailable:{err.__class__.__name__}"
-
-    updated, changed = import_trip_history_from_state_sequences(
-        history,
-        connected_states=connected_states,
-        soc_states=soc_states,
-        imported_at=now,
-    )
-    return updated, changed, "recorder_imported" if changed else "recorder_no_new_trips"
+            return model, False, "ev_charge_calibration_history_limit_exceeded"
+        return model, False, f"ev_charge_calibration_unavailable:{err.__class__.__name__}"
+    if updated.get("status") != "ready" and _ev_charge_calibration_matches(
+        model,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ) and model.get("status") == "ready":
+        retained = {
+            **model,
+            "last_attempt_at": now.isoformat(),
+            "last_attempt_status": updated.get("status"),
+            "last_attempt_sample_count": updated.get("sample_count", 0),
+        }
+        return retained, retained != model, "ev_charge_calibration_insufficient_history_retained"
+    return updated, updated != model, f"ev_charge_calibration_{updated.get('status', 'failed')}"
 
 
 def _load_recorder_states(
     hass: HomeAssistant,
-    connected_entity: str,
+    charging_entity: str,
     soc_entity: str,
     start_time: datetime,
     end_time: datetime,
 ) -> tuple[list[Any], list[Any]]:
     history = import_module("homeassistant.components.recorder.history")
     state_changes = history.state_changes_during_period
-    connected = state_changes(
+    charging = state_changes(
         hass,
         start_time,
         end_time,
-        entity_id=connected_entity,
+        entity_id=charging_entity,
         no_attributes=True,
         include_start_time_state=True,
         limit=MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK,
-    ).get(connected_entity, [])
+    ).get(charging_entity, [])
     soc = state_changes(
         hass,
         start_time,
@@ -253,12 +274,12 @@ def _load_recorder_states(
         include_start_time_state=True,
         limit=MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK,
     ).get(soc_entity, [])
-    return list(connected), list(soc)
+    return list(charging), list(soc)
 
 
 def _load_bounded_ev_history(
     hass: HomeAssistant,
-    connected_entity: str,
+    charging_entity: str,
     soc_entity: str,
     start_time: datetime,
     end_time: datetime,
@@ -266,7 +287,7 @@ def _load_bounded_ev_history(
     """Load and compact EV history in bounded chunks before returning it."""
     chunk_start = start_time
     preferred_chunk_span = timedelta(days=INITIAL_EV_HISTORY_CHUNK_DAYS)
-    compact_connected: list[Any] = []
+    compact_charging: list[Any] = []
     compact_soc: list[Any] = []
     while chunk_start < end_time:
         chunk_end = min(
@@ -274,16 +295,16 @@ def _load_bounded_ev_history(
             end_time,
         )
         while True:
-            connected, soc = _load_recorder_states(
+            charging, soc = _load_recorder_states(
                 hass,
-                connected_entity,
+                charging_entity,
                 soc_entity,
                 chunk_start,
                 chunk_end,
             )
             dense_entity = (
-                connected_entity
-                if len(connected) >= MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
+                charging_entity
+                if len(charging) >= MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
                 else soc_entity
                 if len(soc) >= MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK
                 else None
@@ -295,27 +316,27 @@ def _load_bounded_ev_history(
                 raise EVHistoryLimitError(dense_entity)
             chunk_end = chunk_start + max(duration / 2, MIN_EV_HISTORY_CHUNK)
             preferred_chunk_span = chunk_end - chunk_start
-        selected_connected, selected_soc = _compact_ev_history_chunk(connected, soc)
-        compact_connected.extend(selected_connected)
+        selected_charging, selected_soc = _compact_ev_history_chunk(charging, soc)
+        compact_charging.extend(selected_charging)
         compact_soc.extend(selected_soc)
-        compact_connected = _deduplicate_states(compact_connected)
+        compact_charging = _deduplicate_states(compact_charging)
         compact_soc = _deduplicate_states(compact_soc)
         if (
-            len(compact_connected) > MAX_COMPACT_EV_HISTORY_STATES
+            len(compact_charging) > MAX_COMPACT_EV_HISTORY_STATES
             or len(compact_soc) > MAX_COMPACT_EV_HISTORY_STATES
         ):
             raise EVHistoryLimitError("compacted_ev_history")
         chunk_start = chunk_end
-    return compact_connected, compact_soc
+    return compact_charging, compact_soc
 
 
 def _compact_ev_history_chunk(
-    connected_states: list[Any],
+    charging_states: list[Any],
     soc_states: list[Any],
 ) -> tuple[list[Any], list[Any]]:
-    """Retain connection transitions and only SOC values needed around them."""
-    connected = sorted(
-        (state for state in connected_states if _recorder_state_timestamp(state) is not None),
+    """Retain charging transitions and only SOC values needed around them."""
+    charging = sorted(
+        (state for state in charging_states if _recorder_state_timestamp(state) is not None),
         key=_recorder_state_timestamp,
     )
     soc = sorted(
@@ -325,12 +346,12 @@ def _compact_ev_history_chunk(
     selected_soc: list[Any] = []
     soc_index = 0
     latest_soc: Any | None = None
-    for connected_state in connected:
-        connected_at = _recorder_state_timestamp(connected_state)
+    for charging_state in charging:
+        charging_at = _recorder_state_timestamp(charging_state)
         while soc_index < len(soc):
             candidate = soc[soc_index]
             candidate_at = _recorder_state_timestamp(candidate)
-            if candidate_at is None or connected_at is None or candidate_at > connected_at:
+            if candidate_at is None or charging_at is None or candidate_at > charging_at:
                 break
             latest_soc = candidate
             soc_index += 1
@@ -338,7 +359,7 @@ def _compact_ev_history_chunk(
             selected_soc.append(latest_soc)
     if soc:
         selected_soc.append(soc[-1])
-    return _deduplicate_states(connected), _deduplicate_states(selected_soc)
+    return _deduplicate_states(charging), _deduplicate_states(selected_soc)
 
 
 def _deduplicate_states(states: list[Any]) -> list[Any]:
@@ -502,19 +523,44 @@ def _state_unit(state: Any) -> str:
     return str(attributes.get("unit_of_measurement") or attributes.get("unit") or "")
 
 
-def _import_due(history: dict[str, Any], now: datetime) -> bool:
-    imported_at = history.get("recorder_imported_at")
-    if imported_at is None:
+def _ev_charge_calibration_due(
+    model: dict[str, Any],
+    *,
+    now: datetime,
+    charging_entity: str,
+    soc_entity: str,
+    charge_rate_kw: float,
+) -> bool:
+    if not _ev_charge_calibration_matches(
+        model,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ):
         return True
-    if isinstance(imported_at, datetime):
-        return now >= _align_timestamp(imported_at, now) + RECORDER_IMPORT_INTERVAL
-    if isinstance(imported_at, str):
-        try:
-            parsed = datetime.fromisoformat(imported_at.replace("Z", "+00:00"))
-        except ValueError:
-            return True
-        return now >= _align_timestamp(parsed, now) + RECORDER_IMPORT_INTERVAL
-    return True
+    trained_at = model.get("last_attempt_at") or model.get("trained_at")
+    if not isinstance(trained_at, str):
+        return True
+    try:
+        parsed = datetime.fromisoformat(trained_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return now >= _align_timestamp(parsed, now) + RECORDER_IMPORT_INTERVAL
+
+
+def _ev_charge_calibration_matches(
+    model: dict[str, Any],
+    *,
+    charging_entity: str,
+    soc_entity: str,
+    charge_rate_kw: float,
+) -> bool:
+    return ev_charge_calibration_matches(
+        model,
+        charging_entity_id=charging_entity,
+        soc_entity_id=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    )
 
 
 def _align_timestamp(value: datetime, now: datetime) -> datetime:

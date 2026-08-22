@@ -69,6 +69,7 @@ CONF_BATTERY_MAX_CHARGE_KW = "battery_max_charge_kw"
 CONF_BATTERY_MAX_DISCHARGE_KW = "battery_max_discharge_kw"
 CONF_EV_MIN_SOC_PERCENT = "ev_min_soc_percent"
 CONF_EV_MAX_SOC_PERCENT = "ev_max_soc_percent"
+# Legacy option removed in config-entry version 4. Keep the key for migration only.
 CONF_EV_FALLBACK_TARGET_SOC_PERCENT = "ev_fallback_target_soc_percent"
 CONF_EV_CHARGE_RATE_KW = "ev_charge_rate_kw"
 CONF_EV_SOC_PER_KWH = "ev_soc_per_kwh"
@@ -86,6 +87,7 @@ CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT = "occupied_temperature_tolerance_percent"
 CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA = "hvac_suppression_min_price_delta"
 CONF_HVAC_PRECONDITION_LEAD_MINUTES = "hvac_precondition_lead_minutes"
 CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA = "hvac_precondition_min_price_delta"
+CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY = "hvac_precondition_configured_zones_only"
 CONF_HVAC_PRECONDITION_WHILE_AWAY = "hvac_precondition_while_away"
 CONF_HVAC_MIN_CYCLE_MINUTES = "hvac_min_cycle_minutes"
 CONF_MANUAL_HVAC_OVERRIDE_MINUTES = "manual_hvac_override_minutes"
@@ -126,9 +128,10 @@ DEFAULT_OPTIONS = {
     CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
     CONF_EV_MIN_SOC_PERCENT: 40.0,
     CONF_EV_MAX_SOC_PERCENT: 90.0,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 80.0,
     CONF_EV_CHARGE_RATE_KW: 7.0,
-    CONF_EV_SOC_PER_KWH: 5.0,
+    # Approximately a 50 kWh usable EV battery. The previous 5%/kWh default
+    # materially underestimated charging time for typical battery EVs.
+    CONF_EV_SOC_PER_KWH: 2.0,
     CONF_EV_CONTINUOUS_CHARGING: True,
     CONF_EV_EARLIEST_START: "None",
     CONF_EV_PRICE_LIMIT_ENABLED: False,
@@ -144,6 +147,7 @@ DEFAULT_OPTIONS = {
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA: 0.20,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES: 30,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: 0.20,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False,
     CONF_HVAC_PRECONDITION_WHILE_AWAY: False,
     CONF_HVAC_MIN_CYCLE_MINUTES: 20,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES: 120,
@@ -184,7 +188,6 @@ STORE_KEY = f"{DOMAIN}_state"
 SERVICE_REPLAN = "replan"
 SERVICE_RESTORE_SAFE_STATE = "restore_safe_state"
 SERVICE_SET_EV_READY_BY = "set_ev_ready_by"
-SERVICE_SET_EV_TARGET_SOC = "set_ev_target_soc"
 SERVICE_SET_MANUAL_HVAC_OVERRIDE = "set_manual_hvac_override"
 SERVICE_EXPORT_DIAGNOSTICS = "export_diagnostics"
 SERVICE_EXPORT_SUPPORT_BUNDLE = "export_support_bundle"
@@ -196,7 +199,6 @@ SERVICE_RESUME_CONTROL = "resume_control"
 
 ATTR_REASON = "reason"
 ATTR_READY_BY = "ready_by"
-ATTR_TARGET_SOC = "target_soc"
 ATTR_DURATION_MINUTES = "duration_minutes"
 ATTR_ASSET = "asset"
 ATTR_CONFIG_ENTRY_ID = "config_entry_id"

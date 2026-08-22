@@ -57,7 +57,7 @@
           "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
           "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
           "climate_manual_override_entity": "Input_boolean that immediately releases and blocks planner HVAC control. An on state is automatically cleared after the configured manual override duration.",
-          "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
+          "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature.",
           "climate_target_low_entity": "Input number containing the occupied low comfort target.",
           "climate_target_high_entity": "Input number containing the occupied high comfort target.",
           "person_entities": "Person entities used to infer occupied or away state.",
@@ -85,7 +85,9 @@
       "instance_name_in_use": "Choose a unique planner name.",
       "household_actuator_in_use": "This actuator is already controlled by another Energy Planner entry.",
       "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean.",
-      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
+      "ev_planning_sensor_required": "EV SOC, charging state, and vehicle target SOC entities are required for EV planning.",
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
+      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -117,9 +119,8 @@
               "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
               "ev_min_soc_percent": "Minimum EV SOC",
               "ev_max_soc_percent": "Maximum EV SOC",
-              "ev_fallback_target_soc_percent": "EV target SOC",
               "ev_charge_rate_kw": "EV charge rate (kW)",
-              "ev_soc_per_kwh": "EV SOC gained per kWh",
+              "ev_soc_per_kwh": "Bootstrap EV SOC gained per kWh",
               "ev_continuous_charging": "Prefer one continuous charging session",
               "ev_earliest_start": "Earliest charging start",
               "ev_price_limit_enabled": "Apply maximum import price",
@@ -158,9 +159,8 @@
               "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
               "ev_min_soc_percent": "Lowest EV state of charge the planner treats as acceptable before charging is prioritised.",
               "ev_max_soc_percent": "Upper EV state of charge limit used when planning smart charging.",
-              "ev_fallback_target_soc_percent": "Target state of charge exposed by the native EV target SOC entity.",
               "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
-              "ev_soc_per_kwh": "Estimated EV battery percentage gained from each kWh added.",
+              "ev_soc_per_kwh": "Conservative bootstrap estimate used until Recorder has enough completed charging history to learn the vehicle-specific percentage gained per kWh.",
               "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
               "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
               "ev_price_limit_enabled": "Exclude charging intervals above the maximum import price, except an immediate minimum-SOC recovery interval.",
@@ -203,6 +203,7 @@
               "hvac_suppression_min_price_delta": "HVAC suppression price delta",
               "hvac_precondition_lead_minutes": "HVAC precondition lead time",
               "hvac_precondition_min_price_delta": "HVAC precondition price delta",
+              "hvac_precondition_configured_zones_only": "Precondition configured zones only",
               "hvac_precondition_while_away": "Precondition while away",
               "hvac_min_cycle_minutes": "HVAC minimum cycle time",
               "manual_hvac_override_minutes": "Manual HVAC override duration"
@@ -215,7 +216,7 @@
               "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
               "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
               "climate_manual_override_entity": "Input_boolean that immediately releases and blocks planner HVAC control. An on state is automatically cleared after the configured manual override duration.",
-              "climate_zone_entities": "Zone switches enabled during planner HVAC control and restored when control is released.",
+              "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature.",
               "climate_target_low_entity": "Input number containing the occupied low comfort target.",
               "climate_target_high_entity": "Input number containing the occupied high comfort target.",
               "person_entities": "Person entities used to infer occupied or away state.",
@@ -223,6 +224,7 @@
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
               "hvac_precondition_lead_minutes": "How far ahead HVAC may precondition before an expensive or comfort-sensitive period.",
               "hvac_precondition_min_price_delta": "Minimum price difference required before HVAC preconditioning is considered worthwhile.",
+              "hvac_precondition_configured_zones_only": "Apply tariff preconditioning and coast temperatures only to configured zone climate entities. The main Daikin entity is still turned on and set to the required HVAC mode.",
               "hvac_precondition_while_away": "Allow tariff-driven preconditioning while every configured person is away. Leave off to retain the conservative occupied-only policy.",
               "hvac_min_cycle_minutes": "Minimum time between planner HVAC mode changes.",
               "manual_hvac_override_minutes": "How long manual HVAC changes block planner-owned HVAC control."
@@ -298,9 +300,8 @@
               "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
               "ev_min_soc_percent": "Minimum EV SOC",
               "ev_max_soc_percent": "Maximum EV SOC",
-              "ev_fallback_target_soc_percent": "EV target SOC",
               "ev_charge_rate_kw": "EV charge rate (kW)",
-              "ev_soc_per_kwh": "EV SOC gained per kWh",
+              "ev_soc_per_kwh": "Bootstrap EV SOC gained per kWh",
               "ev_continuous_charging": "Prefer one continuous charging session",
               "ev_earliest_start": "Earliest charging start",
               "ev_price_limit_enabled": "Apply maximum import price",
@@ -317,10 +318,10 @@
               "default_ready_by": "Default EV ready-by time"
             },
             "data_description": {
-              "ev_soc_entity": "EV state-of-charge sensor.",
-              "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
+              "ev_soc_entity": "Required EV state-of-charge sensor used for planning and automatic charge-rate calibration.",
+              "ev_charging_entity": "Required entity that reports whether the EV is actively charging and identifies completed calibration sessions.",
               "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
-              "ev_smart_charging_target_soc_entity": "Optional vehicle or charger target-SOC entity. Its live percentage overrides the native fallback target.",
+              "ev_smart_charging_target_soc_entity": "Required vehicle target-SOC entity. Its live percentage is the authoritative charging target.",
               "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
               "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
               "ev_charger_stop_entity": "Optional separate switch or button used to stop charging.",
@@ -331,9 +332,8 @@
               "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
               "ev_min_soc_percent": "Lowest EV state of charge the planner treats as acceptable before charging is prioritised.",
               "ev_max_soc_percent": "Upper EV state of charge limit used when planning smart charging.",
-              "ev_fallback_target_soc_percent": "Target state of charge exposed by the native EV target SOC entity.",
               "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
-              "ev_soc_per_kwh": "Estimated EV battery percentage gained from each kWh added.",
+              "ev_soc_per_kwh": "Conservative bootstrap estimate used until Recorder has enough completed charging history to learn the vehicle-specific percentage gained per kWh.",
               "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
               "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
               "ev_price_limit_enabled": "Exclude charging intervals above the maximum import price, except an immediate minimum-SOC recovery interval.",
@@ -383,10 +383,10 @@
     },
     "error": {
       "ev_min_above_max": "EV minimum SOC must not be above EV maximum SOC.",
-      "ev_fallback_outside_bounds": "EV fallback target SOC must be between the configured minimum and maximum SOC.",
       "invalid_ready_by": "Default ready-by must be a valid local time.",
       "invalid_priority_weights": "Each planning priority must use a different objective.",
-      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty."
+      "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
+      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
     }
   },
   "exceptions": {

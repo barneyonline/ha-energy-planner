@@ -58,6 +58,7 @@ from .models import (
 )
 from .notifications import cancel_deferred_persistent_notification, defer_persistent_notification
 from .ownership import OwnershipState
+from .planner import asset_meets_confidence_threshold
 from .preflight import production_evidence_fingerprint
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
@@ -330,7 +331,10 @@ class Executor:
         projected_import_kw, _projected_export_kw = _projected_grid_flows_kw(context.slots[0])
         if projected_import_kw is None:
             return "ev_grid_projection_unavailable"
-        if getattr(context, "input_health", InputHealth.UNSAFE) == InputHealth.UNSAFE:
+        if getattr(context, "input_health", None) not in {
+            InputHealth.HEALTHY,
+            InputHealth.DEGRADED,
+        }:
             return "ev_grid_projection_unsafe"
         created_at = getattr(context, "created_at", None)
         if not isinstance(created_at, datetime) or created_at.tzinfo is None:
@@ -698,6 +702,7 @@ class Executor:
                 "mode",
                 "precondition_target",
                 "coast_target",
+                "projected_precondition_end_temperature",
                 "released_until",
             ):
                 if action.desired_state.get(key) is not None:
@@ -766,6 +771,7 @@ class Executor:
                     "mode",
                     "precondition_target",
                     "coast_target",
+                    "projected_precondition_end_temperature",
                     "released_until",
                 ):
                     if action.desired_state.get(key) is not None:
@@ -891,7 +897,30 @@ class Executor:
         if not has_owned_ev_state and not has_ev_reservation:
             return None
         disconnected = context is not None and context.ev_connected is False
-        unhealthy_inputs = context is not None and context.input_health != InputHealth.HEALTHY
+        ev_input_issue = bool(
+            context is not None
+            and any(
+                str(issue).startswith("ev_")
+                for issue in context.input_issues
+                if not str(issue).startswith("advisory_")
+            )
+        )
+        ev_confidence_ineligible = bool(
+            context is not None
+            and not asset_meets_confidence_threshold(
+                ActionAsset.EV,
+                context,
+                self.options,
+            )
+        )
+        unhealthy_inputs = bool(
+            context is not None
+            and (
+                context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+                or ev_input_issue
+                or ev_confidence_ineligible
+            )
+        )
         recovered_reservation = has_ev_reservation and not has_owned_ev_state
         ev_control_disabled = (
             has_ev_reservation
@@ -983,6 +1012,7 @@ class Executor:
         *,
         plan_id: str = "manual_hvac_release",
         action: Any | None = None,
+        preserve_zone_entity_id: str | None = None,
     ) -> ActionOutcome:
         """Release only planner-owned HVAC automation and zone state."""
         now = dt_util.utcnow()
@@ -990,6 +1020,12 @@ class Executor:
         hvac_control = dict(ownership.get("hvac_control", {}))
         automation_states = dict(ownership.get("climate_automations", {}))
         zone_states = dict(hvac_control.get("zone_states", {}))
+        if preserve_zone_entity_id:
+            zone_states.pop(preserve_zone_entity_id, None)
+            # A failed release may retain unresolved ownership for a later retry.
+            # Do not retain the user-controlled zone or that retry would overwrite
+            # the manual target that caused this release.
+            hvac_control["zone_states"] = zone_states
         had_hvac_ownership = bool(
             automation_states
             or zone_states
@@ -997,7 +1033,10 @@ class Executor:
             or ownership.get("planner_takeover_started_at")
             or ownership.get("planner_hvac_action_expires_at")
         )
-        if self.hass is None:
+        if not had_hvac_ownership:
+            result = None
+            failed = False
+        elif self.hass is None:
             result = None
             failed = bool(automation_states or zone_states or hvac_control)
         else:
@@ -2378,6 +2417,17 @@ def _daily_action_cap_reason(asset: ActionAsset, options: dict[str, Any], audit:
     count = 0
     for item in audit:
         if not isinstance(item, dict) or item.get("asset") != str(asset):
+            continue
+        item_kind = item.get("kind")
+        if (
+            asset == ActionAsset.DAIKIN
+            and item_kind is not None
+            and item_kind != str(ActionKind.SET_HVAC)
+        ):
+            # Releases restore previously owned state and must remain
+            # available regardless of the command budget. In particular, a
+            # no-ownership comfort handoff must never consume the allowance
+            # needed for a later preconditioning start.
             continue
         attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
         if attempted_at is None or attempted_at < cutoff:

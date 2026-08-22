@@ -4,16 +4,20 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from custom_components.ha_energy_planner import planner as planner_module
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_PV_FORECAST,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
 )
+from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -52,6 +56,7 @@ def _context(health: InputHealth = InputHealth.HEALTHY) -> DecisionContext:
         ],
         current_battery_soc_percent=50,
         current_ev_soc_percent=60,
+        ev_target_soc_percent=80,
         occupancy_state=OccupancyState.OCCUPIED,
         input_health=health,
     )
@@ -71,6 +76,20 @@ def test_dry_run_plan_has_candidate_actions_without_active_control() -> None:
     assert plan.confidence == 1.0
     assert plan.decision_audit["accepted"][0]["device"] == "Climate"
     assert plan.rejected_actions
+
+
+def test_unclassified_input_health_produces_an_unsafe_actionless_plan() -> None:
+    context = _context()
+    context.input_health = "mystery"  # type: ignore[assignment]
+
+    plan = DryRunPlanner(
+        {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+    ).create_plan(context)
+
+    assert plan.mode == PlannerMode.ACTIVE_DEGRADED
+    assert plan.status == "unsafe"
+    assert plan.confidence == 0.0
+    assert plan.actions == []
 
 
 def test_plan_preview_includes_weather_forecast_temperature() -> None:
@@ -222,11 +241,11 @@ def test_estimated_cost_includes_projected_flexible_load() -> None:
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -334,6 +353,11 @@ def test_climate_confidence_uses_weather_source_instead_of_unrelated_global_mini
     )
 
     assert not planner_module._action_meets_confidence_threshold(action, context, DEFAULT_OPTIONS)
+    assert not planner_module.plan_asset_meets_confidence_threshold(
+        ActionAsset.DAIKIN,
+        object(),
+        DEFAULT_OPTIONS,
+    )
     reason = planner_module._confidence_rejection_reason(ActionAsset.DAIKIN, context, DEFAULT_OPTIONS)
     assert reason is not None
     assert "climate 40.0%" in reason
@@ -354,6 +378,7 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 70}
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -370,7 +395,6 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
         "default_ready_by": "00:20",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     plan = DryRunPlanner(options).create_plan(context)
@@ -387,17 +411,90 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert timeline[0]["end"] == "2026-06-27T00:10:00+00:00"
 
 
+def test_active_plan_keeps_observed_continuous_ev_session_running() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "00:15",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 64
+    context.ev_target_soc_percent = 74
+    context.ev_charging = True
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset, price in [(0, 0.50), (5, 0.10), (10, 0.10)]
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["continued_active_session"] is True
+    assert action.desired_state["charging_reason"] == "ev_continuous_charging_in_progress"
+    assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0]
+
+
+def test_continued_pre_window_slot_counts_toward_ev_target_feasibility() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "00:15",
+        "ev_earliest_start": "00:05",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 8, 17, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 64
+    context.ev_target_soc_percent = 79
+    context.ev_charging = True
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.15,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset in (0, 5, 10)
+    ]
+
+    plan = DryRunPlanner(options).create_plan(context)
+
+    action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
+    assert action.desired_state["continued_active_session"] is True
+    assert action.desired_state["max_attainable_soc_percent"] == 79
+    assert action.desired_state["infeasible"] is False
+
+
 def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
     context = _context()
     context.current_ev_soc_percent = 80
+    context.ev_target_soc_percent = 70
 
     plan = DryRunPlanner(options).create_plan(context)
 
     action = next(action for action in plan.actions if action.asset == ActionAsset.EV)
     assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["target_soc_percent"] == 70
     assert action.desired_state["allocated_slots"] == []
     assert action.desired_state["charging_reason"] == "ev_outside_allocated_charging_window"
+    assert "ev_target_soc_below_current" not in ConstraintValidator(options).validate_plan(context, plan)
 
 
 def test_keep_charger_on_reserves_grid_power_for_preconditioning_after_target() -> None:
@@ -431,6 +528,7 @@ def test_keep_charger_on_policy_does_not_change_confirmation_for_normal_charging
     }
     context = _context()
     context.current_ev_soc_percent = 40
+    context.ev_target_soc_percent = 45
     context.ev_connected = True
 
     action = next(
@@ -461,29 +559,8 @@ def test_keep_charger_on_never_bypasses_external_target_policy_bounds() -> None:
 
     assert action.desired_state["charging_required_now"] is False
     assert action.desired_state["keep_charger_on"] is False
-    assert action.desired_state["configured_target_soc_percent"] == 100
-
-
-def test_keep_charger_on_is_suppressed_during_external_target_fallback() -> None:
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        "ev_keep_charger_on": True,
-    }
-    context = _context()
-    context.current_ev_soc_percent = 80
-    context.ev_connected = True
-    context.ev_target_soc_percent = 80
-    context.ev_target_soc_fallback_active = True
-
-    action = next(
-        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
-    )
-
-    assert action.desired_state["charging_required_now"] is False
-    assert action.desired_state["keep_charger_on"] is False
-    assert action.desired_state["configured_target_soc_percent"] == 80
+    assert action.desired_state["target_soc_percent"] == 90
+    assert action.desired_state["vehicle_target_soc_percent"] == 100
 
 
 def test_keep_charger_on_uses_bounded_target_when_current_soc_is_higher() -> None:
@@ -513,7 +590,6 @@ def test_native_ev_low_price_charging_starts_current_interval() -> None:
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
-        "ev_fallback_target_soc_percent": 80,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0,
         "ev_continuous_charging": False,
@@ -536,7 +612,6 @@ def test_native_ev_low_price_charging_bypasses_earliest_start() -> None:
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
-        "ev_fallback_target_soc_percent": 80,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0.05,
         "ev_earliest_start": "23:00",
@@ -673,11 +748,11 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
         "default_ready_by": "00:15",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 45,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 40
+    context.ev_target_soc_percent = 45
     context.current_hvac_temperature_c = None
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
@@ -700,7 +775,7 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
     allocation = plan.actions[0].desired_state["allocated_slots"][0]
     assert plan.actions[0].reason_codes == [
         "ev_outside_allocated_charging_window",
-        "fallback_until_history_sufficient",
+        "vehicle_target_soc",
         "continuous_charging_window_before_ready_by",
     ]
     assert allocation["valid_at"] == "2026-06-27T00:05:00+00:00"
@@ -853,12 +928,12 @@ def test_ev_schedule_preserves_absolute_ready_by_timestamp() -> None:
         "planner_enabled": True,
         "dry_run": True,
         "default_ready_by": "07:00",
-        "ev_fallback_target_soc_percent": 70,
     }
     context = _context()
     context.created_at = datetime(2026, 7, 11, 20, 30, tzinfo=UTC)
     context.local_timezone = "Australia/Melbourne"
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),
@@ -1033,11 +1108,11 @@ def test_active_plan_uses_runtime_ready_by_option_for_ev_schedule() -> None:
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
-        "ev_fallback_target_soc_percent": 70,
         "planning_interval_minutes": 5,
     }
     context = _context()
     context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 70
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -1064,7 +1139,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
         "dry_run": True,
         "ev_min_soc_percent": 40,
         "ev_max_soc_percent": 90,
-        "ev_fallback_target_soc_percent": 70,
         "default_ready_by": "07:00",
         "ev_charge_rate_kw": 7,
         "ev_soc_per_kwh": 5,
@@ -1076,8 +1150,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
     context.ev_connected = True
     context.ev_target_soc_percent = 80
     context.ev_ready_by = "08:00"
-    context.ev_trip_history_sufficient = True
-    context.ev_trip_max_daily_soc_percent = 5
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=offset),
@@ -1094,7 +1166,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
     assert plan.mode == PlannerMode.DRY_RUN
     assert plan.actions[0].asset == ActionAsset.EV
     assert plan.actions[0].desired_state["target_soc_percent"] == 80
-    assert plan.actions[0].desired_state["configured_target_soc_percent"] == 80
     assert plan.actions[0].desired_state["ready_by"] == "08:00"
     assert plan.actions[0].desired_state["required_charge_percent"] == 8
     assert any(entry["state"] == "charging" for entry in plan.device_plans["ev"]["timeline"])
@@ -1111,14 +1182,13 @@ def test_active_plan_does_not_schedule_ev_when_disconnected() -> None:
     assert plan.actions == []
 
 
-def test_active_plan_uses_trip_history_for_ev_target() -> None:
+def test_active_plan_uses_vehicle_target_without_deriving_a_trip_target() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
         "ev_min_soc_percent": 40,
         "ev_max_soc_percent": 90,
-        "ev_fallback_target_soc_percent": 80,
         "default_ready_by": "03:00",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -1126,6 +1196,7 @@ def test_active_plan_uses_trip_history_for_ev_target() -> None:
     }
     context = _context()
     context.current_ev_soc_percent = 50
+    context.ev_target_soc_percent = 65
     context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     context.slots = [
         DecisionSlot(
@@ -1137,17 +1208,63 @@ def test_active_plan_uses_trip_history_for_ev_target() -> None:
         )
         for offset in range(0, 3 * 60, 5)
     ]
-    context.ev_trip_observed_days = 3
-    context.ev_trip_max_daily_soc_percent = 15
-    context.ev_trip_average_daily_soc_percent = 10
-    context.ev_trip_history_sufficient = True
-
     plan = DryRunPlanner(options).create_plan(context)
 
     assert plan.actions[0].asset == ActionAsset.EV
-    assert plan.actions[0].desired_state["target_soc_percent"] == 55.0
-    assert plan.actions[0].desired_state["trip_history_sufficient"] is True
-    assert "history_max_daily_consumption" in plan.actions[0].reason_codes
+    assert plan.actions[0].desired_state["target_soc_percent"] == 65.0
+    assert plan.actions[0].desired_state["target_soc_source"] == "vehicle_sensor"
+    assert "vehicle_target_soc" in plan.actions[0].reason_codes
+
+
+def test_active_plan_uses_recorder_calibrated_soc_per_kwh() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "default_ready_by": "03:00",
+        "ev_charge_rate_kw": 7,
+        "ev_soc_per_kwh": 5,
+        "planning_interval_minutes": 5,
+    }
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 60
+    context.ev_target_soc_percent = 74
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.20,
+            export_price=0.05,
+            pv_forecast_kw=0,
+            baseline_load_forecast_kw=1,
+        )
+        for offset in range(0, 3 * 60, 5)
+    ]
+    calibration = {
+        "model_version": 1,
+        "status": "ready",
+        "charging_entity_id": "sensor.ev_charging",
+        "soc_entity_id": "sensor.ev_soc",
+        "charge_rate_kw": 7.0,
+        "soc_per_kwh": 1.8,
+        "sample_count": 3,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(
+            options,
+            ev_charge_calibration=calibration,
+            ev_charging_entity_id="sensor.ev_charging",
+            ev_soc_entity_id="sensor.ev_soc",
+        ).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["soc_per_kwh"] == 1.8
+    assert action.desired_state["soc_per_kwh_source"] == "recorder_charging_history"
+    assert action.desired_state["charge_calibration_sample_count"] == 3
+    assert len(action.desired_state["allocated_slots"]) == 14
 
 
 def test_active_plan_sets_enphase_arbitrage_profile_when_forecast_solar_export_value_exceeds_threshold() -> None:
@@ -1301,7 +1418,7 @@ def test_hvac_suppression_uses_two_hour_duration_at_non_default_interval() -> No
     assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
 
 
-def test_active_plan_hands_comfort_back_to_automations_when_outside_bounds() -> None:
+def test_active_plan_does_not_release_hvac_without_ownership_when_outside_bounds() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -1319,11 +1436,10 @@ def test_active_plan_hands_comfort_back_to_automations_when_outside_bounds() -> 
 
     plan = DryRunPlanner(options).create_plan(context)
 
-    assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
-    assert plan.actions[0].desired_state["release_reason"] == "hvac_comfort_handoff"
+    assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
 
 
-def test_degraded_plan_still_hands_comfort_back_without_active_ownership() -> None:
+def test_degraded_ev_issue_does_not_block_asset_eligible_hvac_preconditioning() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -1332,17 +1448,30 @@ def test_degraded_plan_still_hands_comfort_back_without_active_ownership() -> No
     }
     context = _context()
     context.input_health = InputHealth.DEGRADED
+    context.input_issues = ["ev_soc_unavailable"]
     context.current_ev_soc_percent = None
-    context.current_hvac_temperature_c = 24
-    context.occupied_temperature_low_c = 18
-    context.occupied_temperature_high_c = 24
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
     context.hvac_control = {}
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [(0, 0.10), (15, 0.10), (30, 0.50)]
+    ]
 
     plan = DryRunPlanner(options).create_plan(context)
 
-    assert len(plan.actions) == 1
-    assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
-    assert plan.actions[0].desired_state["release_reason"] == "hvac_comfort_handoff"
+    climate_actions = [action for action in plan.actions if action.asset == ActionAsset.DAIKIN]
+    assert climate_actions
+    assert climate_actions[0].kind == ActionKind.SET_HVAC
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
 
 
 def test_dry_run_does_not_hand_comfort_back_without_active_ownership() -> None:
@@ -1561,7 +1690,7 @@ def test_future_away_preconditioning_keeps_hvac_off_until_window_starts() -> Non
     assert preconditioning.execute_not_before > context.created_at
 
 
-def test_future_away_preconditioning_omits_window_inside_new_away_off_rest_period() -> None:
+def test_future_away_preconditioning_can_start_immediately_without_away_off_takeover() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -1601,10 +1730,10 @@ def test_future_away_preconditioning_omits_window_inside_new_away_off_rest_perio
         if action.asset == ActionAsset.DAIKIN
     ]
 
-    assert len(climate_actions) == 1
-    assert climate_actions[0].desired_state == {"hvac_mode": "off"}
-    assert climate_actions[0].reason_codes == ["away_hvac_policy"]
-    assert all(slot.projected_hvac_load_kw == 0.0 for slot in context.slots)
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].execute_not_before == context.created_at
+    assert climate_actions[0].desired_state["hvac_mode"] == "heat"
+    assert context.slots[0].projected_hvac_load_kw == 2.0
 
 
 def test_away_off_ownership_transitions_to_opted_in_preconditioning() -> None:
@@ -1746,8 +1875,7 @@ def test_active_plan_does_not_precondition_further_past_mode_target_boundary() -
 
         plan = DryRunPlanner(options, thermal_model=thermal_model).create_plan(context)
 
-        assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
-        assert plan.actions[0].desired_state["release_reason"] == "hvac_comfort_handoff"
+        assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
 
 
 def test_active_plan_uses_thermal_model_for_hvac_precondition_projection() -> None:
@@ -1855,24 +1983,25 @@ def test_active_plan_thermal_shifts_heat_during_low_tariff_period() -> None:
     assert plan.device_plans["climate"]["next_planned_state_label"] == "Preconditioning: Heat to 23.0 C"
 
 
-def test_active_plan_skips_when_thermal_rate_cannot_reach_target_before_peak() -> None:
+def test_active_plan_uses_partial_preconditioning_when_full_target_is_infeasible() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
+        "planning_interval_minutes": 30,
         "hvac_precondition_lead_minutes": 120,
         "hvac_precondition_min_price_delta": 0.20,
     }
     thermal_model = {
         "enabled": True,
         "active_hvac_load_kw": {"sample_count": 12, "average": 2.0},
-        "active_heat_rate_c_per_hour": {"sample_count": 4, "average": 2.0},
+        "active_heat_rate_c_per_hour": {"sample_count": 4, "average": 0.5},
         "passive_indoor_drift_c_per_hour": {"sample_count": 4, "average": -5.0},
     }
     context = _context()
     context.current_ev_soc_percent = None
     context.current_hvac_mode = "heat"
-    context.current_hvac_temperature_c = 21.0
+    context.current_hvac_temperature_c = 19.1
     context.current_outdoor_temperature_c = 5.0
     context.occupied_temperature_low_c = 19
     context.occupied_temperature_high_c = 23
@@ -1885,12 +2014,16 @@ def test_active_plan_skips_when_thermal_rate_cannot_reach_target_before_peak() -
             baseline_load_forecast_kw=2.0,
             outdoor_temperature_forecast_c=5.0,
         )
-        for offset, price in [(0, 0.10), (30, 0.12), (60, 0.45)]
+        for offset, price in [(0, 0.10), (30, 0.12), (60, 0.45), (90, 0.45)]
     ]
 
     plan = DryRunPlanner(options, thermal_model=thermal_model).create_plan(context)
 
-    assert [action for action in plan.actions if action.asset == ActionAsset.DAIKIN] == []
+    climate_actions = [action for action in plan.actions if action.asset == ActionAsset.DAIKIN]
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].execute_not_before == context.created_at
+    assert climate_actions[0].desired_state["target_temperature"] == 23.0
+    assert [slot.projected_hvac_load_kw for slot in context.slots] == [2.0, 2.0, 0.0, 2.0]
 
 
 def test_thermal_coast_helpers_cover_defensive_branches() -> None:
@@ -2157,7 +2290,7 @@ def test_zero_hvac_precondition_lead_disables_tariff_takeover() -> None:
     assert climate_actions == []
 
 
-def test_fallback_hvac_preconditioning_requires_the_full_lead_window() -> None:
+def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -2182,11 +2315,140 @@ def test_fallback_hvac_preconditioning_requires_the_full_lead_window() -> None:
         for offset, price in [(0, 0.10), (5, 0.10), (10, 0.50), (15, 0.50)]
     ]
 
+    planner = DryRunPlanner(options)
     climate_actions = [
-        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
+        action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
-    assert climate_actions == []
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].execute_not_before == context.created_at
+    assert climate_actions[0].desired_state["target_temperature"] == 23.0
+    assert climate_actions[0].desired_state["projected_precondition_end_temperature"] == 19.0
+    assert all(slot.projected_hvac_load_kw > 0 for slot in context.slots[2:])
+
+    persisted_keys = {
+        "phase",
+        "period_start",
+        "period_end",
+        "precondition_end",
+        "baseline_price",
+        "precondition_min_price_delta",
+        "suppression_min_price_delta",
+        "mode",
+        "precondition_target",
+        "coast_target",
+        "projected_precondition_end_temperature",
+    }
+    context.hvac_control = {
+        key: value
+        for key, value in climate_actions[0].desired_state.items()
+        if key in persisted_keys
+    }
+    for slot in context.slots:
+        slot.projected_hvac_load_kw = 0.0
+
+    continuation = [
+        action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert continuation[0].desired_state["projected_precondition_end_temperature"] == 19.0
+    assert all(slot.projected_hvac_load_kw > 0 for slot in context.slots[2:])
+
+
+def test_fallback_hvac_preconditioning_scans_past_a_tariff_gap() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "planning_interval_minutes": 5,
+        "hvac_precondition_lead_minutes": 30,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 21
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [
+            (0, 0.10),
+            (5, None),
+            (10, 0.10),
+            (15, 0.50),
+            (20, 0.50),
+        ]
+    ]
+
+    climate_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].execute_not_before == context.created_at + timedelta(minutes=10)
+    assert climate_actions[0].desired_state["precondition_end"] == context.created_at + timedelta(
+        minutes=15
+    )
+
+
+@pytest.mark.parametrize(
+    "thermal_model",
+    [
+        None,
+        {
+            "enabled": True,
+            "active_heat_rate_c_per_hour": {"sample_count": 3, "average": 10.0},
+        },
+    ],
+)
+def test_hvac_preconditioning_requalifies_prices_after_a_tariff_gap(
+    thermal_model: dict[str, object] | None,
+) -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "planning_interval_minutes": 5,
+        "hvac_precondition_lead_minutes": 30,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = "heat"
+    context.current_hvac_temperature_c = 22.9
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 23
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=price,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+        )
+        for offset, price in [
+            (0, 0.10),
+            (5, None),
+            (10, 0.29),
+            (15, 0.40),
+        ]
+    ]
+
+    preconditioning_actions = [
+        action
+        for action in DryRunPlanner(options, thermal_model=thermal_model).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+        and action.desired_state.get("phase") == "preconditioning"
+    ]
+
+    assert preconditioning_actions == []
 
 
 def test_hvac_preconditioning_accounts_for_passive_drift_before_delayed_run() -> None:
@@ -2269,6 +2531,7 @@ def test_hvac_lifecycle_scans_full_twenty_four_hour_horizon() -> None:
         "switch.living",
         "input_boolean.bedrooms",
     ]
+    assert actions[0].desired_state["configured_zones_only"] is False
     assert actions[0].execute_not_before == context.slots[18].valid_at
     assert actions[1].desired_state["phase"] == "peak_coast"
     assert actions[1].execute_not_before == context.slots[20].valid_at
@@ -2792,6 +3055,17 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     ]
     assert planner._next_hvac_period(context) is None
 
+    context.current_hvac_mode = "heat"
+    context.current_outdoor_temperature_c = 5
+    context.slots = [
+        DecisionSlot(now, 0.10, 0.05, 1, 2, outdoor_temperature_forecast_c=5),
+        DecisionSlot(now + timedelta(minutes=5), 0.10, 0.05, 1, 2, outdoor_temperature_forecast_c=5),
+        DecisionSlot(now + timedelta(minutes=10), 0.60, 0.05, 1, 2, outdoor_temperature_forecast_c=5),
+    ]
+    catch_up = planner._next_hvac_period(context, earliest_start=now + timedelta(minutes=5))
+    assert catch_up is not None
+    assert catch_up["precondition_start"] == now + timedelta(minutes=5)
+
     peak = DecisionSlot(now + timedelta(minutes=5), 0.60, 0.05, 1, 2, outdoor_temperature_forecast_c=21)
     context.current_hvac_mode = "off"
     context.current_outdoor_temperature_c = 5
@@ -2891,7 +3165,7 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     )
 
 
-def test_hvac_lifecycle_skips_runs_with_tariff_gaps_or_ambiguous_mode() -> None:
+def test_hvac_lifecycle_rejects_tariff_gaps_but_can_catch_up_without_coasting() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -2917,9 +3191,11 @@ def test_hvac_lifecycle_skips_runs_with_tariff_gaps_or_ambiguous_mode() -> None:
         )
         for index, price in enumerate([0.10, None, 0.10, 0.60])
     ]
-    assert [
+    gap_tail = [
         action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
-    ] == []
+    ]
+    assert gap_tail[0].desired_state["phase"] == "preconditioning"
+    assert gap_tail[0].execute_not_before == context.created_at + timedelta(minutes=10)
 
     context.current_hvac_mode = "heat"
     context.current_outdoor_temperature_c = 5
@@ -2947,7 +3223,8 @@ def test_hvac_lifecycle_skips_runs_with_tariff_gaps_or_ambiguous_mode() -> None:
         },
     ).create_plan(context)
     climate_actions = [action for action in coast_limited.actions if action.asset == ActionAsset.DAIKIN]
-    assert climate_actions == []
+    assert climate_actions[0].desired_state["phase"] == "preconditioning"
+    assert climate_actions[0].execute_not_before == context.created_at
     context.current_hvac_mode = "off"
     context.current_outdoor_temperature_c = 21
     for slot in context.slots:
@@ -2964,6 +3241,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
         "dry_run": False,
         "planning_interval_minutes": 5,
         "hvac_precondition_lead_minutes": 15,
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
     }
     thermal_model = {
         "enabled": True,
@@ -2976,6 +3254,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
     context.current_hvac_temperature_c = 22
     context.occupied_temperature_low_c = 19
     context.occupied_temperature_high_c = 23
+    context.climate_zone_entities = ["climate.living_zone"]
     context.slots = [
         DecisionSlot(
             valid_at=context.created_at + timedelta(minutes=index * 5),
@@ -2999,6 +3278,7 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
         "pre_peak_coast",
         "peak_coast",
     ]
+    assert all(action.desired_state["configured_zones_only"] is True for action in actions[:-1])
     precondition_end = context.slots[2].valid_at
     assert actions[0].desired_state["precondition_end"] == precondition_end
     assert actions[1].execute_not_before == precondition_end

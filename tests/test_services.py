@@ -18,10 +18,11 @@ from custom_components.ha_energy_planner.const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
-    ATTR_TARGET_SOC,
     CONF_BYPASS_SAFETY_GATES,
+    CONF_EV_CHARGING,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
@@ -33,7 +34,6 @@ from custom_components.ha_energy_planner.const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
-    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
@@ -93,6 +93,9 @@ class FakeStates:
             "person.home": "home",
             "input_boolean.ev_start": "off",
             "input_boolean.ev_stop": "on",
+            "sensor.ev_soc": "60",
+            "binary_sensor.ev_charging": "off",
+            "sensor.ev_target": "80",
         }
 
     def get(self, entity_id: str) -> FakeState | None:
@@ -134,7 +137,6 @@ def test_non_response_services_await_coordinator_work() -> None:
         (SERVICE_REPLAN, {}),
         (SERVICE_RESTORE_SAFE_STATE, {ATTR_REASON: "test_restore"}),
         (SERVICE_SET_EV_READY_BY, {ATTR_READY_BY: "08:30"}),
-        (SERVICE_SET_EV_TARGET_SOC, {ATTR_TARGET_SOC: 85}),
         (
             SERVICE_SET_MANUAL_HVAC_OVERRIDE,
             {ATTR_DURATION_MINUTES: 15, ATTR_REASON: "test_override"},
@@ -152,7 +154,6 @@ def test_non_response_services_await_coordinator_work() -> None:
         ("replan", None),
         ("restore", "test_restore"),
         ("ready_by", "08:30"),
-        ("target_soc", 85.0),
         ("manual_override", (15, "test_override")),
         ("arm", "test_arm"),
         ("disarm", "test_disarm"),
@@ -205,21 +206,6 @@ def test_set_ev_ready_by_schema_rejects_invalid_time() -> None:
         assert "ready_by must be a valid local time" in str(err)
     else:
         raise AssertionError("Invalid ready_by time was accepted")
-
-
-def test_set_ev_target_soc_schema_accepts_percentage_and_rejects_out_of_range() -> None:
-    coordinator = _coordinator()
-    hass = FakeHass(coordinator)
-    asyncio.run(async_setup(hass, {}))
-    schema = hass.services.schemas[(DOMAIN, SERVICE_SET_EV_TARGET_SOC)]
-
-    assert schema({ATTR_TARGET_SOC: "85"}) == {ATTR_TARGET_SOC: 85.0}
-    try:
-        schema({ATTR_TARGET_SOC: 101})
-    except Exception as err:  # noqa: BLE001 - assert service bounds.
-        assert "value must be at most 100" in str(err)
-    else:
-        raise AssertionError("Invalid target SOC was accepted")
 
 
 def test_reason_code_schemas_accept_compact_codes() -> None:
@@ -430,7 +416,7 @@ def test_run_preflight_keeps_unavailable_ai_configuration_advisory() -> None:
     assert "ai_task_entity_unavailable" in response["discovery"]["ai"]["issues"]
 
 
-def test_run_preflight_keeps_unavailable_external_ev_target_advisory() -> None:
+def test_run_preflight_blocks_control_when_vehicle_target_is_unavailable() -> None:
     coordinator = _partial_coordinator(
         {
             "ev_smart_charging_start_entity": "input_boolean.ev_start",
@@ -447,13 +433,12 @@ def test_run_preflight_keeps_unavailable_external_ev_target_advisory() -> None:
     response = asyncio.run(handler(FakeCall({})))
 
     checks = {check["check"]: check for check in response["checks"]}
-    assert response["ok"] is True
-    assert checks["configured_entities_available"]["ok"] is True
-    assert response["entities"]["unavailable"] == []
-    assert response["entities"]["advisory_unavailable"] == [
-        "sensor.ev_target"
-    ]
-    assert response["entities"]["available_count"] == 2
+    assert response["ok"] is False
+    assert checks["configured_entities_available"]["ok"] is False
+    assert response["entities"]["unavailable"] == ["sensor.ev_target"]
+    assert response["entities"]["advisory_unavailable"] == []
+    assert response["entities"]["available_count"] == 4
+    assert response["discovery"]["ev"]["supported"] is True
 
 
 def test_run_preflight_supports_enphase_only_control() -> None:
@@ -529,7 +514,7 @@ def test_run_preflight_no_control_dry_run_treats_discovery_as_advisory() -> None
     assert "advisory" in checks["required_control_areas_supported"]["message"]
 
 
-def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
+def test_run_preflight_isolates_a_mixed_unsupported_enabled_area() -> None:
     coordinator = _partial_coordinator(
         {
             "ev_smart_charging_start_entity": "input_boolean.ev_start",
@@ -541,12 +526,14 @@ def test_run_preflight_blocks_a_mixed_unsupported_enabled_area() -> None:
     )
     response = _run_preflight(coordinator)
 
-    assert response["ok"] is False
+    assert response["ok"] is True
     assert response["control_areas"]["required"] == ["ev", "hvac"]
+    assert response["control_areas"]["ready"] == ["ev"]
+    assert response["control_areas"]["blocked"] == ["hvac"]
     assert response["discovery"]["ev"]["supported"] is True
     assert response["discovery"]["hvac"]["supported"] is False
     checks = {check["check"]: check for check in response["checks"]}
-    assert checks["required_control_areas_supported"]["ok"] is False
+    assert checks["required_control_areas_supported"]["ok"] is True
     assert "hvac" in checks["required_control_areas_supported"]["message"]
 
 
@@ -577,6 +564,75 @@ def test_run_preflight_separates_historical_evidence_from_current_safety() -> No
     assert response["safe_to_activate_now"] is False
     assert response["active_control_ready"] is False
     assert response["current_plan"]["healthy"] is False
+
+
+def test_run_preflight_accepts_degraded_plan_for_asset_specific_execution() -> None:
+    coordinator = _coordinator()
+    coordinator.data.health = InputHealth.DEGRADED
+    coordinator.data.input_issues = ["ev_soc_unavailable"]
+    coordinator.data.confidence = 0.65
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["healthy"] is False
+    assert response["current_plan"]["input_health_safe"] is True
+    assert response["current_plan"]["safe"] is True
+    assert response["safe_to_activate_now"] is True
+
+
+def test_run_preflight_requires_a_confidence_eligible_ready_area() -> None:
+    coordinator = _partial_coordinator(
+        {
+            "ev_smart_charging_start_entity": "input_boolean.ev_start",
+            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+        },
+        ev_control_enabled=True,
+    )
+    coordinator.data.health = InputHealth.DEGRADED
+    coordinator.data.confidence = 0.4
+    coordinator.data.confidence_breakdown = {
+        "tariff": 0.8,
+        "solar": 0.4,
+        "load": 0.8,
+        "climate": 0.8,
+        "ev": 0.8,
+        "enphase": 0.8,
+    }
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["safe"] is True
+    assert response["control_areas"]["ready"] == ["ev"]
+    assert response["control_areas"]["confidence_eligible"] == []
+    assert response["control_areas"]["confidence_blocked"] == ["ev"]
+    assert response["safe_to_activate_now"] is False
+    checks = {check["check"]: check for check in response["checks"]}
+    assert checks["control_area_confidence_eligible"]["ok"] is False
+
+
+def test_run_preflight_rejects_unclassified_plan_health() -> None:
+    coordinator = _coordinator()
+    coordinator.data.health = "mystery"
+
+    response = _run_preflight(coordinator)
+
+    assert response["current_plan"]["input_health_safe"] is False
+    assert response["current_plan"]["safe"] is False
+    assert response["safe_to_activate_now"] is False
+
+
+def test_run_preflight_scopes_unavailable_occupancy_to_hvac() -> None:
+    coordinator = _coordinator()
+    hass = FakeHass(coordinator)
+    hass.states.values["person.home"] = "unavailable"
+    asyncio.run(async_setup(hass, {}))
+
+    handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
+    response = asyncio.run(handler(FakeCall({})))
+
+    assert response["control_areas"]["ready"] == ["ev", "enphase"]
+    assert response["control_areas"]["blocked"] == ["hvac"]
+    assert response["safe_to_activate_now"] is True
 
 
 def test_run_preflight_combined_safety_bypass_waives_all_prechecks() -> None:
@@ -636,7 +692,7 @@ def test_run_preflight_rejects_stale_or_unconfirmed_plan() -> None:
     assert failed["current_plan"]["last_refresh_succeeded"] is False
 
 
-def test_run_preflight_rejects_pause_but_preserves_evidence_across_device_selection() -> None:
+def test_run_preflight_isolates_asset_pause_and_preserves_evidence_across_device_selection() -> None:
     coordinator = _coordinator()
     coordinator.store.data["control_pause"] = {
         "active": True,
@@ -648,8 +704,10 @@ def test_run_preflight_rejects_pause_but_preserves_evidence_across_device_select
     coordinator.entry.options["climate_control_enabled"] = False
     changed = _run_preflight(coordinator)
 
-    assert paused["safe_to_activate_now"] is False
-    assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is False
+    assert paused["safe_to_activate_now"] is True
+    assert paused["control_areas"]["paused"] == ["ev"]
+    assert paused["control_areas"]["available"] == ["hvac", "enphase"]
+    assert {item["check"]: item for item in paused["checks"]}["control_not_paused"]["ok"] is True
     assert changed["production"]["dry_run_evidence_complete"] is True
     assert changed["production"]["dry_run_evidence_fingerprint_matches"] is True
     assert changed["safe_to_activate_now"] is True
@@ -893,6 +951,9 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
                 "person_entities": "person.home",
                 "ev_smart_charging_start_entity": "input_boolean.ev_start",
                 "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+                CONF_EV_SOC: "sensor.ev_soc",
+                CONF_EV_CHARGING: "binary_sensor.ev_charging",
+                CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
                 "ai_advisor_service": "fake_ai.advice",
             },
             "options": {
@@ -913,6 +974,14 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
         mode=PlannerMode.DRY_RUN,
         summary="healthy dry-run",
         confidence=0.9,
+        confidence_breakdown={
+            "tariff": 0.9,
+            "solar": 0.9,
+            "load": 0.9,
+            "climate": 0.9,
+            "ev": 0.9,
+            "enphase": 0.9,
+        },
         estimated_daily_cost=2.0,
         estimated_cost_horizon_hours=12.0,
         actions=[],
@@ -962,9 +1031,6 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     async def ready_by(value: str) -> None:
         coordinator.awaited.append(("ready_by", value))
 
-    async def target_soc(value: float) -> None:
-        coordinator.awaited.append(("target_soc", value))
-
     async def manual_override(duration: int, reason: str) -> None:
         coordinator.awaited.append(("manual_override", (duration, reason)))
 
@@ -983,7 +1049,6 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     coordinator.async_request_replan = replan
     coordinator.async_restore_safe_state = restore
     coordinator.async_set_ready_by = ready_by
-    coordinator.async_set_ev_target_soc = target_soc
     coordinator.async_set_manual_hvac_override = manual_override
     coordinator.async_arm_production_control = arm
     coordinator.async_operator_arm_production_control = arm
@@ -997,6 +1062,13 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
 def _partial_coordinator(data: dict[str, Any], **options: Any) -> EnergyPlannerCoordinator:
     """Return an armed coordinator with only the requested control surfaces."""
     coordinator = _coordinator()
+    if options.get("ev_control_enabled"):
+        data = {
+            CONF_EV_SOC: "sensor.ev_soc",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+            **data,
+        }
     coordinator.entry.data = dict(data)
     coordinator.entry.options = {
         "ev_control_enabled": False,

@@ -25,7 +25,12 @@ from custom_components.ha_energy_planner import (
 from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
+    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
+    CONF_EV_SOC_PER_KWH,
     CONF_HOUSEHOLD_LOAD,
+    DEFAULT_OPTIONS,
     EV_RESERVATION_EXTERNAL_BASELINE,
 )
 from custom_components.ha_energy_planner.models import OutcomeResult
@@ -131,14 +136,72 @@ def test_config_entry_migration_uses_only_measured_legacy_load() -> None:
 
     assert asyncio.run(async_migrate_entry(hass, measured)) is True
     assert measured.data == {CONF_HOUSEHOLD_LOAD: "sensor.whole_home_power"}
-    assert manager.updated_entries[-1][1]["version"] == 2
+    assert manager.updated_entries[-1][1]["version"] == 4
+    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == DEFAULT_OPTIONS[
+        CONF_EV_SOC_PER_KWH
+    ]
     assert asyncio.run(async_migrate_entry(hass, forecast_only)) is True
     assert forecast_only.data == {}
 
 
+def test_config_entry_migration_updates_only_legacy_default_ev_rate() -> None:
+    manager = FakeConfigEntries()
+    default_rate = FakeEntry(version=2, options={CONF_EV_SOC_PER_KWH: 5.0})
+    custom_rate = FakeEntry(version=2, options={CONF_EV_SOC_PER_KWH: 1.8})
+    malformed_rate = FakeEntry(version=2, options={CONF_EV_SOC_PER_KWH: "unknown"})
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), default_rate)) is True
+    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == 2.0
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), custom_rate)) is True
+    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == 1.8
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), malformed_rate)) is True
+    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == "unknown"
+
+
+def test_config_entry_migration_removes_obsolete_target_soc_fallback() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=3,
+        options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85, CONF_EV_SOC_PER_KWH: 1.9},
+    )
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
+    assert manager.updated_entries[-1][1]["version"] == 4
+    assert manager.updated_entries[-1][1]["options"] == {CONF_EV_SOC_PER_KWH: 1.9}
+
+
+def test_config_entry_migration_requires_vehicle_target_for_configured_ev() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=3,
+        data={CONF_EV_SOC: "sensor.ev_soc"},
+        options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
+    )
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
+    assert manager.updated_entries == []
+    assert entry.version == 3
+
+
+def test_config_entry_migration_accepts_vehicle_target_from_legacy_subentry() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=3,
+        data={CONF_EV_SOC: "sensor.ev_soc"},
+        options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
+    )
+    entry.subentries["ev"].data = {
+        CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target_soc"
+    }
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
+    assert manager.updated_entries[-1][1]["version"] == 4
+    assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT not in manager.updated_entries[-1][1]["options"]
+
+
 def test_config_entry_migration_rejects_unknown_future_version() -> None:
     manager = FakeConfigEntries()
-    entry = FakeEntry(version=3, data={CONF_BASELINE_LOAD_OBSERVED: "sensor.load"})
+    entry = FakeEntry(version=5, data={CONF_BASELINE_LOAD_OBSERVED: "sensor.load"})
 
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
     assert manager.updated_entries == []

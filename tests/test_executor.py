@@ -14,6 +14,7 @@ from homeassistant.core import CoreState
 from custom_components.ha_energy_planner import executor as executor_module
 from custom_components.ha_energy_planner import notifications as notifications_module
 from custom_components.ha_energy_planner.const import (
+    CONF_AMBER_IMPORT_PRICE,
     CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
@@ -41,6 +42,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_MAX_DAILY_EV_ACTIONS,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
+    CONF_PV_FORECAST,
     DEFAULT_OPTIONS,
 )
 from custom_components.ha_energy_planner.executor import (
@@ -1877,6 +1879,38 @@ def test_executor_control_gate_helpers_cover_pause_controls_and_daily_caps() -> 
         _daily_action_cap_reason(ActionAsset.DAIKIN, {CONF_MAX_DAILY_CLIMATE_ACTIONS: 1}, audit, now)
         == "climate_daily_action_cap_reached"
     )
+    climate_audit = [
+        {
+            "asset": "daikin",
+            "kind": "release_hvac",
+            "attempted_at": now.isoformat(),
+            "result": "restored",
+        },
+        {
+            "asset": "daikin",
+            "kind": "set_hvac",
+            "attempted_at": now.isoformat(),
+            "result": "applied",
+        },
+    ]
+    assert (
+        _daily_action_cap_reason(
+            ActionAsset.DAIKIN,
+            {CONF_MAX_DAILY_CLIMATE_ACTIONS: 2},
+            climate_audit,
+            now,
+        )
+        is None
+    )
+    assert (
+        _daily_action_cap_reason(
+            ActionAsset.DAIKIN,
+            {CONF_MAX_DAILY_CLIMATE_ACTIONS: 1},
+            climate_audit,
+            now,
+        )
+        == "climate_daily_action_cap_reached"
+    )
     assert _daily_action_cap_reason(ActionAsset.ENPHASE, {CONF_MAX_DAILY_ENPHASE_ACTIONS: 1}, audit, now) is None
 
     store = FakeStore()
@@ -2225,6 +2259,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
             "mode": "heat",
             "precondition_target": 23.0,
             "coast_target": 19.0,
+            "projected_precondition_end_temperature": 21.0,
             "enable_zones": True,
         },
         [],
@@ -2261,6 +2296,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
     assert store.data["ownership"]["hvac_control"]["phase"] == "preconditioning"
     assert store.data["ownership"]["hvac_control"]["coast_target"] == 19.0
+    assert store.data["ownership"]["hvac_control"]["projected_precondition_end_temperature"] == 21.0
     assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
     assert "planner_hvac_action_expires_at" in store.data["ownership"]
     assert store.flush_count == 1
@@ -2582,6 +2618,81 @@ def test_hvac_specific_release_restores_zones_without_touching_other_assets(monk
     }
 
 
+def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) -> None:
+    restored: list[dict[str, Any]] = []
+
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, Any],
+        ) -> object:
+            restored.append(dict(zones))
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            },
+            "phase": "peak_coast",
+        },
+    }
+
+    outcome = asyncio.run(
+        Executor(store, hass=FakeHass()).async_release_hvac_control(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
+    )
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [{"switch.living": "off"}]
+    assert store.data["ownership"] == {}
+
+    class FailingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, *args: object) -> object:
+            raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailingDaikinAdapter)
+    failed_store = FakeStore()
+    failed_store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"climate.bedrooms": {"target_temperature": 21}},
+            "phase": "peak_coast",
+        },
+    }
+
+    failed = asyncio.run(
+        Executor(failed_store, hass=FakeHass()).async_release_hvac_control(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
+    )
+
+    assert failed.result == OutcomeResult.FAILED
+    assert failed_store.data["ownership"]["hvac_control"]["zone_states"] == {}
+
+
 def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
     now = datetime.now(UTC)
     action = PlanAction(
@@ -2732,6 +2843,19 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
             raise RuntimeError("restore failed")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingAdapter)
+    unowned_store = FakeStore()
+    unowned = asyncio.run(
+        Executor(unowned_store, hass=FakeHass()).async_release_hvac_control("no_ownership")
+    )
+    assert unowned.result == OutcomeResult.SKIPPED
+    assert unowned.reason == "already_released_hvac_control"
+
+    no_hass_store = FakeStore()
+    no_hass_store.data["ownership"] = {"climate_automations": {"automation.hvac": "on"}}
+    no_hass = asyncio.run(Executor(no_hass_store).async_release_hvac_control("no_hass"))
+    assert no_hass.result == OutcomeResult.FAILED
+    assert no_hass_store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
+
     failed_store = FakeStore()
     failed_store.data["ownership"] = {"climate_automations": {"automation.hvac": "on"}}
     failed = asyncio.run(Executor(failed_store, hass=FakeHass()).async_release_hvac_control("manual"))
@@ -4898,6 +5022,65 @@ def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
 
     assert len(hass.services.calls) == 1
     assert len(store.data["outcomes"]) == 1
+
+
+def test_unrelated_degraded_inputs_do_not_stop_planner_owned_ev_power() -> None:
+    now = datetime.now(UTC)
+    store = FakeStore()
+    store.data["ownership"] = {"ev_smart_charging_state": {"switch.ev": "on"}}
+    executor = Executor(store)
+    context = _context(now)
+    context.input_health = InputHealth.DEGRADED
+    context.input_issues = ["occupancy_unknown", "daikin_climate_unavailable"]
+    plan = SimpleNamespace(
+        plan_id="degraded-plan",
+        created_at=now,
+        interval_minutes=5,
+        input_issues=[],
+    )
+
+    assert executor._owned_ev_safety_stop(plan, context) is None
+
+    context.input_issues = ["ev_soc_unavailable"]
+    safety_stop = executor._owned_ev_safety_stop(plan, context)
+    assert safety_stop is not None
+    assert safety_stop.desired_state["input_health_safety_stop"] is True
+
+
+@pytest.mark.parametrize(
+    ("source", "issue"),
+    [
+        (
+            CONF_AMBER_IMPORT_PRICE,
+            "amber_import_price_entity_forecast_coverage_degraded",
+        ),
+        (CONF_PV_FORECAST, "pv_forecast_entity_forecast_coverage_degraded"),
+    ],
+)
+def test_ev_relevant_low_confidence_stops_planner_owned_ev_power(
+    source: str,
+    issue: str,
+) -> None:
+    now = datetime.now(UTC)
+    store = FakeStore()
+    store.data["ownership"] = {"ev_smart_charging_state": {"switch.ev": "on"}}
+    executor = Executor(store, options=dict(DEFAULT_OPTIONS))
+    context = _context(now)
+    context.input_health = InputHealth.DEGRADED
+    context.input_issues = [issue]
+    context.forecast_confidence_by_source = {source: 0.4}
+    plan = SimpleNamespace(
+        plan_id="degraded-plan",
+        created_at=now,
+        interval_minutes=5,
+        input_issues=[],
+    )
+
+    safety_stop = executor._owned_ev_safety_stop(plan, context)
+
+    assert safety_stop is not None
+    assert safety_stop.desired_state["charging_reason"] == "ev_input_health_safety_stop"
+    assert safety_stop.desired_state["input_health_safety_stop"] is True
 
 
 def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:

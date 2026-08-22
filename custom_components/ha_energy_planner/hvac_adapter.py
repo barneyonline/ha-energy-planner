@@ -38,7 +38,7 @@ class HVACCommandResult:
     post_state: dict[str, Any]
     saved_automation_states: dict[str, str]
     rollback_succeeded: bool | None = None
-    saved_zone_states: dict[str, str] = field(default_factory=dict)
+    saved_zone_states: dict[str, Any] = field(default_factory=dict)
     command_sent: bool = False
 
 
@@ -50,7 +50,7 @@ class DaikinHVACAdapter:
         self.hass = hass
         self.entry_data = entry_data
 
-    def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
+    def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
         """Return automation and zone state that must survive a takeover crash."""
         return self._enabled_automation_states(), self._zone_states()
 
@@ -75,6 +75,16 @@ class DaikinHVACAdapter:
             return HVACCommandResult(False, "daikin_climate_unavailable", pre_state, self._snapshot(), {}, True)
         if not action.desired_state:
             return HVACCommandResult(False, "hvac_desired_state_empty", pre_state, self._snapshot(), {}, True)
+        if action.desired_state.get("configured_zones_only") and not self._zone_climate_entities():
+            return HVACCommandResult(
+                False,
+                "zone_only_preconditioning_requires_climate_zone",
+                pre_state,
+                self._snapshot(),
+                restorable_automation_states,
+                True,
+                saved_zone_states,
+            )
         if set(saved_automation_states) != set(self._automation_entities()):
             return HVACCommandResult(
                 False,
@@ -85,7 +95,9 @@ class DaikinHVACAdapter:
                 True,
                 saved_zone_states,
             )
-        if action.desired_state.get("enable_zones") and set(saved_zone_states) != set(self._zone_entities()):
+        if action.desired_state.get("enable_zones") and any(
+            self._state(entity_id) is None for entity_id in self._zone_entities()
+        ):
             return HVACCommandResult(
                 False,
                 "climate_zone_unavailable",
@@ -162,7 +174,10 @@ class DaikinHVACAdapter:
                 rollback_succeeded,
                 unresolved_zones,
             )
-        command_sent = bool(saved_automation_states or changed_zones)
+        command_sent = bool(
+            saved_automation_states
+            or any(entity_id.split(".", 1)[0] != "climate" for entity_id in changed_zones)
+        )
 
         try:
             command_sent = (
@@ -186,7 +201,10 @@ class DaikinHVACAdapter:
                 unresolved_zones,
             )
         else:
-            state_confirmed = await self._async_confirm_hvac_state(climate_entity, action.desired_state)
+            state_confirmed = await self._async_confirm_complete_hvac_state(
+                climate_entity,
+                action.desired_state,
+            )
         confirmation_reason = "hvac_state_confirmation_failed"
         if not state_confirmed:
             # A schedule action can already be running when its automation is
@@ -209,7 +227,7 @@ class DaikinHVACAdapter:
                 except Exception:  # noqa: BLE001 - retry remains inside the same rollback boundary.
                     confirmation_reason = "hvac_control_service_failed"
                 else:
-                    state_confirmed = await self._async_confirm_hvac_state(
+                    state_confirmed = await self._async_confirm_complete_hvac_state(
                         climate_entity,
                         action.desired_state,
                     )
@@ -245,7 +263,7 @@ class DaikinHVACAdapter:
     async def async_restore(
         self,
         saved_automation_states: dict[str, str] | None = None,
-        saved_zone_states: dict[str, str] | None = None,
+        saved_zone_states: dict[str, Any] | None = None,
     ) -> HVACCommandResult:
         """Release HVAC ownership by restoring zones and enabling automations."""
         pre_state = self._snapshot()
@@ -381,10 +399,15 @@ class DaikinHVACAdapter:
                 unresolved[entity_id] = "on"
         return not unresolved, unresolved
 
-    async def _async_enable_zones(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
+    async def _async_enable_zones(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Enable configured zone entities and return those changed."""
-        changed: dict[str, str] = {}
+        changed: dict[str, Any] = {}
         for entity_id, state in states.items():
+            if entity_id.split(".", 1)[0] == "climate":
+                # Target snapshots are restored if any later command in the
+                # takeover transaction fails.
+                changed[entity_id] = state
+                continue
             if state == "on":
                 continue
             changed[entity_id] = state
@@ -398,10 +421,19 @@ class DaikinHVACAdapter:
                 return False, changed
         return True, changed
 
-    async def _async_restore_zone_states(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
+    async def _async_restore_zone_states(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Restore captured zone states."""
-        unresolved: dict[str, str] = {}
+        unresolved: dict[str, Any] = {}
         for entity_id, state in states.items():
+            if entity_id.split(".", 1)[0] == "climate" and isinstance(state, dict):
+                try:
+                    await self._async_apply_hvac_state(entity_id, state)
+                except Exception:  # noqa: BLE001 - retain target snapshot for a later release retry.
+                    unresolved[entity_id] = state
+                    continue
+                if not await self._async_confirm_hvac_state(entity_id, state):
+                    unresolved[entity_id] = state
+                continue
             observed = self._state(entity_id)
             if observed is not None and observed.state == state:
                 continue
@@ -420,8 +452,8 @@ class DaikinHVACAdapter:
     async def _async_rollback_takeover(
         self,
         saved_automation_states: dict[str, str],
-        changed_zones: dict[str, str],
-    ) -> tuple[bool, dict[str, str], dict[str, str]]:
+        changed_zones: dict[str, Any],
+    ) -> tuple[bool, dict[str, str], dict[str, Any]]:
         """Release every actuator acquired before a climate command failed."""
         zones_restored, unresolved_zones = await self._async_restore_zone_states(changed_zones)
         automations_restored, unresolved_states = await self._async_enable_automation_entities(
@@ -455,6 +487,27 @@ class DaikinHVACAdapter:
                 return False
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
+    async def _async_confirm_complete_hvac_state(
+        self,
+        entity_id: str,
+        desired_state: dict[str, Any],
+    ) -> bool:
+        """Confirm the main thermostat and every configured zone target."""
+        if not await self._async_confirm_hvac_state(
+            entity_id,
+            _main_hvac_desired_state(desired_state),
+        ):
+            return False
+        if not desired_state.get("enable_zones"):
+            return True
+        zone_target = _temperature_desired_state(desired_state)
+        if not zone_target:
+            return True
+        for zone_entity in self._zone_climate_entities():
+            if not await self._async_confirm_hvac_state(zone_entity, zone_target):
+                return False
+        return True
+
     async def _async_confirm_hvac_on(self, entity_id: str) -> bool:
         """Wait for the thermostat to leave its off state."""
         loop = asyncio.get_running_loop()
@@ -476,10 +529,11 @@ class DaikinHVACAdapter:
         force: bool = False,
     ) -> bool:
         """Apply thermostat mode before its target and report whether a command was sent."""
-        desired_mode = desired_state.get("hvac_mode")
-        desired_temperature = desired_state.get("target_temperature")
-        target_low = desired_state.get("target_temp_low")
-        target_high = desired_state.get("target_temp_high")
+        main_desired_state = _main_hvac_desired_state(desired_state)
+        desired_mode = main_desired_state.get("hvac_mode")
+        desired_temperature = main_desired_state.get("target_temperature")
+        target_low = main_desired_state.get("target_temp_low")
+        target_high = main_desired_state.get("target_temp_high")
         observed = self._state(entity_id)
         if observed is None:
             raise RuntimeError("climate state unavailable")
@@ -543,6 +597,17 @@ class DaikinHVACAdapter:
                 {ATTR_ENTITY_ID: entity_id, "target_temp_low": target_low, "target_temp_high": target_high},
                 blocking=True,
             )
+        if desired_state.get("enable_zones"):
+            zone_target = _temperature_desired_state(desired_state)
+            for zone_entity in self._zone_climate_entities():
+                command_sent = (
+                    await self._async_apply_hvac_state(
+                        zone_entity,
+                        zone_target,
+                        force=force,
+                    )
+                    or command_sent
+                )
         return command_sent
 
     async def _async_disable_automations(self, states: dict[str, str]) -> tuple[bool, dict[str, str]]:
@@ -592,12 +657,25 @@ class DaikinHVACAdapter:
             return [str(entity_id) for entity_id in configured if str(entity_id).strip()]
         return []
 
-    def _zone_states(self) -> dict[str, str]:
-        return {
-            entity_id: state.state
+    def _zone_states(self) -> dict[str, Any]:
+        states: dict[str, Any] = {}
+        for entity_id in self._zone_entities():
+            state = self._state(entity_id)
+            if state is None:
+                continue
+            if entity_id.split(".", 1)[0] == "climate":
+                states[entity_id] = _climate_target_snapshot(state)
+            else:
+                states[entity_id] = state.state
+        return states
+
+    def _zone_climate_entities(self) -> list[str]:
+        """Return subordinate zone thermostats that receive target setpoints."""
+        return [
+            entity_id
             for entity_id in self._zone_entities()
-            if (state := self._state(entity_id)) is not None
-        }
+            if entity_id.split(".", 1)[0] == "climate"
+        ]
 
     def _zone_entities(self) -> list[str]:
         configured = self.entry_data.get(CONF_CLIMATE_ZONES, "")
@@ -647,6 +725,40 @@ def _already_in_desired_state(state: State, desired_state: dict[str, Any]) -> bo
             desired_state.get("target_temp_high"),
         )
     )
+
+
+def _temperature_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
+    """Return only target-temperature fields supported by subordinate zones."""
+    return {
+        key: desired_state[key]
+        for key in ("target_temperature", "target_temp_low", "target_temp_high")
+        if desired_state.get(key) is not None
+    }
+
+
+def _main_hvac_desired_state(desired_state: dict[str, Any]) -> dict[str, Any]:
+    """Return command fields intended for the main thermostat."""
+    if not desired_state.get("configured_zones_only"):
+        return desired_state
+    return {
+        key: value
+        for key, value in desired_state.items()
+        if key not in {"target_temperature", "target_temp_low", "target_temp_high"}
+    }
+
+
+def _climate_target_snapshot(state: State) -> dict[str, Any]:
+    """Capture the target fields needed to restore a subordinate thermostat."""
+    attributes = getattr(state, "attributes", {}) or {}
+    target_low = attributes.get("target_temp_low")
+    target_high = attributes.get("target_temp_high")
+    if target_low is not None and target_high is not None:
+        return {
+            "target_temp_low": target_low,
+            "target_temp_high": target_high,
+        }
+    temperature = attributes.get("temperature")
+    return {"target_temperature": temperature} if temperature is not None else {}
 
 
 def _mode_matches(state: State, desired_mode: Any) -> bool:

@@ -29,7 +29,6 @@ from .const import (
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
-    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HOUSEHOLD_LOAD,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
@@ -37,10 +36,11 @@ from .const import (
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .load_forecast import FORECAST_CONTRACT_VERSION
+from .planner import confidence_eligible_control_areas
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
-    control_pause_reason,
     parse_production_state,
+    partition_control_areas_by_pause,
     strict_bool,
 )
 
@@ -76,15 +76,20 @@ def build_preflight_report(
     entry_data = combined_entry_data(coordinator.entry)
     options = coordinator.options if options_override is None else {**coordinator.options, **options_override}
     bypass_safety_gates = strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False)
-    control_areas = _control_area_report(entry_data, options)
-    discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
-    _apply_ev_keep_on_preflight(discovery, entry_data, options)
+    now = dt_util.utcnow()
+    control_areas, discovery = _runtime_control_area_report(
+        hass,
+        entry_data,
+        options,
+        plan=getattr(coordinator, "data", None),
+        pause=coordinator.store.data.get("control_pause"),
+        now=now,
+    )
     entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
     recorder_required = bool(entry_data.get(CONF_HOUSEHOLD_LOAD))
     safety = _safety_report(options)
-    now = dt_util.utcnow()
     evidence_fingerprint = production_evidence_fingerprint(entry_data, options)
     production = _production_report(
         coordinator.store.data,
@@ -97,14 +102,15 @@ def build_preflight_report(
         now=now,
         last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
     )
-    control_paused = control_pause_reason(production["pause"], now) is not None
     audit = _audit_report(coordinator.store.data)
 
+    ready_control_areas = list(control_areas.get("ready", []))
+    unpaused_control_areas = list(control_areas.get("available", []))
+    confidence_eligible_areas = list(control_areas.get("confidence_eligible", []))
+    control_paused = bool(ready_control_areas and not unpaused_control_areas)
+    control_area_blocking = bool(control_areas["required"] and not ready_control_areas)
     blocking = [
-        *entity_report["missing"],
-        *entity_report["unavailable"],
-        *service_report["missing"],
-        *service_report["unavailable"],
+        *(["control_areas"] if control_area_blocking else []),
         *(["recorder"] if recorder_required and not recorder["available"] else []),
     ]
     checks = [
@@ -121,7 +127,7 @@ def build_preflight_report(
         {
             "check": "configured_entities_available",
             "ok": not entity_report["missing"] and not entity_report["unavailable"],
-            "blocking": True,
+            "blocking": control_area_blocking,
             "message": _availability_message(
                 "All configured entities are present and available.",
                 missing=entity_report["missing"],
@@ -131,7 +137,7 @@ def build_preflight_report(
         {
             "check": "configured_services_available",
             "ok": not service_report["missing"] and not service_report["unavailable"],
-            "blocking": True,
+            "blocking": control_area_blocking,
             "message": _availability_message(
                 "All configured services are registered.",
                 missing=service_report["missing"],
@@ -140,7 +146,7 @@ def build_preflight_report(
         },
         {
             "check": "required_control_areas_supported",
-            "ok": all(bool(discovery[area]["supported"]) for area in control_areas["required"]),
+            "ok": not control_areas["required"] or bool(ready_control_areas),
             "blocking": True,
             "message": _control_area_message(control_areas, discovery),
         },
@@ -169,13 +175,27 @@ def build_preflight_report(
             "check": "control_not_paused",
             "ok": not control_paused,
             "blocking": True,
-            "message": "Control is not paused." if not control_paused else "An active control pause is in effect.",
+            "message": (
+                "At least one ready control area is not paused."
+                if not control_paused
+                else "Every ready control area is paused."
+            ),
         },
         {
             "check": "current_plan_safe",
             "ok": current_plan["safe"],
             "blocking": True,
             "message": current_plan["message"],
+        },
+        {
+            "check": "control_area_confidence_eligible",
+            "ok": bool(confidence_eligible_areas),
+            "blocking": True,
+            "message": (
+                f"Confidence-eligible control areas: {_bounded_join(confidence_eligible_areas)}."
+                if confidence_eligible_areas
+                else "No ready, unpaused control area clears its configured confidence thresholds."
+            ),
         },
         {
             "check": "production_control_armed",
@@ -197,10 +217,10 @@ def build_preflight_report(
             check["blocking"] = False
     safe_to_activate_now = bypass_safety_gates or (
         not blocking
-        and bool(control_areas["required"])
-        and all(bool(discovery[area]["supported"]) for area in control_areas["required"])
+        and bool(unpaused_control_areas)
         and production["dry_run_evidence_complete"]
         and current_plan["safe"]
+        and bool(confidence_eligible_areas)
         and production["device_controls_enabled"]
         and not control_paused
     )
@@ -329,17 +349,19 @@ def _current_plan_report(
         usable_horizon = None
     issues = [str(issue) for issue in list(getattr(plan, "input_issues", []) or [])]
     healthy = health == "healthy"
+    input_health_safe = health in {"healthy", "degraded"}
     current = status == "current"
     adequate_coverage = bool(
         usable_horizon is not None
         and usable_horizon >= required_horizon
         and not any("incomplete_horizon" in issue for issue in issues)
     )
-    safe = healthy and current and confidence > 0 and adequate_coverage and fresh and last_refresh_succeeded
+    safe = input_health_safe and current and confidence > 0 and adequate_coverage and fresh and last_refresh_succeeded
     if safe:
-        message = f"Current healthy plan has {usable_horizon:g} usable priced hours."
-    elif not healthy:
-        message = "Current plan inputs are not healthy."
+        health_label = "healthy" if healthy else "degraded"
+        message = f"Current {health_label} plan has {usable_horizon:g} usable priced hours."
+    elif not input_health_safe:
+        message = "Current plan has unsafe required inputs."
     elif not current:
         message = "The latest plan is not current."
     elif not fresh:
@@ -354,6 +376,7 @@ def _current_plan_report(
     return {
         "present": True,
         "healthy": healthy,
+        "input_health_safe": input_health_safe,
         "current": current,
         "confidence": confidence,
         "adequate_coverage": adequate_coverage,
@@ -382,11 +405,14 @@ def _entity_report(
     entry_data: dict[str, Any],
     *,
     required_areas: list[str] | None = None,
+    include_shared: bool = True,
 ) -> dict[str, Any]:
-    configured = _configured_entities(entry_data, required_areas=required_areas)
-    advisory_entities = set(
-        _split_entities(entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC))
+    configured = _configured_entities(
+        entry_data,
+        required_areas=required_areas,
+        include_shared=include_shared,
     )
+    advisory_entities: set[str] = set()
     missing: list[str] = []
     unavailable: list[str] = []
     advisory_missing: list[str] = []
@@ -608,15 +634,89 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
     }
 
 
+def _runtime_control_area_report(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+    *,
+    plan: Any,
+    pause: Any,
+    now: datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return shared capability, pause, and confidence readiness by area."""
+    control_areas = _control_area_report(entry_data, options)
+    discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
+    _apply_ev_keep_on_preflight(discovery, entry_data, options)
+    _apply_control_area_readiness(hass, entry_data, control_areas, discovery)
+    ready = list(control_areas.get("ready", []))
+    available, paused = partition_control_areas_by_pause(pause, now, ready)
+    confidence_eligible = confidence_eligible_control_areas(plan, available, options)
+    control_areas.update(
+        {
+            "available": available,
+            "paused": paused,
+            "confidence_eligible": confidence_eligible,
+            "confidence_blocked": [
+                area for area in available if area not in confidence_eligible
+            ],
+        }
+    )
+    return control_areas, discovery
+
+
+def _apply_control_area_readiness(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    control_areas: dict[str, Any],
+    discovery: dict[str, Any],
+) -> None:
+    """Annotate enabled areas so one device outage does not stop the others."""
+    ready: list[str] = []
+    blocked: list[str] = []
+    details = control_areas.get("details", {})
+    for area in control_areas.get("required", []):
+        entities = _entity_report(
+            hass,
+            entry_data,
+            required_areas=[area],
+            include_shared=False,
+        )
+        supported = bool(discovery.get(area, {}).get("supported"))
+        area_ready = bool(
+            details.get(area, {}).get("configured")
+            and supported
+            and not entities["missing"]
+            and not entities["unavailable"]
+        )
+        area_details = details.setdefault(area, {})
+        area_details.update(
+            {
+                "ready": area_ready,
+                "missing_entities": entities["missing"],
+                "unavailable_entities": entities["unavailable"],
+            }
+        )
+        (ready if area_ready else blocked).append(area)
+    control_areas["ready"] = ready
+    control_areas["blocked"] = blocked
+
+
 def _control_area_message(control_areas: dict[str, Any], discovery: dict[str, Any]) -> str:
     """Return a concise capability message for required control areas."""
     required = list(control_areas.get("required", []))
     if not required:
         return "No configured control areas are enabled; capability discovery is advisory."
+    ready = list(control_areas.get("ready", []))
+    blocked = list(control_areas.get("blocked", []))
+    if ready and not blocked:
+        return f"Required control areas are supported: {_bounded_join(ready)}."
+    if ready:
+        return (
+            f"Ready control areas: {_bounded_join(ready)}; "
+            f"blocked areas remain isolated: {_bounded_join(blocked)}."
+        )
     unsupported = [area for area in required if not bool(discovery[area]["supported"])]
-    if not unsupported:
-        return f"Required control areas are supported: {_bounded_join(required)}."
-    return f"Required control areas are unsupported: {_bounded_join(unsupported)}."
+    return f"Required control areas are unsupported: {_bounded_join(unsupported or blocked)}."
 
 
 def _audit_report(store_data: dict[str, Any]) -> dict[str, Any]:
@@ -633,10 +733,13 @@ def _configured_entities(
     entry_data: dict[str, Any],
     *,
     required_areas: list[str] | None = None,
+    include_shared: bool = True,
 ) -> list[str]:
     entity_ids: set[str] = set()
     for key, value in entry_data.items():
         control_area = _entity_control_area(key)
+        if required_areas is not None and control_area is None and not include_shared:
+            continue
         if required_areas is not None and control_area is not None and control_area not in required_areas:
             continue
         if key.endswith("_entity") or key in {CONF_CLIMATE_AUTOMATIONS, CONF_CLIMATE_ZONES, CONF_PERSON_ENTITIES}:
@@ -646,6 +749,8 @@ def _configured_entities(
 
 def _entity_control_area(config_key: str) -> str | None:
     """Return the optional device-control area owning an entity mapping."""
+    if config_key == CONF_PERSON_ENTITIES:
+        return "hvac"
     if config_key.startswith("ai_"):
         return "ai"
     if config_key.startswith("ev_"):

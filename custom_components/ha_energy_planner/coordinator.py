@@ -41,10 +41,11 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
+    CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
+    CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_SMART_CHARGING,
@@ -68,7 +69,6 @@ from .const import (
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
-from .ev import update_trip_history_from_values
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
@@ -84,16 +84,22 @@ from .models import (
 )
 from .notifications import defer_persistent_notification
 from .planner import DryRunPlanner
-from .preflight import _control_area_report, build_preflight_report, production_evidence_fingerprint
+from .preflight import (
+    _control_area_report,
+    _runtime_control_area_report,
+    build_preflight_report,
+    production_evidence_fingerprint,
+)
 from .recorder_import import (
-    async_import_ev_trip_history_from_recorder,
     async_update_builtin_load_forecast,
+    async_update_ev_charge_calibration,
     load_forecast_source_available,
 )
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
     parse_production_state,
+    partition_control_areas_by_pause,
     strict_bool,
 )
 from .storage import PlannerStore
@@ -187,24 +193,18 @@ def _startup_auto_recovery_prerequisites(
     entry_data: dict[str, Any],
 ) -> tuple[bool, str]:
     """Return whether startup dependencies are ready without trusting bypasses."""
-    entities = dict(report.get("entities", {}))
-    if entities.get("missing") or entities.get("unavailable"):
-        return False, "configured_entities_unavailable"
-    services = dict(report.get("services", {}))
-    if services.get("missing") or services.get("unavailable"):
-        return False, "configured_services_unavailable"
     control_areas = dict(report.get("control_areas", {}))
     required = list(control_areas.get("required", []))
     if not required:
         return False, "no_required_control_areas"
-    discovery = dict(report.get("discovery", {}))
-    if any(not bool(dict(discovery.get(area, {})).get("supported")) for area in required):
-        return False, "required_control_area_unsupported"
+    if not control_areas.get("ready"):
+        return False, "no_ready_control_area"
+    if not control_areas.get("available"):
+        return False, "control_paused"
+    if not control_areas.get("confidence_eligible"):
+        return False, "no_confidence_eligible_control_area"
     if entry_data.get(CONF_HOUSEHOLD_LOAD) and not bool(dict(report.get("recorder", {})).get("available")):
         return False, "recorder_unavailable"
-    checks = {str(item.get("check")): item for item in report.get("checks", []) if isinstance(item, dict)}
-    if not bool(checks.get("control_not_paused", {}).get("ok")):
-        return False, "control_paused"
     return True, "startup_dependencies_ready"
 
 
@@ -420,6 +420,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         return self.automatic_control_requested and production.armed
 
     @property
+    def effective_control(self) -> bool:
+        """Return whether current evidence permits automatic device commands."""
+        if not self.active_control:
+            return False
+        return bool(build_preflight_report(self.hass, self).get("active_control_ready"))
+
+    @property
     def refresh_metrics(self) -> dict[str, Any]:
         """Return bounded in-memory refresh telemetry for diagnostics."""
         now = monotonic()
@@ -473,11 +480,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
                 self.hass.async_create_task(self._async_handle_manual_hvac_change("daikin_state_changed"))
                 return
-            if _is_manual_hvac_zone_change(entry_data, self.store.data, event):
-                self.hass.async_create_task(self._async_handle_manual_hvac_change("climate_zone_changed"))
+            if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
+                self.hass.async_create_task(
+                    self._async_handle_manual_hvac_change(
+                        "climate_zone_changed",
+                        preserve_zone_entity_id=str(event.data.get("entity_id") or ""),
+                    )
+                )
                 return
-            if _is_ev_history_state_change(entry_data, event):
-                self.hass.async_create_task(self._async_record_ev_trip_event())
             if not _is_material_state_change(event, self.options):
                 return
             self._schedule_debounced_refresh("state_change")
@@ -773,15 +783,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.entry_data = entry_data
         discovery = CapabilityDiscovery(self.hass, entry_data).inspect()
         await self.store.async_save_discovery(discovery.as_dict())
-        trip_history = dict(self.store.data.get("trip_history", {}))
-        trip_history, trip_import_changed, trip_import_reason = await async_import_ev_trip_history_from_recorder(
-            self.hass,
-            entry_data,
-            trip_history,
-            now=dt_util.utcnow(),
+        ev_charge_calibration = dict(self.store.data.get("ev_charge_calibration", {}))
+        ev_charge_calibration, ev_calibration_changed, ev_calibration_reason = (
+            await async_update_ev_charge_calibration(
+                self.hass,
+                entry_data,
+                ev_charge_calibration,
+                charge_rate_kw=float(options[CONF_EV_CHARGE_RATE_KW]),
+                now=dt_util.utcnow(),
+            )
         )
-        if trip_import_changed:
-            await self.store.async_save_trip_history(trip_history)
+        if ev_calibration_changed:
+            await self.store.async_save_ev_charge_calibration(ev_charge_calibration)
         load_forecast_model = dict(self.store.data.get("built_in_load_forecast", {}))
         load_forecast_model, load_forecast_changed, load_forecast_reason = await async_update_builtin_load_forecast(
             self.hass,
@@ -805,7 +818,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass,
             entry_data,
             options,
-            trip_history=trip_history,
             forecast_calibration=dict(self.store.data.get("forecast_calibration", {})),
             load_forecast_model=load_forecast_model,
             load_forecast_update_reason=load_forecast_reason,
@@ -835,7 +847,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if thermal_model_changed:
             await self.store.async_save_thermal_model(thermal_model)
         preparation_ms = round((perf_counter() - preparation_started) * 1000, 3)
-        planner = DryRunPlanner(options, thermal_model=thermal_model)
+        planner = DryRunPlanner(
+            options,
+            thermal_model=thermal_model,
+            ev_charge_calibration=ev_charge_calibration,
+            ev_charging_entity_id=entry_data.get(CONF_EV_CHARGING),
+            ev_soc_entity_id=entry_data.get(CONF_EV_SOC),
+        )
         planner_started = perf_counter()
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)
         planner_ms = (perf_counter() - planner_started) * 1000
@@ -857,9 +875,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "slot_count": len(context.slots),
                 "actions": _snapshot_actions(plan),
                 "preview": plan.preview[:12],
-                "trip_history": {
-                    "recorder_import_reason": trip_import_reason,
-                    "record_count": len(trip_history.get("records", [])),
+                "ev_charge_calibration": {
+                    "update_reason": ev_calibration_reason,
+                    "status": ev_charge_calibration.get("status"),
+                    "sample_count": ev_charge_calibration.get("sample_count", 0),
+                    "soc_per_kwh": ev_charge_calibration.get("soc_per_kwh"),
                 },
                 "thermal_model": thermal_model_summary(thermal_model),
                 "forecast_training_slots": manager.forecast_training_slots,
@@ -909,7 +929,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_reconcile_production_evidence_contract(self) -> bool:
         """Prepare startup control without discarding prior active intent."""
         production = parse_production_state(self.store.data.get("production"))
-        pause_reason = control_pause_reason(self.store.data.get("control_pause"), dt_util.utcnow())
+        pause = self.store.data.get("control_pause")
+        now = dt_util.utcnow()
+        required_control_areas = list(_control_area_report(self.entry_data, self.options)["required"])
+        unpaused_control_areas, _paused_control_areas = partition_control_areas_by_pause(
+            pause,
+            now,
+            required_control_areas,
+        )
+        pause_blocks_all_control = bool(
+            control_pause_reason(pause, now) is not None
+            and (not required_control_areas or not unpaused_control_areas)
+        )
         recovery = production.raw.get("startup_auto_recovery")
         recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
         recovery_pending_while_disarmed = bool(
@@ -917,22 +948,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             and not production.armed
             and recovery_status in {"waiting_for_safe", "validating", "restoring"}
         )
+        expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
-        if self.active_control and pause_reason is None:
+        if self.active_control and pause_blocks_all_control:
+            await self.async_disarm_production_control("startup_control_paused")
+            await self.async_restore_safe_state("startup_control_paused", refresh=False)
+            return True
+
+        if self.active_control and production.dry_run_evidence_fingerprint != expected_fingerprint:
+            await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+            await self.async_disarm_production_control("production_evidence_contract_changed")
+            return True
+
+        if self.active_control and not pause_blocks_all_control:
             # A previously running installation resumes immediately. Runtime
             # action gates still reject unsafe work while the startup grace
             # observes the fully started Home Assistant instance.
-            current = production.raw
-            current.update(
-                {
-                    "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-                        self.entry_data,
-                        self.options,
-                    ),
-                    "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
-                }
-            )
-            await self._async_save_production(current)
             self._startup_auto_recovery_authorized = True
             self._startup_auto_recovery_deadline = None
             self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
@@ -942,11 +973,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 required_runs=1,
                 reason="previously_active_control_preserved",
             )
-            return True
-
-        if self.active_control and pause_reason is not None:
-            await self.async_disarm_production_control("startup_control_paused")
-            await self.async_restore_safe_state("startup_control_paused", refresh=False)
             return True
 
         if recovery_pending_while_disarmed:
@@ -974,7 +1000,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 store_data.get("production") if isinstance(store_data, dict) else None
             )
 
-        expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
         if not production.armed or production.dry_run_evidence_fingerprint == expected_fingerprint:
             return interrupted_recovery
 
@@ -1274,7 +1299,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         validation = self._last_startup_auto_recovery_validation
         if not isinstance(validation, dict) or validation.get("committed") is not True:
             return False, "validation_plan_not_committed"
-        if validation.get("healthy") is not True or validation.get("violations"):
+        if validation.get("safe") is not True or validation.get("violations"):
             return False, "validation_plan_unsafe"
         report = build_preflight_report(self.hass, self)
         ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
@@ -1291,6 +1316,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_startup_auto_recovery_validation = {
             "plan_id": plan.plan_id,
             "healthy": plan.health == InputHealth.HEALTHY and plan.status != "unsafe",
+            "safe": plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+            and plan.status == "current",
             "violations": list(violations),
             "committed": False,
         }
@@ -1539,17 +1566,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("ready_by_changed")
         await self.async_request_refresh()
 
-    async def async_set_ev_target_soc(self, target_soc: float) -> None:
-        """Persist the native EV target SOC setting and replan."""
-        options = self.options
-        options[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = float(target_soc)
-        config_entries = getattr(self.hass, "config_entries", None)
-        update_entry = getattr(config_entries, "async_update_entry", None)
-        if callable(update_entry):
-            update_entry(self.entry, options=options)
-        self._mark_forced_refresh("ev_target_soc_changed")
-        await self.async_request_refresh()
-
     async def async_set_ev_low_price_threshold(self, threshold: float) -> None:
         """Persist the opportunistic charging price threshold and replan."""
         options = self.options
@@ -1612,6 +1628,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         *,
         source: str = "service",
         expires: bool = True,
+        preserve_zone_entity_id: str | None = None,
     ) -> ActionOutcome | None:
         """Serialize an operator HVAC override with automatic device execution."""
         async with self._command_lock:
@@ -1620,6 +1637,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 reason,
                 source=source,
                 expires=expires,
+                preserve_zone_entity_id=preserve_zone_entity_id,
             )
 
     async def _async_set_manual_hvac_override(
@@ -1629,6 +1647,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         *,
         source: str = "service",
         expires: bool = True,
+        preserve_zone_entity_id: str | None = None,
     ) -> ActionOutcome | None:
         """Set a manual HVAC override."""
         self._mark_forced_refresh("manual_hvac_override")
@@ -1685,7 +1704,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     helper_error = err
             release_hvac = getattr(self.executor, "async_release_hvac_control", None)
             if callable(release_hvac):
-                release_outcome = await release_hvac(reason)
+                release_outcome = (
+                    await release_hvac(
+                        reason,
+                        preserve_zone_entity_id=preserve_zone_entity_id,
+                    )
+                    if preserve_zone_entity_id
+                    else await release_hvac(reason)
+                )
         await self.async_request_refresh()
         if helper_error is not None:
             raise helper_error
@@ -1755,26 +1781,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("manual_hvac_override_cleared")
         await self.async_request_refresh()
 
-    async def _async_handle_manual_hvac_change(self, reason: str) -> None:
+    async def _async_handle_manual_hvac_change(
+        self,
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> None:
         """Record manual HVAC override from observed Daikin state change."""
         await self.async_set_manual_hvac_override(
             int(self.options[CONF_MANUAL_HVAC_OVERRIDE_MINUTES]),
             reason,
+            preserve_zone_entity_id=preserve_zone_entity_id,
         )
-
-    async def _async_record_ev_trip_event(self) -> None:
-        """Record compact EV trip history from current connection/SOC states."""
-        entry_data = self.entry_data
-        connected = _bool_state_value(self.hass, entry_data.get(CONF_EV_CONNECTED))
-        soc_percent = _float_state_value(self.hass, entry_data.get(CONF_EV_SOC))
-        updated, changed = update_trip_history_from_values(
-            dict(self.store.data.get("trip_history", {})),
-            connected=connected,
-            soc_percent=soc_percent,
-            now=dt_util.utcnow(),
-        )
-        if changed:
-            await self.store.async_save_trip_history(updated)
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
         """Restore safe state and refresh."""
@@ -1804,7 +1822,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self,
         reason: str = "user_acknowledged",
     ) -> None:
-        """Cancel startup recovery and apply an explicit operator arm."""
+        """Apply an explicit operator arm only after current safety validation."""
+        report = build_preflight_report(self.hass, self)
+        if not report.get("safe_to_activate_now"):
+            rejection_reason = _active_control_not_ready_reason(report)
+            raise HomeAssistantError(
+                f"Production control is not ready: {rejection_reason}",
+                translation_domain=DOMAIN,
+                translation_key="active_control_not_ready",
+                translation_placeholders={"reason": rejection_reason},
+            )
         try:
             await self.async_cancel_startup_auto_recovery(
                 "operator_armed",
@@ -1892,8 +1919,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         if self.active_control and enabled:
             report = build_preflight_report(self.hass, self, options_override=proposed_options)
-            if not report.get("safe_to_activate_now"):
-                reason = _active_control_not_ready_reason(report)
+            raw_area_state = report.get("control_areas")
+            proposed_area_state = raw_area_state if isinstance(raw_area_state, dict) else {}
+            area_ready = area in proposed_area_state.get("ready", [])
+            area_available = area in proposed_area_state.get("available", [])
+            area_confidence_eligible = area in proposed_area_state.get(
+                "confidence_eligible",
+                [],
+            )
+            if not report.get("safe_to_activate_now") or not (
+                area_ready and area_available and area_confidence_eligible
+            ):
+                if not report.get("safe_to_activate_now"):
+                    reason = _active_control_not_ready_reason(report)
+                elif not area_ready:
+                    reason = f"the selected {area} control area is not ready"
+                elif not area_available:
+                    reason = f"the selected {area} control area is paused"
+                else:
+                    reason = f"the selected {area} control area does not meet confidence thresholds"
                 raise HomeAssistantError(
                     f"Device control is not ready: {reason}",
                     translation_domain=DOMAIN,
@@ -1990,7 +2034,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Track dry-run readiness evidence for the production gate."""
         production_state = parse_production_state(self.store.data.get("production"))
         production = production_state.raw
-        if plan.mode == PlannerMode.DRY_RUN and plan.health.value == "healthy" and not violations:
+        control_areas, _discovery = _runtime_control_area_report(
+            self.hass,
+            self.entry_data,
+            self.options,
+            plan=plan,
+            pause=self.store.data.get("control_pause"),
+            now=plan.created_at,
+        )
+        review_safe = bool(
+            plan.mode == PlannerMode.DRY_RUN
+            and plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+            and plan.status == "current"
+            and (
+                plan.health == InputHealth.HEALTHY
+                or control_areas.get("confidence_eligible")
+            )
+            and not violations
+        )
+        if review_safe:
             evidence_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
             ready_cycles = production_state.dry_run_ready_cycles
             if production.get("dry_run_evidence_fingerprint") != evidence_fingerprint:
@@ -2001,7 +2063,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 DRY_RUN_READY_CYCLES_REQUIRED,
             )
             production["last_dry_run_ready_at"] = plan.created_at
-        elif plan.health.value == "unsafe":
+        elif plan.health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             production["last_blocking_reason"] = "input_health_unsafe"
         await self._async_save_production(production)
 
@@ -2740,7 +2802,7 @@ def _bounded_json(value: Any, *, depth: int = 0) -> Any:
         return "<truncated>"
     value = to_jsonable(value)
     if isinstance(value, dict):
-        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:20]}
+        return {str(key): _bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:24]}
     if isinstance(value, list):
         items = [_bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:
@@ -2827,6 +2889,7 @@ def _hvac_control_from_ownership(ownership: dict[str, Any]) -> dict[str, Any]:
 
 
 def _is_manual_hvac_zone_change(
+    hass: HomeAssistant,
     entry_data: dict[str, Any],
     store_data: dict[str, Any],
     event: Any,
@@ -2840,7 +2903,25 @@ def _is_manual_hvac_zone_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    return bool(old_state is not None and new_state is not None and old_state.state != new_state.state)
+    if old_state is None or new_state is None:
+        return False
+    state_changed = old_state.state != new_state.state
+    control_attribute_changed = False
+    if str(entity_id).split(".", 1)[0] == "climate":
+        old_attributes = getattr(old_state, "attributes", {}) or {}
+        new_attributes = getattr(new_state, "attributes", {}) or {}
+        control_attribute_changed = any(
+            old_attributes.get(key) != new_attributes.get(key)
+            for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+        )
+    if not state_changed and not control_attribute_changed:
+        return False
+    guard_entity = entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
+    if guard_entity:
+        guard_state = hass.states.get(guard_entity)
+        if guard_state is not None and str(guard_state.state).lower() in {"on", "true", "1"}:
+            return False
+    return True
 
 
 def _is_planner_owned_control_feedback(
@@ -2872,11 +2953,27 @@ def _is_planner_owned_control_feedback(
         # example turn_on restoring the previous mode before set_hvac_mode).
         # The bounded pending marker identifies the whole transaction as ours;
         # exact desired-state matching resumes once the transaction completes.
+        if pending_hvac_desired_state.get("configured_zones_only"):
+            old_state = event.data.get("old_state")
+            old_attributes = {} if old_state is None else (getattr(old_state, "attributes", {}) or {})
+            new_attributes = getattr(new_state, "attributes", {}) or {}
+            state_changed = old_state is None or str(getattr(old_state, "state", "")) != str(
+                getattr(new_state, "state", "")
+            )
+            if (
+                not state_changed
+                and old_attributes.get("temperature") != new_attributes.get("temperature")
+            ):
+                return False
         return True
     if asset == "daikin_zone" and pending_hvac_desired_state is not None:
         restored_zones = pending_hvac_desired_state.get("restore_zones")
         if isinstance(restored_zones, dict) and entity_id in restored_zones:
+            if str(entity_id).split(".", 1)[0] == "climate":
+                return True
             return str(getattr(new_state, "state", "")).lower() == str(restored_zones[entity_id]).lower()
+        if str(entity_id).split(".", 1)[0] == "climate":
+            return True
         return bool(
             pending_hvac_desired_state.get("enable_zones") and str(getattr(new_state, "state", "")).lower() == "on"
         )
@@ -2898,12 +2995,19 @@ def _is_planner_owned_control_feedback(
         if asset == "enphase":
             return bool(desired.get("profile")) and observed == str(desired["profile"])
         if asset == "daikin_zone":
+            if str(entity_id).split(".", 1)[0] == "climate":
+                return _matches_hvac_command_feedback(desired, event, zone_entity=True)
             return bool(desired.get("enable_zones") and observed.lower() == "on")
         return _matches_hvac_command_feedback(desired, event)
     return False
 
 
-def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
+def _matches_hvac_command_feedback(
+    desired: dict[str, Any],
+    event: Any,
+    *,
+    zone_entity: bool = False,
+) -> bool:
     """Return whether changed HVAC controls match the planner's command."""
     new_state = event.data.get("new_state")
     old_state = event.data.get("old_state")
@@ -2920,11 +3024,15 @@ def _matches_hvac_command_feedback(desired: dict[str, Any], event: Any) -> bool:
     attributes = getattr(new_state, "attributes", {}) or {}
     if any(old_attributes.get(key) != attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS - {"temperature"}):
         return False
-    desired_temperature = desired.get("target_temperature")
+    desired_temperature = (
+        desired.get("target_temperature")
+        if zone_entity or not desired.get("configured_zones_only")
+        else None
+    )
     temperature_changed = old_state is None or old_attributes.get("temperature") != attributes.get("temperature")
     if temperature_changed:
         if desired_temperature is None:
-            return False
+            return matched_command_change
         observed_temperature = attributes.get("temperature")
         try:
             if float(observed_temperature) != float(desired_temperature):
@@ -2977,14 +3085,6 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
-
-
-def _is_ev_history_state_change(entry_data: dict[str, Any], event: Any) -> bool:
-    entity_id = event.data.get("entity_id")
-    return entity_id in {
-        entry_data.get(CONF_EV_CONNECTED),
-        entry_data.get(CONF_EV_SOC),
-    }
 
 
 def _bool_state_value(hass: HomeAssistant, entity_id: Any) -> bool | None:

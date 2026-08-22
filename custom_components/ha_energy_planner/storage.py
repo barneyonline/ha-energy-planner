@@ -26,13 +26,13 @@ _DICT_FIELDS = {
     "command_rate_limits",
     "discovery",
     "ev_grid_reservation",
+    "ev_charge_calibration",
     "forecast_calibration",
     "built_in_load_forecast",
     "ownership",
     "control_pause",
     "production",
     "thermal_model",
-    "trip_history",
 }
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
@@ -206,9 +206,9 @@ class PlannerStore:
         """Persist latest non-commanding discovery report."""
         await self._async_set_if_changed("discovery", report)
 
-    async def async_save_trip_history(self, trip_history: dict[str, Any]) -> None:
-        """Persist compact EV trip history."""
-        await self._async_set_if_changed("trip_history", trip_history)
+    async def async_save_ev_charge_calibration(self, model: dict[str, Any]) -> None:
+        """Persist the compact Recorder-trained EV charging calibration."""
+        await self._async_set_if_changed("ev_charge_calibration", model)
 
     async def async_save_thermal_model(self, thermal_model: dict[str, Any]) -> None:
         """Persist compact HVAC thermal model state."""
@@ -302,13 +302,13 @@ def _default_data() -> dict[str, Any]:
         "forecast_snapshots": [],
         "dry_run_comparisons": [],
         "ev_grid_reservation": {},
+        "ev_charge_calibration": {},
         "forecast_calibration": {},
         "built_in_load_forecast": {},
         "discovery": {},
         "command_rate_limits": {},
         "production": {},
         "control_pause": {},
-        "trip_history": {},
         "thermal_model": {},
         "ai_recommendations": [],
     }
@@ -318,6 +318,7 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data = _default_data()
     data.update(loaded)
     data.pop("haeo_runs", None)
+    data.pop("trip_history", None)
     for key in _LIST_FIELDS:
         if not isinstance(data.get(key), list):
             data[key] = []

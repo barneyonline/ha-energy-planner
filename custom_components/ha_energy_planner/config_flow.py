@@ -72,7 +72,6 @@ from .const import (
     CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
@@ -92,6 +91,7 @@ from .const import (
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_MIN_CYCLE_MINUTES,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
@@ -245,7 +245,9 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
-        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(["switch", "input_boolean"], multiple=True),
+        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(
+            ["switch", "input_boolean", "climate"], multiple=True
+        ),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
         vol.Optional(CONF_CLIMATE_SCHEDULER_GUARD_TIMER): _entity_selector("timer"),
         vol.Optional(CONF_CLIMATE_MANUAL_OVERRIDE): _entity_selector("input_boolean"),
@@ -373,7 +375,6 @@ _POLICY_SECTION_FIELDS = {
         CONF_BATTERY_MAX_DISCHARGE_KW,
         CONF_EV_MIN_SOC_PERCENT,
         CONF_EV_MAX_SOC_PERCENT,
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -393,6 +394,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_LEAD_MINUTES,
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
         CONF_HVAC_PRECONDITION_WHILE_AWAY,
         CONF_HVAC_MIN_CYCLE_MINUTES,
         CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
@@ -470,7 +472,6 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
         CONF_DEFAULT_READY_BY,
         CONF_EV_MIN_SOC_PERCENT,
         CONF_EV_MAX_SOC_PERCENT,
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -555,9 +556,6 @@ def _option_selector(field: str) -> Any:
         CONF_EV_MAX_SOC_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
         ),
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT: NumberSelector(
-            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
-        ),
         CONF_EV_CHARGE_RATE_KW: NumberSelector(
             NumberSelectorConfig(min=0.1, max=50, step=0.1, mode=NumberSelectorMode.BOX)
         ),
@@ -599,6 +597,7 @@ def _option_selector(field: str) -> Any:
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
         ),
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: BooleanSelector(),
         CONF_HVAC_PRECONDITION_WHILE_AWAY: BooleanSelector(),
         CONF_HVAC_MIN_CYCLE_MINUTES: NumberSelector(
             NumberSelectorConfig(min=0, max=240, step=5, mode=NumberSelectorMode.BOX)
@@ -668,7 +667,7 @@ def _option_selector(field: str) -> Any:
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
-    VERSION = 2
+    VERSION = 4
 
     async def async_step_user(
         self,
@@ -781,6 +780,10 @@ class OptionsFlow(config_entries.OptionsFlow):
             option_errors = _validate_options(updated_options)
             if not _ev_keep_on_control_compatible(updated_data, updated_options):
                 option_errors[CONF_EV_KEEP_CHARGER_ON] = "ev_keep_on_requires_persistent_control"
+            if not _zone_only_preconditioning_compatible(updated_data, updated_options):
+                option_errors[CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] = (
+                    "zone_only_preconditioning_requires_climate_zone"
+                )
             if option_errors:
                 errors.setdefault("base", next(iter(option_errors.values())))
 
@@ -888,11 +891,8 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     errors: dict[str, str] = {}
     ev_min = float(user_input[CONF_EV_MIN_SOC_PERCENT])
     ev_max = float(user_input[CONF_EV_MAX_SOC_PERCENT])
-    ev_fallback = float(user_input[CONF_EV_FALLBACK_TARGET_SOC_PERCENT])
     if ev_min > ev_max:
         errors["base"] = "ev_min_above_max"
-    elif not ev_min <= ev_fallback <= ev_max:
-        errors[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] = "ev_fallback_outside_bounds"
     if not _ready_by_valid(str(user_input[CONF_DEFAULT_READY_BY])):
         errors[CONF_DEFAULT_READY_BY] = "invalid_ready_by"
     earliest_start = str(user_input[CONF_EV_EARLIEST_START])
@@ -971,6 +971,14 @@ def _validate_subentry_config(
         {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))},
     ):
         errors.setdefault("base", "ev_keep_on_requires_persistent_control")
+    if subentry_type == SUBENTRY_EV and any(user_input.values()):
+        for required_key in (
+            CONF_EV_SOC,
+            CONF_EV_CHARGING,
+            CONF_EV_SMART_CHARGING_TARGET_SOC,
+        ):
+            if not user_input.get(required_key):
+                errors.setdefault(required_key, "ev_planning_sensor_required")
     return errors
 
 
@@ -1039,6 +1047,19 @@ def _ev_keep_on_control_compatible(
     )
 
 
+def _zone_only_preconditioning_compatible(
+    entry_data: dict[str, Any],
+    options: dict[str, Any],
+) -> bool:
+    """Return whether zone-only targeting has at least one target thermostat."""
+    if options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is not True:
+        return True
+    return any(
+        entity_id.split(".", 1)[0] == "climate"
+        for entity_id in _entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+    )
+
+
 _ENTITY_DOMAIN_RULES = {
     CONF_AMBER_IMPORT_PRICE: {"sensor"},
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
@@ -1052,7 +1073,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_DAIKIN_CLIMATE: {"climate"},
     CONF_DAIKIN_POWER: {"sensor"},
     CONF_CLIMATE_AUTOMATIONS: {"automation"},
-    CONF_CLIMATE_ZONES: {"switch", "input_boolean"},
+    CONF_CLIMATE_ZONES: {"switch", "input_boolean", "climate"},
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER: {"input_boolean"},
     CONF_CLIMATE_SCHEDULER_GUARD_TIMER: {"timer"},
     CONF_CLIMATE_MANUAL_OVERRIDE: {"input_boolean"},
