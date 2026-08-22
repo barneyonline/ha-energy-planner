@@ -71,9 +71,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
+    CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_EARLIEST_START,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
@@ -213,6 +213,9 @@ def _valid_hass() -> FakeHass:
             "timer.scheduler_guard",
             "select.enphase_profile",
             "switch.shared_charger",
+            "sensor.ev_soc",
+            "binary_sensor.ev_charging",
+            "sensor.ev_target",
             "ai_task.extended_openai_ai_task",
         },
         {
@@ -400,7 +403,12 @@ def test_ev_subentry_allows_its_legacy_aliased_actuator_on_reconfigure() -> None
     errors = _validate_subentry_config(
         hass,
         current_entry,
-        {CONF_EV_SMART_CHARGING: "switch.shared_charger"},
+        {
+            CONF_EV_SMART_CHARGING: "switch.shared_charger",
+            CONF_EV_SOC: "sensor.ev_soc",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+        },
         subentry_type=SUBENTRY_EV,
     )
 
@@ -1006,7 +1014,7 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
         }
     )
 
-    assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT in schema_keys
+    assert "ev_fallback_target_soc_percent" not in schema_keys
     assert CONF_DEFAULT_READY_BY in schema_keys
     assert CONF_EV_LOW_PRICE_CHARGING_ENABLED in schema_keys
     assert CONF_EV_LOW_PRICE_THRESHOLD in schema_keys
@@ -1124,30 +1132,6 @@ def test_options_flow_rejects_incomplete_climate_scheduler_guard() -> None:
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "climate_scheduler_guard_pair_required"}
-
-
-def test_options_flow_surfaces_entity_managed_setting_errors_at_form_level() -> None:
-    flow = OptionsFlow(
-        SimpleNamespace(
-            data={},
-            options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90},
-        )
-    )
-    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
-    submission = _settings_submission(
-        flow,
-        policy_overrides={
-            POLICY_STEP_EV_BATTERY_GRID: {
-                CONF_EV_MIN_SOC_PERCENT: 40,
-                CONF_EV_MAX_SOC_PERCENT: 80,
-            }
-        },
-    )
-
-    result = asyncio.run(flow.async_step_init(submission))
-
-    assert result["type"] == "form"
-    assert result["errors"] == {"base": "ev_fallback_outside_bounds"}
 
 
 def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
@@ -1355,7 +1339,12 @@ def test_central_settings_reject_cross_section_actuator_collisions() -> None:
                 CONF_CLIMATE_TARGET_LOW: "input_number.climate_low",
                 CONF_CLIMATE_TARGET_HIGH: "input_number.climate_high",
             },
-            INPUT_STEP_EV: {CONF_EV_CHARGER: "switch.shared_charger"},
+            INPUT_STEP_EV: {
+                CONF_EV_CHARGER: "switch.shared_charger",
+                CONF_EV_SOC: "sensor.ev_soc",
+                CONF_EV_CHARGING: "binary_sensor.ev_charging",
+                CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+            },
         },
     )
 
@@ -1746,19 +1735,6 @@ def test_default_options_require_intentional_active_mode_enablement() -> None:
     assert DEFAULT_OPTIONS["planner_enabled"] is False
     assert DEFAULT_OPTIONS["dry_run"] is True
     assert DEFAULT_OPTIONS[CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] is True
-
-
-def test_validate_options_rejects_ev_fallback_outside_soc_bounds() -> None:
-    errors = _validate_options(
-        {
-            **DEFAULT_OPTIONS,
-            CONF_EV_MIN_SOC_PERCENT: 50,
-            CONF_EV_MAX_SOC_PERCENT: 80,
-            CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 90,
-        }
-    )
-
-    assert errors[CONF_EV_FALLBACK_TARGET_SOC_PERCENT] == "ev_fallback_outside_bounds"
 
 
 def test_validate_options_rejects_invalid_default_ready_by() -> None:

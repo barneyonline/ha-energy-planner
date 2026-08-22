@@ -31,10 +31,12 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
+    CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_READY_BY,
+    CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
     CONF_PLANNER_ENABLED,
@@ -278,7 +280,7 @@ class FakeStore:
         self.data = data or {}
         self.saved_plans: list[EnergyPlan] = []
         self.discovery: list[dict[str, object]] = []
-        self.trip_history: list[dict[str, object]] = []
+        self.ev_charge_calibrations: list[dict[str, object]] = []
         self.forecast_calibrations: list[dict[str, object]] = []
         self.load_forecasts: list[dict[str, object]] = []
         self.thermal_models: list[dict[str, object]] = []
@@ -302,9 +304,9 @@ class FakeStore:
     async def async_save_discovery(self, discovery: dict[str, object]) -> None:
         self.discovery.append(discovery)
 
-    async def async_save_trip_history(self, trip_history: dict[str, object]) -> None:
-        self.trip_history.append(trip_history)
-        self.data["trip_history"] = trip_history
+    async def async_save_ev_charge_calibration(self, model: dict[str, object]) -> None:
+        self.ev_charge_calibrations.append(model)
+        self.data["ev_charge_calibration"] = model
 
     async def async_save_forecast_calibration(self, calibration: dict[str, object]) -> None:
         self.forecast_calibrations.append(calibration)
@@ -360,6 +362,7 @@ class FakeExecutor:
         self.device_restores: list[tuple[str, str]] = []
         self.device_restore_result = SimpleNamespace(result=OutcomeResult.RESTORED)
         self.hvac_releases: list[str] = []
+        self.hvac_release_preserved_zones: list[str | None] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
@@ -378,8 +381,14 @@ class FakeExecutor:
         self.device_restores.append((asset, reason))
         return self.device_restore_result
 
-    async def async_release_hvac_control(self, reason: str) -> None:
+    async def async_release_hvac_control(
+        self,
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> None:
         self.hvac_releases.append(reason)
+        self.hvac_release_preserved_zones.append(preserve_zone_entity_id)
 
     async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
         self.manual_ev_commands.append((enabled, context, dict(self.options), dict(self.entry_data)))
@@ -1330,7 +1339,7 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     callback(FakeEvent("sensor.ev_soc", "50", "51"))
     callback(FakeEvent("sensor.price", "100", "110"))
 
-    assert len(coordinator.hass.created_tasks) == 2
+    assert len(coordinator.hass.created_tasks) == 1
     assert coordinator._refresh_generation == 1
     assert coordinator._debounce_cancel is not None
     assert len(scheduled) >= 2
@@ -1370,9 +1379,26 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
     coordinator._manual_override_helper_guard = ("off", datetime.now(UTC) + timedelta(minutes=1))
     callback(FakeEvent("input_boolean.override", "on", "off"))
     assert coordinator._manual_override_helper_guard is None
+
+    manual_changes: list[tuple[str, str | None]] = []
+
+    def capture_manual_change(
+        reason: str,
+        *,
+        preserve_zone_entity_id: str | None = None,
+    ) -> object:
+        manual_changes.append((reason, preserve_zone_entity_id))
+
+        async def complete() -> None:
+            return None
+
+        return complete()
+
+    coordinator._async_handle_manual_hvac_change = capture_manual_change
     callback(FakeEvent("switch.zone", "on", "off"))
 
     assert len(coordinator.hass.created_tasks) == 2
+    assert manual_changes == [("climate_zone_changed", "switch.zone")]
 
     startup = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     startup.hass = FakeHass({"input_boolean.override": "on"})
@@ -2329,6 +2355,23 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
     assert _is_planner_owned_control_feedback(
         entry_data,
         {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 23},
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "restore_zones": {
+                "climate.zone_temperature": {"target_temperature": 20},
+            }
+        },
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
         FakeEvent("switch.zone", "off", "on"),
         now,
         pending_hvac_desired_state={"enable_zones": True},
@@ -2866,7 +2909,14 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
     class FakePlanner:
         mode = PlannerMode.DRY_RUN
 
-        def __init__(self, options: dict[str, object], thermal_model: dict[str, object]) -> None:
+        def __init__(
+            self,
+            options: dict[str, object],
+            thermal_model: dict[str, object],
+            ev_charge_calibration: dict[str, object],
+            ev_charging_entity_id: str | None,
+            ev_soc_entity_id: str | None,
+        ) -> None:
             pass
 
         def create_plan(self, built_context: object) -> EnergyPlan:
@@ -2875,14 +2925,15 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
             plan.mode = self.mode
             return plan
 
-    async def fake_import_trip_history(
+    async def fake_update_ev_charge_calibration(
         hass: object,
         data: dict[str, object],
-        history: dict[str, object],
+        model: dict[str, object],
         *,
+        charge_rate_kw: float,
         now: datetime,
     ) -> tuple[dict[str, object], bool, str]:
-        return {"records": [{"soc": 80}]}, True, "imported"
+        return {"status": "ready", "soc_per_kwh": 1.8}, True, "trained"
 
     async def fake_update_load_forecast(
         *args: object,
@@ -2919,8 +2970,8 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         ),
     )
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_import_ev_trip_history_from_recorder",
-        fake_import_trip_history,
+        "custom_components.ha_energy_planner.coordinator.async_update_ev_charge_calibration",
+        fake_update_ev_charge_calibration,
     )
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.async_update_builtin_load_forecast",
@@ -2945,7 +2996,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
     coordinator.entry = FakeEntry({}, {"ai_enabled": False})
     coordinator.store = FakeStore(
         {
-            "trip_history": {},
+            "ev_charge_calibration": {},
             "forecast_snapshots": [],
             "overrides": [{"kind": "other"}],
             "ownership": {"hvac_control": {"phase": "preconditioning"}},
@@ -2967,7 +3018,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
 
     assert result.mode == PlannerMode.DRY_RUN
     assert coordinator.store.dry_run_comparisons[0]["plan_id"] == "plan-dry"
-    assert coordinator.store.trip_history
+    assert coordinator.store.ev_charge_calibrations
     assert coordinator.store.load_forecasts
     assert coordinator.store.forecast_calibrations
     assert coordinator.store.thermal_models
@@ -3250,21 +3301,19 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
 
     coordinator.async_request_refresh = request_refresh
     asyncio.run(coordinator.async_set_ready_by("08:10"))
-    asyncio.run(coordinator.async_set_ev_target_soc(85))
     asyncio.run(coordinator.async_set_ev_low_price_threshold(0.07))
     asyncio.run(coordinator.async_manual_ev_charging(True))
     asyncio.run(coordinator.async_manual_ev_charging(False))
 
     assert coordinator.ready_by == "08:10"
     assert updates[0]["default_ready_by"] == "08:10"
-    assert updates[1]["ev_fallback_target_soc_percent"] == 85
-    assert updates[2]["ev_low_price_threshold"] == 0.07
+    assert updates[1]["ev_low_price_threshold"] == 0.07
     assert [item[0] for item in coordinator.executor.manual_ev_commands] == [True, False]
     assert all(item[1] is coordinator._last_decision_context for item in coordinator.executor.manual_ev_commands)
     assert all("ev_connected_helper" not in item[2] for item in coordinator.executor.manual_ev_commands)
     assert coordinator.overrides[0].reason == "manual_stop"
     assert coordinator.store.async_save_overrides.await_count == 2
-    assert refreshes == ["refresh"] * 5
+    assert refreshes == ["refresh"] * 4
 
 
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
@@ -3494,32 +3543,16 @@ def test_expired_manual_hvac_cleanup_keeps_override_until_helper_turns_off() -> 
 def test_manual_hvac_change_handler_uses_configured_duration() -> None:
     coordinator = _coordinator_for_runtime_services(options={"manual_hvac_override_minutes": 45})
 
-    asyncio.run(coordinator._async_handle_manual_hvac_change("daikin_state_changed"))
-
-    assert coordinator.overrides[-1].reason == "daikin_state_changed"
-    assert coordinator.refresh_requested == 1
-
-
-def test_record_ev_trip_event_saves_when_values_change() -> None:
-    coordinator = _coordinator_for_runtime_services(
-        entry_data={
-            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SOC: "sensor.ev_soc",
-        },
-        hass=FakeHass({"binary_sensor.ev_connected": "on", "sensor.ev_soc": "72"}),
-        store_data={
-            "trip_history": {
-                "active_trip": {
-                    "started_at": "2026-06-27T00:00:00+00:00",
-                    "start_soc_percent": 80,
-                }
-            }
-        },
+    asyncio.run(
+        coordinator._async_handle_manual_hvac_change(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
     )
 
-    asyncio.run(coordinator._async_record_ev_trip_event())
-
-    assert "records" in coordinator.store.data["trip_history"]
+    assert coordinator.overrides[-1].reason == "climate_zone_changed"
+    assert coordinator.executor.hvac_release_preserved_zones == ["climate.bedrooms"]
+    assert coordinator.refresh_requested == 1
 
 
 def test_production_control_runtime_methods_update_store_and_refresh() -> None:
@@ -4175,9 +4208,21 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
 
 def test_asset_safe_degraded_plan_records_production_evidence() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_EV_CHARGER: "switch.ev"},
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_EV_SOC: "sensor.ev_soc",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+        },
         options={CONF_EV_CONTROL_ENABLED: True},
-        hass=FakeHass({"switch.ev": "off"}),
+        hass=FakeHass(
+            {
+                "switch.ev": "off",
+                "sensor.ev_soc": "60",
+                "binary_sensor.ev_charging": "off",
+                "sensor.ev_target": "80",
+            }
+        ),
     )
     plan = _plan("degraded-review")
     plan.mode = PlannerMode.DRY_RUN

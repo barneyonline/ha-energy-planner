@@ -25,7 +25,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
-    CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
@@ -402,7 +401,8 @@ def test_twelve_hour_coverage_in_longer_context_never_schedules_in_missing_tail(
         CONF_BASELINE_LOAD_FORECAST: "sensor.load",
         CONF_BATTERY_SOC: "sensor.battery",
         CONF_EV_SOC: "sensor.ev_soc",
-        CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
         CONF_PERSON_ENTITIES: "person.home",
     }
     hass = FakeHass(
@@ -413,7 +413,8 @@ def test_twelve_hour_coverage_in_longer_context_never_schedules_in_missing_tail(
             "sensor.load": _forecast_state(now, 12, "load_kw", 2.0),
             "sensor.battery": FakeState("60", last_updated=now),
             "sensor.ev_soc": FakeState("40", last_updated=now),
-            "binary_sensor.ev_connected": FakeState("on", last_updated=now),
+                "binary_sensor.ev_connected": FakeState("on", last_updated=now),
+                "sensor.ev_target": FakeState("80", last_updated=now),
             "person.home": FakeState("home", last_updated=now),
         }
     )
@@ -861,7 +862,6 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
         "dry_run": False,
         "planning_horizon_hours": 1,
         "planning_interval_minutes": 15,
-        CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 75,
     }
     entry_data = {
         CONF_AMBER_IMPORT_PRICE: "sensor.import",
@@ -895,23 +895,17 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     assert context.current_ev_soc_percent == 72
     assert context.ev_connected is True
     assert context.ev_target_soc_percent == 80
-    assert context.ev_target_soc_fallback_active is False
     assert context.ev_ready_by == "08:00"
     assert context.input_health == InputHealth.HEALTHY
 
     hass.states.values["sensor.ev_target"] = FakeState("unavailable")
-    fallback_context = InputManager(hass, entry_data, options).build_context()
-    fallback_plan = DryRunPlanner(options).create_plan(fallback_context)
+    unavailable_context = InputManager(hass, entry_data, options).build_context()
+    unavailable_plan = DryRunPlanner(options).create_plan(unavailable_context)
 
-    assert fallback_context.ev_target_soc_percent == 75
-    assert fallback_context.ev_target_soc_fallback_active is True
-    assert fallback_context.input_health == InputHealth.HEALTHY
-    assert (
-        "advisory_ev_smart_charging_target_soc_entity_unavailable_using_native_fallback"
-        in fallback_context.input_issues
-    )
-    assert any(action.asset.value == "ev" for action in fallback_plan.actions)
-    assert fallback_plan.confidence_breakdown["ev"] == 1.0
+    assert unavailable_context.ev_target_soc_percent is None
+    assert unavailable_context.input_health == InputHealth.DEGRADED
+    assert "ev_smart_charging_target_soc_entity_unavailable" in unavailable_context.input_issues
+    assert not any(action.asset.value == "ev" for action in unavailable_plan.actions)
 
 
 def test_input_manager_leaves_connection_unknown_without_external_entity() -> None:
@@ -999,56 +993,6 @@ def test_ev_helper_value_parsers_handle_supported_formats() -> None:
     assert _ready_by_time_or_none("7:05") == "07:05"
     assert _ready_by_time_or_none("07:05:30") == "07:05"
     assert _ready_by_time_or_none("not a time") is None
-
-
-def test_input_manager_adds_trip_history_summary_to_context() -> None:
-    options = {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15}
-    entry_data = {
-        CONF_AMBER_IMPORT_PRICE: "sensor.import",
-        CONF_AMBER_EXPORT_PRICE: "sensor.export",
-        CONF_PV_FORECAST: "sensor.pv",
-        CONF_BASELINE_LOAD_FORECAST: "sensor.load",
-        CONF_BATTERY_SOC: "sensor.battery",
-        CONF_PERSON_ENTITIES: "person.james",
-    }
-    hass = FakeHass(
-        {
-            "sensor.import": FakeState("0.20"),
-            "sensor.export": FakeState("0.05"),
-            "sensor.pv": FakeState("1.0"),
-            "sensor.load": FakeState("2.0"),
-            "sensor.battery": FakeState("55"),
-            "person.james": FakeState("home"),
-        }
-    )
-    trip_history = {
-        "records": [
-            {
-                "started_at": "2026-06-24T08:00:00+00:00",
-                "ended_at": "2026-06-24T09:00:00+00:00",
-                "start_soc_percent": 80,
-                "end_soc_percent": 70,
-            },
-            {
-                "started_at": "2026-06-25T08:00:00+00:00",
-                "ended_at": "2026-06-25T09:00:00+00:00",
-                "start_soc_percent": 80,
-                "end_soc_percent": 68,
-            },
-            {
-                "started_at": "2026-06-26T08:00:00+00:00",
-                "ended_at": "2026-06-26T09:00:00+00:00",
-                "start_soc_percent": 80,
-                "end_soc_percent": 74,
-            },
-        ]
-    }
-
-    context = InputManager(hass, entry_data, options, trip_history=trip_history).build_context()
-
-    assert context.ev_trip_observed_days == 3
-    assert context.ev_trip_max_daily_soc_percent == 12
-    assert context.ev_trip_history_sufficient is True
 
 
 def test_input_manager_converts_cent_price_point_sensors_to_dollars() -> None:

@@ -2618,6 +2618,81 @@ def test_hvac_specific_release_restores_zones_without_touching_other_assets(monk
     }
 
 
+def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) -> None:
+    restored: list[dict[str, Any]] = []
+
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, Any],
+        ) -> object:
+            restored.append(dict(zones))
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            },
+            "phase": "peak_coast",
+        },
+    }
+
+    outcome = asyncio.run(
+        Executor(store, hass=FakeHass()).async_release_hvac_control(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
+    )
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [{"switch.living": "off"}]
+    assert store.data["ownership"] == {}
+
+    class FailingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, *args: object) -> object:
+            raise RuntimeError("restore failed")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailingDaikinAdapter)
+    failed_store = FakeStore()
+    failed_store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"climate.bedrooms": {"target_temperature": 21}},
+            "phase": "peak_coast",
+        },
+    }
+
+    failed = asyncio.run(
+        Executor(failed_store, hass=FakeHass()).async_release_hvac_control(
+            "climate_zone_changed",
+            preserve_zone_entity_id="climate.bedrooms",
+        )
+    )
+
+    assert failed.result == OutcomeResult.FAILED
+    assert failed_store.data["ownership"]["hvac_control"]["zone_states"] == {}
+
+
 def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
     now = datetime.now(UTC)
     action = PlanAction(

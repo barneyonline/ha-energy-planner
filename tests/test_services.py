@@ -18,10 +18,11 @@ from custom_components.ha_energy_planner.const import (
     ATTR_DURATION_MINUTES,
     ATTR_READY_BY,
     ATTR_REASON,
-    ATTR_TARGET_SOC,
     CONF_BYPASS_SAFETY_GATES,
+    CONF_EV_CHARGING,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
@@ -33,7 +34,6 @@ from custom_components.ha_energy_planner.const import (
     SERVICE_RESUME_CONTROL,
     SERVICE_RUN_PREFLIGHT,
     SERVICE_SET_EV_READY_BY,
-    SERVICE_SET_EV_TARGET_SOC,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
@@ -93,6 +93,9 @@ class FakeStates:
             "person.home": "home",
             "input_boolean.ev_start": "off",
             "input_boolean.ev_stop": "on",
+            "sensor.ev_soc": "60",
+            "binary_sensor.ev_charging": "off",
+            "sensor.ev_target": "80",
         }
 
     def get(self, entity_id: str) -> FakeState | None:
@@ -134,7 +137,6 @@ def test_non_response_services_await_coordinator_work() -> None:
         (SERVICE_REPLAN, {}),
         (SERVICE_RESTORE_SAFE_STATE, {ATTR_REASON: "test_restore"}),
         (SERVICE_SET_EV_READY_BY, {ATTR_READY_BY: "08:30"}),
-        (SERVICE_SET_EV_TARGET_SOC, {ATTR_TARGET_SOC: 85}),
         (
             SERVICE_SET_MANUAL_HVAC_OVERRIDE,
             {ATTR_DURATION_MINUTES: 15, ATTR_REASON: "test_override"},
@@ -152,7 +154,6 @@ def test_non_response_services_await_coordinator_work() -> None:
         ("replan", None),
         ("restore", "test_restore"),
         ("ready_by", "08:30"),
-        ("target_soc", 85.0),
         ("manual_override", (15, "test_override")),
         ("arm", "test_arm"),
         ("disarm", "test_disarm"),
@@ -205,21 +206,6 @@ def test_set_ev_ready_by_schema_rejects_invalid_time() -> None:
         assert "ready_by must be a valid local time" in str(err)
     else:
         raise AssertionError("Invalid ready_by time was accepted")
-
-
-def test_set_ev_target_soc_schema_accepts_percentage_and_rejects_out_of_range() -> None:
-    coordinator = _coordinator()
-    hass = FakeHass(coordinator)
-    asyncio.run(async_setup(hass, {}))
-    schema = hass.services.schemas[(DOMAIN, SERVICE_SET_EV_TARGET_SOC)]
-
-    assert schema({ATTR_TARGET_SOC: "85"}) == {ATTR_TARGET_SOC: 85.0}
-    try:
-        schema({ATTR_TARGET_SOC: 101})
-    except Exception as err:  # noqa: BLE001 - assert service bounds.
-        assert "value must be at most 100" in str(err)
-    else:
-        raise AssertionError("Invalid target SOC was accepted")
 
 
 def test_reason_code_schemas_accept_compact_codes() -> None:
@@ -430,7 +416,7 @@ def test_run_preflight_keeps_unavailable_ai_configuration_advisory() -> None:
     assert "ai_task_entity_unavailable" in response["discovery"]["ai"]["issues"]
 
 
-def test_run_preflight_keeps_unavailable_external_ev_target_advisory() -> None:
+def test_run_preflight_blocks_control_when_vehicle_target_is_unavailable() -> None:
     coordinator = _partial_coordinator(
         {
             "ev_smart_charging_start_entity": "input_boolean.ev_start",
@@ -447,13 +433,12 @@ def test_run_preflight_keeps_unavailable_external_ev_target_advisory() -> None:
     response = asyncio.run(handler(FakeCall({})))
 
     checks = {check["check"]: check for check in response["checks"]}
-    assert response["ok"] is True
-    assert checks["configured_entities_available"]["ok"] is True
-    assert response["entities"]["unavailable"] == []
-    assert response["entities"]["advisory_unavailable"] == [
-        "sensor.ev_target"
-    ]
-    assert response["entities"]["available_count"] == 2
+    assert response["ok"] is False
+    assert checks["configured_entities_available"]["ok"] is False
+    assert response["entities"]["unavailable"] == ["sensor.ev_target"]
+    assert response["entities"]["advisory_unavailable"] == []
+    assert response["entities"]["available_count"] == 4
+    assert response["discovery"]["ev"]["supported"] is True
 
 
 def test_run_preflight_supports_enphase_only_control() -> None:
@@ -966,6 +951,9 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
                 "person_entities": "person.home",
                 "ev_smart_charging_start_entity": "input_boolean.ev_start",
                 "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+                CONF_EV_SOC: "sensor.ev_soc",
+                CONF_EV_CHARGING: "binary_sensor.ev_charging",
+                CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
                 "ai_advisor_service": "fake_ai.advice",
             },
             "options": {
@@ -1043,9 +1031,6 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     async def ready_by(value: str) -> None:
         coordinator.awaited.append(("ready_by", value))
 
-    async def target_soc(value: float) -> None:
-        coordinator.awaited.append(("target_soc", value))
-
     async def manual_override(duration: int, reason: str) -> None:
         coordinator.awaited.append(("manual_override", (duration, reason)))
 
@@ -1064,7 +1049,6 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
     coordinator.async_request_replan = replan
     coordinator.async_restore_safe_state = restore
     coordinator.async_set_ready_by = ready_by
-    coordinator.async_set_ev_target_soc = target_soc
     coordinator.async_set_manual_hvac_override = manual_override
     coordinator.async_arm_production_control = arm
     coordinator.async_operator_arm_production_control = arm
@@ -1078,6 +1062,13 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
 def _partial_coordinator(data: dict[str, Any], **options: Any) -> EnergyPlannerCoordinator:
     """Return an armed coordinator with only the requested control surfaces."""
     coordinator = _coordinator()
+    if options.get("ev_control_enabled"):
+        data = {
+            CONF_EV_SOC: "sensor.ev_soc",
+            CONF_EV_CHARGING: "binary_sensor.ev_charging",
+            CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+            **data,
+        }
     coordinator.entry.data = dict(data)
     coordinator.entry.options = {
         "ev_control_enabled": False,
