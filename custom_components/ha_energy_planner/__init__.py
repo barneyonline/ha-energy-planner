@@ -348,6 +348,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         if callable(cancel_auto_recovery):
             await cancel_auto_recovery("setup_entry_failed")
         coordinator.async_shutdown()
+        await coordinator.async_wait_for_plan_execution()
+        await coordinator.async_wait_for_refresh_shutdown()
         await coordinator.async_disarm_production_control("setup_entry_failed")
         await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
         entry.runtime_data = None
@@ -390,6 +392,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
         else:
             await cancel_auto_recovery("entry_unload")
     coordinator.async_shutdown()
+    await coordinator.async_wait_for_plan_execution()
+    await coordinator.async_wait_for_refresh_shutdown()
     unload_completed = False
     try:
         if preserve_automatic_state:

@@ -338,6 +338,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._planner_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
         self._device_control_lock = asyncio.Lock()
+        self._command_lock = asyncio.Lock()
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
         self.entry_topology_signature: tuple[Any, ...] | None = None
@@ -359,6 +360,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._refresh_trigger_counts: dict[str, int] = {}
         self._last_phase_durations: dict[str, float] = {}
         self._ai_advice_task: asyncio.Task[None] | None = None
+        self._plan_execution_task: asyncio.Task[None] | None = None
+        self._pending_plan_execution: tuple[int, EnergyPlan, DecisionContext, dict[str, Any]] | None = None
+        self._deferred_plan_execution: tuple[int, EnergyPlan, DecisionContext, dict[str, Any]] | None = None
         self._ai_advice_fingerprint: str | None = None
         self._ai_advice_pending_fingerprint: str | None = None
         self._ai_advice_pending_reason: str | None = None
@@ -586,7 +590,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         _retry_if_available(self.hass.states.get(load_entity))
 
     def async_shutdown(self) -> None:
-        """Cancel listeners and pending debounced refresh."""
+        """Stop new coordinator work while preserving an in-flight command."""
         # A refresh task may already be queued even after its timer/listener is
         # cancelled. Suppress its eventual commit until setup is resumed.
         self._tearing_down = True
@@ -600,6 +604,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if ai_task is not None and not ai_task.done():
             ai_task.cancel()
         self._ai_advice_task = None
+        # Device execution may already have changed external state and still be
+        # confirming, rolling back, or persisting ownership. Let that single
+        # transaction reach its safe boundary; lifecycle cleanup explicitly
+        # awaits it after this method has prevented any newer work from running.
+        self._pending_plan_execution = None
+        self._deferred_plan_execution = None
         recovery_task = getattr(self, "_startup_auto_recovery_task", None)
         if recovery_task is not None and not recovery_task.done():
             recovery_task.cancel()
@@ -614,6 +624,24 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.executor.notification_grace_until = None
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
+
+    async def async_wait_for_plan_execution(self) -> None:
+        """Wait for the current device transaction without cancelling it."""
+        execution_task = getattr(self, "_plan_execution_task", None)
+        if execution_task is None:
+            return
+        try:
+            await asyncio.shield(execution_task)
+        except Exception:
+            # An unexpected executor failure is logged by the drain loop. Keep
+            # lifecycle restoration moving even for an independently supplied
+            # or already-failed background task.
+            _LOGGER.exception("Unexpected failure while awaiting plan execution shutdown")
+
+    async def async_wait_for_refresh_shutdown(self) -> None:
+        """Wait until any refresh already inside the planner lock has finished."""
+        async with self._planner_lock:
+            return
 
     @callback
     def _schedule_debounced_refresh(
@@ -661,7 +689,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         self._boundary_cancel = async_call_later(self.hass, delay, _refresh)
 
-    async def _async_update_data(self) -> EnergyPlan:
+    async def _async_update_data(self) -> EnergyPlan | None:
         """Refresh planner data."""
         started = perf_counter()
         succeeded = False
@@ -671,11 +699,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._refresh_trigger_counts = trigger_counts
         try:
             async with self._planner_lock:
-                async with self.store.async_delay_save():
-                    result = await self._async_update_data_locked()
+                if getattr(self, "_tearing_down", False):
                     succeeded = True
                     self._increment_refresh_counter("succeeded")
-                    return result
+                    self._increment_refresh_counter("teardown_skipped")
+                    return self.data
+                async with self.store.async_delay_save():
+                    self._deferred_plan_execution = None
+                    result = await self._async_update_data_locked(defer_execution=True)
+                    succeeded = True
+                    self._increment_refresh_counter("succeeded")
+            deferred_execution = self._deferred_plan_execution
+            self._deferred_plan_execution = None
+            if deferred_execution is not None:
+                self._schedule_plan_execution(deferred_execution)
+            return result
         finally:
             if not succeeded:
                 self._increment_refresh_counter("failed")
@@ -692,7 +730,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "phases": dict(getattr(self, "_last_phase_durations", {})),
             }
 
-    async def _async_update_data_locked(self) -> EnergyPlan:
+    async def _async_update_data_locked(self, *, defer_execution: bool = False) -> EnergyPlan:
         """Refresh planner data while holding the planner lock."""
         preparation_started = perf_counter()
         started_generation = self._refresh_generation
@@ -845,7 +883,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self._async_update_production_evidence(plan, violations)
         if plan.mode == PlannerMode.DRY_RUN:
             await self._async_record_dry_run_comparison(plan)
-        result = await self._async_commit_plan_if_current(started_generation, plan, context, options)
+        result = await self._async_commit_plan_if_current(
+            started_generation,
+            plan,
+            context,
+            options,
+            execute=not defer_execution,
+        )
         self._increment_refresh_counter("computed")
         self._last_phase_durations = {
             "inputs_ms": preparation_ms,
@@ -1383,7 +1427,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
                 await self.async_restore_safe_state(reason, refresh=False)
             elif disabled_device_controls:
-                async with self._planner_lock:
+                async with self._command_lock:
                     for area, executor_asset in disabled_device_controls:
                         try:
                             await self.executor.async_restore_device_control(
@@ -1518,7 +1562,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_manual_ev_charging(self, enabled: bool) -> EVCommandResult:
         """Apply a manual charger command through Energy Planner's adapter."""
-        async with self._planner_lock:
+        async with self._command_lock:
             self.executor.options = self.options
             self.executor.entry_data = self.entry_data
             result = await self.executor.async_manual_ev_charging(
@@ -1526,7 +1570,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 getattr(self, "_last_decision_context", None),
             )
             if result.applied:
-                self.overrides = [override for override in self.overrides if override.kind != "manual_ev_charging"]
+                self.overrides = [
+                    override for override in self.overrides if override.kind != "manual_ev_charging"
+                ]
                 self.overrides.append(
                     Override(
                         kind="manual_ev_charging",
@@ -1560,6 +1606,23 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_handle_options_update()
 
     async def async_set_manual_hvac_override(
+        self,
+        duration_minutes: int,
+        reason: str,
+        *,
+        source: str = "service",
+        expires: bool = True,
+    ) -> ActionOutcome | None:
+        """Serialize an operator HVAC override with automatic device execution."""
+        async with self._command_lock:
+            return await self._async_set_manual_hvac_override(
+                duration_minutes,
+                reason,
+                source=source,
+                expires=expires,
+            )
+
+    async def _async_set_manual_hvac_override(
         self,
         duration_minutes: int,
         reason: str,
@@ -1715,7 +1778,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
         """Restore safe state and refresh."""
-        async with self._planner_lock:
+        async with self._command_lock:
             outcome = await self.executor.async_restore_safe_state(reason)
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
@@ -1874,7 +1937,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             }
         )
         await self._async_save_production(production)
-        async with self._planner_lock:
+        async with self._command_lock:
             ownership = self.store.data.get("ownership", {})
             if isinstance(ownership, dict) and (
                 ownership.get("hvac_control")
@@ -1960,7 +2023,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def _async_clear_expired_manual_hvac_state(self) -> bool:
         """Clear planner-managed manual HVAC exposure after its timeout."""
-        ownership = dict(self.store.data.get("ownership", {}))
         manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override_entity:
             try:
@@ -1978,6 +2040,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     manual_override_entity,
                 )
                 return False
+        # The helper call above yields while device execution may persist new
+        # ownership under the independent command lock. Re-read at the atomic
+        # Store replacement boundary so cleanup cannot erase that new state.
+        ownership = dict(self.store.data.get("ownership", {}))
         if "manual_hvac_override_expires_at" in ownership:
             ownership.pop("manual_hvac_override_expires_at", None)
             await self.store.async_save_ownership(ownership)
@@ -2023,8 +2089,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         plan: EnergyPlan,
         context: Any,
         options: dict[str, Any],
+        *,
+        execute: bool = True,
     ) -> EnergyPlan:
-        """Persist and execute only the newest planner result."""
+        """Persist only the newest planner result and optionally execute it."""
         if getattr(self, "_tearing_down", False):
             _LOGGER.debug(
                 "Discarding planner result %s while the config entry is unloading",
@@ -2043,8 +2111,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return self.data or plan
         self._last_decision_context = context
         await self.store.async_save_plan(plan)
-        self.executor.options = options
-        self.executor.entry_data = self.entry_data
         if getattr(self, "_startup_auto_recovery_validation_active", False):
             validation = getattr(self, "_last_startup_auto_recovery_validation", None)
             if isinstance(validation, dict) and validation.get("plan_id") == plan.plan_id:
@@ -2052,6 +2118,87 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # Recovery validation is deliberately non-commanding, including
             # planner-owned safety-stop paths that may normally bypass arming.
             return plan
+        if not execute:
+            self._deferred_plan_execution = (started_generation, plan, context, dict(options))
+            return plan
+        await self._async_execute_plan_if_current(started_generation, plan, context, options)
+        return plan
+
+    @callback
+    def _schedule_plan_execution(
+        self,
+        request: tuple[int, EnergyPlan, DecisionContext, dict[str, Any]],
+    ) -> None:
+        """Queue only the newest committed plan for serialized background execution."""
+        if getattr(self, "_tearing_down", False):
+            return
+        self._pending_plan_execution = request
+        task = getattr(self, "_plan_execution_task", None)
+        if task is not None and not task.done():
+            return
+        created = self.entry.async_create_background_task(
+            self.hass,
+            self._async_drain_plan_execution(),
+            f"{DOMAIN} plan execution",
+        )
+        self._plan_execution_task = created
+        # Lightweight test doubles may deliberately close background coroutines
+        # instead of returning a Task. Do not retain a request they cannot run.
+        if created is None:
+            self._pending_plan_execution = None
+
+    async def _async_drain_plan_execution(self) -> None:
+        """Execute committed plans without holding the coordinator refresh lock."""
+        try:
+            while not getattr(self, "_tearing_down", False):
+                request = self._pending_plan_execution
+                self._pending_plan_execution = None
+                if request is None:
+                    return
+                started_generation, plan, context, options = request
+                async with self._command_lock:
+                    if (
+                        getattr(self, "_tearing_down", False)
+                        or started_generation != self._refresh_generation
+                    ):
+                        continue
+                    try:
+                        await self._async_execute_plan_if_current(
+                            started_generation,
+                            plan,
+                            context,
+                            options,
+                        )
+                    except Exception:
+                        # Isolate one malformed or failed execution transaction
+                        # so a newer coalesced safety plan is not stranded.
+                        _LOGGER.exception(
+                            "Unexpected failure executing committed plan %s",
+                            plan.plan_id,
+                        )
+                    finally:
+                        # Executor outcomes, ownership, reservations, pauses,
+                        # and audit state are Store-backed rather than part of
+                        # the earlier coordinator refresh result.
+                        self.async_update_listeners()
+        finally:
+            self._plan_execution_task = None
+
+    async def _async_execute_plan_if_current(
+        self,
+        started_generation: int,
+        plan: EnergyPlan,
+        context: Any,
+        options: dict[str, Any],
+    ) -> None:
+        """Execute one current plan, stopping between actions when it becomes stale."""
+        if (
+            getattr(self, "_tearing_down", False)
+            or started_generation != self._refresh_generation
+        ):
+            return
+        self.executor.options = options
+        self.executor.entry_data = self.entry_data
         consumed_action = await self.executor.async_evaluate(plan, context)
         evaluated_action = consumed_action if consumed_action in plan.actions else plan.next_action
         for action in plan.actions:
@@ -2076,7 +2223,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # The priority score orders presentation and the first command, but
             # every coordinated device action keeps its own execution gate.
             await self.executor.async_evaluate(replace(plan, actions=[action]), context)
-        return plan
 
     async def _async_get_throttled_ai_advice(
         self,

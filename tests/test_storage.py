@@ -35,14 +35,17 @@ class FakeStore:
     saved: dict[str, Any] | None = None
     save_count: int = 0
     created_keys: list[str] = []
+    created_kwargs: list[dict[str, Any]] = []
     loaded_by_key: dict[str, dict[str, Any] | None] | None = None
     saved_by_key: dict[str, dict[str, Any]] = {}
 
-    def __init__(self, hass: object, version: int, key: str) -> None:
+    def __init__(self, hass: object, version: int, key: str, **kwargs: Any) -> None:
         self.hass = hass
         self.version = version
         self.key = key
+        self.kwargs = kwargs
         FakeStore.created_keys.append(key)
+        FakeStore.created_kwargs.append(kwargs)
 
     async def async_load(self) -> dict[str, Any] | None:
         if self.loaded_by_key is not None:
@@ -58,6 +61,7 @@ class FakeStore:
 def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.created_keys = []
+    FakeStore.created_kwargs = []
 
     PlannerStore(object(), "vehicle-one", legacy_fallback=True)
     PlannerStore(object(), "vehicle-two")
@@ -66,6 +70,11 @@ def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(mo
         "ha_energy_planner_state_vehicle-one",
         "ha_energy_planner_state",
         "ha_energy_planner_state_vehicle-two",
+    ]
+    assert FakeStore.created_kwargs == [
+        {"serialize_in_event_loop": False},
+        {"serialize_in_event_loop": False},
+        {"serialize_in_event_loop": False},
     ]
 
 
@@ -379,11 +388,12 @@ def test_store_flushes_mutation_that_arrives_during_inflight_save(monkeypatch: o
         snapshots: list[dict[str, Any]]
 
         async def async_save(self, data: dict[str, Any]) -> None:
-            snapshot = deepcopy(data)
             if not self.snapshots:
                 self.started.set()
                 await self.release.wait()
-            self.snapshots.append(snapshot)
+            # Home Assistant may serialize this mapping in an executor after
+            # the event loop has accepted another mutation.
+            self.snapshots.append(deepcopy(data))
 
     monkeypatch.setattr(storage_module, "Store", BarrierStore)
 
@@ -599,7 +609,7 @@ def test_store_delay_save_without_mutations_does_not_write(monkeypatch: object) 
     assert FakeStore.save_count == 0
 
 
-def test_forecast_snapshot_retention_covers_day_ahead_training_at_five_minutes(
+def test_forecast_snapshot_retention_is_defensively_bounded(
     monkeypatch: object,
 ) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
@@ -608,9 +618,31 @@ def test_forecast_snapshot_retention_covers_day_ahead_training_at_five_minutes(
 
     asyncio.run(store.async_add_forecast_snapshot({"index": 384}))
 
-    assert len(store.data["forecast_snapshots"]) == 385
-    assert store.data["forecast_snapshots"][0] == {"index": 0}
+    assert len(store.data["forecast_snapshots"]) == 128
+    assert store.data["forecast_snapshots"][0] == {"index": 257}
     assert store.data["forecast_snapshots"][-1] == {"index": 384}
+
+
+def test_forecast_snapshots_keep_one_latest_record_per_half_hour(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+
+    async def add_snapshots() -> None:
+        for index in range(24):
+            created_at = start + timedelta(minutes=5 * index)
+            await store.async_add_forecast_snapshot(
+                {"created_at": created_at, "plan_id": f"plan-{index}"}
+            )
+
+    asyncio.run(add_snapshots())
+
+    assert [item["plan_id"] for item in store.data["forecast_snapshots"]] == [
+        "plan-5",
+        "plan-11",
+        "plan-17",
+        "plan-23",
+    ]
 
 
 def test_background_ai_metadata_attaches_to_matching_forecast_snapshot(monkeypatch: object) -> None:
@@ -619,6 +651,7 @@ def test_background_ai_metadata_attaches_to_matching_forecast_snapshot(monkeypat
     store.data["forecast_snapshots"] = [
         {"plan_id": "current", "ai": None},
         {"plan_id": "newer", "ai": None},
+        "malformed",
     ]
 
     asyncio.run(
@@ -632,9 +665,182 @@ def test_background_ai_metadata_attaches_to_matching_forecast_snapshot(monkeypat
         {
             "plan_id": "current",
             "ai": {"status": "accepted", "accepted_fields": ["confidence"]},
+            "ai_plan_id": "current",
         },
         {"plan_id": "newer", "ai": None},
+        "malformed",
     ]
+
+
+def test_bucketed_snapshot_preserves_delayed_ai_metadata_and_plan_provenance(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+
+    async def replace_then_attach() -> None:
+        await store.async_add_forecast_snapshot(
+            {"created_at": start, "plan_id": "plan-0", "ai": None}
+        )
+        await store.async_add_forecast_snapshot(
+            {"created_at": start + timedelta(minutes=5), "plan_id": "plan-1", "ai": None}
+        )
+        await store.async_attach_ai_to_forecast_snapshot(
+            "plan-0",
+            {"status": "accepted"},
+        )
+        await store.async_add_forecast_snapshot(
+            {"created_at": start + timedelta(minutes=10), "plan_id": "plan-2", "ai": None}
+        )
+
+    asyncio.run(replace_then_attach())
+
+    assert store.data["forecast_snapshots"] == [
+        {
+            "created_at": "2026-06-27T00:10:00+00:00",
+            "plan_id": "plan-2",
+            "ai": {"status": "accepted"},
+            "bucket_plan_ids": ["plan-0", "plan-1"],
+            "ai_plan_id": "plan-0",
+        }
+    ]
+
+
+def test_bucketed_snapshot_retains_distinct_action_evidence_without_duplicates(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+    active = {
+        "action_id": "plan-0-ev-native-smart-charge",
+        "asset": "ev",
+        "kind": "ev_schedule",
+        "desired_state": {"charging_required_now": True, "allocated_slots": [{"price": -0.1}]},
+        "reason_codes": ["negative_price"],
+    }
+    refreshed_active = {**active, "action_id": "plan-1-ev-native-smart-charge"}
+    inactive = {
+        **active,
+        "action_id": "plan-2-ev-native-smart-charge",
+        "desired_state": {"charging_required_now": False, "allocated_slots": []},
+        "reason_codes": ["already_at_target"],
+    }
+
+    async def add_snapshots() -> None:
+        for index, actions in enumerate(([active, "malformed"], [refreshed_active], [inactive])):
+            await store.async_add_forecast_snapshot(
+                {
+                    "created_at": start + timedelta(minutes=5 * index),
+                    "plan_id": f"plan-{index}",
+                    "actions": actions,
+                }
+            )
+
+    asyncio.run(add_snapshots())
+
+    actions = store.data["forecast_snapshots"][0]["actions"]
+    assert [action["action_id"] for action in actions] == [
+        "plan-1-ev-native-smart-charge",
+        "plan-2-ev-native-smart-charge",
+    ]
+
+
+def test_bucketed_snapshot_prioritizes_negative_price_ev_action_at_cap(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+
+    async def add_snapshots() -> None:
+        for index in range(13):
+            negative_price = index == 0
+            action = {
+                "action_id": f"plan-{index}-ev-native-smart-charge",
+                "asset": "ev",
+                "kind": "ev_schedule",
+                "desired_state": (
+                    "malformed"
+                    if index == 1
+                    else {"variant": index}
+                    if index == 2
+                    else {
+                        "charging_required_now": negative_price,
+                        "variant": index,
+                        "allocated_slots": (
+                            [{"import_price": -0.05, "starts_at": "negative"}]
+                            if negative_price
+                            else []
+                        ),
+                    }
+                ),
+            }
+            await store.async_add_forecast_snapshot(
+                {
+                    "created_at": start + timedelta(minutes=index),
+                    "plan_id": f"plan-{index}",
+                    "actions": [action],
+                }
+            )
+
+    asyncio.run(add_snapshots())
+
+    actions = store.data["forecast_snapshots"][0]["actions"]
+    assert len(actions) == 12
+    assert any(
+        isinstance(action.get("desired_state"), dict)
+        and action["desired_state"].get("allocated_slots")
+        and action["desired_state"]["allocated_slots"][0]["import_price"] < 0
+        for action in actions
+    )
+
+
+def test_bucketed_snapshot_preserves_successful_recorder_import_summary(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object())
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+
+    async def add_snapshots() -> None:
+        await store.async_add_forecast_snapshot(
+            {
+                "created_at": start,
+                "plan_id": "imported",
+                "trip_history": {
+                    "recorder_import_reason": "recorder_imported",
+                    "record_count": 1,
+                },
+            }
+        )
+        await store.async_add_forecast_snapshot(
+            {
+                "created_at": start + timedelta(minutes=5),
+                "plan_id": "recent",
+                "trip_history": {
+                    "recorder_import_reason": "recorder_import_recent",
+                    "record_count": 1,
+                },
+            }
+        )
+
+    asyncio.run(add_snapshots())
+
+    assert store.data["forecast_snapshots"][0]["trip_history"] == {
+        "recorder_import_reason": "recorder_imported",
+        "record_count": 1,
+        "latest_recorder_import_reason": "recorder_import_recent",
+    }
+    assert storage_module._merge_forecast_bucket_trip_history(
+        {"recorder_import_reason": "recorder_imported", "record_count": 1},
+        None,
+    ) == {"recorder_import_reason": "recorder_imported", "record_count": 1}
+    assert storage_module._merge_forecast_bucket_trip_history(
+        {"recorder_import_reason": "recorder_import_recent", "record_count": "bad"},
+        {"recorder_import_reason": "recorder_no_new_trips", "record_count": False},
+    ) == {"recorder_import_reason": "recorder_no_new_trips", "record_count": 0}
 
 
 def test_store_audit_entry_bounds_mapping_values(monkeypatch: object) -> None:
@@ -729,7 +935,7 @@ def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatc
     ]
     asyncio.run(store.async_add_dry_run_comparison({"created_at": now, "planned_action_count": 3, "next_action": None}))
 
-    assert len(store.data["forecast_snapshots"]) == 501
+    assert len(store.data["forecast_snapshots"]) == 128
     assert all(item["plan_id"] != "expired" for item in store.data["forecast_snapshots"])
     assert all(isinstance(item, dict) for item in store.data["forecast_snapshots"])
     assert [item["planned_action_count"] for item in store.data["dry_run_comparisons"]] == [2, 3]
