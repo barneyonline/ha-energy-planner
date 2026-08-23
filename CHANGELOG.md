@@ -2,55 +2,106 @@
 
 ## Unreleased
 
-### Added
+### 🚧 Breaking changes
 
-- Climate settings now include **Precondition configured zones only**. When
-  enabled, tariff preconditioning keeps main Daikin power and mode control but
-  applies temperature targets only to configured zone climate entities.
+- None
 
-### Fixed
+### ✨ New features
 
-- Continuous EV charging now remains committed after charging is observed, so
-  tariff forecast revisions cannot split one continuous schedule into repeated
-  short start/stop bursts. Configured maximum import prices remain authoritative.
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 0.9.13 - 2026-08-23
+
+### 🚧 Breaking changes
+
 - EV planning now uses the mapped vehicle target-SOC entity as its authoritative
   target. The obsolete fallback target option and `set_ev_target_soc` service
   are removed by config-entry migration. A configured legacy EV must map its
   vehicle target before that migration can complete.
+
+### ✨ New features
+
+- Climate settings now include **Precondition configured zones only**. When
+  enabled, tariff preconditioning keeps main Daikin power and mode control but
+  applies temperature targets only to configured zone climate entities.
 - EV SOC gained per kWh is now calibrated automatically from completed charging
   sessions in Home Assistant Recorder. The configured estimate remains a
   conservative bootstrap value until at least one hour of clean history is
   available, and learned rates include a 10% readiness margin. A learned model
   is used only with the same charging sensor, SOC sensor, and configured charger
   power that produced it.
+
+### 🐛 Bug fixes
+
+- Continuous EV charging now remains committed after charging is observed, so
+  tariff forecast revisions cannot split one continuous schedule into repeated
+  short start/stop bursts. Configured maximum import prices remain authoritative.
 - Stop-only EV plans remain constraint-valid when the current SOC is already
   above the authoritative vehicle target.
 
+### 🔧 Improvements
+
+- Planner refreshes no longer wait for slow device-service feedback. Device
+  commands are serialized separately, newer plans replace queued stale work,
+  and unload waits for any in-flight command to reach a safe persistence
+  boundary.
+- Recorder imports and retained planning evidence now use bounded, compacted
+  history. EV history is queried in adaptive chunks, forecast and dry-run
+  records are bucketed, and Home Assistant Store serialization runs off the
+  event loop to reduce planner memory, database, and event-loop load.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.12 - 2026-08-16
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Zone thermostat target changes now participate in manual-override detection
+  without misclassifying changes protected by the configured scheduler guard.
+
+### 🔧 Improvements
 
 - Climate Zones can now include subordinate `climate` entities. Planner HVAC
   actions apply and confirm the main thermostat target on every configured zone
   thermostat while retaining switch/helper takeover and restoration behavior.
 
-### Fixed
+### 🔄 Other changes
 
-- Zone thermostat target changes now participate in manual-override detection
-  without misclassifying changes protected by the configured scheduler guard.
+- None
 
 ## 0.9.11 - 2026-08-15
 
-### Changed
+### 🚧 Breaking changes
 
-- **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
-  when their corresponding device-control switch is off. Disabled-area actions
-  are also excluded from the Next actions attributes and action count.
-- Plan calendar descriptions now group action evidence into short bulleted
-  sections and render embedded schedule and forecast timestamps in Home
-  Assistant's local timezone instead of exposing raw UTC ISO values.
+- None
 
-### Fixed
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Manual safety-gate arming now requires the current preflight and reviewed
   production evidence to pass. The Armed entity reports effective command
@@ -76,20 +127,30 @@
   or above the cooling range. Opposite-direction commands and targets outside
   the configured comfort bounds remain blocked.
 
+### 🔧 Improvements
+
+- **Current state** and **Next actions** now omit Climate, EV, or Enphase areas
+  when their corresponding device-control switch is off. Disabled-area actions
+  are also excluded from the Next actions attributes and action count.
+- Plan calendar descriptions now group action evidence into short bulleted
+  sections and render embedded schedule and forecast timestamps in Home
+  Assistant's local timezone instead of exposing raw UTC ISO values.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.10 - 2026-08-15
 
-### Changed
+### 🚧 Breaking changes
 
-- Previously active installations now resume **Automatic control** and
-  **Armed** immediately after restart. The ten-minute startup safety grace
-  begins only when Home Assistant reaches `RUNNING`; ordinary runtime safety
-  gates continue to apply throughout it.
-- **Automatic control** now represents retained operator intent, while
-  **Armed** remains the authoritative command-permission state. If the startup
-  deadline is unsafe, Energy Planner disarms and restores its devices while
-  leaving Automatic control on for automatic recovery.
+- None
 
-### Fixed
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Startup automatic-control recovery now runs as Home Assistant background work,
   preventing its bounded dependency wait from delaying bootstrap or producing a
@@ -107,9 +168,28 @@
   configuration-reload handoff resumes disarmed safety recovery on the
   still-loaded coordinator.
 
+### 🔧 Improvements
+
+- Previously active installations now resume **Automatic control** and
+  **Armed** immediately after restart. The ten-minute startup safety grace
+  begins only when Home Assistant reaches `RUNNING`; ordinary runtime safety
+  gates continue to apply throughout it.
+- **Automatic control** now represents retained operator intent, while
+  **Armed** remains the authoritative command-permission state. If the startup
+  deadline is unsafe, Energy Planner disarms and restores its devices while
+  leaving Automatic control on for automatic recovery.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.9 - 2026-08-15
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Added bounded startup recovery for installations that were actively controlling
   devices before a production-evidence contract transition. Energy Planner waits
@@ -118,7 +198,7 @@
   consecutive non-commanding healthy plans five seconds apart. Recovery never
   overrides an operator stop, a configuration change, or a later runtime outage.
 
-### Fixed
+### 🐛 Bug fixes
 
 - Recorder-facing sensor and binary-sensor attributes now use a shared 12 KiB
   byte budget with deterministic compaction, preventing oversized
@@ -127,9 +207,21 @@
 - The Plan calendar now omits actions and EV charging windows for device-control
   areas whose Climate control, EV control, or Enphase control switch is off.
 
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.8 - 2026-08-13
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Added an opt-in **Precondition while away** Climate policy. It permits only
   the tariff preconditioning/coast lifecycle while occupancy is known to be
@@ -138,7 +230,7 @@
   away-off state into preconditioning also respects the configured HVAC
   minimum cycle/rest period.
 
-### Fixed
+### 🐛 Bug fixes
 
 - When away preconditioning is enabled but its tariff window starts later, the
   planner now turns unowned HVAC off immediately and keeps the future
@@ -164,15 +256,27 @@
   non-expiring helper overrides are bounded on startup and the helper is
   cleared when the timeout expires.
 
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.7 - 2026-08-12
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Added a dedicated **Mode** enum sensor with stable `review` and `active`
   states, exposing the operational mode previously available only as an
   attribute of **Armed**.
 
-### Fixed
+### 🐛 Bug fixes
 
 - **Explain** no longer misclassifies a normal absence of a worthwhile and
   thermally feasible climate-preconditioning window as a Climate settings
@@ -198,18 +302,25 @@
 - Renamed the guard setting to **Climate Scheduler Guard Timer** and added an
   explanatory field description consistent with the other Climate settings.
 
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.6 - 2026-08-12
 
-### Changed
+### 🚧 Breaking changes
 
-- Retired the **Pause control 1 hour** and **Pause control 4 hours** buttons.
-  The flexible `ha_energy_planner.pause_control` service remains available for
-  automations.
-- Retired the duplicate **Keep charger on** switch while preserving **Keep
-  charger enabled after target SOC** in EV settings and retaining its stored
-  value during upgrade.
+- None
 
-### Fixed
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Added a paired climate scheduler guard timer mapping. When the external
   schedule-versus-manual classifier helpers are configured, Energy Planner now
@@ -218,9 +329,30 @@
   unavailable guard state blocks the actuator path so planner activity cannot
   be misclassified as a manual override.
 
+### 🔧 Improvements
+
+- Retired the **Pause control 1 hour** and **Pause control 4 hours** buttons.
+  The flexible `ha_energy_planner.pause_control` service remains available for
+  automations.
+- Retired the duplicate **Keep charger on** switch while preserving **Keep
+  charger enabled after target SOC** in EV settings and retaining its stored
+  value during upgrade.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.5 - 2026-08-11
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Removed the obsolete Ready by, Opportunistic charging, and Opportunistic
   charging price threshold entities during setup now that those controls live
@@ -244,9 +376,36 @@
   feedback before deciding whether rollback is necessary, so a confirmed late
   start is not immediately followed by Stop charging.
 
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.4 - 2026-08-11
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Household-load conservative bounds now calibrate correlated 15-minute
+  residuals as day-level blocks using finite-sample upper quantiles. This keeps
+  the existing 90% safety gate while preventing a small number of historical
+  days from producing an under-sized uncertainty buffer. The model and forecast
+  contracts are version 3 and 4 respectively, so existing models retrain and
+  production review evidence is intentionally renewed after upgrade.
+- Added a diagnostic Load forecast coverage score sensor with the current
+  percentage, required threshold, model status, and combined bypass state.
+
+### 🔧 Improvements
 
 - Consolidated the settings form from thirteen menus into six task-oriented
   sections. EV charging now contains its entity mappings, Ready by,
@@ -259,35 +418,21 @@
   command execution, service errors, and feedback confirmation remain visible
   and enforced.
 
-### Fixed
+### 🔄 Other changes
 
-- Household-load conservative bounds now calibrate correlated 15-minute
-  residuals as day-level blocks using finite-sample upper quantiles. This keeps
-  the existing 90% safety gate while preventing a small number of historical
-  days from producing an under-sized uncertainty buffer. The model and forecast
-  contracts are version 3 and 4 respectively, so existing models retrain and
-  production review evidence is intentionally renewed after upgrade.
-- Added a diagnostic Load forecast coverage score sensor with the current
-  percentage, required threshold, model status, and combined bypass state.
+- None
 
 ## 0.9.3 - 2026-08-11
 
-### Changed
+### 🚧 Breaking changes
 
-- Household-load training now accepts local days with at least 80% valid
-  cleaned 15-minute buckets. Bounded historical negative readings, excluded EV
-  charging, and brief source outages no longer discard an otherwise usable
-  day. The model and forecast contracts are version 2 and 3 respectively, so
-  existing models retrain and production review evidence is intentionally
-  renewed after upgrade.
-- Removed HAEO and HAFO support, including optimizer configuration, service
-  calls, response parsing, planner dependencies, telemetry, fixtures, and
-  validation tooling. Legacy optimizer settings are discarded during migration.
-- Preflight readiness continues to require only the individual EV, Climate,
-  and Enphase control surfaces that are enabled; configured surfaces may remain
-  off without blocking the enabled areas.
+- None
 
-### Fixed
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Upgrades now persistently remove every retired optimizer config alias and
   stored run/action metadata, including entries that have no legacy
@@ -302,9 +447,40 @@
   six-hour retry backoff. Energy Planner remains fail-closed and retries on the
   next refresh after the source appears.
 
+### 🔧 Improvements
+
+- Household-load training now accepts local days with at least 80% valid
+  cleaned 15-minute buckets. Bounded historical negative readings, excluded EV
+  charging, and brief source outages no longer discard an otherwise usable
+  day. The model and forecast contracts are version 2 and 3 respectively, so
+  existing models retrain and production review evidence is intentionally
+  renewed after upgrade.
+- Removed HAEO and HAFO support, including optimizer configuration, service
+  calls, response parsing, planner dependencies, telemetry, fixtures, and
+  validation tooling. Legacy optimizer settings are discarded during migration.
+- Preflight readiness continues to require only the individual EV, Climate,
+  and Enphase control surfaces that are enabled; configured surfaces may remain
+  off without blocking the enabled areas.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.2 - 2026-08-09
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
 
 - Reduced the built-in household-load readiness minimum from seven to three
   complete days while retaining two leakage-free validation origins, the
@@ -316,36 +492,21 @@
   that history is available, EV planning continues to use the configured
   fallback Target SOC.
 
+### 🔄 Other changes
+
+- None
+
 ## 0.9.1 - 2026-08-09
 
-### Changed
+### 🚧 Breaking changes
 
-- Replaced the required external baseline-load forecast with a built-in,
-  deterministic household-load forecast trained from up to 28 days of Home
-  Assistant Recorder history. Energy setup now requires a measured whole-home
-  power sensor and keeps the external PV forecast. The model exposes expected
-  and conservative load evidence through the existing status and calendar
-  surfaces, handles weekday/weekend patterns and DST, and fails closed for
-  active commands while learning, stale, or failed. HAFO is no longer required;
-  HAEO remains optional. Existing measured-load mappings migrate automatically,
-  while forecast-only legacy entries require the user to select a real sensor.
-- Added individual **Climate control**, **EV control**, and **Enphase control**
-  switches. **Automatic control** remains the master arm switch and now respects
-  the selected device switches instead of enabling every configured area.
-  Turning one device control off restores only that device while the other
-  selected areas remain armed. A failed restore leaves the switch on and reports
-  an actionable error; enabling an area while armed must pass preflight first.
-  The evidence fingerprint now covers configured mappings and policy rather than
-  runtime device selection. Existing installations must collect three new review
-  plans and re-arm Automatic control once after upgrading.
-- Removed the manual EV start/stop buttons, Target SOC number entity, and EV
-  connected helper. The fallback Target SOC is now configured in the central
-  **EV, battery and grid** section, while live connection state comes only from
-  an optionally mapped vehicle or charger entity.
-- **Next actions** now summarizes the next state of every configured controlled
-  area in its state value, matching the combined **Current state** presentation.
+- None
 
-### Fixed
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Household-load conservative bounds now protect HAEO-free grid-import checks,
   15-minute profiles are time-weighted into every configured planning interval,
@@ -375,9 +536,58 @@
   output and keeps rejected results visible across materially equivalent plan
   refreshes instead of silently returning an empty result.
 
+### 🔧 Improvements
+
+- Replaced the required external baseline-load forecast with a built-in,
+  deterministic household-load forecast trained from up to 28 days of Home
+  Assistant Recorder history. Energy setup now requires a measured whole-home
+  power sensor and keeps the external PV forecast. The model exposes expected
+  and conservative load evidence through the existing status and calendar
+  surfaces, handles weekday/weekend patterns and DST, and fails closed for
+  active commands while learning, stale, or failed. HAFO is no longer required;
+  HAEO remains optional. Existing measured-load mappings migrate automatically,
+  while forecast-only legacy entries require the user to select a real sensor.
+- Added individual **Climate control**, **EV control**, and **Enphase control**
+  switches. **Automatic control** remains the master arm switch and now respects
+  the selected device switches instead of enabling every configured area.
+  Turning one device control off restores only that device while the other
+  selected areas remain armed. A failed restore leaves the switch on and reports
+  an actionable error; enabling an area while armed must pass preflight first.
+  The evidence fingerprint now covers configured mappings and policy rather than
+  runtime device selection. Existing installations must collect three new review
+  plans and re-arm Automatic control once after upgrading.
+- Removed the manual EV start/stop buttons, Target SOC number entity, and EV
+  connected helper. The fallback Target SOC is now configured in the central
+  **EV, battery and grid** section, while live connection state comes only from
+  an optionally mapped vehicle or charger entity.
+- **Next actions** now summarizes the next state of every configured controlled
+  area in its state value, matching the combined **Current state** presentation.
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.0 - 2026-08-08
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Climate planning now continues evaluating forecast price rises when an
+  unowned HVAC is at or beyond a comfort boundary. This allows preconditioning
+  to be scheduled before the expensive period while preserving the immediate
+  safety release when Energy Planner already owns climate control.
+- Planned action windows now include an explicit date and use Home Assistant's
+  configured local timezone, so tomorrow's preconditioning cannot appear to be
+  a current or UTC-timed action.
+
+### 🔧 Improvements
 
 - Replaced repetitive user-facing confidence percentages with categorical data
   quality evidence. **Next actions** and calendar events now identify the weakest
@@ -411,23 +621,12 @@
   Enphase-control, and AI Enabled switches. **Automatic control** is now the only
   activation switch; obsolete registry entries are removed during setup.
 
-### Fixed
-
-- Climate planning now continues evaluating forecast price rises when an
-  unowned HVAC is at or beyond a comfort boundary. This allows preconditioning
-  to be scheduled before the expensive period while preserving the immediate
-  safety release when Energy Planner already owns climate control.
-- Planned action windows now include an explicit date and use Home Assistant's
-  configured local timezone, so tomorrow's preconditioning cannot appear to be
-  a current or UTC-timed action.
-
-### Safety
 
 - The combined activation refuses to bypass the existing dry-run evidence,
   current-plan, availability, capability, or pause checks. An early activation
   attempt safely starts review planning and reports healthy-plan progress.
 
-### Validation
+### 🔄 Other changes
 
 - The full Docker validation gate passes with `931` tests and `100%` coverage,
   plus Ruff, quality-scale, replay, schema, history, Home Assistant configuration,
@@ -435,7 +634,11 @@
 
 ## 0.8.5 - 2026-08-08
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Climate tariff control now follows a persisted precondition, peak-coast, and
   release lifecycle across the configured planning horizon. Heating can
@@ -448,7 +651,11 @@
   boundaries, lifecycle phase, selected mode and targets, controlled zones, and
   thermal-feasibility evidence.
 
-### Safety
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
 
 - The manual-override helper is authoritative in both directions. Activating it
   immediately releases HVAC ownership, restores zones, and enables configured
@@ -459,7 +666,7 @@
 - Safety releases remain available after production disarm, dry-run enablement,
   degraded input health, climate-control disablement, or action-cap exhaustion.
 
-### Validation
+### 🔄 Other changes
 
 - The full Docker validation gate passes with `921` tests and `100%` coverage,
   plus Ruff, quality-scale, replay, schema, history, Home Assistant configuration,
@@ -467,14 +674,26 @@
 
 ## 0.8.4 - 2026-08-02
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Native HAEO response and flexible-projection capability gaps no longer raise
   recurring fallback notifications when the current deterministic plan remains
   healthy. The capability evidence remains available in plan diagnostics, and
   genuine HAEO service or solve failures still notify.
 
-### Validation
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
 
 - Ruff, quality-scale validation, Home Assistant configuration validation,
   replay and schema checks, and `859` tests at `100%` coverage passed.
@@ -483,7 +702,15 @@
 
 ## 0.8.3 - 2026-08-02
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - EV connector feedback now treats `SUSPENDED_EV` and `SUSPENDED_EVSE` as a
   connected session with no active power delivery. Momentary stop controls are
@@ -492,7 +719,11 @@
 - The EV Stop charging button now uses a supported Material Design icon instead
   of rendering with a blank icon in Home Assistant.
 
-### Validation
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
 
 - Full Docker validation: `858 passed`, `100%` across `8,962` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
@@ -500,24 +731,17 @@
 
 ## 0.8.2 - 2026-08-01
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Added native EV-device entities for enabling opportunistic charging and
   setting its import-price threshold. Both controls persist their values and
   request an immediate replan.
 
-### Changed
-
-- Reserved the Options UI for configuration and operating constraints. Settings
-  backed by native Home Assistant entities are now omitted from Options while
-  retaining their persisted values for upgrade compatibility.
-- Enabled opportunistic EV charging before the configured earliest start when
-  low-price charging is enabled and the current import price is at or below its
-  threshold. Only the current interval bypasses the charging hours; later
-  allocations remain inside the configured window and existing safety gates
-  continue to apply.
-
-### Fixed
+### 🐛 Bug fixes
 
 - Plan fallback notifications are no longer recreated on every refresh when
   their title, message, and reason codes have not changed. A cleared condition
@@ -529,7 +753,18 @@
   legacy nested fingerprints, stays hidden when AI advice is disabled, and no
   longer adds regenerated plan IDs to recorder-facing attributes.
 
-### Validation
+### 🔧 Improvements
+
+- Reserved the Options UI for configuration and operating constraints. Settings
+  backed by native Home Assistant entities are now omitted from Options while
+  retaining their persisted values for upgrade compatibility.
+- Enabled opportunistic EV charging before the configured earliest start when
+  low-price charging is enabled and the current import price is at or below its
+  threshold. Only the current interval bypasses the charging hours; later
+  allocations remain inside the configured window and existing safety gates
+  continue to apply.
+
+### 🔄 Other changes
 
 - Full Docker validation: `855 passed`, `100%` across `8,942` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
@@ -537,13 +772,25 @@
 
 ## 0.8.1 - 2026-07-31
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Energy Planner is classified as a service integration so configured entries
   appear on the main **Settings -> Devices & services -> Integrations** page
   instead of being grouped only with Helpers.
 
-### Validation
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
 
 - Full Docker validation: `837 passed`, `100%` across `8,768` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
@@ -551,7 +798,11 @@
 
 ## 0.8.0 - 2026-07-26
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Charging-state confirmation with bounded retries and a fail-closed timeout
   after direct EV start and stop commands.
@@ -561,28 +812,7 @@
 - Multiple named Energy Planner entries so each EV has isolated entities,
   history, production arming, execution audit, and persisted planner state.
 
-### Changed
-
-- Integration services accept `config_entry_id`; it is required when more than
-  one Energy Planner entry is loaded.
-- Initial setup now asks for an instance name and rejects duplicate names.
-- The first upgraded entry imports the legacy unscoped store into its new
-  entry-scoped store once, marks the legacy source as consumed, and never
-  offers that source to newly named entries.
-- Failed EV charging confirmation now issues an immediate compensating restore
-  or safe-stop command and retains ownership evidence when compensation cannot
-  be completed.
-- Connected-helper state is treated as runtime evidence, so plugging or
-  unplugging does not invalidate an otherwise current production arming record.
-- Preconditioning keep-on confirms the stateful charger control rather than
-  requiring active charging feedback, and per-entry notifications no longer
-  overwrite or dismiss alerts from another EV planner.
-- Active EV entries share an atomic household grid-capacity reservation, with
-  reservations retained until stop or safe-state restoration is confirmed.
-  Observed disconnection now requests that confirmed stop instead of releasing
-  capacity while a persistent charger control may remain enabled.
-
-### Fixed
+### 🐛 Bug fixes
 
 - EV starts now persist their provisional grid claim and original actuator
   topology before crossing the Home Assistant service boundary. After an
@@ -736,7 +966,28 @@
 - Release metadata validation now agrees with multi-entry support and the
   manifest and package versions are aligned at 0.8.0.
 
-### Validation
+### 🔧 Improvements
+
+- Integration services accept `config_entry_id`; it is required when more than
+  one Energy Planner entry is loaded.
+- Initial setup now asks for an instance name and rejects duplicate names.
+- The first upgraded entry imports the legacy unscoped store into its new
+  entry-scoped store once, marks the legacy source as consumed, and never
+  offers that source to newly named entries.
+- Failed EV charging confirmation now issues an immediate compensating restore
+  or safe-stop command and retains ownership evidence when compensation cannot
+  be completed.
+- Connected-helper state is treated as runtime evidence, so plugging or
+  unplugging does not invalidate an otherwise current production arming record.
+- Preconditioning keep-on confirms the stateful charger control rather than
+  requiring active charging feedback, and per-entry notifications no longer
+  overwrite or dismiss alerts from another EV planner.
+- Active EV entries share an atomic household grid-capacity reservation, with
+  reservations retained until stop or safe-state restoration is confirmed.
+  Observed disconnection now requests that confirmed stop instead of releasing
+  capacity while a persistent charger control may remain enabled.
+
+### 🔄 Other changes
 
 - Full Docker validation: `823 passed`, `100%` across `8,708` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
@@ -744,7 +995,22 @@
 
 ## 0.7.0 - 2026-07-17
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Safe-state restoration retains ownership for each asset until its restore is
+  confirmed, and entering disabled or dry-run mode restores planner takeovers.
+- Manual HVAC detection now includes control-attribute changes without treating
+  the planner's own in-flight setpoint changes as manual overrides.
+
+### 🔧 Improvements
 
 - Config-entry and subentry mapping changes now rebuild runtime listeners and
   entities, while failed platform unloads leave the coordinator operational.
@@ -753,14 +1019,7 @@
 - Explicit services and control buttons now raise translated Home Assistant
   errors when no runtime is loaded or a requested device action fails.
 
-### Fixed
-
-- Safe-state restoration retains ownership for each asset until its restore is
-  confirmed, and entering disabled or dry-run mode restores planner takeovers.
-- Manual HVAC detection now includes control-attribute changes without treating
-  the planner's own in-flight setpoint changes as manual overrides.
-
-### Validation
+### 🔄 Other changes
 
 - Full Docker validation: `683 passed`, `100%` across `7,672` statements, plus
   Ruff, replay, schema, history, Home Assistant configuration, and end-to-end
@@ -768,13 +1027,25 @@
 
 ## 0.6.1 - 2026-07-17
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Dry-run comparison sensor attributes now publish compact recorder-safe
   summaries instead of repeating nested execution evidence that could exceed
   Home Assistant's 16,384-byte state-attribute limit.
 
-### Validation
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
 
 - Full Docker validation: `663 passed`, `100%` across `7,548` statements, plus
   replay, schema, history, Home Assistant configuration, and end-to-end smoke
@@ -782,47 +1053,103 @@
 
 ## 0.6.0 - 2026-07-15
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Native EV smart charging, removing the requirement to install the separate EV Smart Charging integration.
 - Direct charger switch or separate start/stop control, native Target SOC and Ready by entities, and manual Start charging/Stop charging buttons.
 - Continuous least-cost charging windows by default, optional interval scheduling, earliest-start limits, maximum import-price filtering, low-price immediate charging, and minimum-SOC immediate recovery.
 - A persistent `ha_energy_planner.set_ev_target_soc` service alongside the now-persistent ready-by service.
 
-### Changed
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
 
 - EV schedule actions now decide whether the charger must be on in the current planning interval; they no longer delegate schedule execution to an external integration.
 - No-op charger decisions are audited as skipped and do not consume daily command caps or command cooldowns.
 - New EV configurations expose direct charger controls only. Existing `ev_smart_charging_*` controls and helper-backed entries remain readable for migration compatibility.
 
-### Validation
+### 🔄 Other changes
 
 - Full Docker validation: `662 passed`, `100%` across `7,536` statements, plus replay, schema, history,
   Home Assistant configuration, and end-to-end smoke checks.
 
 ## 0.5.2 - 2026-07-12
 
-### Changed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
 
 - The AI-provider privacy notice is logged at informational level instead of surfacing as a Home Assistant warning.
 - The plan-fallback notification toggle now uses the same heading-and-description style as the surrounding safety controls.
 
+### 🔄 Other changes
+
+- None
+
 ## 0.5.1 - 2026-07-12
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - An **AI and safety** option to disable and dismiss recurring unsafe-input, grid-limit, and HAEO fallback notifications without weakening fail-closed behavior.
 
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.5.0 - 2026-07-12
 
-### Added
+### 🚧 Breaking changes
+
+- Existing configured planning horizons are preserved; review horizons above 12 hours against the actual Amber coverage available at your site.
+- Configure the optional secondary PV entity only when it exposes timezone-aware timestamps. Solcast tomorrow data can then extend the today forecast safely.
+- Production evidence is tied to the mapped control surfaces and decision policy. Relevant configuration changes require new healthy dry-run evidence before active commands resume.
+- Legacy thermal and forecast-calibration statistics are migrated or reset before they can influence planning.
+- AI provider integrations may log prompts independently; review provider logging settings before enabling advisory features.
+
+### ✨ New features
 
 - Optional second PV forecast input with timestamp-safe Today/Tomorrow stitching.
 - Per-input forecast coverage diagnostics and bounded conservative baseline-load leading-gap fill.
 - Refresh-trigger, phase-timing, retention, HAEO-evidence, and usable-horizon diagnostics.
 - Versioned thermal learning, production evidence contracts, fresh-plan activation checks, and shared fail-closed pause parsing.
 
-### Changed
+### 🐛 Bug fixes
+
+- Dry-run actions are recorded as skipped instead of rejected, while repeated dry-run evidence is coalesced without hiding real command attempts.
+- HAEO is ready only when response-capable services return continuous import and export evidence across enough solve slots.
+- Planner-owned device feedback is suppressed only when a successful command matches the observed state.
+- Stale AI results, stale plans, active pauses, changed control contracts, and missing or malformed production state now fail closed.
+- Corrupt thermal, calibration, retention, pause, boolean, and evidence-counter state is reset, filtered, or blocked safely.
+
+### 🔧 Improvements
 
 - The recommended default planning horizon is now 12 hours. Continuous forecast coverage is healthy at 12 hours, degraded from 8 to under 12 hours, and unsafe below 8 hours.
 - Required point-only inputs no longer masquerade as full forecasts; secondary PV stitching requires timezone-aware timestamps and does not calibrate slots without primary-source provenance.
@@ -831,23 +1158,7 @@
 - Thermal learning uses explicit HVAC mode/power evidence, minimum sample spacing, plausible-rate gates, and bounded robust medians.
 - Forecast calibration and retained planner evidence use bounded, migration-safe, time-aware storage.
 
-### Fixed
-
-- Dry-run actions are recorded as skipped instead of rejected, while repeated dry-run evidence is coalesced without hiding real command attempts.
-- HAEO is ready only when response-capable services return continuous import and export evidence across enough solve slots.
-- Planner-owned device feedback is suppressed only when a successful command matches the observed state.
-- Stale AI results, stale plans, active pauses, changed control contracts, and missing or malformed production state now fail closed.
-- Corrupt thermal, calibration, retention, pause, boolean, and evidence-counter state is reset, filtered, or blocked safely.
-
-### Upgrade Notes
-
-- Existing configured planning horizons are preserved; review horizons above 12 hours against the actual Amber coverage available at your site.
-- Configure the optional secondary PV entity only when it exposes timezone-aware timestamps. Solcast tomorrow data can then extend the today forecast safely.
-- Production evidence is tied to the mapped control surfaces and decision policy. Relevant configuration changes require new healthy dry-run evidence before active commands resume.
-- Legacy thermal and forecast-calibration statistics are migrated or reset before they can influence planning.
-- AI provider integrations may log prompts independently; review provider logging settings before enabling advisory features.
-
-### Validation
+### 🔄 Other changes
 
 - Dockerized pytest: `647 passed`
 - Coverage: `100%` across `7,314` statements
@@ -855,13 +1166,22 @@
 
 ## 0.4.0 - 2026-07-12
 
-### Added
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
 
 - Optional grid carbon-intensity forecasts with carbon-aware EV slot allocation and action scoring.
 - Conservative PV lower bounds and load upper bounds learned independently per forecast lead time.
 - Refresh, HAEO latency/cache/capability, calibration, uncertainty, and cost-horizon telemetry.
 
-### Changed
+### 🐛 Bug fixes
+
+- Carbon priority no longer contributes an unconditional zero score.
+- Solar-flexibility and battery-safety decisions now use conservative learned forecast bounds while cost estimates retain expected values.
+
+### 🔧 Improvements
 
 - EV ready-by deadlines now use the Home Assistant timezone, handle DST gaps/rollovers, and preserve an absolute UTC deadline.
 - HVAC lookahead and preconditioning windows now use elapsed time instead of assuming five-minute slots.
@@ -870,29 +1190,26 @@
 - Production preflight now requires only configured and enabled control areas, allowing safe partial installations.
 - Monetary forecasts use Home Assistant's configured currency and expose the actual priced horizon.
 
-### Fixed
+### 🔄 Other changes
 
-- Carbon priority no longer contributes an unconditional zero score.
-- Solar-flexibility and battery-safety decisions now use conservative learned forecast bounds while cost estimates retain expected values.
+- None
 
 ## 0.3.0 - 2026-07-12
 
-### Added
+### 🚧 Breaking changes
+
+- To enable forecast calibration, configure separate **Observed PV power** and **Observed baseline load power** sensors in the Energy subentry. Do not select the forecast sensors themselves.
+- Existing pre-0.3 calibration state is ignored until the new timestamped per-lead model has enough holdout-validated evidence.
+- Required forecast sources should cover the complete planning horizon; incomplete horizons now mark planning inputs unsafe.
+
+### ✨ New features
 
 - Optional measured PV and household-load power inputs for time-aligned forecast calibration.
 - Independent 30-minute lead-time calibration models with robust median fitting and later holdout validation.
 - Rolling-origin PV/load forecast accuracy validation with MAE and RMSE by near, day, and long horizon.
 - Persistence-baseline gates for exported real forecast evidence.
 
-### Changed
-
-- Successful flexible-load HAEO results now regenerate the final plan instead of only updating stored evidence.
-- Forecast confidence now accounts for actual horizon coverage.
-- Required forecasts with missing or internally gapped coverage fail closed instead of repeating the last value.
-- Estimated daily cost now uses HAEO grid flows where complete and battery charge/discharge evidence otherwise.
-- Forecast attribute changes, including canonical camelCase variants, trigger replanning without reacting to unrelated metadata churn.
-
-### Fixed
+### 🐛 Bug fixes
 
 - Prevented forecast calibration from treating forecast entity states as measured ground truth.
 - Prevented overdue forecasts from being paired with one current observation after downtime.
@@ -900,13 +1217,15 @@
 - Prevented partial HAEO grid-flow evidence from suppressing fallback cost calculation.
 - Prevented timestamp gaps inside a forecast from being silently forward-filled.
 
-### Upgrade Notes
+### 🔧 Improvements
 
-- To enable forecast calibration, configure separate **Observed PV power** and **Observed baseline load power** sensors in the Energy subentry. Do not select the forecast sensors themselves.
-- Existing pre-0.3 calibration state is ignored until the new timestamped per-lead model has enough holdout-validated evidence.
-- Required forecast sources should cover the complete planning horizon; incomplete horizons now mark planning inputs unsafe.
+- Successful flexible-load HAEO results now regenerate the final plan instead of only updating stored evidence.
+- Forecast confidence now accounts for actual horizon coverage.
+- Required forecasts with missing or internally gapped coverage fail closed instead of repeating the last value.
+- Estimated daily cost now uses HAEO grid flows where complete and battery charge/discharge evidence otherwise.
+- Forecast attribute changes, including canonical camelCase variants, trigger replanning without reacting to unrelated metadata churn.
 
-### Validation
+### 🔄 Other changes
 
 - Dockerized pytest: `519 passed`
 - Coverage: `100%` across `6,188` statements
@@ -914,14 +1233,41 @@
 
 ## 0.2.1 - 2026-07-07
 
-### Fixed
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
 
 - Removed duplicated device names from AI, EV, Climate, and Enphase switch labels.
 - Added a one-time entity registry cleanup for duplicated entity IDs generated by earlier labels.
 
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.2.0 - 2026-07-06
 
-### Added
+### 🚧 Breaking changes
+
+- Review the new **EV, battery, and grid** policy options after upgrade:
+  - usable battery capacity
+  - battery round-trip efficiency
+  - maximum battery charge power
+  - maximum battery discharge power
+- Review the new **Data health** confidence thresholds. The defaults are intentionally conservative.
+- Check the new Decision, Decision audit, Rejected actions, and Upcoming timeline entities before arming production control.
+- Run preflight and allow several healthy dry-run cycles before enabling active device control.
+
+### ✨ New features
 
 - Marginal-value planning evidence across EV, climate, Enphase, solar surplus, battery reserve, and tariff value.
 - Weighted device priority scoring based on the configured planning priority order.
@@ -935,25 +1281,18 @@
 - Action backoff when a device command fails.
 - Conflict detection when recent planner-owned EV or Enphase state appears to have been changed externally.
 
-### Changed
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
 
 - Enphase decisions no longer rely on simple tariff spread alone. Battery and solar value now need enough usable capacity and configured savings value.
 - EV charging plans prefer lower effective-cost windows and include solar/grid split details.
 - Plan attributes use more plain-English summaries for accepted and rejected decisions.
 - The production safety model now records clearer reasons when control is paused by failures or conflicts.
 
-### Upgrade Notes
-
-- Review the new **EV, battery, and grid** policy options after upgrade:
-  - usable battery capacity
-  - battery round-trip efficiency
-  - maximum battery charge power
-  - maximum battery discharge power
-- Review the new **Data health** confidence thresholds. The defaults are intentionally conservative.
-- Check the new Decision, Decision audit, Rejected actions, and Upcoming timeline entities before arming production control.
-- Run preflight and allow several healthy dry-run cycles before enabling active device control.
-
-### Validation
+### 🔄 Other changes
 
 - `ruff check custom_components/ha_energy_planner tests`
 - Dockerized pytest and coverage: `492 passed`, `100%` coverage
