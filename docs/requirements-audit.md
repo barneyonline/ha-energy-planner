@@ -534,7 +534,10 @@ Status as of 2026-08-15.
   reconciliation, evidence refresh, re-arm, active refresh, and final readiness
   verification. Whole-system shutdown preserves control state; runtime unload,
   operator disable, explicit safety-gate arm or disarm, pause, and configuration
-  changes retain precedence. Terminal operator cancellation dismisses the
+  changes retain precedence. A temporary all-control pause encountered during
+  setup or reload disarms and restores safe state but persists a restart-resumable
+  recovery handoff, so recovery waits for the pause to clear before re-arming.
+  Terminal operator cancellation dismisses the
   superseded recovery warning. A failed configuration-reload platform unload
   resumes the disarmed recovery lifecycle on the still-loaded coordinator. A
   restarted disarmed recovery resumes with its counter reset.

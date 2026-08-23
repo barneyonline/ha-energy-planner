@@ -74,7 +74,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   appropriate-polling:
     status: done
-    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, skips unchanged input fingerprints instead of fixed blind polling, starts the ten-minute startup grace at Core RUNNING, awaits a non-debounced deadline refresh, and retries disarmed recovery every 30 seconds until three consecutive healthy checks permit re-arming.
+    comment: The coordinator schedules wall-clock interval refreshes and explicit decision-input replans, coalesces storms behind a safe minimum interval, skips unchanged input fingerprints instead of fixed blind polling, starts the ten-minute startup grace at Core RUNNING, preserves a restart-resumable disarmed recovery handoff when setup encounters a temporary all-control pause, awaits non-debounced validation refreshes, and retries every 30 seconds until three consecutive healthy checks permit re-arming.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
