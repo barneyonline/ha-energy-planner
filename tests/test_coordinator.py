@@ -3400,7 +3400,7 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
                 for index in range(20)
             ],
         },
-        hard_constraints=["ev_min_soc", "ready_by"],
+        hard_constraints=["ready_by"],
         reason_codes=["ev_soc_below_target", "fallback_target"],
         expected_cost_delta=None,
         confidence=0.93,
@@ -3472,7 +3472,7 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
                     {"truncated_count": 8},
                 ],
             },
-            "hard_constraints": ["ev_min_soc", "ready_by"],
+            "hard_constraints": ["ready_by"],
             "reason_codes": ["ev_soc_below_target", "fallback_target"],
             "expected_cost_delta": None,
             "confidence": 0.93,

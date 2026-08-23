@@ -237,7 +237,6 @@ def test_estimated_cost_includes_projected_flexible_load() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 70,
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -374,8 +373,8 @@ def test_active_plan_turns_hvac_off_when_away() -> None:
     assert plan.actions[0].desired_state == {"hvac_mode": "off"}
 
 
-def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 70}
+def test_active_plan_schedules_ev_to_vehicle_target_soc() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     context = _context()
     context.current_ev_soc_percent = 60
     context.ev_target_soc_percent = 70
@@ -401,14 +400,14 @@ def test_active_plan_schedules_ev_when_below_minimum_soc() -> None:
     assert plan.actions[0].asset == ActionAsset.EV
     assert plan.actions[0].kind == ActionKind.EV_SCHEDULE
     assert plan.actions[0].desired_state["target_soc_percent"] == 70.0
-    assert plan.actions[0].desired_state["charging_required_now"] is True
+    assert plan.actions[0].desired_state["charging_required_now"] is False
     assert plan.actions[0].desired_state["continuous_charging"] is True
-    assert [slot.projected_ev_load_kw for slot in context.slots] == [6, 6, 0.0, 0.0]
+    assert [slot.projected_ev_load_kw for slot in context.slots] == [0.0, 0.0, 6, 6]
     assert plan.device_plans["ev"]["total_estimated_energy_kwh"] == 1.0
     timeline = plan.device_plans["ev"]["timeline"]
-    assert [item["state"] for item in timeline] == ["charging", "idle"]
-    assert timeline[0]["start"] == "2026-06-27T00:00:00+00:00"
-    assert timeline[0]["end"] == "2026-06-27T00:10:00+00:00"
+    assert [item["state"] for item in timeline] == ["idle", "charging"]
+    assert timeline[1]["start"] == "2026-06-27T00:10:00+00:00"
+    assert timeline[1]["end"] == "2026-06-27T00:20:00+00:00"
 
 
 def test_active_plan_keeps_observed_continuous_ev_session_running() -> None:
@@ -482,7 +481,7 @@ def test_continued_pre_window_slot_counts_toward_ev_target_feasibility() -> None
 
 
 def test_ev_target_at_or_below_current_soc_creates_native_stop_decision() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 40}
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     context = _context()
     context.current_ev_soc_percent = 80
     context.ev_target_soc_percent = 70
@@ -540,7 +539,7 @@ def test_keep_charger_on_policy_does_not_change_confirmation_for_normal_charging
     assert action.desired_state["projected_load_kw_now"] == options["ev_charge_rate_kw"]
 
 
-def test_keep_charger_on_never_bypasses_external_target_policy_bounds() -> None:
+def test_vehicle_target_soc_replaces_legacy_maximum_soc_policy() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -557,13 +556,33 @@ def test_keep_charger_on_never_bypasses_external_target_policy_bounds() -> None:
         action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
 
-    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["charging_required_now"] is True
     assert action.desired_state["keep_charger_on"] is False
-    assert action.desired_state["target_soc_percent"] == 90
+    assert action.desired_state["target_soc_percent"] == 100
     assert action.desired_state["vehicle_target_soc_percent"] == 100
+    assert action.desired_state["target_soc_source"] == "vehicle_sensor"
 
 
-def test_keep_charger_on_uses_bounded_target_when_current_soc_is_higher() -> None:
+def test_vehicle_target_soc_is_the_sole_soc_target() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+    }
+    context = _context()
+    context.current_ev_soc_percent = 20
+    context.ev_connected = True
+    context.ev_target_soc_percent = 30
+
+    action = next(
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
+    )
+
+    assert action.desired_state["target_soc_percent"] == 30
+    assert action.desired_state["target_soc_source"] == "vehicle_sensor"
+
+
+def test_keep_charger_on_uses_vehicle_target_when_current_soc_is_higher() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -589,7 +608,6 @@ def test_native_ev_low_price_charging_starts_current_interval() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 40,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0,
         "ev_continuous_charging": False,
@@ -611,7 +629,6 @@ def test_native_ev_low_price_charging_bypasses_earliest_start() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 40,
         "ev_low_price_charging_enabled": True,
         "ev_low_price_threshold": 0.05,
         "ev_earliest_start": "23:00",
@@ -744,7 +761,6 @@ def test_active_plan_exposes_solar_aware_ev_charge_allocation() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 35,
         "default_ready_by": "00:15",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -1104,7 +1120,6 @@ def test_active_plan_uses_runtime_ready_by_option_for_ev_schedule() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 70,
         "default_ready_by": "00:10",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,
@@ -1137,8 +1152,6 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": True,
-        "ev_min_soc_percent": 40,
-        "ev_max_soc_percent": 90,
         "default_ready_by": "07:00",
         "ev_charge_rate_kw": 7,
         "ev_soc_per_kwh": 5,
@@ -1172,7 +1185,7 @@ def test_dry_run_plan_uses_ev_target_and_ready_by_helpers_for_schedule() -> None
 
 
 def test_active_plan_does_not_schedule_ev_when_disconnected() -> None:
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_min_soc_percent": 70}
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     context = _context()
     context.current_ev_soc_percent = 60
     context.ev_connected = False
@@ -1187,8 +1200,6 @@ def test_active_plan_uses_vehicle_target_without_deriving_a_trip_target() -> Non
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 40,
-        "ev_max_soc_percent": 90,
         "default_ready_by": "03:00",
         "ev_charge_rate_kw": 6,
         "ev_soc_per_kwh": 10,

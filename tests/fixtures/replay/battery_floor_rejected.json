@@ -10,8 +10,6 @@
     "planner_enabled": true,
     "dry_run": false,
     "battery_min_soc_percent": 20,
-    "ev_min_soc_percent": 40,
-    "ev_max_soc_percent": 90,
     "enphase_minimum_savings": 0.25
   },
   "context": {

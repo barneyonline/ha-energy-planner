@@ -17,6 +17,8 @@ from .const import (
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_MAX_SOC_PERCENT,
+    CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
@@ -54,7 +56,7 @@ _LEGACY_DEFAULT_EV_SOC_PER_KWH = 5.0
 async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Migrate measured-load configuration without trusting forecast entities."""
     version = getattr(entry, "version", 1)
-    if version > 4:
+    if version > 5:
         return False
     data = dict(entry.data)
     if not data.get(CONF_HOUSEHOLD_LOAD) and data.get(CONF_BASELINE_LOAD_OBSERVED):
@@ -75,7 +77,10 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
         if _legacy_ev_configuration_requires_target(entry):
             return False
         options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
-    hass.config_entries.async_update_entry(entry, data=data, options=options, version=4)
+    if version < 5:
+        options.pop(CONF_EV_MAX_SOC_PERCENT, None)
+        options.pop(CONF_EV_MIN_SOC_PERCENT, None)
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=5)
     return True
 
 
