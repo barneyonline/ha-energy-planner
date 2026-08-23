@@ -12,7 +12,10 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Automatic control now retains a restart-resumable recovery handoff when setup
+  or reload encounters a temporary pause that blocks every enabled control area.
+  Once the pause clears, healthy validation can restore **Armed / Running**
+  without requiring an operator toggle.
 
 ### 🔧 Improvements
 
