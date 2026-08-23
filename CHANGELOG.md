@@ -4,7 +4,9 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Removed the legacy **Minimum EV SOC** and **Maximum EV SOC** settings. EV
+  charging now uses the live value of the mapped **Vehicle target SOC entity**
+  directly; config-entry migration removes the obsolete stored options.
 
 ### ✨ New features
 

@@ -26,6 +26,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
+    CONF_EV_MAX_SOC_PERCENT,
+    CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_EV_SOC_PER_KWH,
@@ -136,7 +138,7 @@ def test_config_entry_migration_uses_only_measured_legacy_load() -> None:
 
     assert asyncio.run(async_migrate_entry(hass, measured)) is True
     assert measured.data == {CONF_HOUSEHOLD_LOAD: "sensor.whole_home_power"}
-    assert manager.updated_entries[-1][1]["version"] == 4
+    assert manager.updated_entries[-1][1]["version"] == 5
     assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == DEFAULT_OPTIONS[
         CONF_EV_SOC_PER_KWH
     ]
@@ -166,7 +168,7 @@ def test_config_entry_migration_removes_obsolete_target_soc_fallback() -> None:
     )
 
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
-    assert manager.updated_entries[-1][1]["version"] == 4
+    assert manager.updated_entries[-1][1]["version"] == 5
     assert manager.updated_entries[-1][1]["options"] == {CONF_EV_SOC_PER_KWH: 1.9}
 
 
@@ -195,13 +197,26 @@ def test_config_entry_migration_accepts_vehicle_target_from_legacy_subentry() ->
     }
 
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
-    assert manager.updated_entries[-1][1]["version"] == 4
+    assert manager.updated_entries[-1][1]["version"] == 5
     assert CONF_EV_FALLBACK_TARGET_SOC_PERCENT not in manager.updated_entries[-1][1]["options"]
+
+
+def test_config_entry_migration_removes_legacy_ev_soc_limits() -> None:
+    manager = FakeConfigEntries()
+    entry = FakeEntry(
+        version=4,
+        options={CONF_EV_MIN_SOC_PERCENT: 40, CONF_EV_MAX_SOC_PERCENT: 90},
+    )
+
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
+    assert manager.updated_entries[-1][1]["version"] == 5
+    assert CONF_EV_MAX_SOC_PERCENT not in manager.updated_entries[-1][1]["options"]
+    assert CONF_EV_MIN_SOC_PERCENT not in manager.updated_entries[-1][1]["options"]
 
 
 def test_config_entry_migration_rejects_unknown_future_version() -> None:
     manager = FakeConfigEntries()
-    entry = FakeEntry(version=5, data={CONF_BASELINE_LOAD_OBSERVED: "sensor.load"})
+    entry = FakeEntry(version=6, data={CONF_BASELINE_LOAD_OBSERVED: "sensor.load"})
 
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
     assert manager.updated_entries == []

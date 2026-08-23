@@ -13,8 +13,6 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES,
-    CONF_EV_MAX_SOC_PERCENT,
-    CONF_EV_MIN_SOC_PERCENT,
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HVAC_MIN_CYCLE_MINUTES,
@@ -65,10 +63,6 @@ class ConstraintValidator:
                     ActionAsset.ENPHASE,
                 )
             )
-        ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
-        ev_max = float(self.options[CONF_EV_MAX_SOC_PERCENT])
-        if ev_min > ev_max:
-            violations.append(_violation("ev_min_above_ev_max", "EV minimum SOC is above maximum SOC.", ActionAsset.EV))
         if plan.actions and plan.mode == PlannerMode.DISABLED:
             violations.append(
                 _violation(
@@ -222,17 +216,12 @@ class ConstraintValidator:
         desired_soc = action.desired_state.get("target_soc_percent")
         if desired_soc is None:
             return violations
-        ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
-        ev_max = float(self.options[CONF_EV_MAX_SOC_PERCENT])
-        infeasible_evidence = (
-            bool(action.desired_state.get("infeasible")) and action.desired_state.get("allocated_slots") is not None
-        )
-        if not ev_min <= float(desired_soc) <= ev_max and not (infeasible_evidence and float(desired_soc) <= ev_max):
+        if not 0.0 <= float(desired_soc) <= 100.0:
             violations.append(
                 _action_violation(
                     action,
                     "ev_target_soc_outside_bounds",
-                    f"EV target SOC {float(desired_soc):.1f}% is outside configured bounds.",
+                    f"EV target SOC {float(desired_soc):.1f}% is outside physical bounds.",
                 )
             )
         if (
