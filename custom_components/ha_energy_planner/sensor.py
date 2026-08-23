@@ -2085,7 +2085,6 @@ def _plain_reason(value: Any) -> str:
         "battery_floor": "The battery reserve limit must be respected.",
         "enphase_min_savings": "The Enphase savings threshold must be met.",
         "enphase_profile_hold": "The Enphase profile hold period must be respected.",
-        "ev_min_soc": "The EV minimum state of charge must be respected.",
         "ready_by": "The EV ready-by time must be respected.",
         "comfort": "The climate comfort range must be respected.",
     }

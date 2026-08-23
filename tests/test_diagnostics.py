@@ -149,7 +149,7 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
         asset=ActionAsset.EV,
         kind=ActionKind.EV_SCHEDULE,
         desired_state={"target_soc_percent": 80},
-        hard_constraints=["ev_min_soc"],
+        hard_constraints=["ready_by"],
         reason_codes=["ev_soc_below_target"],
         expected_cost_delta=None,
         confidence=0.8,

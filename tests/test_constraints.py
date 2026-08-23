@@ -77,8 +77,8 @@ def _action(now: datetime, asset: ActionAsset, kind: ActionKind, desired_state: 
 
 def test_ev_action_target_outside_bounds_is_rejected() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
-    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 95})
-    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_max_soc_percent": 90}
+    action = _action(now, ActionAsset.EV, ActionKind.EV_SCHEDULE, {"target_soc_percent": 101})
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
     violations = ConstraintValidator(options).validate_action(_context(now), _plan(now, action), action, now=now)
     assert "ev_target_soc_outside_bounds" in violations
 
@@ -581,8 +581,6 @@ def test_plan_validation_reports_config_and_grid_limit_issues() -> None:
     options = {
         **DEFAULT_OPTIONS,
         "battery_min_soc_percent": 10,
-        "ev_min_soc_percent": 90,
-        "ev_max_soc_percent": 80,
         "grid_import_limit_kw": 5,
         "grid_export_limit_kw": 5,
         "dry_run": True,
@@ -593,7 +591,6 @@ def test_plan_validation_reports_config_and_grid_limit_issues() -> None:
     violations = ConstraintValidator(options).validate_plan(context, plan)
 
     assert "battery_soc_below_floor" in violations
-    assert "ev_min_above_ev_max" in violations
     assert "disabled_plan_must_not_generate_control_actions" not in violations
     assert "grid_import_limit_exceeded" in violations
     assert "grid_export_limit_exceeded" in violations
@@ -702,7 +699,7 @@ def test_enphase_restore_is_not_rejected_for_existing_grid_violation() -> None:
     assert "grid_import_limit_exceeded" not in violations
 
 
-def test_ev_target_below_current_and_infeasible_evidence_exception() -> None:
+def test_ev_target_below_current_remains_physically_valid() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = _context(now)
     context.current_ev_soc_percent = 70
@@ -716,8 +713,6 @@ def test_ev_target_below_current_and_infeasible_evidence_exception() -> None:
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
         "dry_run": False,
-        "ev_min_soc_percent": 80,
-        "ev_max_soc_percent": 90,
     }
 
     violations = ConstraintValidator(options).validate_action(context, _plan(now, action), action, now=now)

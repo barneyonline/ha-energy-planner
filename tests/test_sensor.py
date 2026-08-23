@@ -1235,7 +1235,7 @@ def test_asset_plan_sensors_expose_device_specific_actions() -> None:
         asset=ActionAsset.EV,
         kind=ActionKind.EV_SCHEDULE,
         desired_state={"target_soc_percent": 80, "allocated_slots": [{"slot": index} for index in range(20)]},
-        hard_constraints=["ev_min_soc"],
+        hard_constraints=["ready_by"],
         reason_codes=["least_cost_slots_before_ready_by"],
         expected_cost_delta=None,
         confidence=0.8,

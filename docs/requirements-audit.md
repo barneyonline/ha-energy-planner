@@ -121,11 +121,11 @@ Status as of 2026-08-15.
   commands cannot create a restorable takeover baseline.
 - EV target SOC comes only from the required mapped vehicle sensor. Missing,
   unavailable, nonnumeric, or out-of-range target evidence blocks EV planning
-  instead of substituting a planner-derived target. The target is bounded only
-  by the configured minimum and maximum SOC safety policy. Stop-only schedules
-  remain valid when current SOC already exceeds that target. The connected-state
-  entity remains optional because charging feedback independently confirms
-  commanded power delivery.
+  instead of substituting a planner-derived target. The live vehicle value is
+  used directly and must remain within the physical 0% to 100% range. Stop-only
+  schedules remain valid when current SOC already exceeds that target. The
+  connected-state entity remains optional because charging feedback independently
+  confirms commanded power delivery.
 - The optional preconditioning policy keeps the charger control enabled after
   target SOC is reached while preserving manual-stop and execution safety-gate
   precedence. Only the actual after-target preconditioning action selects the
@@ -155,9 +155,9 @@ Status as of 2026-08-15.
   retaining its uncertain capacity, allowing another loaded charger to attempt
   a confirmed stop. Continuous-charging allocation never returns a fragmented
   fallback; a contiguous partial window is explicitly marked infeasible. An
-  explicitly forced current slot is the bounded exception: minimum-SOC recovery
-  and enabled below-threshold opportunistic charging may claim the current slot
-  before the configured earliest start, while any remaining continuous window
+  explicitly forced current slot is the bounded exception: enabled below-threshold
+  opportunistic charging may claim the current slot before the configured earliest
+  start, while any remaining continuous window
   stays within the configured hours. Once charging feedback confirms an active
   continuous session, replanning may retain its current pre-window slot so
   forecast repricing cannot fragment it; the configured maximum import price
