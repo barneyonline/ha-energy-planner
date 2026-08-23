@@ -26,8 +26,6 @@ from .const import (
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
     CONF_EV_MAX_IMPORT_PRICE,
-    CONF_EV_MAX_SOC_PERCENT,
-    CONF_EV_MIN_SOC_PERCENT,
     CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SOC_PER_KWH,
     CONF_HOUSEHOLD_LOAD,
@@ -276,7 +274,6 @@ class DryRunPlanner:
                     execute_not_after,
                 )
             )
-        ev_min = float(self.options[CONF_EV_MIN_SOC_PERCENT])
         if (
             context.ev_connected is not False
             and context.current_ev_soc_percent is not None
@@ -299,7 +296,6 @@ class DryRunPlanner:
                 charge_rate_kw=charge_rate_kw,
             )
             current_slot = context.slots[0] if context.slots else None
-            emergency_charge = context.current_ev_soc_percent < ev_min
             max_import_price = (
                 float(self.options[CONF_EV_MAX_IMPORT_PRICE])
                 if bool(self.options.get(CONF_EV_PRICE_LIMIT_ENABLED, False))
@@ -318,8 +314,7 @@ class DryRunPlanner:
                 current_slot is not None
                 and current_slot.valid_at < earliest_start
                 and (
-                    emergency_charge
-                    or low_price_charge
+                    low_price_charge
                     or (
                         continue_current_charging
                         and current_slot.import_price is not None
@@ -329,18 +324,11 @@ class DryRunPlanner:
             ):
                 available_charge_hours += int(self.options[CONF_PLANNING_INTERVAL_MINUTES]) / 60.0
             requested_target_soc = float(context.ev_target_soc_percent)
-            target_soc = min(
-                max(requested_target_soc, ev_min),
-                float(self.options[CONF_EV_MAX_SOC_PERCENT]),
-            )
-            target_reason = (
-                "vehicle_target_soc"
-                if target_soc == requested_target_soc
-                else "vehicle_target_soc_policy_bounded"
-            )
+            target_soc = requested_target_soc
+            target_reason = "vehicle_target_soc"
             required_charge_percent = max(target_soc - context.current_ev_soc_percent, 0.0)
             max_attainable_soc_percent = min(
-                float(self.options[CONF_EV_MAX_SOC_PERCENT]),
+                100.0,
                 context.current_ev_soc_percent
                 + available_charge_hours * charge_rate_kw * soc_per_kwh,
             )
@@ -356,7 +344,7 @@ class DryRunPlanner:
                 carbon_weight=_carbon_schedule_weight(self.options),
                 earliest_start=earliest_start,
                 continuous=continuous_charging,
-                force_current=emergency_charge or low_price_charge,
+                force_current=low_price_charge,
                 continue_current=continue_current_charging,
                 max_import_price=max_import_price,
             )
@@ -369,8 +357,6 @@ class DryRunPlanner:
             keep_on_after_target = bool(
                 keep_charger_on
                 and not target_infeasible
-                and target_soc == requested_target_soc
-                and ev_min <= target_soc <= float(self.options[CONF_EV_MAX_SOC_PERCENT])
                 and context.current_ev_soc_percent >= target_soc
             )
             manual_ev = next(
@@ -385,8 +371,6 @@ class DryRunPlanner:
                 charging_required_now = True
                 preconditioning_required_now = True
                 charging_reason = "ev_keep_charger_on_for_preconditioning"
-            elif emergency_charge and required_charge_percent > 0:
-                charging_reason = "ev_below_minimum_soc_charge_now"
             elif continue_current_charging and charging_required_now:
                 charging_reason = "ev_continuous_charging_in_progress"
             elif low_price_charge and charging_required_now:
@@ -453,7 +437,7 @@ class DryRunPlanner:
                         ],
                         "infeasible": schedule.infeasible or target_infeasible,
                     },
-                    hard_constraints=["ev_min_soc", "ready_by", "charger_connected"],
+                    hard_constraints=["ready_by", "charger_connected"],
                     reason_codes=[charging_reason, target_reason, schedule.reason],
                     expected_cost_delta=None,
                     confidence=confidence_from_context(context),
