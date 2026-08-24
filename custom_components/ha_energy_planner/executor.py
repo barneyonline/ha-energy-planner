@@ -73,6 +73,12 @@ _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
 _RETIRED_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
 _STARTUP_RECOVERY_NOTIFICATION_ID = "ha_energy_planner_startup_recovery"
+_UNOWNED_ENPHASE_STARTUP_RESTORE_REASONS = frozenset(
+    {
+        "production_evidence_contract_changed",
+        "startup_control_paused",
+    }
+)
 _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _PLAN_UNSAFE_NOTIFICATION_ID,
     _GRID_LIMIT_NOTIFICATION_ID,
@@ -1566,7 +1572,13 @@ class Executor:
                     if enphase_result.applied:
                         remaining_ownership.pop("enphase_profile", None)
                         remaining_ownership.pop("enphase_profile_changed_at", None)
-                    elif enphase_owned or "not_configured" not in enphase_result.reason:
+                    elif enphase_owned or (
+                        "not_configured" not in enphase_result.reason
+                        and not (
+                            reason in _UNOWNED_ENPHASE_STARTUP_RESTORE_REASONS
+                            and enphase_result.reason == "enphase_profile_entity_unavailable"
+                        )
+                    ):
                         restore_failed = True
 
         # Ownership metadata that cannot represent a pending device restore can
