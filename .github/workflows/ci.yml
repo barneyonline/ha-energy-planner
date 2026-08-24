@@ -17,6 +17,7 @@ on:
       - "scripts/**"
       - "README.md"
       - "ha-energy-planner-spec.md"
+      - "hacs.json"
       - "pyproject.toml"
       - "quality_scale.yaml"
       - ".github/workflows/ci.yml"

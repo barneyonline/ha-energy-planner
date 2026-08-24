@@ -232,6 +232,23 @@ scripts/docker-validate.sh
 
 It runs Ruff, the full pytest suite with 100% coverage, replay/schema/history validation, Home Assistant `check_config`, and a Docker smoke test.
 
+For the Home Assistant integration smoke path alone, run:
+
+```bash
+scripts/docker-ha-smoke.sh
+```
+
+The smoke harness coalesces queued coordinator refreshes, waits for background
+device execution and AI advice, and stops Home Assistant as soon as the scenario
+is complete. Its 240-second limit is a failure deadline, not a fixed runtime.
+
+Pull requests classify their changed files before starting the expensive test
+jobs. Integration changes run the full pytest, quality-scale, and validation
+set; test-only and tooling changes run their affected subsets; documentation
+changes avoid the full pytest and Home Assistant validation jobs. Pushes and
+manual Tests runs continue to execute the complete non-smoke CI job set. Run
+`scripts/docker-validate.sh` for the complete gate, including the smoke test.
+
 Start a local Home Assistant instance with:
 
 ```bash

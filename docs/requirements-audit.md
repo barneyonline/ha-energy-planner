@@ -286,7 +286,14 @@ Status as of 2026-08-15.
   `scripts/docker-validate.sh`, `scripts/docker-ha-smoke.sh`, and
   `docker compose`. The full validation gate runs compile and Ruff checks, Dockerized
   pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant
-  `check_config`, and the smoke test in one repeatable sequence. The smoke test
+  `check_config`, and the smoke test in one repeatable sequence. The smoke harness
+  coalesces queued coordinator refreshes, waits for background execution, and
+  stops Home Assistant on an explicit completion marker instead of consuming its
+  full failure timeout. Pull-request CI classifies changed paths with
+  `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
+  fails safe to the full non-smoke CI set for an unclassified trigger path.
+  Pushes and manual Tests runs retain that non-smoke set; `scripts/docker-validate.sh`
+  remains the complete gate including smoke. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
