@@ -16,7 +16,11 @@
 
 ### 🔧 Improvements
 
-- None
+- The Docker Home Assistant smoke test now waits on coordinator work and exits
+  when its scenario completes instead of running until the fixed timeout.
+- Pull-request CI now selects pytest, quality-scale, and validation jobs from
+  the changed paths while retaining the full non-smoke CI set for pushes and
+  manual Tests runs.
 
 ### 🔄 Other changes
 
