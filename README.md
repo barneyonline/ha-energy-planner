@@ -192,6 +192,12 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   consecutive healthy awaited checks revalidate the production contract,
   reconcile safe state, re-arm, and verify a fresh active plan. Any unhealthy
   check resets the sequence. Success is silent and dismisses the prior warning.
+  A production-evidence contract change discovered during startup also enters
+  this fail-closed recovery path when the installation was previously armed and
+  automatic control is still requested. Only fail-safe stop, release, or restore
+  commands may run until the new contract passes all three checks and the final
+  active-plan verification; new start, schedule, or takeover commands remain
+  blocked.
   Operator disable, explicit safety-gate arm or disarm, pause, or a
   configuration change remains immediately authoritative. Terminal operator
   cancellation dismisses the superseded recovery warning. Whole-Home-Assistant
