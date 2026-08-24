@@ -40,8 +40,10 @@ cat > "$TMP_DIR/custom_components/fake_planner_test/__init__.py" <<'PY'
 
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 import json
+from pathlib import Path
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.util import dt as dt_util
@@ -152,6 +154,45 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 continue
             raise RuntimeError("Unsafe production arm unexpectedly succeeded")
 
+    async def wait_for_planner_idle(call: ServiceCall) -> None:
+        """Drain execution, coalesce pending state changes, and drain once more."""
+        for entry in hass.config_entries.async_entries("ha_energy_planner"):
+            coordinator = getattr(entry, "runtime_data", None)
+            if coordinator is None:
+                continue
+            await coordinator.async_wait_for_plan_execution()
+            await asyncio.sleep(0)
+            debounce_cancel = getattr(coordinator, "_debounce_cancel", None)
+            if debounce_cancel is not None:
+                debounce_cancel()
+                coordinator._debounce_cancel = None
+            coordinator._debounced_refresh.async_cancel()
+            await coordinator.async_refresh()
+            await coordinator.async_wait_for_plan_execution()
+            ai_task = getattr(coordinator, "_ai_advice_task", None)
+            if ai_task is not None:
+                await ai_task
+
+    async def wait_for_manual_override_clear(call: ServiceCall) -> None:
+        """Wait until the asynchronous helper-off release has completed."""
+        deadline = asyncio.get_running_loop().time() + 30
+        for entry in hass.config_entries.async_entries("ha_energy_planner"):
+            coordinator = getattr(entry, "runtime_data", None)
+            if coordinator is None:
+                continue
+            while any(
+                override.kind == "manual_hvac" and getattr(override, "source", None) == "helper"
+                for override in coordinator.overrides
+            ):
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("Manual HVAC helper override did not clear")
+                await asyncio.sleep(0.05)
+            await coordinator.async_wait_for_plan_execution()
+
+    async def mark_smoke_complete(call: ServiceCall) -> None:
+        """Write a completion marker before Home Assistant shuts down."""
+        Path(hass.config.config_dir, ".ha_energy_planner_smoke_complete").touch()
+
     async def capture_persistent_notification(call: ServiceCall) -> None:
         """Capture persistent notification calls for smoke validation."""
         notification_id = str(call.data.get("notification_id", ""))
@@ -202,6 +243,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "seed_enphase_command_rate_limit", seed_enphase_command_rate_limit)
     hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
     hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
+    hass.services.async_register(DOMAIN, "wait_for_planner_idle", wait_for_planner_idle)
+    hass.services.async_register(DOMAIN, "wait_for_manual_override_clear", wait_for_manual_override_clear)
+    hass.services.async_register(DOMAIN, "mark_smoke_complete", mark_smoke_complete)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -455,7 +499,10 @@ automation:
       - trigger: homeassistant
         event: start
     actions:
-      - delay: "00:00:08"
+      - wait_template: >-
+          {{ states('binary_sensor.energy_planner_armed') not in ['unknown', 'unavailable'] }}
+        timeout: "00:00:30"
+        continue_on_timeout: false
       # Explicit arming must not turn a persisted request into apparent command
       # authority before the current plan and reviewed evidence are healthy.
       - action: fake_planner_test.assert_unsafe_arm_rejected
@@ -493,7 +540,6 @@ automation:
         data:
           entity_id: input_number.import_price
           value: 0.10
-      - delay: "00:00:02"
       - action: ha_energy_planner.replan
       # Restore only after the coordinated HVAC action and its ownership
       # snapshot have reached the observable actuator state. A fixed delay can
@@ -531,7 +577,7 @@ automation:
           value: 0.10
       - delay: "00:00:02"
       - action: ha_energy_planner.replan
-      - delay: "00:00:07"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.climate_manual_override
@@ -545,7 +591,7 @@ automation:
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_manual_override
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_manual_override_clear
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -555,7 +601,7 @@ automation:
           entity_id: input_select.fake_person
           option: not_home
       - action: ha_energy_planner.replan
-      - delay: "00:00:20"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.set_manual_hvac_override
         data:
           duration_minutes: 10
@@ -577,7 +623,7 @@ automation:
         data:
           ready_by: "23:45:00"
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -586,9 +632,8 @@ automation:
         data:
           entity_id: input_number.ev_soc
           value: 35
-      - delay: "00:00:02"
       - action: ha_energy_planner.replan
-      - delay: "00:00:08"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -612,7 +657,7 @@ automation:
       - delay: "00:00:05"
       - action: fake_planner_test.force_ev_calibration_due
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.pv_forecast
@@ -623,7 +668,7 @@ automation:
           value: 2.0
       - action: fake_planner_test.seed_due_forecast_snapshot
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.fake_indoor_temperature
@@ -644,7 +689,7 @@ automation:
           entity_id: input_boolean.climate_change_from_scheduler
       - action: fake_planner_test.seed_thermal_model_sample
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_select.select_option
         data:
           entity_id: input_select.enphase_profile
@@ -687,7 +732,7 @@ automation:
           entity_id: input_select.enphase_profile
           option: Self-Consumption
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.ev_soc
@@ -701,7 +746,7 @@ automation:
           entity_id: input_number.export_price
           value: 0.60
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -723,7 +768,7 @@ automation:
           entity_id: input_number.export_price
           value: 0.60
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_second_arbitrage_restore
@@ -738,15 +783,14 @@ automation:
           value: 0.60
       - action: fake_planner_test.seed_enphase_command_rate_limit
       - action: ha_energy_planner.replan
-      - delay: "00:00:10"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: button.press
         data:
           entity_id: button.energy_planner_restore_safe_state
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: switch.turn_off
         data:
           entity_id: switch.energy_planner_automatic_control
-      - delay: "00:00:02"
       - action: switch.turn_off
         target:
           entity_id:
@@ -775,18 +819,18 @@ automation:
         data:
           reason: docker_smoke_automatic_control
       - action: ha_energy_planner.replan
-      - delay: "00:00:05"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: fake_planner_test.seed_production_evidence
       - action: switch.turn_on
         data:
           entity_id: switch.energy_planner_automatic_control
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: button.press
         data:
           entity_id: button.energy_planner_explain
-      - delay: "00:00:05"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.replan
-      - delay: "00:00:05"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_text.set_value
         data:
           entity_id: input_text.planner_current_state_seen
@@ -825,6 +869,8 @@ automation:
         data:
           entity_id: input_number.diagnostics_response_seen
           value: "{{ 1 if hep_diagnostics.plan is defined else 0 }}"
+      - action: fake_planner_test.mark_smoke_complete
+      - action: homeassistant.stop
 
 logger:
   default: warning
@@ -1064,9 +1110,18 @@ docker run --rm \
 STATUS=$?
 set -e
 
-if [[ "$STATUS" != "0" && "$STATUS" != "124" ]]; then
+if [[ "$STATUS" != "0" ]]; then
   cat "$LOG_FILE"
+  if [[ "$STATUS" == "124" ]]; then
+    echo "Home Assistant smoke automation did not finish within 240 seconds" >&2
+  fi
   exit "$STATUS"
+fi
+
+if [[ ! -f "$TMP_DIR/.ha_energy_planner_smoke_complete" ]]; then
+  cat "$LOG_FILE"
+  echo "Home Assistant stopped before the smoke automation completed" >&2
+  exit 1
 fi
 
 if ! grep -q "Finished fetching ha_energy_planner data.*success: True" "$LOG_FILE"; then
