@@ -111,12 +111,25 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     async def seed_enphase_command_rate_limit(call: ServiceCall) -> None:
         """Seed a future Enphase command cooldown for smoke execution-gate validation."""
         attempted_at = dt_util.utcnow() + timedelta(minutes=5)
+        stale_conflict_at = dt_util.utcnow() - timedelta(minutes=5)
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
             coordinator = getattr(entry, "runtime_data", None)
             store = getattr(coordinator, "store", None)
             if store is None:
                 continue
             await store.async_save_command_rate_limits({"enphase:set_profile": attempted_at.isoformat()})
+            audit = [dict(item) for item in store.data.get("execution_audit", [])]
+            for item in audit:
+                if item.get("asset") == "enphase" and item.get("result") == "applied":
+                    item["attempted_at"] = stale_conflict_at.isoformat()
+                    item.pop("last_attempted_at", None)
+            store.data["execution_audit"] = audit
+            await store._async_save()
+            options = dict(entry.options)
+            options["command_rate_limit_seconds"] = 1
+            options["climate_control_enabled"] = False
+            options["ev_control_enabled"] = False
+            hass.config_entries.async_update_entry(entry, options=options)
 
     async def seed_production_evidence(call: ServiceCall) -> None:
         """Bind smoke review evidence to the integration's current production contract."""
@@ -525,7 +538,7 @@ automation:
         data:
           entity_id: climate.fake_daikin
           hvac_mode: heat
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -552,7 +565,7 @@ automation:
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_hvac_precondition_restore
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.fake_indoor_temperature
@@ -564,7 +577,7 @@ automation:
         data:
           entity_id: climate.fake_daikin
           hvac_mode: heat
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -575,13 +588,13 @@ automation:
         data:
           entity_id: input_number.import_price
           value: 0.10
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.climate_manual_override
-      - delay: "00:00:03"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_text.set_value
         target:
           entity_id: input_text.manual_override_release_seen
@@ -606,7 +619,7 @@ automation:
         data:
           duration_minutes: 10
           reason: docker_smoke_manual_override
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_select.select_option
         data:
           entity_id: input_select.fake_person
@@ -645,16 +658,16 @@ automation:
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.ev_connected
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.ev_soc
           value: 72
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.ev_connected
-      - delay: "00:00:05"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: fake_planner_test.force_ev_calibration_due
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
@@ -694,11 +707,11 @@ automation:
         data:
           entity_id: input_select.enphase_profile
           option: Self-Consumption
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_ev_baseline_reset
-      - delay: "00:00:02"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_off
         data:
           entity_id:
@@ -710,11 +723,11 @@ automation:
       - action: ha_energy_planner.resume_control
         data:
           reason: docker_smoke_ev_restore_setup
-      - delay: "00:00:01"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_restore
-      - delay: "00:00:03"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.ev_soc
@@ -758,7 +771,7 @@ automation:
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_final_restore
-      - delay: "00:00:03"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -772,7 +785,7 @@ automation:
       - action: ha_energy_planner.restore_safe_state
         data:
           reason: docker_smoke_second_arbitrage_restore
-      - delay: "00:00:03"
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_number.set_value
         data:
           entity_id: input_number.import_price
@@ -782,6 +795,20 @@ automation:
           entity_id: input_number.export_price
           value: 0.60
       - action: fake_planner_test.seed_enphase_command_rate_limit
+      - action: fake_planner_test.wait_for_planner_idle
+      - action: ha_energy_planner.resume_control
+        data:
+          reason: docker_smoke_command_cooldown
+      # Require a profile command while the aged audit keeps the independent
+      # external-conflict gate clear, so the command cooldown is tested first.
+      - action: input_select.select_option
+        data:
+          entity_id: input_select.enphase_profile
+          option: AI Optimisation
+      - action: fake_planner_test.seed_production_evidence
+      - action: ha_energy_planner.arm_production_control
+        data:
+          reason: docker_smoke_command_cooldown
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
       - action: button.press
@@ -791,6 +818,16 @@ automation:
       - action: switch.turn_off
         data:
           entity_id: switch.energy_planner_automatic_control
+      - action: fake_planner_test.wait_for_planner_idle
+      # The cooldown fixture isolated Enphase by disabling the other control
+      # areas directly. Re-enable them so the switch-off smoke below exercises
+      # every real per-area disable and safe-restoration transition.
+      - action: switch.turn_on
+        target:
+          entity_id:
+            - switch.energy_planner_climate_control
+            - switch.energy_planner_ev_control
+      - action: fake_planner_test.wait_for_planner_idle
       - action: switch.turn_off
         target:
           entity_id:
@@ -923,7 +960,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           "forecast_freshness_minutes": 120,
           "material_change_threshold_percent": 5.0,
           "enphase_minimum_savings": 0.25,
-          "command_rate_limit_seconds": 1,
+          "command_rate_limit_seconds": 0,
           "max_daily_ev_actions": 50,
           "max_daily_climate_actions": 50,
           "max_daily_enphase_actions": 50,
@@ -1473,6 +1510,14 @@ if enphase_arbitrage_outcomes and not any(
 ):
     raise SystemExit(
         "Active-mode Enphase arbitrage was neither applied nor safely blocked by conflict/cooldown"
+    )
+if not any(
+    item.get("result") == "rejected"
+    and item.get("reason") == "device_command_rate_limited"
+    for item in enphase_arbitrage_outcomes
+):
+    raise SystemExit(
+        "Seeded Enphase command cooldown did not reject the arbitrage profile"
     )
 final_restore_outcomes = [
     item
