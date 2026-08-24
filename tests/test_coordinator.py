@@ -3815,7 +3815,7 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
                 for index in range(20)
             ],
         },
-        hard_constraints=["ev_min_soc", "ready_by"],
+        hard_constraints=["ready_by"],
         reason_codes=["ev_soc_below_target", "fallback_target"],
         expected_cost_delta=None,
         confidence=0.93,
@@ -3887,7 +3887,7 @@ def test_snapshot_actions_are_bounded_and_auditable() -> None:
                     {"truncated_count": 8},
                 ],
             },
-            "hard_constraints": ["ev_min_soc", "ready_by"],
+            "hard_constraints": ["ready_by"],
             "reason_codes": ["ev_soc_below_target", "fallback_target"],
             "expected_cost_delta": None,
             "confidence": 0.93,
@@ -5154,7 +5154,7 @@ def test_previously_active_startup_preserves_arming_and_intent() -> None:
     assert coordinator.store.data["ev_grid_reservation"]["active"] is True
 
 
-def test_paused_startup_does_not_preserve_active_arming() -> None:
+def test_paused_startup_disarms_and_preserves_auto_recovery() -> None:
     coordinator = _coordinator_for_runtime_services(
         options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
         store_data={
@@ -5172,8 +5172,30 @@ def test_paused_startup_does_not_preserve_active_arming() -> None:
 
     assert coordinator.store.data["production"]["armed"] is False
     assert coordinator.store.data["production"]["disarmed_reason"] == "startup_control_paused"
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_safe"
+    assert recovery["successful_runs"] == 0
+    assert recovery["last_reason"] == "startup_control_paused"
     assert coordinator.executor.restored == ["startup_control_paused"]
-    assert coordinator._startup_auto_recovery_authorized is False
+    assert coordinator._startup_auto_recovery_authorized is True
+
+    # If Home Assistant stops before the pause clears, the persisted handoff
+    # must authorize a fresh recovery task on the next setup.
+    coordinator.store.data["control_pause"]["until"] = datetime.now(UTC) - timedelta(seconds=1)
+    restarted = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        store_data=coordinator.store.data,
+    )
+    restarted._startup_auto_recovery_authorized = False
+
+    assert asyncio.run(restarted.async_reconcile_production_evidence_contract()) is True
+
+    restarted_recovery = restarted.store.data["production"]["startup_auto_recovery"]
+    assert restarted_recovery["status"] == "waiting_for_home_assistant"
+    assert restarted_recovery["successful_runs"] == 0
+    assert restarted_recovery["last_reason"] == "startup_safe_recovery_pending"
+    assert restarted._startup_auto_recovery_authorized is True
+    assert restarted.store.data["production"]["armed"] is False
 
 
 def test_scoped_pause_preserves_unaffected_control_area_at_startup() -> None:

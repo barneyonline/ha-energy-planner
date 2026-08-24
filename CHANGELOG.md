@@ -9,6 +9,9 @@
   target; when synchronisation is enabled, it then applies the same target to
   configured zone thermostats. The former main-setpoint-preserving behavior is
   no longer supported.
+- Removed the legacy **Minimum EV SOC** and **Maximum EV SOC** settings. EV
+  charging now uses the live value of the mapped **Vehicle target SOC entity**
+  directly; config-entry migration removes the obsolete stored options.
 
 ### ✨ New features
 
@@ -43,6 +46,10 @@
   remains untouched while the main thermostat, other zones, and automations
   return to their captured states. Manual supersession is rechecked after
   persistence and confirmation awaits and before automation rollback calls.
+- Automatic control now retains a restart-resumable recovery handoff when setup
+  or reload encounters a temporary pause that blocks every enabled control area.
+  Once the pause clears, healthy validation can restore **Armed / Running**
+  without requiring an operator toggle.
 
 ### 🔧 Improvements
 

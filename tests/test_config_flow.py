@@ -1018,6 +1018,8 @@ def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
     )
 
     assert "ev_fallback_target_soc_percent" not in schema_keys
+    assert CONF_EV_MAX_SOC_PERCENT not in schema_keys
+    assert CONF_EV_MIN_SOC_PERCENT not in schema_keys
     assert CONF_DEFAULT_READY_BY in schema_keys
     assert CONF_EV_LOW_PRICE_CHARGING_ENABLED in schema_keys
     assert CONF_EV_LOW_PRICE_THRESHOLD in schema_keys
@@ -1028,7 +1030,7 @@ def test_options_flow_saves_all_sections_together_and_preserves_options() -> Non
     entry = SimpleNamespace(
         data={CONF_INSTANCE_NAME: "Energy Planner"},
         options={
-            CONF_EV_MIN_SOC_PERCENT: 55,
+            CONF_EV_CHARGE_RATE_KW: 5.5,
             CONF_PRIORITY_WEIGHTS: "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon",
         },
     )
@@ -1064,7 +1066,7 @@ def test_options_flow_saves_all_sections_together_and_preserves_options() -> Non
         }
     ]
     assert result["data"][CONF_PLANNING_HORIZON_HOURS] == 36
-    assert result["data"][CONF_EV_MIN_SOC_PERCENT] == 55
+    assert result["data"][CONF_EV_CHARGE_RATE_KW] == 5.5
     assert result["data"][CONF_PRIORITY_WEIGHTS] == (
         "comfort,cost,ev_readiness,battery_reserve,solar_self_consumption,carbon"
     )
@@ -1095,7 +1097,7 @@ def test_options_flow_sections_prefill_saved_policy_values() -> None:
     assert fields[CONF_PLANNING_INTERVAL_MINUTES].default() == 10
 
 
-def test_options_flow_section_validation_returns_form_errors() -> None:
+def test_options_flow_discards_legacy_ev_soc_limits() -> None:
     flow = OptionsFlow(SimpleNamespace(data={}, options={}))
     flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
     submission = _settings_submission(
@@ -1110,8 +1112,9 @@ def test_options_flow_section_validation_returns_form_errors() -> None:
 
     result = asyncio.run(flow.async_step_init(submission))
 
-    assert result["type"] == "form"
-    assert result["errors"]["base"] == "ev_min_above_max"
+    assert result["type"] == "create_entry"
+    assert CONF_EV_MAX_SOC_PERCENT not in result["data"]
+    assert CONF_EV_MIN_SOC_PERCENT not in result["data"]
 
 
 def test_options_flow_rejects_incomplete_climate_scheduler_guard() -> None:
