@@ -13,7 +13,6 @@ on:
       - "quality_scale.yaml"
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
-      - ".github/workflows/quality-scale.yml"
       - ".github/workflows/codespell.yml"
       - ".github/workflows/hassfest.yml"
       - ".github/workflows/validate.yaml"
@@ -50,6 +49,7 @@ jobs:
           -w /work
           ghcr.io/home-assistant/home-assistant:stable
           sh -c 'python3 -m coverage run -m pytest -q
+          --durations=15
           --junitxml=junit.xml
           -o junit_family=legacy &&
           python3 -m coverage xml -o coverage.xml &&
@@ -68,42 +68,12 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./junit.xml
           report_type: test_results
-      - name: Fail if tests failed
-        if: ${{ steps.pytest.outcome == 'failure' }}
-        run: exit 1
-
-  quality-scale:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Validate quality scale evidence in Home Assistant Docker
-        run: >
-          docker run --rm
-          -v "$PWD:/work"
-          -w /work
-          ghcr.io/home-assistant/home-assistant:stable
-          python3 scripts/validate_quality_scale.py
-      - name: Test quality scale and manifest contracts in Home Assistant Docker
-        run: >
-          docker run --rm
-          -v "$PWD:/work"
-          -w /work
-          ghcr.io/home-assistant/home-assistant:stable
-          python3 -m pytest -q
-          tests/scripts/test_validate_quality_scale.py
-          tests/test_manifest.py
-
-  validation-extras:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v6
-      - name: Run lint, fixture, and Home Assistant config validation
+      - name: Run quality-scale, lint, fixture, and Home Assistant config validation
+        if: ${{ steps.pytest.outcome == 'success' }}
         env:
           HEP_SKIP_HA_SMOKE: "1"
           HEP_SKIP_PYTEST: "1"
-          HEP_SKIP_QUALITY_SCALE: "1"
         run: scripts/docker-validate.sh
+      - name: Fail if tests failed
+        if: ${{ steps.pytest.outcome == 'failure' }}
+        run: exit 1

@@ -21,7 +21,6 @@ on:
       - "quality_scale.yaml"
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
-      - ".github/workflows/quality-scale.yml"
       - ".github/workflows/codespell.yml"
       - ".github/workflows/hassfest.yml"
       - ".github/workflows/validate.yaml"

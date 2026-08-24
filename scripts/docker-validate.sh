@@ -37,7 +37,7 @@ run() {
 
 run env PYTHONPYCACHEPREFIX="$PYCACHE_DIR" python3 -m compileall -q custom_components tests scripts
 run docker run --rm -v "$PWD:/work" -w /work ghcr.io/astral-sh/ruff:0.14.1 check custom_components tests scripts
-run bash -n scripts/docker-ha-smoke.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
+run bash -n scripts/docker-ha-smoke.sh scripts/docker-pytest-fast.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run
 run scripts/export-real-validation-bundle.sh --dry-run
@@ -49,7 +49,7 @@ fi
 if [[ "${HEP_SKIP_PYTEST:-0}" == "1" ]]; then
   printf '\n==> pytest with coverage (skipped: HEP_SKIP_PYTEST=1)\n'
 else
-  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable sh -c 'python3 -m coverage run -m pytest -q && python3 -m coverage report -m'
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable sh -c 'python3 -m coverage run -m pytest -q --durations=15 && python3 -m coverage report -m'
 fi
 run python3 scripts/replay-fixture.py tests/fixtures/replay/*.json
 run python3 scripts/validate-live-schema-fixture.py tests/fixtures/live_schema/*.json
