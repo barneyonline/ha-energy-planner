@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
+from custom_components.ha_energy_planner import ev_adapter as ev_adapter_module
 from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -705,7 +708,13 @@ def test_ev_stop_skips_button_when_vehicle_has_suspended_charging() -> None:
     assert hass.services.calls == []
 
 
-def test_ev_stop_confirms_stateful_control_without_charging_feedback() -> None:
+def test_ev_stop_confirms_stateful_control_without_charging_feedback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_sleep(_delay: float) -> None:
+        raise AssertionError("an existing on control should be checked without waiting")
+
+    monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", unexpected_sleep)
     hass = FakeHass({"switch.ev_charger": "on"})
     adapter = EVSmartChargingAdapter(
         hass,
@@ -1413,6 +1422,7 @@ def test_ev_restore_momentary_takeover_ignores_unrelated_persistent_control() ->
             CONF_EV_CHARGER_START: "button.ev_start",
             CONF_EV_CHARGER_STOP: "button.ev_stop",
         },
+        confirmation_timeout_seconds=0,
     )
 
     result = asyncio.run(
