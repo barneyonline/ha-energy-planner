@@ -57,7 +57,7 @@
           "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
           "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
           "climate_manual_override_entity": "Input_boolean that immediately releases and blocks planner HVAC control. An on state is automatically cleared after the configured manual override duration.",
-          "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature.",
+          "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature only when zone temperature synchronisation is enabled.",
           "climate_target_low_entity": "Input number containing the occupied low comfort target.",
           "climate_target_high_entity": "Input number containing the occupied high comfort target.",
           "person_entities": "Person entities used to infer occupied or away state.",
@@ -87,7 +87,7 @@
       "ev_keep_on_requires_persistent_control": "Keep charger on requires a persistent EV charger switch or input boolean.",
       "ev_planning_sensor_required": "EV SOC, charging state, and vehicle target SOC entities are required for EV planning.",
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
-      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
+      "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -199,7 +199,7 @@
               "hvac_suppression_min_price_delta": "HVAC suppression price delta",
               "hvac_precondition_lead_minutes": "HVAC precondition lead time",
               "hvac_precondition_min_price_delta": "HVAC precondition price delta",
-              "hvac_precondition_configured_zones_only": "Precondition configured zones only",
+              "hvac_precondition_configured_zones_only": "Synchronise configured zone temperatures",
               "hvac_precondition_while_away": "Precondition while away",
               "hvac_min_cycle_minutes": "HVAC minimum cycle time",
               "manual_hvac_override_minutes": "Manual HVAC override duration"
@@ -212,7 +212,7 @@
               "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
               "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
               "climate_manual_override_entity": "Input_boolean that immediately releases and blocks planner HVAC control. An on state is automatically cleared after the configured manual override duration.",
-              "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature.",
+              "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature only when zone temperature synchronisation is enabled.",
               "climate_target_low_entity": "Input number containing the occupied low comfort target.",
               "climate_target_high_entity": "Input number containing the occupied high comfort target.",
               "person_entities": "Person entities used to infer occupied or away state.",
@@ -220,7 +220,7 @@
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
               "hvac_precondition_lead_minutes": "How far ahead HVAC may precondition before an expensive or comfort-sensitive period.",
               "hvac_precondition_min_price_delta": "Minimum price difference required before HVAC preconditioning is considered worthwhile.",
-              "hvac_precondition_configured_zones_only": "Apply tariff preconditioning and coast temperatures only to configured zone climate entities. The main Daikin entity is still turned on and set to the required HVAC mode.",
+              "hvac_precondition_configured_zones_only": "After applying and confirming each tariff preconditioning and coast target on the main Daikin thermostat, apply the same target to configured zone climate entities. Leave disabled to keep zone climate targets unchanged while still controlling zone switches or helpers.",
               "hvac_precondition_while_away": "Allow tariff-driven preconditioning while every configured person is away. Leave off to retain the conservative occupied-only policy.",
               "hvac_min_cycle_minutes": "Minimum time between planner HVAC mode changes.",
               "manual_hvac_override_minutes": "How long manual HVAC changes block planner-owned HVAC control."
@@ -377,7 +377,7 @@
       "invalid_ready_by": "Default ready-by must be a valid local time.",
       "invalid_priority_weights": "Each planning priority must use a different objective.",
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
-      "zone_only_preconditioning_requires_climate_zone": "Precondition configured zones only requires at least one climate entity under Climate Zones."
+      "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones."
     }
   },
   "exceptions": {

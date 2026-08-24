@@ -460,13 +460,35 @@ Status as of 2026-08-15.
   lower-price slots before the peak; catch-up cannot cross a tariff gap or run
   beyond the applicable comfort target. Takeover snapshots configured switch/input-boolean zones,
   disables mapped automations, enables those zones, explicitly turns on the main climate
-  entity, and applies and confirms its target on configured zone climate entities. The
-  default-off configured-zones-only option leaves the main setpoint unchanged while retaining
-  its power and mode control, rejects configurations without a zone climate target, and preserves
+  entity, applies and confirms its target on the main thermostat first, and, when configured-zone
+  synchronisation is enabled, then applies and confirms the same target on configured zone climate
+  entities. Disabled synchronisation leaves zone climate targets unchanged while retaining
+  switch/helper takeover. Target mutations require complete restorable main and synchronized-zone
+  snapshots before takeover. The default-off option rejects configurations without a zone climate
+  target, and failed acquisition restores the captured main mode and target before reporting
+  rollback success. For an originally-off main thermostat, the active mode revealed by turn-on is
+  persisted before planner mode selection, restored before returning to off, and retained as
+  unresolved ownership if it cannot be recovered. Earlier mode or target restoration failures do
+  not skip the independently attempted and confirmed off cleanup. Unresolved main state is
+  persisted for release and safe-state retries and blocks new acquisition until recovered, but a
+  manual main-thermostat change durably supersedes that snapshot
+  before release actuators run and is preserved across restart recovery. Pending
+  transaction feedback suppresses only matching scalar/range targets or expected
+  intermediate mode transitions; off-to-active feedback is expected only during
+  the adapter's explicit turn-on phase. A different manual target or unexpected
+  mode bypasses the scheduler guard, synchronously aborts acquisition rollback,
+  release, or safe-state main restoration, preserves the user's main state, and
+  restores subordinate ownership. Pending zone feedback is matched to the exact
+  action or rollback target; a different user target synchronously supersedes
+  and durably removes only that zone's baseline before the remaining rollback
+  actuators run. Await-to-actuator boundaries recheck supersession after main
+  snapshot persistence, mode confirmation, and automation disable. It preserves
   the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,
   retains unresolved ownership for
-  retry, and never restores the prior climate mode or setpoint. An ownership-free
+  retry. Ordinary lifecycle release never restores the prior climate mode or
+  setpoint; unresolved acquisition recovery restores its persisted main snapshot
+  unless a manual main change supersedes it. An ownership-free
   release is a no-op, and only actual `set_hvac` attempts consume the daily
   climate command allowance. Comfort-boundary
   release of planner-owned control is held through the recorded peak end to
