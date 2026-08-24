@@ -12,7 +12,10 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Home Assistant startup no longer raises a safe-state restore failure when the
+  Enphase profile entity is still loading and Energy Planner has no recorded
+  Enphase ownership to restore. Genuine owned-profile restore failures remain
+  actionable and retain their recovery evidence.
 
 ### 🔧 Improvements
 

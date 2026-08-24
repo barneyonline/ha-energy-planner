@@ -685,6 +685,100 @@ def test_restore_safe_state_attempts_configured_enphase_without_ownership() -> N
     )
 
 
+@pytest.mark.parametrize(
+    "restore_reason",
+    ["production_evidence_contract_changed", "startup_control_paused"],
+)
+def test_restore_safe_state_ignores_unavailable_unowned_enphase_fallback(
+    restore_reason: str,
+) -> None:
+    store = FakeStore()
+    hass = FakeHass()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_ENPHASE_PROFILE: "select.enphase",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state(restore_reason))
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert outcome.reason == f"{restore_reason}:enphase_profile_entity_unavailable"
+    assert store.data["ownership"] == {}
+    assert all(call[1] != "create" for call in hass.services.calls)
+
+
+def test_restore_safe_state_fails_for_unavailable_owned_enphase_profile() -> None:
+    store = FakeStore()
+    store.data["ownership"] = {"enphase_profile": "Self Consumption"}
+    hass = FakeHass()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_ENPHASE_PROFILE: "select.enphase",
+            CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+        },
+    )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("startup"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert outcome.reason == "startup:enphase_profile_entity_unavailable"
+    assert store.data["ownership"] == {"enphase_profile": "Self Consumption"}
+    assert any(call[1] == "create" for call in hass.services.calls)
+
+
+def test_manual_restore_fails_for_unowned_enphase_fallback_failure(
+    monkeypatch: object,
+) -> None:
+    class FailedEnphaseAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore_ai(self) -> object:
+            return SimpleNamespace(
+                applied=False,
+                reason="enphase_profile_service_failed",
+                pre_state={},
+                post_state={},
+            )
+
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FailedEnphaseAdapter)
+    hass = FakeHass()
+
+    outcome = asyncio.run(
+        Executor(FakeStore(), hass=hass).async_restore_safe_state("manual_service_call")
+    )
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert outcome.reason == "manual_service_call:enphase_profile_service_failed"
+    assert any(call[1] == "create" for call in hass.services.calls)
+
+
+def test_unowned_enphase_fallback_exception_remains_a_restore_failure(
+    monkeypatch: object,
+) -> None:
+    class RaisingEnphaseAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore_ai(self) -> object:
+            raise RuntimeError("service failure")
+
+    monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", RaisingEnphaseAdapter)
+
+    outcome = asyncio.run(
+        Executor(FakeStore(), hass=FakeHass()).async_restore_safe_state("manual_service_call")
+    )
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert outcome.reason == "manual_service_call:enphase_restore_exception"
+
+
 def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection() -> None:
     now = datetime.now(UTC)
     action = PlanAction(
