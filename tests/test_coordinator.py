@@ -5081,9 +5081,14 @@ def test_production_evidence_resets_when_control_contract_changes() -> None:
     assert coordinator.store.data["production"]["dry_run_evidence_fingerprint"] != first_fingerprint
 
 
-def test_changed_production_contract_restores_and_disarms_before_rearming() -> None:
+def test_changed_production_contract_disarms_and_preserves_startup_recovery() -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_HOUSEHOLD_LOAD: "sensor.house_b"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
         store_data={
             "production": {
                 "armed": True,
@@ -5102,7 +5107,46 @@ def test_changed_production_contract_restores_and_disarms_before_rearming() -> N
     assert coordinator.executor.restored == ["production_evidence_contract_changed"]
     assert coordinator.store.data["production"]["armed"] is False
     assert coordinator.store.data["production"]["disarmed_reason"] == "production_evidence_contract_changed"
-    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is False
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_safe"
+    assert recovery["successful_runs"] == 0
+    assert recovery["last_reason"] == "production_evidence_contract_changed"
+    assert coordinator._startup_auto_recovery_authorized is True
+
+    # A restart between disarming and post-startup validation must retain the
+    # handoff and reset the consecutive-validation counter.
+    coordinator._startup_auto_recovery_authorized = False
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+    recovery = coordinator.store.data["production"]["startup_auto_recovery"]
+    assert recovery["status"] == "waiting_for_home_assistant"
+    assert recovery["successful_runs"] == 0
+    assert recovery["last_reason"] == "startup_safe_recovery_pending"
+    assert coordinator._startup_auto_recovery_authorized is True
+
+
+def test_changed_production_contract_in_review_disarms_without_auto_recovery() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_HOUSEHOLD_LOAD: "sensor.house_b"},
+        store_data={
+            "production": {
+                "armed": True,
+                "dry_run_ready_cycles": 3,
+                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
+                    {CONF_HOUSEHOLD_LOAD: "sensor.house_a"},
+                    {},
+                ),
+            }
+        },
+    )
+
+    assert asyncio.run(coordinator.async_reconcile_production_evidence_contract()) is True
+
+    production = coordinator.store.data["production"]
+    assert production["armed"] is False
+    assert production["disarmed_reason"] == "production_evidence_contract_changed"
+    assert "startup_auto_recovery" not in production
+    assert getattr(coordinator, "_startup_auto_recovery_authorized", False) is False
+    assert coordinator.executor.restored == ["production_evidence_contract_changed"]
 
 
 def test_previously_active_startup_preserves_arming_and_intent() -> None:
@@ -5278,6 +5322,8 @@ def test_scoped_pause_does_not_approve_a_changed_production_contract() -> None:
     production = coordinator.store.data["production"]
     assert production["armed"] is False
     assert production["disarmed_reason"] == "production_evidence_contract_changed"
+    assert production["startup_auto_recovery"]["status"] == "waiting_for_safe"
+    assert coordinator._startup_auto_recovery_authorized is True
     assert coordinator.executor.restored == ["production_evidence_contract_changed"]
 
 
