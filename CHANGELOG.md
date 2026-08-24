@@ -4,6 +4,28 @@
 
 ### 🚧 Breaking changes
 
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 0.9.14 - 2026-08-24
+
+### 🚧 Breaking changes
+
 - **Precondition configured zones only** is now **Synchronise configured zone
   temperatures**. Daikin preconditioning always changes the main thermostat
   target; when synchronisation is enabled, it then applies the same target to
