@@ -12,11 +12,18 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Home Assistant startup no longer raises a safe-state restore failure when the
+  Enphase profile entity is still loading and Energy Planner has no recorded
+  Enphase ownership to restore. Genuine owned-profile restore failures remain
+  actionable and retain their recovery evidence.
 
 ### 🔧 Improvements
 
-- None
+- The Docker Home Assistant smoke test now waits on coordinator work and exits
+  when its scenario completes instead of running until the fixed timeout.
+- Pull-request CI now selects pytest, quality-scale, and validation jobs from
+  the changed paths while retaining the full non-smoke CI set for pushes and
+  manual Tests runs.
 
 ### 🔄 Other changes
 

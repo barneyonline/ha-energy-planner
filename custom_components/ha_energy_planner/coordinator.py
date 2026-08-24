@@ -1025,8 +1025,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return True
 
         if self.active_control and production.dry_run_evidence_fingerprint != expected_fingerprint:
-            await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
+            # A software or entry migration can change the evidence contract
+            # before configured entities have finished restoring. Fail closed,
+            # but preserve the previously armed automatic-control lifecycle so
+            # the post-startup recovery task can revalidate the new contract
+            # with three fresh, non-commanding plans instead of leaving the
+            # installation permanently disarmed with no task able to recover.
+            self._startup_auto_recovery_authorized = True
+            self._startup_auto_recovery_deadline = None
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_safe",
+                successful_runs=0,
+                reason="production_evidence_contract_changed",
+            )
             await self.async_disarm_production_control("production_evidence_contract_changed")
+            await self.async_restore_safe_state("production_evidence_contract_changed", refresh=False)
             return True
 
         if self.active_control and not pause_blocks_all_control:
