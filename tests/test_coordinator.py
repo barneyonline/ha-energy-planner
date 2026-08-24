@@ -56,12 +56,16 @@ from custom_components.ha_energy_planner.coordinator import (
     _is_manual_hvac_zone_change,
     _is_manual_override_helper_change,
     _is_material_state_change,
+    _is_pending_main_hvac_manual_change,
     _is_planner_owned_control_feedback,
     _latest_ai_plan_fingerprint,
     _latest_ai_service_call_at,
+    _matches_pending_main_hvac_feedback,
+    _matches_pending_zone_hvac_feedback,
     _material_plan_fingerprint,
     _overrides_from_store,
     _parse_datetime_or_none,
+    _pending_zone_hvac_manual_change_entity_id,
     _seconds_until_next_interval_boundary,
     _snapshot_action_load_forecasts,
     _snapshot_actions,
@@ -363,6 +367,10 @@ class FakeExecutor:
         self.device_restore_result = SimpleNamespace(result=OutcomeResult.RESTORED)
         self.hvac_releases: list[str] = []
         self.hvac_release_preserved_zones: list[str | None] = []
+        self.hvac_release_preserved_main: list[bool] = []
+        self.pending_hvac_desired_state: dict[str, object] | None = None
+        self.pending_hvac_manual_overrides = 0
+        self.pending_hvac_manual_zone_overrides: list[str] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
@@ -386,9 +394,27 @@ class FakeExecutor:
         reason: str,
         *,
         preserve_zone_entity_id: str | None = None,
+        preserve_main_state: bool = False,
     ) -> None:
         self.hvac_releases.append(reason)
         self.hvac_release_preserved_zones.append(preserve_zone_entity_id)
+        self.hvac_release_preserved_main.append(preserve_main_state)
+
+    def mark_pending_hvac_manual_override(self) -> bool:
+        """Mark a pending fake HVAC transaction as user-superseded."""
+        if self.pending_hvac_desired_state is None:
+            return False
+        self.pending_hvac_desired_state["manual_override_detected"] = True
+        self.pending_hvac_manual_overrides += 1
+        return True
+
+    def mark_pending_hvac_zone_manual_override(self, entity_id: str) -> bool:
+        """Mark a pending fake zone transaction as user-superseded."""
+        if self.pending_hvac_desired_state is None:
+            return False
+        self.pending_hvac_desired_state["manual_zone_entity_ids"] = [entity_id]
+        self.pending_hvac_manual_zone_overrides.append(entity_id)
+        return True
 
     async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
         self.manual_ev_commands.append((enabled, context, dict(self.options), dict(self.entry_data)))
@@ -1534,11 +1560,24 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
         lambda hass, delay, action: (lambda: None),
     )
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-    coordinator.hass = FakeHass({"input_boolean.override": "off", "switch.zone": "on"})
+    coordinator.hass = FakeHass(
+        {
+            "input_boolean.override": "off",
+            "switch.zone": "on",
+            "climate.zone_temperature": FakeState(
+                "heat",
+                {"temperature": 20},
+            ),
+            "climate.daikin": "heat",
+            "input_boolean.scheduler_change": "off",
+        }
+    )
     coordinator.entry = FakeEntry(
         {
             CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
-            CONF_CLIMATE_ZONES: ["switch.zone"],
+            CONF_CLIMATE_ZONES: ["switch.zone", "climate.zone_temperature"],
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
         },
         {CONF_PLANNING_INTERVAL_MINUTES: 5},
     )
@@ -1557,14 +1596,15 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
     callback(FakeEvent("input_boolean.override", "on", "off"))
     assert coordinator._manual_override_helper_guard is None
 
-    manual_changes: list[tuple[str, str | None]] = []
+    manual_changes: list[tuple[str, str | None, bool]] = []
 
     def capture_manual_change(
         reason: str,
         *,
         preserve_zone_entity_id: str | None = None,
+        preserve_main_state: bool = False,
     ) -> object:
-        manual_changes.append((reason, preserve_zone_entity_id))
+        manual_changes.append((reason, preserve_zone_entity_id, preserve_main_state))
 
         async def complete() -> None:
             return None
@@ -1573,9 +1613,71 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
 
     coordinator._async_handle_manual_hvac_change = capture_manual_change
     callback(FakeEvent("switch.zone", "on", "off"))
+    callback(
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        )
+    )
+    coordinator.executor.pending_hvac_desired_state = {
+        "target_temperature": 21,
+    }
+    callback(
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        )
+    )
+    coordinator.executor.pending_hvac_desired_state.update(
+        {
+            "enable_zones": True,
+            "configured_zones_only": True,
+        }
+    )
+    callback(
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 24},
+        )
+    )
+    coordinator.hass.states.values["input_boolean.scheduler_change"] = "on"
+    callback(
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 21},
+            new_attributes={"temperature": 24},
+        )
+    )
 
-    assert len(coordinator.hass.created_tasks) == 2
-    assert manual_changes == [("climate_zone_changed", "switch.zone")]
+    assert len(coordinator.hass.created_tasks) == 5
+    assert coordinator.executor.pending_hvac_manual_overrides == 1
+    assert coordinator.executor.pending_hvac_manual_zone_overrides == [
+        "climate.zone_temperature"
+    ]
+    assert coordinator.executor.pending_hvac_desired_state == {
+        "target_temperature": 21,
+        "enable_zones": True,
+        "configured_zones_only": True,
+        "manual_zone_entity_ids": ["climate.zone_temperature"],
+        "manual_override_detected": True,
+    }
+    assert manual_changes == [
+        ("climate_zone_changed", "switch.zone", False),
+        ("daikin_state_changed", None, True),
+        ("climate_zone_changed", "climate.zone_temperature", False),
+        ("daikin_state_changed", None, True),
+    ]
 
     startup = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     startup.hass = FakeHass({"input_boolean.override": "on"})
@@ -2549,7 +2651,7 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         "enphase_profile_entity": "select.enphase",
     }
 
-    assert _is_planner_owned_control_feedback(
+    assert not _is_planner_owned_control_feedback(
         entry_data,
         {"execution_audit": []},
         FakeEvent(
@@ -2559,7 +2661,11 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
             new_attributes={"temperature": 21},
         ),
         now,
-        pending_hvac_desired_state={"enable_zones": True, "target_temperature": 21},
+        pending_hvac_desired_state={
+            "enable_zones": True,
+            "target_temperature": 21,
+            "configured_zones_only": True,
+        },
     )
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -2569,7 +2675,11 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
                     "result": "applied",
                     "asset": "daikin",
                     "attempted_at": now,
-                    "desired_state": {"enable_zones": True, "target_temperature": 21},
+                    "desired_state": {
+                        "enable_zones": True,
+                        "target_temperature": 21,
+                        "configured_zones_only": True,
+                    },
                 }
             ]
         },
@@ -2594,6 +2704,58 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
                         "enable_zones": True,
                         "target_temperature": 21,
                         "configured_zones_only": True,
+                    },
+                }
+            ]
+        },
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+        now,
+    )
+    unsynchronized_zone_event = FakeEvent(
+        "climate.zone_temperature",
+        "heat",
+        "heat",
+        old_attributes={"temperature": 20},
+        new_attributes={"temperature": 21},
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        unsynchronized_zone_event,
+        now,
+        pending_hvac_desired_state={
+            "enable_zones": True,
+            "target_temperature": 21,
+            "configured_zones_only": False,
+        },
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        unsynchronized_zone_event,
+        {
+            "enable_zones": True,
+            "target_temperature": 21,
+            "configured_zones_only": False,
+        },
+    ) == "climate.zone_temperature"
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {
+            "execution_audit": [
+                {
+                    "result": "applied",
+                    "asset": "daikin",
+                    "attempted_at": now,
+                    "desired_state": {
+                        "enable_zones": True,
+                        "target_temperature": 21,
+                        "configured_zones_only": False,
                     },
                 }
             ]
@@ -2632,6 +2794,66 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
             }
         },
     )
+    mismatched_zone_event = FakeEvent(
+        "climate.zone_temperature",
+        "heat",
+        "heat",
+        old_attributes={"temperature": 20},
+        new_attributes={"temperature": 24},
+    )
+    pending_zone_restore = {
+        "restore_zones": {
+            "climate.zone_temperature": {"target_temperature": 20},
+        }
+    }
+    assert not _matches_pending_zone_hvac_feedback(
+        {"target_temperature": 20},
+        mismatched_zone_event,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        mismatched_zone_event,
+        now,
+        pending_hvac_desired_state=pending_zone_restore,
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        mismatched_zone_event,
+        pending_zone_restore,
+    ) == "climate.zone_temperature"
+    assert not _matches_pending_zone_hvac_feedback(
+        {"target_temperature": 20},
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20, "fan_mode": "auto"},
+            new_attributes={"temperature": 20, "fan_mode": "high"},
+        ),
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        SimpleNamespace(
+            data={
+                "entity_id": "switch.zone",
+                "old_state": None,
+                "new_state": SimpleNamespace(state="on", attributes={}),
+            }
+        ),
+        {"enable_zones": True},
+    ) is None
+    unchanged_switch_event = FakeEvent("switch.zone", "on", "on")
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        unchanged_switch_event,
+        {"enable_zones": True},
+    ) is None
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        FakeEvent("switch.zone", "on", "off"),
+        {"restore_zones": {"switch.zone": "off"}},
+    ) is None
     assert _is_planner_owned_control_feedback(
         entry_data,
         {"execution_audit": []},
@@ -2639,6 +2861,21 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         now,
         pending_hvac_desired_state={"enable_zones": True},
     )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        FakeEvent("switch.zone", "off", "on"),
+        {"enable_zones": False},
+    ) == "switch.zone"
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        FakeEvent("switch.zone", "on", "off"),
+        {"enable_zones": True},
+    ) == "switch.zone"
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        FakeEvent("switch.zone", "off", "on"),
+        {"enable_zones": True},
+    ) is None
     assert _is_planner_owned_control_feedback(
         entry_data,
         {
@@ -2695,7 +2932,7 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         ),
         now,
     )
-    assert not _is_planner_owned_control_feedback(
+    assert _is_planner_owned_control_feedback(
         entry_data,
         {
             "execution_audit": [
@@ -2719,7 +2956,7 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         ),
         now,
     )
-    assert not _is_planner_owned_control_feedback(
+    assert _is_planner_owned_control_feedback(
         entry_data,
         {"execution_audit": []},
         FakeEvent(
@@ -2765,6 +3002,37 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         now,
         pending_hvac_desired_state={"target_temperature": 21},
     )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 21},
+            new_attributes={"temperature": 24},
+        ),
+        now,
+        pending_hvac_desired_state={"target_temperature": 21},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 23},
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "restore_main": {
+                "hvac_mode": "off",
+                "target_temperature": 20,
+            }
+        },
+    )
     assert _is_planner_owned_control_feedback(
         entry_data,
         {"execution_audit": []},
@@ -2778,7 +3046,154 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         pending_hvac_desired_state={
             "hvac_mode": "heat",
             "target_temperature": 21,
+            "turn_on_feedback_expected": True,
         },
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "off",
+            "cool",
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+        },
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "cool",
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+        },
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "off",
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+        },
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "cool",
+            "heat",
+            new_attributes={"temperature": 21},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 21,
+        },
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "cool",
+            new_attributes={"temperature": 20},
+        ),
+        now,
+        pending_hvac_desired_state={
+            "restore_main": {
+                "hvac_mode": "off",
+                "target_temperature": 20,
+                "rollback_active_hvac_mode": "cool",
+            }
+        },
+    )
+
+    assert _matches_pending_main_hvac_feedback(
+        {"target_temp_low": 20, "target_temp_high": 25},
+        FakeEvent(
+            "climate.daikin",
+            "heat_cool",
+            "heat_cool",
+            old_attributes={"target_temp_low": 19, "target_temp_high": 24},
+            new_attributes={"target_temp_low": 20.0, "target_temp_high": 25.0},
+        ),
+    )
+    assert not _matches_pending_main_hvac_feedback(
+        {"target_temp_low": 20, "target_temp_high": 25},
+        FakeEvent(
+            "climate.daikin",
+            "heat_cool",
+            "heat_cool",
+            old_attributes={"target_temp_low": 19, "target_temp_high": 24},
+            new_attributes={"target_temp_low": 20, "target_temp_high": 26},
+        ),
+    )
+    assert not _matches_pending_main_hvac_feedback(
+        {"target_temperature": 21},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"fan_mode": "auto"},
+            new_attributes={"fan_mode": "high"},
+        ),
+    )
+    missing_old_state = FakeEvent("climate.daikin", "heat", "heat")
+    missing_old_state.data["old_state"] = None
+    assert not _is_pending_main_hvac_manual_change(
+        entry_data,
+        missing_old_state,
+        {"target_temperature": 21},
+    )
+    missing_new_state = FakeEvent("climate.daikin", "heat", "heat")
+    missing_new_state.data["new_state"] = None
+    assert not _matches_pending_main_hvac_feedback(
+        {"target_temperature": 21},
+        missing_new_state,
+    )
+    assert not _matches_pending_main_hvac_feedback(
+        {"target_temperature": 21},
+        FakeEvent("climate.daikin", "heat", "heat"),
+    )
+    assert not _matches_pending_main_hvac_feedback(
+        {},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 21},
+        ),
+    )
+    assert not _matches_pending_main_hvac_feedback(
+        {"target_temperature": 21},
+        FakeEvent(
+            "climate.daikin",
+            "heat",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": "invalid"},
+        ),
     )
     assert _is_planner_owned_control_feedback(
         entry_data,
@@ -3936,6 +4351,22 @@ def test_manual_hvac_change_handler_uses_configured_duration() -> None:
 
     assert coordinator.overrides[-1].reason == "climate_zone_changed"
     assert coordinator.executor.hvac_release_preserved_zones == ["climate.bedrooms"]
+    assert coordinator.executor.hvac_release_preserved_main == [False]
+    assert coordinator.refresh_requested == 1
+
+
+def test_manual_main_hvac_change_handler_preserves_user_state() -> None:
+    coordinator = _coordinator_for_runtime_services(options={"manual_hvac_override_minutes": 45})
+
+    asyncio.run(
+        coordinator._async_handle_manual_hvac_change(
+            "daikin_state_changed",
+            preserve_main_state=True,
+        )
+    )
+
+    assert coordinator.overrides[-1].reason == "daikin_state_changed"
+    assert coordinator.executor.hvac_release_preserved_main == [True]
     assert coordinator.refresh_requested == 1
 
 

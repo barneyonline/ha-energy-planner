@@ -4,7 +4,11 @@
 
 ### 🚧 Breaking changes
 
-- None
+- **Precondition configured zones only** is now **Synchronise configured zone
+  temperatures**. Daikin preconditioning always changes the main thermostat
+  target; when synchronisation is enabled, it then applies the same target to
+  configured zone thermostats. The former main-setpoint-preserving behavior is
+  no longer supported.
 
 ### ✨ New features
 
@@ -12,7 +16,33 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Daikin HVAC control now confirms the main target before setting subordinate
+  zone temperatures, allowing the device to refresh zone temperature bounds
+  derived from the main setpoint. Target changes fail closed before takeover
+  when a main or synchronized zone target cannot be captured for rollback.
+- Disabling configured-zone temperature synchronisation now leaves climate-zone
+  targets unchanged, and a failed synchronized takeover restores the captured
+  main mode and target before reporting a successful rollback. When takeover
+  starts from off, rollback also restores the active mode Daikin remembered for
+  its next turn-on before switching it off again. Unresolved main state is
+  retained for a later release retry, while a subsequent manual change to the
+  main thermostat durably supersedes that snapshot before release and is left
+  untouched across restarts. An originally-off thermostat is always commanded
+  back off even if an earlier mode or target restoration step fails, and no new
+  HVAC acquisition can clear an unresolved main-state snapshot before recovery.
+  Main-target feedback published during a multi-call transaction is ignored
+  only when it matches the pending planner or rollback target, so a different
+  user setpoint still creates a manual override even while the scheduler guard
+  is active. An off-to-active intermediate mode is accepted only during the
+  adapter's explicit turn-on phase. The in-flight transaction, release, or
+  safe-state recovery then stops restoring the main thermostat, durably
+  preserves the user's mode and target, and restores only subordinate zones
+  and automations. Unexpected mode transitions follow the same path. Pending
+  zone feedback is also matched to the exact commanded or restored target;
+  a different user zone target is durably removed from rollback ownership and
+  remains untouched while the main thermostat, other zones, and automations
+  return to their captured states. Manual supersession is rechecked after
+  persistence and confirmation awaits and before automation rollback calls.
 
 ### 🔧 Improvements
 
