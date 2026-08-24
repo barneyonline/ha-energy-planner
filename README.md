@@ -192,6 +192,12 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   consecutive healthy awaited checks revalidate the production contract,
   reconcile safe state, re-arm, and verify a fresh active plan. Any unhealthy
   check resets the sequence. Success is silent and dismisses the prior warning.
+  A production-evidence contract change discovered during startup also enters
+  this fail-closed recovery path when the installation was previously armed and
+  automatic control is still requested. Only fail-safe stop, release, or restore
+  commands may run until the new contract passes all three checks and the final
+  active-plan verification; new start, schedule, or takeover commands remain
+  blocked.
   Operator disable, explicit safety-gate arm or disarm, pause, or a
   configuration change remains immediately authoritative. Terminal operator
   cancellation dismisses the superseded recovery warning. Whole-Home-Assistant
@@ -244,6 +250,23 @@ Pass a test file, node ID, or any additional pytest arguments to target a change
 scripts/docker-pytest-fast.sh tests/test_planner.py
 scripts/docker-pytest-fast.sh tests/test_planner.py::test_active_plan_turns_hvac_off_when_away
 ```
+
+For the Home Assistant integration smoke path alone, run:
+
+```bash
+scripts/docker-ha-smoke.sh
+```
+
+The smoke harness coalesces queued coordinator refreshes, waits for background
+device execution and AI advice, and stops Home Assistant as soon as the scenario
+is complete. Its 240-second limit is a failure deadline, not a fixed runtime.
+
+Pull requests classify their changed files before starting the expensive test
+jobs. Integration changes run the full pytest, quality-scale, and validation
+set; test-only and tooling changes run their affected subsets; documentation
+changes avoid the full pytest and Home Assistant validation jobs. Pushes and
+manual Tests runs continue to execute the complete non-smoke CI job set. Run
+`scripts/docker-validate.sh` for the complete gate, including the smoke test.
 
 Start a local Home Assistant instance with:
 

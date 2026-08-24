@@ -286,7 +286,14 @@ Status as of 2026-08-15.
   `scripts/docker-validate.sh`, `scripts/docker-ha-smoke.sh`, and
   `docker compose`. The full validation gate runs compile and Ruff checks, Dockerized
   pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant
-  `check_config`, and the smoke test in one repeatable sequence. The smoke test
+  `check_config`, and the smoke test in one repeatable sequence. The smoke harness
+  coalesces queued coordinator refreshes, waits for background execution, and
+  stops Home Assistant on an explicit completion marker instead of consuming its
+  full failure timeout. Pull-request CI classifies changed paths with
+  `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
+  fails safe to the full non-smoke CI set for an unclassified trigger path.
+  Pushes and manual Tests runs retain that non-smoke set; `scripts/docker-validate.sh`
+  remains the complete gate including smoke. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
@@ -406,7 +413,11 @@ Status as of 2026-08-15.
   production evidence fingerprint includes the measured mapping and built-in
   forecast contract version, but excludes routine model values and retraining
   timestamps. A mismatch restores safe state and explicitly disarms production
-  control before new dry-run review cycles. Explicit operator arming also
+  control. When startup finds the mismatch on a previously armed installation
+  whose automatic-control intent is still active, it persists a restart-safe
+  handoff and requires three fresh non-commanding validation plans plus final
+  active-plan verification before re-arming; otherwise new dry-run review cycles
+  remain required. Explicit operator arming also
   requires current preflight and matching evidence rather than merely setting
   the persisted armed flag. Relevant evidence is exposed through
   the existing Current state, Next actions, calendar, diagnostics, and support
@@ -563,6 +574,9 @@ Status as of 2026-08-15.
   superseded recovery warning. A failed configuration-reload platform unload
   resumes the disarmed recovery lifecycle on the still-loaded coordinator. A
   restarted disarmed recovery resumes with its counter reset.
+  A production-evidence mismatch found while reconciling a previously armed
+  startup follows the same disarmed recovery lifecycle, so migrations cannot
+  leave automatic-control intent stranded without a background recovery task.
   Recovery is registered as Home Assistant background work so its grace and
   validation waits cannot hold bootstrap open.
 - EV ready-by wall times are resolved in Home Assistant's configured timezone,

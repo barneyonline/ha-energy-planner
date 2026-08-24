@@ -9,10 +9,12 @@ on:
       - "scripts/**"
       - "README.md"
       - "ha-energy-planner-spec.md"
+      - "hacs.json"
       - "pyproject.toml"
       - "quality_scale.yaml"
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
+      - ".github/workflows/quality-scale.yml"
       - ".github/workflows/codespell.yml"
       - ".github/workflows/hassfest.yml"
       - ".github/workflows/validate.yaml"
@@ -31,7 +33,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      pytest: ${{ steps.select.outputs.pytest }}
+      quality_scale: ${{ steps.select.outputs.quality_scale }}
+      validation_extras: ${{ steps.select.outputs.validation_extras }}
+      dedicated_quality_scale: ${{ steps.select.outputs.dedicated_quality_scale }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Select checks for this change set
+        id: select
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --no-renames --name-only --diff-filter=ACDMRT "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed-files.txt"
+            python3 scripts/select_ci_checks.py --paths-file "$RUNNER_TEMP/changed-files.txt" >> "$GITHUB_OUTPUT"
+          else
+            python3 scripts/select_ci_checks.py --all >> "$GITHUB_OUTPUT"
+          fi
+
   pytest-coverage:
+    needs: changes
+    if: needs.changes.outputs.pytest == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -68,12 +97,48 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./junit.xml
           report_type: test_results
-      - name: Run quality-scale, lint, fixture, and Home Assistant config validation
-        if: ${{ steps.pytest.outcome == 'success' }}
-        env:
-          HEP_SKIP_HA_SMOKE: "1"
-          HEP_SKIP_PYTEST: "1"
-        run: scripts/docker-validate.sh
       - name: Fail if tests failed
         if: ${{ steps.pytest.outcome == 'failure' }}
         run: exit 1
+
+  quality-scale:
+    needs: changes
+    if: >-
+      needs.changes.outputs.quality_scale == 'true' &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.dedicated_quality_scale != 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Validate quality scale evidence in Home Assistant Docker
+        run: >
+          docker run --rm
+          -v "$PWD:/work"
+          -w /work
+          ghcr.io/home-assistant/home-assistant:stable
+          python3 scripts/validate_quality_scale.py
+      - name: Test quality scale and manifest contracts in Home Assistant Docker
+        run: >
+          docker run --rm
+          -v "$PWD:/work"
+          -w /work
+          ghcr.io/home-assistant/home-assistant:stable
+          python3 -m pytest -q
+          tests/scripts/test_validate_quality_scale.py
+          tests/test_manifest.py
+
+  validation-extras:
+    needs: changes
+    if: needs.changes.outputs.validation_extras == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run lint, fixture, and Home Assistant config validation
+        env:
+          HEP_SKIP_HA_SMOKE: "1"
+          HEP_SKIP_PYTEST: "1"
+          HEP_SKIP_QUALITY_SCALE: "1"
+        run: scripts/docker-validate.sh
