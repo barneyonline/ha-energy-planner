@@ -2220,15 +2220,98 @@ def test_executor_reports_dry_run_as_skipped_before_plan_violations() -> None:
 def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object) -> None:
     class FakeDaikinAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
-            pass
+            self.persist_main_state: Any = None
+            self.manual_override_check: Any = None
+            self.persist_manual_supersession: Any = None
+            self.zone_manual_override_check: Any = None
+            self.persist_zone_supersession: Any = None
+            self.persist_supersessions: Any = None
+            self.set_turn_on_feedback: Any = None
+            self.set_pending_main_restore: Any = None
+            self.set_pending_zone_restore: Any = None
 
-        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, str]]:
-            return {"automation.hvac": "on"}, {"switch.zone": "off"}
+        def set_main_state_persistence_callback(self, callback: Any) -> None:
+            self.persist_main_state = callback
+
+        def set_manual_override_check(self, callback: Any) -> None:
+            self.manual_override_check = callback
+
+        def set_manual_override_persistence_callback(self, callback: Any) -> None:
+            self.persist_manual_supersession = callback
+
+        def set_zone_manual_override_check(self, callback: Any) -> None:
+            self.zone_manual_override_check = callback
+
+        def set_zone_manual_override_persistence_callback(self, callback: Any) -> None:
+            self.persist_zone_supersession = callback
+
+        def set_manual_supersession_persistence_callback(self, callback: Any) -> None:
+            self.persist_supersessions = callback
+
+        def set_turn_on_feedback_callback(self, callback: Any) -> None:
+            self.set_turn_on_feedback = callback
+
+        def set_pending_main_restore_callback(self, callback: Any) -> None:
+            self.set_pending_main_restore = callback
+
+        def set_pending_zone_restore_callback(self, callback: Any) -> None:
+            self.set_pending_zone_restore = callback
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
+            return {"automation.hvac": "on"}, {
+                "switch.zone": "off",
+                "climate.zone_temperature": {"target_temperature": 21},
+            }
+
+        def main_takeover_snapshot(self) -> dict[str, Any]:
+            return {"hvac_mode": "off", "target_temperature": 20}
 
         async def async_execute(self, action: PlanAction) -> object:
+            assert self.manual_override_check() is False
+            assert callable(self.persist_manual_supersession)
+            assert self.zone_manual_override_check() == set()
+            assert callable(self.persist_zone_supersession)
+            assert callable(self.persist_supersessions)
+            self.set_turn_on_feedback(True)
+            assert executor.pending_hvac_desired_state[
+                "turn_on_feedback_expected"
+            ] is True
+            self.set_turn_on_feedback(False)
+            self.set_pending_main_restore(
+                {"hvac_mode": "off", "target_temperature": 20}
+            )
+            assert executor.pending_hvac_desired_state["restore_main"] == {
+                "hvac_mode": "off",
+                "target_temperature": 20,
+            }
+            self.set_pending_zone_restore(
+                {"switch.zone": "off"}
+            )
+            assert executor.pending_hvac_desired_state["restore_zones"] == {
+                "switch.zone": "off"
+            }
             assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
             assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
+            assert store.data["ownership"]["hvac_control"]["main_state"] == {
+                "hvac_mode": "off",
+                "target_temperature": 20,
+            }
             assert store.flush_count >= 1
+            await self.persist_main_state(
+                {
+                    "hvac_mode": "off",
+                    "target_temperature": 20,
+                    "rollback_hvac_mode_changed": True,
+                    "rollback_active_hvac_mode": "cool",
+                }
+            )
+            assert store.data["ownership"]["hvac_control"]["main_state"] == {
+                "hvac_mode": "off",
+                "target_temperature": 20,
+                "rollback_hvac_mode_changed": True,
+                "rollback_active_hvac_mode": "cool",
+            }
+            assert store.flush_count >= 2
             return type(
                 "Result",
                 (),
@@ -2298,8 +2381,9 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     assert store.data["ownership"]["hvac_control"]["coast_target"] == 19.0
     assert store.data["ownership"]["hvac_control"]["projected_precondition_end_temperature"] == 21.0
     assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
+    assert "main_state" not in store.data["ownership"]["hvac_control"]
     assert "planner_hvac_action_expires_at" in store.data["ownership"]
-    assert store.flush_count == 1
+    assert store.flush_count == 2
 
     takeover_started_at = store.data["ownership"]["planner_takeover_started_at"]
     peak_action = replace(
@@ -2310,7 +2394,75 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     asyncio.run(executor.async_evaluate(replace(plan, actions=[peak_action])))
 
     assert store.data["ownership"]["planner_takeover_started_at"] == takeover_started_at
-    assert store.flush_count == 2
+    assert store.flush_count == 4
+
+
+def test_executor_marks_only_an_active_hvac_transaction_as_manual() -> None:
+    executor = Executor(FakeStore())
+
+    assert executor.mark_pending_hvac_manual_override() is False
+    assert executor.mark_pending_hvac_zone_manual_override("switch.zone") is False
+    assert executor.mark_pending_hvac_zone_manual_override("") is False
+    executor.pending_hvac_desired_state = {"target_temperature": 21}
+
+    assert executor.mark_pending_hvac_manual_override() is True
+    assert executor.mark_pending_hvac_zone_manual_override("switch.zone") is True
+    assert executor.mark_pending_hvac_zone_manual_override("switch.zone") is True
+    assert executor.pending_hvac_desired_state == {
+        "target_temperature": 21,
+        "manual_override_detected": True,
+        "manual_zone_entity_ids": ["switch.zone"],
+    }
+
+
+def test_executor_flushes_manual_main_supersession_without_losing_subordinates() -> None:
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "zone_states": {"switch.zone": "off"},
+        },
+    }
+    executor = Executor(store)
+
+    asyncio.run(executor._async_persist_provisional_hvac_manual_supersession())
+
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {"zone_states": {"switch.zone": "off"}},
+    }
+    assert store.flush_count == 1
+
+
+def test_executor_flushes_manual_zone_supersession_without_losing_other_evidence() -> None:
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "zone_states": {
+                "climate.manual_zone": {"target_temperature": 22},
+                "switch.other_zone": "off",
+            },
+        },
+    }
+    executor = Executor(store)
+
+    asyncio.run(
+        executor._async_persist_provisional_hvac_zone_supersession(
+            {"climate.manual_zone"}
+        )
+    )
+
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "zone_states": {"switch.other_zone": "off"},
+        },
+    }
+    assert store.flush_count == 1
 
 
 def test_executor_marks_away_off_without_taking_zone_ownership(
@@ -2324,14 +2476,31 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
             return {"automation.hvac": "on"}, {"switch.zone": "off"}
 
         async def async_execute(self, action: PlanAction) -> object:
-            assert action.desired_state == {"hvac_mode": "off"}
+            if action.desired_state == {"hvac_mode": "off"}:
+                saved_zone_states: dict[str, str] = {}
+                post_state = {
+                    "climate.daikin": "off",
+                    "switch.zone": "off",
+                }
+            else:
+                # The away-off phase already created an empty zone ownership
+                # map. A later phase must merge this newly acquired baseline
+                # before the adapter can mutate the zone.
+                assert store.data["ownership"]["hvac_control"][
+                    "zone_states"
+                ] == {"switch.zone": "off"}
+                saved_zone_states = {"switch.zone": "off"}
+                post_state = {
+                    "climate.daikin": "heat",
+                    "switch.zone": "on",
+                }
             return SimpleNamespace(
                 applied=True,
                 reason="hvac_action_applied",
                 pre_state={"climate.daikin": "heat", "switch.zone": "off"},
-                post_state={"climate.daikin": "off", "switch.zone": "off"},
+                post_state=post_state,
                 saved_automation_states={"automation.hvac": "on"},
-                saved_zone_states={},
+                saved_zone_states=saved_zone_states,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -2378,6 +2547,25 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
     assert away_control["zone_states"] == {}
     assert away_control["phase"] == "away_off"
     assert isinstance(away_control["started_at"], datetime)
+
+    precondition_action = replace(
+        action,
+        action_id="hvac-precondition",
+        desired_state={
+            "hvac_mode": "heat",
+            "target_temperature": 23,
+            "enable_zones": True,
+        },
+    )
+    asyncio.run(
+        executor.async_evaluate(
+            replace(plan, actions=[precondition_action]),
+        )
+    )
+
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {
+        "switch.zone": "off",
+    }
 
 
 @pytest.mark.parametrize(
@@ -2574,6 +2762,185 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
     assert store.data["outcomes"][0].reason == "hvac_control_service_failed"
 
 
+def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
+    monkeypatch: object,
+) -> None:
+    class RaisingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
+            return {}, {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            }
+
+        def main_takeover_snapshot(self) -> dict[str, Any]:
+            return {"hvac_mode": "off", "target_temperature": 20}
+
+        async def async_execute(self, action: PlanAction) -> object:
+            assert executor.mark_pending_hvac_manual_override() is True
+            assert executor.mark_pending_hvac_zone_manual_override(
+                "climate.bedrooms"
+            ) is True
+            raise RuntimeError("unexpected adapter failure")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "phase": "preconditioning",
+            "hvac_mode": "heat",
+            "target_temperature": 23.0,
+            "enable_zones": True,
+            "configured_zones_only": True,
+        },
+        [],
+        [],
+        None,
+        1.0,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "off"}),
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True},
+    )
+    _arm_store(store, executor)
+
+    with pytest.raises(RuntimeError, match="unexpected adapter failure"):
+        asyncio.run(executor.async_evaluate(plan))
+
+    hvac_control = store.data["ownership"]["hvac_control"]
+    assert "main_state" not in hvac_control
+    assert hvac_control["zone_states"] == {"switch.living": "off"}
+    assert store.flush_count == 2
+
+
+@pytest.mark.parametrize("rollback_succeeded", [True, False])
+def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
+    monkeypatch: object,
+    rollback_succeeded: bool,
+) -> None:
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            self.persist_zone_supersession: Any = None
+
+        def set_zone_manual_override_persistence_callback(
+            self,
+            callback: Any,
+        ) -> None:
+            self.persist_zone_supersession = callback
+
+        def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
+            return {}, {}
+
+        async def async_execute(self, action: PlanAction) -> object:
+            assert executor.mark_pending_hvac_manual_override() is True
+            assert executor.mark_pending_hvac_zone_manual_override(
+                "climate.manual_zone"
+            ) is True
+            await self.persist_zone_supersession({"climate.manual_zone"})
+            return SimpleNamespace(
+                applied=False,
+                reason="manual_hvac_override_detected",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={
+                    "climate.manual_zone": {"target_temperature": 20},
+                },
+                rollback_succeeded=rollback_succeeded,
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {
+            "phase": "preconditioning",
+            "target_temperature": 23.0,
+            "enable_zones": True,
+            "configured_zones_only": True,
+        },
+        [],
+        [],
+        None,
+        1.0,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "phase": "preconditioning",
+            "main_state": {},
+            "zone_states": {
+                "climate.manual_zone": {"target_temperature": 20},
+                "switch.other_zone": "off",
+            },
+        },
+    }
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "heat"}),
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True},
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan))
+
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {
+        "switch.other_zone": "off"
+    }
+    assert "main_state" not in store.data["ownership"]["hvac_control"]
+    if not rollback_succeeded:
+        assert store.data["ownership"]["hvac_control"][
+            "required_evidence_lost"
+        ] == "hvac_acquisition_rollback_failed"
+    assert store.data["outcomes"][0].reason == "manual_hvac_override_detected"
+
+
 def test_hvac_specific_release_restores_zones_without_touching_other_assets(monkeypatch: object) -> None:
     restored: list[tuple[dict[str, str], dict[str, str]]] = []
 
@@ -2618,6 +2985,101 @@ def test_hvac_specific_release_restores_zones_without_touching_other_assets(monk
     }
 
 
+def test_hvac_specific_release_restores_persisted_main_state(monkeypatch: object) -> None:
+    restored: list[tuple[dict[str, str], dict[str, Any], dict[str, Any]]] = []
+
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, Any],
+            main_state: dict[str, Any],
+        ) -> object:
+            restored.append((dict(automations), dict(zones), dict(main_state)))
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+                saved_main_state={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"switch.zone": "off"},
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "required_evidence_lost": "hvac_acquisition_rollback_failed",
+        },
+    }
+
+    outcome = asyncio.run(
+        Executor(store, hass=FakeHass()).async_release_hvac_control("retry")
+    )
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [
+        (
+            {"automation.hvac": "on"},
+            {"switch.zone": "off"},
+            {"hvac_mode": "off", "target_temperature": 20},
+        )
+    ]
+    assert store.data["ownership"] == {}
+
+
+def test_hvac_specific_release_retains_unresolved_main_state(monkeypatch: object) -> None:
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, Any],
+            main_state: dict[str, Any],
+        ) -> object:
+            return SimpleNamespace(
+                applied=False,
+                rollback_succeeded=False,
+                reason="hvac_release_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+                saved_main_state=main_state,
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    saved_main_state = {"hvac_mode": "off", "target_temperature": 20}
+    store = FakeStore()
+    store.data["ownership"] = {
+        "hvac_control": {
+            "zone_states": {},
+            "main_state": saved_main_state,
+        },
+    }
+
+    outcome = asyncio.run(
+        Executor(store, hass=FakeHass()).async_release_hvac_control("retry")
+    )
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert store.data["ownership"]["hvac_control"] == {
+        "zone_states": {},
+        "main_state": saved_main_state,
+        "required_evidence_lost": "hvac_release_failed",
+    }
+
+
 def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) -> None:
     restored: list[dict[str, Any]] = []
 
@@ -2630,6 +3092,10 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
             automations: dict[str, str],
             zones: dict[str, Any],
         ) -> object:
+            assert "climate.bedrooms" not in store.data["ownership"][
+                "hvac_control"
+            ]["zone_states"]
+            assert store.flush_count == 1
             restored.append(dict(zones))
             return SimpleNamespace(
                 applied=True,
@@ -2670,6 +3136,10 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
             pass
 
         async def async_restore(self, *args: object) -> object:
+            assert "climate.bedrooms" not in failed_store.data["ownership"][
+                "hvac_control"
+            ]["zone_states"]
+            assert failed_store.flush_count == 1
             raise RuntimeError("restore failed")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailingDaikinAdapter)
@@ -2691,6 +3161,99 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
 
     assert failed.result == OutcomeResult.FAILED
     assert failed_store.data["ownership"]["hvac_control"]["zone_states"] == {}
+
+
+def test_manual_hvac_release_preserves_changed_main_state(monkeypatch: object) -> None:
+    restored: list[tuple[dict[str, str], dict[str, Any]]] = []
+
+    class FakeDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(
+            self,
+            automations: dict[str, str],
+            zones: dict[str, Any],
+        ) -> object:
+            assert "main_state" not in store.data["ownership"]["hvac_control"]
+            assert store.flush_count == 1
+            restored.append((dict(automations), dict(zones)))
+            return SimpleNamespace(
+                applied=True,
+                rollback_succeeded=True,
+                reason="hvac_control_released",
+                pre_state={},
+                post_state={},
+                saved_automation_states={},
+                saved_zone_states={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"switch.zone": "off"},
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "required_evidence_lost": "hvac_acquisition_rollback_failed",
+        },
+    }
+
+    outcome = asyncio.run(
+        Executor(store, hass=FakeHass()).async_release_hvac_control(
+            "daikin_state_changed",
+            preserve_main_state=True,
+        )
+    )
+
+    assert outcome.result == OutcomeResult.RESTORED
+    assert restored == [
+        ({"automation.hvac": "on"}, {"switch.zone": "off"})
+    ]
+    assert store.data["ownership"] == {}
+
+
+def test_hvac_release_exception_does_not_reintroduce_inflight_manual_changes(
+    monkeypatch: object,
+) -> None:
+    class RaisingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, *args: object) -> object:
+            assert executor.mark_pending_hvac_manual_override() is True
+            assert executor.mark_pending_hvac_zone_manual_override(
+                "climate.bedrooms"
+            ) is True
+            raise RuntimeError("unexpected adapter failure")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            },
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "phase": "peak_coast",
+        },
+    }
+    executor = Executor(store, hass=FakeHass())
+
+    outcome = asyncio.run(executor.async_release_hvac_control("retry"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert store.flush_count == 1
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"switch.living": "off"},
+            "phase": "peak_coast",
+            "required_evidence_lost": "hvac_release_failed",
+        },
+    }
 
 
 def test_planned_hvac_release_bypasses_normal_execution_gates() -> None:
@@ -2935,7 +3498,9 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
 
 
 def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: object) -> None:
-    restored_states: list[tuple[dict[str, str], dict[str, str]]] = []
+    restored_states: list[
+        tuple[dict[str, str], dict[str, str], dict[str, Any]]
+    ] = []
 
     class TransactionalDaikinAdapter:
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -2953,19 +3518,28 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
                 },
             )
 
+        def main_takeover_snapshot(self) -> dict[str, Any]:
+            return {"hvac_mode": "heat", "target_temperature": 20}
+
         async def async_execute(self, action: PlanAction) -> object:
             return SimpleNamespace(
                 applied=False,
-                reason="hvac_automation_rollback_failed",
+                reason="hvac_acquisition_rollback_failed",
                 pre_state={"automation.hvac": "on"},
                 post_state={"automation.hvac": "off"},
                 saved_automation_states={"automation.hvac": "on"},
                 saved_zone_states={"switch.zone": "off"},
+                saved_main_state={"hvac_mode": "heat", "target_temperature": 20},
                 rollback_succeeded=False,
             )
 
-        async def async_restore(self, states: dict[str, str], zones: dict[str, str]) -> object:
-            restored_states.append((dict(states), dict(zones)))
+        async def async_restore(
+            self,
+            states: dict[str, str],
+            zones: dict[str, str],
+            main_state: dict[str, Any],
+        ) -> object:
+            restored_states.append((dict(states), dict(zones), dict(main_state)))
             return SimpleNamespace(
                 applied=True,
                 rollback_succeeded=True,
@@ -3017,12 +3591,116 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
     assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
     assert store.data["ownership"]["hvac_control"] == {
         "zone_states": {"switch.zone": "off"},
+        "main_state": {"hvac_mode": "heat", "target_temperature": 20},
         "required_evidence_lost": "hvac_acquisition_rollback_failed",
     }
     outcome = asyncio.run(executor.async_restore_safe_state("retry"))
     assert outcome.result == OutcomeResult.RESTORED
-    assert restored_states == [({"automation.hvac": "on"}, {"switch.zone": "off"})]
+    assert restored_states == [
+        (
+            {"automation.hvac": "on"},
+            {"switch.zone": "off"},
+            {"hvac_mode": "heat", "target_temperature": 20},
+        )
+    ]
     assert store.data["ownership"] == {}
+
+
+def test_executor_recovers_unresolved_main_before_new_acquisition(
+    monkeypatch: object,
+) -> None:
+    restored_main_states: list[dict[str, Any]] = []
+
+    class RecoveryOnlyDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_execute(self, action: PlanAction) -> object:
+            raise AssertionError("new acquisition must wait for main recovery")
+
+        async def async_restore(
+            self,
+            states: dict[str, str],
+            zones: dict[str, Any],
+            main_state: dict[str, Any],
+        ) -> object:
+            restored_main_states.append(dict(main_state))
+            return SimpleNamespace(
+                applied=False,
+                rollback_succeeded=False,
+                reason="hvac_release_failed",
+                pre_state={"climate.daikin": "heat"},
+                post_state={"climate.daikin": "heat"},
+                saved_automation_states=states,
+                saved_zone_states=zones,
+                saved_main_state=main_state,
+            )
+
+    monkeypatch.setattr(
+        executor_module,
+        "DaikinHVACAdapter",
+        RecoveryOnlyDaikinAdapter,
+    )
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-new-acquisition",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"hvac_mode": "cool"},
+        [],
+        [],
+        None,
+        1.0,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    saved_main_state = {"hvac_mode": "off", "target_temperature": 20}
+    store = FakeStore()
+    store.data["ownership"] = {
+        "hvac_control": {
+            "zone_states": {},
+            "main_state": saved_main_state,
+            "required_evidence_lost": "hvac_acquisition_rollback_failed",
+        },
+    }
+    executor = Executor(
+        store,
+        hass=FakeHass({"climate.daikin": "heat"}),
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={
+            **DEFAULT_OPTIONS,
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+            "planner_enabled": True,
+            "dry_run": False,
+        },
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan, _context(now)))
+
+    assert restored_main_states == [saved_main_state]
+    assert store.data["ownership"]["hvac_control"] == {
+        "zone_states": {},
+        "main_state": saved_main_state,
+        "required_evidence_lost": "hvac_release_failed",
+    }
+    assert store.data["outcomes"][0].result == OutcomeResult.FAILED
+    assert store.data["outcomes"][0].reason == "hvac_release_failed"
 
 
 def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
@@ -3036,6 +3714,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
             self,
             states: dict[str, str],
             zones: dict[str, str],
+            main_state: dict[str, Any],
         ) -> object:
             assert states == {
                 "automation.restored": "on",
@@ -3045,6 +3724,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
                 "switch.restored": "off",
                 "switch.failed": "off",
             }
+            assert main_state == {"hvac_mode": "heat", "target_temperature": 20}
             return SimpleNamespace(
                 applied=False,
                 rollback_succeeded=False,
@@ -3053,6 +3733,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
                 post_state={},
                 saved_automation_states={"automation.failed": "on"},
                 saved_zone_states={"switch.failed": "off"},
+                saved_main_state={"hvac_mode": "heat", "target_temperature": 20},
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", PartialDaikinAdapter)
@@ -3068,6 +3749,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
                 "switch.restored": "off",
                 "switch.failed": "off",
             },
+            "main_state": {"hvac_mode": "heat", "target_temperature": 20},
         },
         "planner_takeover_started_at": "2026-01-01T00:00:00+00:00",
         "planner_hvac_action_expires_at": "2026-01-01T00:02:00+00:00",
@@ -3082,6 +3764,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
         "hvac_control": {
             "phase": "peak_coast",
             "zone_states": {"switch.failed": "off"},
+            "main_state": {"hvac_mode": "heat", "target_temperature": 20},
             "required_evidence_lost": "hvac_release_failed",
         },
         "planner_takeover_started_at": "2026-01-01T00:00:00+00:00",
@@ -3644,6 +4327,97 @@ def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: obje
             "zone_states": {},
             "required_evidence_lost": "hvac_release_failed",
         },
+    }
+
+
+def test_safe_state_exception_does_not_reintroduce_inflight_manual_hvac_changes(
+    monkeypatch: object,
+) -> None:
+    class RaisingDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, *args: object) -> object:
+            assert executor.mark_pending_hvac_manual_override() is True
+            assert executor.mark_pending_hvac_zone_manual_override(
+                "climate.bedrooms"
+            ) is True
+            raise RuntimeError("unexpected adapter failure")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            },
+            "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "phase": "peak_coast",
+        },
+    }
+    executor = Executor(store, hass=FakeHass())
+
+    outcome = asyncio.run(executor.async_restore_safe_state("manual"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert "hvac_restore_exception" in outcome.reason
+    assert store.flush_count == 1
+    assert store.data["ownership"] == {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {"switch.living": "off"},
+            "phase": "peak_coast",
+            "required_evidence_lost": "hvac_release_failed",
+        },
+    }
+
+
+def test_safe_state_failed_result_filters_inflight_manual_zone(
+    monkeypatch: object,
+) -> None:
+    class FailedDaikinAdapter:
+        def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
+            pass
+
+        async def async_restore(self, *args: object) -> object:
+            assert executor.mark_pending_hvac_zone_manual_override(
+                "climate.bedrooms"
+            ) is True
+            return SimpleNamespace(
+                applied=False,
+                rollback_succeeded=False,
+                reason="hvac_release_failed",
+                pre_state={},
+                post_state={},
+                saved_automation_states={"automation.hvac": "on"},
+                saved_zone_states={
+                    "climate.bedrooms": {"target_temperature": 21},
+                    "switch.living": "off",
+                },
+                saved_main_state={},
+            )
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedDaikinAdapter)
+    store = FakeStore()
+    store.data["ownership"] = {
+        "climate_automations": {"automation.hvac": "on"},
+        "hvac_control": {
+            "zone_states": {
+                "climate.bedrooms": {"target_temperature": 21},
+                "switch.living": "off",
+            },
+            "phase": "peak_coast",
+        },
+    }
+    executor = Executor(store, hass=FakeHass())
+
+    outcome = asyncio.run(executor.async_restore_safe_state("manual"))
+
+    assert outcome.result == OutcomeResult.FAILED
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {
+        "switch.living": "off",
     }
 
 
