@@ -373,8 +373,6 @@ _POLICY_SECTION_FIELDS = {
         CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT,
         CONF_BATTERY_MAX_CHARGE_KW,
         CONF_BATTERY_MAX_DISCHARGE_KW,
-        CONF_EV_MIN_SOC_PERCENT,
-        CONF_EV_MAX_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -470,8 +468,6 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
     ),
     INPUT_STEP_EV: (
         CONF_DEFAULT_READY_BY,
-        CONF_EV_MIN_SOC_PERCENT,
-        CONF_EV_MAX_SOC_PERCENT,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
         CONF_EV_CONTINUOUS_CHARGING,
@@ -549,12 +545,6 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_BATTERY_MAX_DISCHARGE_KW: NumberSelector(
             NumberSelectorConfig(min=0, max=50, step=0.1, mode=NumberSelectorMode.BOX)
-        ),
-        CONF_EV_MIN_SOC_PERCENT: NumberSelector(
-            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
-        ),
-        CONF_EV_MAX_SOC_PERCENT: NumberSelector(
-            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_EV_CHARGE_RATE_KW: NumberSelector(
             NumberSelectorConfig(min=0.1, max=50, step=0.1, mode=NumberSelectorMode.BOX)
@@ -667,7 +657,7 @@ def _option_selector(field: str) -> Any:
 class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
-    VERSION = 4
+    VERSION = 5
 
     async def async_step_user(
         self,
@@ -880,6 +870,8 @@ def _normalize_ai_config(user_input: dict[str, Any]) -> dict[str, Any]:
 def _normalize_options_input(user_input: dict[str, Any]) -> dict[str, Any]:
     """Return persisted options from the policy form."""
     data = dict(user_input)
+    data.pop(CONF_EV_MIN_SOC_PERCENT, None)
+    data.pop(CONF_EV_MAX_SOC_PERCENT, None)
     data[CONF_PRIORITY_WEIGHTS] = ",".join(_priority_values_from_form(data))
     for field in _PRIORITY_FORM_FIELDS:
         data.pop(field, None)
@@ -889,10 +881,6 @@ def _normalize_options_input(user_input: dict[str, Any]) -> dict[str, Any]:
 def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     """Validate policy options that selectors alone cannot prove."""
     errors: dict[str, str] = {}
-    ev_min = float(user_input[CONF_EV_MIN_SOC_PERCENT])
-    ev_max = float(user_input[CONF_EV_MAX_SOC_PERCENT])
-    if ev_min > ev_max:
-        errors["base"] = "ev_min_above_max"
     if not _ready_by_valid(str(user_input[CONF_DEFAULT_READY_BY])):
         errors[CONF_DEFAULT_READY_BY] = "invalid_ready_by"
     earliest_start = str(user_input[CONF_EV_EARLIEST_START])

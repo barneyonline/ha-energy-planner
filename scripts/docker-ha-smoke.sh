@@ -856,8 +856,6 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
           "planning_interval_minutes": 5,
           "default_ready_by": "07:00",
           "battery_min_soc_percent": 10.0,
-          "ev_min_soc_percent": 40.0,
-          "ev_max_soc_percent": 90.0,
           "ev_fallback_target_soc_percent": 80.0,
           "ev_charge_rate_kw": 7.0,
           "ev_soc_per_kwh": 5.0,

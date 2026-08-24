@@ -104,7 +104,6 @@ _EV_CONTROL_TOPOLOGY_KEYS = (
 _EV_SAFETY_PLAN_ISSUES = frozenset(
     {
         "grid_import_limit_exceeded",
-        "ev_min_above_ev_max",
     }
 )
 

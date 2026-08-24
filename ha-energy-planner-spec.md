@@ -77,7 +77,7 @@ them without changing the core plan, safety, or audit contracts.
 | HVAC when home | Use existing climate target helpers. Occupied comfort is a configurable hard range of plus/minus 10% around each target by default. |
 | HVAC coordination | Temporarily disable relevant existing climate automations when planner action is active. Control Daikin directly, then restore each automation to its prior enabled state. |
 | HVAC manual action | A manual Daikin change triggers a configurable temporary override; default two hours. |
-| EV target | Forecast next-day driving energy from vehicle trip history, constrained by configurable minimum and maximum SOC. |
+| EV target | Use the live target from the required mapped vehicle target-SOC entity. |
 | EV ready-by | Configurable helper; default 07:00 local time. |
 | EV control | Use the existing EV Smart Charging integration rather than direct MINI commands. |
 | Failure behavior | Restore Enphase AI Optimisation, restore prior Daikin automation state, and return EV Smart Charging to its pre-takeover behavior. |
@@ -222,8 +222,6 @@ planning_horizon_hours: 24
 planning_interval_minutes: 5
 default_ready_by: 07:00
 battery_min_soc_percent: 10
-ev_min_soc_percent: configurable
-ev_max_soc_percent: configurable
 occupied_temperature_tolerance_percent: 10
 manual_hvac_override_minutes: 120
 enphase_profile_min_hold_minutes: 30
@@ -241,8 +239,9 @@ AI enabled/disabled state.
 Hard constraints are inviolable in both planning and execution:
 
 - Battery SOC floor.
-- EV minimum/maximum SOC and active ready-by target, subject only to physical
-  infeasibility.
+- EV target SOC must come from the mapped vehicle entity and remain within the
+  physical 0% to 100% range; the active ready-by target is subject only to
+  physical infeasibility.
 - Occupied HVAC temperature bounds derived from existing target helpers.
 - Maximum grid import/export limits.
 - Device availability, manual overrides, minimum profile hold, and minimum
@@ -354,16 +353,14 @@ preview in entity attributes.
 ### 9.2 EV scheduling
 
 1. Determine whether the EV is connected and eligible for charging.
-2. Determine current SOC, configured minimum/maximum SOC, charge rate, and
-   active ready-by time.
-3. Estimate next-day driving energy from recorded trip history. The forecast
-   method must be documented and conservative when history is sparse.
-4. Clamp required target SOC to configured minimum and maximum values.
-5. Allocate required charging energy to the least-cost feasible slots before
+2. Determine current SOC, the live vehicle target SOC, charge rate, and active
+   ready-by time.
+3. Use the mapped vehicle target SOC directly as the required target.
+4. Allocate required charging energy to the least-cost feasible slots before
    ready-by, considering local grid-flow projections and charger limits.
-6. If the target is infeasible, choose the maximum attainable SOC, raise a
+5. If the target is infeasible, choose the maximum attainable SOC, raise a
    persistent alert, and retain the evidence in the outcome log.
-7. Execute through EV Smart Charging and verify its observable state.
+6. Execute through EV Smart Charging and verify its observable state.
 
 ### 9.3 HVAC policy
 
@@ -419,7 +416,7 @@ The local model must not:
 
 - Call Home Assistant services.
 - Select or modify Enphase profile, Daikin setting, or EV controls directly.
-- Change battery reserve, comfort range, EV bounds, ready-by time, manual
+- Change battery reserve, comfort range, the vehicle target SOC, ready-by time, manual
   override state, or profile-hold period.
 - Bypass staleness, health, or ownership guards.
 - Receive raw secrets, access tokens, or unnecessary location history.

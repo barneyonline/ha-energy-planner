@@ -178,6 +178,10 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   begins when Home Assistant reaches `RUNNING`, not when the config entry loads.
   Ordinary input-health, constraint, capability, conflict, feedback, cooldown,
   and rate-limit gates continue to protect every command during the grace.
+- If a temporary pause blocks every enabled control area during setup or reload,
+  Energy Planner disarms and restores safe state while retaining automatic-control
+  intent and a restart-resumable recovery handoff. After the pause expires or is
+  resumed, three consecutive healthy checks safely restore **Armed / Running**.
 - At the deadline Energy Planner awaits a fresh, non-debounced plan and complete
   preflight. A healthy result remains armed silently. An unsafe, unavailable,
   failed, or uncommitted result disarms before one best-effort safe-state

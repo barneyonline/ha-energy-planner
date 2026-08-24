@@ -67,6 +67,7 @@ CONF_BATTERY_USABLE_CAPACITY_KWH = "battery_usable_capacity_kwh"
 CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT = "battery_round_trip_efficiency_percent"
 CONF_BATTERY_MAX_CHARGE_KW = "battery_max_charge_kw"
 CONF_BATTERY_MAX_DISCHARGE_KW = "battery_max_discharge_kw"
+# Retained only so config-entry migration can discard the legacy SOC options.
 CONF_EV_MIN_SOC_PERCENT = "ev_min_soc_percent"
 CONF_EV_MAX_SOC_PERCENT = "ev_max_soc_percent"
 # Legacy option removed in config-entry version 4. Keep the key for migration only.
@@ -126,8 +127,6 @@ DEFAULT_OPTIONS = {
     CONF_BATTERY_ROUND_TRIP_EFFICIENCY_PERCENT: 90.0,
     CONF_BATTERY_MAX_CHARGE_KW: 5.0,
     CONF_BATTERY_MAX_DISCHARGE_KW: 5.0,
-    CONF_EV_MIN_SOC_PERCENT: 40.0,
-    CONF_EV_MAX_SOC_PERCENT: 90.0,
     CONF_EV_CHARGE_RATE_KW: 7.0,
     # Approximately a 50 kWh usable EV battery. The previous 5%/kWh default
     # materially underestimated charging time for typical battery EVs.

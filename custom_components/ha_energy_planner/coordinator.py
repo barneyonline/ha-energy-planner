@@ -1008,6 +1008,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
         if self.active_control and pause_blocks_all_control:
+            # A temporary pause remains authoritative, but it must not erase a
+            # previously armed installation's automatic-control lifecycle.
+            # Persist the restart-resumable handoff before disarming so a
+            # reload or process stop between these operations still retries
+            # once the pause clears.
+            self._startup_auto_recovery_authorized = True
+            self._startup_auto_recovery_deadline = None
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_safe",
+                successful_runs=0,
+                reason="startup_control_paused",
+            )
             await self.async_disarm_production_control("startup_control_paused")
             await self.async_restore_safe_state("startup_control_paused", refresh=False)
             return True

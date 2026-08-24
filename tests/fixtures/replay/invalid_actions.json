@@ -11,8 +11,6 @@
     "planner_enabled": true,
     "dry_run": false,
     "battery_min_soc_percent": 10,
-    "ev_min_soc_percent": 40,
-    "ev_max_soc_percent": 90,
     "enphase_profile_min_hold_minutes": 30
   },
   "context": {
@@ -63,7 +61,7 @@
         "asset": "ev",
         "kind": "ev_schedule",
         "desired_state": {
-          "target_soc_percent": 95
+          "target_soc_percent": 101
         }
       },
       {
