@@ -133,6 +133,7 @@
               "bypass_safety_gates": "Bypass safety gates",
               "price_freshness_minutes": "Price freshness window",
               "forecast_freshness_minutes": "Forecast freshness window",
+              "household_load_outage_grace_minutes": "Household-load outage grace",
               "material_change_threshold_percent": "Material change threshold",
               "minimum_tariff_confidence": "Minimum tariff confidence",
               "minimum_solar_confidence": "Minimum solar confidence",
@@ -171,6 +172,7 @@
               "bypass_safety_gates": "Waives the 90% household-load coverage threshold and all production preflight requirements so Automatic control can arm. This reduces protection against unsafe inputs and unexpected demand; leave it off unless you accept that risk.",
               "price_freshness_minutes": "Maximum age for price inputs before they are treated as stale.",
               "forecast_freshness_minutes": "Maximum age for forecast inputs before they are treated as stale.",
+              "household_load_outage_grace_minutes": "Minutes that a current, quality-approved built-in load model may cover an unknown or unavailable live household-load sensor.",
               "material_change_threshold_percent": "Minimum plan-change percentage before a new plan is considered materially different.",
               "minimum_tariff_confidence": "Lowest tariff confidence allowed before tariff-driven decisions should be treated as degraded.",
               "minimum_solar_confidence": "Lowest solar forecast confidence allowed before solar-driven decisions should be treated as degraded.",
@@ -376,6 +378,7 @@
     "error": {
       "invalid_ready_by": "Default ready-by must be a valid local time.",
       "invalid_priority_weights": "Each planning priority must use a different objective.",
+      "invalid_load_outage_grace": "Household-load outage grace must be between 0 and 30 minutes.",
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones."
     }

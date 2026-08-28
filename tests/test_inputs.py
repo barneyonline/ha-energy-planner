@@ -29,6 +29,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_PERSON_ENTITIES,
     CONF_PV_FORECAST,
     CONF_PV_FORECAST_SECONDARY,
@@ -79,6 +80,7 @@ class FakeState:
     state: str
     attributes: dict[str, Any] = field(default_factory=dict)
     last_updated: datetime = field(default_factory=lambda: datetime.now(UTC))
+    last_changed: datetime | None = None
 
 
 class FakeStates:
@@ -323,6 +325,181 @@ def test_builtin_load_mapping_and_recorder_failures_are_explicit(monkeypatch: An
     )
     normalized_hvac._built_in_load_series(now, 1, 15)
     assert normalized_hvac.load_forecast_details["recent_correction_factor"] == 0.75
+
+
+@pytest.mark.parametrize("outage_seconds", [0, 599])
+def test_builtin_load_uses_ready_model_during_short_known_outage(
+    outage_seconds: int,
+) -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState(
+                    "unavailable",
+                    last_changed=now - timedelta(seconds=outage_seconds),
+                )
+            }
+        ),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        {
+            **DEFAULT_OPTIONS,
+            CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 10,
+            "planning_horizon_hours": 1,
+            "planning_interval_minutes": 15,
+        },
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+
+    values, issue = manager._built_in_load_series(now, 1, 15)
+
+    assert values == [1.0] * 4
+    assert issue == "household_load_model_fallback_active"
+    assert manager.load_forecast_details["fallback_applied"] is True
+    assert manager.load_forecast_details["current_correction_applied"] is False
+    assert manager.load_forecast_details["live_source_outage_seconds"] == outage_seconds
+    assert manager.forecast_confidence_details[-1]["confidence"] == 0.65
+    assert manager._health_from_issues([issue]) == InputHealth.DEGRADED
+
+
+def test_builtin_load_fails_closed_at_grace_boundary_and_for_wrong_model() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    options = {
+        **DEFAULT_OPTIONS,
+        CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 10,
+    }
+    expired = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState(
+                    "unknown", last_changed=now - timedelta(minutes=10)
+                )
+            }
+        ),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    wrong_timezone = _RawInputManager(
+        FakeHass(
+            {"sensor.house": FakeState("unavailable", last_changed=now)}
+        ),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        options,
+        load_forecast_model=_constant_load_model(
+            "sensor.house", 1.0, now, timezone="Australia/Sydney"
+        ),
+    )
+
+    assert expired._built_in_load_series(now, 1, 15)[1] == "household_load_entity_unavailable"
+    assert wrong_timezone._built_in_load_series(now, 1, 15)[1] == "household_load_entity_unavailable"
+
+
+def test_builtin_load_fallback_requires_outage_state_and_normalizes_naive_transition() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass({}),
+        {},
+        {**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 10},
+    )
+
+    invalid_state = manager._load_model_fallback_status(
+        FakeState("bad", last_changed=now),
+        now=now,
+        source_issue="household_load_entity_unavailable",
+        model_status="ready",
+        expected=[1.0],
+        upper=[1.2],
+    )
+    naive_transition = manager._load_model_fallback_status(
+        FakeState("unavailable", last_changed=now.replace(tzinfo=None)),
+        now=now,
+        source_issue="household_load_entity_unavailable",
+        model_status="ready",
+        expected=[1.0],
+        upper=[1.2],
+    )
+    future_transition = manager._load_model_fallback_status(
+        FakeState("unavailable", last_changed=now + timedelta(seconds=1)),
+        now=now,
+        source_issue="household_load_entity_unavailable",
+        model_status="ready",
+        expected=[1.0],
+        upper=[1.2],
+    )
+
+    assert invalid_state == (False, None)
+    assert naive_transition == (True, 0.0)
+    assert future_transition == (False, None)
+
+
+def test_builtin_load_fallback_uses_persisted_continuous_outage_start() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass(
+            {
+                "sensor.house": FakeState(
+                    "unknown",
+                    last_changed=now,
+                )
+            }
+        ),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        {
+            **DEFAULT_OPTIONS,
+            CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 10,
+        },
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+        load_source_outage={
+            "entity_id": "sensor.house",
+            "started_at": (now - timedelta(minutes=11)).isoformat(),
+            "last_observed_state": "unavailable",
+        },
+    )
+
+    _values, issue = manager._built_in_load_series(now, 1, 15)
+
+    assert issue == "household_load_entity_unavailable"
+    assert manager.load_forecast_details["fallback_applied"] is False
+    assert manager.load_forecast_details["live_source_outage_seconds"] == 660
+
+    malformed = _RawInputManager(
+        manager.hass,
+        manager.entry_data,
+        manager.options,
+        load_source_outage={
+            "entity_id": "sensor.house",
+            "started_at": "invalid",
+        },
+    )
+    assert malformed._load_model_fallback_status(
+        manager.hass.states.get("sensor.house"),
+        now=now,
+        source_issue="household_load_entity_unavailable",
+        model_status="ready",
+        expected=[1.0],
+        upper=[1.2],
+    ) == (False, None)
+
+    invalidated = _RawInputManager(
+        manager.hass,
+        manager.entry_data,
+        manager.options,
+        load_source_outage={
+            "entity_id": "sensor.house",
+            "started_at": (now - timedelta(minutes=2)).isoformat(),
+            "fallback_eligible": False,
+            "invalid_reason": "household_load_non_numeric",
+        },
+    )
+    assert invalidated._load_model_fallback_status(
+        manager.hass.states.get("sensor.house"),
+        now=now,
+        source_issue="household_load_entity_unavailable",
+        model_status="ready",
+        expected=[1.0],
+        upper=[1.2],
+    ) == (False, None)
 
 
 def test_forecast_source_issue_time_parses_string_attribute() -> None:
@@ -1121,6 +1298,105 @@ def test_input_manager_converts_weather_current_temperature_from_fahrenheit() ->
     assert context.current_outdoor_temperature_c == 20.0
     assert [slot.outdoor_temperature_forecast_c for slot in context.slots] == [25.0, None, None, None]
     assert context.input_health == InputHealth.HEALTHY
+
+
+def test_input_manager_prefers_hourly_weather_service_response() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass(
+            {
+                "weather.home": FakeState(
+                    "sunny",
+                    {"temperature": 10, "temperature_unit": "°C"},
+                )
+            }
+        ),
+        {CONF_WEATHER: "weather.home"},
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15},
+        weather_forecast={
+            "forecast": [
+                {"datetime": now.isoformat(), "temperature": 14},
+                {
+                    "datetime": (now + timedelta(hours=1)).isoformat(),
+                    "temperature": 15,
+                },
+            ]
+        },
+        weather_forecast_details={"fetch_status": "fetched"},
+    )
+
+    current, forecast, _issue = manager._optional_weather_temperatures(
+        CONF_WEATHER,
+        now,
+        1,
+        15,
+    )
+
+    assert current == 10
+    assert forecast[0] == 14
+    assert manager.forecast_confidence_details[-1]["source"].startswith(
+        "weather_service_hourly"
+    )
+
+
+def test_input_manager_weather_fallback_diagnostics_report_actual_source_and_coverage() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    failure_details = {
+        "fetch_status": "failed",
+        "source_type": "legacy_attributes_or_point_value",
+        "failure_reason": "HomeAssistantError:unavailable",
+    }
+    legacy = _RawInputManager(
+        FakeHass(
+            {
+                "weather.home": FakeState(
+                    "sunny",
+                    {
+                        "temperature": 10,
+                        "temperature_unit": "°C",
+                        "forecast": [
+                            {"datetime": now.isoformat(), "temperature": 14},
+                            {
+                                "datetime": (now + timedelta(hours=1)).isoformat(),
+                                "temperature": 15,
+                            },
+                        ],
+                    },
+                )
+            }
+        ),
+        {CONF_WEATHER: "weather.home"},
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15},
+        weather_forecast_details=failure_details,
+    )
+
+    legacy._optional_weather_temperatures(CONF_WEATHER, now, 1, 15)
+
+    assert legacy.weather_forecast_details["source_type"] == "legacy_entity_attributes"
+    assert legacy.weather_forecast_details["point_count"] > 0
+    assert legacy.weather_forecast_details["coverage_start"] == now.isoformat()
+    assert legacy.weather_forecast_details["coverage_end"] is not None
+    assert legacy.weather_forecast_details["failure_reason"] == "HomeAssistantError:unavailable"
+
+    point = _RawInputManager(
+        FakeHass(
+            {
+                "weather.home": FakeState(
+                    "sunny",
+                    {"temperature": 10, "temperature_unit": "°C"},
+                )
+            }
+        ),
+        {CONF_WEATHER: "weather.home"},
+        {**DEFAULT_OPTIONS, "planning_horizon_hours": 1, "planning_interval_minutes": 15},
+        weather_forecast_details=failure_details,
+    )
+
+    point._optional_weather_temperatures(CONF_WEATHER, now, 1, 15)
+
+    assert point.weather_forecast_details["source_type"] == "point_value_repeated"
+    assert point.weather_forecast_details["point_count"] == 1
+    assert point.weather_forecast_details["covered_hours"] == 0.0
 
 
 def test_input_manager_parses_camel_case_current_weather_temperature() -> None:

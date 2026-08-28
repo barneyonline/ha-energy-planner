@@ -34,46 +34,67 @@ def update_thermal_model(
     current = dict(current_sample or {})
     if not previous and isinstance(updated.get("last_sample"), Mapping):
         previous = dict(updated["last_sample"])
-    updated["last_sample"] = current
     # Never train across a migration boundary: the legacy anchor may be one of
     # the high-frequency/noisy samples that contaminated the old statistics.
     if _migrated or not previous:
+        updated["last_sample"] = current
         return updated, True
 
     previous_time = _parse_datetime_or_none(previous.get("sampled_at"))
     current_time = _parse_datetime_or_none(current.get("sampled_at"))
     previous_time, current_time = _aligned_datetimes(previous_time, current_time)
-    previous_temp = _float_or_none(previous.get("indoor_temperature_c"))
-    current_temp = _float_or_none(current.get("indoor_temperature_c"))
-    previous_power = _float_or_none(previous.get("hvac_power_kw"))
-    if (
-        previous_time is None
-        or current_time is None
-        or current_time <= previous_time
-        or previous_temp is None
-        or current_temp is None
-    ):
+    if previous_time is None or current_time is None or current_time <= previous_time:
+        updated["last_sample"] = current
         return updated, True
 
     hours = (current_time - previous_time).total_seconds() / 3600
-    if hours < MIN_SAMPLE_INTERVAL_MINUTES / 60 or hours > MAX_SAMPLE_INTERVAL_HOURS:
+    if hours > MAX_SAMPLE_INTERVAL_HOURS:
+        updated["last_sample"] = current
         return updated, True
 
+    previous_power = _float_or_none(previous.get("hvac_power_kw"))
     current_power = _float_or_none(current.get("hvac_power_kw"))
     previous_mode = _hvac_mode(previous.get("hvac_mode"))
     current_mode = _hvac_mode(current.get("hvac_mode"))
-    if previous_power is None or current_power is None or not previous_mode or not current_mode:
+    telemetry_complete = bool(
+        previous_power is not None
+        and current_power is not None
+        and previous_mode
+        and current_mode
+    )
+    transitioned = bool(
+        telemetry_complete
+        and (
+            previous_mode != current_mode
+            or (previous_power >= ACTIVE_POWER_THRESHOLD_KW)
+            != (current_power >= ACTIVE_POWER_THRESHOLD_KW)
+        )
+    )
+    if hours < MIN_SAMPLE_INTERVAL_MINUTES / 60:
+        if transitioned:
+            updated["last_sample"] = current
+            return updated, True
+        # Frequent coordinator refreshes must not move the training anchor;
+        # incomplete telemetry cannot prove a transition and must not discard
+        # the next eligible observation either.
+        return updated, False
+
+    if not telemetry_complete or transitioned:
+        updated["last_sample"] = current
         return updated, True
-    modes_stable = previous_mode == current_mode
-    previous_active = previous_power is not None and previous_power >= ACTIVE_POWER_THRESHOLD_KW
-    current_active = current_power is not None and current_power >= ACTIVE_POWER_THRESHOLD_KW
+
+    updated["last_sample"] = current
+    assert previous_power is not None and current_power is not None
+    previous_active = previous_power >= ACTIVE_POWER_THRESHOLD_KW
+    current_active = current_power >= ACTIVE_POWER_THRESHOLD_KW
+    previous_temp = _float_or_none(previous.get("indoor_temperature_c"))
+    current_temp = _float_or_none(current.get("indoor_temperature_c"))
+    if previous_temp is None or current_temp is None:
+        return updated, True
     temperature_delta = current_temp - previous_temp
 
     # Samples spanning an HVAC start, stop, or mode transition conflate two
     # operating regimes and are deliberately retained only as the next anchor.
-    if not modes_stable or previous_active != current_active:
-        return updated, True
-
     if previous_active and current_active and current_mode in _ACTIVE_HVAC_MODES:
         if abs(temperature_delta) >= MIN_TEMPERATURE_DELTA_C:
             active_rate = temperature_delta / hours

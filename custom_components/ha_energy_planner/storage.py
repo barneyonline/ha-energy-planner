@@ -29,6 +29,7 @@ _DICT_FIELDS = {
     "ev_charge_calibration",
     "forecast_calibration",
     "built_in_load_forecast",
+    "load_source_outage",
     "ownership",
     "control_pause",
     "production",
@@ -175,6 +176,10 @@ class PlannerStore:
         """Persist the aggregate Recorder-trained load model."""
         await self._async_set_if_changed("built_in_load_forecast", model)
 
+    async def async_save_load_source_outage(self, outage: dict[str, Any]) -> None:
+        """Persist the start of a continuous unusable household-load period."""
+        await self._async_set_if_changed("load_source_outage", outage)
+
     async def async_add_ai_recommendation(self, recommendation: dict[str, Any]) -> None:
         """Persist compact AI recommendation metadata."""
         recommendations = list(self.data.get("ai_recommendations", []))
@@ -305,6 +310,7 @@ def _default_data() -> dict[str, Any]:
         "ev_charge_calibration": {},
         "forecast_calibration": {},
         "built_in_load_forecast": {},
+        "load_source_outage": {},
         "discovery": {},
         "command_rate_limits": {},
         "production": {},

@@ -72,6 +72,7 @@ _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
 _RETIRED_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
+_HVAC_CAPABILITY_NOTIFICATION_ID = "ha_energy_planner_hvac_capability"
 _STARTUP_RECOVERY_NOTIFICATION_ID = "ha_energy_planner_startup_recovery"
 _UNOWNED_ENPHASE_STARTUP_RESTORE_REASONS = frozenset(
     {
@@ -83,6 +84,7 @@ _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _PLAN_UNSAFE_NOTIFICATION_ID,
     _GRID_LIMIT_NOTIFICATION_ID,
     _EV_INFEASIBLE_NOTIFICATION_ID,
+    _HVAC_CAPABILITY_NOTIFICATION_ID,
 )
 PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
 ACTION_BACKOFF_DURATION = timedelta(minutes=10)
@@ -220,6 +222,7 @@ class Executor:
                     CapabilityDiscovery(
                         self.hass,
                         self.entry_data,
+                        self.options,
                     )
                     .inspect()
                     .ev.issues
@@ -486,6 +489,7 @@ class Executor:
                 CapabilityDiscovery(
                     self.hass,
                     capability_entry_data,
+                    self.options,
                 )
                 .inspect()
                 .for_asset(action.asset)
@@ -1873,6 +1877,45 @@ class Executor:
             self._plan_fallback_notification_signatures.clear()
             await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
             return
+        climate_target_issues = [
+            issue
+            for issue in plan.input_issues
+            if issue
+            in {
+                "main_climate_target_unavailable",
+                "climate_zone_target_unavailable",
+            }
+        ]
+        if climate_target_issues:
+            details: dict[str, Any] = {}
+            if self.hass is not None:
+                details = CapabilityDiscovery(
+                    self.hass,
+                    self.entry_data,
+                    self.options,
+                ).inspect().hvac.details
+            affected = sorted(
+                {
+                    str(entity_id)
+                    for key in ("main_target_unavailable", "zone_targets_unavailable")
+                    for entity_id in details.get(key, [])
+                }
+            )
+            affected_text = ", ".join(affected) if affected else "configured climate entities"
+            await self._async_create_plan_fallback_notification(
+                title=self._notification_title("climate rollback target unavailable"),
+                message=(
+                    "Climate actions were suppressed before execution because Energy Planner "
+                    "cannot capture a finite rollback target for: "
+                    f"{affected_text}. Restore the thermostat target, or disable configured-zone "
+                    "temperature synchronisation. EV control remains independently eligible."
+                ),
+                notification_id=self._notification_id(_HVAC_CAPABILITY_NOTIFICATION_ID),
+            )
+        else:
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(_HVAC_CAPABILITY_NOTIFICATION_ID)
+            )
         if "input_health_unsafe" in violations and actionable_input_issues:
             await self._async_create_plan_fallback_notification(
                 title=self._notification_title("configuration needs attention"),

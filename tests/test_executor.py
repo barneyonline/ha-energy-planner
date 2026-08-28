@@ -37,6 +37,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_GRID_IMPORT_LIMIT_KW,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
@@ -280,17 +281,23 @@ class FakeState:
     """Minimal HA state."""
 
     state: str
+    attributes: dict[str, Any] | None = None
 
 
 class FakeStates:
     """Minimal state registry."""
 
-    def __init__(self, values: dict[str, str] | None = None) -> None:
+    def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.values = values or {}
 
     def get(self, entity_id: str) -> FakeState | None:
         value = self.values.get(entity_id)
-        return None if value is None else FakeState(value)
+        if value is None:
+            return None
+        if isinstance(value, FakeState):
+            return value
+        attributes = {"temperature": 21.0} if entity_id.startswith("climate.") else None
+        return FakeState(value, attributes)
 
 
 class FakeServices:
@@ -317,7 +324,7 @@ class FakeServices:
 class FakeHass:
     """Minimal HA object."""
 
-    def __init__(self, values: dict[str, str] | None = None) -> None:
+    def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.states = FakeStates(values)
         self.services = FakeServices(self.states)
 
@@ -890,6 +897,11 @@ def test_plan_fallback_notification_reports_unsafe_and_grid_limit_classes() -> N
     assert hass.services.calls == [
         (
             "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_hvac_capability"},
+        ),
+        (
+            "persistent_notification",
             "create",
             {
                 "title": "Energy Planner configuration needs attention",
@@ -967,9 +979,59 @@ def test_plan_fallback_notification_dismisses_during_startup_grace() -> None:
         (
             "persistent_notification",
             "dismiss",
+            {"notification_id": "ha_energy_planner_hvac_capability"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
     ]
+
+
+def test_hvac_capability_notification_is_deduplicated_and_recovers() -> None:
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="plan-1",
+        created_at=now,
+        horizon_hours=24,
+        interval_minutes=5,
+        status="current",
+        health=InputHealth.DEGRADED,
+        mode=PlannerMode.ACTIVE_DEGRADED,
+        summary="test",
+        confidence=0.8,
+        estimated_daily_cost=None,
+        actions=[],
+        preview=[],
+        input_issues=["main_climate_target_unavailable"],
+    )
+    hass = FakeHass({"climate.daikin": FakeState("off", {})})
+    executor = Executor(
+        FakeStore(),
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+
+    creates = [
+        call
+        for call in hass.services.calls
+        if call[:2] == ("persistent_notification", "create")
+        and call[2]["notification_id"] == "ha_energy_planner_hvac_capability"
+    ]
+    assert len(creates) == 1
+
+    plan.input_issues = []
+    asyncio.run(executor.async_notify_plan_fallback(plan, []))
+    assert (
+        "persistent_notification",
+        "dismiss",
+        {"notification_id": "ha_energy_planner_hvac_capability"},
+    ) in hass.services.calls
 
 
 def test_plan_fallback_notifications_can_be_disabled() -> None:
@@ -1019,6 +1081,11 @@ def test_plan_fallback_notifications_can_be_disabled() -> None:
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_ev_infeasible"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_hvac_capability"},
         ),
         (
             "persistent_notification",
@@ -1164,6 +1231,11 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
             "persistent_notification",
             "dismiss",
             {"notification_id": "ha_energy_planner_ev_infeasible"},
+        ),
+        (
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": "ha_energy_planner_hvac_capability"},
         ),
         (
             "persistent_notification",
@@ -2489,6 +2561,66 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
 
     assert store.data["ownership"]["planner_takeover_started_at"] == takeover_started_at
     assert store.flush_count == 4
+
+
+@pytest.mark.parametrize("synchronize_zone_temperatures", [False, True])
+def test_executor_rechecks_climate_rollback_capability_before_mutation(
+    monkeypatch: object,
+    synchronize_zone_temperatures: bool,
+) -> None:
+    class UnexpectedAdapter:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            raise AssertionError("adapter must not be constructed")
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", UnexpectedAdapter)
+    now = datetime.now(UTC)
+    action = PlanAction(
+        "hvac-race",
+        "plan-1",
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+        ActionAsset.DAIKIN,
+        ActionKind.SET_HVAC,
+        {"hvac_mode": "heat", "target_temperature": 21},
+        [],
+        [],
+        None,
+        1.0,
+    )
+    plan = EnergyPlan(
+        "plan-1",
+        now,
+        24,
+        5,
+        "current",
+        InputHealth.HEALTHY,
+        PlannerMode.ACTIVE_HEALTHY,
+        "test",
+        1.0,
+        None,
+        [action],
+        [],
+    )
+    store = FakeStore()
+    hass = FakeHass({"climate.daikin": FakeState("off", {})})
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        options={
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+            CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: synchronize_zone_temperatures,
+        },
+    )
+    _arm_store(store, executor)
+
+    asyncio.run(executor.async_evaluate(plan))
+
+    assert store.data["outcomes"][-1].result == OutcomeResult.REJECTED
+    assert store.data["outcomes"][-1].reason == "main_climate_target_unavailable"
+    assert store.data["ownership"] == {}
+    assert store.data.get("control_pause", {}) == {}
+    assert hass.services.calls == []
 
 
 def test_executor_marks_only_an_active_hvac_transaction_as_manual() -> None:

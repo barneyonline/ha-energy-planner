@@ -73,9 +73,13 @@ Status as of 2026-08-15.
   identify the limiting source, affected entities, temporal coverage, and
   corrective action so a fixed fallback weight is not presented as a measured
   probability.
-- Weather forecast attributes and current weather state are normalized into
-  outdoor temperature values for the decision context, with canonical attribute
-  matching and Fahrenheit-to-Celsius conversion for common weather schemas.
+- Weather uses the official hourly `weather.get_forecasts` response action,
+  normalizes naive timestamps in Home Assistant's timezone before UTC alignment,
+  and caches successful responses for the shorter of 15 minutes and the planning
+  interval. Manual replans force a fetch. A failed fetch reuses cache only within
+  forecast freshness, then tries legacy attributes and the current point value.
+  Diagnostics expose fetch/cache status, age, source, coverage, and failure;
+  canonical matching and Fahrenheit-to-Celsius conversion remain supported.
 - Safety defaults are fail-closed: execution disabled, dry-run enabled, stale
   required inputs unsafe, non-finite numeric inputs rejected, and due actions
   revalidated before execution.
@@ -365,6 +369,17 @@ Status as of 2026-08-15.
   only gaps of at most 30 minutes are interpolated. A bounded recent-load
   correction fades to neutral over two hours, and UTC planning slots are mapped
   through timezone-aware local timestamps for DST folds and gaps.
+- A configurable `household_load_outage_grace_minutes` (default 10, range
+  0–30) permits only a known `unknown`/`unavailable` transition to use a ready,
+  quality-approved, current, complete model that still matches the mapped
+  entity and timezone. The degraded path omits current-load correction, uses
+  the conservative upper series, caps load confidence at 0.65, and records
+  outage age, grace, model age, and correction state. Missing/non-numeric
+  entities, model mismatch, stale or incomplete models, and elapsed grace fail
+  closed. A persisted continuous-outage timestamp survives sentinel changes,
+  non-numeric interludes, reloads, and restarts. Missing or non-numeric evidence
+  makes the continuous outage ineligible for fallback until numeric recovery.
+  The option participates in production-evidence fingerprinting.
 - Conservative-bound calibration treats each local day as one dependent block:
   it computes a finite-sample 90% positive-residual score per day and applies a
   conservative 95% finite-sample upper quantile across those day scores. This
@@ -477,7 +492,15 @@ Status as of 2026-08-15.
   switch/helper takeover. Target mutations require complete restorable main and synchronized-zone
   snapshots before takeover. The default-off option rejects configurations without a zone climate
   target, and failed acquisition restores the captured main mode and target before reporting
-  rollback success. For an originally-off main thermostat, the active mode revealed by turn-on is
+  rollback success. Options-aware discovery always validates the finite main
+  rollback target and additionally validates configured-zone targets when
+  synchronisation is enabled. It publishes affected entity IDs in Current state
+  and Next actions, hard-suppresses new HVAC takeover candidates while keeping
+  releases eligible, and creates one recovery-aware notification.
+  Execution repeats the check immediately before adapter construction so the
+  race path cannot acquire ownership, start the scheduler guard, mutate a
+  device, or create a failure pause; adapter checks remain the final boundary.
+  For an originally-off main thermostat, the active mode revealed by turn-on is
   persisted before planner mode selection, restored before returning to off, and retained as
   unresolved ownership if it cannot be recovered. Earlier mode or target restoration failures do
   not skip the independently attempted and confirmed off cleanup. Unresolved main state is
@@ -516,7 +539,11 @@ Status as of 2026-08-15.
   clamping them, and derives medians from bounded rolling windows. Legacy
   unbounded statistics are reset before a new anchor is accepted. It also
   tolerates timezone-naive timestamps and comma-decimal strings and ignores
-  non-finite values. Planner tests cover replayed cold/heating and
+  non-finite values. Refreshes inside the five-minute minimum preserve the last
+  eligible anchor; stable observations therefore mature during refresh storms.
+  Mode/power transitions and invalid or over-two-hour gaps advance or reset the
+  anchor without changing the version-2 schema or persisted statistics. Planner
+  tests cover replayed cold/heating and
   warm/cooling thermal samples feeding preconditioning projections. Docker
   smoke coverage validates one active HVAC power sample from Home Assistant
   climate/power entities plus occupied preconditioning, expensive-period
@@ -655,7 +682,10 @@ Status as of 2026-08-15.
   persistent switch/input-boolean. Partial
   EV, Climate, or Enphase installations can arm independently;
   dry-run-only installations keep discovery advisory and cannot claim active
-  production readiness without an enabled controllable area.
+  production readiness without an enabled controllable area. AI availability
+  requires both the configured `ai_task` entity and registered
+  `ai_task.generate_data`; sensor and preflight evidence expose configured,
+  effective availability, and a stable reason while Explain remains advisory.
 - Preflight distinguishes historical dry-run evidence from current activation
   safety. `safe_to_activate_now` additionally requires a current healthy,
   non-zero-confidence plan, a recent successful coordinator refresh, at least
@@ -668,7 +698,8 @@ Status as of 2026-08-15.
   closed on a mismatch, missing state, non-boolean armed value, or malformed or
   unreasonable evidence counter. Pause
   parsing is shared and timezone-aware; malformed active and legacy pause states
-  remain paused rather than failing open.
+  remain paused rather than failing open. Expired records report inactive and
+  expired at the report timestamp while retaining reason, assets, and expiry.
   `active_control_ready` still requires the independent production arm.
 - Planner refreshes are serialized behind a coordinator lock, and stale planner
   results are discarded before they can overwrite the active plan. Current

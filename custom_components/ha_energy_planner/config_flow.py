@@ -90,6 +90,7 @@ from .const import (
     CONF_GRID_EXPORT_LIMIT_KW,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
@@ -418,6 +419,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_BYPASS_SAFETY_GATES,
         CONF_PRICE_FRESHNESS_MINUTES,
         CONF_FORECAST_FRESHNESS_MINUTES,
+        CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
         CONF_MIN_TARIFF_CONFIDENCE,
         CONF_MIN_SOLAR_CONFIDENCE,
@@ -613,6 +615,9 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_FORECAST_FRESHNESS_MINUTES: NumberSelector(
             NumberSelectorConfig(min=1, max=1440, step=5, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: NumberSelector(
+            NumberSelectorConfig(min=0, max=30, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
@@ -889,6 +894,12 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     priority_values = _priority_values_from_form(user_input)
     if not _priority_weights_valid(priority_values):
         errors["base"] = "invalid_priority_weights"
+    try:
+        load_grace = float(user_input[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES])
+    except (KeyError, TypeError, ValueError):
+        load_grace = -1
+    if not 0 <= load_grace <= 30:
+        errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] = "invalid_load_outage_grace"
     return errors
 
 

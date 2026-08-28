@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from math import isfinite
+from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
@@ -34,6 +35,7 @@ from .const import (
     CONF_EV_SOC,
     CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_PERSON_ENTITIES,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
@@ -112,6 +114,9 @@ class InputManager:
         forecast_calibration: Mapping[str, Any] | None = None,
         load_forecast_model: Mapping[str, Any] | None = None,
         load_forecast_update_reason: str | None = None,
+        load_source_outage: Mapping[str, Any] | None = None,
+        weather_forecast: Mapping[str, Any] | None = None,
+        weather_forecast_details: Mapping[str, Any] | None = None,
     ) -> None:
         """Initialize input manager."""
         self.hass = hass
@@ -120,6 +125,9 @@ class InputManager:
         self.forecast_calibration = dict(forecast_calibration or {})
         self.load_forecast_model = dict(load_forecast_model or {})
         self.load_forecast_update_reason = load_forecast_update_reason
+        self.load_source_outage = dict(load_source_outage or {})
+        self.weather_forecast = dict(weather_forecast or {})
+        self.weather_forecast_details = dict(weather_forecast_details or {})
         self.load_forecast_details: dict[str, Any] = {}
         self.forecast_training_slots: list[dict[str, Any]] = []
         self.forecast_confidence_details: list[dict[str, Any]] = []
@@ -545,14 +553,55 @@ class InputManager:
             current_load_kw=clean_current_load if recent_load_is_clean else None,
             current_ev_charging=current_ev_charging,
         )
+        fallback_active, outage_seconds = self._load_model_fallback_status(
+            state,
+            now=now,
+            source_issue=source_issue,
+            model_status=result.status,
+            expected=result.expected_kw,
+            upper=result.upper_kw,
+        )
+        if fallback_active:
+            source_issue = "household_load_model_fallback_active"
         self.load_forecast_details = {
             **result.details,
             "update_reason": self.load_forecast_update_reason,
+            "live_source_status": (
+                "model_fallback"
+                if fallback_active
+                else "unavailable"
+                if source_issue
+                else "available"
+            ),
+            "live_source_outage_seconds": outage_seconds,
+            "outage_grace_minutes": int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)),
+            "current_correction_applied": (
+                current_load is not None and recent_load_is_clean and current_ev_charging is not True
+            ),
+            "fallback_applied": fallback_active,
         }
-        confidence = 0.0 if source_issue else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
+        confidence = (
+            0.65
+            if fallback_active
+            else 0.0
+            if source_issue
+            else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
+        )
         coverage_details = {
             **result.details,
-            "classification": source_issue or ("healthy" if result.status == "ready" else result.status),
+            "classification": "degraded" if fallback_active else source_issue or (
+                "healthy" if result.status == "ready" else result.status
+            ),
+            "live_source_outage_seconds": outage_seconds,
+            "outage_grace_minutes": int(
+                self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)
+            ),
+            "current_correction_applied": (
+                current_load is not None
+                and recent_load_is_clean
+                and current_ev_charging is not True
+            ),
+            "fallback_applied": fallback_active,
             "covered_hours": round(
                 sum(value is not None for value in result.expected_kw) * interval / 60,
                 4,
@@ -601,6 +650,47 @@ class InputManager:
         ):
             issue = f"{CONF_HOUSEHOLD_LOAD}_history_limit_exceeded"
         return result.expected_kw, source_issue or issue
+
+    def _load_model_fallback_status(
+        self,
+        state: State | None,
+        *,
+        now: datetime,
+        source_issue: str | None,
+        model_status: str,
+        expected: list[float | None],
+        upper: list[float | None],
+    ) -> tuple[bool, float | None]:
+        """Return whether a short known live-source outage may use the safe model."""
+        if state is None or source_issue != f"{CONF_HOUSEHOLD_LOAD}_unavailable":
+            return False, None
+        if str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}:
+            return False, None
+        entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
+        changed_at: Any = None
+        if self.load_source_outage.get("entity_id") == entity_id:
+            if self.load_source_outage.get("fallback_eligible") not in (None, True):
+                return False, None
+            changed_at = dt_util.parse_datetime(
+                str(self.load_source_outage.get("started_at") or "")
+            )
+            if changed_at is None:
+                return False, None
+        else:
+            changed_at = getattr(state, "last_changed", None)
+        if not isinstance(changed_at, datetime):
+            return False, None
+        if changed_at.tzinfo is None:
+            changed_at = changed_at.replace(tzinfo=UTC)
+        outage_seconds = (dt_util.as_utc(now) - dt_util.as_utc(changed_at)).total_seconds()
+        if outage_seconds < 0:
+            return False, None
+        grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)), 0)
+        within_grace = grace_minutes > 0 and outage_seconds < grace_minutes * 60
+        complete = bool(expected) and len(expected) == len(upper) and all(
+            value is not None for value in (*expected, *upper)
+        )
+        return within_grace and model_status == "ready" and complete, round(outage_seconds, 3)
 
     def _optional_series(
         self,
@@ -742,11 +832,23 @@ class InputManager:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
         if not self._valid_state(state):
+            self.weather_forecast_details = {
+                **self.weather_forecast_details,
+                "source_type": "unavailable_state",
+                "point_count": 0,
+                "coverage_start": None,
+                "coverage_end": None,
+                "classification": "unsafe",
+                "covered_hours": 0.0,
+                "continuous_hours": 0.0,
+                "requested_hours": float(horizon),
+            }
             self._record_forecast_confidence(
                 0.0,
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source="unavailable_state",
+                details=self.weather_forecast_details,
             )
             return None, [None] * slot_count, f"{config_key}_unavailable"
         attributes = getattr(state, "attributes", {}) or {}
@@ -758,8 +860,14 @@ class InputManager:
             unit = str(_attribute_value(attributes, "unit_of_measurement", "unit", "temperature_unit") or "")
             current_temperature = normalize_scalar_value(current_temperature, value_kind="temperature", unit=unit)
 
+        forecast_state = state
+        service_forecast = self.weather_forecast.get("forecast")
+        if isinstance(service_forecast, list) and service_forecast:
+            forecast_state = SimpleNamespace(
+                attributes={**attributes, "forecast": service_forecast},
+            )
         forecast = forecast_series_from_state(
-            state,
+            forecast_state,
             issued_at=now,
             horizon_hours=horizon,
             interval_minutes=interval,
@@ -768,28 +876,88 @@ class InputManager:
         )
         if forecast:
             coverage = forecast_coverage_ratio(forecast)
+            source = (
+                "weather_service_hourly"
+                if forecast_state is not state and coverage == 1.0
+                else "weather_service_hourly_partial"
+                if forecast_state is not state
+                else "forecast_series"
+                if coverage == 1.0
+                else "forecast_series_partial"
+            )
+            coverage_details = forecast_coverage_details(
+                forecast,
+                starts_at=now,
+                interval_minutes=interval,
+            )
+            self.weather_forecast_details = {
+                **self.weather_forecast_details,
+                **coverage_details,
+                "source_type": (
+                    source
+                    if forecast_state is not state
+                    else "legacy_entity_attributes"
+                    if coverage == 1.0
+                    else "legacy_entity_attributes_partial"
+                ),
+                "point_count": (
+                    self.weather_forecast_details.get(
+                        "point_count",
+                        sum(value is not None for value in forecast),
+                    )
+                    if forecast_state is not state
+                    else sum(value is not None for value in forecast)
+                ),
+                "coverage_start": coverage_details.get("first_timestamp"),
+                "coverage_end": coverage_details.get("last_timestamp"),
+            }
             self._record_forecast_confidence(
                 _state_confidence(state, default=1.0) * coverage,
                 config_key=config_key,
                 entity_id=str(entity_id),
-                source="forecast_series" if coverage == 1.0 else "forecast_series_partial",
+                source=source,
+                details=self.weather_forecast_details,
             )
             padded = list(forecast[:slot_count])
             issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
             return current_temperature, padded, issue
         if current_temperature is not None:
+            self.weather_forecast_details = {
+                **self.weather_forecast_details,
+                "source_type": "point_value_repeated",
+                "point_count": 1,
+                "coverage_start": now.isoformat(),
+                "coverage_end": now.isoformat(),
+                "classification": "point_value_only",
+                "covered_hours": 0.0,
+                "continuous_hours": 0.0,
+                "requested_hours": float(horizon),
+            }
             self._record_forecast_confidence(
                 _POINT_SENSOR_CONFIDENCE,
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source="point_value_repeated",
+                details=self.weather_forecast_details,
             )
             return current_temperature, [current_temperature] * slot_count, None
+        self.weather_forecast_details = {
+            **self.weather_forecast_details,
+            "source_type": "invalid_state",
+            "point_count": 0,
+            "coverage_start": None,
+            "coverage_end": None,
+            "classification": "unsafe",
+            "covered_hours": 0.0,
+            "continuous_hours": 0.0,
+            "requested_hours": float(horizon),
+        }
         self._record_forecast_confidence(
             0.0,
             config_key=config_key,
             entity_id=str(entity_id),
             source="invalid_state",
+            details=self.weather_forecast_details,
         )
         return None, [None] * slot_count, f"{config_key}_non_numeric_temperature"
 
@@ -893,6 +1061,7 @@ class InputManager:
         ]
         if any(
             not issue.endswith(("_forecast_coverage_degraded", "_forecast_degraded"))
+            and issue != "household_load_model_fallback_active"
             for issue in required_issues
         ):
             return InputHealth.UNSAFE

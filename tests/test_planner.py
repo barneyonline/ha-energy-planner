@@ -78,6 +78,38 @@ def test_dry_run_plan_has_candidate_actions_without_active_control() -> None:
     assert plan.rejected_actions
 
 
+def test_hvac_rollback_capability_issue_suppresses_takeover_but_keeps_release() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "minimum_climate_confidence": 0,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.occupancy_state = OccupancyState.AWAY
+    context.input_issues = ["main_climate_target_unavailable"]
+
+    blocked = DryRunPlanner(options).create_plan(context)
+
+    assert [
+        action for action in blocked.actions if action.asset == ActionAsset.DAIKIN
+    ] == []
+
+    context.hvac_control = {
+        "phase": "preconditioning",
+        "required_evidence_lost": "main_climate_target_unavailable",
+    }
+    release_actions = [
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.DAIKIN
+    ]
+
+    assert len(release_actions) == 1
+    assert release_actions[0].kind == ActionKind.RELEASE_HVAC
+
+
 def test_unclassified_input_health_produces_an_unsafe_actionless_plan() -> None:
     context = _context()
     context.input_health = "mystery"  # type: ignore[assignment]

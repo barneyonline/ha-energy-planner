@@ -84,6 +84,42 @@ def control_pause_reason(value: Any, now: datetime, *, asset: str | None = None)
     return f"{asset}_control_paused" if asset in asset_values else None
 
 
+def control_pause_status(value: Any, now: datetime) -> dict[str, Any]:
+    """Return effective pause state while retaining bounded audit fields."""
+    if value is None or value == {}:
+        return {"active": False, "expired": False}
+    if not isinstance(value, dict):
+        return {
+            "active": True,
+            "expired": False,
+            "reason": "planner_paused",
+            "assets": ["all"],
+            "until": None,
+            "malformed": True,
+        }
+    status = dict(value)
+    raw_active = value.get("active")
+    explicitly_inactive = raw_active is False or str(raw_active).lower() in {
+        "false",
+        "off",
+        "0",
+    }
+    until = _datetime_or_none(value.get("until"))
+    expired = bool(
+        not explicitly_inactive
+        and until is not None
+        and _as_utc(now) >= until
+    )
+    active = control_pause_reason(value, now) is not None
+    status["active"] = active
+    status["expired"] = expired
+    if active and not status.get("reason"):
+        status["reason"] = "planner_paused"
+    if value.get("until") is not None and until is None:
+        status["malformed"] = True
+    return status
+
+
 def partition_control_areas_by_pause(
     value: Any,
     now: datetime,
