@@ -15,6 +15,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import EnergyPlannerCoordinator
+from .discovery import CapabilityDiscovery
 from .entity import EnergyPlannerEntity, async_add_planner_entities
 from .models import OutcomeResult
 from .notifications import defer_persistent_notification
@@ -52,7 +53,11 @@ async def _request_ai_advice(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 def _ai_advice_available(coordinator: EnergyPlannerCoordinator) -> bool:
-    return bool(str(coordinator.entry_data.get("ai_task_entity", "") or "").strip())
+    return CapabilityDiscovery(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.options,
+    ).inspect().ai.supported
 
 
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:

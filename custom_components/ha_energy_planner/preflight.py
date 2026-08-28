@@ -39,6 +39,7 @@ from .load_forecast import FORECAST_CONTRACT_VERSION
 from .planner import confidence_eligible_control_areas
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
+    control_pause_status,
     parse_production_state,
     partition_control_areas_by_pause,
     strict_bool,
@@ -96,6 +97,7 @@ def build_preflight_report(
         options,
         control_areas,
         expected_evidence_fingerprint=evidence_fingerprint,
+        now=now,
     )
     current_plan = _current_plan_report(
         getattr(coordinator, "data", None),
@@ -513,11 +515,15 @@ def _production_report(
     control_areas: dict[str, Any],
     *,
     expected_evidence_fingerprint: str | None = None,
+    now: datetime | None = None,
 ) -> dict[str, Any]:
     """Return production readiness state."""
     production_state = parse_production_state(store_data.get("production"))
     production = production_state.raw
-    pause = store_data.get("control_pause", {})
+    pause = control_pause_status(
+        store_data.get("control_pause", {}),
+        now or dt_util.utcnow(),
+    )
     device_controls = {
         "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
         "climate": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
@@ -645,7 +651,7 @@ def _runtime_control_area_report(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return shared capability, pause, and confidence readiness by area."""
     control_areas = _control_area_report(entry_data, options)
-    discovery = CapabilityDiscovery(hass, entry_data).inspect().as_dict()
+    discovery = CapabilityDiscovery(hass, entry_data, options).inspect().as_dict()
     _apply_ev_keep_on_preflight(discovery, entry_data, options)
     _apply_control_area_readiness(hass, entry_data, control_areas, discovery)
     ready = list(control_areas.get("ready", []))

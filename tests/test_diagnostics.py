@@ -36,6 +36,7 @@ class FakeCoordinator:
     automatic_control_requested: bool = False
     active_control: bool = False
     effective_control: bool = False
+    weather_forecast_diagnostics: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -77,8 +78,24 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
                             "successful_runs": 2,
                         }
                     },
+                    "control_pause": {
+                        "active": True,
+                        "until": "2020-01-01T00:00:00+00:00",
+                        "reason": "historical_failure",
+                        "assets": ["daikin"],
+                    },
+                    "load_source_outage": {
+                        "entity_id": "sensor.house",
+                        "started_at": "2026-08-25T00:00:00+00:00",
+                        "last_observed_state": "unavailable",
+                    },
                 }
             ),
+            weather_forecast_diagnostics={
+                "fetch_status": "cached_after_error",
+                "cache_age_seconds": 901,
+                "failure_reason": "HomeAssistantError:unavailable",
+            },
         ),
     )
 
@@ -92,6 +109,12 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
     assert diagnostics["store"]["discovery"]["status"] == "ok"
     assert diagnostics["startup_auto_recovery"] == {"status": "validating", "successful_runs": 2}
     assert diagnostics["automatic_control"] == {"requested": False, "running": False}
+    assert diagnostics["weather_forecast"]["fetch_status"] == "cached_after_error"
+    assert diagnostics["weather_forecast"]["cache_age_seconds"] == 901
+    assert diagnostics["store"]["control_pause"]["active"] is False
+    assert diagnostics["store"]["control_pause"]["expired"] is True
+    assert diagnostics["store"]["control_pause"]["reason"] == "historical_failure"
+    assert diagnostics["store"]["load_source_outage"]["entity_id"] == "sensor.house"
 
 
 def test_diagnostics_redacts_prompts_addresses_and_raw_model_payloads() -> None:

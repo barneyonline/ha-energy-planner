@@ -5,9 +5,11 @@ from __future__ import annotations
 from typing import Any
 
 from homeassistant.core import HomeAssistant
+from homeassistant.util import dt as dt_util
 
 from .entry_data import combined_entry_data
 from .models import to_jsonable
+from .safety import control_pause_status
 from .type_defs import EnergyPlannerConfigEntry
 
 REDACT_KEYS = {
@@ -81,6 +83,9 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "refresh_performance": _redact(_refresh_performance(coordinator)),
+        "weather_forecast": _redact(
+            dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
+        ),
         "automatic_control": {
             "requested": automatic_control_requested,
             "running": automatic_control_running,
@@ -152,12 +157,16 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         "discovery": store_data.get("discovery", {}),
         "ownership": store_data.get("ownership", {}),
         "production": store_data.get("production", {}),
-        "control_pause": store_data.get("control_pause", {}),
+        "control_pause": control_pause_status(
+            store_data.get("control_pause", {}),
+            dt_util.utcnow(),
+        ),
         "ev_charge_calibration": _ev_charge_calibration_summary(
             store_data.get("ev_charge_calibration", {})
         ),
         "forecast_calibration": store_data.get("forecast_calibration", {}),
         "built_in_load_forecast": _load_forecast_summary(store_data.get("built_in_load_forecast", {})),
+        "load_source_outage": store_data.get("load_source_outage", {}),
         "thermal_model": store_data.get("thermal_model", {}),
     }
 

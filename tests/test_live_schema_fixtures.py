@@ -126,8 +126,13 @@ def test_v1_real_profile_reports_missing_export_source_metadata() -> None:
 
 def _assert_forecast_fixture(fixture: dict[str, Any]) -> None:
     issued_at = _parse_datetime(fixture["issued_at"])
+    attributes = dict(fixture.get("attributes", {}))
+    response = fixture.get("response")
+    source_entity_id = fixture.get("source_entity_id")
+    if isinstance(response, dict) and isinstance(response.get(source_entity_id), dict):
+        attributes["forecast"] = response[source_entity_id].get("forecast", [])
     series = forecast_series_from_state(
-        FakeState(str(fixture.get("state", "")), dict(fixture.get("attributes", {}))),
+        FakeState(str(fixture.get("state", "")), attributes),
         issued_at=issued_at,
         horizon_hours=int(fixture["horizon_hours"]),
         interval_minutes=int(fixture["interval_minutes"]),

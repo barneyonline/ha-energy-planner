@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 from custom_components.ha_energy_planner.safety import (
     control_pause_reason,
+    control_pause_status,
     parse_production_state,
     partition_control_areas_by_pause,
     strict_bool,
@@ -74,3 +75,27 @@ def test_control_area_pause_partition_preserves_unpaused_assets_and_fails_closed
         areas,
     ) == ([], areas)
     assert partition_control_areas_by_pause({}, now, ["unknown"]) == ([], ["unknown"])
+
+
+def test_control_pause_status_reports_expiry_without_losing_audit_fields() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    expired = control_pause_status(
+        {
+            "active": True,
+            "until": (now - timedelta(minutes=1)).isoformat(),
+            "reason": "climate_zone_target_unavailable",
+            "assets": ["daikin"],
+        },
+        now,
+    )
+
+    assert expired["active"] is False
+    assert expired["expired"] is True
+    assert expired["reason"] == "climate_zone_target_unavailable"
+    assert expired["assets"] == ["daikin"]
+    assert control_pause_status("corrupt", now)["active"] is True
+    malformed = control_pause_status(
+        {"active": True, "until": "invalid", "assets": ["ev"]}, now
+    )
+    assert malformed["active"] is True
+    assert malformed["malformed"] is True

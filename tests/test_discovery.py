@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ADVISOR_SERVICE,
@@ -21,11 +22,13 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
 )
 from custom_components.ha_energy_planner.discovery import (
     CapabilityDiscovery,
     _profile_control_service,
     _service_evidence,
+    _state_missing,
 )
 from custom_components.ha_energy_planner.models import ActionAsset
 
@@ -35,17 +38,23 @@ class FakeState:
     """Minimal HA state."""
 
     state: str
+    attributes: dict[str, Any] = field(default_factory=dict)
 
 
 class FakeStates:
     """Minimal states registry."""
 
-    def __init__(self, values: dict[str, str]) -> None:
+    def __init__(self, values: dict[str, str | FakeState]) -> None:
         self.values = values
 
     def get(self, entity_id: str) -> FakeState | None:
         value = self.values.get(entity_id)
-        return None if value is None else FakeState(value)
+        if value is None:
+            return None
+        if isinstance(value, FakeState):
+            return value
+        attributes = {"temperature": 21.0} if entity_id.startswith("climate.") else {}
+        return FakeState(value, attributes)
 
 
 class FakeServices:
@@ -61,7 +70,7 @@ class FakeServices:
 class FakeHass:
     """Minimal HA object."""
 
-    def __init__(self, states: dict[str, str], services: set[tuple[str, str]]) -> None:
+    def __init__(self, states: dict[str, str | FakeState], services: set[tuple[str, str]]) -> None:
         self.states = FakeStates(states)
         self.services = FakeServices(services)
 
@@ -96,6 +105,48 @@ def test_discovery_reports_supported_controls() -> None:
     assert report.ai.supported is True
 
 
+def test_climate_target_discovery_is_options_aware_and_reports_entities() -> None:
+    hass = FakeHass(
+        {
+            "climate.main": FakeState("heat", {"temperature": None}),
+            "climate.zone": FakeState("off", {"temperature": None}),
+            "switch.zone": "on",
+        },
+        set(),
+    )
+    entry_data = {
+        CONF_DAIKIN_CLIMATE: "climate.main",
+        CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"],
+    }
+
+    disabled = CapabilityDiscovery(hass, entry_data, {}).inspect().hvac
+    enabled = CapabilityDiscovery(
+        hass,
+        entry_data,
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    ).inspect().hvac
+
+    assert "main_climate_target_unavailable" in disabled.issues
+    assert "climate_zone_target_unavailable" not in disabled.issues
+    assert disabled.details["main_target_unavailable"] == ["climate.main"]
+    assert disabled.details["zone_targets_unavailable"] == []
+    assert "main_climate_target_unavailable" in enabled.issues
+    assert "climate_zone_target_unavailable" in enabled.issues
+    assert enabled.details["main_target_unavailable"] == ["climate.main"]
+    assert enabled.details["zone_targets_unavailable"] == ["climate.zone"]
+
+    hass.states.values["climate.main"] = FakeState("heat", {"temperature": 21})
+    hass.states.values["climate.zone"] = FakeState(
+        "heat", {"target_temp_low": 19, "target_temp_high": 23}
+    )
+    recovered = CapabilityDiscovery(
+        hass,
+        entry_data,
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    ).inspect().hvac
+    assert recovered.supported is True
+
+
 def test_discovery_treats_unknown_button_controls_as_available() -> None:
     hass = FakeHass(
         {
@@ -115,6 +166,10 @@ def test_discovery_treats_unknown_button_controls_as_available() -> None:
 
     assert report.ev.supported is True
     assert report.ev.issues == []
+
+
+def test_state_missing_fails_closed_without_state_registry() -> None:
+    assert _state_missing(object(), "climate.home") is True
 
 
 def test_discovery_rejects_legacy_single_button_without_stop_control() -> None:
