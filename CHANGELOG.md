@@ -22,7 +22,7 @@
 
 - None
 
-## 0.9.15 - 2026-08-28
+## 0.9.16 - 2026-08-28
 
 ### 🚧 Breaking changes
 
@@ -36,10 +36,6 @@
 
 ### 🐛 Bug fixes
 
-- Home Assistant startup no longer raises a safe-state restore failure when the
-  Enphase profile entity is still loading and Energy Planner has no recorded
-  Enphase ownership to restore. Genuine owned-profile restore failures remain
-  actionable and retain their recovery evidence.
 - The main climate rollback target is now checked during discovery, planning,
   preflight, and immediately before execution in every configuration; configured
   zone targets are additionally checked when temperature synchronisation is
@@ -58,6 +54,31 @@
 - Explain availability now requires both the configured AI task entity and the
   `ai_task.generate_data` action. Expired pauses report inactive while retaining
   their historical reason, assets, and expiry.
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 0.9.15 - 2026-08-28
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Home Assistant startup no longer raises a safe-state restore failure when the
+  Enphase profile entity is still loading and Energy Planner has no recorded
+  Enphase ownership to restore. Genuine owned-profile restore failures remain
+  actionable and retain their recovery evidence.
 
 ### 🔧 Improvements
 
