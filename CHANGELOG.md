@@ -12,10 +12,52 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 0.9.15 - 2026-08-25
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- Added a configurable 0–30 minute household-load outage grace, defaulting to
+  10 minutes. A current, quality-approved built-in model can conservatively
+  bridge only a known `unknown`/`unavailable` transition inside that window.
+
+### 🐛 Bug fixes
+
 - Home Assistant startup no longer raises a safe-state restore failure when the
   Enphase profile entity is still loading and Energy Planner has no recorded
   Enphase ownership to restore. Genuine owned-profile restore failures remain
   actionable and retain their recovery evidence.
+- The main climate rollback target is now checked during discovery, planning,
+  preflight, and immediately before execution in every configuration; configured
+  zone targets are additionally checked when temperature synchronisation is
+  enabled. Missing targets hard-suppress new HVAC takeover while keeping release
+  eligible and notify once without blocking independent EV control.
+- Weather planning now retrieves Home Assistant's hourly
+  `weather.get_forecasts` response, normalises naive timestamps in the Home
+  Assistant timezone, and uses a freshness-bounded cache before legacy attribute
+  or point fallbacks with their actual source and coverage reported.
+- Continuous household-load outage timing now survives unavailable-state
+  changes, non-numeric interludes, reloads, and restarts, so the grace cannot be
+  restarted without a valid numeric recovery. Missing or non-numeric evidence
+  invalidates fallback for the remainder of that continuous outage.
+- Sub-five-minute coordinator refreshes no longer replace the HVAC thermal
+  learner's eligible anchor, allowing stable five-minute samples to mature.
+- Explain availability now requires both the configured AI task entity and the
+  `ai_task.generate_data` action. Expired pauses report inactive while retaining
+  their historical reason, assets, and expiry.
 
 ### 🔧 Improvements
 

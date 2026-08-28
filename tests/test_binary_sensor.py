@@ -34,7 +34,8 @@ class _AvailableStates:
     def get(self, entity_id: str) -> object | None:
         if entity_id not in self._entity_ids:
             return None
-        return SimpleNamespace(state="on", attributes={})
+        attributes = {"temperature": 21.0} if entity_id.startswith("climate.") else {}
+        return SimpleNamespace(state="on", attributes=attributes)
 
 
 class _AvailableServices:

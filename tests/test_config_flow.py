@@ -87,6 +87,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
@@ -1807,6 +1808,19 @@ def test_entity_values_and_ready_by_helpers_handle_edge_cases() -> None:
 
 def test_validate_options_accepts_default_policy_values() -> None:
     assert _validate_options(dict(DEFAULT_OPTIONS)) == {}
+
+
+@pytest.mark.parametrize("value", [None, -1, 31])
+def test_validate_options_rejects_invalid_household_load_outage_grace(
+    value: object,
+) -> None:
+    errors = _validate_options(
+        {**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: value}
+    )
+
+    assert errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] == (
+        "invalid_load_outage_grace"
+    )
 
 
 def test_default_options_require_intentional_active_mode_enablement() -> None:

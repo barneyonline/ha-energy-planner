@@ -72,6 +72,121 @@ def test_thermal_model_tracks_active_cooling_rate() -> None:
     assert summary["active_cool_rate_sample_count"] == 12
 
 
+def test_thermal_model_one_minute_refreshes_preserve_five_minute_anchor() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    anchor = {
+        "sampled_at": now.isoformat(),
+        "hvac_mode": "heat",
+        "indoor_temperature_c": 20.0,
+        "hvac_power_kw": 1.8,
+    }
+    model: dict[str, object] = {
+        "model_version": THERMAL_MODEL_VERSION,
+        "last_sample": anchor,
+    }
+    for minute in range(1, 5):
+        model, changed = update_thermal_model(
+            model,
+            model["last_sample"],
+            {
+                **anchor,
+                "sampled_at": (now + timedelta(minutes=minute)).isoformat(),
+                "indoor_temperature_c": 20.02 * minute,
+            },
+        )
+        assert changed is False
+        assert model["last_sample"] == anchor
+
+    model, changed = update_thermal_model(
+        model,
+        model["last_sample"],
+        {
+            **anchor,
+            "sampled_at": (now + timedelta(minutes=5)).isoformat(),
+            "indoor_temperature_c": 20.1,
+        },
+    )
+
+    assert changed is True
+    assert thermal_model_summary(model)["active_sample_count"] == 1
+
+
+def test_thermal_model_short_invalid_telemetry_preserves_anchor() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    anchor = {
+        "sampled_at": now,
+        "hvac_mode": "heat",
+        "indoor_temperature_c": 20.0,
+        "hvac_power_kw": 1.5,
+    }
+
+    for field in ("hvac_power_kw", "hvac_mode"):
+        invalid = {
+            **anchor,
+            "sampled_at": now + timedelta(minutes=1),
+            field: None,
+        }
+        model, changed = update_thermal_model(
+            {"model_version": THERMAL_MODEL_VERSION, "last_sample": anchor},
+            anchor,
+            invalid,
+        )
+
+        assert changed is False
+        assert model["last_sample"] == anchor
+
+
+def test_thermal_model_short_confirmed_transition_resets_anchor() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    anchor = {
+        "sampled_at": now,
+        "hvac_mode": "heat",
+        "indoor_temperature_c": 20.0,
+        "hvac_power_kw": 1.5,
+    }
+    transitioned = {
+        **anchor,
+        "sampled_at": now + timedelta(minutes=1),
+        "hvac_mode": "off",
+        "hvac_power_kw": 0.0,
+    }
+
+    model, changed = update_thermal_model(
+        {"model_version": THERMAL_MODEL_VERSION, "last_sample": anchor},
+        anchor,
+        transitioned,
+    )
+
+    assert changed is True
+    assert model["last_sample"] == transitioned
+
+
+def test_thermal_model_advances_anchor_for_invalid_eligible_temperature() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    previous = {
+        "sampled_at": now,
+        "hvac_mode": "heat",
+        "indoor_temperature_c": 20.0,
+        "hvac_power_kw": 1.5,
+    }
+    current = {
+        "sampled_at": now + timedelta(minutes=5),
+        "hvac_mode": "heat",
+        "indoor_temperature_c": "invalid",
+        "hvac_power_kw": 1.5,
+    }
+
+    model, changed = update_thermal_model(
+        {"model_version": THERMAL_MODEL_VERSION, "last_sample": previous},
+        previous,
+        current,
+    )
+
+    assert changed is True
+    assert model["last_sample"] == current
+    assert thermal_model_summary(model)["active_sample_count"] == 0
+
+
 def test_thermal_model_tracks_passive_temperature_drift_without_hvac_power() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
 
