@@ -30,7 +30,7 @@ def test_release_metadata_versions_match() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert _manifest()["version"] == pyproject["project"]["version"] == "0.9.14"
+    assert _manifest()["version"] == pyproject["project"]["version"] == "0.9.15"
 
 
 def test_manifest_keeps_dependency_surface_explicit() -> None:
