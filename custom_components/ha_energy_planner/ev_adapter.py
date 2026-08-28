@@ -402,7 +402,13 @@ class EVChargerAdapter:
     async def _async_existing_state_proves_safe(self) -> bool:
         """Return whether inactive feedback plus an off control proves safety."""
         persistent_control = self._keep_on_entity()
-        if not await self._async_control_proves_safe(persistent_control):
+        if not persistent_control or persistent_control.split(".", 1)[0] not in {
+            "switch",
+            "input_boolean",
+        }:
+            return False
+        control_state = self._state(persistent_control)
+        if control_state is None or not _control_state_matches(control_state, False):
             return False
 
         connected_entity = self.entry_data.get(CONF_EV_CONNECTED)
