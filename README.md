@@ -39,7 +39,7 @@ For full planning, configure:
 
 Weather, carbon intensity, measured PV power, and AI are optional. An external solar forecast is still required.
 
-Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.14.
+Compatibility: Home Assistant 2026.6.0 or newer; current integration version 0.9.15.
 
 ## Installation
 
@@ -106,6 +106,20 @@ Training runs at startup, after a source change, and at most every six hours. Re
 
 Changing the load mapping disarms production control and requires fresh review cycles. Routine retraining does not.
 
+**Household-load outage grace** defaults to 10 minutes and can be set from 0 to
+30 minutes. It applies only when an existing mapped sensor transitions to
+`unknown` or `unavailable` and the built-in model is ready, current,
+quality-approved, complete for the planning horizon, and still matches the
+entity and Home Assistant timezone. During the grace, planning is **Active
+Degraded**, uses the conservative upper load forecast without a live correction,
+and caps load confidence at 0.65. Missing entities, non-numeric values, unusable
+models, and outages at or beyond the limit fail closed immediately. Changing
+the grace invalidates prior production evidence and requires fresh review. The
+outage start survives unavailable-state changes, non-numeric interludes,
+integration reloads, and Home Assistant restarts. A missing or non-numeric
+observation makes that continuous outage ineligible for fallback; only a valid
+numeric live value resets it.
+
 ## Controls and status
 
 | Entity | Purpose |
@@ -124,7 +138,16 @@ The advanced **Run safety check** button always returns a Home Assistant notific
 
 Energy Planner queues persistent notifications until Home Assistant has completed startup and every integration has had a chance to load. A queued alert is cancelled if the condition recovers first; otherwise, the latest alert for each condition is shown after startup.
 
-**Explain** treats an uneconomic or thermally unsuitable climate-preconditioning window as a normal no-action plan result. It recommends changing Climate settings only when the current plan contains a specific comfort, presence, or climate-control input fault.
+Pause attributes are evaluated at report time: an elapsed pause is shown as
+`active: false` and `expired: true`, while its reason, affected assets, and
+expiry remain available for audit. Malformed pause records remain fail-closed.
+
+**Explain** is available only while its configured `ai_task` entity exists and
+Home Assistant provides `ai_task.generate_data`. It remains advisory and never
+blocks device control. It treats an uneconomic or thermally unsuitable
+climate-preconditioning window as a normal no-action plan result and recommends
+changing Climate settings only for a specific comfort, presence, or
+climate-control input fault.
 
 Turning off a device control selector always takes effect immediately. The disabled area disappears from **Current state** and **Next actions**, including the latter's action attributes and count. Energy Planner then makes one serialized best-effort safe-state restore; if confirmation is unavailable, it retains diagnostic recovery evidence and notifies without turning the selector back on or permitting new start/schedule commands. Unresolved EV ownership remains eligible for bounded safe-stop recovery after interruption or restart, with ten-minute backoff and a maximum of three failed attempts per rolling day. Dedicated EV retry timestamps keep those limits intact if another control area later updates the shared pause state or execution-audit rows rotate out.
 
@@ -134,9 +157,23 @@ Mapped EV start and stop controls are planner actuators. Energy Planner does not
 
 ## Planning behavior
 
+Configured weather entities are queried with Home Assistant's hourly
+`weather.get_forecasts` response action. Successful responses are cached for the
+shortest of 15 minutes, the planning interval, and the configured forecast
+freshness window; a manual replan refreshes them immediately. Naive timestamps use Home Assistant's configured timezone before
+UTC alignment. On an action failure, a cached response remains usable only
+within the configured forecast freshness window, followed by legacy forecast
+attributes and finally the current point value. Weather remains advisory and
+cannot block unrelated assets.
+
 EV planning considers the vehicle target SOC, ready-by time, price, solar, battery reserve, grid limits, connection state, and confirmed charger feedback. Home Assistant Recorder history automatically calibrates the effective percentage gained per kWh from completed charging sessions using the configured charger power. Sessions must last at least 30 minutes, and at least 60 minutes of clean history is required before the learned rate replaces the conservative **Bootstrap EV SOC gained per kWh** setting. A learned rate is reused only while the charging sensor, SOC sensor, and configured charger power still match; configuration changes use the bootstrap rate until retraining succeeds. A 10% margin is applied to the observed rate so planning starts early rather than risking a missed ready-by time. Once a continuous charging window starts and charging is confirmed, later tariff revisions keep that session running until its planned target unless a configured hard price limit or safety gate requires a stop. The integration supports a persistent charger switch or separate start/stop controls. Multiple EVs require separate named Energy Planner entries.
 
 Climate planning searches the configured tariff horizon for a lower-cost preconditioning window before an expensive period. Preconditioning requires somebody home by default. **Precondition while away** can explicitly permit only a complete planner-generated tariff preconditioning/coast lifecycle when occupancy is known to be away; it does not permit unrelated HVAC-on commands, unknown occupancy, targets outside the configured comfort bounds, or restarting planner-owned HVAC before the configured minimum cycle/rest period has elapsed. Only an action matching the persisted lifecycle mode and timestamps qualifies as a continuation that can bypass a redundant rest check. If an away preconditioning window begins in the future, unowned HVAC is turned off immediately and remains off until that window begins. If a refresh or temporary block misses the preferred start, the planner can use the remaining contiguous lower-price slots rather than discarding the entire opportunity. It never crosses a tariff-data gap or continues heating/cooling past the applicable comfort target. The planner can temporarily take ownership of configured climate automations and zones, then restores zone switches/helpers and automations when the period ends, comfort is reached, relevant confidence falls below threshold, inputs become unsafe, or a manual override occurs. The main Daikin thermostat always receives and confirms the planner target. When **Synchronise configured zone temperatures** is enabled, configured zone climate entities then receive and confirm the same target; this main-first order allows Daikin to update zone temperature bounds derived from the main setpoint before a zone command is validated. When it is disabled, zone climate targets remain unchanged while configured zone switches/helpers are still enabled and restored. Synchronisation requires at least one `climate` entity under Climate Zones and fails closed before takeover if any main or zone target that would be replaced cannot be captured for rollback. A failed takeover restores the captured main mode, main target, and zone targets before reporting rollback success. If immediate main restoration fails, the captured state remains owned and is retried during release or safe-state recovery; a later manual main-thermostat change supersedes the snapshot and is never overwritten by release. It does not call the release adapter when no HVAC ownership exists, and releases do not consume the daily climate command cap. Takeover stops already-running configured automation actions even when an automation is already off, while release re-enables only automations that were active before takeover. It confirms the complete commanded main and zone state and reasserts it once if a concurrent schedule overwrites the first command. If an external schedule-versus-manual classifier is used, configure both its Scheduler Change `input_boolean` and **Climate Scheduler Guard Timer** under Climate and presence. Energy Planner starts and confirms both for a 30-second settle window before any planner-owned HVAC mutation; an incomplete or unavailable guard fails closed instead of allowing the action to be classified as manual. External Manual Override helper changes use the configured manual override duration and are automatically cleared when it expires.
+
+The main thermostat rollback target is required even when configured-zone
+temperature synchronisation is off. When any required main or zone target is
+missing, new HVAC takeover candidates are removed before execution; an existing
+planner-owned HVAC state can still be released safely.
 
 For an originally-off main thermostat, acquisition rollback restores the active
 mode Daikin remembered for its next turn-on before switching it off again. That

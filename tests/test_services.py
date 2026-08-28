@@ -24,6 +24,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     DOMAIN,
     SERVICE_ARM_PRODUCTION_CONTROL,
     SERVICE_DISARM_PRODUCTION_CONTROL,
@@ -74,6 +75,7 @@ class FakeState:
     """Minimal Home Assistant state."""
 
     state: str = "on"
+    attributes: dict[str, Any] | None = None
 
 
 class FakeStates:
@@ -100,7 +102,10 @@ class FakeStates:
 
     def get(self, entity_id: str) -> FakeState | None:
         value = self.values.get(entity_id)
-        return None if value is None else FakeState(value)
+        if value is None:
+            return None
+        attributes = {"temperature": 21.0} if entity_id.startswith("climate.") else None
+        return FakeState(value, attributes)
 
 
 class FakeConfigEntries:
@@ -826,9 +831,14 @@ def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
         },
     )
     changed_policy = production_evidence_fingerprint(entry_data, {**options, "command_rate_limit_seconds": 120})
+    changed_load_grace = production_evidence_fingerprint(
+        entry_data,
+        {**options, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 10},
+    )
 
     assert active == original
     assert changed_policy != original
+    assert changed_load_grace != original
 
 
 def test_production_evidence_changes_with_household_load_mapping() -> None:

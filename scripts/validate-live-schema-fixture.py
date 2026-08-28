@@ -126,8 +126,13 @@ def _has_profile_source_field(fixture: dict[str, Any], field: str) -> bool:
 
 def _validate_forecast_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     issued_at = _parse_datetime(fixture["issued_at"])
+    attributes = dict(fixture.get("attributes", {}))
+    response = fixture.get("response")
+    source_entity_id = fixture.get("source_entity_id")
+    if isinstance(response, dict) and isinstance(response.get(source_entity_id), dict):
+        attributes["forecast"] = response[source_entity_id].get("forecast", [])
     series = forecast_series_from_state(
-        FixtureState(str(fixture.get("state", "")), dict(fixture.get("attributes", {}))),
+        FixtureState(str(fixture.get("state", "")), attributes),
         issued_at=issued_at,
         horizon_hours=int(fixture["horizon_hours"]),
         interval_minutes=int(fixture["interval_minutes"]),

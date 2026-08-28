@@ -35,6 +35,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SOC,
     CONF_PERSON_ENTITIES,
+    CONF_WEATHER,
     DOMAIN,
 )
 from .coordinator import (
@@ -43,6 +44,7 @@ from .coordinator import (
     _ai_recommendation_fingerprint,
     _material_plan_fingerprint,
 )
+from .discovery import CapabilityDiscovery
 from .entity import EnergyPlannerEntity, async_add_planner_entities, recorder_safe_attributes
 from .load_forecast import MIN_UPPER_COVERAGE
 from .models import ActionAsset, ActionKind, EnergyPlan, InputHealth, PlanAction, to_jsonable
@@ -50,6 +52,7 @@ from .preflight import _control_area_report, production_evidence_fingerprint
 from .safety import (
     DRY_RUN_READY_CYCLES_REQUIRED,
     control_pause_reason,
+    control_pause_status,
     parse_production_state,
     partition_control_areas_by_pause,
     strict_bool,
@@ -415,6 +418,10 @@ def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         "health": "Unknown" if plan is None else _display_state(plan.health),
         "controlled_assets": _controlled_state_groups(coordinator),
     }
+    if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
+        attrs["climate_capability"] = _climate_capability_attrs(coordinator)
+    if coordinator.entry_data.get(CONF_WEATHER):
+        attrs["weather_forecast"] = _weather_forecast_attrs(coordinator)
     load_forecast = _built_in_load_forecast_attrs(coordinator)
     if load_forecast:
         attrs["load_forecast"] = load_forecast
@@ -517,13 +524,14 @@ def _live_entity_snapshot(
         )
         if attributes.get(key) is not None
     }
-    return {
+    result = {
         "entity_id": entity_id,
         "name": attributes.get("friendly_name", entity_id),
         "role": role,
         "state": "missing" if state is None else str(state.state),
         "details": _bounded_json(details),
     }
+    return result
 
 
 def _asset_owned(store_data: dict[str, Any], asset: ActionAsset) -> bool:
@@ -589,7 +597,7 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
             )
             if action_forecast:
                 determination["load_forecast"] = action_forecast
-    return {
+    result = {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
         "mode": _display_state(plan.mode),
@@ -603,6 +611,48 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "actions": actions,
         "ai_explanation": _ai_advice_attrs(coordinator),
     }
+    if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
+        result["climate_capability"] = _climate_capability_attrs(coordinator)
+    if coordinator.entry_data.get(CONF_WEATHER):
+        result["weather_forecast"] = _weather_forecast_attrs(coordinator)
+    return result
+
+
+def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return actionable rollback-target evidence for current and next views."""
+    if coordinator.hass is None:
+        return {
+            "available": False,
+            "issues": ["home_assistant_unavailable"],
+            "main_target_unavailable": [],
+            "zone_targets_unavailable": [],
+            "synchronize_zone_temperatures": False,
+        }
+    evidence = CapabilityDiscovery(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.options,
+    ).inspect().hvac
+    return {
+        "available": evidence.supported,
+        "issues": list(evidence.issues),
+        "main_target_unavailable": list(
+            evidence.details.get("main_target_unavailable", [])
+        ),
+        "zone_targets_unavailable": list(
+            evidence.details.get("zone_targets_unavailable", [])
+        ),
+        "synchronize_zone_temperatures": evidence.details.get(
+            "synchronize_zone_temperatures", False
+        ),
+    }
+
+
+def _weather_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return the latest service/cache evidence even when the plan was unchanged."""
+    return _bounded_json(
+        dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
+    )
 
 
 def _ordered_actions(plan: EnergyPlan | None) -> list[PlanAction]:
@@ -1216,8 +1266,11 @@ def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
         if isinstance(accepted, dict) and accepted.get("outcome"):
             return _display_state(accepted["outcome"])
         return "No actionable result"
-    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
+    capability = _ai_capability_attrs(coordinator)
+    if not capability["configured"]:
         return "Not configured"
+    if not capability["available"]:
+        return "Unavailable"
     if _current_ai_pending(coordinator) is not None:
         return "Pending"
     return "No response"
@@ -1225,11 +1278,11 @@ def _ai_advice_state(coordinator: EnergyPlannerCoordinator) -> str:
 
 def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest bounded explain-or-troubleshoot result."""
-    available = bool(str(coordinator.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip())
+    capability = _ai_capability_attrs(coordinator)
     current = _current_ai_recommendation(coordinator)
     if current is None:
         attributes: dict[str, Any] = {
-            "available": available,
+            **capability,
             "result": None,
         }
         pending = _current_ai_pending(coordinator)
@@ -1247,7 +1300,7 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     current_plan_id = getattr(getattr(coordinator, "data", None), "plan_id", None)
     source_plan_id = latest.get("plan_id")
     result: dict[str, Any] = {
-        "available": available,
+        **capability,
         "created_at": latest.get("created_at"),
         "plan_id": source_plan_id,
         "reused_for_current_plan": bool(source_plan_id and source_plan_id != current_plan_id),
@@ -1270,6 +1323,27 @@ def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
             "verification": accepted.get("verification"),
         }
     return result
+
+
+def _ai_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return effective AI provider availability from entity and service evidence."""
+    task_entity = str(coordinator.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip()
+    if coordinator.hass is None:
+        return {
+            "configured": bool(task_entity),
+            "available": bool(task_entity),
+            "availability_reason": None if task_entity else "ai_task_entity_not_configured",
+        }
+    evidence = CapabilityDiscovery(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.options,
+    ).inspect().ai
+    return {
+        "configured": bool(task_entity),
+        "available": evidence.supported,
+        "availability_reason": evidence.issues[0] if evidence.issues else None,
+    }
 
 
 def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
@@ -1533,6 +1607,11 @@ def _built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict
         "validation",
         "cleaning",
         "update_reason",
+        "live_source_status",
+        "live_source_outage_seconds",
+        "outage_grace_minutes",
+        "current_correction_applied",
+        "fallback_applied",
     )
     return {key: _bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
 
@@ -1807,7 +1886,7 @@ def _production_readiness_attrs(coordinator: EnergyPlannerCoordinator) -> dict[s
         "required_control_areas": required_areas,
         "available_control_areas": available_control_areas,
         "paused_control_areas": paused_control_areas,
-        "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
+        "pause": _bounded_json(control_pause_status(pause, now)),
         "startup_auto_recovery_status": startup_recovery.get("status", "inactive"),
         "startup_auto_recovery_successful_runs": startup_recovery.get("successful_runs", 0),
         "startup_auto_recovery_required_runs": startup_recovery.get(
@@ -1976,7 +2055,9 @@ def _support_bundle_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, An
     return {
         "plan_id": None if coordinator.data is None else coordinator.data.plan_id,
         "production": _bounded_json(coordinator.store.data.get("production", {})),
-        "pause": _bounded_json(coordinator.store.data.get("control_pause", {})),
+        "pause": _bounded_json(
+            control_pause_status(coordinator.store.data.get("control_pause", {}), dt_util.utcnow())
+        ),
         "latest_audit": _execution_audit_attrs(coordinator).get("latest"),
         "latest_ai": _ai_advice_attrs(coordinator),
         "support_service": "ha_energy_planner.export_support_bundle",

@@ -47,6 +47,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _active_control_not_ready_reason,
     _ai_advice_notification_message,
     _bool_state_value,
+    _bounded_reason,
     _configured_entity_ids,
     _decision_input_fingerprint,
     _expired_manual_hvac_state,
@@ -63,6 +64,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _matches_pending_main_hvac_feedback,
     _matches_pending_zone_hvac_feedback,
     _material_plan_fingerprint,
+    _normalize_hourly_forecast,
     _overrides_from_store,
     _parse_datetime_or_none,
     _pending_zone_hvac_manual_change_entity_id,
@@ -75,6 +77,8 @@ from custom_components.ha_energy_planner.coordinator import (
     _startup_auto_recovery_validation_ready,
     _unexpired_overrides,
     _updated_load_forecast_training_attempted,
+    _updated_load_source_outage,
+    _weather_forecast_from_response,
 )
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -90,6 +94,424 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+
+def test_hourly_weather_response_normalizes_naive_sydney_datetimes_across_dst() -> None:
+    response = {
+        "weather.home": {
+            "forecast": [
+                {"datetime": "2026-10-04T01:00:00", "temperature": 12},
+                {"datetime": "2026-10-04T03:00:00", "temperature": 14},
+            ]
+        }
+    }
+
+    extracted = _weather_forecast_from_response(response, "weather.home")
+    normalized = _normalize_hourly_forecast(
+        extracted,
+        timezone="Australia/Sydney",
+    )
+
+    assert normalized[0]["datetime"] == "2026-10-03T15:00:00+00:00"
+    assert normalized[1]["datetime"] == "2026-10-03T16:00:00+00:00"
+
+
+def test_load_source_outage_retains_start_until_numeric_recovery() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    states: dict[str, Any] = {
+        "sensor.house": SimpleNamespace(
+            state="unknown",
+            attributes={"unit_of_measurement": "kW"},
+            last_changed=now - timedelta(minutes=2),
+        )
+    }
+    hass = SimpleNamespace(states=SimpleNamespace(get=states.get))
+    entry_data = {CONF_HOUSEHOLD_LOAD: "sensor.house"}
+
+    first = _updated_load_source_outage(hass, entry_data, {}, now=now)
+    states["sensor.house"] = SimpleNamespace(
+        state="unavailable",
+        attributes={"unit_of_measurement": "kW"},
+        last_changed=now + timedelta(minutes=5),
+    )
+    retained = _updated_load_source_outage(
+        hass,
+        entry_data,
+        first,
+        now=now + timedelta(minutes=5),
+    )
+    states["sensor.house"] = SimpleNamespace(
+        state="bad",
+        attributes={"unit_of_measurement": "kW"},
+        last_changed=now + timedelta(minutes=6),
+    )
+    still_retained = _updated_load_source_outage(
+        hass,
+        entry_data,
+        retained,
+        now=now + timedelta(minutes=6),
+    )
+    states["sensor.house"] = SimpleNamespace(
+        state="unknown",
+        attributes={"unit_of_measurement": "kW"},
+        last_changed=now + timedelta(minutes=6, seconds=30),
+    )
+    still_ineligible = _updated_load_source_outage(
+        hass,
+        entry_data,
+        still_retained,
+        now=now + timedelta(minutes=6, seconds=30),
+    )
+    states["sensor.house"] = SimpleNamespace(
+        state="1.5",
+        attributes={"unit_of_measurement": "kW"},
+        last_changed=now + timedelta(minutes=7),
+    )
+
+    assert retained["started_at"] == first["started_at"]
+    assert still_retained["started_at"] == first["started_at"]
+    assert still_retained["fallback_eligible"] is False
+    assert still_ineligible["fallback_eligible"] is False
+    assert _updated_load_source_outage(
+        hass,
+        entry_data,
+        still_retained,
+        now=now + timedelta(minutes=7),
+    ) == {}
+
+
+def test_load_source_outage_handles_missing_and_malformed_persisted_evidence() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda _entity_id: None))
+
+    assert _updated_load_source_outage(hass, {}, {}, now=now) == {}
+    missing = _updated_load_source_outage(
+        hass,
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        {},
+        now=now,
+    )
+    malformed = _updated_load_source_outage(
+        hass,
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+        {"entity_id": "sensor.house", "started_at": "invalid"},
+        now=now + timedelta(minutes=1),
+    )
+
+    assert missing["started_at"] is None
+    assert missing["last_observed_state"] == "missing"
+    assert missing["fallback_eligible"] is False
+    assert malformed["malformed"] is True
+    assert malformed["started_at"] == "invalid"
+
+
+def test_coordinator_persists_load_source_outage_with_store_compatibility() -> None:
+    save_outage = AsyncMock()
+    coordinator = SimpleNamespace(
+        store=SimpleNamespace(
+            data={},
+            async_save_load_source_outage=save_outage,
+        )
+    )
+    outage = {
+        "entity_id": "sensor.house",
+        "started_at": "2026-08-25T00:00:00+00:00",
+    }
+
+    asyncio.run(
+        EnergyPlannerCoordinator._async_save_load_source_outage(
+            coordinator,
+            outage,
+        )
+    )
+    coordinator.store.data["load_source_outage"] = outage
+    asyncio.run(
+        EnergyPlannerCoordinator._async_save_load_source_outage(
+            coordinator,
+            outage,
+        )
+    )
+
+    assert save_outage.await_count == 1
+
+    legacy = SimpleNamespace(store=SimpleNamespace(data={}))
+    asyncio.run(
+        EnergyPlannerCoordinator._async_save_load_source_outage(
+            legacy,
+            outage,
+        )
+    )
+    assert legacy.store.data["load_source_outage"] == outage
+
+
+def test_hourly_weather_response_skips_dst_gaps_and_disambiguates_folds() -> None:
+    spring = _normalize_hourly_forecast(
+        [
+            {"datetime": "2026-10-04T01:00:00", "temperature": 11},
+            {"datetime": "2026-10-04T02:00:00", "temperature": 12},
+            {"datetime": "2026-10-04T03:00:00", "temperature": 13},
+        ],
+        timezone="Australia/Sydney",
+    )
+    autumn = _normalize_hourly_forecast(
+        [
+            {"datetime": "2026-04-05T01:00:00", "temperature": 11},
+            {"datetime": "2026-04-05T02:00:00", "temperature": 12},
+            {"datetime": "2026-04-05T02:00:00", "temperature": 13},
+            {"datetime": "2026-04-05T03:00:00", "temperature": 14},
+        ],
+        timezone="Australia/Sydney",
+    )
+    aware = _normalize_hourly_forecast(
+        [{"datetime": "2026-10-03T16:00:00+00:00", "temperature": 13}],
+        timezone="Australia/Sydney",
+    )
+
+    assert [item["datetime"] for item in spring] == [
+        "2026-10-03T15:00:00+00:00",
+        "2026-10-03T16:00:00+00:00",
+    ]
+    assert [item["datetime"] for item in autumn] == [
+        "2026-04-04T14:00:00+00:00",
+        "2026-04-04T15:00:00+00:00",
+        "2026-04-04T16:00:00+00:00",
+        "2026-04-04T17:00:00+00:00",
+    ]
+    assert aware[0]["datetime"] == "2026-10-03T16:00:00+00:00"
+
+
+def test_hourly_weather_forecast_fetch_caches_and_manual_force_refreshes() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+    forecast = [
+        {
+            "datetime": (datetime(2026, 8, 25, 10) + timedelta(hours=index)).isoformat(),
+            "temperature": 12 + index / 10,
+        }
+        for index in range(73)
+    ]
+
+    class ForecastServices:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def async_call(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {"weather.home": {"forecast": forecast}}
+
+    services = ForecastServices()
+    coordinator = SimpleNamespace(
+        hass=SimpleNamespace(
+            services=services,
+            config=SimpleNamespace(time_zone="Australia/Sydney"),
+        ),
+        _weather_forecast_cache={},
+    )
+    options = {"planning_interval_minutes": 5, "forecast_freshness_minutes": 120}
+
+    first, first_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now,
+            force=False,
+        )
+    )
+    cached, cached_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now + timedelta(minutes=1),
+            force=False,
+        )
+    )
+    forced, forced_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now + timedelta(minutes=2),
+            force=True,
+        )
+    )
+
+    assert len(first["forecast"]) == 73
+    assert first_details["fetch_status"] == "fetched"
+    assert cached == first
+    assert cached_details["fetch_status"] == "cache_hit"
+    assert forced == first
+    assert forced_details["fetch_status"] == "fetched"
+    assert coordinator.weather_forecast_diagnostics == forced_details
+    assert services.calls == 2
+
+
+def test_hourly_weather_cache_hit_respects_shorter_forecast_freshness() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+
+    class ForecastServices:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def async_call(self, *_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {
+                "weather.home": {
+                    "forecast": [
+                        {"datetime": now.isoformat(), "temperature": 12}
+                    ]
+                }
+            }
+
+    services = ForecastServices()
+    coordinator = SimpleNamespace(
+        hass=SimpleNamespace(
+            services=services,
+            config=SimpleNamespace(time_zone="UTC"),
+        ),
+        _weather_forecast_cache={},
+    )
+    options = {
+        "planning_interval_minutes": 5,
+        "forecast_freshness_minutes": 1,
+    }
+
+    asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now,
+            force=False,
+        )
+    )
+    _forecast, details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now + timedelta(minutes=2),
+            force=False,
+        )
+    )
+
+    assert services.calls == 2
+    assert details["fetch_status"] == "fetched"
+
+
+def test_hourly_weather_forecast_failure_uses_fresh_cache_then_legacy_fallback() -> None:
+    now = datetime(2026, 8, 25, tzinfo=UTC)
+
+    class FailureServices:
+        response: Any = RuntimeError("weather unavailable")
+
+        async def async_call(self, *_args: Any, **_kwargs: Any) -> Any:
+            if isinstance(self.response, Exception):
+                raise self.response
+            return self.response
+
+    services = FailureServices()
+    cached_forecast = [
+        {"datetime": now.isoformat(), "temperature": 12},
+    ]
+    coordinator = SimpleNamespace(
+        hass=SimpleNamespace(
+            services=services,
+            config=SimpleNamespace(time_zone="UTC"),
+        ),
+        _weather_forecast_cache={
+            "entity_id": "weather.home",
+            "fetched_at": now - timedelta(minutes=10),
+            "forecast": cached_forecast,
+        },
+    )
+    options = {"planning_interval_minutes": 5, "forecast_freshness_minutes": 120}
+
+    cached, details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now,
+            force=True,
+        )
+    )
+    assert cached == {"forecast": cached_forecast}
+    assert details["fetch_status"] == "cached_after_error"
+    assert details["failure_reason"].startswith("RuntimeError:")
+    assert coordinator.weather_forecast_diagnostics == details
+
+    coordinator._weather_forecast_cache = {}
+    services.response = {}
+    failed, failed_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now,
+            force=True,
+        )
+    )
+    assert failed == {}
+    assert failed_details["fetch_status"] == "failed"
+    assert failed_details["point_count"] == 0
+    assert failed_details["coverage_start"] is None
+
+    coordinator.weather_forecast_diagnostics = {
+        **failed_details,
+        "entity_id": "weather.home",
+        "source_type": "point_value_repeated",
+        "point_count": 1,
+        "coverage_start": now.isoformat(),
+        "coverage_end": now.isoformat(),
+        "covered_hours": 0.0,
+    }
+    retained, retained_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now + timedelta(minutes=1),
+            force=True,
+        )
+    )
+    assert retained == {}
+    assert retained_details["source_type"] == "point_value_repeated"
+    assert retained_details["point_count"] == 1
+
+    services.response = {
+        "weather.home": {"forecast": [{"datetime": "invalid", "temperature": 12}]}
+    }
+    invalid, invalid_details = asyncio.run(
+        EnergyPlannerCoordinator._async_weather_forecast(
+            coordinator,
+            {"weather_entity": "weather.home"},
+            options,
+            now=now,
+            force=True,
+        )
+    )
+    assert invalid == {}
+    assert "response_invalid" in invalid_details["failure_reason"]
+
+
+def test_hourly_weather_helpers_fail_closed_on_malformed_shapes() -> None:
+    assert _weather_forecast_from_response([], "weather.home") == []
+    assert _weather_forecast_from_response({}, "weather.home") == []
+    assert _weather_forecast_from_response(
+        {"weather.home": {"forecast": "invalid"}}, "weather.home"
+    ) == []
+    normalized = _normalize_hourly_forecast(
+        [
+            {"datetime": "invalid", "temperature": 1},
+            {"datetime": "2026-08-25T00:00:00", "temperature": 2},
+        ],
+        timezone="Invalid/Timezone",
+    )
+    assert normalized == [
+        {"datetime": "2026-08-25T00:00:00+00:00", "temperature": 2}
+    ]
+    assert _bounded_reason(RuntimeError()) == "RuntimeError"
 
 
 def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
@@ -237,18 +659,23 @@ class FakeState:
 class FakeStates:
     """Minimal state registry."""
 
-    def __init__(self, values: dict[str, str]) -> None:
+    def __init__(self, values: dict[str, str | FakeState]) -> None:
         self.values = values
 
     def get(self, entity_id: str) -> FakeState | None:
         value = self.values.get(entity_id)
-        return None if value is None else FakeState(value)
+        if value is None:
+            return None
+        if isinstance(value, FakeState):
+            return value
+        attributes = {"temperature": 21.0} if entity_id.startswith("climate.") else {}
+        return FakeState(value, attributes)
 
 
 class FakeHass:
     """Minimal HA object."""
 
-    def __init__(self, values: dict[str, str] | None = None) -> None:
+    def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.state = CoreState.running
         self.states = FakeStates(values or {})
         self.services = SimpleNamespace(calls=[], async_call=self._async_call_service)
@@ -3581,6 +4008,45 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline() -> Non
     assert coordinator._refresh_counters["fingerprint_skipped"] == 1
 
 
+def test_active_load_outage_bypasses_unchanged_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            "amber_import_price_entity": "sensor.price",
+            CONF_HOUSEHOLD_LOAD: "sensor.house",
+        },
+        hass=FakeHass(
+            {
+                "sensor.price": "0.20",
+                "sensor.house": "unavailable",
+            }
+        ),
+    )
+    coordinator.data = _plan("existing-outage")
+    coordinator._last_decision_fingerprint = _decision_input_fingerprint(
+        coordinator.hass,
+        coordinator.entry_data,
+        coordinator.planner_options,
+        coordinator.overrides,
+        now=coordinator.data.created_at,
+    )
+
+    def reached_discovery(_self: object) -> None:
+        raise RuntimeError("outage_was_replanned")
+
+    monkeypatch.setattr(coordinator_module.CapabilityDiscovery, "inspect", reached_discovery)
+    original = coordinator_module.dt_util.utcnow
+    coordinator_module.dt_util.utcnow = lambda: coordinator.data.created_at
+    try:
+        with pytest.raises(RuntimeError, match="outage_was_replanned"):
+            asyncio.run(coordinator._async_update_data_locked())
+    finally:
+        coordinator_module.dt_util.utcnow = original
+
+    assert coordinator.store.data["load_source_outage"]["entity_id"] == "sensor.house"
+
+
 def test_explicit_replan_marks_next_refresh_as_forced() -> None:
     coordinator = _coordinator_for_runtime_services()
 
@@ -3712,7 +4178,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
 
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
-        lambda hass, data: SimpleNamespace(
+        lambda hass, data, options: SimpleNamespace(
             inspect=lambda: SimpleNamespace(
                 as_dict=lambda: {},
                 climate=SimpleNamespace(issues=["climate_zone_unavailable"]),

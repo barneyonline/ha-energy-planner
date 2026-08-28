@@ -446,12 +446,18 @@ class DryRunPlanner:
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
         if enphase_action is not None:
             actions.append(enphase_action)
+        hvac_capability_blocked = _hvac_rollback_capability_unavailable(context)
         actions = [
             action
             for action in actions
             if action.kind == ActionKind.RELEASE_HVAC
-            or _is_hvac_away_off_action(action)
-            or _action_meets_confidence_threshold(action, context, self.options)
+            or (
+                not (action.asset == ActionAsset.DAIKIN and hvac_capability_blocked)
+                and (
+                    _is_hvac_away_off_action(action)
+                    or _action_meets_confidence_threshold(action, context, self.options)
+                )
+            )
         ]
         return sorted(actions, key=lambda action: _action_score(action, context, self.options)["score"], reverse=True)
 
@@ -1309,11 +1315,27 @@ def confidence_from_context(context: DecisionContext) -> float:
     )
 
 
+def _hvac_rollback_capability_unavailable(context: DecisionContext) -> bool:
+    """Return whether HVAC takeover lacks a required rollback target."""
+    return any(
+        issue
+        in {
+            "main_climate_target_unavailable",
+            "climate_zone_target_unavailable",
+        }
+        for issue in context.input_issues
+    )
+
+
 def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
     """Return confidence by planning subsystem."""
     base = confidence_from_context(context)
     health = confidence_from_health(context.input_health)
-    issue_text = " ".join(issue for issue in context.input_issues if not issue.startswith("advisory_"))
+    issue_text = " ".join(
+        issue
+        for issue in context.input_issues
+        if not issue.startswith("advisory_") and issue != "household_load_model_fallback_active"
+    )
     breakdown = {
         "overall": base,
         "tariff": _subsystem_confidence(

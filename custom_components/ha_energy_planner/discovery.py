@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from homeassistant.core import HomeAssistant
@@ -29,6 +30,8 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    DEFAULT_OPTIONS,
 )
 from .models import ActionAsset
 
@@ -74,10 +77,16 @@ class DiscoveryReport:
 class CapabilityDiscovery:
     """Inspect Home Assistant entities/services without issuing device commands."""
 
-    def __init__(self, hass: HomeAssistant, entry_data: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry_data: dict[str, Any],
+        options: dict[str, Any] | None = None,
+    ) -> None:
         """Initialize discovery."""
         self.hass = hass
         self.entry_data = entry_data
+        self.options = {**DEFAULT_OPTIONS, **(options or {})}
 
     def inspect(self) -> DiscoveryReport:
         """Return current capability evidence."""
@@ -163,6 +172,24 @@ class CapabilityDiscovery:
         unavailable_zones = [entity_id for entity_id in zones if _state_missing(self.hass, entity_id)]
         if unavailable_zones:
             issues.append("climate_zone_unavailable")
+        synchronize_targets = (
+            self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is True
+        )
+        main_target_unavailable: list[str] = []
+        zone_targets_unavailable: list[str] = []
+        if climate and not _state_missing(self.hass, climate):
+            climate_state = self.hass.states.get(climate)
+            if not _has_finite_temperature_target(climate_state):
+                main_target_unavailable.append(str(climate))
+                issues.append("main_climate_target_unavailable")
+        if synchronize_targets:
+            for entity_id in zones:
+                if not entity_id.startswith("climate.") or _state_missing(self.hass, entity_id):
+                    continue
+                if not _has_finite_temperature_target(self.hass.states.get(entity_id)):
+                    zone_targets_unavailable.append(entity_id)
+            if zone_targets_unavailable:
+                issues.append("climate_zone_target_unavailable")
         manual_override = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override and _state_missing(self.hass, manual_override):
             issues.append("climate_manual_override_unavailable")
@@ -184,6 +211,9 @@ class CapabilityDiscovery:
                 "unavailable_automations": unavailable,
                 "zone_entities": zones,
                 "unavailable_zones": unavailable_zones,
+                "synchronize_zone_temperatures": synchronize_targets,
+                "main_target_unavailable": main_target_unavailable,
+                "zone_targets_unavailable": zone_targets_unavailable,
                 "manual_override_entity": manual_override,
                 "scheduler_guard_entity": scheduler_guard,
                 "scheduler_guard_timer_entity": scheduler_timer,
@@ -232,13 +262,33 @@ class CapabilityDiscovery:
                 {
                     **service_evidence.details,
                     "ai_task_entity": task_entity,
+                    "configured": True,
+                    "available": not issues,
+                    "reason": issues[0] if issues else None,
                 },
             )
 
         service = self.entry_data.get(CONF_AI_ADVISOR_SERVICE)
         if service == "ai_task.generate_data":
-            return CapabilityEvidence(False, ["ai_task_entity_not_configured"], {"service": service})
-        return CapabilityEvidence(False, ["ai_service_not_configured"], {})
+            return CapabilityEvidence(
+                False,
+                ["ai_task_entity_not_configured"],
+                {
+                    "service": service,
+                    "configured": False,
+                    "available": False,
+                    "reason": "ai_task_entity_not_configured",
+                },
+            )
+        return CapabilityEvidence(
+            False,
+            ["ai_task_entity_not_configured"],
+            {
+                "configured": False,
+                "available": False,
+                "reason": "ai_task_entity_not_configured",
+            },
+        )
 
 
 def _service_evidence(hass: HomeAssistant, service_name: str | None, label: str) -> CapabilityEvidence:
@@ -269,13 +319,36 @@ def _profile_control_service(profile_entity: str | None) -> str | None:
 
 
 def _state_missing(hass: HomeAssistant, entity_id: str) -> bool:
-    state = hass.states.get(entity_id)
+    states = getattr(hass, "states", None)
+    get_state = getattr(states, "get", None)
+    if not callable(get_state):
+        return True
+    state = get_state(entity_id)
     if state is None:
         return True
     domain = entity_id.split(".", 1)[0]
     if domain in {"button", "input_button"}:
         return state.state == "unavailable"
     return state.state in {"unknown", "unavailable"}
+
+
+def _has_finite_temperature_target(state: Any) -> bool:
+    """Return whether a climate state contains a complete finite rollback target."""
+    attributes = getattr(state, "attributes", {}) or {}
+    temperature = _finite_float(attributes.get("temperature"))
+    if temperature is not None:
+        return True
+    return _finite_float(attributes.get("target_temp_low")) is not None and _finite_float(
+        attributes.get("target_temp_high")
+    ) is not None
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isfinite(parsed) else None
 
 
 def _split_entity_values(value: Any) -> list[str]:

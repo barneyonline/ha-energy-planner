@@ -13,6 +13,7 @@ from datetime import UTC, datetime, timedelta
 from math import ceil, isfinite
 from time import monotonic, perf_counter
 from typing import Any, Never
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -52,6 +53,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
+    CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -73,6 +75,7 @@ from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
 from .inputs import InputManager
+from .load_forecast import normalize_power_kw
 from .models import (
     ActionOutcome,
     DecisionContext,
@@ -352,6 +355,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_decision_context: DecisionContext | None = None
         self._tearing_down = False
         self._force_next_refresh = False
+        self._weather_forecast_cache: dict[str, Any] = {}
+        self.weather_forecast_diagnostics: dict[str, Any] = {}
         self._load_forecast_training_attempted = False
         self._refresh_counters: dict[str, int] = {
             "requested": 0,
@@ -820,17 +825,32 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.planner_options
         entry_data = self.entry_data
         self.executor.options = options
+        force_refresh = bool(getattr(self, "_force_next_refresh", False))
+        self._force_next_refresh = False
+        weather_forecast, weather_forecast_details = await self._async_weather_forecast(
+            entry_data,
+            options,
+            now=now,
+            force=force_refresh,
+        )
+        load_source_outage = _updated_load_source_outage(
+            self.hass,
+            entry_data,
+            self.store.data.get("load_source_outage"),
+            now=now,
+        )
+        await self._async_save_load_source_outage(load_source_outage)
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
             entry_data,
             options,
             self.overrides,
             now=dt_util.utcnow(),
+            weather_forecast=weather_forecast,
         )
-        force_refresh = bool(getattr(self, "_force_next_refresh", False))
-        self._force_next_refresh = False
         if (
             not force_refresh
+            and not load_source_outage
             and decision_fingerprint == getattr(self, "_last_decision_fingerprint", None)
             and getattr(self, "data", None) is not None
         ):
@@ -838,7 +858,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_phase_durations = {"fingerprint_ms": round((perf_counter() - preparation_started) * 1000, 3)}
             return self.data
         self.executor.entry_data = entry_data
-        discovery = CapabilityDiscovery(self.hass, entry_data).inspect()
+        discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
         await self.store.async_save_discovery(discovery.as_dict())
         ev_charge_calibration = dict(self.store.data.get("ev_charge_calibration", {}))
         ev_charge_calibration, ev_calibration_changed, ev_calibration_reason = (
@@ -878,6 +898,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             forecast_calibration=dict(self.store.data.get("forecast_calibration", {})),
             load_forecast_model=load_forecast_model,
             load_forecast_update_reason=load_forecast_reason,
+            load_source_outage=load_source_outage,
+            weather_forecast=weather_forecast,
+            weather_forecast_details=weather_forecast_details,
         )
         forecast_calibration, calibration_changed = update_forecast_calibration(
             dict(self.store.data.get("forecast_calibration", {})),
@@ -889,11 +912,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        self.weather_forecast_diagnostics = dict(
+            getattr(manager, "weather_forecast_details", weather_forecast_details)
+        )
+        climate_discovery = getattr(
+            discovery,
+            "hvac",
+            getattr(discovery, "climate", None),
+        )
+        climate_issues = list(getattr(climate_discovery, "issues", []))
+        for issue in climate_issues:
+            if issue not in context.input_issues:
+                context.input_issues.append(issue)
         stored_ownership = self.store.data.get("ownership", {})
         if isinstance(stored_ownership, dict):
             context.hvac_control = _hvac_control_from_ownership(stored_ownership)
-        climate_discovery = getattr(discovery, "climate", None)
-        climate_issues = list(getattr(climate_discovery, "issues", []))
         if context.hvac_control and climate_issues:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
         thermal_model, thermal_model_changed = update_thermal_model(
@@ -2168,6 +2201,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         else:
             self.store.data["control_pause"] = to_jsonable(pause)
 
+    async def _async_save_load_source_outage(self, outage: dict[str, Any]) -> None:
+        """Persist continuous load-source outage evidence when supported."""
+        if self.store.data.get("load_source_outage") == outage:
+            return
+        save_outage = getattr(self.store, "async_save_load_source_outage", None)
+        if callable(save_outage):
+            await save_outage(outage)
+        else:
+            self.store.data["load_source_outage"] = to_jsonable(outage)
+
     async def _async_clear_expired_manual_hvac_state(self) -> bool:
         """Clear planner-managed manual HVAC exposure after its timeout."""
         manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
@@ -2270,6 +2313,153 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return plan
         await self._async_execute_plan_if_current(started_generation, plan, context, options)
         return plan
+
+    async def _async_weather_forecast(
+        self,
+        entry_data: dict[str, Any],
+        options: dict[str, Any],
+        *,
+        now: datetime,
+        force: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return an hourly weather response with bounded cache fallback."""
+        prior_details = dict(
+            getattr(self, "weather_forecast_diagnostics", {}) or {}
+        )
+
+        def result(
+            forecast_result: dict[str, Any],
+            details: dict[str, Any],
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            effective_details = {**details, "entity_id": entity_id}
+            if (
+                effective_details.get("source_type")
+                == "legacy_attributes_or_point_value"
+                and prior_details.get("entity_id") == entity_id
+                and prior_details.get("source_type")
+                in {
+                    "legacy_entity_attributes",
+                    "legacy_entity_attributes_partial",
+                    "point_value_repeated",
+                    "unavailable_state",
+                    "invalid_state",
+                }
+            ):
+                for key in (
+                    "source_type",
+                    "point_count",
+                    "coverage_start",
+                    "coverage_end",
+                    "classification",
+                    "covered_hours",
+                    "continuous_hours",
+                    "requested_hours",
+                ):
+                    if key in prior_details:
+                        effective_details[key] = prior_details[key]
+            self.weather_forecast_diagnostics = dict(effective_details)
+            return forecast_result, effective_details
+
+        entity_id = str(entry_data.get(CONF_WEATHER) or "").strip()
+        if not entity_id:
+            return result(
+                {},
+                {"fetch_status": "not_configured", "source_type": "none"},
+            )
+
+        cache = getattr(self, "_weather_forecast_cache", {})
+        cached_entity = str(cache.get("entity_id") or "")
+        cached_at = _parse_datetime_or_none(cache.get("fetched_at"))
+        cached_forecast = cache.get("forecast")
+        cache_age_seconds = (
+            max((dt_util.as_utc(now) - dt_util.as_utc(cached_at)).total_seconds(), 0.0)
+            if cached_at is not None
+            else None
+        )
+        planning_minutes = max(int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), 1)
+        freshness_minutes = max(
+            int(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)),
+            0,
+        )
+        refresh_after_seconds = min(planning_minutes, 15, freshness_minutes) * 60
+        cache_matches = (
+            cached_entity == entity_id
+            and isinstance(cached_forecast, list)
+            and bool(cached_forecast)
+            and cache_age_seconds is not None
+        )
+        if not force and cache_matches and cache_age_seconds < refresh_after_seconds:
+            return result(
+                {"forecast": list(cached_forecast)},
+                _weather_forecast_details(
+                    fetch_status="cache_hit",
+                    source_type="weather_service_hourly",
+                    forecast=cached_forecast,
+                    cache_age_seconds=cache_age_seconds,
+                ),
+            )
+
+        failure_reason: str | None = None
+        try:
+            response = await self.hass.services.async_call(
+                "weather",
+                "get_forecasts",
+                {"entity_id": entity_id, "type": "hourly"},
+                blocking=True,
+                return_response=True,
+            )
+            forecast = _weather_forecast_from_response(response, entity_id)
+            if not forecast:
+                raise ValueError("weather_forecast_response_empty")
+            normalized = _normalize_hourly_forecast(
+                forecast,
+                timezone=str(
+                    getattr(getattr(self.hass, "config", None), "time_zone", None)
+                    or "UTC"
+                ),
+            )
+            if not normalized:
+                raise ValueError("weather_forecast_response_invalid")
+            self._weather_forecast_cache = {
+                "entity_id": entity_id,
+                "fetched_at": now,
+                "forecast": normalized,
+            }
+            return result(
+                {"forecast": normalized},
+                _weather_forecast_details(
+                    fetch_status="fetched",
+                    source_type="weather_service_hourly",
+                    forecast=normalized,
+                    cache_age_seconds=0.0,
+                ),
+            )
+        except Exception as err:  # noqa: BLE001 - weather is advisory and falls back safely.
+            failure_reason = _bounded_reason(err)
+            _LOGGER.debug("Hourly weather forecast fetch failed: %s", failure_reason)
+
+        freshness_seconds = freshness_minutes * 60
+        if cache_matches and cache_age_seconds <= freshness_seconds:
+            return result(
+                {"forecast": list(cached_forecast)},
+                _weather_forecast_details(
+                    fetch_status="cached_after_error",
+                    source_type="weather_service_hourly_cache",
+                    forecast=cached_forecast,
+                    cache_age_seconds=cache_age_seconds,
+                    failure_reason=failure_reason,
+                ),
+            )
+        return result(
+            {},
+            _weather_forecast_details(
+                fetch_status="failed",
+                source_type="legacy_attributes_or_point_value",
+                forecast=[],
+                cache_age_seconds=cache_age_seconds,
+                failure_reason=failure_reason,
+            ),
+        )
 
     @callback
     def _schedule_plan_execution(
@@ -2692,6 +2882,177 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         counters[key] = int(counters.get(key, 0)) + 1
 
 
+def _weather_forecast_from_response(response: Any, entity_id: str) -> list[dict[str, Any]]:
+    """Extract the documented per-entity forecast response."""
+    if not isinstance(response, dict):
+        return []
+    entity_response = response.get(entity_id)
+    if not isinstance(entity_response, dict):
+        return []
+    forecast = entity_response.get("forecast")
+    if not isinstance(forecast, list):
+        return []
+    return [dict(item) for item in forecast if isinstance(item, dict)]
+
+
+def _updated_load_source_outage(
+    hass: HomeAssistant,
+    entry_data: dict[str, Any],
+    previous: Any,
+    *,
+    now: datetime,
+) -> dict[str, Any]:
+    """Retain one start timestamp until household load becomes numeric again."""
+    entity_id = str(entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
+    if not entity_id:
+        return {}
+    state = hass.states.get(entity_id)
+    attributes = getattr(state, "attributes", {}) or {}
+    unit = str(attributes.get("unit_of_measurement") or attributes.get("unit") or "")
+    if state is not None and normalize_power_kw(getattr(state, "state", None), unit) is not None:
+        return {}
+    observed_state = "missing" if state is None else str(state.state)
+    sentinel_state = observed_state.lower() in {"unknown", "unavailable"}
+
+    prior = dict(previous) if isinstance(previous, dict) else {}
+    prior_matches = prior.get("entity_id") == entity_id
+    prior_started_at = (
+        _parse_datetime_or_none(prior.get("started_at")) if prior_matches else None
+    )
+    if prior_matches and prior_started_at is None:
+        return {
+            "entity_id": entity_id,
+            "started_at": prior.get("started_at"),
+            "last_observed_state": observed_state,
+            "fallback_eligible": False,
+            "invalid_reason": "outage_transition_time_unknown",
+            "malformed": True,
+        }
+    if prior_started_at is not None:
+        fallback_eligible = prior.get("fallback_eligible") is not False
+        invalid_reason = prior.get("invalid_reason")
+        if not sentinel_state:
+            fallback_eligible = False
+            invalid_reason = (
+                "household_load_entity_missing"
+                if state is None
+                else "household_load_non_numeric"
+            )
+        result = {
+            "entity_id": entity_id,
+            "started_at": prior_started_at.isoformat(),
+            "last_observed_state": observed_state,
+            "fallback_eligible": fallback_eligible,
+        }
+        if invalid_reason:
+            result["invalid_reason"] = invalid_reason
+        return result
+
+    state_changed_at = getattr(state, "last_changed", None)
+    if not sentinel_state or not isinstance(state_changed_at, datetime):
+        return {
+            "entity_id": entity_id,
+            "started_at": None,
+            "last_observed_state": observed_state,
+            "fallback_eligible": False,
+            "invalid_reason": (
+                "household_load_entity_missing"
+                if state is None
+                else "household_load_non_numeric"
+                if not sentinel_state
+                else "outage_transition_time_unknown"
+            ),
+        }
+    started_at = (
+        state_changed_at.replace(tzinfo=UTC)
+        if state_changed_at.tzinfo is None
+        else state_changed_at.astimezone(UTC)
+    )
+    return {
+        "entity_id": entity_id,
+        "started_at": started_at.isoformat(),
+        "last_observed_state": observed_state,
+        "fallback_eligible": True,
+    }
+
+
+def _normalize_hourly_forecast(
+    forecast: list[dict[str, Any]],
+    *,
+    timezone: str,
+) -> list[dict[str, Any]]:
+    """Normalize forecast datetimes to UTC, treating naive values as HA local time."""
+    try:
+        local_timezone = ZoneInfo(timezone)
+    except ZoneInfoNotFoundError:
+        local_timezone = ZoneInfo("UTC")
+    normalized: list[dict[str, Any]] = []
+    previous_naive_utc: datetime | None = None
+    for item in forecast:
+        parsed = _parse_datetime_or_none(item.get("datetime"))
+        if parsed is None:
+            continue
+        if parsed.tzinfo is None:
+            candidates = _naive_local_utc_candidates(parsed, local_timezone)
+            parsed_utc = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if previous_naive_utc is None or candidate > previous_naive_utc
+                ),
+                None,
+            )
+            if parsed_utc is None:
+                continue
+            previous_naive_utc = parsed_utc
+        else:
+            parsed_utc = parsed.astimezone(UTC)
+        normalized_item = dict(item)
+        normalized_item["datetime"] = parsed_utc.isoformat()
+        normalized.append(normalized_item)
+    return normalized
+
+
+def _naive_local_utc_candidates(value: datetime, timezone: ZoneInfo) -> list[datetime]:
+    """Return valid UTC instants for a naive wall time, including DST folds."""
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        candidate = value.replace(tzinfo=timezone, fold=fold).astimezone(UTC)
+        round_trip = candidate.astimezone(timezone).replace(tzinfo=None)
+        if round_trip == value and candidate not in candidates:
+            candidates.append(candidate)
+    return sorted(candidates)
+
+
+def _weather_forecast_details(
+    *,
+    fetch_status: str,
+    source_type: str,
+    forecast: list[dict[str, Any]],
+    cache_age_seconds: float | None,
+    failure_reason: str | None = None,
+) -> dict[str, Any]:
+    """Return bounded operator diagnostics for the hourly forecast fetch."""
+    datetimes = [str(item.get("datetime")) for item in forecast if item.get("datetime")]
+    return {
+        "fetch_status": fetch_status,
+        "source_type": source_type,
+        "cache_age_seconds": (
+            round(cache_age_seconds, 3) if cache_age_seconds is not None else None
+        ),
+        "point_count": len(forecast),
+        "coverage_start": min(datetimes) if datetimes else None,
+        "coverage_end": max(datetimes) if datetimes else None,
+        "failure_reason": failure_reason,
+    }
+
+
+def _bounded_reason(error: Exception) -> str:
+    """Return a bounded service failure reason without leaking payloads."""
+    message = str(error).strip().replace("\n", " ")[:160]
+    return f"{type(error).__name__}:{message}" if message else type(error).__name__
+
+
 def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     """Return explicit decision-input entity IDs that may trigger replanning."""
     entity_ids: set[str] = set()
@@ -2708,6 +3069,7 @@ def _decision_input_fingerprint(
     overrides: list[Override],
     *,
     now: datetime,
+    weather_forecast: dict[str, Any] | None = None,
 ) -> str:
     """Return a stable fingerprint of decision state for one planning interval."""
     interval_seconds = max(int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), 1) * 60
@@ -2727,6 +3089,7 @@ def _decision_input_fingerprint(
         "states": states,
         "options": options,
         "overrides": to_jsonable(overrides),
+        "weather_forecast": weather_forecast or {},
     }
     encoded = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()

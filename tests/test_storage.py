@@ -97,6 +97,21 @@ def test_store_persists_ev_grid_reservation_high_watermark(monkeypatch: object) 
     assert store.data["ev_grid_reservation"]["load_kw"] == 11.0
 
 
+def test_store_persists_continuous_load_source_outage(monkeypatch: object) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.saved = None
+    store = PlannerStore(object(), "vehicle-one")
+    outage = {
+        "entity_id": "sensor.house",
+        "started_at": "2026-08-25T00:00:00+00:00",
+        "last_observed_state": "unavailable",
+    }
+
+    asyncio.run(store.async_save_load_source_outage(outage))
+
+    assert store.data["load_source_outage"] == outage
+
+
 def test_store_imports_legacy_state_into_first_entry_namespace(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     monkeypatch.setattr(
@@ -154,6 +169,7 @@ def test_store_load_fills_missing_schema_defaults(monkeypatch: object) -> None:
     assert store.data["forecast_snapshots"] == []
     assert store.data["command_rate_limits"] == {}
     assert store.data["built_in_load_forecast"] == {}
+    assert store.data["load_source_outage"] == {}
     assert store.data["active_plan"] is None
     assert store.data["execution_audit"] == []
 
@@ -167,6 +183,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
         "ownership": None,
         "ev_charge_calibration": [],
         "built_in_load_forecast": [],
+        "load_source_outage": [],
         "future_metadata": {"kept": True},
     }
 
@@ -179,6 +196,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
     assert store.data["ownership"] == {}
     assert store.data["ev_charge_calibration"] == {}
     assert store.data["built_in_load_forecast"] == {}
+    assert store.data["load_source_outage"] == {}
     assert store.data["future_metadata"] == {"kept": True}
 
 

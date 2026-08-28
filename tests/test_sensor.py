@@ -287,6 +287,7 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
             "ev_charger_entity": "switch.ev",
             "ev_charging_entity": "binary_sensor.ev_charging",
             "ev_soc_entity": "sensor.ev_soc",
+            "weather_entity": "weather.home",
         },
         hass=SimpleNamespace(states=SimpleNamespace(get=states.get)),
         store_data={
@@ -300,6 +301,11 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
                         "status": "ready",
                         "first_expected_kw": 1.0,
                         "first_upper_kw": 1.3,
+                        "live_source_status": "model_fallback",
+                        "live_source_outage_seconds": 120,
+                        "outage_grace_minutes": 10,
+                        "current_correction_applied": False,
+                        "fallback_applied": True,
                     },
                     "action_load_forecasts": [
                         {
@@ -319,6 +325,12 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
             ],
         },
     )
+    coordinator.weather_forecast_diagnostics = {
+        "fetch_status": "cached_after_error",
+        "source_type": "weather_service_hourly_cache",
+        "cache_age_seconds": 901,
+        "failure_reason": "HomeAssistantError:unavailable",
+    }
     current = next(item for item in SENSORS if item.key == "current_state")
     next_actions = next(item for item in SENSORS if item.key == "next_actions")
 
@@ -327,6 +339,9 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert current_attrs["controlled_assets"][0]["planner_owns_control"] is True
     assert current_attrs["controlled_assets"][0]["entities"][0]["details"]["current_temperature"] == 19
     assert current_attrs["controlled_assets"][1]["entities"][0]["state"] == "off"
+    assert current_attrs["weather_forecast"]["fetch_status"] == "cached_after_error"
+    assert current_attrs["load_forecast"]["live_source_status"] == "model_fallback"
+    assert current_attrs["load_forecast"]["fallback_applied"] is True
 
     assert next_actions.value_fn(coordinator) == (
         "Climate: Preconditioning: Heat to 21 C | EV: Start EV charging"
@@ -338,7 +353,13 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert action_attrs["actions"][1]["determination"]["load_forecast"]["expected_kw"] == 1.5
     assert action_attrs["actions"][0]["desired_state"]["Target temperature C"] == 21
     assert action_attrs["policy_order"] == ["cost", "comfort", "ev_readiness"]
-    assert action_attrs["ai_explanation"] == {"available": False, "result": None}
+    assert action_attrs["weather_forecast"]["cache_age_seconds"] == 901
+    assert action_attrs["ai_explanation"] == {
+        "configured": False,
+        "available": False,
+        "availability_reason": "ai_task_entity_not_configured",
+        "result": None,
+    }
     assert "plan_confidence" not in action_attrs
     assert "confidence" not in action_attrs["actions"][0]
 
@@ -487,7 +508,12 @@ def test_operational_summary_sensors_expose_production_audit_and_support_context
     assert comparison.value_fn(coordinator) == "2 Planned"
     assert comparison.attrs_fn(coordinator)["latest"]["plan_id"] == "plan-1"
     assert support.value_fn(coordinator) == "Needs Review"
-    assert support.attrs_fn(coordinator)["latest_ai"] == {"available": False, "result": None}
+    assert support.attrs_fn(coordinator)["latest_ai"] == {
+        "configured": False,
+        "available": False,
+        "availability_reason": "ai_task_entity_not_configured",
+        "result": None,
+    }
 
 
 def test_dry_run_comparison_attributes_stay_below_recorder_limit() -> None:
@@ -1632,6 +1658,37 @@ def test_ai_advice_sensor_exposes_latest_accepted_response() -> None:
     }
 
 
+def test_ai_advice_sensor_uses_effective_entity_and_service_availability() -> None:
+    states = {"ai_task.provider": SimpleNamespace(state="ready")}
+    services_available = False
+    hass = SimpleNamespace(
+        states=SimpleNamespace(get=states.get),
+        services=SimpleNamespace(
+            has_service=lambda domain, service: services_available
+            and (domain, service) == ("ai_task", "generate_data")
+        ),
+    )
+    coordinator = _coordinator(
+        _plan(),
+        entry_data={"ai_task_entity": "ai_task.provider"},
+        hass=hass,
+    )
+    description = next(
+        item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice"
+    )
+
+    assert description.value_fn(coordinator) == "Unavailable"
+    assert description.attrs_fn(coordinator)["availability_reason"] == "ai_service_unavailable"
+
+    services_available = True
+    assert description.value_fn(coordinator) == "No response"
+    assert description.attrs_fn(coordinator)["available"] is True
+
+    states.clear()
+    assert description.value_fn(coordinator) == "Unavailable"
+    assert description.attrs_fn(coordinator)["availability_reason"] == "ai_task_entity_unavailable"
+
+
 def test_ai_advice_sensor_reuses_accepted_response_for_equivalent_new_plan() -> None:
     previous = _plan()
     current = replace(previous, plan_id="plan-2")
@@ -1737,7 +1794,12 @@ def test_ai_advice_sensor_hides_cached_and_pending_results_without_provider() ->
     description = next(item for item in LEGACY_SENSOR_DESCRIPTIONS if item.key == "ai_advice")
 
     assert description.value_fn(coordinator) == "Not configured"
-    assert description.attrs_fn(coordinator) == {"available": False, "result": None}
+    assert description.attrs_fn(coordinator) == {
+        "configured": False,
+        "available": False,
+        "availability_reason": "ai_task_entity_not_configured",
+        "result": None,
+    }
 
 
 def test_ai_advice_sensor_does_not_reuse_older_matching_response() -> None:
@@ -1782,7 +1844,9 @@ def test_ai_advice_sensor_reports_pending_for_current_plan() -> None:
 
     assert description.value_fn(coordinator) == "Pending"
     assert description.attrs_fn(coordinator) == {
+        "configured": True,
         "available": True,
+        "availability_reason": None,
         "result": None,
         "pending_reason": "ai_rate_limited",
     }
@@ -1885,7 +1949,12 @@ def test_ai_advice_sensor_hides_legacy_history_without_plan_fingerprint() -> Non
     attrs = description.attrs_fn(coordinator)
 
     assert description.value_fn(coordinator) == "No response"
-    assert attrs == {"available": True, "result": None}
+    assert attrs == {
+        "configured": True,
+        "available": True,
+        "availability_reason": None,
+        "result": None,
+    }
 
 
 def test_ai_advice_sensor_hides_stale_or_unsafe_plan_advice() -> None:
