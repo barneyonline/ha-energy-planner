@@ -275,6 +275,19 @@ scripts/docker-validate.sh
 
 It runs Ruff, the full pytest suite with 100% coverage, replay/schema/history validation, Home Assistant `check_config`, and a Docker smoke test.
 
+For a fast edit-test loop, rerun only the last failures and stop at the first new failure:
+
+```bash
+scripts/docker-pytest-fast.sh
+```
+
+Pass a test file, node ID, or any additional pytest arguments to target a change:
+
+```bash
+scripts/docker-pytest-fast.sh tests/test_planner.py
+scripts/docker-pytest-fast.sh tests/test_planner.py::test_active_plan_turns_hvac_off_when_away
+```
+
 For the Home Assistant integration smoke path alone, run:
 
 ```bash

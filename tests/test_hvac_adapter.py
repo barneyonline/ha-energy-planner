@@ -1263,7 +1263,10 @@ def test_hvac_zone_release_failure_is_retained_for_retry() -> None:
     assert adapter._zone_entities() == []
 
 
-def test_hvac_zone_state_mismatch_fails_acquisition_and_release_closed() -> None:
+def test_hvac_zone_state_mismatch_fails_acquisition_and_release_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0.0)
     acquisition_hass = FakeHass(
         {
             "climate.daikin": "heat",
@@ -1300,7 +1303,10 @@ def test_hvac_zone_state_mismatch_fails_acquisition_and_release_closed() -> None
     assert release_result.saved_zone_states == {"switch.zone": "off"}
 
 
-def test_hvac_automation_state_mismatch_is_retained_for_release_retry() -> None:
+def test_hvac_automation_state_mismatch_is_retained_for_release_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0.0)
     hass = FakeHass({"automation.climate": "off"})
     hass.services.noop_entities.add("automation.climate")
     adapter = DaikinHVACAdapter(
