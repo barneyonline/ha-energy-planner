@@ -618,7 +618,9 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
             )
 
     for old_suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls"):
-        old_device = dev_reg.async_get_device(identifiers={(DOMAIN, f"{entry.entry_id}_{old_suffix}")})
+        old_device = dev_reg.async_get_device_by_identifier(
+            (DOMAIN, f"{entry.entry_id}_{old_suffix}"), entry.entry_id
+        )
         if old_device is not None and old_device.id != device.id:
             dev_reg.async_remove_device(old_device.id)
 
