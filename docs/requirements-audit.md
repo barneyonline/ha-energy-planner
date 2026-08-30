@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-08-15.
+Status as of 2026-08-30.
 
 ## Covered
 
@@ -16,9 +16,12 @@ Status as of 2026-08-15.
   falls back to safe list/dict defaults while preserving unknown metadata, and
   malformed persisted execution timestamps are ignored instead of raising
   through safety-gate evaluation.
-- The user-facing status surface is limited to **Armed**, **Current state**,
-  **Next actions**, and the read-only **Plan** calendar. Armed reports effective
-  command authority: a persisted arm request remains visible in attributes but
+- The primary user-facing status surface is limited to **Armed**, **Current
+  state**, **Next actions**, and the read-only **Plan** calendar. Diagnostic
+  **Decision summary**, **Plan health**, **Current load forecast**, **Planning
+  duration**, and **Load forecast coverage score** sensors provide deeper
+  bounded evidence without cluttering that primary surface. Armed reports
+  effective command authority: a persisted arm request remains visible in attributes but
   stale or incomplete reviewed production evidence keeps the entity off with a
   stable blocking reason. Manual arming re-runs preflight and cannot cancel safe
   recovery or grant apparent authority while that evidence is invalid. Current
@@ -397,6 +400,9 @@ Status as of 2026-08-15.
   percentage (including a failed retraining score when the prior safe model is
   retained), its evaluation time, the active-model score,
   required threshold, model status, and whether the combined bypass is active.
+  The complementary `current_load_forecast` diagnostic sensor exposes the
+  expected load used for the current interval, its conservative upper bound,
+  horizon coverage, correction state, model age, and source/fallback health.
 - Readiness requires three training days with at least 80% valid buckets per
   day, 80% valid historical coverage, two
   leakage-free holdout origins with at least 144 aligned samples, MAE no more

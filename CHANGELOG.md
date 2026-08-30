@@ -24,7 +24,10 @@
 
 ### 🔧 Improvements
 
-- None
+- Added diagnostic **Decision summary**, **Plan health**, **Current load
+  forecast**, and **Planning duration** sensors. They expose bounded decision,
+  issue, model, and refresh-performance evidence without expanding the primary
+  control surface. **Current load forecast** has an explicit home-power icon.
 
 ### 🔄 Other changes
 
