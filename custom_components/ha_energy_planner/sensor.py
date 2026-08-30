@@ -9,7 +9,7 @@ from typing import Any
 
 from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
 from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
@@ -39,6 +39,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import (
+    STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES,
     STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
     EnergyPlannerCoordinator,
     _ai_recommendation_fingerprint,
@@ -316,8 +317,8 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         translation_key="mode",
         icon="mdi:state-machine",
         device_class=SensorDeviceClass.ENUM,
-        options=["review", "active"],
-        value_fn=lambda coordinator: "active" if coordinator.effective_control else "review",
+        options=["review", "recovery", "active"],
+        value_fn=lambda coordinator: _mode_state(coordinator),
     ),
     PlannerSensorDescription(
         key="current_state",
@@ -343,6 +344,23 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         attrs_fn=lambda coordinator: _load_forecast_coverage_attrs(coordinator),
     ),
 )
+
+
+def _mode_state(coordinator: EnergyPlannerCoordinator) -> str:
+    """Return the visible automatic-control lifecycle state."""
+    production = parse_production_state(coordinator.store.data.get("production"))
+    recovery = production.raw.get("startup_auto_recovery")
+    recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
+    automatic_control_requested = bool(
+        getattr(coordinator, "automatic_control_requested", coordinator.active_control)
+    )
+    if (
+        automatic_control_requested
+        and getattr(getattr(coordinator, "hass", None), "state", None) == CoreState.running
+        and recovery_status in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+    ):
+        return "recovery"
+    return "active" if coordinator.effective_control else "review"
 
 
 async def async_setup_entry(

@@ -437,7 +437,7 @@ rules:
         - tests/test_sensor.py
   entity-disabled-by-default:
     status: done
-    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master intent switch while Armed exposes effective command authority and manual arming cannot bypass stale reviewed evidence, and the three visible device switches select its control areas.
+    comment: Advanced preflight, arm/disarm, replan, and resume buttons are disabled by default; fixed-duration pause buttons are retired in favour of the pause service, Run safety check always returns its pass/fail notification when enabled, Automatic control remains the sole master intent switch and stays on through post-startup recovery, Mode exposes that Recovery lifecycle, Armed exposes effective command authority, manual arming cannot bypass stale reviewed evidence, and the three visible device switches select its control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
