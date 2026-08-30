@@ -5,8 +5,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
-
 from .const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -15,6 +13,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
 )
+from .type_defs import EnergyPlannerConfigEntry
 
 _RETIRED_CONFIG_KEYS = frozenset(
     {
@@ -30,7 +29,7 @@ def remove_retired_config_keys(data: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if key not in _RETIRED_CONFIG_KEYS}
 
 
-def combined_entry_data(entry: ConfigEntry) -> dict[str, Any]:
+def combined_entry_data(entry: EnergyPlannerConfigEntry) -> dict[str, Any]:
     """Return hub data merged with planner input subentry data."""
     data = remove_retired_config_keys(entry.data)
     for subentry in getattr(entry, "subentries", {}).values():

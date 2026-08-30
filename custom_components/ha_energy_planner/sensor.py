@@ -627,7 +627,7 @@ def _controlled_state_summary(coordinator: EnergyPlannerCoordinator) -> str:
 def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return actual entity snapshots grouped by controlled asset."""
     plan = coordinator.data
-    attrs = {
+    attrs: dict[str, Any] = {
         "plan_id": None if plan is None else plan.plan_id,
         "plan_created_at": None if plan is None else plan.created_at.isoformat(),
         "mode": "Unknown" if plan is None else _display_state(plan.mode),
@@ -866,9 +866,8 @@ def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
 
 def _weather_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest service/cache evidence even when the plan was unchanged."""
-    return _bounded_json(
-        dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
-    )
+    bounded = _bounded_json(dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {}))
+    return dict(bounded) if isinstance(bounded, dict) else {}
 
 
 def _ordered_actions(plan: EnergyPlan | None) -> list[PlanAction]:
@@ -950,7 +949,7 @@ def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return plan status with bounded refresh telemetry."""
     if not coordinator.data:
         return {}
-    return to_jsonable(
+    result = to_jsonable(
         {
             "plan_id": coordinator.data.plan_id,
             "created_at": coordinator.data.created_at.isoformat(),
@@ -963,6 +962,7 @@ def _plan_status_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
             "refresh_metrics": getattr(coordinator, "refresh_metrics", None),
         }
     )
+    return dict(result) if isinstance(result, dict) else {}
 
 
 def _asset_plan_state(plan: EnergyPlan | None, asset: ActionAsset) -> str:
@@ -1731,7 +1731,10 @@ def _limiting_source_evidence(
         "entity_id": source.get("entity_id"),
         "source": source.get("source"),
         "reason": source.get("reason"),
-        "coverage": _coverage_summary(coverage, coordinator.data.horizon_hours),
+        "coverage": _coverage_summary(
+            coverage,
+            coordinator.data.horizon_hours if coordinator.data is not None else 0.0,
+        ),
     }
     return {key: value for key, value in evidence.items() if value not in (None, "", {})}
 
@@ -2259,7 +2262,7 @@ def _dry_run_comparison_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
 
 def _dry_run_comparison_summary(item: dict[str, Any], *, include_next_action: bool) -> dict[str, Any]:
     """Return a compact comparison summary suitable for state attributes."""
-    summary = {
+    summary: dict[str, Any] = {
         key: _bounded_attribute_scalar(item.get(key))
         for key in (
             "created_at",

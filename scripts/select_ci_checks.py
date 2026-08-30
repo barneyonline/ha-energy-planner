@@ -43,6 +43,7 @@ _DEDICATED_QUALITY_SCALE_PATTERNS = (
     "hacs.json",
     "quality_scale.yaml",
     "scripts/validate_quality_scale.py",
+    "scripts/docker-mypy.sh",
     "scripts/docker-validate.sh",
     "pyproject.toml",
     ".github/workflows/quality-scale.yml",

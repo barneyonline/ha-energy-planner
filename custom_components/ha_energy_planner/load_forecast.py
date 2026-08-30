@@ -247,7 +247,7 @@ def load_forecast_from_model(
 ) -> LoadForecastResult:
     """Return planning-interval expected and conservative load forecasts."""
     slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
-    empty = [None] * slot_count
+    empty: list[float | None] = [None] * slot_count
     validated = _validated_model(model, source_entity_id, timezone)
     if validated is None:
         return LoadForecastResult(empty, empty.copy(), "failed", _model_details(model, "failed", 0.0))
@@ -753,7 +753,11 @@ def _validated_model(
                 if isinstance(training_days, int) and not isinstance(training_days, bool)
                 else 0
             ),
-            history_coverage=float(history_coverage) if _valid_fraction(history_coverage) else 0.0,
+            history_coverage=(
+                float(history_coverage)
+                if isinstance(history_coverage, int | float) and _valid_fraction(history_coverage)
+                else 0.0
+            ),
             validation=validation if isinstance(validation, dict) else {},
             profiles=model["profiles"],
             bypass_conservative_bound_gate=model["safety_gates_bypassed"],

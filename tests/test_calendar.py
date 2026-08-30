@@ -270,6 +270,7 @@ def test_calendar_ignores_malformed_ev_slots() -> None:
                 {"valid_at": "not-a-date", "charge_kw": 7},
                 {"valid_at": now.replace(tzinfo=None).isoformat(), "charge_kw": 7},
                 {"valid_at": now.isoformat(), "charge_kw": "invalid"},
+                {"valid_at": now.isoformat(), "charge_kw": {"unexpected": 7}},
                 {"valid_at": now.isoformat(), "charge_kw": "nan"},
                 {"valid_at": now.isoformat(), "charge_kw": 0},
                 {"valid_at": now.isoformat(), "charge_kw": 7},

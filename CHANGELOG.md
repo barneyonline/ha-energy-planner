@@ -28,6 +28,9 @@
   forecast**, and **Planning duration** sensors. They expose bounded decision,
   issue, model, and refresh-performance evidence without expanding the primary
   control surface. **Current load forecast** has an explicit home-power icon.
+- Added strict mypy coverage for every integration module, typed config-entry
+  runtime data throughout, and a pinned Docker/CI type-checking gate. The
+  repository quality-scale self-assessment is now Platinum.
 
 ### 🔄 Other changes
 

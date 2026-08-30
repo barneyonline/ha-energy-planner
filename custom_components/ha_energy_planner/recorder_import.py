@@ -335,14 +335,21 @@ def _compact_ev_history_chunk(
     soc_states: list[Any],
 ) -> tuple[list[Any], list[Any]]:
     """Retain charging transitions and only SOC values needed around them."""
-    charging = sorted(
-        (state for state in charging_states if _recorder_state_timestamp(state) is not None),
-        key=_recorder_state_timestamp,
-    )
-    soc = sorted(
-        (state for state in soc_states if _recorder_state_timestamp(state) is not None),
-        key=_recorder_state_timestamp,
-    )
+    charging_with_timestamps: list[tuple[datetime, Any]] = []
+    for state in charging_states:
+        timestamp = _recorder_state_timestamp(state)
+        if timestamp is not None:
+            charging_with_timestamps.append((timestamp, state))
+    soc_with_timestamps: list[tuple[datetime, Any]] = []
+    for state in soc_states:
+        timestamp = _recorder_state_timestamp(state)
+        if timestamp is not None:
+            soc_with_timestamps.append((timestamp, state))
+    charging = [
+        state
+        for _timestamp, state in sorted(charging_with_timestamps, key=lambda item: item[0])
+    ]
+    soc = [state for _timestamp, state in sorted(soc_with_timestamps, key=lambda item: item[0])]
     selected_soc: list[Any] = []
     soc_index = 0
     latest_soc: Any | None = None

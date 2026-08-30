@@ -198,8 +198,8 @@ class CapabilityDiscovery:
         if bool(scheduler_guard) != bool(scheduler_timer):
             issues.append("climate_scheduler_guard_incomplete")
         elif scheduler_guard and (
-            _state_missing(self.hass, scheduler_guard)
-            or _state_missing(self.hass, scheduler_timer)
+            _state_missing(self.hass, str(scheduler_guard))
+            or _state_missing(self.hass, str(scheduler_timer))
         ):
             issues.append("climate_scheduler_guard_unavailable")
         return CapabilityEvidence(
@@ -328,8 +328,8 @@ def _state_missing(hass: HomeAssistant, entity_id: str) -> bool:
         return True
     domain = entity_id.split(".", 1)[0]
     if domain in {"button", "input_button"}:
-        return state.state == "unavailable"
-    return state.state in {"unknown", "unavailable"}
+        return bool(state.state == "unavailable")
+    return bool(state.state in {"unknown", "unavailable"})
 
 
 def _has_finite_temperature_target(state: Any) -> bool:

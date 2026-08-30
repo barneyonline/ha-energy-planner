@@ -249,6 +249,7 @@ class FakeCoordinator:
         self.reconcile_count = 0
         self.start_count = 0
         self.shutdown_count = 0
+        self.final_shutdown_count = 0
         self.execution_wait_count = 0
         self.refresh_wait_count = 0
         self.restore_calls: list[tuple[str, bool]] = []
@@ -286,9 +287,13 @@ class FakeCoordinator:
         self.start_count += 1
         self.lifecycle_calls.append("start")
 
-    def async_shutdown(self) -> None:
+    def _begin_shutdown(self) -> None:
         self.shutdown_count += 1
         self.lifecycle_calls.append("shutdown")
+
+    async def async_shutdown(self) -> None:
+        self._begin_shutdown()
+        self.final_shutdown_count += 1
 
     async def async_wait_for_plan_execution(self) -> None:
         self.execution_wait_count += 1
@@ -338,6 +343,7 @@ def test_unload_restores_safe_state_without_refresh() -> None:
 
     assert result is True
     assert coordinator.shutdown_count == 1
+    assert coordinator.final_shutdown_count == 0
     assert coordinator.execution_wait_count == 1
     assert coordinator.refresh_wait_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["entry_unload"]
@@ -349,7 +355,7 @@ def test_unload_restores_safe_state_without_refresh() -> None:
         "wait_refresh",
         "restore",
     ]
-    assert entry.runtime_data is None
+    assert not hasattr(entry, "runtime_data")
     assert len(hass.config_entries.unloaded) == 1
 
 
@@ -465,7 +471,7 @@ def test_unload_continues_after_unowned_best_effort_restore_failure() -> None:
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.shutdown_count == 1
     assert coordinator.disarm_calls == ["entry_unload"]
-    assert entry.runtime_data is None
+    assert not hasattr(entry, "runtime_data")
     assert len(hass.config_entries.unloaded) == 1
 
 
@@ -496,6 +502,7 @@ def test_failed_platform_unload_keeps_coordinator_running() -> None:
     assert result is False
     assert coordinator.restore_calls == [("entry_unload", False)]
     assert coordinator.shutdown_count == 1
+    assert coordinator.final_shutdown_count == 0
     assert coordinator.start_count == 1
     assert entry.runtime_data is coordinator
     assert coordinator.replan_count == 0
@@ -687,11 +694,12 @@ def test_setup_failure_restores_safe_state_without_refresh(monkeypatch: pytest.M
     assert coordinator.auto_recovery_start_count == 1
     assert coordinator.auto_recovery_cancel_reasons == ["setup_entry_failed"]
     assert coordinator.shutdown_count == 1
+    assert coordinator.final_shutdown_count == 1
     assert coordinator.execution_wait_count == 1
     assert coordinator.refresh_wait_count == 1
     assert coordinator.disarm_calls == ["setup_entry_failed"]
     assert coordinator.restore_calls == [("setup_entry_failed", False)]
-    assert entry.runtime_data is None
+    assert not hasattr(entry, "runtime_data")
 
 
 def test_options_update_listener_requests_replan_without_reload() -> None:

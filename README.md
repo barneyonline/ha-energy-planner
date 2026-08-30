@@ -7,7 +7,7 @@
 [![Tests](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/ci.yml?branch=main&label=tests)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/ci.yml)
 [![Codecov](https://codecov.io/gh/barneyonline/ha-energy-planner/branch/main/graph/badge.svg)](https://codecov.io/gh/barneyonline/ha-energy-planner)
 [![Hassfest](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/hassfest.yml?branch=main&label=hassfest)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/hassfest.yml)
-[![Self-assessed quality: Gold](https://img.shields.io/badge/self--assessed%20quality-gold-blue)](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
+[![Self-assessed quality: Platinum](https://img.shields.io/badge/self--assessed%20quality-platinum-blue)](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
 
 [![HACS](https://img.shields.io/badge/HACS-custom-orange.svg)](https://hacs.xyz)
 [![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
@@ -20,7 +20,7 @@ Energy Planner is a local-first Home Assistant custom integration that coordinat
 >
 > Automatic control can issue real device commands. Begin in review mode, check the proposed plan and safety evidence, and keep the vendors' own protections and limits enabled.
 
-The Gold quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
+The Platinum quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
 
 ## Supported Functionality
 
@@ -50,6 +50,10 @@ Provided Home Assistant actions:
 - `ha_energy_planner.arm_production_control` and `ha_energy_planner.disarm_production_control`: explicitly manage the advanced production safety gate.
 
 With multiple planner entries, provide `config_entry_id` when calling an action. Create one named Energy Planner entry per EV when managing multiple vehicles.
+
+Energy Planner does not provide custom automation triggers or conditions; use
+its entity state changes and the standard Home Assistant automation building
+blocks when automating planner behavior.
 
 ## Installation
 

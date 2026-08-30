@@ -40,7 +40,52 @@ def _write_reference(root: Path, path: str) -> None:
 
 
 def _write_quality_scale(root: Path, body: str) -> None:
-    (root / "quality_scale.yaml").write_text(body, encoding="utf-8")
+    data = validate_quality_scale.yaml.safe_load(body) or {}
+    manifest = json.loads(
+        (root / "custom_components" / "ha_energy_planner" / "manifest.json").read_text(encoding="utf-8")
+    )
+    claimed = manifest.get("quality_scale")
+    claimed_index = (
+        validate_quality_scale.QUALITY_LEVEL_ORDER.index(claimed)
+        if claimed in validate_quality_scale.QUALITY_LEVEL_ORDER
+        else -1
+    )
+    rules = {
+        rule: "done" if level_index <= claimed_index else "todo"
+        for level_index, level in enumerate(validate_quality_scale.QUALITY_LEVEL_ORDER)
+        for rule in validate_quality_scale.QUALITY_RULES_BY_LEVEL[level]
+    }
+    rules.update(data.get("rules") or {})
+    data["levels"] = {
+        level: {"required": list(validate_quality_scale.QUALITY_RULES_BY_LEVEL[level])}
+        for level in validate_quality_scale.QUALITY_LEVEL_ORDER
+    }
+    data["rules"] = rules
+    (root / "quality_scale.yaml").write_text(
+        validate_quality_scale.yaml.safe_dump(data, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def _write_strict_gate(root: Path) -> None:
+    (root / "pyproject.toml").write_text(
+        '[tool.mypy]\nstrict = true\nfiles = ["custom_components/ha_energy_planner"]\n',
+        encoding="utf-8",
+    )
+    scripts = root / "scripts"
+    scripts.mkdir(exist_ok=True)
+    mypy_script = scripts / "docker-mypy.sh"
+    mypy_script.write_text(
+        "ghcr.io/home-assistant/home-assistant:2026.8.2\n"
+        'python3 -m pip install "mypy==1.19.1"\n'
+        "MYPYPATH=/usr/src/homeassistant python3 -m mypy\n",
+        encoding="utf-8",
+    )
+    mypy_script.chmod(0o755)
+    (scripts / "docker-validate.sh").write_text("run scripts/docker-mypy.sh\n", encoding="utf-8")
+    workflows = root / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "quality-scale.yml").write_text("run: scripts/docker-mypy.sh\n", encoding="utf-8")
 
 
 def test_repository_quality_scale_matches_manifest_claim() -> None:
@@ -73,6 +118,8 @@ rules:
     status: done
     references:
       docs: [README.md]
+  diagnostics:
+    status: todo
 """,
     )
 
@@ -103,7 +150,7 @@ rules:
     exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
 
     assert exit_code == 1
-    assert "Manifest must claim quality_scale 'gold'" in "\n".join(messages)
+    assert "Manifest must claim quality_scale 'platinum'" in "\n".join(messages)
 
 
 def test_generated_integration_cache_directories_are_rejected(tmp_path: Path) -> None:
@@ -132,7 +179,7 @@ rules: {}
     assert "Generated cache directories" in "\n".join(messages)
 
 
-def test_na_rules_need_explanatory_comments(tmp_path: Path) -> None:
+def test_exempt_rules_need_explanatory_comments(tmp_path: Path) -> None:
     _write_manifest(tmp_path, "bronze")
     _write_reference(tmp_path, "README.md")
     _write_quality_scale(
@@ -143,7 +190,7 @@ levels:
     required: [discovery-update-info]
 rules:
   discovery-update-info:
-    status: n/a
+    status: exempt
     references:
       docs: [README.md]
 """,
@@ -152,12 +199,13 @@ rules:
     exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
 
     assert exit_code == 1
-    assert "n/a rules missing explanatory comments" in "\n".join(messages)
+    assert "exempt rules missing explanatory comments" in "\n".join(messages)
 
 
-def test_documented_integration_exceptions_may_be_na(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, "gold")
+def test_documented_integration_exceptions_may_be_exempt(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "platinum")
     _write_reference(tmp_path, "README.md")
+    _write_strict_gate(tmp_path)
     _write_quality_scale(
         tmp_path,
         """
@@ -172,7 +220,7 @@ levels:
     required: []
 rules:
   entity-device-class:
-    status: n/a
+    status: exempt
     comment: Device classes do not apply to this entity platform.
     references:
       docs: [README.md]
@@ -216,11 +264,9 @@ rules:
 
 
 def test_strict_typing_done_accepts_an_enforced_strict_checker(tmp_path: Path) -> None:
-    _write_manifest(tmp_path, "gold")
+    _write_manifest(tmp_path, "platinum")
     _write_reference(tmp_path, "README.md")
-    _write_reference(tmp_path, "scripts/docker-validate.sh")
-    (tmp_path / "pyproject.toml").write_text("[tool.mypy]\nstrict = true\n", encoding="utf-8")
-    (tmp_path / "scripts" / "docker-validate.sh").write_text("mypy custom_components\n", encoding="utf-8")
+    _write_strict_gate(tmp_path)
     _write_quality_scale(
         tmp_path,
         """
@@ -246,7 +292,7 @@ rules:
     assert exit_code == 0, "\n".join(messages)
 
 
-def test_na_status_is_restricted_to_allowlisted_rules(tmp_path: Path) -> None:
+def test_exempt_status_is_restricted_to_allowlisted_rules(tmp_path: Path) -> None:
     _write_manifest(tmp_path, "bronze")
     _write_reference(tmp_path, "README.md")
     _write_quality_scale(
@@ -257,7 +303,7 @@ levels:
     required: [config-flow]
 rules:
   config-flow:
-    status: n/a
+    status: exempt
     comment: Not acceptable for this rule.
     references:
       docs: [README.md]
@@ -267,7 +313,7 @@ rules:
     exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
 
     assert exit_code == 1
-    assert "Rules marked n/a without an allowlist exception" in "\n".join(messages)
+    assert "Rules marked exempt without an allowlist exception" in "\n".join(messages)
 
 
 def test_unknown_status_is_reported(tmp_path: Path) -> None:
@@ -291,6 +337,38 @@ rules:
 
     assert exit_code == 1
     assert "unsupported status" in "\n".join(messages)
+
+
+def test_legacy_na_status_is_reported(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "bronze")
+    _write_quality_scale(
+        tmp_path,
+        """
+rules:
+  docs-triggers:
+    status: n/a
+    comment: Legacy spelling must not pass the upstream-aligned validator.
+""",
+    )
+
+    exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
+
+    assert exit_code == 1
+    assert "unsupported status" in "\n".join(messages)
+
+
+def test_pinned_rule_catalog_cannot_delete_a_required_rule(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "bronze")
+    _write_quality_scale(tmp_path, "rules: {}")
+    quality_path = tmp_path / "quality_scale.yaml"
+    quality = validate_quality_scale.yaml.safe_load(quality_path.read_text(encoding="utf-8"))
+    quality["levels"]["bronze"]["required"].remove("docs-triggers")
+    quality_path.write_text(validate_quality_scale.yaml.safe_dump(quality, sort_keys=False), encoding="utf-8")
+
+    exit_code, messages = validate_quality_scale.validate_quality_scale(tmp_path)
+
+    assert exit_code == 1
+    assert "catalog differs" in "\n".join(messages)
 
 
 def test_broken_references_are_reported(tmp_path: Path) -> None:

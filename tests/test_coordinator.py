@@ -1328,6 +1328,34 @@ def test_material_state_change_treats_non_finite_numbers_as_material() -> None:
     assert _is_material_state_change(FakeEvent("sensor.price", "inf", "1.0"), options)
 
 
+def test_material_state_and_hvac_feedback_fail_closed_for_structured_values() -> None:
+    """Malformed structured states cannot be mistaken for numeric planner feedback."""
+    structured_state_event = SimpleNamespace(
+        data={
+            "old_state": SimpleNamespace(state={"value": 1}, attributes={}),
+            "new_state": SimpleNamespace(state={"value": 2}, attributes={}),
+        }
+    )
+    structured_temperature_event = SimpleNamespace(
+        data={
+            "old_state": SimpleNamespace(state="heat", attributes={"temperature": 20}),
+            "new_state": SimpleNamespace(
+                state="heat",
+                attributes={"temperature": {"unexpected": 21}},
+            ),
+        }
+    )
+
+    assert _is_material_state_change(
+        structured_state_event,
+        {"material_change_threshold_percent": 5},
+    )
+    assert not coordinator_module._matches_hvac_command_feedback(
+        {"hvac_mode": "heat", "target_temperature": 21},
+        structured_temperature_event,
+    )
+
+
 def test_material_state_change_detects_only_planner_input_attribute_updates() -> None:
     options = {"material_change_threshold_percent": 5}
     old_forecast = [{"valid_at": "2026-06-27T10:00:00+00:00", "value": 1.0}]
@@ -1575,7 +1603,7 @@ def test_startup_auto_recovery_begins_only_after_home_assistant_started(monkeypa
     coordinator._boundary_cancel = None
     coordinator._ai_advice_task = None
     coordinator._unsub_listeners = []
-    coordinator.async_shutdown()
+    coordinator._begin_shutdown()
     assert coordinator.entry.task.cancelled is True
     assert coordinator._startup_auto_recovery_authorized is False
 
@@ -6563,7 +6591,7 @@ def test_startup_recovery_start_callback_and_shutdown_edge_paths(monkeypatch: ob
     coordinator._startup_auto_recovery_task = None
     coordinator._startup_auto_recovery_start_unsub = lambda: unsubscribed.append(True)
     coordinator._unsub_listeners = []
-    coordinator.async_shutdown()
+    coordinator._begin_shutdown()
     assert unsubscribed
 
 
@@ -6871,7 +6899,7 @@ def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None
     assert production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options) == fingerprint
 
 
-def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution() -> None:
+def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution(monkeypatch: object) -> None:
     calls: list[str] = []
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator._debounce_cancel = lambda: calls.append("debounce")
@@ -6892,9 +6920,13 @@ def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution() -> No
         lambda: calls.append("listener_2"),
     ]
 
-    coordinator.async_shutdown()
+    async def base_shutdown(_coordinator: object) -> None:
+        calls.append("base")
 
-    assert calls == ["debounce", "boundary", "ai", "listener_2", "listener_1"]
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_shutdown", base_shutdown)
+    asyncio.run(coordinator.async_shutdown())
+
+    assert calls == ["debounce", "boundary", "ai", "listener_2", "listener_1", "base"]
     assert coordinator._debounce_cancel is None
     assert coordinator._boundary_cancel is None
     assert coordinator._ai_advice_task is None

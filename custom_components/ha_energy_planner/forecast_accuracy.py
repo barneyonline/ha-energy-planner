@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime
 from math import isfinite, sqrt
 from typing import Any
@@ -89,7 +89,7 @@ def _validated_sample(sample: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _metrics(samples: list[Mapping[str, Any]]) -> dict[str, float | int]:
+def _metrics(samples: Sequence[Mapping[str, Any]]) -> dict[str, float | int]:
     forecast_errors = [float(sample["forecast"]) - float(sample["actual"]) for sample in samples]
     baseline_errors = [float(sample["baseline"]) - float(sample["actual"]) for sample in samples]
     count = len(samples)
