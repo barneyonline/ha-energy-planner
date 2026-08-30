@@ -2441,6 +2441,24 @@ class Executor:
                     expected,
                 )
             )
+        set_coupled_zone_feedback = getattr(
+            adapter,
+            "set_coupled_zone_feedback_callback",
+            None,
+        )
+        if callable(set_coupled_zone_feedback):
+            set_coupled_zone_feedback(
+                lambda actuator_entity_id, expected_state, context_id: pending.__setitem__(
+                    "coupled_zone_feedback_expected",
+                    None
+                    if expected_state is None
+                    else {
+                        "actuator_entity_id": actuator_entity_id,
+                        "context_id": context_id,
+                        "state": expected_state,
+                    },
+                )
+            )
         set_pending_main_restore = getattr(
             adapter,
             "set_pending_main_restore_callback",

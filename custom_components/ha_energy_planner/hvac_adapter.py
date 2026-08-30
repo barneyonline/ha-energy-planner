@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
-from homeassistant.core import HomeAssistant, State
+from homeassistant.core import Context, HomeAssistant, State
 
 from .const import (
     CONF_CLIMATE_AUTOMATIONS,
@@ -67,6 +67,9 @@ class DaikinHVACAdapter:
         self._async_persist_supersessions: Callable[[bool, set[str]], Awaitable[None]] | None = None
         self._persisted_zone_supersessions: set[str] = set()
         self._set_turn_on_feedback_expected: Callable[[bool], None] | None = None
+        self._set_coupled_zone_feedback_expected: (
+            Callable[[str | None, str | None, str | None], None] | None
+        ) = None
         self._set_pending_main_restore: Callable[[dict[str, Any]], None] | None = None
         self._set_pending_zone_restore: Callable[[dict[str, Any]], None] | None = None
 
@@ -115,6 +118,13 @@ class DaikinHVACAdapter:
     ) -> None:
         """Expose the bounded phase that can publish a turn-on mode."""
         self._set_turn_on_feedback_expected = callback
+
+    def set_coupled_zone_feedback_callback(
+        self,
+        callback: Callable[[str | None, str | None, str | None], None],
+    ) -> None:
+        """Expose a zone-actuator call that can publish linked climate feedback."""
+        self._set_coupled_zone_feedback_expected = callback
 
     def set_pending_main_restore_callback(
         self,
@@ -739,22 +749,50 @@ class DaikinHVACAdapter:
             if state == "on":
                 continue
             changed[entity_id] = state
-            try:
-                await self.hass.services.async_call(
-                    entity_id.split(".", 1)[0], SERVICE_TURN_ON, {ATTR_ENTITY_ID: entity_id}, blocking=True
+            service_context = (
+                Context()
+                if self._set_coupled_zone_feedback_expected is not None
+                else None
+            )
+            if self._set_coupled_zone_feedback_expected is not None:
+                self._set_coupled_zone_feedback_expected(
+                    entity_id,
+                    "on",
+                    service_context.id if service_context is not None else None,
                 )
-            except Exception:  # noqa: BLE001
-                return False, changed
             try:
-                self._raise_if_manual_override_requested()
-            except _HVACManualOverrideError:
-                return False, changed
-            if not await self._async_confirm_state(entity_id, "on"):
-                return False, changed
-            try:
-                self._raise_if_manual_override_requested()
-            except _HVACManualOverrideError:
-                return False, changed
+                try:
+                    service_data = {ATTR_ENTITY_ID: entity_id}
+                    if service_context is None:
+                        await self.hass.services.async_call(
+                            entity_id.split(".", 1)[0],
+                            SERVICE_TURN_ON,
+                            service_data,
+                            blocking=True,
+                        )
+                    else:
+                        await self.hass.services.async_call(
+                            entity_id.split(".", 1)[0],
+                            SERVICE_TURN_ON,
+                            service_data,
+                            blocking=True,
+                            context=service_context,
+                        )
+                except Exception:  # noqa: BLE001
+                    return False, changed
+                try:
+                    self._raise_if_manual_override_requested()
+                except _HVACManualOverrideError:
+                    return False, changed
+                if not await self._async_confirm_state(entity_id, "on"):
+                    return False, changed
+                try:
+                    self._raise_if_manual_override_requested()
+                except _HVACManualOverrideError:
+                    return False, changed
+            finally:
+                if self._set_coupled_zone_feedback_expected is not None:
+                    self._set_coupled_zone_feedback_expected(None, None, None)
         return True, changed
 
     async def _async_restore_zone_states(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
@@ -787,19 +825,43 @@ class DaikinHVACAdapter:
                 if observed is not None and observed.state == state:
                     continue
                 service = SERVICE_TURN_ON if state == "on" else SERVICE_TURN_OFF
-                try:
-                    await self.hass.services.async_call(
-                        entity_id.split(".", 1)[0],
-                        service,
-                        {ATTR_ENTITY_ID: entity_id},
-                        blocking=True,
+                service_context = (
+                    Context()
+                    if self._set_coupled_zone_feedback_expected is not None
+                    else None
+                )
+                if self._set_coupled_zone_feedback_expected is not None:
+                    self._set_coupled_zone_feedback_expected(
+                        entity_id,
+                        state,
+                        service_context.id if service_context is not None else None,
                     )
+                try:
+                    service_data = {ATTR_ENTITY_ID: entity_id}
+                    if service_context is None:
+                        await self.hass.services.async_call(
+                            entity_id.split(".", 1)[0],
+                            service,
+                            service_data,
+                            blocking=True,
+                        )
+                    else:
+                        await self.hass.services.async_call(
+                            entity_id.split(".", 1)[0],
+                            service,
+                            service_data,
+                            blocking=True,
+                            context=service_context,
+                        )
                     confirmed = await self._async_confirm_state(
                         entity_id,
                         state,
                     )
                 except Exception:  # noqa: BLE001 - retain state for a later release retry.
                     pass
+                finally:
+                    if self._set_coupled_zone_feedback_expected is not None:
+                        self._set_coupled_zone_feedback_expected(None, None, None)
             if await self._async_zone_restore_is_superseded(entity_id):
                 continue
             if not confirmed:
