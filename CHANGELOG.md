@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 0.9.17 - 2026-08-30
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Added opt-in daily daylight EV charging. Complete sunrise-to-sunset forecasts
   are ranked by solar-aware effective cost, with the existing ready-by schedule
   retained when daylight cannot safely meet the target.
