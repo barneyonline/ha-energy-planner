@@ -92,6 +92,7 @@ class EVChargeAllocation:
     grid_import_used_kw: float = 0.0
     carbon_intensity_g_per_kwh: float | None = None
     estimated_carbon_g: float | None = None
+    allocation_source: str = "ready_by"
 
 
 @dataclass(slots=True)
@@ -303,6 +304,7 @@ def allocate_least_cost_charging(
     force_current: bool = False,
     continue_current: bool = False,
     max_import_price: float | None = None,
+    allocation_source: str = "ready_by",
 ) -> EVChargeSchedule:
     """Allocate EV charging to cheapest feasible slots before ready-by.
 
@@ -411,6 +413,7 @@ def allocate_least_cost_charging(
                 grid_import_used_kw=grid_kw,
                 carbon_intensity_g_per_kwh=carbon_intensity,
                 estimated_carbon_g=estimated_carbon,
+                allocation_source=allocation_source,
             )
         )
         remaining -= added_soc

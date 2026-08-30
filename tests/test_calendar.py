@@ -110,10 +110,27 @@ def test_calendar_expands_ev_schedule_into_complete_charging_windows() -> None:
         desired_state={
             "target_soc_percent": 80,
             "ready_by": "07:00",
+            "daylight_lowest_cost": {
+                "selected": True,
+                "window_start_utc": (now + timedelta(minutes=20)).isoformat(),
+                "window_end_utc": (now + timedelta(hours=8)).isoformat(),
+            },
             "allocated_slots": [
-                {"valid_at": (now + timedelta(minutes=30)).isoformat(), "charge_kw": 7},
-                {"valid_at": (now + timedelta(minutes=35)).isoformat(), "charge_kw": 6},
-                {"valid_at": (now + timedelta(minutes=50)).isoformat(), "charge_kw": 7},
+                {
+                    "valid_at": (now + timedelta(minutes=30)).isoformat(),
+                    "charge_kw": 7,
+                    "allocation_source": "daylight",
+                },
+                {
+                    "valid_at": (now + timedelta(minutes=35)).isoformat(),
+                    "charge_kw": 6,
+                    "allocation_source": "daylight",
+                },
+                {
+                    "valid_at": (now + timedelta(minutes=50)).isoformat(),
+                    "charge_kw": 7,
+                    "allocation_source": "daylight",
+                },
             ],
         },
     )
@@ -143,7 +160,45 @@ def test_calendar_expands_ev_schedule_into_complete_charging_windows() -> None:
     assert "Estimated energy: 1.08 kWh" in (events[0].description or "")
     assert "Target SOC: 80%" in (events[0].description or "")
     assert "Ready by: 07:00" in (events[0].description or "")
+    assert "Policy: Lowest effective-cost daylight charging" in (events[0].description or "")
+    assert "Sunrise:" in (events[0].description or "")
+    assert "Sunset:" in (events[0].description or "")
     assert "Power: 7 kW" in (events[1].description or "")
+
+
+def test_calendar_separates_daylight_and_ready_by_fallback_windows() -> None:
+    now = datetime.now(UTC).replace(microsecond=0)
+    action = replace(
+        _action("ev-mixed-schedule", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "daylight_lowest_cost": {
+                "selected": True,
+                "window_start_utc": now.isoformat(),
+                "window_end_utc": (now + timedelta(minutes=5)).isoformat(),
+            },
+            "allocated_slots": [
+                {
+                    "valid_at": now.isoformat(),
+                    "charge_kw": 7,
+                    "allocation_source": "daylight",
+                },
+                {
+                    "valid_at": (now + timedelta(minutes=5)).isoformat(),
+                    "charge_kw": 7,
+                    "allocation_source": "ready_by_fallback",
+                },
+            ],
+        },
+    )
+
+    events = calendar_module._calendar_events(_coordinator(_plan([action])))
+
+    assert len(events) == 2
+    assert "Allocation: Daylight preference" in (events[0].description or "")
+    assert "Sunset:" in (events[0].description or "")
+    assert "Allocation: Ready-by fallback" in (events[1].description or "")
+    assert "Sunrise:" not in (events[1].description or "")
 
 
 def test_calendar_omits_ev_schedule_without_allocated_charging() -> None:

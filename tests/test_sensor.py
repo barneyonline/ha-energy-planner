@@ -2117,6 +2117,42 @@ def test_sensor_helper_edge_cases_for_labels_and_timeline() -> None:
         "Start": "Sat 27 Jun, 00:00",
         "Bad Time": "not-a-time",
     }
+    daylight_details = sensor_module._plain_state_details(
+        {
+            "daylight_lowest_cost": {
+                "enabled": True,
+                "applicable": True,
+                "forecast_complete": False,
+                "selected": False,
+                "window_start_utc": now.isoformat(),
+                "window_end_utc": (now + timedelta(hours=8)).isoformat(),
+                "reason": "ev_daylight_forecast_incomplete",
+                "unavailable_detail": None,
+            },
+            "allocation_source_now": "ready_by_fallback",
+            "allocated_slots": [
+                {"allocation_source": "daylight"},
+                {"allocation_source": "ready_by_fallback"},
+            ],
+        }
+    )
+    assert daylight_details["Daylight lowest-cost charging"] == {
+        "Enabled": True,
+        "Applicable": True,
+        "Forecast Complete": False,
+        "Selected": False,
+        "Sunrise": "Sat 27 Jun, 00:00",
+        "Sunset": "Sat 27 Jun, 08:00",
+        "Status": (
+            "The complete remaining sunrise-to-sunset forecast is not available, "
+            "so ready-by scheduling is used."
+        ),
+    }
+    assert daylight_details["Current allocation source"] == "Ready-by fallback"
+    assert daylight_details["Charging allocation sources"] == [
+        "Daylight preference",
+        "Ready-by fallback",
+    ]
     assert sensor_module._reason_summary("away_hvac_policy") == "Nobody is home, so climate control can be reduced."
     assert sensor_module._reason_summary(123) == ""
     assert sensor_module._time_label(None) is None

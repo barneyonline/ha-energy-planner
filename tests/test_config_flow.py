@@ -74,6 +74,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
+    CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
@@ -986,19 +987,31 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
         for marker, validator in schema.schema.items()
         if str(getattr(marker, "schema", marker)) == INPUT_STEP_EV
     )
-    fields = {
+    ordered_fields = [
         str(getattr(marker, "schema", marker))
         for marker in ev_section.schema.schema
-    }
+    ]
+    fields = set(ordered_fields)
 
     assert {
         CONF_EV_SOC,
         CONF_EV_CHARGER,
         CONF_DEFAULT_READY_BY,
         CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
         CONF_EV_LOW_PRICE_THRESHOLD,
         CONF_EV_KEEP_CHARGER_ON,
     } <= fields
+    assert ordered_fields.index(CONF_EV_LOW_PRICE_CHARGING_ENABLED) < ordered_fields.index(
+        CONF_EV_LOW_PRICE_THRESHOLD
+    ) < ordered_fields.index(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED)
+
+    ev_strings = _strings()["options"]["step"]["init"]["sections"][INPUT_STEP_EV]
+    assert (
+        ev_strings["data"][CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED]
+        == "Enable lowest-cost daylight charging"
+    )
+    assert "lowest-cost daylight charging" in ev_strings["description"]
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
