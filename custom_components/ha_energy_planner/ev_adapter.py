@@ -565,8 +565,14 @@ class EVChargerAdapter:
         """Honor saved helper-based entries while users migrate to native controls."""
         target_soc = action.desired_state.get("target_soc_percent")
         ready_by = action.desired_state.get("ready_by")
-        target_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
-        ready_by_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
+        target_entity_value = self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
+        target_entity = target_entity_value if isinstance(target_entity_value, str) and target_entity_value else None
+        ready_by_entity_value = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
+        ready_by_entity = (
+            ready_by_entity_value
+            if isinstance(ready_by_entity_value, str) and ready_by_entity_value
+            else None
+        )
         if target_soc is not None:
             if not target_entity:
                 return EVCommandResult(False, "ev_target_soc_helper_not_configured", self._snapshot(), self._snapshot())
@@ -581,10 +587,24 @@ class EVChargerAdapter:
                 ready_by_entity
             ):
                 return EVCommandResult(False, "ev_ready_by_helper_unsupported", self._snapshot(), self._snapshot())
-        if target_soc is not None and not await self._async_set_entity_value(target_entity, target_soc):
-            return EVCommandResult(False, "ev_target_soc_helper_unsupported", self._snapshot(), self._snapshot())
-        if ready_by is not None and not await self._async_set_entity_value(ready_by_entity, ready_by):
-            return EVCommandResult(False, "ev_ready_by_helper_unsupported", self._snapshot(), self._snapshot())
+        if target_soc is not None:
+            assert target_entity is not None
+            if not await self._async_set_entity_value(target_entity, target_soc):
+                return EVCommandResult(
+                    False,
+                    "ev_target_soc_helper_unsupported",
+                    self._snapshot(),
+                    self._snapshot(),
+                )
+        if ready_by is not None:
+            assert ready_by_entity is not None
+            if not await self._async_set_entity_value(ready_by_entity, ready_by):
+                return EVCommandResult(
+                    False,
+                    "ev_ready_by_helper_unsupported",
+                    self._snapshot(),
+                    self._snapshot(),
+                )
         return await self._async_start(action)
 
     def _start_entity(self) -> str | None:

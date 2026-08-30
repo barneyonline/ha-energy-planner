@@ -9,9 +9,11 @@ levels:
       - config-flow
       - dependency-transparency
       - docs-actions
+      - docs-conditions
       - docs-high-level-description
       - docs-installation-instructions
       - docs-removal-instructions
+      - docs-triggers
       - entity-event-setup
       - entity-unique-id
       - has-entity-name
@@ -139,6 +141,18 @@ rules:
     references:
       code:
         - custom_components/ha_energy_planner/services.yaml
+      docs:
+        - README.md
+  docs-conditions:
+    status: exempt
+    comment: The integration does not provide custom automation conditions.
+    references:
+      docs:
+        - README.md
+  docs-triggers:
+    status: exempt
+    comment: The integration does not provide custom automation triggers.
+    references:
       docs:
         - README.md
   docs-high-level-description:
@@ -292,7 +306,7 @@ rules:
         - tests/test_coordinator.py
         - tests/test_executor.py
   reauthentication-flow:
-    status: n/a
+    status: exempt
     comment: This local-first integration stores entity/service mappings and no remote account credential that requires Home Assistant reauthentication.
     references:
       code:
@@ -345,7 +359,7 @@ rules:
         - tests/test_calendar.py
         - scripts/docker-ha-smoke.sh
   discovery-update-info:
-    status: n/a
+    status: exempt
     comment: The integration is configured explicitly and does not use Home Assistant discovery flows; its internal capability preflight is runtime validation, not device discovery.
     references:
       code:
@@ -355,7 +369,7 @@ rules:
         - tests/test_discovery.py
         - scripts/docker-ha-smoke.sh
   discovery:
-    status: n/a
+    status: exempt
     comment: The integration does not discover devices or services; users explicitly map existing Home Assistant entities and services through the central Configure input sections.
     references:
       code:
@@ -402,7 +416,7 @@ rules:
       docs:
         - ha-energy-planner-spec.md
   dynamic-devices:
-    status: n/a
+    status: exempt
     comment: Energy Planner exposes one fixed service device per config entry and has no discovered device inventory that can appear dynamically.
     references:
       code:
@@ -468,7 +482,7 @@ rules:
         - tests/test_services.py
         - tests/test_switch_button.py
   icon-translations:
-    status: n/a
+    status: exempt
     comment: No custom icon translation file is required for the current entity set.
     references:
       code:
@@ -482,7 +496,7 @@ rules:
       tests:
         - tests/test_config_flow.py
   repair-issues:
-    status: n/a
+    status: exempt
     comment: No issue currently requires a Home Assistant Repairs flow; runtime safety failures are actionable through translated service errors, preflight evidence, and safe-state restoration.
     references:
       code:
@@ -491,7 +505,7 @@ rules:
         - tests/test_executor.py
         - scripts/docker-ha-smoke.sh
   stale-devices:
-    status: n/a
+    status: exempt
     comment: The integration has one config-entry device and no discovered device inventory to prune.
     references:
       code:
@@ -504,18 +518,22 @@ rules:
         - custom_components/ha_energy_planner/coordinator.py
         - custom_components/ha_energy_planner/ai_advisor.py
   inject-websession:
-    status: n/a
+    status: exempt
     comment: The integration does not maintain an aiohttp API client; optional AI calls are delegated to configured Home Assistant services.
     references:
       code:
         - custom_components/ha_energy_planner/ai_advisor.py
   strict-typing:
-    status: todo
-    comment: Runtime data and public boundaries are annotated, but the complete integration does not yet pass a strict static type checker; this rule is not claimed at the Gold target.
+    status: done
+    comment: Every integration module passes strict mypy against the pinned Home Assistant type surface; typed config-entry runtime data is used throughout, and the Docker and pull-request gates enforce the complete integration check.
     references:
       code:
         - custom_components/ha_energy_planner/type_defs.py
         - custom_components/ha_energy_planner/__init__.py
         - custom_components/ha_energy_planner/entity.py
         - pyproject.toml
+        - scripts/docker-mypy.sh
         - scripts/docker-validate.sh
+        - .github/workflows/quality-scale.yml
+      tests:
+        - tests/scripts/test_validate_quality_scale.py

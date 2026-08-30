@@ -5129,6 +5129,17 @@ def test_unconfirmed_owned_manual_ev_stop_fails_closed() -> None:
     assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
 
 
+def test_manual_ev_control_fails_closed_without_home_assistant() -> None:
+    store = FakeStore()
+    executor = Executor(store)
+
+    result = asyncio.run(executor.async_manual_ev_charging(False, None))
+
+    assert result.applied is False
+    assert result.reason == "home_assistant_unavailable"
+    assert store.data["outcomes"][-1].result == OutcomeResult.REJECTED
+
+
 def test_manual_ev_start_rejects_missing_grid_projection_context() -> None:
     hass = FakeHass()
     hass.data = {}

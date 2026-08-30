@@ -48,6 +48,17 @@ def test_smoke_script_changes_only_run_validation_extras() -> None:
     )
 
 
+def test_mypy_runner_changes_run_dedicated_quality_checks() -> None:
+    module = _module()
+
+    assert module.select_checks(["scripts/docker-mypy.sh"]) == module.CheckSelection(
+        pytest=False,
+        quality_scale=True,
+        validation_extras=True,
+        dedicated_quality_scale=True,
+    )
+
+
 def test_test_changes_run_pytest_and_validation() -> None:
     module = _module()
 

@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, TypeGuard
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -900,7 +900,7 @@ class InputManager:
             unit = str(_attribute_value(attributes, "unit_of_measurement", "unit", "temperature_unit") or "")
             current_temperature = normalize_scalar_value(current_temperature, value_kind="temperature", unit=unit)
 
-        forecast_state = state
+        forecast_state: Any = state
         service_forecast = self.weather_forecast.get("forecast")
         if isinstance(service_forecast, list) and service_forecast:
             forecast_state = SimpleNamespace(
@@ -1026,7 +1026,12 @@ class InputManager:
                 )
             ):
                 issue = f"{key}_stale"
-                issues.append(_advisory_issue(issue) if key == CONF_CARBON_INTENSITY_FORECAST else issue)
+                if key == CONF_CARBON_INTENSITY_FORECAST:
+                    advisory_issue = _advisory_issue(issue)
+                    if advisory_issue is not None:
+                        issues.append(advisory_issue)
+                else:
+                    issues.append(issue)
         load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)
         load_state = self._state(load_entity) if load_entity else None
         if load_state and now - load_state.last_updated > forecast_timeout:
@@ -1085,7 +1090,7 @@ class InputManager:
         return self._state_cache[cache_key]
 
     @staticmethod
-    def _valid_state(state: State | None) -> bool:
+    def _valid_state(state: State | None) -> TypeGuard[State]:
         return state is not None and state.state not in STATE_UNKNOWN_VALUES
 
     @staticmethod

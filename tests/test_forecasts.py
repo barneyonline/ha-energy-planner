@@ -472,6 +472,23 @@ def test_ordered_forecast_honors_explicit_minute_cadence_without_extending_cover
     ) == [1.0, 1.0, 2.0, 2.0, None, None, None, None]
 
 
+def test_ordered_forecast_ignores_invalid_explicit_cadence() -> None:
+    issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
+    state = FakeState(
+        "0",
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": "invalid"},
+    )
+
+    assert forecast_series_from_state(
+        state,
+        issued_at=issued_at,
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) == [1.0, 2.0, None, None]
+
+
 def test_timestamped_forecast_does_not_fill_irregular_internal_gaps() -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(

@@ -10,6 +10,7 @@ from math import isfinite
 from types import SimpleNamespace
 from typing import Any
 
+from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -123,7 +124,7 @@ class Executor:
         self,
         store: PlannerStore,
         *,
-        hass: Any | None = None,
+        hass: HomeAssistant | None = None,
         entry_data: dict[str, Any] | None = None,
         options: dict[str, Any] | None = None,
         notification_grace_until: datetime | None = None,
@@ -183,6 +184,16 @@ class Executor:
             },
         )
         plan_id = getattr(context, "plan_id", "manual") if context is not None else "manual"
+        if self.hass is None:
+            result = EVCommandResult(False, "home_assistant_unavailable", {}, {})
+            await self._async_record_manual_ev_outcome(
+                action,
+                result,
+                now,
+                plan_id=plan_id,
+                rejected=True,
+            )
+            return result
         if enabled:
             gate_reason = _pause_rejection_reason(
                 self.store.data.get("control_pause"),
@@ -393,7 +404,7 @@ class Executor:
             self._ev_safety_stop_attempted_plan_id = plan.plan_id
             await self.async_evaluate(replace(plan, actions=[safety_stop]), context)
             if action is None or action.asset == ActionAsset.EV:
-                return
+                return None
         now = dt_util.utcnow()
         due_hvac_releases = [
             candidate
@@ -428,11 +439,11 @@ class Executor:
                     )
                     return due_hvac_continuation
         if action is None:
-            return
+            return None
         safety_ev_stop = _ev_action_is_safety_stop(action)
         owned_safety_stop = _ev_action_is_owned_safety_stop(action)
         if not owned_safety_stop and (now < action.execute_not_before or now > action.execute_not_after):
-            return
+            return None
         if action.asset == ActionAsset.DAIKIN and action.kind == ActionKind.RELEASE_HVAC:
             await self.async_release_hvac_control(
                 str(action.desired_state.get("release_reason") or "planned_hvac_release"),
@@ -457,7 +468,7 @@ class Executor:
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         ownership = self._ownership_from_store()
         if context is not None and self.options and not safety_ev_stop:
             violations = ConstraintValidator(self.options).validate_action(
@@ -479,7 +490,7 @@ class Executor:
                         plan_id=plan.plan_id,
                     )
                 )
-                return
+                return None
         if self.hass is not None:
             await self._async_notify_ev_infeasible(action)
             capability_entry_data = (
@@ -519,7 +530,7 @@ class Executor:
                         plan_id=plan.plan_id,
                     )
                 )
-                return
+                return None
         reason = self._rejection_reason(plan)
         if safety_ev_stop and reason == "input_health_degraded":
             reason = None
@@ -539,7 +550,7 @@ class Executor:
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         hvac_continuation = bool(
             action.asset == ActionAsset.DAIKIN
             and action.desired_state.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"}
@@ -558,7 +569,7 @@ class Executor:
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         rate_limit_reason = (
             None if _ev_action_is_safety_stop(action) or hvac_continuation else self._rate_limit_reason(action, now)
         )
@@ -574,7 +585,7 @@ class Executor:
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         if reason is None and action.asset == ActionAsset.EV and self.hass is not None:
             reservation_reason, previous_reservation = self._reserve_ev_grid_capacity(action, context, now)
             if reservation_reason is not None:
@@ -589,26 +600,26 @@ class Executor:
                         plan_id=plan.plan_id,
                     )
                 )
-                return
+                return None
             ev_entry_data = self._ev_entry_data_for_action(action)
-            provisional_ownership = False
+            ev_provisional_ownership = False
             if _ev_action_wants_power(action):
                 # The device call below is a crash boundary. Persist possible
                 # load first so a restart cannot forget an accepted EV start.
                 await self.async_persist_ev_grid_reservation()
-                provisional_ownership = await self._async_save_provisional_ev_ownership(
+                ev_provisional_ownership = await self._async_save_provisional_ev_ownership(
                     action,
                     ev_entry_data,
                 )
                 await self._async_flush_provisional_state()
-            result = await EVSmartChargingAdapter(
+            ev_result = await EVSmartChargingAdapter(
                 self.hass,
                 ev_entry_data,
                 confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                 confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
             ).async_execute(action)
-            no_change = result.reason == "already_in_desired_state"
-            safe_stop_confirmed = _ev_result_proves_safe(result)
+            no_change = ev_result.reason == "already_in_desired_state"
+            safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             stored_ownership = self.store.data.get("ownership")
             planner_owned_stop = bool(
                 safety_ev_stop
@@ -625,13 +636,13 @@ class Executor:
                     )
                 )
             )
-            action_applied = safe_stop_confirmed if planner_owned_stop else result.applied
+            action_applied = safe_stop_confirmed if planner_owned_stop else ev_result.applied
             result_reason = (
                 "ev_stop_not_confirmed"
-                if planner_owned_stop and result.applied and not safe_stop_confirmed
+                if planner_owned_stop and ev_result.applied and not safe_stop_confirmed
                 else "ev_safe_stop_compensated"
-                if planner_owned_stop and safe_stop_confirmed and not result.applied
-                else result.reason
+                if planner_owned_stop and safe_stop_confirmed and not ev_result.applied
+                else ev_result.reason
             )
             if not no_change:
                 await self._async_record_command_attempt(action, now)
@@ -659,35 +670,44 @@ class Executor:
                     pause_duration,
                     safety_stop_failure=planner_owned_stop,
                 )
-            self._reconcile_ev_grid_reservation(action, result, previous_reservation)
+            self._reconcile_ev_grid_reservation(action, ev_result, previous_reservation)
             if planner_owned_stop and not action_applied and self.entry_id:
                 # Let another controllable EV shed load after this claimant
                 # failed, while retaining this entry's uncertain reservation.
                 self._clear_ev_grid_shedding_claim(self.entry_id)
             await self.async_persist_ev_grid_reservation()
             if action_applied and planner_owned_stop:
-                ownership = dict(self.store.data.get("ownership", {}))
-                ownership.pop("ev_smart_charging_state", None)
-                ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
-                ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
-                await self.store.async_save_ownership(ownership)
+                ownership_data = dict(self.store.data.get("ownership", {}))
+                ownership_data.pop("ev_smart_charging_state", None)
+                ownership_data.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
+                ownership_data.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
+                await self.store.async_save_ownership(ownership_data)
             charger_state_may_still_be_owned = (
                 _ev_action_wants_power(action)
-                and (bool(getattr(result, "command_sent", result.applied and not no_change)) or action_applied)
-                and getattr(result, "rollback_succeeded", None) is not True
+                and (
+                    bool(
+                        getattr(
+                            ev_result,
+                            "command_sent",
+                            ev_result.applied and not no_change,
+                        )
+                    )
+                    or action_applied
+                )
+                and getattr(ev_result, "rollback_succeeded", None) is not True
                 and not (action_applied and planner_owned_stop)
             )
             if charger_state_may_still_be_owned:
-                ownership = dict(self.store.data.get("ownership", {}))
-                if "ev_smart_charging_state" not in ownership:
-                    ownership["ev_smart_charging_state"] = result.pre_state
-                    ownership[_EV_COMMAND_ENTITY_OWNERSHIP_KEY] = _ev_command_entity_for_action(
+                ownership_data = dict(self.store.data.get("ownership", {}))
+                if "ev_smart_charging_state" not in ownership_data:
+                    ownership_data["ev_smart_charging_state"] = ev_result.pre_state
+                    ownership_data[_EV_COMMAND_ENTITY_OWNERSHIP_KEY] = _ev_command_entity_for_action(
                         action,
                         ev_entry_data,
                     )
-                    ownership[_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY] = _ev_control_topology(ev_entry_data)
-                    await self.store.async_save_ownership(ownership)
-            elif provisional_ownership and not self._has_ev_grid_reservation():
+                    ownership_data[_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY] = _ev_control_topology(ev_entry_data)
+                    await self.store.async_save_ownership(ownership_data)
+            elif ev_provisional_ownership and not self._has_ev_grid_reservation():
                 await self._async_clear_provisional_ev_ownership()
             await self.store.async_add_outcome(
                 self._action_outcome(
@@ -701,13 +721,13 @@ class Executor:
                         else OutcomeResult.FAILED
                     ),
                     reason=result_reason,
-                    pre_state=result.pre_state,
-                    post_state=result.post_state,
+                    pre_state=ev_result.pre_state,
+                    post_state=ev_result.post_state,
                     plan_id=plan.plan_id,
                     ev_entry_data=ev_entry_data,
                 )
             )
-            return
+            return None
         if reason is None and action.asset == ActionAsset.DAIKIN and self.hass is not None:
             existing_hvac_control = dict(
                 dict(self.store.data.get("ownership", {})).get("hvac_control", {})
@@ -721,7 +741,7 @@ class Executor:
                     "hvac_unresolved_main_state_recovery",
                     plan_id=plan.plan_id,
                 )
-                return
+                return None
             adapter = DaikinHVACAdapter(self.hass, self.entry_data)
             ownership_before = deepcopy(dict(self.store.data.get("ownership", {})))
             had_hvac_ownership_before = bool(
@@ -742,16 +762,16 @@ class Executor:
                     for entity_id, state in zone_snapshot.items()
                     if entity_id.split(".", 1)[0] != "climate"
                 }
-            provisional_ownership = deepcopy(ownership_before)
+            provisional_ownership_data = deepcopy(ownership_before)
             provisional_automation_states = dict(
-                provisional_ownership.get("climate_automations", {})
+                provisional_ownership_data.get("climate_automations", {})
             )
             for entity_id, state in automation_snapshot.items():
                 provisional_automation_states.setdefault(entity_id, state)
-            provisional_ownership["climate_automations"] = (
+            provisional_ownership_data["climate_automations"] = (
                 provisional_automation_states
             )
-            provisional_hvac_control = dict(provisional_ownership.get("hvac_control", {}))
+            provisional_hvac_control = dict(provisional_ownership_data.get("hvac_control", {}))
             provisional_zone_states = dict(
                 provisional_hvac_control.get("zone_states", {})
             )
@@ -781,10 +801,10 @@ class Executor:
                     "away_off" if action.desired_state.get("hvac_mode") == "off" else "direct_control"
                 )
             provisional_hvac_control.setdefault("started_at", now)
-            provisional_ownership["hvac_control"] = provisional_hvac_control
-            provisional_ownership.setdefault("planner_takeover_started_at", now)
-            provisional_ownership["planner_hvac_action_expires_at"] = now + timedelta(minutes=2)
-            await self.store.async_save_ownership(provisional_ownership)
+            provisional_ownership_data["hvac_control"] = provisional_hvac_control
+            provisional_ownership_data.setdefault("planner_takeover_started_at", now)
+            provisional_ownership_data["planner_hvac_action_expires_at"] = now + timedelta(minutes=2)
+            await self.store.async_save_ownership(provisional_ownership_data)
             await self._async_flush_provisional_state()
             set_main_state_persistence_callback = getattr(
                 adapter,
@@ -803,7 +823,7 @@ class Executor:
             )
             try:
                 try:
-                    result = await adapter.async_execute(action)
+                    hvac_result = await adapter.async_execute(action)
                 except Exception:  # noqa: BLE001 - preserve manual evidence before the executor boundary re-raises.
                     main_state_superseded = (
                         pending_hvac_desired_state.get(
@@ -844,14 +864,14 @@ class Executor:
                 is True
             )
             no_change = (
-                result.reason == "already_in_desired_hvac_state"
-                and not bool(getattr(result, "command_sent", False))
+                hvac_result.reason == "already_in_desired_hvac_state"
+                and not bool(getattr(hvac_result, "command_sent", False))
             )
             if not no_change:
                 await self._async_record_command_attempt(action, now)
-            if not result.applied:
-                await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
-                if getattr(result, "rollback_succeeded", None) is True:
+            if not hvac_result.applied:
+                await self._async_pause_asset_control(action.asset, now, hvac_result.reason, ACTION_BACKOFF_DURATION)
+                if getattr(hvac_result, "rollback_succeeded", None) is True:
                     rollback_ownership = deepcopy(ownership_before)
                     if isinstance(
                             rollback_ownership.get("hvac_control"),
@@ -876,12 +896,12 @@ class Executor:
                         rollback_hvac_control["zone_states"] = rollback_zone_states
                         rollback_ownership["hvac_control"] = rollback_hvac_control
                     await self.store.async_save_ownership(rollback_ownership)
-                if getattr(result, "rollback_succeeded", None) is False:
+                if getattr(hvac_result, "rollback_succeeded", None) is False:
                     ownership_data = deepcopy(ownership_before)
                     saved_states = (
                         dict(ownership_data.get("climate_automations", {})) if had_hvac_ownership_before else {}
                     )
-                    for entity_id, state in result.saved_automation_states.items():
+                    for entity_id, state in hvac_result.saved_automation_states.items():
                         saved_states.setdefault(entity_id, state)
                     if saved_states:
                         ownership_data["climate_automations"] = saved_states
@@ -891,12 +911,12 @@ class Executor:
                     zone_states = dict(hvac_control.get("zone_states", {})) if had_hvac_ownership_before else {}
                     for entity_id in superseded_zone_entity_ids:
                         zone_states.pop(entity_id, None)
-                    for entity_id, state in getattr(result, "saved_zone_states", {}).items():
+                    for entity_id, state in getattr(hvac_result, "saved_zone_states", {}).items():
                         if entity_id in superseded_zone_entity_ids:
                             continue
                         zone_states.setdefault(entity_id, state)
                     hvac_control["zone_states"] = zone_states
-                    unresolved_main_state = dict(getattr(result, "saved_main_state", {}))
+                    unresolved_main_state = dict(getattr(hvac_result, "saved_main_state", {}))
                     if unresolved_main_state:
                         hvac_control.setdefault(
                             _HVAC_MAIN_STATE_OWNERSHIP_KEY,
@@ -905,15 +925,15 @@ class Executor:
                     hvac_control["required_evidence_lost"] = "hvac_acquisition_rollback_failed"
                     ownership_data["hvac_control"] = hvac_control
                     await self.store.async_save_ownership(ownership_data)
-            if result.applied:
+            if hvac_result.applied:
                 ownership_data = dict(self.store.data.get("ownership", {}))
                 saved_automations = dict(ownership_data.get("climate_automations", {}))
-                for entity_id, state in result.saved_automation_states.items():
+                for entity_id, state in hvac_result.saved_automation_states.items():
                     saved_automations.setdefault(entity_id, state)
                 ownership_data["climate_automations"] = saved_automations
                 hvac_control = dict(ownership_data.get("hvac_control", {}))
                 saved_zones = dict(hvac_control.get("zone_states", {}))
-                for entity_id, state in getattr(result, "saved_zone_states", {}).items():
+                for entity_id, state in getattr(hvac_result, "saved_zone_states", {}).items():
                     saved_zones.setdefault(entity_id, state)
                 hvac_control["zone_states"] = saved_zones
                 hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
@@ -947,52 +967,54 @@ class Executor:
                         OutcomeResult.SKIPPED
                         if no_change
                         else OutcomeResult.APPLIED
-                        if result.applied
+                        if hvac_result.applied
                         else OutcomeResult.FAILED
                     ),
-                    reason=result.reason,
-                    pre_state=result.pre_state,
-                    post_state=result.post_state,
+                    reason=hvac_result.reason,
+                    pre_state=hvac_result.pre_state,
+                    post_state=hvac_result.post_state,
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         if reason is None and action.asset == ActionAsset.ENPHASE and self.hass is not None:
-            result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_execute(action)
+            enphase_result = await EnphaseProfileAdapter(self.hass, self.entry_data).async_execute(action)
             await self._async_record_command_attempt(action, now)
-            if not result.applied:
-                await self._async_pause_asset_control(action.asset, now, result.reason, ACTION_BACKOFF_DURATION)
+            if not enphase_result.applied:
+                await self._async_pause_asset_control(
+                    action.asset, now, enphase_result.reason, ACTION_BACKOFF_DURATION
+                )
                 if (
-                    bool(getattr(result, "command_sent", False))
-                    and getattr(result, "rollback_succeeded", None) is not True
-                    and result.saved_profile is not None
+                    bool(getattr(enphase_result, "command_sent", False))
+                    and getattr(enphase_result, "rollback_succeeded", None) is not True
+                    and enphase_result.saved_profile is not None
                 ):
                     ownership_data = dict(self.store.data.get("ownership", {}))
-                    ownership_data.setdefault("enphase_profile", result.saved_profile)
+                    ownership_data.setdefault("enphase_profile", enphase_result.saved_profile)
                     ownership_data["enphase_profile_changed_at"] = now
                     await self.store.async_save_ownership(ownership_data)
-            if result.applied:
+            if enphase_result.applied:
                 ownership_data = dict(self.store.data.get("ownership", {}))
                 if action.kind == ActionKind.RESTORE_AI:
                     ownership_data.pop("enphase_profile", None)
                     ownership_data.pop("enphase_profile_changed_at", None)
-                elif result.saved_profile is not None:
-                    ownership_data["enphase_profile"] = result.saved_profile
-                if result.changed_profile_at and action.kind != ActionKind.RESTORE_AI:
+                elif enphase_result.saved_profile is not None:
+                    ownership_data["enphase_profile"] = enphase_result.saved_profile
+                if enphase_result.changed_profile_at and action.kind != ActionKind.RESTORE_AI:
                     ownership_data["enphase_profile_changed_at"] = now
                 await self.store.async_save_ownership(ownership_data)
             await self.store.async_add_outcome(
                 self._action_outcome(
                     action,
                     now,
-                    result=OutcomeResult.APPLIED if result.applied else OutcomeResult.FAILED,
-                    reason=result.reason,
-                    pre_state=result.pre_state,
-                    post_state=result.post_state,
+                    result=OutcomeResult.APPLIED if enphase_result.applied else OutcomeResult.FAILED,
+                    reason=enphase_result.reason,
+                    pre_state=enphase_result.pre_state,
+                    post_state=enphase_result.post_state,
                     plan_id=plan.plan_id,
                 )
             )
-            return
+            return None
         reason = reason or "unsupported_asset_execution"
         await self.store.async_add_outcome(
             self._action_outcome(
@@ -1005,12 +1027,13 @@ class Executor:
                 plan_id=plan.plan_id,
             )
         )
+        return None
 
     def _owned_ev_safety_stop(
         self,
         plan: EnergyPlan,
         context: DecisionContext | None,
-    ) -> Any | None:
+    ) -> PlanAction | None:
         """Return a stop when planner-owned EV power must be made safe."""
         manual_start_override = bool(
             context is not None
@@ -1110,8 +1133,9 @@ class Executor:
             charging_reason = f"ev_{reservation_safety_issue}_safety_stop"
         else:
             charging_reason = f"ev_{plan_safety_issue}_safety_stop"
-        return SimpleNamespace(
+        return PlanAction(
             action_id=f"{plan.plan_id}-ev-owned-safety-stop",
+            plan_id=plan.plan_id,
             asset=ActionAsset.EV,
             kind=ActionKind.EV_STOP,
             desired_state={
@@ -1122,6 +1146,10 @@ class Executor:
             },
             execute_not_before=plan.created_at,
             execute_not_after=plan.created_at + timedelta(minutes=max(int(plan.interval_minutes), 1)),
+            hard_constraints=[],
+            reason_codes=[charging_reason],
+            expected_cost_delta=None,
+            confidence=1.0,
         )
 
     def _ev_reservation_safety_issue(
@@ -1221,7 +1249,7 @@ class Executor:
         else:
             try:
                 adapter = DaikinHVACAdapter(self.hass, self.entry_data)
-                pending_hvac_desired_state = {
+                pending_hvac_desired_state: dict[str, Any] = {
                     "restore_zones": zone_states,
                     "restore_main": main_state,
                 }
@@ -1440,7 +1468,7 @@ class Executor:
             if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
                 try:
                     adapter = DaikinHVACAdapter(self.hass, self.entry_data)
-                    pending_hvac_desired_state = {
+                    pending_hvac_desired_state: dict[str, Any] = {
                         "restore_zones": hvac_zone_state,
                         "restore_main": hvac_main_state,
                     }
@@ -2059,7 +2087,7 @@ class Executor:
             ),
         ):
             return False
-        services = getattr(self.hass, "services", None)
+        services = self.hass.services
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "create"):
             return False
@@ -2104,7 +2132,7 @@ class Executor:
         if self.hass is None:
             return
         cancel_deferred_persistent_notification(self.hass, notification_id)
-        services = getattr(self.hass, "services", None)
+        services = self.hass.services
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "dismiss"):
             return
@@ -2640,29 +2668,29 @@ def _ev_result_proves_safe(result: Any) -> bool:
 
 
 def _normalized_ev_stop_result(
-    result: Any,
+    result: EVCommandResult,
     *,
     require_safe: bool,
 ) -> EVCommandResult:
     """Normalize manual-stop success when a safe state is authoritative."""
     safe_state_confirmed = _ev_result_proves_safe(result)
-    raw_applied = bool(getattr(result, "applied", False))
+    raw_applied = result.applied
     applied = safe_state_confirmed if require_safe else raw_applied or safe_state_confirmed
-    reason = str(getattr(result, "reason", "ev_stop_failed"))
+    reason = result.reason
     if safe_state_confirmed and not raw_applied:
         reason = "ev_safe_stop_compensated"
     elif require_safe and raw_applied and not safe_state_confirmed:
         reason = "ev_stop_not_confirmed"
-    if applied == raw_applied and reason == getattr(result, "reason", None):
+    if applied == raw_applied and reason == result.reason:
         return result
     return EVCommandResult(
         applied,
         reason,
-        getattr(result, "pre_state", {}),
-        getattr(result, "post_state", {}),
-        command_sent=bool(getattr(result, "command_sent", False)),
-        rollback_succeeded=getattr(result, "rollback_succeeded", None),
-        safe_state_confirmed=getattr(result, "safe_state_confirmed", None),
+        result.pre_state,
+        result.post_state,
+        command_sent=result.command_sent,
+        rollback_succeeded=result.rollback_succeeded,
+        safe_state_confirmed=result.safe_state_confirmed,
     )
 
 

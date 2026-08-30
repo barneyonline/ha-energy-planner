@@ -64,7 +64,7 @@ jobs:
               raise SystemExit(f"manifest.json missing required keys: {', '.join(missing)}")
           if manifest["domain"] != "ha_energy_planner":
               raise SystemExit(f"unexpected manifest domain: {manifest['domain']}")
-          if manifest["quality_scale"] != "gold":
+          if manifest["quality_scale"] != "platinum":
               raise SystemExit(f"unexpected quality scale: {manifest['quality_scale']}")
           if manifest["integration_type"] != "service" or manifest["iot_class"] != "calculated":
               raise SystemExit("unexpected integration classification")

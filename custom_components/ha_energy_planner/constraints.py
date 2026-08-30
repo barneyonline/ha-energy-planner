@@ -361,9 +361,13 @@ def _is_verified_away_preconditioning_action(action: PlanAction) -> bool:
         for value in lifecycle_numbers
     )
     valid_window = False
-    if all(
-        isinstance(value, datetime) and value.tzinfo is not None
-        for value in (period_start, period_end, precondition_end)
+    if (
+        isinstance(period_start, datetime)
+        and period_start.tzinfo is not None
+        and isinstance(period_end, datetime)
+        and period_end.tzinfo is not None
+        and isinstance(precondition_end, datetime)
+        and precondition_end.tzinfo is not None
     ):
         valid_window = precondition_end <= period_start < period_end
     return bool(

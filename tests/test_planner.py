@@ -3334,6 +3334,22 @@ def test_hvac_lifecycle_fail_safe_release_branches() -> None:
     assert planner.create_plan(context).actions[0].desired_state["release_reason"] == "hvac_required_evidence_lost"
 
 
+def test_persisted_hvac_coast_projection_requires_current_temperature() -> None:
+    context = _context()
+    context.current_hvac_temperature_c = None
+    planner = DryRunPlanner(DEFAULT_OPTIONS)
+
+    planner._project_active_hvac_slots(
+        context,
+        phase="peak_coast",
+        mode="heat",
+        active_until=context.created_at + timedelta(minutes=30),
+        comfort_boundary=19.0,
+    )
+
+    assert all(slot.projected_hvac_load_kw == 0.0 for slot in context.slots)
+
+
 def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = _context()
@@ -3347,6 +3363,10 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     assert planner_module._datetime_value(datetime(2026, 6, 27, 1)) == datetime(2026, 6, 27, 1, tzinfo=UTC)
     assert planner_module._datetime_value("bad") is None
     assert planner._next_hvac_period(context) is None
+
+    context.current_hvac_temperature_c = None
+    assert planner._next_hvac_period(context) is None
+    context.current_hvac_temperature_c = 21
 
     context.slots = [
         DecisionSlot(now, 0.10, 0.05, 1, 2),

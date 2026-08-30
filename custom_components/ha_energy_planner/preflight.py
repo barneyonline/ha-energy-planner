@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -492,7 +493,7 @@ def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str
 
 
 def _recorder_report(hass: HomeAssistant) -> dict[str, Any]:
-    components = getattr(getattr(hass, "config", None), "components", set())
+    components: Collection[str] = getattr(getattr(hass, "config", None), "components", set())
     data = getattr(hass, "data", {})
     available = "recorder" in components or (isinstance(data, dict) and "recorder" in data)
     return {"available": available}
