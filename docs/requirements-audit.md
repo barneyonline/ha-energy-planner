@@ -517,9 +517,14 @@ Status as of 2026-08-15.
   mode bypasses the scheduler guard, synchronously aborts acquisition rollback,
   release, or safe-state main restoration, preserves the user's main state, and
   restores subordinate ownership. Pending zone feedback is matched to the exact
-  action or rollback target; a different user target synchronously supersedes
-  and durably removes only that zone's baseline before the remaining rollback
-  actuators run. Await-to-actuator boundaries recheck supersession after main
+  action or rollback target. A configured switch/helper's coupled climate entity
+  may publish only the corresponding off-to-active or active-to-off transition
+  with the actuator call's Home Assistant context while that call and
+  confirmation are explicitly phased. A context-free sibling refresh requires
+  an unambiguous actuator/climate entity-ID pair; unrelated zone, user-context,
+  target, and auxiliary-control changes still supersede the transaction. A different user
+  target synchronously supersedes and durably removes only that zone's baseline
+  before the remaining rollback actuators run. Await-to-actuator boundaries recheck supersession after main
   snapshot persistence, mode confirmation, and automation disable. It preserves
   the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,

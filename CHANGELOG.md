@@ -14,7 +14,10 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Planner-owned zone switch/helper changes no longer misclassify causally linked
+  climate-entity on/off feedback as a manual override, including synchronized
+  zone restoration. Feedback is correlated to the actuator service context, so
+  unrelated mode, target, and auxiliary-control changes remain manual overrides.
 
 ### 🔧 Improvements
 

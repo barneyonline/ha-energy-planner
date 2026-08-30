@@ -49,6 +49,7 @@ from custom_components.ha_energy_planner.coordinator import (
     _bool_state_value,
     _bounded_reason,
     _configured_entity_ids,
+    _coupled_zone_entity_ids_match,
     _decision_input_fingerprint,
     _expired_manual_hvac_state,
     _float_state_value,
@@ -1221,12 +1222,20 @@ class FakeEvent:
         *,
         old_attributes: dict[str, object] | None = None,
         new_attributes: dict[str, object] | None = None,
+        context_id: str | None = None,
+        parent_context_id: str | None = None,
+        context_user_id: str | None = None,
     ) -> None:
         self.data = {
             "entity_id": entity_id,
             "old_state": FakeState(old, old_attributes or {}),
             "new_state": FakeState(new, new_attributes or {}),
         }
+        self.context = SimpleNamespace(
+            id=context_id,
+            parent_id=parent_context_id,
+            user_id=context_user_id,
+        )
 
 
 def test_manual_hvac_change_detected_without_guard() -> None:
@@ -2076,6 +2085,25 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
             new_attributes={"temperature": 24},
         )
     )
+    coordinator.executor.pending_hvac_desired_state = {
+        "enable_zones": True,
+        "configured_zones_only": False,
+        "coupled_zone_feedback_expected": {
+            "actuator_entity_id": "switch.zone",
+            "context_id": "planner-context",
+            "state": "on",
+        },
+    }
+    callback(
+        FakeEvent(
+            "climate.zone_temperature",
+            "off",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 20},
+            context_id="planner-context",
+        )
+    )
     coordinator.hass.states.values["input_boolean.scheduler_change"] = "on"
     callback(
         FakeEvent(
@@ -2093,10 +2121,13 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
         "climate.zone_temperature"
     ]
     assert coordinator.executor.pending_hvac_desired_state == {
-        "target_temperature": 21,
         "enable_zones": True,
-        "configured_zones_only": True,
-        "manual_zone_entity_ids": ["climate.zone_temperature"],
+        "configured_zones_only": False,
+        "coupled_zone_feedback_expected": {
+            "actuator_entity_id": "switch.zone",
+            "context_id": "planner-context",
+            "state": "on",
+        },
         "manual_override_detected": True,
     }
     assert manual_changes == [
@@ -3077,6 +3108,8 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
         "climate_zone_entities": ["switch.zone", "climate.zone_temperature"],
         "enphase_profile_entity": "select.enphase",
     }
+    assert not _coupled_zone_entity_ids_match("invalid", "climate.zone_temperature")
+    assert not _coupled_zone_entity_ids_match("climate.zone", "switch.zone")
 
     assert not _is_planner_owned_control_feedback(
         entry_data,
@@ -3171,6 +3204,202 @@ def test_planner_owned_control_feedback_uses_grace_evidence() -> None:
             "configured_zones_only": False,
         },
     ) == "climate.zone_temperature"
+    coupled_zone_on_event = FakeEvent(
+        "climate.zone_temperature",
+        "off",
+        "heat",
+        old_attributes={"temperature": 20},
+        new_attributes={"temperature": 20},
+        context_id="planner-context",
+    )
+    coupled_zone_pending = {
+        "enable_zones": True,
+        "configured_zones_only": False,
+        "coupled_zone_feedback_expected": {
+            "actuator_entity_id": "switch.zone",
+            "context_id": "planner-context",
+            "state": "on",
+        },
+    }
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        coupled_zone_on_event,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        coupled_zone_on_event,
+        coupled_zone_pending,
+    ) is None
+    pair_only_coupled_event = FakeEvent(
+        "climate.zone_temperature",
+        "off",
+        "heat",
+        old_attributes={"temperature": 20},
+        new_attributes={"temperature": 20},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        pair_only_coupled_event,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    ambiguous_entry_data = {
+        **entry_data,
+        "climate_zone_entities": [
+            "switch.zone",
+            "climate.zone_temperature",
+            "climate.zone_bedrooms_temperature",
+        ],
+    }
+    assert not _is_planner_owned_control_feedback(
+        ambiguous_entry_data,
+        {"execution_audit": []},
+        pair_only_coupled_event,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        ambiguous_entry_data,
+        pair_only_coupled_event,
+        coupled_zone_pending,
+    ) == "climate.zone_temperature"
+    assert _is_planner_owned_control_feedback(
+        ambiguous_entry_data,
+        {"execution_audit": []},
+        coupled_zone_on_event,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    missing_coupled_old_state = FakeEvent(
+        "climate.zone_temperature",
+        "off",
+        "heat",
+        context_id="planner-context",
+    )
+    missing_coupled_old_state.data["old_state"] = None
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        missing_coupled_old_state,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        coupled_zone_on_event,
+        now,
+        pending_hvac_desired_state={
+            "coupled_zone_feedback_expected": {
+                "context_id": "planner-context",
+                "state": "invalid",
+            }
+        },
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "off",
+            "off",
+            context_id="planner-context",
+        ),
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        coupled_zone_on_event,
+        now,
+        pending_hvac_desired_state={
+            "enable_zones": True,
+            "configured_zones_only": False,
+        },
+    )
+    unrelated_manual_zone_event = FakeEvent(
+        "climate.zone_temperature",
+        "off",
+        "heat",
+        old_attributes={"temperature": 20},
+        new_attributes={"temperature": 20},
+        context_id="manual-context",
+        context_user_id="user-1",
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        unrelated_manual_zone_event,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        unrelated_manual_zone_event,
+        coupled_zone_pending,
+    ) == "climate.zone_temperature"
+    assert _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "heat",
+            "off",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 20},
+            parent_context_id="planner-context",
+        ),
+        now,
+        pending_hvac_desired_state={
+            "restore_zones": {
+                "switch.zone": "off",
+                "climate.zone_temperature": {"target_temperature": 20},
+            },
+            "configured_zones_only": False,
+            "coupled_zone_feedback_expected": {
+                "actuator_entity_id": "switch.zone",
+                "context_id": "planner-context",
+                "state": "off",
+            },
+        },
+    )
+    mismatched_coupled_feedback = FakeEvent(
+        "climate.zone_temperature",
+        "off",
+        "heat",
+        old_attributes={"temperature": 20, "fan_mode": "auto"},
+        new_attributes={"temperature": 20, "fan_mode": "high"},
+    )
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        mismatched_coupled_feedback,
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(
+        entry_data,
+        mismatched_coupled_feedback,
+        coupled_zone_pending,
+    ) == "climate.zone_temperature"
+    assert not _is_planner_owned_control_feedback(
+        entry_data,
+        {"execution_audit": []},
+        FakeEvent(
+            "climate.zone_temperature",
+            "off",
+            "heat",
+            old_attributes={"temperature": 20},
+            new_attributes={"temperature": 19},
+        ),
+        now,
+        pending_hvac_desired_state=coupled_zone_pending,
+    )
     assert not _is_planner_owned_control_feedback(
         entry_data,
         {
