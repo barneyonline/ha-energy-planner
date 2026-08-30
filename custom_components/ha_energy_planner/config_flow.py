@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import SectionConfig, section
 from homeassistant.helpers import config_validation as cv
@@ -17,6 +16,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
     SelectSelectorMode,
@@ -24,6 +24,9 @@ from homeassistant.helpers.selector import (
     TextSelectorConfig,
 )
 from voluptuous import Invalid
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.selector import EntityWithDeviceFilterSelectorConfig
 
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
@@ -130,6 +133,7 @@ from .const import (
     INTEGRATION_NAME,
 )
 from .entry_data import combined_entry_data
+from .type_defs import EnergyPlannerConfigEntry
 
 SUBENTRY_ENERGY = "energy"
 SUBENTRY_CLIMATE = "climate"
@@ -174,14 +178,14 @@ _CARBON_INTENSITY_SENSOR_UNITS = (
     "kgCO2/kWh",
     "kgCO₂/kWh",
 )
-_EV_TARGET_SOC_FILTER = [
+_EV_TARGET_SOC_FILTER: list[EntityWithDeviceFilterSelectorConfig] = [
     {"domain": ["number", "input_number", "select", "input_select"]},
     {"domain": "sensor", "device_class": "battery", "unit_of_measurement": list(_PERCENT_SENSOR_UNITS)},
     {"domain": "sensor", "unit_of_measurement": list(_PERCENT_SENSOR_UNITS)},
 ]
 
 
-def _sensor_filter(units: tuple[str, ...]) -> dict[str, Any]:
+def _sensor_filter(units: tuple[str, ...]) -> EntityWithDeviceFilterSelectorConfig:
     """Return a selector filter for sensors that expose one of the expected units."""
     return {"domain": "sensor", "unit_of_measurement": list(units)}
 
@@ -190,7 +194,11 @@ def _entity_selector(
     domain: str | list[str] | None = None,
     *,
     multiple: bool = False,
-    entity_filter: dict[str, Any] | list[dict[str, Any]] | None = None,
+    entity_filter: (
+        EntityWithDeviceFilterSelectorConfig
+        | list[EntityWithDeviceFilterSelectorConfig]
+        | None
+    ) = None,
 ) -> EntitySelector:
     config = EntitySelectorConfig(multiple=multiple)
     if entity_filter is not None:
@@ -518,7 +526,10 @@ def _priority_selector() -> SelectSelector:
     """Return the planning objective selector."""
     return SelectSelector(
         SelectSelectorConfig(
-            options=[{"value": value, "label": _PRIORITY_LABELS[value]} for value in _PRIORITY_OBJECTIVES],
+            options=[
+                SelectOptionDict(value=value, label=_PRIORITY_LABELS[value])
+                for value in _PRIORITY_OBJECTIVES
+            ],
             mode=SelectSelectorMode.DROPDOWN,
             custom_value=False,
             sort=False,
@@ -700,14 +711,14 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
     @staticmethod
-    def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> OptionsFlow:
+    def async_get_options_flow(config_entry: EnergyPlannerConfigEntry) -> OptionsFlow:
         """Return options flow."""
         return OptionsFlow(config_entry)
 
 class OptionsFlow(config_entries.OptionsFlow):
     """Handle central Energy Planner settings."""
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+    def __init__(self, config_entry: EnergyPlannerConfigEntry) -> None:
         """Initialize options flow."""
         self._config_entry = config_entry
         self._data = dict(getattr(config_entry, "data", {}))
@@ -954,7 +965,7 @@ def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[st
 
 def _validate_subentry_config(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: EnergyPlannerConfigEntry,
     user_input: dict[str, Any],
     *,
     subentry_type: str | None = None,
@@ -987,7 +998,7 @@ def _validate_subentry_config(
 
 def _duplicate_household_actuator_errors(
     hass: HomeAssistant,
-    current_entry: ConfigEntry,
+    current_entry: EnergyPlannerConfigEntry,
     user_input: dict[str, Any],
     *,
     subentry_type: str | None = None,
@@ -1014,9 +1025,10 @@ def _duplicate_household_actuator_errors(
     if not callable(async_entries):
         return errors
     current_entry_id = str(getattr(current_entry, "entry_id", ""))
-    current_subentry_keys = _SUBENTRY_ACTUATOR_KEYS.get(
-        subentry_type,
-        frozenset(key for key in _ACTUATOR_KEYS if key in user_input),
+    current_subentry_keys = (
+        _SUBENTRY_ACTUATOR_KEYS.get(subentry_type, frozenset())
+        if subentry_type is not None
+        else frozenset(key for key in _ACTUATOR_KEYS if key in user_input)
     )
     for other_entry in async_entries(DOMAIN):
         is_current_entry = other_entry is current_entry or (

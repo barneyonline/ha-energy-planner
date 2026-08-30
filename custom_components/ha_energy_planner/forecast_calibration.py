@@ -55,10 +55,11 @@ def apply_forecast_calibration(
         if not isinstance(bucket, Mapping) or not calibration_enabled:
             adjusted.append(number)
             continue
-        factor_key = {
-            "lower": "lower_factor",
-            "upper": "upper_factor",
-        }.get(uncertainty_mode, "factor")
+        factor_key = "factor"
+        if uncertainty_mode == "lower":
+            factor_key = "lower_factor"
+        elif uncertainty_mode == "upper":
+            factor_key = "upper_factor"
         try:
             factor_value = float(bucket.get(factor_key, bucket.get("factor", 1.0)))
         except (TypeError, ValueError):

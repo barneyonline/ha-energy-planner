@@ -776,7 +776,7 @@ class DryRunPlanner:
                     active_until=period_end,
                     comfort_boundary=coast_target,
                 )
-            common = {
+            common: dict[str, Any] = {
                 "period_start": period_start,
                 "period_end": period_end,
                 "precondition_end": precondition_end,
@@ -925,9 +925,11 @@ class DryRunPlanner:
         """Return the earliest thermally feasible relative-price period."""
         if len(context.slots) < 2:
             return None
-        low = float(context.occupied_temperature_low_c)
-        high = float(context.occupied_temperature_high_c)
-        current = float(context.current_hvac_temperature_c)
+        low = context.occupied_temperature_low_c
+        high = context.occupied_temperature_high_c
+        current = context.current_hvac_temperature_c
+        if low is None or high is None or current is None:
+            return None
         interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         lead_minutes = int(self.options[CONF_HVAC_PRECONDITION_LEAD_MINUTES])
         if lead_minutes <= 0:
@@ -946,7 +948,7 @@ class DryRunPlanner:
                 continue
             window_start = max(0, index - lead_slots)
             priced_window = [
-                (position, float(context.slots[position].import_price))
+                (position, _known_float(context.slots[position].import_price))
                 for position in range(window_start, index)
                 if context.slots[position].import_price is not None
             ]
@@ -961,7 +963,7 @@ class DryRunPlanner:
             while (
                 end_index < len(context.slots)
                 and context.slots[end_index].import_price is not None
-                and float(context.slots[end_index].import_price) >= baseline + suppression_delta
+                and _known_float(context.slots[end_index].import_price) >= baseline + suppression_delta
             ):
                 end_index += 1
             mode = _future_hvac_mode(context, slot, current, low, high)
@@ -1008,7 +1010,7 @@ class DryRunPlanner:
                 run = context.slots[possible_start : possible_start + required_slots]
                 if any(item.import_price is None for item in run):
                     continue
-                run_baseline = min(float(item.import_price) for item in run)
+                run_baseline = min(_known_float(item.import_price) for item in run)
                 if float(slot.import_price) < run_baseline + start_delta:
                     continue
                 completion = possible_start + required_slots
@@ -1023,8 +1025,12 @@ class DryRunPlanner:
                     )
                     if available_coast is None or available_coast < coast_hours:
                         continue
-                cost = sum(float(item.import_price) for item in run)
-                if best_cost is None or cost < best_cost or (cost == best_cost and possible_start > best_start):
+                cost = sum(_known_float(item.import_price) for item in run)
+                if (
+                    best_cost is None
+                    or cost < best_cost
+                    or (cost == best_cost and (best_start is None or possible_start > best_start))
+                ):
                     best_cost = cost
                     best_start = possible_start
                     best_required_slots = required_slots
@@ -1033,7 +1039,7 @@ class DryRunPlanner:
                     while (
                         best_end_index < len(context.slots)
                         and context.slots[best_end_index].import_price is not None
-                        and float(context.slots[best_end_index].import_price)
+                        and _known_float(context.slots[best_end_index].import_price)
                         >= run_baseline + suppression_delta
                     ):
                         best_end_index += 1
@@ -1064,14 +1070,14 @@ class DryRunPlanner:
                     run = context.slots[possible_start:index]
                     if not run or any(item.import_price is None for item in run):
                         continue
-                    tail_baseline = min(float(item.import_price) for item in run)
+                    tail_baseline = min(_known_float(item.import_price) for item in run)
                     if float(slot.import_price) < tail_baseline + start_delta:
                         continue
                     tail_end_index = index + 1
                     while (
                         tail_end_index < len(context.slots)
                         and context.slots[tail_end_index].import_price is not None
-                        and float(context.slots[tail_end_index].import_price)
+                        and _known_float(context.slots[tail_end_index].import_price)
                         >= tail_baseline + suppression_delta
                     ):
                         tail_end_index += 1
@@ -1228,12 +1234,15 @@ class DryRunPlanner:
                     projected_load,
                 )
             return
+        starting_temperature = context.current_hvac_temperature_c
+        if starting_temperature is None:
+            return
         self._project_hvac_coast_slots(
             context,
             mode=mode,
             coast_started_at=context.created_at,
             active_until=active_until,
-            starting_temperature=float(context.current_hvac_temperature_c),
+            starting_temperature=starting_temperature,
             comfort_boundary=comfort_boundary,
         )
 
@@ -1915,6 +1924,12 @@ def _finite_number(value: Any) -> float | None:
     return number if isfinite(number) else None
 
 
+def _known_float(value: float | None) -> float:
+    """Return a float after the caller has established it is present."""
+    assert value is not None
+    return float(value)
+
+
 def _persisted_hvac_period_qualifies(
     context: DecisionContext,
     period_start: datetime,
@@ -2070,7 +2085,7 @@ def _device_plan(
 
 def _climate_plan_summary(context: DecisionContext, actions: list[PlanAction]) -> dict[str, Any]:
     """Return current and next planned climate state summaries."""
-    current = {
+    current: dict[str, Any] = {
         "state": context.current_hvac_mode or "unknown",
         "hvac_mode": context.current_hvac_mode,
         "current_temperature": context.current_hvac_temperature_c,
@@ -2334,17 +2349,17 @@ def _climate_timeline_entry(slot: Any, slot_actions: list[PlanAction], actions: 
         return entry
     if projected_load is not None and projected_load > 0:
         related_action = actions[0] if actions else None
-        entry = {
+        projected_entry: dict[str, Any] = {
             "state": "preconditioning",
             "projected_hvac_load_kw": round(projected_load, 4),
         }
         if related_action is not None:
-            entry["reason_codes"] = related_action.reason_codes[:4]
+            projected_entry["reason_codes"] = related_action.reason_codes[:4]
             if related_action.desired_state.get("hvac_mode"):
-                entry["hvac_mode"] = related_action.desired_state.get("hvac_mode")
+                projected_entry["hvac_mode"] = related_action.desired_state.get("hvac_mode")
             if related_action.desired_state.get("target_temperature") is not None:
-                entry["target_temperature"] = related_action.desired_state.get("target_temperature")
-        return entry
+                projected_entry["target_temperature"] = related_action.desired_state.get("target_temperature")
+        return projected_entry
     return {"state": "idle"}
 
 
@@ -2364,7 +2379,7 @@ def _enphase_timeline_entry(slot: Any, slot_actions: list[PlanAction], actions: 
             entry["arbitrage_value"] = action.desired_state.get("arbitrage_value")
         return entry
 
-    entry: dict[str, Any] = {"state": "idle"}
+    entry = {"state": "idle"}
     if planned_profile:
         entry["profile"] = planned_profile
     return entry

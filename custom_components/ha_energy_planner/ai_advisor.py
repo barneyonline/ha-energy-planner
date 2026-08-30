@@ -534,10 +534,13 @@ def _extract_response_text(response: Mapping[str, Any]) -> str | None:
     speech = response.get("speech")
     if isinstance(speech, Mapping):
         plain = speech.get("plain")
-        if isinstance(plain, Mapping) and isinstance(plain.get("speech"), str):
-            return plain["speech"]
-        if isinstance(speech.get("speech"), str):
-            return speech["speech"]
+        if isinstance(plain, Mapping):
+            plain_speech = plain.get("speech")
+            if isinstance(plain_speech, str):
+                return plain_speech
+        direct_speech = speech.get("speech")
+        if isinstance(direct_speech, str):
+            return direct_speech
 
     nested_response = response.get("response")
     if isinstance(nested_response, Mapping):

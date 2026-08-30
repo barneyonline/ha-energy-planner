@@ -784,7 +784,7 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
         def async_start_listeners(self) -> None:
             pass
 
-        def async_shutdown(self) -> None:
+        async def async_shutdown(self) -> None:
             pass
 
         async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> None:

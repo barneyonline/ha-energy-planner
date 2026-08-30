@@ -16,6 +16,12 @@ show_missing = true
 skip_covered = true
 fail_under = 100
 
+[tool.mypy]
+strict = true
+python_version = "3.14"
+incremental = false
+files = ["custom_components/ha_energy_planner"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py314"

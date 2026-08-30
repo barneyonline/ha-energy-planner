@@ -142,8 +142,11 @@ def _valid_ev_charging_slots(action: PlanAction) -> list[tuple[datetime, float, 
         if not isinstance(item, dict) or not item.get("valid_at"):
             continue
         start = dt_util.parse_datetime(str(item["valid_at"]))
+        charge_kw_value = item.get("charge_kw")
+        if not isinstance(charge_kw_value, str | int | float):
+            continue
         try:
-            charge_kw = float(item.get("charge_kw"))
+            charge_kw = float(charge_kw_value)
         except (TypeError, ValueError):
             continue
         if start is None or start.tzinfo is None or not isfinite(charge_kw) or charge_kw <= 0:
@@ -333,6 +336,7 @@ def _calendar_value_text(value: Any) -> str:
 
 def _calendar_datetime(value: Any) -> datetime | None:
     """Parse one timezone-aware calendar timestamp."""
+    parsed: datetime | None
     if isinstance(value, datetime):
         parsed = value
     elif isinstance(value, str):
