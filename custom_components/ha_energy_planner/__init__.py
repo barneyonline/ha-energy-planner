@@ -367,12 +367,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
         if callable(cancel_auto_recovery):
             await cancel_auto_recovery("setup_entry_failed")
-        coordinator.async_shutdown()
+        await coordinator.async_shutdown()
         await coordinator.async_wait_for_plan_execution()
         await coordinator.async_wait_for_refresh_shutdown()
         await coordinator.async_disarm_production_control("setup_entry_failed")
         await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
-        entry.runtime_data = None
+        object.__delattr__(entry, "runtime_data")
         raise
     return True
 
@@ -411,7 +411,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
             )
         else:
             await cancel_auto_recovery("entry_unload")
-    coordinator.async_shutdown()
+    # The base coordinator shutdown is irreversible. Home Assistant invokes
+    # the registered async_shutdown callback only after this unload succeeds.
+    coordinator._begin_shutdown()
     await coordinator.async_wait_for_plan_execution()
     await coordinator.async_wait_for_refresh_shutdown()
     unload_completed = False
@@ -419,7 +421,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
         if preserve_automatic_state:
             unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
             if unload_ok:
-                entry.runtime_data = None
+                object.__delattr__(entry, "runtime_data")
                 unload_completed = True
             elif configuration_reload_handoff:
                 coordinator._configuration_reload_handoff = False
@@ -442,7 +444,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
             return False
         unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
         if unload_ok:
-            entry.runtime_data = None
+            object.__delattr__(entry, "runtime_data")
             unload_completed = True
         else:
             await coordinator.async_disarm_production_control("entry_platform_unload_failed")

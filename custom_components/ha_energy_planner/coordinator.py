@@ -113,6 +113,7 @@ _LOGGER = logging.getLogger(__name__)
 
 _AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 
+
 STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
 STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
@@ -355,6 +356,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_decision_context: DecisionContext | None = None
         self._tearing_down = False
         self._force_next_refresh = False
+        self._manual_override_helper_guard: tuple[str, datetime] | None = None
         self._weather_forecast_cache: dict[str, Any] = {}
         self.weather_forecast_diagnostics: dict[str, Any] = {}
         self._load_forecast_training_attempted = False
@@ -661,7 +663,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # but before this state-change listener is registered.
         _retry_if_available(self.hass.states.get(load_entity))
 
-    def async_shutdown(self) -> None:
+    def _begin_shutdown(self) -> None:
         """Stop new coordinator work while preserving an in-flight command."""
         # A refresh task may already be queued even after its timer/listener is
         # cancelled. Suppress its eventual commit until setup is resumed.
@@ -696,6 +698,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.executor.notification_grace_until = None
         while self._unsub_listeners:
             self._unsub_listeners.pop()()
+
+    async def async_shutdown(self) -> None:
+        """Stop integration work and release coordinator resources."""
+        self._begin_shutdown()
+        await super().async_shutdown()
 
     async def async_wait_for_plan_execution(self) -> None:
         """Wait for the current device transaction without cancelling it."""
@@ -856,6 +863,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         ):
             self._increment_refresh_counter("fingerprint_skipped")
             self._last_phase_durations = {"fingerprint_ms": round((perf_counter() - preparation_started) * 1000, 3)}
+            assert self.data is not None
             return self.data
         self.executor.entry_data = entry_data
         discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
@@ -1588,8 +1596,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.async_request_replan()
             if automatic_lifecycle_was_active and self.automatic_control_requested:
                 if device_control_only_change:
-                    production = parse_production_state(self.store.data.get("production")).raw
-                    production.update(
+                    production_update: dict[str, object] = dict(
+                        parse_production_state(self.store.data.get("production")).raw
+                    )
+                    production_update.update(
                         {
                             "dry_run_evidence_fingerprint": production_evidence_fingerprint(
                                 self.entry_data,
@@ -1598,7 +1608,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                             "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
                         }
                     )
-                    await self._async_save_production(production)
+                    await self._async_save_production(production_update)
                 self._startup_auto_recovery_authorized = True
                 await self._async_update_startup_auto_recovery(
                     "waiting_for_home_assistant",
@@ -2370,7 +2380,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         cache = getattr(self, "_weather_forecast_cache", {})
         cached_entity = str(cache.get("entity_id") or "")
         cached_at = _parse_datetime_or_none(cache.get("fetched_at"))
-        cached_forecast = cache.get("forecast")
+        cached_forecast_value = cache.get("forecast")
+        cached_forecast = (
+            [dict(item) for item in cached_forecast_value if isinstance(item, dict)]
+            if isinstance(cached_forecast_value, list)
+            else []
+        )
         cache_age_seconds = (
             max((dt_util.as_utc(now) - dt_util.as_utc(cached_at)).total_seconds(), 0.0)
             if cached_at is not None
@@ -2384,11 +2399,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         refresh_after_seconds = min(planning_minutes, 15, freshness_minutes) * 60
         cache_matches = (
             cached_entity == entity_id
-            and isinstance(cached_forecast, list)
             and bool(cached_forecast)
             and cache_age_seconds is not None
         )
-        if not force and cache_matches and cache_age_seconds < refresh_after_seconds:
+        if (
+            not force
+            and cache_matches
+            and cache_age_seconds is not None
+            and cache_age_seconds < refresh_after_seconds
+        ):
             return result(
                 {"forecast": list(cached_forecast)},
                 _weather_forecast_details(
@@ -2439,7 +2458,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             _LOGGER.debug("Hourly weather forecast fetch failed: %s", failure_reason)
 
         freshness_seconds = freshness_minutes * 60
-        if cache_matches and cache_age_seconds <= freshness_seconds:
+        if (
+            cache_matches
+            and cache_age_seconds is not None
+            and cache_age_seconds <= freshness_seconds
+        ):
             return result(
                 {"forecast": list(cached_forecast)},
                 _weather_forecast_details(
@@ -2871,7 +2894,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if last_requested is None:
             return 0.0
         elapsed = monotonic() - last_requested
-        return max(float(MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS) - elapsed, 0.0)
+        return float(max(float(MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS) - elapsed, 0.0))
 
     def _increment_refresh_counter(self, key: str) -> None:
         """Increment in-memory refresh telemetry with test-object compatibility."""
@@ -3147,8 +3170,10 @@ def _ai_recommendation_fingerprint(recommendation: Any) -> str | None:
     if isinstance(fingerprint, str) and fingerprint:
         return fingerprint
     detail = recommendation.get("rejected_detail")
-    if isinstance(detail, dict) and isinstance(detail.get("plan_fingerprint"), str):
-        return detail["plan_fingerprint"]
+    if isinstance(detail, dict):
+        detail_fingerprint = detail.get("plan_fingerprint")
+        if isinstance(detail_fingerprint, str):
+            return detail_fingerprint
     return None
 
 
@@ -3779,6 +3804,10 @@ def _matches_hvac_command_feedback(
         if desired_temperature is None:
             return matched_command_change
         observed_temperature = attributes.get("temperature")
+        if not isinstance(observed_temperature, str | int | float) or not isinstance(
+            desired_temperature, str | int | float
+        ):
+            return False
         try:
             if float(observed_temperature) != float(desired_temperature):
                 return False
@@ -3800,6 +3829,10 @@ def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:
         return True
     if old_value == new_value:
         return False
+    if not isinstance(old_value, str | int | float) or not isinstance(
+        new_value, str | int | float
+    ):
+        return True
     try:
         old_number = float(old_value)
         new_number = float(new_value)

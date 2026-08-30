@@ -2,6 +2,11 @@
 
 Status as of 2026-08-30.
 
+The integration self-assesses at Platinum against the current Home Assistant
+quality-scale catalog. All 40 integration modules pass strict mypy against the
+pinned Home Assistant type surface, including typed `ConfigEntry.runtime_data`
+use throughout; the Docker and pull-request gates enforce that result.
+
 ## Covered
 
 - Custom integration scaffold, config flow, options flow, entities, services,

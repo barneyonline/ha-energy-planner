@@ -23,7 +23,7 @@ def test_manifest_classifies_multi_entry_calculated_service() -> None:
     assert manifest["integration_type"] == "service"
     assert manifest["iot_class"] == "calculated"
     assert manifest["single_config_entry"] is False
-    assert manifest["quality_scale"] == "gold"
+    assert manifest["quality_scale"] == "platinum"
 
 
 def test_release_metadata_versions_match() -> None:

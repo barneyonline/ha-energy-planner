@@ -190,8 +190,11 @@ def forecast_coverage_details(
 def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
     """Return a valid explicitly declared forecast cadence in minutes."""
     for key in ("forecast_interval_minutes", "interval_minutes", "resolution_minutes"):
+        raw_value = attributes.get(key)
+        if raw_value is None:
+            continue
         try:
-            value = float(attributes.get(key))
+            value = float(raw_value)
         except (TypeError, ValueError):
             continue
         if isfinite(value) and value > 0:
@@ -410,12 +413,17 @@ def _energy_items_as_average_power(
     timestamps = [valid_at for _item, _flattened, valid_at in prepared if valid_at is not None]
     inferred_hours = _infer_bucket_hours(timestamps)
     converted: list[Any] = []
-    for item, flattened, valid_at in prepared:
-        if flattened is None:
+    for item, prepared_flattened, valid_at in prepared:
+        if prepared_flattened is None:
             converted.append(item)
             continue
-        value_key = next((key for key in value_keys if key in flattened), None)
-        unit = str(flattened.get("unit", flattened.get("units", flattened.get("unit_of_measurement", default_unit))))
+        value_key = next((key for key in value_keys if key in prepared_flattened), None)
+        unit = str(
+            prepared_flattened.get(
+                "unit",
+                prepared_flattened.get("units", prepared_flattened.get("unit_of_measurement", default_unit)),
+            )
+        )
         if value_key is None or _normalize_unit(unit) not in _ENERGY_UNITS:
             converted.append(item)
             continue
@@ -424,7 +432,7 @@ def _energy_items_as_average_power(
             converted.append(item)
             continue
         try:
-            energy = float(flattened[value_key])
+            energy = float(prepared_flattened[value_key])
         except (TypeError, ValueError):
             converted.append(item)
             continue

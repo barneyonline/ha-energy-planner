@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import voluptuous as vol
 
+import custom_components.ha_energy_planner.config_flow as config_flow_module
 from custom_components.ha_energy_planner.config_flow import (
     INPUT_STEP_AI,
     INPUT_STEP_CLIMATE,
@@ -110,6 +112,21 @@ from custom_components.ha_energy_planner.subentry_migration import (
 )
 
 CONF_BASELINE_LOAD_FORECAST = CONF_HOUSEHOLD_LOAD
+
+
+def test_newer_selector_filter_type_is_not_a_runtime_dependency() -> None:
+    """Keep the config flow importable on the minimum supported HA release."""
+    module_path = Path(config_flow_module.__file__)
+    module = ast.parse(module_path.read_text(encoding="utf-8"))
+    runtime_selector_imports = {
+        alias.name
+        for node in module.body
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "homeassistant.helpers.selector"
+        for alias in node.names
+    }
+
+    assert "EntityWithDeviceFilterSelectorConfig" not in runtime_selector_imports
 
 
 @dataclass(slots=True)

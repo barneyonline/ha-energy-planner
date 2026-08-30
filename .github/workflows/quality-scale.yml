@@ -15,6 +15,7 @@ on:
       - "hacs.json"
       - "quality_scale.yaml"
       - "scripts/validate_quality_scale.py"
+      - "scripts/docker-mypy.sh"
       - "scripts/docker-validate.sh"
       - "pyproject.toml"
       - ".github/workflows/quality-scale.yml"
@@ -30,6 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Run strict type checking
+        run: scripts/docker-mypy.sh
       - name: Validate quality scale evidence in Home Assistant Docker
         run: >
           docker run --rm

@@ -10,6 +10,7 @@ from homeassistant.core import HomeAssistant, callback
 from .const import DOMAIN
 from .entry_data import combined_entry_data
 from .models import InputHealth
+from .type_defs import EnergyPlannerConfigEntry
 
 _INPUT_SECTION_PREFIXES = (
     ("amber_", "pv_", "baseline_load_", "battery_soc_", "carbon_intensity_"),
@@ -84,7 +85,7 @@ async def system_health_info(hass: HomeAssistant) -> dict[str, Any]:
     return info
 
 
-def _entry_health_summary(entry: Any) -> dict[str, Any]:
+def _entry_health_summary(entry: EnergyPlannerConfigEntry) -> dict[str, Any]:
     """Return deterministic non-sensitive health for one loaded planner entry."""
     coordinator = entry.runtime_data
     plan = coordinator.data

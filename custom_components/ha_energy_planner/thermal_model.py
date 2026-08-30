@@ -62,14 +62,12 @@ def update_thermal_model(
         and previous_mode
         and current_mode
     )
-    transitioned = bool(
-        telemetry_complete
-        and (
-            previous_mode != current_mode
-            or (previous_power >= ACTIVE_POWER_THRESHOLD_KW)
+    transitioned = False
+    if telemetry_complete and previous_power is not None and current_power is not None:
+        transitioned = previous_mode != current_mode or (
+            (previous_power >= ACTIVE_POWER_THRESHOLD_KW)
             != (current_power >= ACTIVE_POWER_THRESHOLD_KW)
         )
-    )
     if hours < MIN_SAMPLE_INTERVAL_MINUTES / 60:
         if transitioned:
             updated["last_sample"] = current

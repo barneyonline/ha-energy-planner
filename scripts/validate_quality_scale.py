@@ -18,9 +18,71 @@ except Exception:  # pragma: no cover
     raise
 
 DOMAIN = "ha_energy_planner"
-EXPECTED_QUALITY_SCALE = "gold"
+EXPECTED_QUALITY_SCALE = "platinum"
 QUALITY_LEVEL_ORDER = ("bronze", "silver", "gold", "platinum")
-NA_ALLOWED_RULES = {
+QUALITY_RULES_BY_LEVEL = {
+    "bronze": (
+        "action-setup",
+        "appropriate-polling",
+        "brands",
+        "common-modules",
+        "config-flow-test-coverage",
+        "config-flow",
+        "dependency-transparency",
+        "docs-actions",
+        "docs-conditions",
+        "docs-high-level-description",
+        "docs-installation-instructions",
+        "docs-removal-instructions",
+        "docs-triggers",
+        "entity-event-setup",
+        "entity-unique-id",
+        "has-entity-name",
+        "runtime-data",
+        "test-before-configure",
+        "test-before-setup",
+        "unique-config-entry",
+    ),
+    "silver": (
+        "action-exceptions",
+        "config-entry-unloading",
+        "docs-configuration-parameters",
+        "docs-installation-parameters",
+        "entity-unavailable",
+        "integration-owner",
+        "log-when-unavailable",
+        "parallel-updates",
+        "reauthentication-flow",
+        "test-coverage",
+    ),
+    "gold": (
+        "devices",
+        "diagnostics",
+        "discovery-update-info",
+        "discovery",
+        "docs-data-update",
+        "docs-examples",
+        "docs-known-limitations",
+        "docs-supported-devices",
+        "docs-supported-functions",
+        "docs-troubleshooting",
+        "docs-use-cases",
+        "dynamic-devices",
+        "entity-category",
+        "entity-device-class",
+        "entity-disabled-by-default",
+        "entity-translations",
+        "exception-translations",
+        "icon-translations",
+        "reconfiguration-flow",
+        "repair-issues",
+        "stale-devices",
+    ),
+    "platinum": ("async-dependency", "inject-websession", "strict-typing"),
+}
+EXEMPT_ALLOWED_RULES = {
+    "docs-conditions",
+    "docs-triggers",
     "discovery",
     "discovery-update-info",
     "dynamic-devices",
@@ -36,7 +98,7 @@ NA_ALLOWED_RULES = {
     "repair-issues",
     "stale-devices",
 }
-VALID_STATUSES = {"done", "n/a", "todo"}
+VALID_STATUSES = {"done", "exempt", "todo"}
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -102,10 +164,25 @@ def _strict_typing_gate_is_configured(root: Path) -> bool:
     try:
         pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
         validation_script = (root / "scripts" / "docker-validate.sh").read_text(encoding="utf-8")
+        mypy_script_path = root / "scripts" / "docker-mypy.sh"
+        mypy_script = mypy_script_path.read_text(encoding="utf-8")
+        quality_workflow = (root / ".github" / "workflows" / "quality-scale.yml").read_text(encoding="utf-8")
     except (OSError, tomllib.TOMLDecodeError):
         return False
     mypy = pyproject.get("tool", {}).get("mypy", {})
-    return mypy.get("strict") is True and "mypy" in validation_script
+    return bool(
+        mypy.get("strict") is True
+        and mypy.get("files") == ["custom_components/ha_energy_planner"]
+        and not mypy.get("exclude")
+        and not mypy.get("disable_error_code")
+        and not mypy.get("overrides")
+        and mypy_script_path.stat().st_mode & 0o111
+        and "ghcr.io/home-assistant/home-assistant:2026.8.2" in mypy_script
+        and '"mypy==1.19.1"' in mypy_script
+        and "python3 -m mypy" in mypy_script
+        and "run scripts/docker-mypy.sh" in validation_script
+        and "run: scripts/docker-mypy.sh" in quality_workflow
+    )
 
 
 def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
@@ -122,10 +199,29 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     rules = quality.get("rules") or {}
     if claimed != EXPECTED_QUALITY_SCALE:
         messages.append(f"ERROR: Manifest must claim quality_scale {EXPECTED_QUALITY_SCALE!r}; got {claimed!r}")
-    required_rules: list[str] = []
-    for level in _required_levels_for_claim(claimed):
+    catalog_errors = []
+    for level in QUALITY_LEVEL_ORDER:
         level_entry = levels.get(level) or {}
-        required_rules.extend(str(rule) for rule in level_entry.get("required") or [])
+        actual = tuple(str(rule) for rule in level_entry.get("required") or [])
+        expected = QUALITY_RULES_BY_LEVEL[level]
+        if actual != expected:
+            catalog_errors.append(level)
+    if catalog_errors:
+        messages.append(
+            "ERROR: Quality scale catalog differs from the pinned Home Assistant rules: "
+            + ", ".join(catalog_errors)
+        )
+
+    canonical_rules = {rule for level in QUALITY_LEVEL_ORDER for rule in QUALITY_RULES_BY_LEVEL[level]}
+    unknown_rules = sorted(set(rules) - canonical_rules)
+    if unknown_rules:
+        messages.append("ERROR: Unknown quality scale rule evidence: " + ", ".join(unknown_rules))
+
+    required_rules = [
+        rule
+        for level in _required_levels_for_claim(claimed)
+        for rule in QUALITY_RULES_BY_LEVEL[level]
+    ]
 
     missing_rules = [rule for rule in required_rules if rule not in rules]
     if missing_rules:
@@ -145,11 +241,11 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
         if status not in VALID_STATUSES:
             unknown_status_rules.append(str(rule))
 
-        if rule in required_rules and status not in {"done", "n/a"}:
+        if rule in required_rules and status not in {"done", "exempt"}:
             incomplete_rules.append(rule)
             continue
-        if status == "n/a":
-            if rule not in NA_ALLOWED_RULES:
+        if status == "exempt":
+            if rule not in EXEMPT_ALLOWED_RULES:
                 bad_na_rules.append(rule)
             if not isinstance(entry, dict) or not str(entry.get("comment") or "").strip():
                 missing_na_comments.append(rule)
@@ -161,11 +257,11 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     if unknown_status_rules:
         messages.append("ERROR: Rules have an unsupported status: " + ", ".join(unknown_status_rules))
     if incomplete_rules:
-        messages.append(f"ERROR: Rules not marked done or n/a: {', '.join(incomplete_rules)}")
+        messages.append(f"ERROR: Rules not marked done or exempt: {', '.join(incomplete_rules)}")
     if bad_na_rules:
-        messages.append("ERROR: Rules marked n/a without an allowlist exception: " + ", ".join(bad_na_rules))
+        messages.append("ERROR: Rules marked exempt without an allowlist exception: " + ", ".join(bad_na_rules))
     if missing_na_comments:
-        messages.append("ERROR: n/a rules missing explanatory comments: " + ", ".join(missing_na_comments))
+        messages.append("ERROR: exempt rules missing explanatory comments: " + ", ".join(missing_na_comments))
     if broken_references:
         messages.append("ERROR: Broken quality scale references: " + ", ".join(broken_references))
     if generated_artifacts:
