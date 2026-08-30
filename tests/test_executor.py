@@ -2393,6 +2393,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
             self.persist_zone_supersession: Any = None
             self.persist_supersessions: Any = None
             self.set_turn_on_feedback: Any = None
+            self.set_coupled_zone_feedback: Any = None
             self.set_pending_main_restore: Any = None
             self.set_pending_zone_restore: Any = None
 
@@ -2416,6 +2417,9 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
 
         def set_turn_on_feedback_callback(self, callback: Any) -> None:
             self.set_turn_on_feedback = callback
+
+        def set_coupled_zone_feedback_callback(self, callback: Any) -> None:
+            self.set_coupled_zone_feedback = callback
 
         def set_pending_main_restore_callback(self, callback: Any) -> None:
             self.set_pending_main_restore = callback
@@ -2443,6 +2447,19 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
                 "turn_on_feedback_expected"
             ] is True
             self.set_turn_on_feedback(False)
+            self.set_coupled_zone_feedback(
+                "switch.zone",
+                "on",
+                "planner-context",
+            )
+            assert executor.pending_hvac_desired_state[
+                "coupled_zone_feedback_expected"
+            ] == {
+                "actuator_entity_id": "switch.zone",
+                "context_id": "planner-context",
+                "state": "on",
+            }
+            self.set_coupled_zone_feedback(None, None, None)
             self.set_pending_main_restore(
                 {"hvac_mode": "off", "target_temperature": 20}
             )

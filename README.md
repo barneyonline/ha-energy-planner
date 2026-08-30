@@ -191,11 +191,16 @@ override even while the scheduler guard is active. An acquisition rollback,
 release, or safe-state recovery then stops restoring the main thermostat,
 leaves the user's main state untouched, and restores only subordinate zones
 and automations before release completes. Pending zone-climate feedback must
-likewise match the exact planner or rollback target. A different user zone
-target is durably removed from ownership before rollback continues, remains
-untouched during the current transaction and later recovery, and does not stop
-the main thermostat, other zones, or automations from returning to their
-captured states.
+likewise match the exact planner or rollback target. When a configured zone
+switch/helper and climate entity are coupled by the device integration, only
+the corresponding climate off/on transition during that actuator's bounded
+service-call phase and carrying its Home Assistant service context is treated
+as planner feedback. A context-free sibling refresh is accepted only for an
+unambiguous actuator/climate entity-ID pair; changing another zone, its target,
+or any other climate control remains manual. A different user zone target is durably
+removed from ownership before rollback continues, remains untouched during the
+current transaction and later recovery, and does not stop the main thermostat,
+other zones, or automations from returning to their captured states.
 
 Enphase planning can select configured self-consumption, backup, or AI profiles using local tariff, PV, household-load, battery, and policy evidence.
 

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from homeassistant.core import Context
 
 from custom_components.ha_energy_planner import hvac_adapter as hvac_adapter_module
 from custom_components.ha_energy_planner.const import (
@@ -16,6 +18,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
+)
+from custom_components.ha_energy_planner.coordinator import (
+    _is_planner_owned_control_feedback,
+    _pending_zone_hvac_manual_change_entity_id,
 )
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
 from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, PlanAction
@@ -50,11 +56,20 @@ class FakeServices:
     def __init__(self, states: FakeStates) -> None:
         self.states = states
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.contexts: list[Any] = []
         self.fail_services: set[tuple[str, str]] = set()
         self.noop_entities: set[str] = set()
 
-    async def async_call(self, domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+    async def async_call(
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+        context: Any = None,
+    ) -> None:
         self.calls.append((domain, service, data))
+        self.contexts.append(context)
         if (domain, service) in self.fail_services:
             raise RuntimeError("service failed")
         entity_id = data["entity_id"]
@@ -1505,7 +1520,13 @@ def test_hvac_takeover_turns_on_climate_and_zones_then_release_restores_zones() 
         },
     )
     turn_on_feedback_phases: list[bool] = []
+    coupled_zone_feedback_phases: list[tuple[str | None, str | None, str | None]] = []
     adapter.set_turn_on_feedback_callback(turn_on_feedback_phases.append)
+    adapter.set_coupled_zone_feedback_callback(
+        lambda entity_id, state, context_id: coupled_zone_feedback_phases.append(
+            (entity_id, state, context_id)
+        )
+    )
 
     acquired = asyncio.run(
         adapter.async_execute(
@@ -1522,6 +1543,21 @@ def test_hvac_takeover_turns_on_climate_and_zones_then_release_restores_zones() 
 
     assert acquired.saved_zone_states == {"switch.living": "off", "input_boolean.study": "on"}
     assert turn_on_feedback_phases == [True, False]
+    assert coupled_zone_feedback_phases[0][:2] == ("switch.living", "on")
+    assert coupled_zone_feedback_phases[0][2]
+    assert coupled_zone_feedback_phases[1] == (None, None, None)
+    assert coupled_zone_feedback_phases[2][:2] == ("switch.living", "off")
+    assert coupled_zone_feedback_phases[2][2]
+    assert coupled_zone_feedback_phases[3] == (None, None, None)
+    zone_service_contexts = [
+        context
+        for call, context in zip(hass.services.calls, hass.services.contexts, strict=True)
+        if call[2].get("entity_id") == "switch.living"
+    ]
+    assert [context.id for context in zone_service_contexts] == [
+        coupled_zone_feedback_phases[0][2],
+        coupled_zone_feedback_phases[2][2],
+    ]
     assert hass.services.calls[:5] == [
         ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
         ("switch", "turn_on", {"entity_id": "switch.living"}),
@@ -1641,6 +1677,133 @@ def test_hvac_disabled_zone_synchronization_leaves_climate_targets_unchanged() -
         ("switch", "turn_on", {"entity_id": "switch.living"}),
         ("climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 23}),
     ]
+
+
+def test_coupled_zone_feedback_is_context_scoped_during_takeover_and_release() -> None:
+    entry_data = {
+        CONF_DAIKIN_CLIMATE: "climate.daikin",
+        CONF_CLIMATE_ZONES: ["switch.living", "climate.living_temperature"],
+    }
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 20}),
+            "switch.living": "off",
+            "climate.living_temperature": FakeState(
+                "off",
+                {"temperature": 20},
+            ),
+        }
+    )
+    adapter = DaikinHVACAdapter(hass, entry_data)
+    pending: dict[str, Any] = {
+        "enable_zones": True,
+        "configured_zones_only": True,
+        "target_temperature": 23,
+    }
+    planner_feedback: list[bool] = []
+    pending_conflicts: list[str | None] = []
+    unrelated_feedback: list[bool] = []
+
+    def set_coupled_feedback(
+        actuator_entity_id: str | None,
+        state: str | None,
+        context_id: str | None,
+    ) -> None:
+        pending["coupled_zone_feedback_expected"] = (
+            None
+            if state is None
+            else {
+                "actuator_entity_id": actuator_entity_id,
+                "context_id": context_id,
+                "state": state,
+            }
+        )
+
+    def zone_event(old_mode: str, new_mode: str, context: Context) -> Any:
+        return SimpleNamespace(
+            context=context,
+            data={
+                "entity_id": "climate.living_temperature",
+                "old_state": FakeState(old_mode, {"temperature": 20}),
+                "new_state": FakeState(new_mode, {"temperature": 20}),
+            },
+        )
+
+    original_async_call = hass.services.async_call
+
+    async def publish_coupled_feedback(
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        blocking: bool = False,
+        context: Context | None = None,
+    ) -> None:
+        if data.get("entity_id") == "switch.living":
+            assert context is not None
+            old_mode, new_mode = (
+                ("off", "heat") if service == "turn_on" else ("heat", "off")
+            )
+            event = zone_event(old_mode, new_mode, context)
+            planner_feedback.append(
+                _is_planner_owned_control_feedback(
+                    entry_data,
+                    {"execution_audit": []},
+                    event,
+                    datetime.now(UTC),
+                    pending_hvac_desired_state=pending,
+                )
+            )
+            pending_conflicts.append(
+                _pending_zone_hvac_manual_change_entity_id(
+                    entry_data,
+                    event,
+                    pending,
+                )
+            )
+            unrelated_feedback.append(
+                _is_planner_owned_control_feedback(
+                    entry_data,
+                    {"execution_audit": []},
+                    zone_event(
+                        old_mode,
+                        new_mode,
+                        Context(user_id="manual-user"),
+                    ),
+                    datetime.now(UTC),
+                    pending_hvac_desired_state=pending,
+                )
+            )
+            hass.states.values["climate.living_temperature"] = FakeState(
+                new_mode,
+                {"temperature": 20},
+            )
+        await original_async_call(domain, service, data, blocking, context)
+
+    hass.services.async_call = publish_coupled_feedback
+    adapter.set_coupled_zone_feedback_callback(set_coupled_feedback)
+
+    acquired = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                }
+            )
+        )
+    )
+    pending["restore_zones"] = acquired.saved_zone_states
+    released = asyncio.run(
+        adapter.async_restore({}, acquired.saved_zone_states)
+    )
+
+    assert acquired.applied is True
+    assert released.applied is True
+    assert planner_feedback == [True, True]
+    assert pending_conflicts == [None, None]
+    assert unrelated_feedback == [False, False]
 
 
 def test_hvac_pending_manual_override_stops_before_actuator_commands() -> None:
