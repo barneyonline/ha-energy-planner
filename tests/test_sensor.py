@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.core import CoreState
 
 from custom_components.ha_energy_planner import sensor as sensor_module
 from custom_components.ha_energy_planner.coordinator import _material_plan_fingerprint
@@ -81,13 +82,44 @@ def test_mode_sensor_exposes_operational_control_mode() -> None:
     )
 
     assert description.device_class == SensorDeviceClass.ENUM
-    assert description.options == ["review", "active"]
+    assert description.options == ["review", "recovery", "active"]
     assert description.value_fn(review) == "review"
     assert description.value_fn(active) == "active"
 
     active.effective_control = False
     assert active.active_control is True
     assert description.value_fn(active) == "review"
+
+
+def test_mode_sensor_reports_post_startup_auto_recovery_and_retains_intent() -> None:
+    description = next(item for item in SENSORS if item.key == "mode")
+    coordinator = _coordinator(
+        _plan(),
+        options={"planner_enabled": True, "dry_run": False},
+        store_data={
+            "production": {
+                "armed": False,
+                "startup_auto_recovery": {
+                    "status": "waiting_for_safe",
+                    "successful_runs": 0,
+                },
+            }
+        },
+        hass=SimpleNamespace(state=CoreState.running),
+    )
+
+    assert coordinator.automatic_control_requested is True
+    assert coordinator.active_control is False
+    for status in sensor_module.STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES:
+        coordinator.store.data["production"]["startup_auto_recovery"]["status"] = status
+        assert description.value_fn(coordinator) == "recovery"
+
+    coordinator.hass.state = CoreState.starting
+    assert description.value_fn(coordinator) == "review"
+
+    coordinator.hass.state = CoreState.running
+    coordinator.store.data["production"]["startup_auto_recovery"]["status"] = "recovered"
+    assert description.value_fn(coordinator) == "review"
 
 
 def test_load_forecast_coverage_sensor_exposes_score_threshold_and_bypass() -> None:

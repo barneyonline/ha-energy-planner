@@ -14,6 +14,9 @@
 
 ### 🐛 Bug fixes
 
+- Mode now reports **Recovery** after Home Assistant startup while automatic
+  control is being safely recovered, without turning off the retained Automatic
+  control request.
 - Planner-owned zone switch/helper changes no longer misclassify causally linked
   climate-entity on/off feedback as a manual override, including synchronized
   zone restoration. Feedback is correlated to the actuator service context, so

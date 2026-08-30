@@ -116,7 +116,7 @@ _AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
 STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
-_STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
+STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
     {
         "waiting",
         "waiting_for_home_assistant",
@@ -1101,7 +1101,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return True
 
         interrupted_recovery = bool(
-            isinstance(recovery, dict) and recovery_status in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+            isinstance(recovery, dict) and recovery_status in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
         )
         if interrupted_recovery and isinstance(recovery, dict):
             await self._async_update_startup_auto_recovery(
@@ -1138,7 +1138,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         recovery_active = bool(
             getattr(self, "_startup_auto_recovery_authorized", False)
-            or (isinstance(recovery, dict) and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES)
+            or (isinstance(recovery, dict) and recovery.get("status") in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES)
         )
         self._startup_auto_recovery_authorized = False
         self._startup_auto_recovery_deadline = None
@@ -1517,7 +1517,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     getattr(self, "_startup_auto_recovery_authorized", False)
                     or (
                         isinstance(recovery, dict)
-                        and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+                        and recovery.get("status") in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
                     )
                 )
             )
@@ -1620,7 +1620,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     getattr(self, "_startup_auto_recovery_authorized", False)
                     or (
                         isinstance(recovery, dict)
-                        and recovery.get("status") in _STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
+                        and recovery.get("status") in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES
                     )
                 )
             )

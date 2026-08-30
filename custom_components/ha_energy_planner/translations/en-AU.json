@@ -440,6 +440,7 @@
         "name": "Mode",
         "state": {
           "review": "Review",
+          "recovery": "Recovery",
           "active": "Active"
         }
       }
