@@ -436,6 +436,23 @@
       "load_forecast_coverage_score": {
         "name": "Load forecast coverage score"
       },
+      "decision_summary": {
+        "name": "Decision summary"
+      },
+      "plan_health": {
+        "name": "Plan health",
+        "state": {
+          "healthy": "Healthy",
+          "degraded": "Degraded",
+          "unsafe": "Unsafe"
+        }
+      },
+      "current_load_forecast": {
+        "name": "Current load forecast"
+      },
+      "planning_duration": {
+        "name": "Planning duration"
+      },
       "mode": {
         "name": "Mode",
         "state": {
