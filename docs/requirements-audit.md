@@ -53,7 +53,7 @@ Status as of 2026-08-15.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Ready by and opportunistic-charging policy are configured centrally. The EV
+  Ready by, opportunistic charging, and opt-in lowest-cost daylight charging are configured centrally. The EV
   mapping requires SOC, charging feedback, and the authoritative vehicle target
   SOC entity. Retired number, time, and switch entities, the duplicate
   keep-charger-on switch, the fixed-duration pause buttons, the manual EV
@@ -165,7 +165,11 @@ Status as of 2026-08-15.
   stays within the configured hours. Once charging feedback confirms an active
   continuous session, replanning may retain its current pre-window slot so
   forecast repricing cannot fragment it; the configured maximum import price
-  remains authoritative. Completed Recorder
+  remains authoritative. Daylight preference is evaluated from deterministic sunrise/sunset windows
+  calculated from Home Assistant's configured location. It requires complete
+  effective-cost evidence through sunset; continuous schedules fall back as a
+  whole when daylight capacity is insufficient, while split schedules allocate
+  daylight first and de-duplicate ready-by fallback slots. Completed Recorder
   charging sessions of at least 30 minutes calibrate effective SOC gained per
   kWh from SOC gain, configured charger power, and active duration. At least 60
   minutes and 3% gain are required; the learned rate carries a 10% conservative
@@ -513,9 +517,14 @@ Status as of 2026-08-15.
   mode bypasses the scheduler guard, synchronously aborts acquisition rollback,
   release, or safe-state main restoration, preserves the user's main state, and
   restores subordinate ownership. Pending zone feedback is matched to the exact
-  action or rollback target; a different user target synchronously supersedes
-  and durably removes only that zone's baseline before the remaining rollback
-  actuators run. Await-to-actuator boundaries recheck supersession after main
+  action or rollback target. A configured switch/helper's coupled climate entity
+  may publish only the corresponding off-to-active or active-to-off transition
+  with the actuator call's Home Assistant context while that call and
+  confirmation are explicitly phased. A context-free sibling refresh requires
+  an unambiguous actuator/climate entity-ID pair; unrelated zone, user-context,
+  target, and auxiliary-control changes still supersede the transaction. A different user
+  target synchronously supersedes and durably removes only that zone's baseline
+  before the remaining rollback actuators run. Await-to-actuator boundaries recheck supersession after main
   snapshot persistence, mode confirmation, and automation disable. It preserves
   the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,

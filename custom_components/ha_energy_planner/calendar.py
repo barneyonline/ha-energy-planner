@@ -111,10 +111,14 @@ def _ev_charging_events(
     interval = timedelta(minutes=interval_minutes)
     valid_slots = _valid_ev_charging_slots(action)
     windows: list[dict[str, Any]] = []
-    for start, charge_kw in valid_slots:
+    for start, charge_kw, allocation_source in valid_slots:
         end = start + interval
         energy_kwh = charge_kw * interval_minutes / 60
-        if windows and start == windows[-1]["end"]:
+        if (
+            windows
+            and start == windows[-1]["end"]
+            and allocation_source == windows[-1]["allocation_source"]
+        ):
             windows[-1]["end"] = end
             windows[-1]["energy_kwh"] += energy_kwh
             windows[-1]["charge_rates"].add(charge_kw)
@@ -125,14 +129,15 @@ def _ev_charging_events(
                     "end": end,
                     "energy_kwh": energy_kwh,
                     "charge_rates": {charge_kw},
+                    "allocation_source": allocation_source,
                 }
             )
     return [_ev_charging_event(action, window, index) for index, window in enumerate(windows, start=1)]
 
 
-def _valid_ev_charging_slots(action: PlanAction) -> list[tuple[datetime, float]]:
+def _valid_ev_charging_slots(action: PlanAction) -> list[tuple[datetime, float, str]]:
     """Return finite, timezone-aware charging slots without breaking the calendar."""
-    valid_slots: list[tuple[datetime, float]] = []
+    valid_slots: list[tuple[datetime, float, str]] = []
     for item in action.desired_state.get("allocated_slots", []):
         if not isinstance(item, dict) or not item.get("valid_at"):
             continue
@@ -143,7 +148,8 @@ def _valid_ev_charging_slots(action: PlanAction) -> list[tuple[datetime, float]]
             continue
         if start is None or start.tzinfo is None or not isfinite(charge_kw) or charge_kw <= 0:
             continue
-        valid_slots.append((start, charge_kw))
+        allocation_source = str(item.get("allocation_source") or "ready_by")
+        valid_slots.append((start, charge_kw, allocation_source))
     return sorted(valid_slots, key=lambda item: item[0])
 
 
@@ -177,6 +183,29 @@ def _ev_charging_event(
     ready_by = action.desired_state.get("ready_by")
     if ready_by:
         charging_details.append(f"Ready by: {ready_by}")
+    daylight = action.desired_state.get("daylight_lowest_cost")
+    allocation_source = str(window.get("allocation_source") or "ready_by")
+    if (
+        isinstance(daylight, dict)
+        and daylight.get("selected")
+        and allocation_source == "daylight"
+    ):
+        charging_details.append("Policy: Lowest effective-cost daylight charging")
+        charging_details.append("Allocation: Daylight preference")
+        for key, label in (
+            ("window_start_utc", "Sunrise"),
+            ("window_end_utc", "Sunset"),
+        ):
+            instant = dt_util.parse_datetime(str(daylight.get(key, "")))
+            if instant is not None:
+                charging_details.append(f"{label}: {_local_datetime_text(instant)}")
+    elif (
+        isinstance(daylight, dict)
+        and daylight.get("selected")
+        and allocation_source == "ready_by_fallback"
+    ):
+        charging_details.append("Policy: Ready-by fallback after daylight preference")
+        charging_details.append("Allocation: Ready-by fallback")
     _append_description_section(description_lines, "Charging", charging_details)
     _append_description_section(
         description_lines,

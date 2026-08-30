@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from math import isfinite
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from homeassistant.const import SUN_EVENT_SUNRISE, SUN_EVENT_SUNSET
 from homeassistant.core import HomeAssistant, State
+from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -30,6 +33,7 @@ from .const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
+    CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
@@ -60,7 +64,7 @@ from .forecasts import (
     normalize_scalar_value,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
-from .models import DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
+from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -85,6 +89,36 @@ _OPTIONAL_NUMERIC_KINDS_BY_CONFIG = {
     CONF_PV_OBSERVED: ("power", "power"),
 }
 _POINT_SENSOR_CONFIDENCE = 0.7
+
+
+def _daylight_windows(
+    hass: HomeAssistant,
+    start: datetime,
+    horizon_end: datetime,
+) -> list[DaylightWindow]:
+    """Return sunrise-to-sunset windows intersecting the planning horizon."""
+    try:
+        timezone = ZoneInfo(str(getattr(hass.config, "time_zone", None) or "UTC"))
+    except ZoneInfoNotFoundError:
+        timezone = ZoneInfo("UTC")
+    first_date = start.astimezone(timezone).date()
+    last_date = horizon_end.astimezone(timezone).date()
+    windows: list[DaylightWindow] = []
+    current_date: date = first_date
+    while current_date <= last_date:
+        try:
+            sunrise = get_astral_event_date(hass, SUN_EVENT_SUNRISE, current_date)
+            sunset = get_astral_event_date(hass, SUN_EVENT_SUNSET, current_date)
+        except (AttributeError, ValueError):
+            sunrise = None
+            sunset = None
+        if sunrise is not None and sunset is not None and sunrise < sunset:
+            sunrise = sunrise.astimezone(UTC)
+            sunset = sunset.astimezone(UTC)
+            if sunset > start and sunrise < horizon_end:
+                windows.append(DaylightWindow(start=sunrise, end=sunset))
+        current_date += timedelta(days=1)
+    return windows
 
 
 def _split_entity_values(value: Any) -> list[str]:
@@ -287,6 +321,11 @@ class InputManager:
             for item in self.forecast_confidence_details
             if item.get("config_key") is not None
         }
+        daylight_windows = (
+            _daylight_windows(self.hass, now, now + timedelta(hours=horizon))
+            if bool(self.options.get(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED, False))
+            else []
+        )
         return DecisionContext(
             created_at=now,
             plan_id=uuid4().hex,
@@ -328,6 +367,7 @@ class InputManager:
             forecast_confidence=forecast_confidence,
             forecast_confidence_by_source=forecast_confidence_by_source,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
+            daylight_windows=daylight_windows,
         )
 
     def _numeric_state(self, config_key: str) -> tuple[float | None, str | None]:

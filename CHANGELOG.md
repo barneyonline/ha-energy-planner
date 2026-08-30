@@ -8,13 +8,19 @@
 
 ### ✨ New features
 
-- None
+- Added opt-in daily daylight EV charging. Complete sunrise-to-sunset forecasts
+  are ranked by solar-aware effective cost, with the existing ready-by schedule
+  retained when daylight cannot safely meet the target.
 
 ### 🐛 Bug fixes
 
 - Mode now reports **Recovery** after Home Assistant startup while automatic
   control is being safely recovered, without turning off the retained Automatic
   control request.
+- Planner-owned zone switch/helper changes no longer misclassify causally linked
+  climate-entity on/off feedback as a manual override, including synchronized
+  zone restoration. Feedback is correlated to the actuator service context, so
+  unrelated mode, target, and auxiliary-control changes remain manual overrides.
 
 ### 🔧 Improvements
 
