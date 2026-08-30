@@ -35,9 +35,9 @@ Status as of 2026-08-15.
   page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
   sections; the former Add device/config-subentry surface is removed. Existing
   subentry mappings are folded into the main config entry during setup.
-- Automatic control is the sole master intent switch. It can remain on while
+- Automatic control is the sole master intent switch. It remains on while
   startup safety temporarily disarms production command authority; Armed and
-  the stable active/review Mode sensor expose actual running state. Separate Climate control,
+  the stable active/recovery/review Mode sensor expose actual lifecycle state. Separate Climate control,
   EV control, and Enphase control switches select the participating areas and
   appear with Automatic control in the device's Controls section. A
   device-off transition while armed restores only that asset and fails without
@@ -597,7 +597,8 @@ Status as of 2026-08-15.
   normal runtime safety gates remain authoritative. The deadline uses one
   awaited `async_refresh()` and a complete preflight. A healthy result remains
   armed silently. An unsafe or failed result disarms before best-effort restore,
-  retains automatic intent, notifies once, and persists `waiting_for_safe`.
+  retains automatic intent, shows **Recovery** in Mode after Home Assistant has
+  started, notifies once, and persists `waiting_for_safe`.
   Recovery then runs non-debounced checks every 30 seconds indefinitely and
   requires three consecutive healthy committed plans before safe-state
   reconciliation, evidence refresh, re-arm, active refresh, and final readiness
