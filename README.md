@@ -129,10 +129,18 @@ numeric live value resets it.
 | **Current state** | Live state of every configured area whose device-control switch is on |
 | **Next actions** | Next state, planned actions, and decision evidence for enabled control areas |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
+| **Decision summary** | Planned and rejected decision counts, policy order, constrained budget, and bounded evidence for each result |
+| **Plan health** | Current input-health classification, confidence, issues, limiting inputs, and suggested corrective actions |
+| **Current load forecast** | Expected household load for the current planning interval, with the conservative bound and model/source health |
+| **Planning duration** | Last refresh runtime, success, trigger, rolling throughput, skipped work, and phase timings |
 | **Plan** | Calendar view of upcoming controlled actions, with readable evidence sections, local timestamps, and complete EV charging windows |
 | **Automatic control** | Retains the operator's request for automatic control, including while startup safety is temporarily disarmed |
 | Device control switches | Select whether Climate, EV, or Enphase may participate; grouped under Controls |
 | **Explain** | Requests one evidence-based AI explanation and returns it as a Home Assistant notification |
+
+The decision, health, load-forecast, planning-duration, and forecast-coverage
+entities are categorized as diagnostics so the primary device view remains
+focused on controls and immediate status.
 
 The advanced **Run safety check** button always returns a Home Assistant notification, including when every check passes.
 
