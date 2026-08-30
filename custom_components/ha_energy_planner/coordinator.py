@@ -3406,6 +3406,15 @@ def _is_planner_owned_control_feedback(
             event,
         )
     if asset == "daikin_zone" and pending_hvac_desired_state is not None:
+        if (
+            str(entity_id).split(".", 1)[0] == "climate"
+            and _matches_pending_coupled_zone_hvac_feedback(
+                entry_data,
+                pending_hvac_desired_state,
+                event,
+            )
+        ):
+            return True
         restored_zones = pending_hvac_desired_state.get("restore_zones")
         if isinstance(restored_zones, dict) and entity_id in restored_zones:
             if str(entity_id).split(".", 1)[0] == "climate":
@@ -3590,6 +3599,86 @@ def _matches_pending_zone_hvac_feedback(
     )
 
 
+def _matches_pending_coupled_zone_hvac_feedback(
+    entry_data: dict[str, Any],
+    pending: dict[str, Any],
+    event: Any,
+) -> bool:
+    """Return whether a zone actuator explains linked climate mode feedback."""
+    expected = pending.get("coupled_zone_feedback_expected")
+    if not isinstance(expected, dict):
+        return False
+    expected_state = expected.get("state")
+    expected_context_id = expected.get("context_id")
+    if expected_state not in {"on", "off"} or not expected_context_id:
+        return False
+    event_context = getattr(event, "context", None)
+    context_matches = expected_context_id in {
+        getattr(event_context, "id", None),
+        getattr(event_context, "parent_id", None),
+    }
+    entity_pair_matches = _unambiguous_coupled_zone_entity_ids_match(
+        entry_data,
+        expected.get("actuator_entity_id"),
+        event.data.get("entity_id"),
+    )
+    if not context_matches and not (
+        entity_pair_matches
+        and getattr(event_context, "user_id", None) is None
+        and getattr(event_context, "parent_id", None) is None
+    ):
+        return False
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    if old_state is None or new_state is None:
+        return False
+    old_mode = str(old_state.state).lower()
+    new_mode = str(new_state.state).lower()
+    expected_transition = (
+        old_mode == "off" and new_mode in _ACTIVE_HVAC_MODES
+        if expected_state == "on"
+        else old_mode in _ACTIVE_HVAC_MODES and new_mode == "off"
+    )
+    if not expected_transition:
+        return False
+    old_attributes = getattr(old_state, "attributes", {}) or {}
+    new_attributes = getattr(new_state, "attributes", {}) or {}
+    return not any(
+        old_attributes.get(attribute) != new_attributes.get(attribute)
+        for attribute in _HVAC_CONTROL_ATTRIBUTE_KEYS
+    )
+
+
+def _coupled_zone_entity_ids_match(actuator_entity_id: Any, climate_entity_id: Any) -> bool:
+    """Return whether configured entity IDs identify one actuator/climate pair."""
+    actuator = str(actuator_entity_id or "")
+    climate = str(climate_entity_id or "")
+    if "." not in actuator or "." not in climate:
+        return False
+    actuator_domain, actuator_object_id = actuator.split(".", 1)
+    climate_domain, climate_object_id = climate.split(".", 1)
+    if actuator_domain == "climate" or climate_domain != "climate":
+        return False
+    return climate_object_id == actuator_object_id or climate_object_id.startswith(
+        f"{actuator_object_id}_"
+    )
+
+
+def _unambiguous_coupled_zone_entity_ids_match(
+    entry_data: dict[str, Any],
+    actuator_entity_id: Any,
+    climate_entity_id: Any,
+) -> bool:
+    """Return whether exactly one configured climate zone matches an actuator."""
+    climate = str(climate_entity_id or "")
+    matches = {
+        entity_id
+        for entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+        if _coupled_zone_entity_ids_match(actuator_entity_id, entity_id)
+    }
+    return matches == {climate}
+
+
 def _pending_zone_hvac_manual_change_entity_id(
     entry_data: dict[str, Any],
     event: Any,
@@ -3617,6 +3706,11 @@ def _pending_zone_hvac_manual_change_entity_id(
     if not control_changed:
         return None
     restored_zones = pending.get("restore_zones")
+    if (
+        entity_id.split(".", 1)[0] == "climate"
+        and _matches_pending_coupled_zone_hvac_feedback(entry_data, pending, event)
+    ):
+        return None
     if isinstance(restored_zones, dict) and entity_id in restored_zones:
         expected = restored_zones[entity_id]
         if entity_id.split(".", 1)[0] == "climate":
@@ -3629,9 +3723,8 @@ def _pending_zone_hvac_manual_change_entity_id(
         return None if matches else entity_id
     if entity_id.split(".", 1)[0] == "climate":
         if pending.get("configured_zones_only") is not True:
-            # This transaction did not command subordinate temperatures, so a
-            # configured zone control change cannot be planner feedback. Mark
-            # it synchronously despite the scheduler guard being armed.
+            # Other subordinate climate changes remain synchronously
+            # classified despite the armed scheduler guard.
             return entity_id
         return (
             None
