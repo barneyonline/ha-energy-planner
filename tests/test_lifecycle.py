@@ -839,6 +839,7 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
 ) -> None:
     updated: list[tuple[str, dict[str, Any]]] = []
     created: list[dict[str, Any]] = []
+    lookups: list[tuple[tuple[str, str], str]] = []
     removed: list[str] = []
 
     class FakeEntityRegistry:
@@ -874,8 +875,11 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
             created.append(kwargs)
             return SimpleNamespace(id="planner_device")
 
-        def async_get_device(self, identifiers: Any) -> Any:
-            identifier = next(iter(identifiers))[1]
+        def async_get_device_by_identifier(
+            self, identifier: tuple[str, str], config_entry_id: str
+        ) -> Any:
+            lookups.append((identifier, config_entry_id))
+            identifier = identifier[1]
             if identifier in {"test_entry_system", "test_entry_ai", "test_entry_controls"}:
                 return SimpleNamespace(id=f"old_{identifier.rsplit('_', 1)[-1]}")
             return None
@@ -906,5 +910,9 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
             "switch.ai_enabled",
             {"device_id": "planner_device", "config_subentry_id": None},
         ),
+    ]
+    assert lookups == [
+        (("ha_energy_planner", f"test_entry_{suffix}"), "test_entry")
+        for suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls")
     ]
     assert removed == ["old_system", "old_ai", "old_controls"]
