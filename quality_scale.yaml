@@ -412,7 +412,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
-    comment: The three device control selectors remain in Controls; EV policy such as Keep charger on is central configuration, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary. Current state, Next actions, and the Plan calendar follow those selectors and omit disabled control areas.
+    comment: The three device control selectors remain in Controls; EV policy such as Keep charger on is central configuration, while the compact Armed, Current state, Next actions, and Plan calendar status surface remains primary. Decision summary, Plan health, Current load forecast, Planning duration, and Load forecast coverage score are categorized as diagnostics. Current state, Next actions, and the Plan calendar follow the device selectors and omit disabled control areas.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -428,7 +428,7 @@ rules:
         - tests/test_calendar.py
   entity-device-class:
     status: done
-    comment: Armed uses the running device class; the consolidated text status sensors and read-only action calendar have no applicable device class.
+    comment: Armed uses the running device class, Plan health uses enum, Current load forecast uses power in kW, and Planning duration uses duration in milliseconds; the consolidated text status sensors and read-only action calendar have no applicable device class.
     references:
       code:
         - custom_components/ha_energy_planner/sensor.py
@@ -446,7 +446,7 @@ rules:
         - custom_components/ha_energy_planner/button.py
   entity-translations:
     status: done
-    comment: Planner entities, including Armed, Current state, Next actions, the Plan calendar with complete EV charging windows, Automatic control, and the three device control selectors grouped under Controls, use translation keys mirrored across bundled English translations; retired pause and Keep charger on entities are removed from registries.
+    comment: Planner entities, including the primary status/control surface and diagnostic decision, health, load-forecast, duration, and coverage sensors, use translation keys mirrored across bundled English translations; retired pause and Keep charger on entities are removed from registries.
     references:
       code:
         - custom_components/ha_energy_planner/strings.json

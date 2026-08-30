@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import SensorDeviceClass
+from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import CoreState
 
 from custom_components.ha_energy_planner import sensor as sensor_module
@@ -36,6 +37,10 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "current_state": "No controls configured",
         "next_actions": "Unknown",
         "load_forecast_coverage_score": None,
+        "decision_summary": "Unknown",
+        "plan_health": None,
+        "current_load_forecast": None,
+        "planning_duration": None,
     }
     assert attrs["current_state"] == {
         "mode": "Unknown",
@@ -54,6 +59,10 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
         "model_status": "unknown",
         "quality_failures": [],
     }
+    assert attrs["decision_summary"] == {}
+    assert attrs["plan_health"] == {}
+    assert attrs["current_load_forecast"] == {}
+    assert attrs["planning_duration"] == {}
 
     coordinator.data = _plan()
     assert next(item for item in SENSORS if item.key == "next_actions").value_fn(coordinator) == (
@@ -191,6 +200,170 @@ def test_load_forecast_coverage_sensor_uses_latest_retained_training_score() -> 
         "model_status": "ready",
         "quality_failures": [],
     }
+
+
+def test_diagnostic_decision_and_health_sensors_explain_current_plan() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    action = PlanAction(
+        action_id="ev-1",
+        plan_id="plan-1",
+        execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5),
+        asset=ActionAsset.EV,
+        kind=ActionKind.EV_START,
+        desired_state={"charge_kw": 7.0},
+        hard_constraints=["grid_import_limit"],
+        reason_codes=["least_cost_slots_before_ready_by"],
+        expected_cost_delta=-0.4,
+        confidence=0.9,
+    )
+    plan = _plan(actions=[action], input_issues=["weather_entity_unavailable"])
+    plan.health = InputHealth.DEGRADED
+    plan.decision_audit = {
+        "summary": "EV charging uses the lowest-cost feasible slot.",
+        "policy_order": ["safety", "cost"],
+        "marginal_budget": {"grid_headroom_kw": 4.5},
+        "accepted": [{"action_id": "ev-1", "device": "EV", "reason": "lowest cost"}],
+    }
+    plan.rejected_actions = [{"device": "Climate", "reason": "nobody is home"}]
+    coordinator = _coordinator(plan)
+    decision = next(item for item in SENSORS if item.key == "decision_summary")
+    health = next(item for item in SENSORS if item.key == "plan_health")
+
+    assert decision.entity_category == EntityCategory.DIAGNOSTIC
+    assert decision.value_fn(coordinator) == "1 planned, 1 rejected"
+    assert decision.attrs_fn(coordinator)["summary"] == (
+        "EV charging uses the lowest-cost feasible slot."
+    )
+    assert decision.attrs_fn(coordinator)["planned_actions"][0]["determination"][
+        "accepted_decision"
+    ]["reason"] == "lowest cost"
+    assert decision.attrs_fn(coordinator)["rejected_actions"] == [
+        {"device": "Climate", "reason": "nobody is home"}
+    ]
+
+    assert health.device_class == SensorDeviceClass.ENUM
+    assert health.options == ["healthy", "degraded", "unsafe"]
+    assert health.value_fn(coordinator) == "degraded"
+    assert health.attrs_fn(coordinator)["confidence_percent"] == 87.5
+    assert health.attrs_fn(coordinator)["issues"] == [
+        {
+            "code": "weather_entity_unavailable",
+            "description": "Weather Entity Unavailable",
+        }
+    ]
+    plan.health = "corrupt"
+    assert health.value_fn(coordinator) is None
+
+
+def test_current_load_forecast_sensor_exposes_expected_and_conservative_power() -> None:
+    plan = _plan()
+    coordinator = _coordinator(
+        plan,
+        store_data={
+            "forecast_snapshots": [
+                {
+                    "plan_id": plan.plan_id,
+                    "created_at": "2026-06-27T00:00:00+00:00",
+                    "built_in_load_forecast": {
+                        "status": "ready",
+                        "model_age_hours": 2.5,
+                        "trained_at": "2026-06-26T21:30:00+00:00",
+                        "source_entity_id": "sensor.whole_home_power",
+                        "first_expected_kw": 1.2345,
+                        "first_upper_kw": 1.8,
+                        "forecast_coverage": 0.995,
+                        "recent_correction_factor": 1.1,
+                        "live_source_status": "available",
+                        "current_correction_applied": True,
+                        "fallback_applied": False,
+                        "update_reason": "load_forecast_ready",
+                        "quality_failures": [],
+                    },
+                }
+            ]
+        },
+    )
+    description = next(item for item in SENSORS if item.key == "current_load_forecast")
+
+    assert description.icon == "mdi:home-lightning-bolt"
+    assert description.device_class == SensorDeviceClass.POWER
+    assert description.native_unit_of_measurement == UnitOfPower.KILO_WATT
+    assert description.entity_category == EntityCategory.DIAGNOSTIC
+    assert description.value_fn(coordinator) == 1.2345
+    assert description.attrs_fn(coordinator) == {
+        "plan_id": "plan-1",
+        "valid_at": "2026-06-27T00:00:00+00:00",
+        "forecast_interval_minutes": 5,
+        "conservative_forecast_kw": 1.8,
+        "forecast_horizon_coverage_percent": 99.5,
+        "model_status": "ready",
+        "model_age_hours": 2.5,
+        "trained_at": "2026-06-26T21:30:00+00:00",
+        "source_entity_id": "sensor.whole_home_power",
+        "live_source_status": "available",
+        "recent_correction_factor": 1.1,
+        "current_correction_applied": True,
+        "fallback_applied": False,
+        "update_reason": "load_forecast_ready",
+        "quality_failures": [],
+    }
+
+    coordinator.store.data["forecast_snapshots"][0]["built_in_load_forecast"][
+        "first_expected_kw"
+    ] = float("nan")
+    assert description.value_fn(coordinator) is None
+
+
+def test_planning_duration_sensor_exposes_bounded_refresh_performance() -> None:
+    coordinator = _coordinator(_plan())
+    coordinator.last_refresh_metadata = {
+        "duration_ms": 27.25,
+        "succeeded": True,
+        "completed_at": datetime(2026, 6, 27, 0, 5, tzinfo=UTC),
+        "trigger": "state_change",
+        "phases": {"planner_ms": 4.5},
+    }
+    coordinator.refresh_metrics = {
+        "last_duration_ms": 27.25,
+        "last_trigger": "state_change",
+        "refreshes_last_hour": 8,
+        "requested": 12,
+        "completed": 10,
+        "succeeded": 9,
+        "failed": 1,
+        "coalesced": 2,
+        "fingerprint_skipped": 5,
+        "computed": 4,
+        "trigger_counts": {"state_change": 7, "boundary": 3},
+        "phase_durations_ms": {"inputs_ms": 20.0, "planner_ms": 4.5},
+    }
+    description = next(item for item in SENSORS if item.key == "planning_duration")
+
+    assert description.device_class == SensorDeviceClass.DURATION
+    assert description.native_unit_of_measurement == UnitOfTime.MILLISECONDS
+    assert description.entity_category == EntityCategory.DIAGNOSTIC
+    assert description.value_fn(coordinator) == 27.25
+    assert description.attrs_fn(coordinator) == {
+        "last_refresh_succeeded": True,
+        "last_completed_at": "2026-06-27T00:05:00+00:00",
+        "last_trigger": "state_change",
+        "refreshes_last_hour": 8,
+        "counters": {
+            "requested": 12,
+            "completed": 10,
+            "succeeded": 9,
+            "failed": 1,
+            "coalesced": 2,
+            "fingerprint_skipped": 5,
+            "computed": 4,
+        },
+        "trigger_counts": {"state_change": 7, "boundary": 3},
+        "phase_durations_ms": {"inputs_ms": 20.0, "planner_ms": 4.5},
+    }
+
+    del coordinator.refresh_metrics
+    assert description.value_fn(coordinator) == 27.25
 
 
 def test_retired_sensor_helpers_remain_safe_for_diagnostics_without_a_plan() -> None:

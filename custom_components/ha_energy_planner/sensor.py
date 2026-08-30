@@ -5,10 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from math import isfinite
 from typing import Any
 
-from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
-from homeassistant.const import EntityCategory
+from homeassistant.components.sensor import (
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+)
+from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -343,6 +348,44 @@ SENSORS: tuple[PlannerSensorDescription, ...] = (
         value_fn=lambda coordinator: _load_forecast_coverage_score(coordinator),
         attrs_fn=lambda coordinator: _load_forecast_coverage_attrs(coordinator),
     ),
+    PlannerSensorDescription(
+        key="decision_summary",
+        translation_key="decision_summary",
+        icon="mdi:clipboard-list-outline",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _decision_summary_state(coordinator),
+        attrs_fn=lambda coordinator: _decision_summary_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="plan_health",
+        translation_key="plan_health",
+        icon="mdi:heart-pulse",
+        device_class=SensorDeviceClass.ENUM,
+        options=["healthy", "degraded", "unsafe"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _plan_health_state(coordinator),
+        attrs_fn=lambda coordinator: _plan_health_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="current_load_forecast",
+        translation_key="current_load_forecast",
+        icon="mdi:home-lightning-bolt",
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _current_load_forecast_value(coordinator),
+        attrs_fn=lambda coordinator: _current_load_forecast_attrs(coordinator),
+    ),
+    PlannerSensorDescription(
+        key="planning_duration",
+        translation_key="planning_duration",
+        icon="mdi:timer-outline",
+        device_class=SensorDeviceClass.DURATION,
+        native_unit_of_measurement=UnitOfTime.MILLISECONDS,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda coordinator: _planning_duration_value(coordinator),
+        attrs_fn=lambda coordinator: _planning_duration_attrs(coordinator),
+    ),
 )
 
 
@@ -416,6 +459,161 @@ class PlannerSensor(EnergyPlannerEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return state attributes."""
         return recorder_safe_attributes(self.entity_description.attrs_fn(self.coordinator))
+
+
+def _decision_summary_state(coordinator: EnergyPlannerCoordinator) -> str:
+    """Return concise accepted/planned and rejected decision counts."""
+    plan = coordinator.data
+    if plan is None:
+        return "Unknown"
+    planned = len(plan.actions)
+    rejected = len(plan.rejected_actions) if isinstance(plan.rejected_actions, list) else 0
+    return f"{planned} planned, {rejected} rejected"
+
+
+def _decision_summary_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return bounded evidence explaining the current planning result."""
+    plan = coordinator.data
+    if plan is None:
+        return {}
+    audit = plan.decision_audit if isinstance(plan.decision_audit, dict) else {}
+    rejected = plan.rejected_actions if isinstance(plan.rejected_actions, list) else []
+    accepted = _accepted_decisions(plan)
+    return {
+        "plan_id": plan.plan_id,
+        "plan_created_at": plan.created_at.isoformat(),
+        "summary": audit.get("summary") or plan.summary,
+        "policy_order": _bounded_json(audit.get("policy_order", [])),
+        "marginal_budget": _bounded_json(audit.get("marginal_budget", {})),
+        "planned_action_count": len(plan.actions),
+        "planned_actions": [
+            _action_with_determination(action, accepted, audit)
+            for action in _ordered_actions(plan)[:12]
+        ],
+        "rejected_action_count": len(rejected),
+        "rejected_actions": _bounded_json([item for item in rejected if isinstance(item, dict)][:12]),
+        "estimated_cost": plan.estimated_daily_cost,
+        "estimated_cost_horizon_hours": plan.estimated_cost_horizon_hours,
+    }
+
+
+def _plan_health_state(coordinator: EnergyPlannerCoordinator) -> str | None:
+    """Return the current input-health classification."""
+    plan = coordinator.data
+    if plan is None:
+        return None
+    health = str(plan.health)
+    return health if health in {str(item) for item in InputHealth} else None
+
+
+def _plan_health_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return actionable health and data-quality evidence."""
+    plan = coordinator.data
+    if plan is None:
+        return {}
+    issue_codes = [str(issue) for issue in plan.input_issues[:20]]
+    return {
+        "plan_id": plan.plan_id,
+        "plan_created_at": plan.created_at.isoformat(),
+        "plan_status": plan.status,
+        "mode": str(plan.mode),
+        "summary": plan.summary,
+        "confidence_percent": round(plan.confidence * 100, 1),
+        "issue_count": len(plan.input_issues),
+        "issues": [
+            {"code": issue, "description": _plain_reason(issue)} for issue in issue_codes
+        ],
+        "data_quality": _decision_data_quality_attrs(coordinator),
+    }
+
+
+def _current_load_forecast_value(
+    coordinator: EnergyPlannerCoordinator,
+) -> float | None:
+    """Return expected household load for the current planning interval."""
+    return _finite_number(_built_in_load_forecast_attrs(coordinator).get("first_expected_kw"))
+
+
+def _current_load_forecast_attrs(
+    coordinator: EnergyPlannerCoordinator,
+) -> dict[str, Any]:
+    """Return current expected and conservative load-forecast evidence."""
+    latest = _latest_forecast_snapshot(coordinator)
+    model = _built_in_load_forecast_attrs(coordinator)
+    if not model:
+        return {}
+    coverage = _finite_number(model.get("forecast_coverage"))
+    return {
+        "plan_id": latest.get("plan_id"),
+        "valid_at": to_jsonable(latest.get("created_at")),
+        "forecast_interval_minutes": None
+        if coordinator.data is None
+        else coordinator.data.interval_minutes,
+        "conservative_forecast_kw": _finite_number(model.get("first_upper_kw")),
+        "forecast_horizon_coverage_percent": None
+        if coverage is None
+        else round(coverage * 100, 1),
+        "model_status": model.get("status"),
+        "model_age_hours": model.get("model_age_hours"),
+        "trained_at": model.get("trained_at"),
+        "source_entity_id": model.get("source_entity_id"),
+        "live_source_status": model.get("live_source_status"),
+        "recent_correction_factor": model.get("recent_correction_factor"),
+        "current_correction_applied": model.get("current_correction_applied"),
+        "fallback_applied": model.get("fallback_applied"),
+        "update_reason": model.get("update_reason"),
+        "quality_failures": model.get("quality_failures", []),
+    }
+
+
+def _planning_duration_value(coordinator: EnergyPlannerCoordinator) -> float | None:
+    """Return the last completed coordinator refresh duration."""
+    metrics = getattr(coordinator, "refresh_metrics", None)
+    if isinstance(metrics, dict):
+        duration = _finite_number(metrics.get("last_duration_ms"))
+        if duration is not None:
+            return duration
+    latest = getattr(coordinator, "last_refresh_metadata", None)
+    return _finite_number(latest.get("duration_ms")) if isinstance(latest, dict) else None
+
+
+def _planning_duration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Return refresh throughput, trigger, and phase timing telemetry."""
+    metrics = getattr(coordinator, "refresh_metrics", None)
+    metrics = metrics if isinstance(metrics, dict) else {}
+    latest = getattr(coordinator, "last_refresh_metadata", None)
+    latest = latest if isinstance(latest, dict) else {}
+    if not metrics and not latest:
+        return {}
+    counter_keys = (
+        "requested",
+        "completed",
+        "succeeded",
+        "failed",
+        "coalesced",
+        "fingerprint_skipped",
+        "computed",
+        "teardown_skipped",
+    )
+    return {
+        "last_refresh_succeeded": latest.get("succeeded"),
+        "last_completed_at": to_jsonable(latest.get("completed_at")),
+        "last_trigger": metrics.get("last_trigger", latest.get("trigger")),
+        "refreshes_last_hour": metrics.get("refreshes_last_hour"),
+        "counters": {key: metrics[key] for key in counter_keys if key in metrics},
+        "trigger_counts": _bounded_json(metrics.get("trigger_counts", {})),
+        "phase_durations_ms": _bounded_json(
+            metrics.get("phase_durations_ms", latest.get("phases", {}))
+        ),
+    }
+
+
+def _finite_number(value: Any) -> float | None:
+    """Return a finite numeric value while rejecting booleans and corrupt data."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return None
+    number = float(value)
+    return number if isfinite(number) else None
 
 
 def _controlled_state_summary(coordinator: EnergyPlannerCoordinator) -> str:
