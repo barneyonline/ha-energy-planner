@@ -53,7 +53,7 @@ Status as of 2026-08-15.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Ready by and opportunistic-charging policy are configured centrally. The EV
+  Ready by, opportunistic charging, and opt-in lowest-cost daylight charging are configured centrally. The EV
   mapping requires SOC, charging feedback, and the authoritative vehicle target
   SOC entity. Retired number, time, and switch entities, the duplicate
   keep-charger-on switch, the fixed-duration pause buttons, the manual EV
@@ -165,7 +165,11 @@ Status as of 2026-08-15.
   stays within the configured hours. Once charging feedback confirms an active
   continuous session, replanning may retain its current pre-window slot so
   forecast repricing cannot fragment it; the configured maximum import price
-  remains authoritative. Completed Recorder
+  remains authoritative. Daylight preference is evaluated from deterministic sunrise/sunset windows
+  calculated from Home Assistant's configured location. It requires complete
+  effective-cost evidence through sunset; continuous schedules fall back as a
+  whole when daylight capacity is insufficient, while split schedules allocate
+  daylight first and de-duplicate ready-by fallback slots. Completed Recorder
   charging sessions of at least 30 minutes calibrate effective SOC gained per
   kWh from SOC gain, configured charger power, and active duration. At least 60
   minutes and 3% gain are required; the learned rate carries a 10% conservative

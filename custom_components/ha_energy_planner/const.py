@@ -75,6 +75,7 @@ CONF_EV_FALLBACK_TARGET_SOC_PERCENT = "ev_fallback_target_soc_percent"
 CONF_EV_CHARGE_RATE_KW = "ev_charge_rate_kw"
 CONF_EV_SOC_PER_KWH = "ev_soc_per_kwh"
 CONF_EV_CONTINUOUS_CHARGING = "ev_continuous_charging"
+CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED = "ev_daylight_lowest_cost_charging_enabled"
 CONF_EV_EARLIEST_START = "ev_earliest_start"
 CONF_EV_PRICE_LIMIT_ENABLED = "ev_price_limit_enabled"
 CONF_EV_MAX_IMPORT_PRICE = "ev_max_import_price"
@@ -133,6 +134,7 @@ DEFAULT_OPTIONS = {
     # materially underestimated charging time for typical battery EVs.
     CONF_EV_SOC_PER_KWH: 2.0,
     CONF_EV_CONTINUOUS_CHARGING: True,
+    CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: False,
     CONF_EV_EARLIEST_START: "None",
     CONF_EV_PRICE_LIMIT_ENABLED: False,
     CONF_EV_MAX_IMPORT_PRICE: 1.0,

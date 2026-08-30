@@ -971,13 +971,60 @@ def _plain_state_details(state: dict[str, Any]) -> dict[str, Any]:
             details[_plain_key(key)] = [_plain_reason(item) for item in value]
         elif key in {"state", "action", "hvac_mode", "arbitrage_direction", "arbitrage_source"}:
             details[_plain_key(key)] = _display_state(value)
-        elif key in {"start", "end", "execute_not_before", "execute_not_after"}:
+        elif key in {
+            "start",
+            "end",
+            "execute_not_before",
+            "execute_not_after",
+            "daylight_window_start_utc",
+            "daylight_window_end_utc",
+        }:
             details[_plain_key(key)] = _date_time_label(value) or value
+        elif key == "daylight_lowest_cost" and isinstance(value, dict):
+            details[_plain_key(key)] = _plain_daylight_evidence(value)
+        elif key == "allocation_source_now":
+            details[_plain_key(key)] = _plain_allocation_source(value)
         elif key == "allocated_slots" and isinstance(value, list):
             details["Charging windows"] = len(value)
+            allocation_sources = list(
+                dict.fromkeys(
+                    _plain_allocation_source(item.get("allocation_source"))
+                    for item in value
+                    if isinstance(item, dict) and item.get("allocation_source")
+                )
+            )
+            if allocation_sources:
+                details["Charging allocation sources"] = allocation_sources
         else:
             details[_plain_key(key)] = _bounded_json(value)
     return details
+
+
+def _plain_daylight_evidence(value: dict[str, Any]) -> dict[str, Any]:
+    """Return daylight scheduling evidence with readable labels and values."""
+    details: dict[str, Any] = {}
+    for key, item in value.items():
+        if item is None:
+            continue
+        if key in {"window_start_utc", "window_end_utc"}:
+            label = "Sunrise" if key == "window_start_utc" else "Sunset"
+            details[label] = _date_time_label(item) or item
+        elif key == "reason":
+            details["Status"] = _plain_reason(item)
+        else:
+            details[_plain_key(key)] = _bounded_json(item)
+    return details
+
+
+def _plain_allocation_source(value: Any) -> str:
+    """Return a readable EV charging allocation source."""
+    labels = {
+        "daylight": "Daylight preference",
+        "ready_by": "Ready-by schedule",
+        "ready_by_fallback": "Ready-by fallback",
+    }
+    text = str(value or "ready_by")
+    return labels.get(text, _display_state(text))
 
 
 def _action_sentence(action: PlanAction) -> str:
@@ -2131,7 +2178,7 @@ def _reason_summary(reasons: Any) -> str:
         reasons = [reasons]
     if not isinstance(reasons, list):
         return ""
-    readable = [_plain_reason(reason) for reason in reasons[:3]]
+    readable = [_plain_reason(reason) for reason in reasons[:4]]
     return "; ".join(reason for reason in readable if reason)
 
 
@@ -2161,6 +2208,35 @@ def _plain_reason(value: Any) -> str:
         "least_cost_solar_aware_slots_before_ready_by": (
             "Charging was placed in the lowest effective-cost slots, including forecast solar surplus."
         ),
+        "daylight_lowest_effective_cost_slots": (
+            "Charging was placed in the lowest effective-cost complete daylight window."
+        ),
+        "daylight_lowest_effective_cost_with_ready_by_fallback": (
+            "Daylight charging was preferred first, with remaining charge placed before ready-by."
+        ),
+        "ev_daylight_lowest_cost_selected": "A complete lowest-cost daylight charging window was selected.",
+        "ev_daylight_lowest_cost_charge_now": "The EV is in its selected lowest-cost daylight window.",
+        "ev_daylight_lowest_cost_with_ready_by_fallback": (
+            "Daylight slots were selected first and ready-by slots cover the remaining charge."
+        ),
+        "ev_daylight_forecast_incomplete": (
+            "The complete remaining sunrise-to-sunset forecast is not available, so ready-by scheduling is used."
+        ),
+        "ev_daylight_window_not_before_ready_by": (
+            "No complete daylight window ends before the next ready-by deadline."
+        ),
+        "ev_daylight_continuous_capacity_insufficient": (
+            "Daylight cannot fit one complete continuous session, so ready-by scheduling is used."
+        ),
+        "ev_daylight_no_eligible_charge": (
+            "No daylight slot is eligible under the configured charging constraints."
+        ),
+        "ev_daylight_deferred_active_session": (
+            "The confirmed continuous charging session takes precedence over daylight replanning."
+        ),
+        "ev_daylight_deferred_opportunistic_charge": (
+            "The current opportunistic-price charging request takes precedence over daylight scheduling."
+        ),
         "configured_target": "The configured EV target state of charge is being used.",
         "history_max_daily_consumption": "Trip history raised the EV target to cover recent driving.",
         "battery_floor": "The battery reserve limit must be respected.",
@@ -2187,6 +2263,16 @@ def _plain_key(value: Any) -> str:
         "occupied_temperature_high": "Comfort high C",
         "target_soc_percent": "Target SOC percent",
         "ready_by": "Ready by",
+        "daylight_lowest_cost_enabled": "Daylight lowest-cost enabled",
+        "daylight_lowest_cost_applicable": "Daylight window applicable",
+        "daylight_forecast_complete": "Daylight forecast complete",
+        "daylight_lowest_cost_selected": "Daylight schedule selected",
+        "daylight_window_start_utc": "Sunrise",
+        "daylight_window_end_utc": "Sunset",
+        "daylight_lowest_cost_reason": "Daylight scheduling status",
+        "daylight_lowest_cost": "Daylight lowest-cost charging",
+        "allocation_source": "Allocation source",
+        "allocation_source_now": "Current allocation source",
         "arbitrage_value": "Estimated value",
         "arbitrage_source": "Value source",
         "arbitrage_direction": "Battery strategy",

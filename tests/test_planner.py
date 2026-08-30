@@ -11,6 +11,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_CARBON_INTENSITY_FORECAST,
+    CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
     CONF_HOUSEHOLD_LOAD,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_PV_FORECAST,
@@ -21,6 +22,7 @@ from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
+    DaylightWindow,
     DecisionContext,
     DecisionSlot,
     InputHealth,
@@ -60,6 +62,265 @@ def _context(health: InputHealth = InputHealth.HEALTHY) -> DecisionContext:
         occupancy_state=OccupancyState.OCCUPIED,
         input_health=health,
     )
+
+
+def _daylight_ev_context() -> DecisionContext:
+    """Return a complete daytime tariff horizon before the next ready-by."""
+    context = _context()
+    context.created_at = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = 40
+    context.ev_target_soc_percent = 50
+    context.current_hvac_temperature_c = None
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.30,
+            export_price=0.05,
+            pv_forecast_kw=0.0,
+            baseline_load_forecast_kw=1.0,
+        )
+        for offset in range(0, 21 * 60, 5)
+    ]
+    context.daylight_windows = [
+        DaylightWindow(
+            start=datetime(2026, 6, 27, 8, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 27, 17, 0, tzinfo=UTC),
+        )
+    ]
+    return context
+
+
+def test_daylight_lowest_cost_selects_cheapest_complete_contiguous_window() -> None:
+    context = _daylight_ev_context()
+    for slot in context.slots:
+        if slot.valid_at in {
+            datetime(2026, 6, 27, 12, 0, tzinfo=UTC),
+            datetime(2026, 6, 27, 12, 5, tzinfo=UTC),
+        }:
+            slot.import_price = 0.05
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True,
+        "ev_earliest_start": "23:00",
+        "default_ready_by": "07:00",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    daylight = action.desired_state["daylight_lowest_cost"]
+    assert daylight["selected"] is True
+    assert daylight["forecast_complete"] is True
+    assert [item["valid_at"] for item in action.desired_state["allocated_slots"]] == [
+        "2026-06-27T12:00:00+00:00",
+        "2026-06-27T12:05:00+00:00",
+    ]
+    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {
+        "daylight"
+    }
+
+
+def test_daylight_schedule_does_not_allocate_a_slot_past_sunset() -> None:
+    context = _daylight_ev_context()
+    context.current_ev_soc_percent = 49.5
+    context.daylight_windows = [
+        DaylightWindow(
+            start=datetime(2026, 6, 27, 8, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 27, 17, 3, tzinfo=UTC),
+        )
+    ]
+    for slot in context.slots:
+        if slot.valid_at == datetime(2026, 6, 27, 17, 0, tzinfo=UTC):
+            slot.import_price = -1.0
+        elif slot.valid_at == datetime(2026, 6, 27, 16, 55, tzinfo=UTC):
+            slot.import_price = 0.01
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True,
+        "default_ready_by": "07:00",
+        "ev_continuous_charging": False,
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+    allocations = action.desired_state["allocated_slots"]
+
+    assert action.desired_state["daylight_lowest_cost"]["selected"] is True
+    assert allocations[0]["valid_at"] == "2026-06-27T16:55:00+00:00"
+    assert all(
+        datetime.fromisoformat(item["valid_at"]) + timedelta(minutes=5)
+        <= context.daylight_windows[0].end
+        for item in allocations
+        if item["allocation_source"] == "daylight"
+    )
+
+
+def test_disabled_daylight_policy_preserves_compact_legacy_ev_evidence() -> None:
+    context = _daylight_ev_context()
+    action = next(
+        action
+        for action in DryRunPlanner(
+            {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
+        ).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    assert "daylight_lowest_cost" not in action.desired_state
+    assert "allocation_source_now" not in action.desired_state
+    assert all(
+        "allocation_source" not in item
+        for item in action.desired_state["allocated_slots"]
+    )
+
+
+def test_split_daylight_schedule_uses_ready_by_fallback_without_duplicates() -> None:
+    context = _daylight_ev_context()
+    context.current_ev_soc_percent = 35
+    context.daylight_windows = [
+        DaylightWindow(
+            start=datetime(2026, 6, 27, 10, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 27, 10, 10, tzinfo=UTC),
+        )
+    ]
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True,
+        "ev_continuous_charging": False,
+        "ev_earliest_start": "23:00",
+        "default_ready_by": "07:00",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+    allocations = action.desired_state["allocated_slots"]
+
+    assert action.desired_state["daylight_lowest_cost"]["selected"] is True
+    assert [item["allocation_source"] for item in allocations] == [
+        "daylight",
+        "daylight",
+        "ready_by_fallback",
+    ]
+    assert len({item["valid_at"] for item in allocations}) == len(allocations)
+    assert action.desired_state["infeasible"] is False
+
+
+def test_incomplete_daylight_forecast_preserves_ready_by_schedule() -> None:
+    context = _daylight_ev_context()
+    context.slots = context.slots[:12]
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True,
+        "default_ready_by": "07:00",
+        "ev_continuous_charging": False,
+    }
+
+    action = next(
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    daylight = action.desired_state["daylight_lowest_cost"]
+    assert daylight["applicable"] is True
+    assert daylight["forecast_complete"] is False
+    assert daylight["selected"] is False
+    assert daylight["reason"] == "ev_daylight_forecast_incomplete"
+    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {
+        "ready_by"
+    }
+
+
+@pytest.mark.parametrize(
+    ("scenario", "expected_reason"),
+    [
+        ("active_session", "ev_daylight_deferred_active_session"),
+        ("opportunistic", "ev_daylight_deferred_opportunistic_charge"),
+        ("no_window", "ev_daylight_window_not_before_ready_by"),
+        ("already_at_target", "already_at_target"),
+        ("no_eligible", "ev_daylight_no_eligible_charge"),
+        ("continuous_shortfall", "ev_daylight_continuous_capacity_insufficient"),
+    ],
+)
+def test_daylight_preference_preserves_higher_priority_and_fallback_paths(
+    scenario: str,
+    expected_reason: str,
+) -> None:
+    context = _daylight_ev_context()
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True,
+        "default_ready_by": "07:00",
+        "ev_charge_rate_kw": 6,
+        "ev_soc_per_kwh": 10,
+    }
+    if scenario == "active_session":
+        context.ev_charging = True
+    elif scenario == "opportunistic":
+        options.update(
+            {
+                "ev_low_price_charging_enabled": True,
+                "ev_low_price_threshold": 1.0,
+            }
+        )
+    elif scenario == "no_window":
+        context.daylight_windows = []
+    elif scenario == "already_at_target":
+        context.current_ev_soc_percent = context.ev_target_soc_percent
+    elif scenario == "no_eligible":
+        options.update(
+            {
+                "ev_price_limit_enabled": True,
+                "ev_max_import_price": 0.10,
+            }
+        )
+    else:
+        context.daylight_windows = [
+            DaylightWindow(
+                start=context.created_at,
+                end=context.created_at + timedelta(minutes=5),
+            )
+        ]
+
+    action = next(
+        action
+        for action in DryRunPlanner(options).create_plan(context).actions
+        if action.asset == ActionAsset.EV
+    )
+
+    daylight = action.desired_state["daylight_lowest_cost"]
+    assert daylight["selected"] is False
+    assert daylight["reason"] == expected_reason
+    if scenario == "already_at_target":
+        assert action.reason_codes == [
+            "ev_outside_allocated_charging_window",
+            "vehicle_target_soc",
+            "already_at_target",
+        ]
 
 
 def test_dry_run_plan_has_candidate_actions_without_active_control() -> None:

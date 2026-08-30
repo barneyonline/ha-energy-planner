@@ -8,7 +8,9 @@
 
 ### ✨ New features
 
-- None
+- Added opt-in daily daylight EV charging. Complete sunrise-to-sunset forecasts
+  are ranked by solar-aware effective cost, with the existing ready-by schedule
+  retained when daylight cannot safely meet the target.
 
 ### 🐛 Bug fixes
 

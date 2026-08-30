@@ -21,6 +21,7 @@ from .const import (
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CONTINUOUS_CHARGING,
+    CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
@@ -50,7 +51,7 @@ from .const import (
     CONF_WEATHER,
     DEFAULT_OPTIONS,
 )
-from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
+from .ev import EVChargeSchedule, allocate_least_cost_charging, effective_ev_soc_per_kwh
 from .models import (
     ActionAsset,
     ActionKind,
@@ -308,6 +309,9 @@ class DryRunPlanner:
                 and (max_import_price is None or float(current_slot.import_price) <= max_import_price)
             )
             continuous_charging = bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True))
+            daylight_lowest_cost_enabled = bool(
+                self.options.get(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED, False)
+            )
             continue_current_charging = continuous_charging and context.ev_charging is True
             available_charge_hours = max((ready_by - earliest_start).total_seconds() / 3600, 0.0)
             if (
@@ -333,7 +337,7 @@ class DryRunPlanner:
                 + available_charge_hours * charge_rate_kw * soc_per_kwh,
             )
             target_infeasible = max_attainable_soc_percent + 0.000001 < target_soc
-            schedule = allocate_least_cost_charging(
+            standard_schedule = allocate_least_cost_charging(
                 context.slots,
                 current_soc_percent=context.current_ev_soc_percent,
                 target_soc_percent=target_soc,
@@ -348,7 +352,30 @@ class DryRunPlanner:
                 continue_current=continue_current_charging,
                 max_import_price=max_import_price,
             )
+            schedule, daylight_evidence = _daylight_preferred_ev_schedule(
+                context,
+                standard_schedule=standard_schedule,
+                enabled=daylight_lowest_cost_enabled,
+                current_soc_percent=context.current_ev_soc_percent,
+                target_soc_percent=target_soc,
+                ready_by=ready_by,
+                earliest_start=earliest_start,
+                charge_rate_kw=charge_rate_kw,
+                soc_per_kwh=soc_per_kwh,
+                interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+                carbon_weight=_carbon_schedule_weight(self.options),
+                continuous=continuous_charging,
+                continue_current=continue_current_charging,
+                force_current=low_price_charge,
+                max_import_price=max_import_price,
+            )
+            max_attainable_soc_percent = max(
+                max_attainable_soc_percent,
+                schedule.scheduled_soc_percent,
+            )
+            target_infeasible = schedule.infeasible
             allocation_by_time = {allocation.valid_at: allocation for allocation in schedule.allocations}
+            current_allocation = allocation_by_time.get(current_slot.valid_at) if current_slot else None
             for slot in context.slots:
                 if slot.valid_at in allocation_by_time:
                     slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
@@ -375,6 +402,11 @@ class DryRunPlanner:
                 charging_reason = "ev_continuous_charging_in_progress"
             elif low_price_charge and charging_required_now:
                 charging_reason = "ev_low_price_charge_now"
+            elif (
+                current_allocation is not None
+                and current_allocation.allocation_source == "daylight"
+            ):
+                charging_reason = "ev_daylight_lowest_cost_charge_now"
             elif charging_required_now:
                 charging_reason = "ev_in_allocated_charging_window"
             else:
@@ -413,11 +445,32 @@ class DryRunPlanner:
                             self.ev_charge_calibration.get("sample_count", 0) or 0
                         ),
                         "continuous_charging": continuous_charging,
+                        **(
+                            {
+                                "daylight_lowest_cost": {
+                                    "enabled": True,
+                                    **daylight_evidence,
+                                }
+                            }
+                            if daylight_lowest_cost_enabled
+                            else {}
+                        ),
                         "continued_active_session": bool(
                             continue_current_charging and charging_required_now
                         ),
                         "keep_charger_on": preconditioning_required_now,
                         "projected_load_kw_now": projected_load_kw_now,
+                        **(
+                            {
+                                "allocation_source_now": (
+                                    current_allocation.allocation_source
+                                    if current_allocation is not None
+                                    else None
+                                )
+                            }
+                            if daylight_lowest_cost_enabled
+                            else {}
+                        ),
                         "price_limit": float(self.options[CONF_EV_MAX_IMPORT_PRICE])
                         if bool(self.options.get(CONF_EV_PRICE_LIMIT_ENABLED, False))
                         else None,
@@ -432,13 +485,31 @@ class DryRunPlanner:
                                 "grid_import_used_kw": allocation.grid_import_used_kw,
                                 "carbon_intensity_g_per_kwh": allocation.carbon_intensity_g_per_kwh,
                                 "estimated_carbon_g": allocation.estimated_carbon_g,
+                                **(
+                                    {"allocation_source": allocation.allocation_source}
+                                    if daylight_lowest_cost_enabled
+                                    else {}
+                                ),
                             }
                             for allocation in schedule.allocations
                         ],
                         "infeasible": schedule.infeasible or target_infeasible,
                     },
                     hard_constraints=["ready_by", "charger_connected"],
-                    reason_codes=[charging_reason, target_reason, schedule.reason],
+                    reason_codes=list(
+                        dict.fromkeys(
+                            [
+                                charging_reason,
+                                target_reason,
+                                schedule.reason,
+                                *(
+                                    [str(daylight_evidence["reason"])]
+                                    if daylight_lowest_cost_enabled
+                                    else []
+                                ),
+                            ]
+                        )
+                    ),
                     expected_cost_delta=None,
                     confidence=confidence_from_context(context),
                 )
@@ -2327,6 +2398,184 @@ def _planned_enphase_profile(actions: list[PlanAction]) -> str | None:
         if profile:
             return str(profile)
     return None
+
+
+def _daylight_preferred_ev_schedule(
+    context: DecisionContext,
+    *,
+    standard_schedule: EVChargeSchedule,
+    enabled: bool,
+    current_soc_percent: float,
+    target_soc_percent: float,
+    ready_by: datetime,
+    earliest_start: datetime,
+    charge_rate_kw: float,
+    soc_per_kwh: float,
+    interval_minutes: int,
+    carbon_weight: float,
+    continuous: bool,
+    continue_current: bool,
+    force_current: bool,
+    max_import_price: float | None,
+) -> tuple[EVChargeSchedule, dict[str, Any]]:
+    """Prefer a fully known daylight window without weakening ready-by behavior."""
+    evidence: dict[str, Any] = {
+        "applicable": False,
+        "forecast_complete": False,
+        "selected": False,
+        "window_start_utc": None,
+        "window_end_utc": None,
+        "reason": "ev_daylight_lowest_cost_disabled",
+    }
+    if not enabled:
+        return standard_schedule, evidence
+    if continue_current:
+        evidence["reason"] = "ev_daylight_deferred_active_session"
+        return standard_schedule, evidence
+    if force_current:
+        evidence["reason"] = "ev_daylight_deferred_opportunistic_charge"
+        return standard_schedule, evidence
+    if current_soc_percent >= target_soc_percent:
+        evidence["reason"] = "already_at_target"
+        return standard_schedule, evidence
+
+    window = next(
+        (
+            item
+            for item in sorted(context.daylight_windows, key=lambda item: item.start)
+            if item.end > context.created_at and item.end <= ready_by
+        ),
+        None,
+    )
+    if window is None:
+        evidence["reason"] = "ev_daylight_window_not_before_ready_by"
+        return standard_schedule, evidence
+
+    evidence.update(
+        {
+            "applicable": True,
+            "window_start_utc": window.start.isoformat(),
+            "window_end_utc": window.end.isoformat(),
+        }
+    )
+    interval = timedelta(minutes=interval_minutes)
+    remaining_start = max(context.created_at, window.start)
+    daylight_forecast_slots = sorted(
+        (
+            slot
+            for slot in context.slots
+            if remaining_start <= slot.valid_at < window.end
+        ),
+        key=lambda slot: slot.valid_at,
+    )
+    complete = bool(
+        daylight_forecast_slots
+        and daylight_forecast_slots[0].valid_at < remaining_start + interval
+        and daylight_forecast_slots[-1].valid_at + interval >= window.end
+        and all(
+            right.valid_at - left.valid_at == interval
+            for left, right in zip(
+                daylight_forecast_slots,
+                daylight_forecast_slots[1:],
+                strict=False,
+            )
+        )
+        and all(
+            _daylight_cost_inputs_complete(slot)
+            for slot in daylight_forecast_slots
+        )
+    )
+    evidence["forecast_complete"] = complete
+    if not complete:
+        evidence["reason"] = "ev_daylight_forecast_incomplete"
+        return standard_schedule, evidence
+
+    daylight_slots = [
+        slot
+        for slot in daylight_forecast_slots
+        if slot.valid_at + interval <= window.end
+    ]
+    daylight_schedule = allocate_least_cost_charging(
+        daylight_slots,
+        current_soc_percent=current_soc_percent,
+        target_soc_percent=target_soc_percent,
+        ready_by=window.end,
+        charge_rate_kw=charge_rate_kw,
+        soc_per_kwh=soc_per_kwh,
+        interval_minutes=interval_minutes,
+        carbon_weight=carbon_weight,
+        continuous=continuous,
+        max_import_price=max_import_price,
+        allocation_source="daylight",
+    )
+    if not daylight_schedule.allocations:
+        evidence["reason"] = "ev_daylight_no_eligible_charge"
+        return standard_schedule, evidence
+    if not daylight_schedule.infeasible:
+        evidence.update({"selected": True, "reason": "ev_daylight_lowest_cost_selected"})
+        return (
+            EVChargeSchedule(
+                allocations=daylight_schedule.allocations,
+                target_soc_percent=daylight_schedule.target_soc_percent,
+                scheduled_soc_percent=daylight_schedule.scheduled_soc_percent,
+                required_charge_percent=daylight_schedule.required_charge_percent,
+                infeasible=False,
+                reason="daylight_lowest_effective_cost_slots",
+            ),
+            evidence,
+        )
+    if continuous:
+        evidence["reason"] = "ev_daylight_continuous_capacity_insufficient"
+        return standard_schedule, evidence
+
+    daylight_times = {slot.valid_at for slot in daylight_slots}
+    fallback_schedule = allocate_least_cost_charging(
+        [slot for slot in context.slots if slot.valid_at not in daylight_times],
+        current_soc_percent=daylight_schedule.scheduled_soc_percent,
+        target_soc_percent=target_soc_percent,
+        ready_by=ready_by,
+        charge_rate_kw=charge_rate_kw,
+        soc_per_kwh=soc_per_kwh,
+        interval_minutes=interval_minutes,
+        carbon_weight=carbon_weight,
+        earliest_start=earliest_start,
+        continuous=False,
+        max_import_price=max_import_price,
+        allocation_source="ready_by_fallback",
+    )
+    evidence.update(
+        {
+            "selected": True,
+            "reason": "ev_daylight_lowest_cost_with_ready_by_fallback",
+        }
+    )
+    return (
+        EVChargeSchedule(
+            allocations=[*daylight_schedule.allocations, *fallback_schedule.allocations],
+            target_soc_percent=target_soc_percent,
+            scheduled_soc_percent=fallback_schedule.scheduled_soc_percent,
+            required_charge_percent=daylight_schedule.required_charge_percent,
+            infeasible=fallback_schedule.infeasible,
+            reason="daylight_lowest_effective_cost_with_ready_by_fallback",
+        ),
+        evidence,
+    )
+
+
+def _daylight_cost_inputs_complete(slot: Any) -> bool:
+    """Return whether a slot can be compared using complete effective-cost evidence."""
+    values = (
+        slot.import_price,
+        slot.export_price,
+        slot.pv_forecast_kw,
+        slot.baseline_load_forecast_kw,
+    )
+    return all(
+        value is not None
+        and not isinstance(value, bool)
+        and isfinite(float(value))
+        for value in values
+    )
 
 
 def _next_ready_by(created_at: Any, ready_by: str, local_timezone: str | None = None) -> Any:
