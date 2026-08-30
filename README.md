@@ -125,7 +125,7 @@ numeric live value resets it.
 | Entity | Purpose |
 | --- | --- |
 | **Armed** | Whether Energy Planner may currently issue commands and why; stale or incomplete reviewed evidence keeps it off even if an earlier arm request was persisted |
-| **Mode** | `review` while observing and `active` when automatic control is fully active |
+| **Mode** | `review` while observing, `recovery` while post-startup automatic recovery is running, and `active` when automatic control is fully active |
 | **Current state** | Live state of every configured area whose device-control switch is on |
 | **Next actions** | Next state, planned actions, and decision evidence for enabled control areas |
 | **Load forecast coverage score** | Current conservative-bound score, required threshold, and safety-bypass state |
@@ -224,7 +224,7 @@ Enphase planning can select configured self-consumption, backup, or AI profiles 
   failed, or uncommitted result disarms before one best-effort safe-state
   restore and creates one notification. **Automatic control remains on** because
   it represents retained intent; **Armed** is the actual command-authority gate,
-  and **Mode** reads `review` while safety has disarmed commands.
+  and **Mode** reads `recovery` while post-startup safety recovery is running.
 - Disarmed startup recovery retries every 30 seconds indefinitely. Three
   consecutive healthy awaited checks revalidate the production contract,
   reconcile safe state, re-arm, and verify a fresh active plan. Any unhealthy

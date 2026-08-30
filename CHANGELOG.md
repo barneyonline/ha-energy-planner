@@ -12,7 +12,9 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Mode now reports **Recovery** after Home Assistant startup while automatic
+  control is being safely recovered, without turning off the retained Automatic
+  control request.
 
 ### 🔧 Improvements
 
