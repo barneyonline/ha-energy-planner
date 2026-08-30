@@ -14,6 +14,7 @@ from .models import (
     ActionAsset,
     ActionKind,
     ConstraintViolation,
+    DaylightWindow,
     DecisionContext,
     DecisionSlot,
     EnergyPlan,
@@ -126,6 +127,14 @@ def _context_from_fixture(data: dict[str, Any]) -> DecisionContext:
         hvac_control=dict(data.get("hvac_control", {})),
         climate_zone_entities=list(data.get("climate_zone_entities", [])),
         input_issues=list(data.get("input_issues", [])),
+        local_timezone=str(data.get("local_timezone", "UTC")),
+        daylight_windows=[
+            DaylightWindow(
+                start=_parse_datetime(window["start"]),
+                end=_parse_datetime(window["end"]),
+            )
+            for window in data.get("daylight_windows", [])
+        ],
     )
 
 

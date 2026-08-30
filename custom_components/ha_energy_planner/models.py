@@ -107,6 +107,14 @@ class DecisionSlot:
 
 
 @dataclass(slots=True)
+class DaylightWindow:
+    """Local sunrise-to-sunset window expressed as absolute instants."""
+
+    start: datetime
+    end: datetime
+
+
+@dataclass(slots=True)
 class DecisionContext:
     """Planner input context for a rolling horizon."""
 
@@ -139,6 +147,7 @@ class DecisionContext:
     forecast_confidence: float = 1.0
     forecast_confidence_by_source: dict[str, float] = field(default_factory=dict)
     local_timezone: str = "UTC"
+    daylight_windows: list[DaylightWindow] = field(default_factory=list)
 
 
 @dataclass(slots=True)

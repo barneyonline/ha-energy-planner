@@ -43,6 +43,7 @@ from custom_components.ha_energy_planner.inputs import (
 from custom_components.ha_energy_planner.inputs import (
     _attribute_value,
     _combined_confidence,
+    _daylight_windows,
     _finite_float_or_none,
     _forecast_source_issued_at,
     _forecast_training_indices,
@@ -71,6 +72,54 @@ def test_climate_zone_configuration_normalizes_strings_lists_and_invalid_values(
         "input_boolean.two",
     ]
     assert inputs_module._split_entity_values(None) == []
+
+
+def test_daylight_windows_use_local_solar_events_and_horizon(monkeypatch: Any) -> None:
+    hass = FakeHass({}, "Australia/Melbourne")
+    start = datetime(2026, 6, 26, 22, 0, tzinfo=UTC)
+    horizon_end = datetime(2026, 6, 27, 10, 0, tzinfo=UTC)
+
+    def event(_hass: Any, kind: str, day: Any) -> datetime:
+        hour = 21 if kind == inputs_module.SUN_EVENT_SUNRISE else 7
+        event_day = day - timedelta(days=1) if hour == 21 else day
+        return datetime.combine(event_day, datetime.min.time(), tzinfo=UTC) + timedelta(hours=hour)
+
+    monkeypatch.setattr(inputs_module, "get_astral_event_date", event)
+
+    windows = _daylight_windows(hass, start, horizon_end)
+
+    assert windows == [
+        inputs_module.DaylightWindow(
+            start=datetime(2026, 6, 26, 21, 0, tzinfo=UTC),
+            end=datetime(2026, 6, 27, 7, 0, tzinfo=UTC),
+        )
+    ]
+
+
+def test_daylight_windows_skip_dates_without_solar_events(monkeypatch: Any) -> None:
+    hass = FakeHass({}, "UTC")
+    monkeypatch.setattr(inputs_module, "get_astral_event_date", lambda *_args: None)
+
+    assert _daylight_windows(
+        hass,
+        datetime(2026, 6, 27, tzinfo=UTC),
+        datetime(2026, 6, 28, tzinfo=UTC),
+    ) == []
+
+
+def test_daylight_windows_handle_invalid_timezone_and_solar_error(monkeypatch: Any) -> None:
+    hass = FakeHass({}, "Invalid/Timezone")
+
+    def failed_event(*_args: Any) -> datetime:
+        raise ValueError("solar event unavailable")
+
+    monkeypatch.setattr(inputs_module, "get_astral_event_date", failed_event)
+
+    assert _daylight_windows(
+        hass,
+        datetime(2026, 6, 27, tzinfo=UTC),
+        datetime(2026, 6, 28, tzinfo=UTC),
+    ) == []
 
 
 @dataclass(slots=True)
