@@ -67,10 +67,12 @@ from .const import (
     DEFAULT_OPTIONS,
     DOMAIN,
     MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS,
+    STATE_UNKNOWN_VALUES,
 )
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
+from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import update_forecast_calibration
@@ -117,6 +119,7 @@ _AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
 STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
+EV_AUTO_START_COMPENSATION_RETRY_SECONDS = 30
 STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
     {
         "waiting",
@@ -254,9 +257,10 @@ _ACTIVE_HVAC_MODES = frozenset(
     {"auto", "cool", "dry", "fan_only", "heat", "heat_cool"}
 )
 
-# Only state that is consumed as a decision input may request a replan. Device
-# command/result entities and high-frequency observation inputs deliberately do
-# not appear here; they are sampled on the scheduled planning boundary.
+# Only state that is consumed as a decision input may request a replan. The EV
+# charging-feedback entity is also observed so an unsolicited plug-in start can
+# be stopped promptly; other command/result and high-frequency observation
+# entities are sampled on the scheduled planning boundary.
 _DECISION_INPUT_ENTITY_KEYS = frozenset(
     {
         CONF_AMBER_IMPORT_PRICE,
@@ -272,6 +276,7 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_CLIMATE_TARGET_HIGH,
         CONF_PERSON_ENTITIES,
         CONF_EV_SOC,
+        CONF_EV_CHARGING,
         CONF_EV_CONNECTED,
         CONF_EV_SMART_CHARGING_READY_BY,
         CONF_EV_SMART_CHARGING_TARGET_SOC,
@@ -342,6 +347,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
+        self._ev_auto_start_retry_cancel: Callable[[], None] | None = None
+        self._ev_auto_start_compensation_pending = False
+        self._ev_auto_start_compensation_generation = 0
         self._planner_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
         self._device_control_lock = asyncio.Lock()
@@ -471,6 +479,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entry_data = self.entry_data
             now = dt_util.utcnow()
             executor = getattr(self, "executor", None)
+            charging_entity = entry_data.get(CONF_EV_CHARGING)
+            if charging_entity and event.data.get("entity_id") == charging_entity:
+                new_state = event.data.get("new_state")
+                new_value = getattr(new_state, "state", None)
+                if (
+                    new_value is not None
+                    and str(new_value).strip().lower() not in STATE_UNKNOWN_VALUES
+                    and ev_charging_state(new_value) is False
+                ):
+                    self._clear_ev_auto_start_compensation()
             pending_hvac_desired_state = getattr(
                 executor,
                 "pending_hvac_desired_state",
@@ -484,6 +502,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 pending_hvac_desired_state=pending_hvac_desired_state,
             ):
                 return
+            if _event_reports_ev_charging_started(entry_data, event):
+                if self.active_control and strict_bool(
+                    self.options.get(CONF_EV_CONTROL_ENABLED),
+                    default=False,
+                ):
+                    if _consume_expected_ev_start_feedback(executor, now):
+                        self._clear_ev_auto_start_compensation()
+                        return
+                    self._ev_auto_start_compensation_pending = True
+                    self.hass.async_create_task(
+                        self._async_compensate_ev_auto_start(
+                            require_unowned=True,
+                            generation=self._ev_auto_start_compensation_generation,
+                        )
+                    )
+                    return
             if _is_pending_main_hvac_manual_change(
                 entry_data,
                 event,
@@ -557,6 +591,30 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._schedule_debounced_refresh("state_change")
 
         self._unsub_listeners.append(async_track_state_change_event(self.hass, entity_ids, _handle_state_change))
+        charging_entity = entry_data.get(CONF_EV_CHARGING)
+        charging_state = self.hass.states.get(charging_entity) if charging_entity else None
+        if (
+            charging_state is not None
+            and ev_charging_state(charging_state.state) is True
+            and self.active_control
+            and strict_bool(
+                self.options.get(CONF_EV_CONTROL_ENABLED),
+                default=False,
+            )
+        ):
+            if _consume_expected_ev_start_feedback(
+                getattr(self, "executor", None),
+                dt_util.utcnow(),
+            ):
+                self._clear_ev_auto_start_compensation()
+            else:
+                self._ev_auto_start_compensation_pending = True
+                self.hass.async_create_task(
+                    self._async_compensate_ev_auto_start(
+                        require_unowned=True,
+                        generation=self._ev_auto_start_compensation_generation,
+                    )
+                )
         helper_entity = entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         helper_state = self.hass.states.get(helper_entity) if helper_entity else None
         helper_value = None if helper_state is None else str(helper_state.state).lower()
@@ -668,6 +726,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # A refresh task may already be queued even after its timer/listener is
         # cancelled. Suppress its eventual commit until setup is resumed.
         self._tearing_down = True
+        self._clear_ev_auto_start_compensation()
         if self._debounce_cancel is not None:
             self._debounce_cancel()
             self._debounce_cancel = None
@@ -1367,6 +1426,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         await self.async_arm_production_control("startup_auto_recovered")
         try:
+            await self._async_compensate_ev_auto_start(
+                require_unowned=False,
+                refresh=False,
+            )
             self._mark_forced_refresh("startup_auto_recovery_activation")
             await self.async_refresh()
         except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
@@ -1573,6 +1636,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 and strict_bool(previous_options.get(option_key), default=False)
                 and not strict_bool(current_options.get(option_key), default=False)
             ]
+            if any(area == "ev" for area, _executor_asset in disabled_device_controls):
+                self._clear_ev_auto_start_compensation()
             if planner_disabled or dry_run_enabled:
                 reason = "planner_disabled" if planner_disabled else "dry_run_enabled"
                 await self.async_restore_safe_state(reason, refresh=False)
@@ -1967,6 +2032,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
         finally:
             await self.async_arm_production_control(reason)
+            await self._async_compensate_ev_auto_start(require_unowned=False)
 
     async def async_set_active_control(self, enabled: bool) -> None:
         """Enable or safely return from automatic device control as one operation."""
@@ -2017,6 +2083,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options[CONF_DRY_RUN] = False
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
+        await self._async_compensate_ev_auto_start(require_unowned=False)
 
     async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
         """Enable or safely restore exactly one device control area."""
@@ -2097,9 +2164,127 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
         await self.async_handle_options_update()
+        if option_key == CONF_EV_CONTROL_ENABLED:
+            await self._async_compensate_ev_auto_start(require_unowned=False)
+
+    async def _async_compensate_ev_auto_start(
+        self,
+        *,
+        require_unowned: bool,
+        refresh: bool = True,
+        generation: int | None = None,
+    ) -> EVCommandResult | None:
+        """Stop charging that began outside Energy Planner control."""
+        result: EVCommandResult | None = None
+        async with self._command_lock:
+            if generation is not None and generation != getattr(
+                self,
+                "_ev_auto_start_compensation_generation",
+                0,
+            ):
+                return None
+            if (
+                getattr(self, "_tearing_down", False)
+                or not self.active_control
+                or not strict_bool(
+                    self.options.get(CONF_EV_CONTROL_ENABLED),
+                    default=False,
+                )
+            ):
+                self._clear_ev_auto_start_compensation()
+                return None
+            charging_entity = self.entry_data.get(CONF_EV_CHARGING)
+            charging_state = self.hass.states.get(charging_entity) if charging_entity else None
+            charging_value = getattr(charging_state, "state", None)
+            charging_active = (
+                ev_charging_state(charging_value)
+                if charging_value is not None
+                and str(charging_value).strip().lower() not in STATE_UNKNOWN_VALUES
+                else None
+            )
+            compensation_pending = getattr(
+                self,
+                "_ev_auto_start_compensation_pending",
+                False,
+            )
+            if charging_active is False:
+                self._clear_ev_auto_start_compensation()
+                return None
+            if charging_active is not True and not compensation_pending:
+                return None
+            if require_unowned and _ev_start_feedback_is_expected(
+                getattr(self, "executor", None),
+                dt_util.utcnow(),
+            ):
+                self._clear_ev_auto_start_compensation()
+                return None
+            self._ev_auto_start_compensation_pending = True
+            try:
+                result = await self.executor.async_compensate_ev_auto_start(
+                    getattr(self, "_last_decision_context", None)
+                )
+            except Exception:  # noqa: BLE001 - pending safety stop must retry after executor failures.
+                self._schedule_ev_auto_start_compensation_retry()
+                raise
+        if result.applied:
+            self._clear_ev_auto_start_compensation()
+        else:
+            self._schedule_ev_auto_start_compensation_retry()
+        self.async_update_listeners()
+        if refresh:
+            self._mark_forced_refresh("ev_auto_start_compensation")
+            await self.async_request_refresh()
+        return result
+
+    @callback
+    def _schedule_ev_auto_start_compensation_retry(self) -> None:
+        """Retry one confirmed unsolicited start without requiring a new event."""
+        if (
+            not getattr(self, "_ev_auto_start_compensation_pending", False)
+            or getattr(self, "_tearing_down", False)
+            or getattr(self, "_ev_auto_start_retry_cancel", None) is not None
+        ):
+            return
+        generation = getattr(self, "_ev_auto_start_compensation_generation", 0)
+
+        @callback
+        def _retry(_now: Any) -> None:
+            self._ev_auto_start_retry_cancel = None
+            if (
+                not self._ev_auto_start_compensation_pending
+                or getattr(self, "_tearing_down", False)
+                or generation
+                != getattr(self, "_ev_auto_start_compensation_generation", 0)
+            ):
+                return
+            self.hass.async_create_task(
+                self._async_compensate_ev_auto_start(
+                    require_unowned=True,
+                    generation=generation,
+                )
+            )
+
+        self._ev_auto_start_retry_cancel = async_call_later(
+            self.hass,
+            EV_AUTO_START_COMPENSATION_RETRY_SECONDS,
+            _retry,
+        )
+
+    @callback
+    def _clear_ev_auto_start_compensation(self) -> None:
+        """Clear a completed or no-longer-authorized compensation retry."""
+        self._ev_auto_start_compensation_generation = (
+            getattr(self, "_ev_auto_start_compensation_generation", 0) + 1
+        )
+        self._ev_auto_start_compensation_pending = False
+        cancel = getattr(self, "_ev_auto_start_retry_cancel", None)
+        if cancel is not None:
+            cancel()
+        self._ev_auto_start_retry_cancel = None
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
         """Disarm production control."""
+        self._clear_ev_auto_start_compensation()
         production = parse_production_state(self.store.data.get("production")).raw
         production.update(
             {
@@ -3845,6 +4030,44 @@ def _is_material_state_change(event: Any, options: dict[str, Any]) -> bool:
         return delta > 0
     threshold_percent = float(options.get(CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT, 0.0))
     return (delta / abs(old_number)) * 100 >= threshold_percent
+
+
+def _event_reports_ev_charging_started(
+    entry_data: dict[str, Any],
+    event: Any,
+) -> bool:
+    """Return whether mapped feedback newly reports active EV charging."""
+    if event.data.get("entity_id") != entry_data.get(CONF_EV_CHARGING):
+        return False
+    new_state = event.data.get("new_state")
+    if new_state is None or ev_charging_state(new_state.state) is not True:
+        return False
+    old_state = event.data.get("old_state")
+    return old_state is None or ev_charging_state(old_state.state) is not True
+
+
+def _ev_start_feedback_is_expected(
+    executor: Any,
+    now: datetime,
+) -> bool:
+    """Return whether charging feedback is expected from an issued EV start."""
+    expected_until = _parse_datetime_or_none(
+        getattr(executor, "ev_start_feedback_expected_until", None)
+    )
+    if expected_until is None:
+        return False
+    if expected_until.tzinfo is None:
+        expected_until = expected_until.replace(tzinfo=UTC)
+    normalized_now = now.replace(tzinfo=UTC) if now.tzinfo is None else now.astimezone(UTC)
+    return bool(expected_until >= normalized_now)
+
+
+def _consume_expected_ev_start_feedback(executor: Any, now: datetime) -> bool:
+    """Consume one bounded expectation after its charging feedback arrives."""
+    if not _ev_start_feedback_is_expected(executor, now):
+        return False
+    executor.ev_start_feedback_expected_until = None
+    return True
 
 
 def _material_attributes_changed(old_state: Any, new_state: Any) -> bool:
