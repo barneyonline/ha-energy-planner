@@ -5015,6 +5015,31 @@ def test_manual_ev_stop_uses_owned_topology_after_reconfigure() -> None:
     assert store.data["outcomes"][-1].service_target == "switch.old_charger"
 
 
+def test_ev_auto_start_compensation_uses_audited_stop_path() -> None:
+    hass = FakeHass({"input_boolean.ev_charger": "on"})
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={
+            CONF_EV_CHARGER: "input_boolean.ev_charger",
+            CONF_EV_CHARGING: "input_boolean.ev_charger",
+        },
+    )
+
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+
+    assert result.applied is True
+    assert hass.states.values["input_boolean.ev_charger"] == "off"
+    assert hass.services.calls == [
+        ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_charger"})
+    ]
+    outcome = store.data["outcomes"][-1]
+    assert outcome.action_id == "ev_auto_start_compensation"
+    assert outcome.kind == "ev_stop"
+    assert outcome.desired_state["charging_reason"] == "ev_auto_start_compensation"
+
+
 def test_compensated_manual_ev_stop_is_successful() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(
@@ -5208,6 +5233,7 @@ def test_manual_ev_start_rejects_control_without_safe_stop_path() -> None:
 
     assert result.applied is False
     assert result.reason == "ev_stop_control_unsupported"
+    assert executor.ev_start_feedback_expected_until is None
     assert hass.services.calls == []
     assert (
         hass.data.get("ha_energy_planner", {}).get(
@@ -5250,6 +5276,7 @@ def test_successful_manual_ev_start_is_owned_and_restorable() -> None:
     started = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
 
     assert started.applied is True
+    assert executor.ev_start_feedback_expected_until is not None
     assert store.data["ownership"]["ev_smart_charging_state"][CONF_EV_CHARGER] == "off"
     assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"ev-a"}
 
@@ -5293,6 +5320,7 @@ def test_manual_ev_start_adopts_and_restores_already_active_charger() -> None:
     assert started.applied is True
     assert started.reason == "already_in_desired_state"
     assert started.command_sent is False
+    assert executor.ev_start_feedback_expected_until is None
     assert store.data["ownership"]["ev_smart_charging_state"] == {
         CONF_EV_CHARGER: "on",
         CONF_EV_CONNECTED: "on",
@@ -5412,6 +5440,7 @@ def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
     reservation = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
     assert reservation["retain_when_unloaded"] is True
     assert store.data["control_pause"]["reason"] == "ev_charging_confirmation_timeout"
+    assert executor.ev_start_feedback_expected_until is not None
     assert isinstance(store.data["command_rate_limits"]["ev:ev_start"], datetime)
     assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
     assert store.data["outcomes"][-1].action_id == "manual_ev_start"
@@ -5467,6 +5496,7 @@ def test_manual_ev_rolled_back_start_clears_provisional_recovery_state(
     result = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
 
     assert result.rollback_succeeded is True
+    assert executor.ev_start_feedback_expected_until is None
     assert store.data["ownership"] == {}
     assert store.data["ev_grid_reservation"] == {"active": False}
     assert hass.data["ha_energy_planner"]["ev_grid_reservations"] == {}
@@ -7258,5 +7288,9 @@ def test_ev_grid_reservation_defensive_branches() -> None:
         )
         is False
     )
+    assert executor.ev_start_feedback_expected_until is None
+    executor._expect_ev_start_feedback()
+    assert executor.ev_start_feedback_expected_until is not None
     asyncio.run(executor._async_clear_provisional_ev_ownership())
+    assert executor.ev_start_feedback_expected_until is None
     assert executor.store.data["ownership"] == {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}

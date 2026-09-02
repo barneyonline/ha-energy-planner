@@ -49,8 +49,11 @@ from custom_components.ha_energy_planner.coordinator import (
     _bool_state_value,
     _bounded_reason,
     _configured_entity_ids,
+    _consume_expected_ev_start_feedback,
     _coupled_zone_entity_ids_match,
     _decision_input_fingerprint,
+    _ev_start_feedback_is_expected,
+    _event_reports_ev_charging_started,
     _expired_manual_hvac_state,
     _float_state_value,
     _hvac_control_from_ownership,
@@ -527,6 +530,7 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
             "ai_task_entity": "ai_task.local",
             "daikin_power_entity": "sensor.daikin_power",
             "ev_smart_charging_entity": "switch.ev_control",
+            "ev_charging_entity": "sensor.ev_charging",
             "ev_smart_charging_ready_by_entity": "select.ev_ready_by",
             "pv_forecast_secondary_entity": "sensor.pv_tomorrow",
             "empty_entity": "",
@@ -536,9 +540,49 @@ def test_configured_entity_ids_excludes_services_and_splits_lists() -> None:
         "person.cath",
         "person.james",
         "select.ev_ready_by",
+        "sensor.ev_charging",
         "sensor.import_price",
         "sensor.pv_tomorrow",
     ]
+
+
+def test_ev_charging_started_requires_mapped_new_active_feedback() -> None:
+    entry_data = {CONF_EV_CHARGING: "sensor.ev_charging"}
+
+    assert _event_reports_ev_charging_started(
+        entry_data,
+        FakeEvent("sensor.ev_charging", "connected", "charging"),
+    )
+    assert not _event_reports_ev_charging_started(
+        entry_data,
+        FakeEvent("sensor.ev_charging", "on", "charging"),
+    )
+    assert not _event_reports_ev_charging_started(
+        entry_data,
+        FakeEvent("sensor.other", "connected", "charging"),
+    )
+    assert not _event_reports_ev_charging_started(
+        entry_data,
+        FakeEvent("sensor.ev_charging", "charging", "connected"),
+    )
+
+
+def test_expected_ev_start_feedback_is_bounded_and_consumed_once() -> None:
+    now = datetime.now(UTC)
+    executor = SimpleNamespace(
+        ev_start_feedback_expected_until=now + timedelta(minutes=1)
+    )
+
+    assert _ev_start_feedback_is_expected(executor, now)
+    assert _consume_expected_ev_start_feedback(executor, now)
+    assert executor.ev_start_feedback_expected_until is None
+    assert not _consume_expected_ev_start_feedback(executor, now)
+
+    executor.ev_start_feedback_expected_until = now - timedelta(seconds=1)
+    assert not _ev_start_feedback_is_expected(executor, now)
+
+    executor.ev_start_feedback_expected_until = datetime.now() + timedelta(minutes=1)
+    assert _ev_start_feedback_is_expected(executor, now)
 
 
 @pytest.mark.parametrize(
@@ -797,9 +841,11 @@ class FakeExecutor:
         self.hvac_release_preserved_zones: list[str | None] = []
         self.hvac_release_preserved_main: list[bool] = []
         self.pending_hvac_desired_state: dict[str, object] | None = None
+        self.ev_start_feedback_expected_until: datetime | None = None
         self.pending_hvac_manual_overrides = 0
         self.pending_hvac_manual_zone_overrides: list[str] = []
         self.manual_ev_commands: list[tuple[bool, object, dict[str, object], dict[str, object]]] = []
+        self.ev_auto_start_compensations: list[object] = []
         self.reservation_syncs = 0
         self.reservation_persists = 0
         self.startup_recovery_notifications: list[str] = []
@@ -846,6 +892,10 @@ class FakeExecutor:
 
     async def async_manual_ev_charging(self, enabled: bool, context: object) -> object:
         self.manual_ev_commands.append((enabled, context, dict(self.options), dict(self.entry_data)))
+        return SimpleNamespace(applied=True)
+
+    async def async_compensate_ev_auto_start(self, context: object) -> object:
+        self.ev_auto_start_compensations.append(context)
         return SimpleNamespace(applied=True)
 
     def sync_ev_grid_reservation(self) -> None:
@@ -2010,6 +2060,193 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     assert coordinator._refresh_generation == 1
     assert coordinator._debounce_cancel is not None
     assert len(scheduled) >= 2
+
+
+def test_start_listeners_queues_stop_for_unsolicited_ev_charging(
+    monkeypatch: object,
+) -> None:
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "connected"}),
+        store_data={"production": {"armed": True}},
+    )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    coordinator.async_start_listeners()
+    callbacks[0](FakeEvent("sensor.ev_charging", "connected", "charging"))
+
+    compensate.assert_called_once_with(require_unowned=True, generation=0)
+    assert len(coordinator.hass.created_tasks) == 1
+    assert coordinator._ev_auto_start_compensation_pending is True
+
+
+def test_start_listeners_queues_stop_for_initial_active_charging(
+    monkeypatch: object,
+) -> None:
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: lambda: None,
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    coordinator.async_start_listeners()
+
+    compensate.assert_called_once_with(require_unowned=True, generation=0)
+    assert len(coordinator.hass.created_tasks) == 1
+    assert coordinator._ev_auto_start_compensation_pending is True
+
+
+def test_start_listeners_initial_expected_start_clears_pending_retry(
+    monkeypatch: object,
+) -> None:
+    cancelled: list[bool] = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: lambda: None,
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.executor.ev_start_feedback_expected_until = datetime.now(UTC) + timedelta(
+        minutes=1
+    )
+    coordinator._ev_auto_start_compensation_pending = True
+    coordinator._ev_auto_start_retry_cancel = lambda: cancelled.append(True)
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    coordinator.async_start_listeners()
+
+    compensate.assert_not_called()
+    assert coordinator.hass.created_tasks == []
+    assert coordinator.executor.ev_start_feedback_expected_until is None
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert coordinator._ev_auto_start_retry_cancel is None
+    assert cancelled == [True]
+
+
+def test_start_listeners_does_not_stop_expected_planner_ev_start(
+    monkeypatch: object,
+) -> None:
+    callbacks: list[object] = []
+    cancelled: list[bool] = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "connected"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.executor.ev_start_feedback_expected_until = datetime.now(UTC) + timedelta(
+        minutes=1
+    )
+    coordinator._ev_auto_start_compensation_pending = True
+    coordinator._ev_auto_start_retry_cancel = lambda: cancelled.append(True)
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    coordinator.async_start_listeners()
+    callbacks[0](FakeEvent("sensor.ev_charging", "connected", "charging"))
+
+    compensate.assert_not_called()
+    assert coordinator.hass.created_tasks == []
+    assert coordinator.executor.ev_start_feedback_expected_until is None
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert coordinator._ev_auto_start_retry_cancel is None
+    assert cancelled == [True]
+
+
+def test_start_listeners_stops_replug_auto_start_with_retained_ownership(
+    monkeypatch: object,
+) -> None:
+    callbacks: list[object] = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "connected"}),
+        store_data={
+            "production": {"armed": True},
+            "ownership": {
+                "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+                "ev_smart_charging_command_entity_id": "button.ev_start",
+                "ev_smart_charging_control_topology": {
+                    CONF_EV_CHARGER: "button.ev_start"
+                },
+            },
+        },
+    )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    coordinator.async_start_listeners()
+    callbacks[0](FakeEvent("sensor.ev_charging", "connected", "charging"))
+
+    compensate.assert_called_once_with(require_unowned=True, generation=0)
+    assert len(coordinator.hass.created_tasks) == 1
 
 
 def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monkeypatch: object) -> None:
@@ -4816,6 +5053,304 @@ def test_native_ev_settings_persist_and_manual_control_replans() -> None:
     assert refreshes == ["refresh"] * 4
 
 
+def test_active_ev_control_compensates_current_auto_started_charging() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._last_decision_context = SimpleNamespace(plan_id="latest")
+    coordinator.async_update_listeners = lambda: None
+
+    result = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+
+    assert result.applied is True
+    assert coordinator.executor.ev_auto_start_compensations == [
+        coordinator._last_decision_context
+    ]
+    assert coordinator.refresh_requested == 1
+    assert coordinator._pending_refresh_trigger == "ev_auto_start_compensation"
+    assert coordinator._ev_auto_start_compensation_pending is False
+
+
+def test_failed_ev_auto_start_compensation_retries_until_applied(
+    monkeypatch: object,
+) -> None:
+    scheduled: list[tuple[float, object]] = []
+    queued_tasks: list[object] = []
+    cancelled: list[bool] = []
+
+    def fake_async_call_later(hass: object, delay: float, action: object) -> object:
+        scheduled.append((delay, action))
+        return lambda: cancelled.append(True)
+
+    monkeypatch.setattr(coordinator_module, "async_call_later", fake_async_call_later)
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.async_update_listeners = lambda: None
+    coordinator.hass.async_create_task = lambda task: queued_tasks.append(task)
+    coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
+        side_effect=[
+            SimpleNamespace(applied=False),
+            SimpleNamespace(applied=False),
+            SimpleNamespace(applied=True),
+        ]
+    )
+
+    first = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+
+    assert first.applied is False
+    assert coordinator._ev_auto_start_compensation_pending is True
+    assert scheduled[0][0] == coordinator_module.EV_AUTO_START_COMPENSATION_RETRY_SECONDS
+    coordinator._schedule_ev_auto_start_compensation_retry()
+    assert len(scheduled) == 1
+
+    coordinator._clear_ev_auto_start_compensation()
+    assert cancelled == [True]
+    scheduled[0][1](None)
+    assert queued_tasks == []
+
+    second = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+    assert second.applied is False
+    scheduled[1][1](None)
+    assert len(queued_tasks) == 1
+
+    asyncio.run(queued_tasks.pop())
+
+    assert coordinator.executor.async_compensate_ev_auto_start.await_count == 3
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert coordinator._ev_auto_start_retry_cancel is None
+    assert coordinator.refresh_requested == 3
+
+
+def test_queued_ev_auto_start_retry_is_invalidated_when_compensation_clears(
+    monkeypatch: object,
+) -> None:
+    scheduled: list[tuple[float, object]] = []
+    queued_tasks: list[object] = []
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_call_later",
+        lambda hass, delay, action: scheduled.append((delay, action)) or (lambda: None),
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.async_update_listeners = lambda: None
+    coordinator.hass.async_create_task = lambda task: queued_tasks.append(task)
+    coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
+        return_value=SimpleNamespace(applied=False)
+    )
+
+    asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+    scheduled[0][1](None)
+    assert len(queued_tasks) == 1
+
+    coordinator.executor.ev_start_feedback_expected_until = datetime.now(UTC) + timedelta(
+        minutes=1
+    )
+    assert _consume_expected_ev_start_feedback(
+        coordinator.executor,
+        datetime.now(UTC),
+    )
+    coordinator._clear_ev_auto_start_compensation()
+    asyncio.run(queued_tasks.pop())
+
+    assert coordinator.executor.async_compensate_ev_auto_start.await_count == 1
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert coordinator._ev_auto_start_retry_cancel is None
+
+
+def test_inactive_ev_feedback_cancels_pending_auto_start_retry(
+    monkeypatch: object,
+) -> None:
+    callbacks: list[object] = []
+    cancelled: list[bool] = []
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_call_later",
+        lambda hass, delay, action: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "connected"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._ev_auto_start_compensation_pending = True
+    coordinator._ev_auto_start_retry_cancel = lambda: cancelled.append(True)
+
+    coordinator.async_start_listeners()
+    callbacks[0](FakeEvent("sensor.ev_charging", "charging", "unavailable"))
+
+    assert coordinator._ev_auto_start_compensation_pending is True
+    assert coordinator._ev_auto_start_retry_cancel is not None
+    assert cancelled == []
+
+    callbacks[0](FakeEvent("sensor.ev_charging", "charging", "connected"))
+
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert coordinator._ev_auto_start_retry_cancel is None
+    assert cancelled == [True]
+
+    coordinator._ev_auto_start_compensation_pending = True
+    coordinator._ev_auto_start_retry_cancel = lambda: cancelled.append(True)
+    result = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+
+    assert result is None
+    assert coordinator._ev_auto_start_compensation_pending is False
+    assert cancelled == [True, True]
+
+
+@pytest.mark.parametrize("feedback_state", ["unknown", "unavailable"])
+def test_pending_ev_auto_start_compensation_retries_with_indeterminate_feedback(
+    monkeypatch: object,
+    feedback_state: str,
+) -> None:
+    scheduled: list[tuple[float, object]] = []
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_call_later",
+        lambda hass, delay, action: scheduled.append((delay, action)) or (lambda: None),
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": feedback_state}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.async_update_listeners = lambda: None
+    coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
+        return_value=SimpleNamespace(applied=False)
+    )
+    coordinator._ev_auto_start_compensation_pending = True
+
+    result = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+
+    assert result.applied is False
+    coordinator.executor.async_compensate_ev_auto_start.assert_awaited_once_with(None)
+    assert coordinator._ev_auto_start_compensation_pending is True
+    assert scheduled[0][0] == coordinator_module.EV_AUTO_START_COMPENSATION_RETRY_SECONDS
+
+
+def test_ev_auto_start_compensation_exception_schedules_retry(
+    monkeypatch: object,
+) -> None:
+    scheduled: list[tuple[float, object]] = []
+    monkeypatch.setattr(
+        coordinator_module,
+        "async_call_later",
+        lambda hass, delay, action: scheduled.append((delay, action)) or (lambda: None),
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
+        side_effect=RuntimeError("store unavailable")
+    )
+
+    with pytest.raises(RuntimeError, match="store unavailable"):
+        asyncio.run(
+            coordinator._async_compensate_ev_auto_start(require_unowned=False)
+        )
+
+    assert coordinator._ev_auto_start_compensation_pending is True
+    assert scheduled[0][0] == coordinator_module.EV_AUTO_START_COMPENSATION_RETRY_SECONDS
+    assert coordinator.refresh_requested == 0
+
+
+def test_ev_auto_start_compensation_requires_armed_master_control() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={CONF_EV_CONTROL_ENABLED: True},
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+    )
+
+    result = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=False)
+    )
+
+    assert result is None
+    assert coordinator.executor.ev_auto_start_compensations == []
+    assert coordinator.refresh_requested == 0
+
+
+def test_ev_auto_start_compensation_preserves_expected_start_feedback() -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.executor.ev_start_feedback_expected_until = datetime.now(UTC) + timedelta(
+        minutes=1
+    )
+
+    result = asyncio.run(
+        coordinator._async_compensate_ev_auto_start(require_unowned=True)
+    )
+
+    assert result is None
+    assert coordinator.executor.ev_auto_start_compensations == []
+    assert coordinator.refresh_requested == 0
+
+
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
@@ -5158,6 +5693,39 @@ def test_combined_active_control_respects_selected_areas_and_arms(monkeypatch: o
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.store.data["production"]["armed_reason"] == "automatic_control_enabled"
     assert coordinator.active_control is True
+
+
+def test_enabling_master_control_compensates_running_ev(
+    monkeypatch: object,
+) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_EV_CHARGING: "sensor.ev_charging",
+        },
+        options={
+            CONF_PLANNER_ENABLED: False,
+            CONF_DRY_RUN: True,
+            CONF_EV_CONTROL_ENABLED: True,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"safe_to_activate_now": True},
+    )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    asyncio.run(coordinator.async_set_active_control(True))
+
+    compensate.assert_awaited_once_with(require_unowned=False)
 
 
 def test_effective_control_requires_active_intent_and_current_preflight(monkeypatch: object) -> None:
@@ -5508,6 +6076,54 @@ def test_device_control_enable_while_active_preflights_without_disarming(monkeyp
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.executor.device_restores == []
     assert coordinator.active_control is True
+
+
+def test_enabling_ev_control_while_active_compensates_running_charger(
+    monkeypatch: object,
+) -> None:
+    class ConfigEntries:
+        def async_update_entry(self, entry: FakeEntry, *, options: dict[str, object]) -> None:
+            entry.options = options
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_EV_CHARGER: "switch.ev",
+            CONF_EV_CHARGING: "sensor.ev_charging",
+        },
+        options={
+            CONF_PLANNER_ENABLED: True,
+            CONF_DRY_RUN: False,
+            CONF_EV_CONTROL_ENABLED: False,
+        },
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator.hass.config_entries = ConfigEntries()
+    monkeypatch.setattr(
+        coordinator_module,
+        "_control_area_report",
+        lambda entry_data, options: {"details": {"ev": {"configured": True}}},
+    )
+    monkeypatch.setattr(
+        coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": True,
+            "control_areas": {
+                "ready": ["ev"],
+                "available": ["ev"],
+                "confidence_eligible": ["ev"],
+            },
+        },
+    )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
+
+    asyncio.run(
+        coordinator.async_set_device_control(CONF_EV_CONTROL_ENABLED, True)
+    )
+
+    compensate.assert_awaited_once_with(require_unowned=False)
 
 
 @pytest.mark.parametrize(
@@ -6368,6 +6984,8 @@ def test_operator_arm_cancels_disarmed_recovery_before_granting_authority(
         "build_preflight_report",
         lambda hass, coordinator_arg: {"safe_to_activate_now": True},
     )
+    compensate = AsyncMock(return_value=None)
+    coordinator._async_compensate_ev_auto_start = compensate
 
     asyncio.run(coordinator.async_operator_arm_production_control("button_pressed"))
 
@@ -6378,6 +6996,7 @@ def test_operator_arm_cancels_disarmed_recovery_before_granting_authority(
     assert coordinator._startup_auto_recovery_authorized is False
     assert coordinator.executor.restored == []
     assert coordinator.executor.startup_recovery_dismissals == 1
+    compensate.assert_awaited_once_with(require_unowned=False)
 
 
 def test_operator_arm_rejects_stale_evidence_without_cancelling_recovery(
@@ -7071,6 +7690,9 @@ def _coordinator_for_runtime_services(
     coordinator.refresh_requested = 0
     coordinator._debounce_cancel = None
     coordinator._boundary_cancel = None
+    coordinator._ev_auto_start_retry_cancel = None
+    coordinator._ev_auto_start_compensation_pending = False
+    coordinator._ev_auto_start_compensation_generation = 0
     coordinator._unsub_listeners = []
 
     async def request_refresh() -> None:

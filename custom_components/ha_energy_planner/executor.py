@@ -140,6 +140,7 @@ class Executor:
         self.entry_id = entry_id
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
+        self.ev_start_feedback_expected_until: datetime | None = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
         self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
 
@@ -171,13 +172,42 @@ class Executor:
         context: DecisionContext | None,
     ) -> EVCommandResult:
         """Apply an explicit EV command with shared capacity and recovery tracking."""
+        return await self._async_set_ev_charging(
+            enabled,
+            context,
+            action_id="manual_ev_start" if enabled else "manual_ev_stop",
+            charging_reason="manual_start" if enabled else "manual_stop",
+        )
+
+    async def async_compensate_ev_auto_start(
+        self,
+        context: DecisionContext | None,
+    ) -> EVCommandResult:
+        """Stop an unsolicited charger auto-start through the audited EV path."""
+        return await self._async_set_ev_charging(
+            False,
+            context,
+            action_id="ev_auto_start_compensation",
+            charging_reason="ev_auto_start_compensation",
+        )
+
+    async def _async_set_ev_charging(
+        self,
+        enabled: bool,
+        context: DecisionContext | None,
+        *,
+        action_id: str,
+        charging_reason: str,
+    ) -> EVCommandResult:
+        """Apply one EV command with shared capacity and recovery tracking."""
         now = dt_util.utcnow()
         action = SimpleNamespace(
-            action_id="manual_ev_start" if enabled else "manual_ev_stop",
+            action_id=action_id,
             asset=ActionAsset.EV,
             kind=ActionKind.EV_START if enabled else ActionKind.EV_STOP,
             desired_state={
                 "charging_required_now": enabled,
+                "charging_reason": charging_reason,
                 "projected_load_kw_now": (
                     _positive_float(self.options.get(CONF_EV_CHARGE_RATE_KW)) if enabled else 0.0
                 ),
@@ -276,15 +306,20 @@ class Executor:
                 ev_entry_data,
             )
             await self._async_flush_provisional_state()
+            self._expect_ev_start_feedback()
         owned_manual_stop = bool(
             not enabled and (self._owned_ev_control_topology() is not None or isinstance(previous_reservation, dict))
         )
+        if not enabled:
+            self.ev_start_feedback_expected_until = None
         result = await EVSmartChargingAdapter(
             self.hass,
             ev_entry_data,
             confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
             confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
         ).async_set_charging(enabled)
+        if enabled:
+            self._reconcile_ev_start_feedback_expectation(result)
         if not enabled:
             result = _normalized_ev_stop_result(
                 result,
@@ -612,12 +647,17 @@ class Executor:
                     ev_entry_data,
                 )
                 await self._async_flush_provisional_state()
+                self._expect_ev_start_feedback()
+            else:
+                self.ev_start_feedback_expected_until = None
             ev_result = await EVSmartChargingAdapter(
                 self.hass,
                 ev_entry_data,
                 confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                 confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
             ).async_execute(action)
+            if _ev_action_wants_power(action):
+                self._reconcile_ev_start_feedback_expectation(ev_result)
             no_change = ev_result.reason == "already_in_desired_state"
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             stored_ownership = self.store.data.get("ownership")
@@ -2340,14 +2380,36 @@ class Executor:
         # command and must be cleared if its reservation is safely released.
         return True
 
+    def _expect_ev_start_feedback(self) -> None:
+        """Expect one charging transition from the immediately following start."""
+        confirmation_seconds = max(
+            float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
+            0.0,
+        ) * (
+            max(int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)), 0) + 1
+        )
+        self.ev_start_feedback_expected_until = dt_util.utcnow() + max(
+            CONFLICT_DETECTION_WINDOW,
+            timedelta(seconds=confirmation_seconds + 30),
+        )
+
     async def _async_clear_provisional_ev_ownership(self) -> None:
         """Remove actuator-only ownership after a start is proven not to own power."""
+        self.ev_start_feedback_expected_until = None
         ownership = dict(self.store.data.get("ownership", {}))
         if ownership.get("ev_smart_charging_state"):
             return
         ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
         ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
         await self.store.async_save_ownership(ownership)
+
+    def _reconcile_ev_start_feedback_expectation(
+        self,
+        result: EVCommandResult,
+    ) -> None:
+        """Clear start feedback that cannot follow the completed command."""
+        if not result.command_sent or result.rollback_succeeded is True:
+            self.ev_start_feedback_expected_until = None
 
     async def _async_flush_provisional_state(self) -> None:
         """Make provisional recovery state durable before a device command."""
