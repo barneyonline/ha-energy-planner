@@ -22,6 +22,32 @@
 
 - None
 
+## 0.9.18 - 2026-09-02
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- When Automatic control is armed and EV control is enabled, Energy Planner now
+  stops charger-initiated charging after plug-in. Failed or unconfirmed stops
+  retry every 30 seconds through temporarily unavailable feedback, while
+  planner-issued and manual Energy Planner starts remain ownership-tracked and
+  are not mistaken for unsolicited charging.
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 0.9.17 - 2026-08-30
 
 ### 🚧 Breaking changes
