@@ -312,13 +312,20 @@ def test_request_ai_advice_button_uses_current_planner_advisory() -> None:
     assert description.available_fn(coordinator) is False
     coordinator.entry_data[CONF_AI_TASK_ENTITY] = "ai_task.local"
     coordinator.hass.states = SimpleNamespace(
-        get=lambda entity_id: SimpleNamespace(state="ready")
+        get=lambda entity_id: SimpleNamespace(state="unknown")
         if entity_id == "ai_task.local"
         else None
     )
     assert description.available_fn(coordinator) is True
     entity = PlannerButton(coordinator, description)
     assert entity.available is True
+
+    coordinator.hass.states = SimpleNamespace(
+        get=lambda entity_id: SimpleNamespace(state="unavailable")
+        if entity_id == "ai_task.local"
+        else None
+    )
+    assert description.available_fn(coordinator) is False
 
     asyncio.run(PlannerButton.async_press(button))
 

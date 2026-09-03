@@ -452,7 +452,8 @@ def _entity_unavailable(entity_id: str, state_value: Any) -> bool:
     """Return true when a configured entity cannot be used for preflight."""
     state = str(state_value or "").lower()
     domain = entity_id.split(".", 1)[0]
-    if domain in {"button", "input_button"}:
+    # AI Tasks and momentary controls can remain unknown until first use.
+    if domain in {"ai_task", "button", "input_button"}:
         return state == "unavailable"
     return state in {"unknown", "unavailable"}
 
