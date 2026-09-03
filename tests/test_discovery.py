@@ -168,6 +168,40 @@ def test_discovery_treats_unknown_button_controls_as_available() -> None:
     assert report.ev.issues == []
 
 
+def test_discovery_treats_unknown_ai_task_as_available() -> None:
+    hass = FakeHass(
+        {"ai_task.local": "unknown"},
+        {("ai_task", "generate_data")},
+    )
+
+    report = CapabilityDiscovery(
+        hass,
+        {CONF_AI_TASK_ENTITY: "ai_task.local"},
+    ).inspect()
+
+    assert report.ai.supported is True
+    assert report.ai.issues == []
+    assert report.ai.details["available"] is True
+    assert report.ai.details["reason"] is None
+
+
+def test_discovery_rejects_unavailable_ai_task() -> None:
+    hass = FakeHass(
+        {"ai_task.local": "unavailable"},
+        {("ai_task", "generate_data")},
+    )
+
+    report = CapabilityDiscovery(
+        hass,
+        {CONF_AI_TASK_ENTITY: "ai_task.local"},
+    ).inspect()
+
+    assert report.ai.supported is False
+    assert report.ai.issues == ["ai_task_entity_unavailable"]
+    assert report.ai.details["available"] is False
+    assert report.ai.details["reason"] == "ai_task_entity_unavailable"
+
+
 def test_state_missing_fails_closed_without_state_registry() -> None:
     assert _state_missing(object(), "climate.home") is True
 

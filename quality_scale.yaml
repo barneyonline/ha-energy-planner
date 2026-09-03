@@ -271,14 +271,16 @@ rules:
         - README.md
   entity-unavailable:
     status: done
-    comment: Required input health is surfaced as a binary sensor and unsafe inputs block execution.
+    comment: Required input health is surfaced as a binary sensor and unsafe inputs block execution. AI Task discovery permits the valid first-use unknown state while still rejecting missing and explicitly unavailable providers.
     references:
       code:
         - custom_components/ha_energy_planner/binary_sensor.py
         - custom_components/ha_energy_planner/inputs.py
+        - custom_components/ha_energy_planner/discovery.py
       tests:
         - tests/test_binary_sensor.py
         - tests/test_inputs.py
+        - tests/test_discovery.py
         - tests/fixtures/replay/stale_input_suppresses_control.json
   integration-owner:
     status: done

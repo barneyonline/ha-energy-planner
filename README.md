@@ -118,7 +118,10 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - Enphase control is limited to the verified profiles exposed by the mapped Home Assistant integration; it does not directly command battery charge or discharge power.
 - EV control requires a mapped target-SOC entity and confirmed charger feedback. Multiple EVs require separate Energy Planner entries.
 - Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely.
-- Optional AI explanations depend on a configured Home Assistant `ai_task` entity and remain advisory only.
+- Optional AI explanations depend on a configured Home Assistant `ai_task`
+  entity and remain advisory only. A newly created AI Task with state `unknown`
+  can be used immediately; only a missing or explicitly `unavailable` provider
+  blocks Explain.
 - Bypassing safety gates is an advanced, default-off setting that reduces protection and should be used only with an explicit understanding of the risk.
 
 ## Troubleshooting

@@ -327,7 +327,8 @@ def _state_missing(hass: HomeAssistant, entity_id: str) -> bool:
     if state is None:
         return True
     domain = entity_id.split(".", 1)[0]
-    if domain in {"button", "input_button"}:
+    # AI Tasks and momentary controls can remain unknown until first use.
+    if domain in {"ai_task", "button", "input_button"}:
         return bool(state.state == "unavailable")
     return bool(state.state in {"unknown", "unavailable"})
 
