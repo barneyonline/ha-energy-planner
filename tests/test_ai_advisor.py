@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Any
 
 from custom_components.ha_energy_planner.ai_advisor import (
@@ -442,6 +443,24 @@ def test_local_ai_advisor_skips_provider_entity_not_ready() -> None:
                 CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
                 CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
             },
+            DEFAULT_OPTIONS,
+        ).async_get_advice(_context(), _plan())
+    )
+
+    assert result.status == "skipped"
+    assert result.rejected_reason == "ai_provider_not_ready"
+    assert hass.services.calls == []
+
+
+def test_local_ai_advisor_skips_explicitly_unavailable_provider_entity() -> None:
+    hass = FakeHass({})
+    hass.states = SimpleNamespace(
+        get=lambda entity_id: SimpleNamespace(state="unavailable")
+    )
+    result = asyncio.run(
+        LocalAIAdvisor(
+            hass,
+            {CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task"},
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )

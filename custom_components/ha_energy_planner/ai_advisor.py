@@ -127,7 +127,7 @@ class LocalAIAdvisor:
         if not service_name:
             return _with_provider(_rejected_result("skipped", "ai_service_not_configured", None), entry_data)
         domain, service = service_name.split(".", 1)
-        if _provider_entity_missing(self.hass, service_name, entry_data):
+        if _provider_entity_unavailable(self.hass, entry_data):
             return _with_provider(_rejected_result("skipped", "ai_provider_not_ready", service_name), entry_data)
         has_service = getattr(self.hass.services, "has_service", None)
         if callable(has_service) and not has_service(domain, service):
@@ -433,13 +433,16 @@ def _with_provider(result: AIAdviceResult, entry_data: Mapping[str, Any]) -> AIA
     return result
 
 
-def _provider_entity_missing(hass: Any, service_name: str, entry_data: Mapping[str, Any]) -> bool:
-    """Return whether the selected provider entity has not been registered yet."""
+def _provider_entity_unavailable(
+    hass: Any,
+    entry_data: Mapping[str, Any],
+) -> bool:
+    """Return whether the selected provider entity cannot accept a request."""
     entity_id = str(entry_data.get(CONF_AI_TASK_ENTITY) or "")
-
-    states = getattr(hass, "states", None)
-    get_state = getattr(states, "get", None)
-    return bool(entity_id) and callable(get_state) and get_state(entity_id) is None
+    state = hass.states.get(entity_id)
+    if state is None:
+        return True
+    return str(getattr(state, "state", "") or "").lower() == "unavailable"
 
 
 def _parse_response(response: Any) -> Any:
