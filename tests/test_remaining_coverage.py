@@ -157,6 +157,7 @@ def test_remaining_preflight_helpers() -> None:
                 "button.ev_start": "unknown",
                 "input_button.ev_stop": "unknown",
                 "button.ev_unavailable": "unavailable",
+                "ai_task.local": "unknown",
             }
         ),
         services=Services({("ok", "service")}),
@@ -169,6 +170,7 @@ def test_remaining_preflight_helpers() -> None:
         "ev_smart_charging_start_entity": "button.ev_start",
         "ev_smart_charging_stop_entity": "input_button.ev_stop",
         "ev_unavailable_entity": "button.ev_unavailable",
+        "ai_task_entity": "ai_task.local",
         "person_entities": ["person.a", "bad"],
         "service_key": "badservice",
         "ai_advisor_service": "ok.service",

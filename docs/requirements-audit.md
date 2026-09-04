@@ -718,8 +718,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   dry-run-only installations keep discovery advisory and cannot claim active
   production readiness without an enabled controllable area. AI availability
   requires both the configured `ai_task` entity and registered
-  `ai_task.generate_data`; sensor and preflight evidence expose configured,
-  effective availability, and a stable reason while Explain remains advisory.
+  `ai_task.generate_data`. A newly registered AI Task's initial `unknown` state
+  is requestable, while a missing entity or explicit `unavailable` state remains
+  blocked; sensor and preflight evidence expose configured, effective
+  availability, and a stable reason while Explain remains advisory.
 - Preflight distinguishes historical dry-run evidence from current activation
   safety. `safe_to_activate_now` additionally requires a current healthy,
   non-zero-confidence plan, a recent successful coordinator refresh, at least

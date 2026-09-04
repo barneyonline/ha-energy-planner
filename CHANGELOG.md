@@ -12,7 +12,9 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Newly created AI Task providers can now be used by Explain while their initial
+  Home Assistant state is `unknown`; missing and explicitly `unavailable`
+  providers remain blocked.
 
 ### 🔧 Improvements
 
