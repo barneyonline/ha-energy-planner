@@ -12,6 +12,28 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.0.0 - 2026-09-05
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Disarming restores planner-owned HVAC zones and automations before saving
   the disarmed state, so storage failures cannot prevent that restoration.
   Failed saves remain visible and retryable, including unresolved restoration.
@@ -56,7 +78,6 @@
   forms; archived the obsolete specification. Stable 1.x publication requires a
   completed operating-evidence record. The HA minimum remains 2026.6.0 and the
   pinned validation baseline is now 2026.9.0.
-
 - History training runs in the background with source and lifetime checks before
   publication. Failed EV history imports back off, and indexed calibration and
   forecast lookups reduce work on larger histories.
