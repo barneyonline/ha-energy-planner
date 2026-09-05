@@ -168,6 +168,8 @@ rules:
     references:
       docs:
         - README.md
+        - docs/stable-release.md
+        - docs/release-checklist.md
         - ha-energy-planner-spec.md
   docs-installation-instructions:
     status: done
@@ -212,6 +214,7 @@ rules:
         - tests/test_lifecycle.py
   test-before-configure:
     status: done
+    comment: Initial setup only creates a named local planner; Configure validates mapped entities and policy before command authority. This service integration has no remote connection to test at name creation.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -273,6 +276,8 @@ rules:
     references:
       docs:
         - README.md
+        - docs/stable-release.md
+        - docs/release-checklist.md
         - ha-energy-planner-spec.md
   docs-installation-parameters:
     status: done
@@ -328,13 +333,15 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent and branch evidence is published separately.
+    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent; branch evidence is published and per-module regressions are rejected. Runtime smoke installs a deterministic release package and upgrade tests preserve previous-release recovery evidence.
     references:
       tests:
         - tests/test_ha_runtime.py
         - tests/test_control_runtime.py
         - tests/fixtures/decision_replay/ev_reprice_override_recovery.json
         - tests/fixtures/decision_replay/ev_autumn_ready_by.json
+        - tests/test_storage_runtime.py
+        - tests/test_upgrade_runtime.py
         - tests/test_device_registry_runtime.py
         - tests/test_training.py
         - scripts/docker-compatibility.sh
@@ -420,12 +427,16 @@ rules:
     references:
       docs:
         - README.md
+        - docs/stable-release.md
+        - docs/release-checklist.md
         - ha-energy-planner-spec.md
   docs-supported-functions:
     status: done
     references:
       docs:
         - README.md
+        - docs/stable-release.md
+        - docs/release-checklist.md
         - ha-energy-planner-spec.md
   docs-troubleshooting:
     status: done
@@ -515,7 +526,7 @@ rules:
         - tests/scripts/test_validate_quality_scale.py
   reconfiguration-flow:
     status: done
-    comment: Every input mapping and policy section is editable from the integration's central Configure flow, with runtime topology rebuilt after mapping changes.
+    comment: Configure edits all input and policy sections with topology rebuilds; Reconfigure repairs missing legacy vehicle targets and retries migration without replacing the entry.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -523,7 +534,7 @@ rules:
         - tests/test_config_flow.py
   repair-issues:
     status: exempt
-    comment: No issue currently requires a Home Assistant Repairs flow; runtime safety failures are actionable through translated service errors, preflight evidence, and safe-state restoration.
+    comment: Legacy target migration has an explicit Reconfigure recovery path. Runtime and storage failures use translated service errors, preflight evidence, and safe-state restoration; no separate Repairs flow is needed.
     references:
       code:
         - custom_components/ha_energy_planner/executor.py

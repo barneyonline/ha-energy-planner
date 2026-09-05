@@ -19,6 +19,8 @@ on:
       - ".github/workflows/hassfest.yml"
       - ".github/workflows/validate.yaml"
       - ".github/workflows/release-assets.yml"
+  schedule:
+    - cron: "0 3 * * 1"
   workflow_dispatch:
   workflow_call:
     secrets:
@@ -40,7 +42,7 @@ jobs:
       quality_scale: ${{ steps.select.outputs.quality_scale }}
       validation_extras: ${{ steps.select.outputs.validation_extras }}
       dedicated_quality_scale: ${{ steps.select.outputs.dedicated_quality_scale }}
-      ha_minimum: ${{ steps.select.outputs.ha_minimum }}
+      ha_matrix: ${{ steps.select.outputs.ha_matrix }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -58,7 +60,7 @@ jobs:
           else
             python3 scripts/select_ci_checks.py --all >> "$GITHUB_OUTPUT"
           fi
-          python3 -c 'import json; print("ha_minimum=" + json.load(open("hacs.json"))["homeassistant"])' >> "$GITHUB_OUTPUT"
+          echo "ha_matrix=$(python3 scripts/support_policy.py matrix)" >> "$GITHUB_OUTPUT"
 
   pytest-coverage:
     needs: changes
@@ -163,9 +165,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        version: ["${{ needs.changes.outputs.ha_minimum }}", "2026.8.2", "stable"]
+        version: ${{ fromJSON(needs.changes.outputs.ha_matrix) }}
     steps:
       - uses: actions/checkout@v6
+      - name: Refresh runtime image
+        run: docker pull ghcr.io/home-assistant/home-assistant:${{ matrix.version }}
       - name: Test Home Assistant runtime contracts
         env:
           HA_VERSION: ${{ matrix.version }}
@@ -173,4 +177,24 @@ jobs:
       - name: Exercise real platforms, services and storage
         env:
           HEP_HA_IMAGE: ghcr.io/home-assistant/home-assistant:${{ matrix.version }}
-        run: scripts/docker-ha-smoke.sh
+        run: scripts/docker-package-smoke.sh
+
+  release-package:
+    needs: changes
+    if: needs.changes.outputs.pytest == 'true' || needs.changes.outputs.validation_extras == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build deterministic release artifact
+        run: python3 scripts/package-release.py
+      - name: Record release validation environment
+        run: |
+          docker pull "$(python3 scripts/support_policy.py image)"
+          scripts/validation-environment.sh > validation-environment.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-package
+          path: |
+            dist/*.zip
+            dist/*.sha256
+            validation-environment.txt

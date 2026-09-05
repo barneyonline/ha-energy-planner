@@ -86,8 +86,9 @@ def _write_strict_gate(root: Path) -> None:
     scripts.mkdir(exist_ok=True)
     mypy_script = scripts / "docker-mypy.sh"
     mypy_script.write_text(
-        "ghcr.io/home-assistant/home-assistant:2026.8.2\n"
-        'python3 -m pip install "mypy==1.19.1"\n'
+        "python3 scripts/support_policy.py image\n"
+        "python3 scripts/support_policy.py mypy\n"
+        'python3 -m pip install "mypy==$MYPY_VERSION"\n'
         "MYPYPATH=/usr/src/homeassistant python3 -m mypy\n",
         encoding="utf-8",
     )

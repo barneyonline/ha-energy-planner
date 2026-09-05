@@ -12,15 +12,19 @@
 
 ### 🐛 Bug fixes
 
-- Device control now requires a confirmed, atomic storage write before dispatch.
-  Home Assistant write failures and shutdown-deferred saves retain pending
-  recovery metadata for retry instead of being mistaken for durable saves.
 - Disarming restores planner-owned HVAC zones and automations before saving
   the disarmed state, so storage failures cannot prevent that restoration.
   Failed saves remain visible and retryable, including unresolved restoration.
 - Continuous EV charging compares whole-window energy costs instead of summed
   price ranks, including partial final slots and solar opportunity cost while
   retaining configured carbon preferences and active-session continuity.
+- Failed Home Assistant Store writes now block new device acquisitions instead
+  of being mistaken for durable recovery evidence. Dirty generations are retried,
+  cancelled writes are drained, and shutdown writes are acknowledged explicitly.
+- Startup recovery backs off after persistent errors and respects shutdown or
+  disabled automatic control before retrying.
+- Older EV configurations can repair a missing vehicle target-SOC mapping through
+  Reconfigure without deleting the entry or its recovery state.
 - Newly created AI Task providers can now be used by Explain while their initial
   Home Assistant state is `unknown`; missing and explicitly `unavailable`
   providers remain blocked.
@@ -44,6 +48,15 @@
   Enphase, overlapping multi-EV start/stop tests, exhaustive small charging-cost
   comparisons, decision replays across repricing/manual overrides/stale-input
   recovery, and autumn repeated-hour ready-by coverage.
+- Entry deletion cleans resolved per-entry history and retains uncertain recovery evidence.
+- Added previous-release setup/reload/restart fixtures, a branch regression gate,
+  centralized compatibility versions, weekly runtime checks, deterministic release
+  ZIP/checksum validation and package installation smoke tests.
+- Refreshed setup, service examples, support/upgrade/rollback contracts and issue
+  forms; archived the obsolete specification. Stable 1.x publication requires a
+  completed operating-evidence record. The HA minimum remains 2026.6.0 and the
+  pinned validation baseline is now 2026.9.0.
+
 - History training runs in the background with source and lifetime checks before
   publication. Failed EV history imports back off, and indexed calibration and
   forecast lookups reduce work on larger histories.

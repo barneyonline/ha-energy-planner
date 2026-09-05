@@ -50,12 +50,11 @@ class PlannerStore:
         """Initialize storage."""
         storage_key = STORE_KEY if entry_id is None else f"{STORE_KEY}_{entry_id}"
         self._entry_id = entry_id
-        self._store = Store(
+        self._store: Store = Store(
             hass,
             STORE_VERSION,
             storage_key,
             serialize_in_event_loop=False,
-            atomic_writes=True,
         )
         self._legacy_store: Store | None = (
             Store(
@@ -63,7 +62,6 @@ class PlannerStore:
                 STORE_VERSION,
                 STORE_KEY,
                 serialize_in_event_loop=False,
-                atomic_writes=True,
             )
             if entry_id is not None and legacy_fallback
             else None
@@ -95,6 +93,19 @@ class PlannerStore:
         """Persist the compact active plan."""
         self.data["active_plan"] = to_jsonable(plan)
         await self._async_save()
+
+    async def async_remove_if_safe(self) -> bool:
+        """Delete this entry's data only when raw recovery evidence is resolved."""
+        loaded = await self._store.async_load()
+        if loaded is not None:
+            ownership = loaded.get("ownership", {})
+            reservation = loaded.get("ev_grid_reservation", {})
+            if not isinstance(ownership, dict) or ownership:
+                return False
+            if not isinstance(reservation, dict) or (reservation and reservation.get("active") is not False):
+                return False
+        await self._store.async_remove()
+        return True
 
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""

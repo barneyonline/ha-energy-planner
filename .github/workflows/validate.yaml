@@ -79,8 +79,12 @@ jobs:
           hacs = json.loads(Path("hacs.json").read_text(encoding="utf-8"))
           if hacs.get("name") != manifest["name"]:
               raise SystemExit(f"hacs name {hacs.get('name')} does not match manifest name {manifest['name']}")
-          if hacs.get("homeassistant") != "2026.6.0":
-              raise SystemExit(f"unexpected HACS minimum Home Assistant version: {hacs.get('homeassistant')}")
+          def Version(value):
+              return tuple(map(int, value.split(".")))
+          minimum = Version(hacs["homeassistant"])
+          baseline = Version(pyproject["tool"]["energy-planner"]["support"]["baseline"])
+          if minimum > baseline:
+              raise SystemExit("Minimum Home Assistant exceeds the tested baseline")
           for path in [
               Path("custom_components/ha_energy_planner/strings.json"),
               Path("custom_components/ha_energy_planner/translations/en.json"),

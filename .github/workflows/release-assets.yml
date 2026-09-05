@@ -15,31 +15,24 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Validate release tag matches manifest version
+      - name: Require stable operating evidence
         env:
           RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          version = json.loads(
-              Path("custom_components/ha_energy_planner/manifest.json").read_text(encoding="utf-8")
-          )["version"]
-          tag = os.environ["RELEASE_TAG"].removeprefix("v")
-          if version != tag:
-              raise SystemExit(
-                  f"Release tag {os.environ['RELEASE_TAG']} does not match manifest version {version}"
-              )
-          PY
-      - name: Create component archive
+          if [[ "$RELEASE_TAG" =~ ^v?[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
+            gh release download "$RELEASE_TAG" --pattern release-evidence.json --dir "$RUNNER_TEMP/release-evidence"
+            python3 scripts/validate-release-evidence.py --version "$RELEASE_TAG" --commit "$(git rev-parse HEAD)" --evidence "$RUNNER_TEMP/release-evidence/release-evidence.json"
+          fi
+      - name: Build validated component and checksum
         env:
           RELEASE_TAG: ${{ github.ref_name }}
-        run: |
-          zip -r "ha-energy-planner-${RELEASE_TAG}.zip" custom_components/ha_energy_planner \
-            -x "*/__pycache__/*" "*/.mypy_cache/*" "*/.pytest_cache/*"
-      - name: Upload release asset
+        run: python3 scripts/package-release.py --version "$RELEASE_TAG"
+      - name: Verify packaged runtime before attaching assets
+        run: scripts/docker-package-smoke.sh
+      - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
-          files: ha-energy-planner-${{ github.ref_name }}.zip
+          files: |
+            dist/*.zip
+            dist/*.sha256

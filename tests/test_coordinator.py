@@ -7369,7 +7369,9 @@ def test_startup_recovery_cancellation_covers_task_and_restore_failure() -> None
     assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "cancelled"
 
 
-def test_startup_recovery_orchestration_safe_unsafe_cancelled_and_error_paths() -> None:
+def test_startup_recovery_orchestration_safe_unsafe_cancelled_and_error_paths(monkeypatch: object) -> None:
+    sleep = AsyncMock()
+    monkeypatch.setattr(startup_recovery_module.asyncio, "sleep", sleep)
     safe = _startup_recovery_test_coordinator()
     safe.store.data["production"]["armed"] = True
     safe._async_complete_startup_grace = AsyncMock(return_value=(True, "healthy"))
@@ -7405,6 +7407,7 @@ def test_startup_recovery_orchestration_safe_unsafe_cancelled_and_error_paths() 
     unexpected._async_enter_startup_safe_recovery = AsyncMock()
     asyncio.run(unexpected._async_run_startup_auto_recovery())
     unexpected._async_enter_startup_safe_recovery.assert_awaited_once_with("unexpected_recovery_error")
+    sleep.assert_awaited_once_with(30)
     assert unexpected.hass.created_tasks
 
     nested_failure = _startup_recovery_test_coordinator()
@@ -7413,6 +7416,30 @@ def test_startup_recovery_orchestration_safe_unsafe_cancelled_and_error_paths() 
     nested_failure.async_disarm_production_control = AsyncMock(side_effect=RuntimeError("disarm failed"))
     asyncio.run(nested_failure._async_run_startup_auto_recovery())
     nested_failure.async_disarm_production_control.assert_awaited_once_with("unexpected_recovery_error")
+
+
+@pytest.mark.parametrize("stop_reason", ["teardown", "disabled", "cancelled"])
+def test_startup_recovery_failure_backoff_respects_stop(monkeypatch: object, stop_reason: str) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator._async_retry_startup_safe_recovery = AsyncMock(side_effect=RuntimeError("disk full"))
+    coordinator._async_enter_startup_safe_recovery = AsyncMock()
+
+    async def stop_during_backoff(delay: float) -> None:
+        assert delay == 30
+        if stop_reason == "teardown":
+            coordinator._tearing_down = True
+        elif stop_reason == "disabled":
+            coordinator.entry.options[CONF_PLANNER_ENABLED] = False
+        else:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(startup_recovery_module.asyncio, "sleep", stop_during_backoff)
+    if stop_reason == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(coordinator._async_run_startup_auto_recovery())
+    else:
+        asyncio.run(coordinator._async_run_startup_auto_recovery())
+    assert not coordinator.hass.created_tasks
 
 
 def test_startup_grace_default_deadline_sleep_and_cancel(monkeypatch: object) -> None:
