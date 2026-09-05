@@ -60,3 +60,24 @@ def test_operating_record_requires_complete_real_duration_and_matching_revision(
     assert validator.requires_observation("v1.0.0")
     assert not validator.requires_observation("0.9.19")
     assert not validator.requires_observation("1.0.0rc1")
+
+
+@pytest.mark.parametrize("invalid_fields", [
+    {}, {"evidence": None}, {"evidence": False}, {"evidence": True},
+    {"evidence": 0}, {"evidence": 1}, {"evidence": []}, {"evidence": {}},
+    {"evidence": ["trace reference"]}, {"evidence": {"trace": "reference"}},
+    {"evidence": ""}, {"evidence": " \t\n"},
+])
+def test_operating_record_rejects_missing_blank_and_non_string_evidence(invalid_fields):
+    validator = module("validate-release-evidence")
+    commit = "a" * 40
+    for scenario in validator.SCENARIOS:
+        record = {
+            "commit": commit, "version": "1.0.0",
+            "started_at": "2026-01-01T00:00:00+00:00", "ended_at": "2026-01-03T00:00:00+00:00",
+            "scenarios": {name: {"result": "passed", "evidence": "redacted trace reference"}
+                          for name in validator.SCENARIOS},
+        }
+        record["scenarios"][scenario] = {"result": "passed", **invalid_fields}
+        with pytest.raises(ValueError, match=f"Completed evidence is required for {scenario}"):
+            validator.validate_evidence(record, commit, "1.0.0")
