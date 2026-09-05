@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_right
 from datetime import UTC, datetime, timedelta
 from math import isfinite
+from operator import itemgetter
 from typing import Any
 
 from .models import ForecastPoint
@@ -559,16 +561,13 @@ def _value_for_slot(
     final_cadence: timedelta,
 ) -> float | None:
     """Return the bucket value only while the source forecast has coverage."""
-    if slot_time < timestamped[0][0]:
+    # Right insertion preserves the source's last value for duplicate times.
+    # Search the sorted series directly, avoiding a scan per destination slot.
+    position = bisect_right(timestamped, slot_time, key=itemgetter(0)) - 1
+    if position < 0:
         return None
-    selected: float | None = None
-    selected_at: datetime | None = None
-    for valid_at, value in timestamped:
-        if valid_at > slot_time:
-            break
-        selected = value
-        selected_at = valid_at
-    if selected_at is None or slot_time >= selected_at + final_cadence:
+    selected_at, selected = timestamped[position]
+    if slot_time >= selected_at + final_cadence:
         return None
     return selected
 
@@ -580,11 +579,7 @@ def _conservative_cadence(
     maximum: timedelta | None = None,
 ) -> timedelta:
     """Infer bucket duration without extending beyond a declared or observed cadence."""
-    gaps = [
-        right[0] - left[0]
-        for left, right in zip(timestamped, timestamped[1:], strict=False)
-        if right[0] > left[0]
-    ]
+    gaps = [right[0] - left[0] for left, right in zip(timestamped, timestamped[1:], strict=False) if right[0] > left[0]]
     cadence = min(gaps) if gaps else default
     return min(cadence, maximum) if maximum is not None else cadence
 

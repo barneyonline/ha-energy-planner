@@ -737,6 +737,13 @@ class OptionsFlow(config_entries.OptionsFlow):
                 if step_id not in user_input:
                     continue
                 submitted = dict(user_input[step_id])
+                updated_options.update(
+                    {
+                        key: value
+                        for key, value in submitted.items()
+                        if key in _SETTINGS_SECTION_OPTION_FIELDS[step_id]
+                    }
+                )
                 for input_type in _SETTINGS_SECTION_INPUT_TYPES[step_id]:
                     data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
                     section_fields = _schema_field_names(data_schema)
@@ -758,6 +765,7 @@ class OptionsFlow(config_entries.OptionsFlow):
                             self._config_entry,
                             submitted_data,
                             subentry_type=input_type,
+                            options=updated_options,
                         )
                         if mappings_changed
                         else {}
@@ -771,13 +779,6 @@ class OptionsFlow(config_entries.OptionsFlow):
                         if key not in section_fields
                     }
                     updated_data.update(submitted_data)
-                updated_options.update(
-                    {
-                        key: value
-                        for key, value in submitted.items()
-                        if key in _SETTINGS_SECTION_OPTION_FIELDS[step_id]
-                    }
-                )
 
             duplicate_errors = _duplicate_household_actuator_errors(
                 self.hass,
@@ -969,6 +970,7 @@ def _validate_subentry_config(
     user_input: dict[str, Any],
     *,
     subentry_type: str | None = None,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     """Validate one subentry, including cross-entry actuator ownership."""
     errors = _validate_config(hass, user_input)
@@ -982,7 +984,7 @@ def _validate_subentry_config(
         errors.setdefault(key, error)
     if subentry_type == SUBENTRY_EV and not _ev_keep_on_control_compatible(
         user_input,
-        {**DEFAULT_OPTIONS, **dict(getattr(entry, "options", {}))},
+        {**DEFAULT_OPTIONS, **(dict(getattr(entry, "options", {})) if options is None else options)},
     ):
         errors.setdefault("base", "ev_keep_on_requires_persistent_control")
     if subentry_type == SUBENTRY_EV and any(user_input.values()):

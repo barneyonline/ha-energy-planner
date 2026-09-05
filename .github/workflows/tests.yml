@@ -40,6 +40,7 @@ jobs:
       quality_scale: ${{ steps.select.outputs.quality_scale }}
       validation_extras: ${{ steps.select.outputs.validation_extras }}
       dedicated_quality_scale: ${{ steps.select.outputs.dedicated_quality_scale }}
+      ha_minimum: ${{ steps.select.outputs.ha_minimum }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -57,6 +58,7 @@ jobs:
           else
             python3 scripts/select_ci_checks.py --all >> "$GITHUB_OUTPUT"
           fi
+          python3 -c 'import json; print("ha_minimum=" + json.load(open("hacs.json"))["homeassistant"])' >> "$GITHUB_OUTPUT"
 
   pytest-coverage:
     needs: changes
@@ -77,12 +79,23 @@ jobs:
           -v "$PWD:/work"
           -w /work
           ghcr.io/home-assistant/home-assistant:stable
-          sh -c 'python3 -m coverage run -m pytest -q
+          sh -c 'python3 -m coverage run --branch -m pytest -q
           --durations=15
           --junitxml=junit.xml
           -o junit_family=legacy &&
-          python3 -m coverage xml -o coverage.xml &&
-          python3 -m coverage report -m'
+          python3 -m coverage json --fail-under=0 -o coverage.json &&
+          python3 -m coverage xml --fail-under=0 -o coverage.xml &&
+          python3 -m coverage report -m --fail-under=0 &&
+          python3 scripts/check_coverage.py coverage.json'
+      - name: Preserve statement and branch evidence
+        if: ${{ always() && hashFiles('coverage.json') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-evidence
+          path: |
+            coverage.json
+            coverage.xml
+            junit.xml
       - name: Upload coverage to Codecov
         if: ${{ always() && hashFiles('coverage.xml') != '' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
         uses: codecov/codecov-action@v6
@@ -142,3 +155,22 @@ jobs:
           HEP_SKIP_PYTEST: "1"
           HEP_SKIP_QUALITY_SCALE: "1"
         run: scripts/docker-validate.sh
+
+  runtime-compatibility:
+    needs: changes
+    if: needs.changes.outputs.pytest == 'true' || needs.changes.outputs.validation_extras == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["${{ needs.changes.outputs.ha_minimum }}", "2026.8.2", "stable"]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Test Home Assistant runtime contracts
+        env:
+          HA_VERSION: ${{ matrix.version }}
+        run: scripts/docker-compatibility.sh "$HA_VERSION"
+      - name: Exercise real platforms, services and storage
+        env:
+          HEP_HA_IMAGE: ghcr.io/home-assistant/home-assistant:${{ matrix.version }}
+        run: scripts/docker-ha-smoke.sh

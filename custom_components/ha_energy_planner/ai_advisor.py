@@ -16,6 +16,10 @@ from .const import (
 )
 from .models import DecisionContext, EnergyPlan
 
+MAX_AI_RESPONSE_CHARACTERS = 32_768
+MAX_AI_RESPONSE_NODES = 1_024
+MAX_AI_RESPONSE_DEPTH = 8
+
 AI_ACTION_TARGETS: dict[str, tuple[str, tuple[str, ...]]] = {
     "amber_import_price_entity": ("Import price input", ("amber_import_price", "import_price")),
     "amber_export_price_entity": ("Export price input", ("amber_export_price", "export_price")),
@@ -82,6 +86,7 @@ FORBIDDEN_RESPONSE_FIELDS = frozenset(
 )
 
 REJECTION_MESSAGES = {
+    "ai_response_too_large": "The AI response exceeded the bounded troubleshooting response limits.",
     "ai_response_not_json": "The AI service did not return a JSON object.",
     "ai_response_forbidden_fields": (
         "The AI response included fields that Energy Planner will not accept because AI troubleshooting cannot command "
@@ -137,16 +142,13 @@ class LocalAIAdvisor:
         timeout = int(self.options.get(CONF_AI_TIMEOUT_SECONDS, 20))
         try:
             async with asyncio.timeout(timeout):
-                try:
-                    response = await self.hass.services.async_call(
-                        domain,
-                        service,
-                        payload,
-                        blocking=True,
-                        return_response=True,
-                    )
-                except TypeError:
-                    response = await self.hass.services.async_call(domain, service, payload, blocking=True)
+                response = await self.hass.services.async_call(
+                    domain,
+                    service,
+                    payload,
+                    blocking=True,
+                    return_response=True,
+                )
         except TimeoutError:
             return _with_provider(_rejected_result("rejected", "ai_timeout", service_name), entry_data)
         except Exception as err:  # noqa: BLE001 - advisor must fail closed.
@@ -160,6 +162,8 @@ class LocalAIAdvisor:
                 entry_data,
             )
 
+        if not _response_within_limits(response):
+            return _with_provider(_rejected_result("rejected", "ai_response_too_large", service_name), entry_data)
         parsed = _parse_response(response)
         if not isinstance(parsed, Mapping):
             return _with_provider(_rejected_result("rejected", "ai_response_not_json", service_name), entry_data)
@@ -445,8 +449,35 @@ def _provider_entity_unavailable(
     return str(getattr(state, "state", "") or "").lower() == "unavailable"
 
 
+def _response_within_limits(response: Any) -> bool:
+    """Bound total provider data before recursive parsing or JSON decoding."""
+    pending: list[tuple[Any, int]] = [(response, 0)]
+    remaining_nodes = MAX_AI_RESPONSE_NODES
+    remaining_characters = MAX_AI_RESPONSE_CHARACTERS
+    while pending:
+        value, depth = pending.pop()
+        remaining_nodes -= 1
+        if depth > MAX_AI_RESPONSE_DEPTH or remaining_nodes < 0:
+            return False
+        if isinstance(value, str):
+            remaining_characters -= len(value)
+            if remaining_characters < 0:
+                return False
+        elif isinstance(value, Mapping):
+            if len(value) * 2 > remaining_nodes:
+                return False
+            pending.extend((item, depth + 1) for pair in value.items() for item in pair)
+        elif isinstance(value, list | tuple):
+            if len(value) > remaining_nodes:
+                return False
+            pending.extend((item, depth + 1) for item in value)
+    return True
+
+
 def _parse_response(response: Any) -> Any:
     """Extract JSON object from common Home Assistant service response shapes."""
+    if not _response_within_limits(response):
+        return None
     if isinstance(response, Mapping):
         data = response.get("data")
         if isinstance(data, Mapping):
@@ -509,25 +540,30 @@ def _numeric_range(values: Any) -> list[float] | None:
 
 
 def _loads(value: str) -> Any:
+    if len(value) > MAX_AI_RESPONSE_CHARACTERS:
+        return None
     value = value.strip()
     try:
-        return json.loads(value)
-    except json.JSONDecodeError:
+        parsed = json.loads(value)
+        return parsed if _response_within_limits(parsed) else None
+    except (ValueError, RecursionError):
         pass
 
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", value, flags=re.DOTALL | re.IGNORECASE)
     if fenced:
         try:
-            return json.loads(fenced.group(1))
-        except json.JSONDecodeError:
+            parsed = json.loads(fenced.group(1))
+            return parsed if _response_within_limits(parsed) else None
+        except (ValueError, RecursionError):
             pass
 
     start = value.find("{")
     end = value.rfind("}")
     if 0 <= start < end:
         try:
-            return json.loads(value[start : end + 1])
-        except json.JSONDecodeError:
+            parsed = json.loads(value[start : end + 1])
+            return parsed if _response_within_limits(parsed) else None
+        except (ValueError, RecursionError):
             return None
     return None
 

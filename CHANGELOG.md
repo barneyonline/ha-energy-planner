@@ -15,10 +15,33 @@
 - Newly created AI Task providers can now be used by Explain while their initial
   Home Assistant state is `unknown`; missing and explicitly `unavailable`
   providers remain blocked.
+- Enphase control now durably records the original profile before sending a
+  command and retains restoration evidence after cancellation or uncertain
+  acceptance. Repeated acquisitions preserve the original profile.
+- Device commands and restoration have explicit dispatch deadlines. Weather
+  providers also have a deadline, with fresh cached forecasts used when available.
+- Reload and cancelled setup now drain entry-owned work and remove deferred
+  notifications so an old coordinator cannot act after teardown.
+- EV options validate the complete proposed configuration, allowing charger
+  controls and Keep charger on to be changed together.
+- Device migration uses registry APIs available on the minimum supported Home
+  Assistant release and preserves unrelated devices and other entries.
+- AI provider errors no longer cause a duplicate request; response parsing is
+  bounded before processing, and cancelled attempts remain accounted for.
 
 ### 🔧 Improvements
 
-- None
+- History training runs in the background with source and lifetime checks before
+  publication. Failed EV history imports back off, and indexed calibration and
+  forecast lookups reduce work on larger histories.
+- Removed retired entity implementations while preserving registry migrations
+  and live entity IDs. Custom icons now use Home Assistant icon translations.
+- Split planning, control transactions, presentation, and coordinator services
+  into focused modules with explicit internal contracts.
+- Consolidated retained execution history into one migrated audit stream.
+- Added real Home Assistant runtime and smoke checks for the minimum supported,
+  pinned, and current versions in CI. Validation enforces full statement
+  coverage and reports branch coverage separately.
 
 ### 🔄 Other changes
 

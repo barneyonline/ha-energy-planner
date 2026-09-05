@@ -223,22 +223,8 @@ def test_switch_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator({CONF_DRY_RUN: True})
     entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator)
     added: list[object] = []
-    removed: list[str] = []
 
-    class FakeRegistry:
-        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> str:
-            return f"switch.{unique_id}"
-
-        def async_remove(self, entity_id: str) -> None:
-            removed.append(entity_id)
-
-    def fake_add_planner_entities(entry_arg: object, add_entities: object, entities: object) -> None:
-        added.extend(entities)
-
-    monkeypatch.setattr(switch_module, "async_add_planner_entities", fake_add_planner_entities)
-    monkeypatch.setattr(switch_module.er, "async_get", lambda hass: FakeRegistry())
-
-    asyncio.run(switch_module.async_setup_entry(SimpleNamespace(), entry, None))
+    asyncio.run(switch_module.async_setup_entry(SimpleNamespace(), entry, added.extend))
     switch = PlannerSwitch(
         coordinator,
         next(description for description in SWITCHES if description.key == "active_control"),
@@ -246,49 +232,18 @@ def test_switch_setup_and_constructor(monkeypatch: object) -> None:
 
     assert len(added) == len(SWITCHES)
     assert switch.is_on is False
-    assert removed == [
-        "switch.entry-1_enabled",
-        "switch.entry-1_dry_run",
-        "switch.entry-1_ai_enabled",
-        "switch.entry-1_ev_control_enabled",
-        "switch.entry-1_climate_control_enabled",
-        "switch.entry-1_enphase_control_enabled",
-        "switch.entry-1_ev_connected_helper",
-        "switch.entry-1_ev_opportunistic_charging",
-        "switch.entry-1_ev_keep_charger_on",
-    ]
 
 
 def test_button_setup_and_constructor(monkeypatch: object) -> None:
     coordinator = FakeCoordinator()
     entry = SimpleNamespace(entry_id="entry-1", runtime_data=coordinator)
     added: list[object] = []
-    removed: list[str] = []
 
-    class FakeRegistry:
-        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> str:
-            return f"button.{unique_id}"
-
-        def async_remove(self, entity_id: str) -> None:
-            removed.append(entity_id)
-
-    def fake_add_planner_entities(entry_arg: object, add_entities: object, entities: object) -> None:
-        added.extend(entities)
-
-    monkeypatch.setattr(button_module, "async_add_planner_entities", fake_add_planner_entities)
-    monkeypatch.setattr(button_module.er, "async_get", lambda hass: FakeRegistry())
-
-    asyncio.run(button_module.async_setup_entry(None, entry, None))
+    asyncio.run(button_module.async_setup_entry(None, entry, added.extend))
     button = PlannerButton(coordinator, next(description for description in BUTTONS if description.key == "replan"))
 
     assert len(added) == len(BUTTONS)
     assert button.unique_id == "entry-1_replan"
-    assert removed == [
-        "button.entry-1_ev_start_charging",
-        "button.entry-1_ev_stop_charging",
-        "button.entry-1_pause_control_1h",
-        "button.entry-1_pause_control_4h",
-    ]
 
 
 def test_replan_button_requests_replan() -> None:
@@ -312,18 +267,14 @@ def test_request_ai_advice_button_uses_current_planner_advisory() -> None:
     assert description.available_fn(coordinator) is False
     coordinator.entry_data[CONF_AI_TASK_ENTITY] = "ai_task.local"
     coordinator.hass.states = SimpleNamespace(
-        get=lambda entity_id: SimpleNamespace(state="unknown")
-        if entity_id == "ai_task.local"
-        else None
+        get=lambda entity_id: SimpleNamespace(state="unknown") if entity_id == "ai_task.local" else None
     )
     assert description.available_fn(coordinator) is True
     entity = PlannerButton(coordinator, description)
     assert entity.available is True
 
     coordinator.hass.states = SimpleNamespace(
-        get=lambda entity_id: SimpleNamespace(state="unavailable")
-        if entity_id == "ai_task.local"
-        else None
+        get=lambda entity_id: SimpleNamespace(state="unavailable") if entity_id == "ai_task.local" else None
     )
     assert description.available_fn(coordinator) is False
 
@@ -352,7 +303,7 @@ def test_removed_manual_ev_buttons_are_not_exposed() -> None:
     assert "ev_stop_charging" not in descriptions
     assert "pause_control_1h" not in descriptions
     assert "pause_control_4h" not in descriptions
-    assert descriptions["request_ai_advice"].icon == "mdi:comment-question-outline"
+    assert descriptions["request_ai_advice"].icon is None
 
 
 def test_restore_button_raises_translated_error_when_restore_is_incomplete() -> None:

@@ -10,6 +10,7 @@ from typing import Any
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import HomeAssistant, State
 
+from .adapter_helpers import async_call_device_service, available_state
 from .const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -21,7 +22,6 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
-    STATE_UNKNOWN_VALUES,
 )
 from .ev import ev_charging_state, ev_charging_state_proves_safe
 from .models import ActionKind, PlanAction
@@ -569,9 +569,7 @@ class EVChargerAdapter:
         target_entity = target_entity_value if isinstance(target_entity_value, str) and target_entity_value else None
         ready_by_entity_value = self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY)
         ready_by_entity = (
-            ready_by_entity_value
-            if isinstance(ready_by_entity_value, str) and ready_by_entity_value
-            else None
+            ready_by_entity_value if isinstance(ready_by_entity_value, str) and ready_by_entity_value else None
         )
         if target_soc is not None:
             if not target_entity:
@@ -708,7 +706,7 @@ class EVChargerAdapter:
         domain = entity_id.split(".", 1)[0]
         if domain in {"button", "input_button"} and (turn_on or press_button):
             try:
-                await self.hass.services.async_call(domain, "press", {ATTR_ENTITY_ID: entity_id}, blocking=True)
+                await async_call_device_service(self.hass, domain, "press", {ATTR_ENTITY_ID: entity_id}, blocking=True)
             except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
                 return EVCommandResult(
                     False,
@@ -727,7 +725,7 @@ class EVChargerAdapter:
             if not force and ((turn_on and _truthy_state(state)) or (not turn_on and not _truthy_state(state))):
                 return EVCommandResult(True, "already_in_desired_state", self._snapshot(), self._snapshot())
             try:
-                await self.hass.services.async_call(domain, service, {ATTR_ENTITY_ID: entity_id}, blocking=True)
+                await async_call_device_service(self.hass, domain, service, {ATTR_ENTITY_ID: entity_id}, blocking=True)
             except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
                 return EVCommandResult(
                     False,
@@ -745,31 +743,31 @@ class EVChargerAdapter:
             return True
         with suppress(Exception):
             if domain in {"number", "input_number"}:
-                await self.hass.services.async_call(
-                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": value}, blocking=True
+                await async_call_device_service(
+                    self.hass, domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": value}, blocking=True
                 )
                 return True
             if domain == "input_datetime":
-                await self.hass.services.async_call(
-                    domain, "set_datetime", {ATTR_ENTITY_ID: entity_id, "time": str(value)}, blocking=True
+                await async_call_device_service(
+                    self.hass, domain, "set_datetime", {ATTR_ENTITY_ID: entity_id, "time": str(value)}, blocking=True
                 )
                 return True
             if domain == "input_text":
-                await self.hass.services.async_call(
-                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
+                await async_call_device_service(
+                    self.hass, domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
                 )
                 return True
             if domain == "time":
-                await self.hass.services.async_call(
-                    domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
+                await async_call_device_service(
+                    self.hass, domain, "set_value", {ATTR_ENTITY_ID: entity_id, "value": str(value)}, blocking=True
                 )
                 return True
             if domain in {"select", "input_select"}:
                 option = self._select_option_for_value(entity_id, value)
                 if option is None:
                     return False
-                await self.hass.services.async_call(
-                    domain, "select_option", {ATTR_ENTITY_ID: entity_id, "option": option}, blocking=True
+                await async_call_device_service(
+                    self.hass, domain, "select_option", {ATTR_ENTITY_ID: entity_id, "option": option}, blocking=True
                 )
                 return True
         return False
@@ -848,12 +846,7 @@ class EVChargerAdapter:
         return {key: self._state_value(entity_id) for key, entity_id in entity_ids.items()}
 
     def _state(self, entity_id: str | None) -> State | None:
-        if not entity_id:
-            return None
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in STATE_UNKNOWN_VALUES:
-            return None
-        return state
+        return available_state(self.hass, entity_id)
 
     def _state_value(self, entity_id: str) -> str | None:
         state = self._state(entity_id)

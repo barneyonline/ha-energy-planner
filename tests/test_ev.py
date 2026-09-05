@@ -545,3 +545,15 @@ def test_charge_calibration_rejects_invalid_power_noise_and_implausible_gain() -
 
     assert calibration["status"] == "insufficient_history"
     assert calibration["sample_count"] == 0
+
+
+def test_indexed_soc_lookup_preserves_duplicate_and_freshness_boundaries() -> None:
+    from custom_components.ha_energy_planner.ev import _soc_at_or_before
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    points = [(now, 10.0), (now, 20.0), (now + timedelta(minutes=30), 30.0)]
+    assert _soc_at_or_before(points, now) == 20.0
+    assert _soc_at_or_before(points, now + timedelta(minutes=15)) == 20.0
+    assert _soc_at_or_before(points, now + timedelta(minutes=15, seconds=1)) is None
+    assert _soc_at_or_before(points, now - timedelta(seconds=1)) is None
+    assert _soc_at_or_before([], now) is None

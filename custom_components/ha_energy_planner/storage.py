@@ -18,11 +18,11 @@ _LIST_FIELDS = {
     "execution_audit",
     "forecast_snapshots",
     "dry_run_comparisons",
-    "outcomes",
     "overrides",
 }
 
 _DICT_FIELDS = {
+    "ai_last_attempt",
     "command_rate_limits",
     "discovery",
     "ev_grid_reservation",
@@ -106,16 +106,6 @@ class PlannerStore:
         else:
             audit.append(entry)
         self.data["execution_audit"] = audit[-100:]
-        outcomes = list(self.data.get("outcomes", []))
-        serialized = to_jsonable(outcome)
-        if outcomes and _deduplicable_outcome(serialized) and _same_audit_outcome(outcomes[-1], serialized):
-            previous_outcome = dict(outcomes[-1])
-            previous_outcome["occurrence_count"] = int(previous_outcome.get("occurrence_count", 1)) + 1
-            previous_outcome["last_attempted_at"] = serialized.get("attempted_at")
-            outcomes[-1] = previous_outcome
-        else:
-            outcomes.append(serialized)
-        self.data["outcomes"] = outcomes[-100:]
         await self._async_save()
 
     async def async_save_overrides(self, overrides: list[Override]) -> None:
@@ -179,6 +169,11 @@ class PlannerStore:
     async def async_save_load_source_outage(self, outage: dict[str, Any]) -> None:
         """Persist the start of a continuous unusable household-load period."""
         await self._async_set_if_changed("load_source_outage", outage)
+
+    async def async_save_ai_attempt(self, attempt: dict[str, Any]) -> None:
+        """Persist sanitized call admission independently of result acceptance."""
+        await self._async_set_if_changed("ai_last_attempt", attempt)
+        await self.async_flush()
 
     async def async_add_ai_recommendation(self, recommendation: dict[str, Any]) -> None:
         """Persist compact AI recommendation metadata."""
@@ -301,7 +296,7 @@ def _default_data() -> dict[str, Any]:
     return {
         "active_plan": None,
         "execution_audit": [],
-        "outcomes": [],
+        "audit_history_version": 1,
         "ownership": {},
         "overrides": [],
         "forecast_snapshots": [],
@@ -317,6 +312,7 @@ def _default_data() -> dict[str, Any]:
         "control_pause": {},
         "thermal_model": {},
         "ai_recommendations": [],
+        "ai_last_attempt": {},
     }
 
 
@@ -325,6 +321,9 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data.update(loaded)
     data.pop("haeo_runs", None)
     data.pop("trip_history", None)
+    data["execution_audit"] = [_audit_entry(record) for record in audit_records(loaded)][-100:]
+    data["audit_history_version"] = 1
+    data.pop("outcomes", None)
     for key in _LIST_FIELDS:
         if not isinstance(data.get(key), list):
             data[key] = []
@@ -351,7 +350,17 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _audit_entry(outcome: ActionOutcome) -> dict[str, Any]:
+def audit_records(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Read canonical history, accepting outcome-only stores during migration."""
+    audit = data.get("execution_audit")
+    records = [item for item in audit if isinstance(item, dict)] if isinstance(audit, list) else []
+    if records:
+        return records
+    legacy = data.get("outcomes")
+    return [item for item in legacy if isinstance(item, dict)] if isinstance(legacy, list) else []
+
+
+def _audit_entry(outcome: ActionOutcome | dict[str, Any]) -> dict[str, Any]:
     """Return a compact, redacted execution audit entry."""
     entry = to_jsonable(outcome)
     audit = {
@@ -368,6 +377,12 @@ def _audit_entry(outcome: ActionOutcome) -> dict[str, Any]:
     }
     if isinstance(entry.get("desired_state"), dict):
         audit["desired_state"] = _bounded_mapping(entry["desired_state"])
+    if "occurrence_count" in entry:
+        count = entry["occurrence_count"]
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            audit["occurrence_count"] = count
+    if isinstance(entry.get("last_attempted_at"), str):
+        audit["last_attempted_at"] = entry["last_attempted_at"]
     return audit
 
 

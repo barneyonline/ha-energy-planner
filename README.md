@@ -134,6 +134,14 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - **Multiple entries call the wrong planner:** pass the intended `config_entry_id` to the action.
 - **More evidence is needed:** download diagnostics from the integration page or run `ha_energy_planner.export_support_bundle`. Secrets, raw AI content, and unnecessary location history are excluded.
 
+Device service dispatch is limited to 30 seconds per call, including restoration.
+A timeout can occur after a device accepted the command; the planner retains
+ownership evidence until state is reconciled. Weather requests have a ten-second
+deadline and use a still-fresh cache when available. Recorder training runs in
+the background, publishes only for the current configuration, and backs off
+failed EV history imports for 15 minutes. Plans remain subject to the existing
+input-health and control safety gates while training is pending.
+
 ## Removal
 
 1. Turn off **Automatic control** and each device-control switch.
@@ -150,5 +158,6 @@ Removing Energy Planner stops future plans and commands. It does not remove sour
 - [Issue tracker](https://github.com/barneyonline/ha-energy-planner/issues)
 - [Release notes](CHANGELOG.md)
 - [Requirements and implementation evidence](docs/requirements-audit.md)
+- [Architecture review and implementation evidence](docs/architecture-review-2026-09-05.md)
 - [Quality-scale evidence](quality_scale.yaml)
 - [Home Assistant Integration Quality Scale](https://developers.home-assistant.io/docs/core/integration-quality-scale/)

@@ -59,6 +59,7 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.ownership import EnphaseProfileGuard, OwnershipState
+from custom_components.ha_energy_planner.plan_presentation import display_state
 from custom_components.ha_energy_planner.preflight import (
     _audit_report,
     _availability_message,
@@ -191,7 +192,6 @@ def test_remaining_preflight_helpers() -> None:
     assert _split_entities(["sensor.a", "bad"]) == ["sensor.a"]
     assert _split_entities(123) == []
     assert _audit_report({"execution_audit": ["bad", {"plan_id": "plan-1", "secret": "drop"}]})["recent_outcomes"] == [
-        {},
         {"plan_id": "plan-1"},
     ]
     assert _bounded_join(["a", "b", "c", "d", "e", "f"]) == "a, b, c, d, e, 1 more"
@@ -551,10 +551,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     )
     assert sensor_module._charge_state_label_from_raw("charging") == "Charging"
     assert sensor_module._charge_timeline_state_label({"state": "paused"}) == "Paused"
-    assert sensor_module._presence_attrs(
-        SimpleNamespace(entry_data={"person_entities": "person.a, person.b"}, data=None)
-    ) == {"person_entities": ["person.a", "person.b"]}
-    assert sensor_module._display_state("   ") == "Unknown"
+    assert display_state("   ") == "Unknown"
 
     # Discovery/system-health lower helpers.
     assert CapabilityEvidence(True).details == {}
@@ -784,6 +781,9 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
             return False
 
         def async_start_listeners(self) -> None:
+            pass
+
+        def async_start_startup_auto_recovery(self) -> None:
             pass
 
         async def async_shutdown(self) -> None:

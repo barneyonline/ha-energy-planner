@@ -199,22 +199,34 @@ def test_latest_forecast_valid_at_skips_values_without_timestamps_and_normalizes
 def test_forecast_timestamp_status_distinguishes_aware_naive_and_ordered_payloads() -> None:
     keys = ("power", "value")
 
-    assert forecast_timestamp_status_from_state(
-        FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00+10:00", "power": 1.0}]}),
-        value_keys=keys,
-    ) == "aware_timestamps"
-    assert forecast_timestamp_status_from_state(
-        FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00", "power": 1.0}]}),
-        value_keys=keys,
-    ) == "naive_timestamps"
-    assert forecast_timestamp_status_from_state(
-        FakeState("0", {"forecast": [1.0, 2.0]}),
-        value_keys=keys,
-    ) == "untimestamped"
-    assert forecast_timestamp_status_from_state(
-        FakeState("0", {"forecast": [{"period_start": "bad", "power": 1.0}]}),
-        value_keys=keys,
-    ) == "untimestamped"
+    assert (
+        forecast_timestamp_status_from_state(
+            FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00+10:00", "power": 1.0}]}),
+            value_keys=keys,
+        )
+        == "aware_timestamps"
+    )
+    assert (
+        forecast_timestamp_status_from_state(
+            FakeState("0", {"forecast": [{"period_start": "2026-06-27T00:00:00", "power": 1.0}]}),
+            value_keys=keys,
+        )
+        == "naive_timestamps"
+    )
+    assert (
+        forecast_timestamp_status_from_state(
+            FakeState("0", {"forecast": [1.0, 2.0]}),
+            value_keys=keys,
+        )
+        == "untimestamped"
+    )
+    assert (
+        forecast_timestamp_status_from_state(
+            FakeState("0", {"forecast": [{"period_start": "bad", "power": 1.0}]}),
+            value_keys=keys,
+        )
+        == "untimestamped"
+    )
 
 
 def test_forecast_series_converts_solcast_wh_energy_buckets_to_average_kw() -> None:
@@ -595,3 +607,27 @@ def test_scalar_normalization_passthroughs_and_energy_units() -> None:
     assert normalize_scalar_value(0.42, value_kind="carbon_intensity", unit="kgCO₂/kWh") == 420
     assert normalize_scalar_value(420, value_kind="carbon_intensity", unit="gCO2/kWh") == 420
     assert normalize_scalar_value(7, value_kind="other") == 7
+
+
+def test_energy_buckets_without_timestamps_keep_hourly_fallback() -> None:
+    """A provider without timestamps still converts its energy units consistently."""
+    assert _energy_items_as_average_power(
+        [{"energy": 500, "unit": "Wh"}, {"energy": 2, "unit": "kWh"}],
+        ("energy",),
+        "kWh",
+    ) == [{"energy": 0.5, "unit": "kW"}, {"energy": 2.0, "unit": "kW"}]
+
+
+def test_indexed_forecast_alignment_preserves_duplicates_and_expired_gaps() -> None:
+    from custom_components.ha_energy_planner.forecasts import _value_for_slot
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    cadence = timedelta(minutes=5)
+    points = [(start + index * cadence, float(index)) for index in range(10000)]
+    points.insert(9999, (points[9999][0], -1.0))
+    assert _value_for_slot(start - cadence, points, final_cadence=cadence) is None
+    assert _value_for_slot(points[-1][0], points, final_cadence=cadence) == 9999.0
+    assert _value_for_slot(points[-1][0] + cadence, points, final_cadence=cadence) is None
+    assert _value_for_slot(start, [], final_cadence=cadence) is None
+    sparse = [points[0], points[-1]]
+    assert _value_for_slot(start + cadence, sparse, final_cadence=cadence) is None

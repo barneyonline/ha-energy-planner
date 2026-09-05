@@ -220,12 +220,8 @@ def test_enphase_rollback_rejects_missing_profile_or_invalid_service() -> None:
         confirmation_interval_seconds=0,
     )
 
-    assert asyncio.run(
-        adapter._async_rollback_profile("select.enphase_profile", "select.select_option", None)
-    ) is False
-    assert asyncio.run(
-        adapter._async_rollback_profile("select.enphase_profile", "invalid", "AI Optimisation")
-    ) is False
+    assert asyncio.run(adapter._async_rollback_profile("select.enphase_profile", "select.select_option", None)) is False
+    assert asyncio.run(adapter._async_rollback_profile("select.enphase_profile", "invalid", "AI Optimisation")) is False
 
 
 def test_enphase_profile_change_fails_closed_when_service_fails() -> None:
@@ -347,3 +343,150 @@ def test_enphase_profile_change_skips_when_already_selected_and_helper_fallbacks
     assert result.changed_profile_at is False
     assert _profile_control_service({}, None) is None
     assert _profile_control_service({}, "sensor.enphase") is None
+
+
+class TransactionStore:
+    """Durable fake records the exact ownership visible before dispatch."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, Any] = {"ownership": {"unrelated": "preserved"}}
+        self.durable: dict[str, Any] = {}
+        self.fail_flush = False
+
+    async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
+        self.data["ownership"] = dict(ownership)
+
+    async def async_flush(self) -> None:
+        if self.fail_flush:
+            raise OSError("storage failed")
+        self.durable = dict(self.data["ownership"])
+
+
+def test_enphase_transaction_preserves_original_baseline_and_unowned_noop() -> None:
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    async def run() -> None:
+        store = TransactionStore()
+        hass = FakeHass({"select.enphase_profile": "Custom Baseline"})
+        adapter = EnphaseProfileAdapter(hass, _entry_data())
+        now = datetime.now(UTC)
+        noop = await EnphaseControlTransaction(store, adapter, now).async_execute(
+            _action(ActionKind.SET_PROFILE, {"profile": "Custom Baseline"})
+        )
+        assert not noop.command_sent
+        assert store.data["ownership"] == {"unrelated": "preserved"}
+        for profile in ["Full Backup", "Full Backup", "Self Consumption"]:
+            await EnphaseControlTransaction(store, adapter, now).async_execute(
+                _action(ActionKind.SET_PROFILE, {"profile": profile})
+            )
+            assert store.data["ownership"]["enphase_profile"] == "Custom Baseline"
+        assert store.durable["enphase_profile"] == "Custom Baseline"
+        await EnphaseControlTransaction(store, adapter, now).async_execute(_action(ActionKind.RESTORE_AI))
+        assert store.data["ownership"] == {"unrelated": "preserved"}
+        assert hass.states.values["select.enphase_profile"] == "AI Optimisation"
+
+    asyncio.run(run())
+
+
+def test_enphase_transaction_cancellation_retains_durable_restore_evidence() -> None:
+    import pytest
+
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    async def run() -> None:
+        for accept in [False, True]:
+            store = TransactionStore()
+            hass = FakeHass({"select.enphase_profile": "Custom Baseline"})
+            original = hass.services.async_call
+
+            async def cancelled(
+                domain: str,
+                service: str,
+                data: dict[str, Any],
+                blocking: bool = False,
+                store: Any = store,
+                accept: bool = accept,
+                original: Any = original,
+            ) -> None:
+                assert store.durable["enphase_profile"] == "Custom Baseline"
+                if accept:
+                    await original(domain, service, data, blocking)
+                raise asyncio.CancelledError
+
+            hass.services.async_call = cancelled
+            with pytest.raises(asyncio.CancelledError):
+                await EnphaseControlTransaction(
+                    store, EnphaseProfileAdapter(hass, _entry_data()), datetime.now(UTC)
+                ).async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"}))
+            assert store.data["ownership"]["enphase_profile"] == "Custom Baseline"
+            hass.services.async_call = original
+            result = await EnphaseProfileAdapter(hass, _entry_data()).async_restore_profile(
+                store.durable["enphase_profile"]
+            )
+            assert result.applied
+            assert hass.states.values["select.enphase_profile"] == "Custom Baseline"
+
+    asyncio.run(run())
+
+
+def test_enphase_transaction_storage_failure_prevents_all_commands() -> None:
+    import pytest
+
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    store = TransactionStore()
+    store.fail_flush = True
+    hass = FakeHass({"select.enphase_profile": "Custom Baseline"})
+    with pytest.raises(OSError, match="storage failed"):
+        asyncio.run(
+            EnphaseControlTransaction(
+                store, EnphaseProfileAdapter(hass, _entry_data()), datetime.now(UTC)
+            ).async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"}))
+        )
+    assert hass.services.calls == []
+
+
+def test_enphase_transaction_confirmation_failure_restores_previous_ownership() -> None:
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    store = TransactionStore()
+    hass = FakeHass({"select.enphase_profile": "Custom Baseline"}, confirm_change=False)
+    result = asyncio.run(
+        EnphaseControlTransaction(
+            store, EnphaseProfileAdapter(hass, _entry_data(), confirmation_attempts=1), datetime.now(UTC)
+        ).async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"}))
+    )
+    assert result.rollback_succeeded is True
+    assert store.data["ownership"] == {"unrelated": "preserved"}
+
+
+def test_enphase_dispatch_and_compensation_are_bounded(monkeypatch: Any) -> None:
+    from custom_components.ha_energy_planner import adapter_helpers
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    monkeypatch.setattr(adapter_helpers, "DEVICE_SERVICE_TIMEOUT_SECONDS", 0.005)
+
+    async def run() -> None:
+        store = TransactionStore()
+        hass = FakeHass({"select.enphase_profile": "Custom Baseline"})
+        calls = 0
+
+        async def hung(domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                hass.states.values[data["entity_id"]] = data["option"]
+            await asyncio.Event().wait()
+
+        hass.services.async_call = hung
+        async with asyncio.timeout(1):
+            result = await EnphaseControlTransaction(
+                store, EnphaseProfileAdapter(hass, _entry_data()), datetime.now(UTC)
+            ).async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"}))
+        assert not result.applied
+        assert result.command_sent
+        assert result.rollback_succeeded is False
+        assert calls == 2
+        assert store.data["ownership"]["enphase_profile"] == "Custom Baseline"
+
+    asyncio.run(run())

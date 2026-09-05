@@ -3,7 +3,7 @@
 Status as of 2026-08-30.
 
 The integration self-assesses at Platinum against the current Home Assistant
-quality-scale catalog. All 40 integration modules pass strict mypy against the
+quality-scale catalog. All integration modules are checked with strict mypy against the
 pinned Home Assistant type surface, including typed `ConfigEntry.runtime_data`
 use throughout; the Docker and pull-request gates enforce that result.
 
@@ -320,9 +320,13 @@ use throughout; the Docker and pull-request gates enforce that result.
   stops Home Assistant on an explicit completion marker instead of consuming its
   full failure timeout. Pull-request CI classifies changed paths with
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
-  fails safe to the full non-smoke CI set for an unclassified trigger path.
-  Pushes and manual Tests runs retain that non-smoke set; `scripts/docker-validate.sh`
-  remains the complete gate including smoke. The smoke test
+  fails safe to the full CI set for an unclassified trigger path.
+  Behavioral changes also run real runtime contracts and smoke tests on the HACS
+  minimum version, pinned HA 2026.8.2, and current stable. Documentation-only
+  changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
+  complete local gate including minimum/pinned runtime contracts and stable smoke.
+  Coverage instruments branches, enforces exactly 100% statement coverage with
+  `scripts/check_coverage.py`, and publishes branch evidence separately. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
