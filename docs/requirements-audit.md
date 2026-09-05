@@ -1,6 +1,6 @@
 # Requirements Audit
 
-Status as of 2026-08-30.
+Status as of 2026-09-05.
 
 The integration self-assesses at Platinum against the current Home Assistant
 quality-scale catalog. All integration modules are checked with strict mypy against the
@@ -9,6 +9,29 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Actuator recovery metadata uses atomic Home Assistant Store writes with an
+  explicit successful-write acknowledgement. Home Assistant's logged write
+  failures and shutdown-deferred saves cannot acknowledge the pending generation
+  or permit new device dispatch. `tests/test_control_runtime.py` injects real
+  Store write failures before EV, HVAC and Enphase commands, verifies retries,
+  and recovers interrupted commands using newly constructed HA/Store/executor
+  instances and persisted ownership/reservations. The compatibility matrix runs
+  these contracts on the minimum, pinned and stable Home Assistant versions.
+- Operator disarm revokes command authority and restores owned HVAC before
+  flushing the resulting state. Real Store tests cover disk failures and
+  shutdown-deferred saves after takeover, including partial restoration failure,
+  retained durable recovery evidence, listener updates, and successful retries.
+  Acquisition continues to require its explicit durable flush.
+- Continuous EV windows minimize total energy cost, including fractional final
+  slots and solar opportunity cost; configured carbon preferences and current
+  session anchoring remain enforced. `tests/test_ev.py` checks an independent
+  exhaustive cost oracle, and `tests/test_executor.py` overlaps EV transactions
+  across persistence, cancellation, failed dispatch and stop confirmation.
+- Observation sequences in `tests/fixtures/decision_replay/` regenerate plans
+  and execute them across successive refresh times with real HA services and
+  storage. They verify charging allocations, exact commands, manual stops,
+  stale-input safe stops, resumed planning, and both autumn ready-by occurrences.
+  These supplement the existing constraint-only supplied-plan replay fixtures.
 - Custom integration scaffold, config flow, options flow, entities, services,
   diagnostics, and versioned Home Assistant `Store` persistence are present.
   The manifest classifies Energy Planner as a service integration so configured
