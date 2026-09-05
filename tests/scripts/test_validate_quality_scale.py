@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _load_module():
     root = Path(__file__).resolve().parents[2]
@@ -30,6 +32,14 @@ def _write_manifest(root: Path, quality_scale: str | None = "bronze") -> None:
     (manifest_dir / "manifest.json").write_text(
         json.dumps(manifest),
         encoding="utf-8",
+    )
+    (manifest_dir / "const.py").write_text('PLATFORMS = ["sensor"]\n', encoding="utf-8")
+    (manifest_dir / "sensor.py").write_text("PARALLEL_UPDATES = 0\n", encoding="utf-8")
+    (manifest_dir / "strings.json").write_text(
+        json.dumps({"entity": {"sensor": {"example": {"name": "Example"}}}}), encoding="utf-8"
+    )
+    (manifest_dir / "icons.json").write_text(
+        json.dumps({"entity": {"sensor": {"example": {"default": "mdi:flash"}}}}), encoding="utf-8"
     )
 
 
@@ -94,6 +104,57 @@ def test_repository_quality_scale_matches_manifest_claim() -> None:
     exit_code, messages = validate_quality_scale.validate_quality_scale(root)
 
     assert exit_code == 0, "\n".join(messages)
+
+
+def test_done_comments_cannot_hide_missing_parallel_policy(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "platinum")
+    component = tmp_path / "custom_components" / "ha_energy_planner"
+    (component / "sensor.py").write_text("# coordinator handles updates\n", encoding="utf-8")
+    errors = validate_quality_scale._platform_contract_errors(tmp_path, {"parallel-updates": "done"})
+    assert any("sensor must declare" in error for error in errors)
+
+
+def test_icon_exemption_is_not_allowed() -> None:
+    assert "icon-translations" not in validate_quality_scale.EXEMPT_ALLOWED_RULES
+
+
+def test_icon_keys_and_python_icons_are_checked(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "platinum")
+    component = tmp_path / "custom_components" / "ha_energy_planner"
+    (component / "sensor.py").write_text(
+        'PARALLEL_UPDATES = 0\nclass Sensor:\n    _attr_icon = "mdi:flash"\n', encoding="utf-8"
+    )
+    (component / "icons.json").write_text(
+        json.dumps({"entity": {"sensor": {"missing_translation": {"default": "mdi:flash"}}}}),
+        encoding="utf-8",
+    )
+    errors = validate_quality_scale._platform_contract_errors(tmp_path, {"icon-translations": "done"})
+    assert any("missing_translation" in error for error in errors)
+    assert any("_attr_icon" in error for error in errors)
+
+
+def test_missing_platform_and_icon_resources_fail_verification(tmp_path: Path) -> None:
+    _write_manifest(tmp_path, "platinum")
+    component = tmp_path / "custom_components" / "ha_energy_planner"
+    (component / "icons.json").unlink()
+    assert validate_quality_scale._platform_contract_errors(tmp_path, {"icon-translations": "done"})
+    (component / "sensor.py").unlink()
+    assert validate_quality_scale._platform_contract_errors(tmp_path, {"parallel-updates": "done"})
+
+
+@pytest.mark.parametrize("declaration", [
+    '_attr_icon: str = "mdi:flash"',
+    'def __init__(self):\n        self._attr_icon = "mdi:flash"',
+    'def __init__(self):\n        self._attr_icon: str = "mdi:flash"',
+])
+def test_annotated_and_instance_icons_cannot_bypass_contract(tmp_path: Path, declaration: str) -> None:
+    _write_manifest(tmp_path, "platinum")
+    component = tmp_path / "custom_components" / "ha_energy_planner"
+    (component / "sensor.py").write_text(
+        f"PARALLEL_UPDATES = 0\nclass Sensor:\n    {declaration}\n", encoding="utf-8"
+    )
+    errors = validate_quality_scale._platform_contract_errors(tmp_path, {"icon-translations": "done"})
+    assert any("sets _attr_icon" in error for error in errors)
 
 
 def test_gold_claim_requires_rules_from_every_claimed_level(tmp_path: Path) -> None:

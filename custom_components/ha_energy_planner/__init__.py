@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -47,6 +49,10 @@ from .type_defs import EnergyPlannerConfigEntry
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
+
+    from .coordinator import EnergyPlannerCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
 _DUPLICATE_ENTITY_ID_MIGRATIONS = {"switch.ai_ai_enabled": "switch.ai_enabled"}
@@ -352,29 +358,64 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
     coordinator.entry_topology_signature = _entry_topology_signature(entry)
     entry.runtime_data = coordinator
+    forwarding_started = False
     try:
         await coordinator.async_reconcile_production_evidence_contract()
         await coordinator.async_config_entry_first_refresh()
         coordinator.async_start_listeners()
-        start_auto_recovery = getattr(coordinator, "async_start_startup_auto_recovery", None)
-        if callable(start_auto_recovery):
-            start_auto_recovery()
+        coordinator.async_start_startup_auto_recovery()
+        forwarding_started = True
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         _async_sync_planner_device(hass, entry)
         entry.async_on_unload(entry.add_update_listener(_async_update_listener))
         entry.async_on_unload(coordinator.async_shutdown)
-    except Exception:
-        cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
-        if callable(cancel_auto_recovery):
-            await cancel_auto_recovery("setup_entry_failed")
-        await coordinator.async_shutdown()
-        await coordinator.async_wait_for_plan_execution()
-        await coordinator.async_wait_for_refresh_shutdown()
-        await coordinator.async_disarm_production_control("setup_entry_failed")
-        await coordinator.async_restore_safe_state("setup_entry_failed", refresh=False)
-        object.__delattr__(entry, "runtime_data")
+    except (Exception, asyncio.CancelledError):
+        # Keep cleanup alive if Home Assistant cancels setup while platforms or
+        # recovery are starting. Do not cancel a transaction with external effects.
+        coordinator._tearing_down = True
+        cleanup = asyncio.create_task(
+            _async_cleanup_failed_setup(hass, entry, coordinator, forwarding_started)
+        )
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                continue
+        cleanup.result()
         raise
     return True
+
+
+async def _async_cleanup_failed_setup(
+    hass: HomeAssistant,
+    entry: EnergyPlannerConfigEntry,
+    coordinator: EnergyPlannerCoordinator,
+    forwarding_started: bool,
+) -> None:
+    """Attempt every cleanup step without masking the original setup failure."""
+    from .notifications import cancel_deferred_notifications_for_entry
+
+    steps: list[Callable[[], Awaitable[object]]] = [
+        lambda: coordinator.async_cancel_startup_auto_recovery("setup_entry_failed"),
+        coordinator.async_shutdown,
+        coordinator.async_wait_for_plan_execution,
+        coordinator.async_wait_for_refresh_shutdown,
+        lambda: coordinator.async_disarm_production_control("setup_entry_failed"),
+        lambda: coordinator.async_restore_safe_state("setup_entry_failed", refresh=False),
+    ]
+    if forwarding_started:
+        steps.append(lambda: hass.config_entries.async_unload_platforms(entry, PLATFORMS))
+    try:
+        for step in steps:
+            try:
+                await step()
+            except (Exception, asyncio.CancelledError):
+                _LOGGER.exception("Energy Planner setup cleanup step failed")
+    finally:
+        # A draining device transaction may defer a notification after shutdown
+        # first removed callbacks. Release these final references as well.
+        cancel_deferred_notifications_for_entry(hass, entry.entry_id)
+        object.__delattr__(entry, "runtime_data")
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
@@ -400,17 +441,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     # Stop new listener/timer work before waiting for any in-flight planner
     # execution. The coordinator's teardown marker also prevents an already
     # queued refresh from committing a new device command after restoration.
-    cancel_auto_recovery = getattr(coordinator, "async_cancel_startup_auto_recovery", None)
-    if callable(cancel_auto_recovery):
-        if preserve_automatic_state:
-            await cancel_auto_recovery(
-                "configuration_reload"
-                if configuration_reload_handoff
-                else "home_assistant_shutdown",
-                preserve_control=True,
-            )
-        else:
-            await cancel_auto_recovery("entry_unload")
+    if preserve_automatic_state:
+        await coordinator.async_cancel_startup_auto_recovery(
+            "configuration_reload" if configuration_reload_handoff else "home_assistant_shutdown",
+            preserve_control=True,
+        )
+    else:
+        await coordinator.async_cancel_startup_auto_recovery("entry_unload")
     # The base coordinator shutdown is irreversible. Home Assistant invokes
     # the registered async_shutdown callback only after this unload succeeds.
     coordinator._begin_shutdown()
@@ -597,10 +634,12 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
     from homeassistant.helpers import entity_registry as er
 
     from .entity import planner_device_identifier
+    from .entity_registry_migration import async_migrate_entity_registry
 
     ent_reg = er.async_get(hass)
     dev_reg = dr.async_get(hass)
     _async_migrate_duplicate_entity_ids(ent_reg)
+    async_migrate_entity_registry(hass, entry)
     device = dev_reg.async_get_or_create(
         config_entry_id=entry.entry_id,
         identifiers={planner_device_identifier(entry.entry_id)},
@@ -619,11 +658,14 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
                 config_subentry_id=None,
             )
 
-    for old_suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls"):
-        old_device = dev_reg.async_get_device_by_identifier(
-            (DOMAIN, f"{entry.entry_id}_{old_suffix}"), entry.entry_id
-        )
-        if old_device is not None and old_device.id != device.id:
+    retired_identifiers = {
+        (DOMAIN, f"{entry.entry_id}_{suffix}")
+        for suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls")
+    }
+    # This entry-scoped API is supported throughout our HA version range;
+    # async_get_device_by_identifier was only introduced after HA 2026.6.
+    for old_device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        if old_device.id != device.id and old_device.identifiers & retired_identifiers:
             dev_reg.async_remove_device(old_device.id)
 
 

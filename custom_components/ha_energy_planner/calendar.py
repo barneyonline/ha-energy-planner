@@ -19,20 +19,22 @@ from .const import (
 from .coordinator import EnergyPlannerCoordinator
 from .entity import (
     EnergyPlannerEntity,
-    async_add_planner_entities,
     recorder_safe_identifier,
     recorder_safe_text,
 )
 from .models import ActionAsset, ActionKind, PlanAction
-from .safety import strict_bool
-from .sensor import (
-    _action_load_forecast_attrs,
-    _action_sentence,
-    _asset_name,
-    _decision_data_quality_attrs,
-    _plain_action,
+from .plan_presentation import (
+    action_load_forecast_attrs,
+    action_sentence,
+    asset_name,
+    decision_data_quality_attrs,
+    plain_action,
 )
+from .safety import strict_bool
 from .type_defs import EnergyPlannerConfigEntry
+
+# Read-only entities receive coordinator updates.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(
@@ -42,14 +44,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up the planner action calendar."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    async_add_planner_entities(entry, async_add_entities, [EnergyPlannerCalendar(coordinator)])
+    async_add_entities([EnergyPlannerCalendar(coordinator)])
 
 
 class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
     """Calendar of controlled actions in the current committed plan."""
 
     _attr_translation_key = "plan"
-    _attr_icon = "mdi:calendar-clock"
 
     def __init__(self, coordinator: EnergyPlannerCoordinator) -> None:
         """Initialize the calendar."""
@@ -114,11 +115,7 @@ def _ev_charging_events(
     for start, charge_kw, allocation_source in valid_slots:
         end = start + interval
         energy_kwh = charge_kw * interval_minutes / 60
-        if (
-            windows
-            and start == windows[-1]["end"]
-            and allocation_source == windows[-1]["allocation_source"]
-        ):
+        if windows and start == windows[-1]["end"] and allocation_source == windows[-1]["allocation_source"]:
             windows[-1]["end"] = end
             windows[-1]["energy_kwh"] += energy_kwh
             windows[-1]["charge_rates"].add(charge_kw)
@@ -166,7 +163,7 @@ def _ev_charging_event(
     end = window["end"]
     rates = sorted(float(rate) for rate in window["charge_rates"])
     rate_text = f"{rates[0]:g} kW" if len(rates) == 1 else f"{rates[0]:g}-{rates[-1]:g} kW"
-    details = _plain_action(action)
+    details = plain_action(action)
     description_lines = ["Planned EV charging window."]
     _append_description_section(
         description_lines,
@@ -188,11 +185,7 @@ def _ev_charging_event(
         charging_details.append(f"Ready by: {ready_by}")
     daylight = action.desired_state.get("daylight_lowest_cost")
     allocation_source = str(window.get("allocation_source") or "ready_by")
-    if (
-        isinstance(daylight, dict)
-        and daylight.get("selected")
-        and allocation_source == "daylight"
-    ):
+    if isinstance(daylight, dict) and daylight.get("selected") and allocation_source == "daylight":
         charging_details.append("Policy: Lowest effective-cost daylight charging")
         charging_details.append("Allocation: Daylight preference")
         for key, label in (
@@ -202,11 +195,7 @@ def _ev_charging_event(
             instant = dt_util.parse_datetime(str(daylight.get(key, "")))
             if instant is not None:
                 charging_details.append(f"{label}: {_local_datetime_text(instant)}")
-    elif (
-        isinstance(daylight, dict)
-        and daylight.get("selected")
-        and allocation_source == "ready_by_fallback"
-    ):
+    elif isinstance(daylight, dict) and daylight.get("selected") and allocation_source == "ready_by_fallback":
         charging_details.append("Policy: Ready-by fallback after daylight preference")
         charging_details.append("Allocation: Ready-by fallback")
     _append_description_section(description_lines, "Charging", charging_details)
@@ -237,14 +226,14 @@ def _local_datetime_text(value: datetime) -> str:
 
 def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -> CalendarEvent:
     """Convert a controlled action to a Home Assistant calendar event."""
-    details = _plain_action(action)
-    description_lines = [_action_sentence(action)]
+    details = plain_action(action)
+    description_lines = [action_sentence(action)]
     _append_description_section(
         description_lines,
         "Why",
         [details.get("why", "No reason was recorded.")],
     )
-    data_quality = _decision_data_quality_attrs(coordinator)
+    data_quality = decision_data_quality_attrs(coordinator)
     if data_quality.get("status") != "Good":
         _append_description_section(
             description_lines,
@@ -268,7 +257,7 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
                 planned_state.append(detail)
         _append_description_section(description_lines, "Schedule", schedule)
         _append_description_section(description_lines, "Planned state", planned_state)
-    load_forecast = _action_load_forecast_attrs(coordinator, action.action_id)
+    load_forecast = action_load_forecast_attrs(coordinator, action.action_id)
     if load_forecast:
         expected = load_forecast.get("expected_kw")
         conservative = load_forecast.get("conservative_kw")
@@ -288,9 +277,9 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
     return CalendarEvent(
         start=action.execute_not_before,
         end=action.execute_not_after,
-        summary=recorder_safe_text(f"{_asset_name(action.asset)}: {details['action']}", max_bytes=255),
+        summary=recorder_safe_text(f"{asset_name(action.asset)}: {details['action']}", max_bytes=255),
         description=recorder_safe_text("\n".join(description_lines), max_bytes=4_096),
-        location=recorder_safe_text(_asset_name(action.asset), max_bytes=255),
+        location=recorder_safe_text(asset_name(action.asset), max_bytes=255),
         uid=recorder_safe_identifier(action.action_id, max_bytes=255),
     )
 

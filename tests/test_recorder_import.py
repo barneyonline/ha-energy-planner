@@ -683,7 +683,9 @@ def test_ev_charge_calibration_requires_inputs_and_retains_model_on_recorder_err
 
     assert missing == (existing, False, "ev_charge_calibration_entities_not_configured")
     assert invalid == (existing, False, "ev_charge_calibration_charge_rate_invalid")
-    assert failed == (existing, False, "ev_charge_calibration_unavailable:RuntimeError")
+    assert failed[0]["soc_per_kwh"] == existing["soc_per_kwh"]
+    assert failed[0]["failed_attempt"]["attempted_at"] == now.isoformat()
+    assert failed[1:] == (True, "ev_charge_calibration_unavailable:RuntimeError")
 
 
 def test_ev_calibration_prefers_recorder_database_executor(monkeypatch: Any) -> None:
@@ -769,8 +771,9 @@ def test_ev_calibration_reports_bounded_history_limit(monkeypatch: Any) -> None:
         )
     )
 
-    assert model == existing
-    assert changed is False
+    assert model["soc_per_kwh"] == existing["soc_per_kwh"]
+    assert model["failed_attempt"]["attempted_at"] == now.isoformat()
+    assert changed is True
     assert reason == "ev_charge_calibration_history_limit_exceeded"
 
 
@@ -990,3 +993,92 @@ def test_ev_calibration_due_handles_invalid_and_naive_timestamps() -> None:
     assert recorder_import._ev_charge_calibration_matches(
         {**matching, "charge_rate_kw": "bad"}, **kwargs
     ) is False
+
+
+def test_ev_failure_backoff_tracks_attempt_identity_and_recovers(monkeypatch: Any) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    mapping = {CONF_EV_CHARGING: "sensor.charger", CONF_EV_SOC: "sensor.soc"}
+    calls = 0
+
+    def load(*args: Any) -> tuple[list[Any], list[Any]]:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(recorder_import, "_load_bounded_ev_history", load)
+    async def run() -> None:
+        model, changed, _ = await recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), mapping, {}, charge_rate_kw=7, now=now
+        )
+        assert changed
+        assert "charging_entity_id" not in model
+        recent = await recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), mapping, model, charge_rate_kw=7, now=now + timedelta(minutes=14)
+        )
+        assert recent == (model, False, "ev_charge_calibration_recent")
+        assert calls == 1
+        await recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), mapping, model, charge_rate_kw=7, now=now + timedelta(minutes=15)
+        )
+        assert calls == 2
+        for changed_mapping, rate in (
+            ({**mapping, CONF_EV_SOC: "sensor.new_soc"}, 7),
+            ({**mapping, CONF_EV_CHARGING: "sensor.new_charger"}, 7),
+            (mapping, 11),
+        ):
+            await recorder_import.async_update_ev_charge_calibration(
+                FakeHass(), changed_mapping, model, charge_rate_kw=rate, now=now
+            )
+        assert calls == 5
+        for timestamp in (None, "bad", (now + timedelta(days=1)).isoformat()):
+            attempt = {**model["failed_attempt"], "attempted_at": timestamp}
+            assert recorder_import._ev_charge_calibration_due(
+                {"failed_attempt": attempt}, now=now,
+                charging_entity="sensor.charger", soc_entity="sensor.soc", charge_rate_kw=7,
+            )
+        attempt = {**model["failed_attempt"], "model_version": -1}
+        assert recorder_import._ev_charge_calibration_due(
+            {"failed_attempt": attempt}, now=now,
+            charging_entity="sensor.charger", soc_entity="sensor.soc", charge_rate_kw=7,
+        )
+        monkeypatch.setattr(recorder_import, "_load_bounded_ev_history", lambda *args: ([], []))
+        recovered, _, _ = await recorder_import.async_update_ev_charge_calibration(
+            FakeHass(), mapping, model, charge_rate_kw=7, now=now + timedelta(minutes=15)
+        )
+        assert "failed_attempt" not in recovered
+    asyncio.run(run())
+
+
+def test_ev_calibration_build_executes_off_loop_and_cancellation_propagates(monkeypatch: Any) -> None:
+    import threading
+
+    main_thread = threading.get_ident()
+    monkeypatch.setattr(recorder_import, "_load_bounded_ev_history", lambda *args: ([], []))
+    original = recorder_import.build_ev_charge_calibration
+    build_threads: list[int] = []
+
+    def build(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        build_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(recorder_import, "build_ev_charge_calibration", build)
+    class ThreadHass(FakeHass):
+        async def async_add_executor_job(self, fn: Any, *args: Any) -> Any:
+            return await asyncio.to_thread(fn, *args)
+
+    monkeypatch.setattr(recorder_import, "_recorder_executor", lambda hass: hass.async_add_executor_job)
+    async def run() -> None:
+        await recorder_import.async_update_ev_charge_calibration(
+            ThreadHass(), {CONF_EV_CHARGING: "sensor.charger", CONF_EV_SOC: "sensor.soc"},
+            {}, charge_rate_kw=7, now=datetime(2026, 6, 27, tzinfo=UTC),
+        )
+        assert build_threads and build_threads[0] != main_thread
+        async def cancelled(*args: Any) -> Any:
+            raise asyncio.CancelledError
+        monkeypatch.setattr(recorder_import, "_recorder_executor", lambda hass: cancelled)
+        with pytest.raises(asyncio.CancelledError):
+            await recorder_import.async_update_ev_charge_calibration(
+                ThreadHass(), {CONF_EV_CHARGING: "sensor.charger", CONF_EV_SOC: "sensor.soc"},
+                {}, charge_rate_kw=7, now=datetime(2026, 6, 27, tzinfo=UTC),
+            )
+    asyncio.run(run())

@@ -7,6 +7,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from custom_components.ha_energy_planner import planner as planner_module
+from custom_components.ha_energy_planner import planner_battery as battery_module
+from custom_components.ha_energy_planner import planner_confidence as confidence_module
+from custom_components.ha_energy_planner import planner_hvac as hvac_module
+from custom_components.ha_energy_planner import planner_presentation as presentation_module
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -33,10 +37,10 @@ from custom_components.ha_energy_planner.models import (
 )
 from custom_components.ha_energy_planner.planner import (
     DryRunPlanner,
-    _arbitrage_spread,
     _ev_earliest_start,
     _next_ready_by,
 )
+from custom_components.ha_energy_planner.planner_battery import _arbitrage_spread
 from custom_components.ha_energy_planner.thermal_model import update_thermal_model
 
 
@@ -110,9 +114,7 @@ def test_daylight_lowest_cost_selects_cheapest_complete_contiguous_window() -> N
     }
 
     action = next(
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.EV
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
 
     daylight = action.desired_state["daylight_lowest_cost"]
@@ -122,9 +124,7 @@ def test_daylight_lowest_cost_selects_cheapest_complete_contiguous_window() -> N
         "2026-06-27T12:00:00+00:00",
         "2026-06-27T12:05:00+00:00",
     ]
-    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {
-        "daylight"
-    }
+    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {"daylight"}
 
 
 def test_daylight_schedule_does_not_allocate_a_slot_past_sunset() -> None:
@@ -153,17 +153,14 @@ def test_daylight_schedule_does_not_allocate_a_slot_past_sunset() -> None:
     }
 
     action = next(
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.EV
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
     allocations = action.desired_state["allocated_slots"]
 
     assert action.desired_state["daylight_lowest_cost"]["selected"] is True
     assert allocations[0]["valid_at"] == "2026-06-27T16:55:00+00:00"
     assert all(
-        datetime.fromisoformat(item["valid_at"]) + timedelta(minutes=5)
-        <= context.daylight_windows[0].end
+        datetime.fromisoformat(item["valid_at"]) + timedelta(minutes=5) <= context.daylight_windows[0].end
         for item in allocations
         if item["allocation_source"] == "daylight"
     )
@@ -173,18 +170,15 @@ def test_disabled_daylight_policy_preserves_compact_legacy_ev_evidence() -> None
     context = _daylight_ev_context()
     action = next(
         action
-        for action in DryRunPlanner(
-            {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
-        ).create_plan(context).actions
+        for action in DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+        .create_plan(context)
+        .actions
         if action.asset == ActionAsset.EV
     )
 
     assert "daylight_lowest_cost" not in action.desired_state
     assert "allocation_source_now" not in action.desired_state
-    assert all(
-        "allocation_source" not in item
-        for item in action.desired_state["allocated_slots"]
-    )
+    assert all("allocation_source" not in item for item in action.desired_state["allocated_slots"])
 
 
 def test_split_daylight_schedule_uses_ready_by_fallback_without_duplicates() -> None:
@@ -209,9 +203,7 @@ def test_split_daylight_schedule_uses_ready_by_fallback_without_duplicates() -> 
     }
 
     action = next(
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.EV
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
     allocations = action.desired_state["allocated_slots"]
 
@@ -238,9 +230,7 @@ def test_incomplete_daylight_forecast_preserves_ready_by_schedule() -> None:
     }
 
     action = next(
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.EV
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
 
     daylight = action.desired_state["daylight_lowest_cost"]
@@ -248,9 +238,7 @@ def test_incomplete_daylight_forecast_preserves_ready_by_schedule() -> None:
     assert daylight["forecast_complete"] is False
     assert daylight["selected"] is False
     assert daylight["reason"] == "ev_daylight_forecast_incomplete"
-    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {
-        "ready_by"
-    }
+    assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {"ready_by"}
 
 
 @pytest.mark.parametrize(
@@ -307,9 +295,7 @@ def test_daylight_preference_preserves_higher_priority_and_fallback_paths(
         ]
 
     action = next(
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.EV
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.EV
     )
 
     daylight = action.desired_state["daylight_lowest_cost"]
@@ -353,18 +339,14 @@ def test_hvac_rollback_capability_issue_suppresses_takeover_but_keeps_release() 
 
     blocked = DryRunPlanner(options).create_plan(context)
 
-    assert [
-        action for action in blocked.actions if action.asset == ActionAsset.DAIKIN
-    ] == []
+    assert [action for action in blocked.actions if action.asset == ActionAsset.DAIKIN] == []
 
     context.hvac_control = {
         "phase": "preconditioning",
         "required_evidence_lost": "main_climate_target_unavailable",
     }
     release_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert len(release_actions) == 1
@@ -375,9 +357,7 @@ def test_unclassified_input_health_produces_an_unsafe_actionless_plan() -> None:
     context = _context()
     context.input_health = "mystery"  # type: ignore[assignment]
 
-    plan = DryRunPlanner(
-        {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
-    ).create_plan(context)
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).create_plan(context)
 
     assert plan.mode == PlannerMode.ACTIVE_DEGRADED
     assert plan.status == "unsafe"
@@ -644,15 +624,35 @@ def test_climate_confidence_uses_weather_source_instead_of_unrelated_global_mini
         confidence=1.0,
     )
 
-    assert not planner_module._action_meets_confidence_threshold(action, context, DEFAULT_OPTIONS)
-    assert not planner_module.plan_asset_meets_confidence_threshold(
+    assert not confidence_module._action_meets_confidence_threshold(action, context, DEFAULT_OPTIONS)
+    assert not confidence_module.plan_asset_meets_confidence_threshold(
         ActionAsset.DAIKIN,
         object(),
         DEFAULT_OPTIONS,
     )
-    reason = planner_module._confidence_rejection_reason(ActionAsset.DAIKIN, context, DEFAULT_OPTIONS)
+    reason = confidence_module._confidence_rejection_reason(ActionAsset.DAIKIN, context, DEFAULT_OPTIONS)
     assert reason is not None
     assert "climate 40.0%" in reason
+
+
+def test_control_area_eligibility_requires_each_assets_own_confidence() -> None:
+    """The exposed eligibility list excludes low evidence and unknown control areas."""
+    plan = DryRunPlanner(DEFAULT_OPTIONS).create_plan(_context())
+    plan.confidence_breakdown = {
+        "tariff": 1.0,
+        "solar": 1.0,
+        "ev": 1.0,
+        "enphase": 1.0,
+        "climate": 0.0,
+        "load": 1.0,
+    }
+    assert confidence_module.confidence_eligible_control_areas(
+        plan, ["ev", "hvac", "unknown", "enphase"], DEFAULT_OPTIONS
+    ) == ["ev", "enphase"]
+    plan.confidence_breakdown["tariff"] = 0.0
+    assert confidence_module.confidence_eligible_control_areas(
+        plan, ["ev", "hvac", "enphase"], DEFAULT_OPTIONS
+    ) == []
 
 
 def test_active_plan_turns_hvac_off_when_away() -> None:
@@ -1215,12 +1215,12 @@ def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None
 
     assert _next_ready_by(now, "bad") == datetime(2026, 6, 28, 7, 0, tzinfo=UTC)
     assert _arbitrage_spread(context) == 0.0
-    assert planner_module._forecast_solar_export_value(context, 5) is None
+    assert battery_module._forecast_solar_export_value(context, 5) is None
     context.slots = [DecisionSlot(now, 0.25, 0.50, None, None)]
     assert _arbitrage_spread(context) == 0.25
     context.input_health = InputHealth.DEGRADED
     assert DryRunPlanner(DEFAULT_OPTIONS)._confidence(context) == 0.65
-    assert planner_module._display_text("   ") == "Unknown"
+    assert presentation_module._display_text("   ") == "Unknown"
 
 
 def test_next_ready_by_uses_melbourne_standard_and_daylight_offsets() -> None:
@@ -1300,7 +1300,7 @@ def test_estimated_cost_reports_its_non_daily_horizon() -> None:
 def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> None:
     context = _context()
     context.input_issues = ["pv_forecast_entity_unavailable", "ev_soc_entity_unavailable"]
-    assert planner_module._subsystem_confidence(1.0, "pv_forecast_entity_unavailable", ("pv_forecast",)) == 0.4
+    assert confidence_module._subsystem_confidence(1.0, "pv_forecast_entity_unavailable", ("pv_forecast",)) == 0.4
     assert planner_module._battery_reserve_score(context) == 0.1
     context.current_battery_soc_percent = 35
     assert planner_module._battery_reserve_score(context) == 0.5
@@ -1315,7 +1315,7 @@ def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> Non
     context.slots = []
     rejected = planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)
     assert rejected["reason"] == "Skipped comfort preconditioning because no tariff forecast slots are available."
-    assert planner_module._timeline_card_rows({"bad": "value"}) == []
+    assert presentation_module._timeline_card_rows({"bad": "value"}) == []
 
     context.slots = [DecisionSlot(context.created_at, 0.2, 0.05, None, 1.0)]
     rejected = planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)
@@ -1324,7 +1324,7 @@ def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> Non
         "that both met the configured price difference and could be shifted within the thermal limits. "
         "This is a normal no-action planning outcome."
     )
-    assert planner_module._forecast_surplus_kwh(context, 5) == 0.0
+    assert battery_module._forecast_surplus_kwh(context, 5) == 0.0
 
     action = PlanAction(
         action_id="ev",
@@ -1339,7 +1339,7 @@ def test_planner_new_decision_helpers_cover_confidence_and_budget_edges() -> Non
         expected_cost_delta=None,
         confidence=1.0,
     )
-    assert not planner_module._action_meets_confidence_threshold(
+    assert not confidence_module._action_meets_confidence_threshold(
         action,
         context,
         {**DEFAULT_OPTIONS, "minimum_ev_confidence": 90.0},
@@ -1561,7 +1561,9 @@ def test_active_plan_uses_recorder_calibrated_soc_per_kwh() -> None:
             ev_charge_calibration=calibration,
             ev_charging_entity_id="sensor.ev_charging",
             ev_soc_entity_id="sensor.ev_soc",
-        ).create_plan(context).actions
+        )
+        .create_plan(context)
+        .actions
         if action.asset == ActionAsset.EV
     )
 
@@ -2080,9 +2082,7 @@ def test_away_off_ownership_transitions_to_opted_in_preconditioning() -> None:
     ]
 
     climate_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert climate_actions[0].kind == ActionKind.SET_HVAC
@@ -2103,9 +2103,7 @@ def test_away_off_ownership_remains_stable_without_preconditioning_candidate() -
     context.hvac_control = {"phase": "away_off"}
 
     climate_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert climate_actions == []
@@ -2128,9 +2126,7 @@ def test_away_off_ownership_does_not_release_at_comfort_boundary_without_candida
     context.hvac_control = {"phase": "away_off"}
 
     climate_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert climate_actions == []
@@ -2339,16 +2335,16 @@ def test_thermal_coast_helpers_cover_defensive_branches() -> None:
     context.current_hvac_temperature_c = 21
     context.current_outdoor_temperature_c = None
 
-    assert planner_module._effective_passive_drift_c_per_hour(context, "heat", {}) is None
+    assert hvac_module._effective_passive_drift_c_per_hour(context, "heat", {}) is None
     context.current_outdoor_temperature_c = 5
-    assert planner_module._effective_passive_drift_c_per_hour(context, "heat", {}) == -0.5
+    assert hvac_module._effective_passive_drift_c_per_hour(context, "heat", {}) == -0.5
     context.current_outdoor_temperature_c = 30
-    assert planner_module._effective_passive_drift_c_per_hour(context, "cool", {}) == 0.5
+    assert hvac_module._effective_passive_drift_c_per_hour(context, "cool", {}) == 0.5
     context.current_outdoor_temperature_c = 5
-    assert planner_module._effective_passive_drift_c_per_hour(context, "cool", {}) is None
+    assert hvac_module._effective_passive_drift_c_per_hour(context, "cool", {}) is None
 
     assert (
-        planner_module._effective_passive_drift_c_per_hour(
+        hvac_module._effective_passive_drift_c_per_hour(
             context,
             "heat",
             {"passive_indoor_drift_c_per_hour": {"average": -0.25}},
@@ -2356,7 +2352,7 @@ def test_thermal_coast_helpers_cover_defensive_branches() -> None:
         == -0.25
     )
     assert (
-        planner_module._thermal_coast_hours(
+        hvac_module._thermal_coast_hours(
             mode="heat",
             target_temperature=23,
             comfort_boundary=19,
@@ -2365,7 +2361,7 @@ def test_thermal_coast_helpers_cover_defensive_branches() -> None:
         is None
     )
     assert (
-        planner_module._thermal_coast_hours(
+        hvac_module._thermal_coast_hours(
             mode="cool",
             target_temperature=19,
             comfort_boundary=23,
@@ -2374,7 +2370,7 @@ def test_thermal_coast_helpers_cover_defensive_branches() -> None:
         == 8
     )
     assert (
-        planner_module._thermal_coast_hours(
+        hvac_module._thermal_coast_hours(
             mode="heat",
             target_temperature=23,
             comfort_boundary=19,
@@ -2620,9 +2616,7 @@ def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -
     ]
 
     planner = DryRunPlanner(options)
-    climate_actions = [
-        action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN
-    ]
+    climate_actions = [action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN]
 
     assert climate_actions[0].desired_state["phase"] == "preconditioning"
     assert climate_actions[0].execute_not_before == context.created_at
@@ -2644,16 +2638,12 @@ def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -
         "projected_precondition_end_temperature",
     }
     context.hvac_control = {
-        key: value
-        for key, value in climate_actions[0].desired_state.items()
-        if key in persisted_keys
+        key: value for key, value in climate_actions[0].desired_state.items() if key in persisted_keys
     }
     for slot in context.slots:
         slot.projected_hvac_load_kw = 0.0
 
-    continuation = [
-        action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN
-    ]
+    continuation = [action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN]
 
     assert continuation[0].desired_state["projected_precondition_end_temperature"] == 19.0
     assert all(slot.projected_hvac_load_kw > 0 for slot in context.slots[2:])
@@ -2691,16 +2681,12 @@ def test_fallback_hvac_preconditioning_scans_past_a_tariff_gap() -> None:
     ]
 
     climate_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert climate_actions[0].desired_state["phase"] == "preconditioning"
     assert climate_actions[0].execute_not_before == context.created_at + timedelta(minutes=10)
-    assert climate_actions[0].desired_state["precondition_end"] == context.created_at + timedelta(
-        minutes=15
-    )
+    assert climate_actions[0].desired_state["precondition_end"] == context.created_at + timedelta(minutes=15)
 
 
 @pytest.mark.parametrize(
@@ -2748,8 +2734,7 @@ def test_hvac_preconditioning_requalifies_prices_after_a_tariff_gap(
     preconditioning_actions = [
         action
         for action in DryRunPlanner(options, thermal_model=thermal_model).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
-        and action.desired_state.get("phase") == "preconditioning"
+        if action.asset == ActionAsset.DAIKIN and action.desired_state.get("phase") == "preconditioning"
     ]
 
     assert preconditioning_actions == []
@@ -3170,9 +3155,7 @@ def test_active_hvac_lifecycle_releases_when_weather_confidence_falls() -> None:
     }
 
     climate_actions = [
-        action
-        for action in DryRunPlanner(options).create_plan(context).actions
-        if action.asset == ActionAsset.DAIKIN
+        action for action in DryRunPlanner(options).create_plan(context).actions if action.asset == ActionAsset.DAIKIN
     ]
 
     assert len(climate_actions) == 1
@@ -3339,7 +3322,7 @@ def test_persisted_hvac_coast_projection_requires_current_temperature() -> None:
     context.current_hvac_temperature_c = None
     planner = DryRunPlanner(DEFAULT_OPTIONS)
 
-    planner._project_active_hvac_slots(
+    planner.hvac_policy._project_active_hvac_slots(
         context,
         phase="peak_coast",
         mode="heat",
@@ -3359,25 +3342,25 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
     context.occupied_temperature_high_c = 23
     planner = DryRunPlanner({**DEFAULT_OPTIONS, "planning_interval_minutes": 5})
 
-    assert planner_module._datetime_value("2026-06-27T01:00:00Z") == datetime(2026, 6, 27, 1, tzinfo=UTC)
-    assert planner_module._datetime_value(datetime(2026, 6, 27, 1)) == datetime(2026, 6, 27, 1, tzinfo=UTC)
-    assert planner_module._datetime_value("bad") is None
-    assert planner._next_hvac_period(context) is None
+    assert hvac_module._datetime_value("2026-06-27T01:00:00Z") == datetime(2026, 6, 27, 1, tzinfo=UTC)
+    assert hvac_module._datetime_value(datetime(2026, 6, 27, 1)) == datetime(2026, 6, 27, 1, tzinfo=UTC)
+    assert hvac_module._datetime_value("bad") is None
+    assert planner.hvac_policy._next_hvac_period(context) is None
 
     context.current_hvac_temperature_c = None
-    assert planner._next_hvac_period(context) is None
+    assert planner.hvac_policy._next_hvac_period(context) is None
     context.current_hvac_temperature_c = 21
 
     context.slots = [
         DecisionSlot(now, 0.10, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5), None, 0.05, 1, 2),
     ]
-    assert planner._next_hvac_period(context) is None
+    assert planner.hvac_policy._next_hvac_period(context) is None
     context.slots = [
         DecisionSlot(now, None, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5), 0.60, 0.05, 1, 2),
     ]
-    assert planner._next_hvac_period(context) is None
+    assert planner.hvac_policy._next_hvac_period(context) is None
 
     context.current_hvac_mode = "heat"
     context.current_outdoor_temperature_c = 5
@@ -3386,44 +3369,40 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
         DecisionSlot(now + timedelta(minutes=5), 0.10, 0.05, 1, 2, outdoor_temperature_forecast_c=5),
         DecisionSlot(now + timedelta(minutes=10), 0.60, 0.05, 1, 2, outdoor_temperature_forecast_c=5),
     ]
-    catch_up = planner._next_hvac_period(context, earliest_start=now + timedelta(minutes=5))
+    catch_up = planner.hvac_policy._next_hvac_period(context, earliest_start=now + timedelta(minutes=5))
     assert catch_up is not None
     assert catch_up["precondition_start"] == now + timedelta(minutes=5)
 
     peak = DecisionSlot(now + timedelta(minutes=5), 0.60, 0.05, 1, 2, outdoor_temperature_forecast_c=21)
     context.current_hvac_mode = "off"
     context.current_outdoor_temperature_c = 5
-    assert planner_module._future_hvac_mode(context, peak, 21, 19, 23) == "heat"
+    assert hvac_module._future_hvac_mode(context, peak, 21, 19, 23) == "heat"
     context.current_outdoor_temperature_c = 30
-    assert planner_module._future_hvac_mode(context, peak, 21, 19, 23) == "cool"
+    assert hvac_module._future_hvac_mode(context, peak, 21, 19, 23) == "cool"
     context.current_outdoor_temperature_c = 21
-    assert planner_module._future_hvac_mode(context, peak, 20, 19, 23) == "heat"
-    assert planner_module._future_hvac_mode(context, peak, 22, 19, 23) == "cool"
-    assert planner_module._future_hvac_mode(context, peak, 21, 19, 23) is None
+    assert hvac_module._future_hvac_mode(context, peak, 20, 19, 23) == "heat"
+    assert hvac_module._future_hvac_mode(context, peak, 22, 19, 23) == "cool"
+    assert hvac_module._future_hvac_mode(context, peak, 21, 19, 23) is None
 
     context.slots = []
-    assert not planner_module._tariff_evidence_covers_period(
+    assert not hvac_module._tariff_evidence_covers_period(
         context,
         now + timedelta(minutes=5),
         timedelta(minutes=5),
     )
-    assert not planner_module._persisted_hvac_period_qualifies(
-        context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20
-    )
+    assert not hvac_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20)
     context.slots = [DecisionSlot(now, 0.20, 0.05, 1, 2)]
-    assert not planner_module._tariff_evidence_covers_period(
+    assert not hvac_module._tariff_evidence_covers_period(
         context,
         now + timedelta(minutes=5),
         timedelta(0),
     )
-    assert not planner_module._persisted_hvac_period_qualifies(
-        context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20
-    )
+    assert not hvac_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20)
     context.slots = [
         DecisionSlot(now, 0.50, 0.05, 1, 2),
         DecisionSlot(now, 0.50, 0.05, 1, 2),
     ]
-    assert not planner_module._persisted_hvac_period_qualifies(
+    assert not hvac_module._persisted_hvac_period_qualifies(
         context,
         now,
         now + timedelta(minutes=5),
@@ -3435,7 +3414,7 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
         DecisionSlot(now, 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5), 0.50, 0.05, 1, 2),
     ]
-    assert not planner_module._persisted_hvac_period_qualifies(
+    assert not hvac_module._persisted_hvac_period_qualifies(
         context,
         now + timedelta(minutes=20),
         now + timedelta(minutes=25),
@@ -3447,15 +3426,11 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
         DecisionSlot(now, 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5), 0.20, 0.05, 1, 2),
     ]
-    assert not planner_module._persisted_hvac_period_qualifies(
-        context, now, now + timedelta(minutes=10), 0.10, 0.20, 0.20
-    )
+    assert not hvac_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=10), 0.10, 0.20, 0.20)
     context.slots = [DecisionSlot(now, 0.50, 0.05, 1, 2)]
-    assert not planner_module._persisted_hvac_period_qualifies(
-        context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20
-    )
+    assert not hvac_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=5), 0.10, 0.20, 0.20)
     context.slots = [DecisionSlot(now, None, 0.05, 1, 2)]
-    assert not planner_module._tariff_evidence_covers_period(
+    assert not hvac_module._tariff_evidence_covers_period(
         context,
         now + timedelta(minutes=5),
         timedelta(minutes=5),
@@ -3464,7 +3439,7 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
         DecisionSlot(now, 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=10), 0.50, 0.05, 1, 2),
     ]
-    assert not planner_module._tariff_evidence_covers_period(
+    assert not hvac_module._tariff_evidence_covers_period(
         context,
         now + timedelta(minutes=15),
         timedelta(minutes=5),
@@ -3473,13 +3448,13 @@ def test_hvac_lifecycle_period_and_mode_helpers_cover_forecast_edges() -> None:
         DecisionSlot(now, 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5), 0.50, 0.05, 1, 2),
     ]
-    assert planner_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=10), 0.10, 0.20, 0.20)
+    assert hvac_module._persisted_hvac_period_qualifies(context, now, now + timedelta(minutes=10), 0.10, 0.20, 0.20)
     context.slots = [
         DecisionSlot(now + timedelta(seconds=1), 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=5, seconds=1), 0.50, 0.05, 1, 2),
         DecisionSlot(now + timedelta(minutes=10, seconds=1), 0.50, 0.05, 1, 2),
     ]
-    assert planner_module._persisted_hvac_period_qualifies(
+    assert hvac_module._persisted_hvac_period_qualifies(
         context,
         now + timedelta(minutes=5),
         now + timedelta(minutes=15),

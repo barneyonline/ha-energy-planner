@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "$ROOT_DIR/.ha-smoke.XXXXXX")"
-LOG_FILE="$TMP_DIR/home-assistant.log"
+LOG_FILE="$TMP_DIR/docker-console.log"
+HA_IMAGE="${HEP_HA_IMAGE:-ghcr.io/home-assistant/home-assistant:stable}"
 
 cleanup() {
   if [[ "${KEEP_HA_SMOKE:-0}" == "1" ]]; then
@@ -14,7 +15,7 @@ cleanup() {
       docker run --rm \
         -v "$TMP_DIR:/cleanup" \
         --entrypoint /bin/sh \
-        ghcr.io/home-assistant/home-assistant:stable \
+        "$HA_IMAGE" \
         -c 'find /cleanup -mindepth 1 -exec rm -rf {} +' >/dev/null 2>&1 || true
       rm -rf "$TMP_DIR" 2>/dev/null || true
     fi
@@ -179,7 +180,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             if debounce_cancel is not None:
                 debounce_cancel()
                 coordinator._debounce_cancel = None
-            coordinator._debounced_refresh.async_cancel()
             await coordinator.async_refresh()
             await coordinator.async_wait_for_plan_execution()
             ai_task = getattr(coordinator, "_ai_advice_task", None)
@@ -201,6 +201,30 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     raise TimeoutError("Manual HVAC helper override did not clear")
                 await asyncio.sleep(0.05)
             await coordinator.async_wait_for_plan_execution()
+
+    async def wait_for_hvac_away_off(call: ServiceCall) -> None:
+        """Observe the away transaction before introducing a newer manual override."""
+        async with asyncio.timeout(30):
+            for entry in hass.config_entries.async_entries("ha_energy_planner"):
+                coordinator = entry.runtime_data
+                while True:
+                    climate = hass.states.get("climate.fake_daikin")
+                    applied = any(
+                        item.get("result") == "applied"
+                        and str(item.get("action_id", "")).endswith("-hvac-away-off")
+                        and item.get("reason") == "hvac_action_applied"
+                        and item.get("post_state", {}).get("daikin_climate_entity") == "off"
+                        for item in coordinator.store.data.get("execution_audit", [])
+                    )
+                    if applied and climate is not None and climate.state == "off":
+                        break
+                    # Existing preconditioning ownership is released before
+                    # a later plan can acquire away-off ownership. Complete
+                    # that transaction, then request its follow-up plan using
+                    # the public API instead of relying on incidental timers.
+                    await coordinator.async_wait_for_plan_execution()
+                    await coordinator.async_refresh()
+                    await asyncio.sleep(0.05)
 
     async def mark_smoke_complete(call: ServiceCall) -> None:
         """Write a completion marker before Home Assistant shuts down."""
@@ -258,6 +282,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
     hass.services.async_register(DOMAIN, "wait_for_planner_idle", wait_for_planner_idle)
     hass.services.async_register(DOMAIN, "wait_for_manual_override_clear", wait_for_manual_override_clear)
+    hass.services.async_register(DOMAIN, "wait_for_hvac_away_off", wait_for_hvac_away_off)
     hass.services.async_register(DOMAIN, "mark_smoke_complete", mark_smoke_complete)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
@@ -527,10 +552,9 @@ automation:
           {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
         timeout: "00:00:30"
         continue_on_timeout: false
-      - action: fake_planner_test.seed_production_evidence
-      - action: ha_energy_planner.arm_production_control
-        data:
-          reason: docker_smoke_reviewed_contract
+      # Establish the synthetic baseline before arming can acquire HVAC
+      # ownership. Re-enabling a conflict automation after takeover would
+      # correctly cause the planner to release that ownership.
       - action: input_boolean.turn_on
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -553,6 +577,10 @@ automation:
         data:
           entity_id: input_number.import_price
           value: 0.10
+      - action: fake_planner_test.seed_production_evidence
+      - action: ha_energy_planner.arm_production_control
+        data:
+          reason: docker_smoke_reviewed_contract
       - action: ha_energy_planner.replan
       # Restore only after the coordinated HVAC action and its ownership
       # snapshot have reached the observable actuator state. A fixed delay can
@@ -615,6 +643,7 @@ automation:
           option: not_home
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
+      - action: fake_planner_test.wait_for_hvac_away_off
       - action: ha_energy_planner.set_manual_hvac_override
         data:
           duration_minutes: 10
@@ -697,6 +726,7 @@ automation:
         data:
           entity_id: climate.fake_daikin
           hvac_mode: heat
+      - action: fake_planner_test.wait_for_planner_idle
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_change_from_scheduler
@@ -1142,7 +1172,7 @@ set +e
 docker run --rm \
   -v "$TMP_DIR:/config" \
   --entrypoint timeout \
-  ghcr.io/home-assistant/home-assistant:stable \
+  "$HA_IMAGE" \
   240s python3 -m homeassistant --config /config >"$LOG_FILE" 2>&1
 STATUS=$?
 set -e
@@ -1388,7 +1418,7 @@ if active_average < 1.7:
 overrides = store_data.get("overrides", [])
 if not any(item.get("reason") == "docker_smoke_manual_override" for item in overrides):
     raise SystemExit("set_manual_hvac_override service did not persist the smoke override")
-outcomes = store_data.get("outcomes", [])
+outcomes = store_data.get("execution_audit", [])
 restore_outcomes = [
     item
     for item in outcomes

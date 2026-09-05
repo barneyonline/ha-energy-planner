@@ -10,6 +10,7 @@ from homeassistant.util import dt as dt_util
 from .entry_data import combined_entry_data
 from .models import to_jsonable
 from .safety import control_pause_status
+from .storage import audit_records
 from .type_defs import EnergyPlannerConfigEntry
 
 REDACT_KEYS = {
@@ -95,8 +96,8 @@ async def async_get_config_entry_diagnostics(
             if isinstance(store_data.get("production"), dict)
             else {}
         ),
-        "recent_outcomes": _redact(_recent_items(store_data, "outcomes", limit=10)),
-        "recent_audit": _redact(_recent_items(store_data, "execution_audit", limit=20)),
+        "recent_outcomes": _redact(audit_records(store_data)[-10:]),
+        "recent_audit": _redact(audit_records(store_data)[-20:]),
         "recent_dry_run_comparisons": _redact(_recent_items(store_data, "dry_run_comparisons", limit=10)),
         "store": _redact(_store_summary(store_data)),
     }
@@ -138,7 +139,7 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
     """Return bounded Store metadata instead of the full Store payload."""
     return {
         "active_plan_present": bool(store_data.get("active_plan")),
-        "outcome_count": len(store_data.get("outcomes", [])) if isinstance(store_data.get("outcomes"), list) else 0,
+        "outcome_count": len(audit_records(store_data)),
         "forecast_snapshot_count": (
             len(store_data.get("forecast_snapshots", []))
             if isinstance(store_data.get("forecast_snapshots"), list)

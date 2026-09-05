@@ -19,12 +19,16 @@ ENTITY_DESCRIPTIONS = {
 }
 
 
-def test_all_entity_descriptions_have_icons() -> None:
-    """Every integration-created entity should have a visible icon."""
+def test_all_entity_descriptions_use_frontend_icon_translations() -> None:
+    """Custom icons stay out of recorder state and resolve by translation key."""
+    icons = _load_json(_integration_path("icons.json"))["entity"]
     for platform, descriptions in ENTITY_DESCRIPTIONS.items():
+        assert set(icons[platform]) == {description.translation_key for description in descriptions}
         for description in descriptions:
-            assert isinstance(description.icon, str), f"{platform}.{description.key} is missing an icon"
-            assert description.icon.startswith("mdi:"), f"{platform}.{description.key} icon should be an mdi icon"
+            assert description.icon is None
+            icon = icons[platform][description.translation_key]["default"]
+            assert isinstance(icon, str) and icon.startswith("mdi:")
+    assert icons["calendar"] == {"plan": {"default": "mdi:calendar-clock"}}
 
 
 def test_all_entity_descriptions_have_translated_names() -> None:

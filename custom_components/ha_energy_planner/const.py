@@ -7,7 +7,7 @@ INTEGRATION_NAME = "Energy Planner"
 LEGACY_INTEGRATION_NAME = f"HA {INTEGRATION_NAME}"
 CONF_INSTANCE_NAME = "instance_name"
 
-PLATFORMS = ["sensor", "binary_sensor", "switch", "button", "number", "time", "calendar"]
+PLATFORMS = ["sensor", "binary_sensor", "switch", "button", "calendar"]
 
 CONF_AMBER_IMPORT_PRICE = "amber_import_price_entity"
 CONF_AMBER_EXPORT_PRICE = "amber_export_price_entity"
