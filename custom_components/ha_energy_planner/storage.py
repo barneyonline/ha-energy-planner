@@ -8,9 +8,9 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.storage import Store
 
 from .const import STORE_KEY, STORE_VERSION
+from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
 
 _LIST_FIELDS = {
@@ -50,18 +50,20 @@ class PlannerStore:
         """Initialize storage."""
         storage_key = STORE_KEY if entry_id is None else f"{STORE_KEY}_{entry_id}"
         self._entry_id = entry_id
-        self._store: Store[dict[str, Any]] = Store(
+        self._store = Store(
             hass,
             STORE_VERSION,
             storage_key,
             serialize_in_event_loop=False,
+            atomic_writes=True,
         )
-        self._legacy_store: Store[dict[str, Any]] | None = (
+        self._legacy_store: Store | None = (
             Store(
                 hass,
                 STORE_VERSION,
                 STORE_KEY,
                 serialize_in_event_loop=False,
+                atomic_writes=True,
             )
             if entry_id is not None and legacy_fallback
             else None

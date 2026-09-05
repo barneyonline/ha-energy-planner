@@ -1870,17 +1870,24 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "disarmed_reason": reason,
             }
         )
-        await self._async_save_production(production)
-        async with self._command_lock:
-            ownership = self.store.data.get("ownership", {})
-            if isinstance(ownership, dict) and (
-                ownership.get("hvac_control")
-                or ownership.get("climate_automations")
-                or ownership.get("planner_takeover_started_at")
-                or ownership.get("planner_hvac_action_expires_at")
-            ):
-                await self.executor.async_release_hvac_control("production_control_disarmed")
-        self.async_update_listeners()
+        try:
+            # Revoke authority immediately, but restore already-owned HVAC before
+            # attempting persistence. A failed save must not strand disabled
+            # automations or enabled zones. The final flush still raises and
+            # retains dirty state; acquisition keeps its explicit durable flush.
+            async with self.store.async_delay_save():
+                await self._async_save_production(production)
+                async with self._command_lock:
+                    ownership = self.store.data.get("ownership", {})
+                    if isinstance(ownership, dict) and (
+                        ownership.get("hvac_control")
+                        or ownership.get("climate_automations")
+                        or ownership.get("planner_takeover_started_at")
+                        or ownership.get("planner_hvac_action_expires_at")
+                    ):
+                        await self.executor.async_release_hvac_control("production_control_disarmed")
+        finally:
+            self.async_update_listeners()
 
     async def async_operator_disarm_production_control(
         self,

@@ -72,9 +72,9 @@ def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(mo
         "ha_energy_planner_state_vehicle-two",
     ]
     assert FakeStore.created_kwargs == [
-        {"serialize_in_event_loop": False},
-        {"serialize_in_event_loop": False},
-        {"serialize_in_event_loop": False},
+        {"serialize_in_event_loop": False, "atomic_writes": True},
+        {"serialize_in_event_loop": False, "atomic_writes": True},
+        {"serialize_in_event_loop": False, "atomic_writes": True},
     ]
 
 
