@@ -15,11 +15,6 @@
 
 Energy Planner is a local-first Home Assistant custom integration that coordinates tariffs, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles in one guarded plan.
 
-> [!IMPORTANT]
-> Energy Planner is an unofficial community project in active development. It is not affiliated with, endorsed by, or supported by Home Assistant, Enphase, Amber Electric, Solcast, Daikin, or other vendors.
->
-> Automatic control can issue real device commands. Begin in review mode, check the proposed plan and safety evidence, and keep the vendors' own protections and limits enabled.
-
 The Platinum quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
 
 ## Supported Functionality
