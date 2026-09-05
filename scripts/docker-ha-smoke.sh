@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "$ROOT_DIR/.ha-smoke.XXXXXX")"
 LOG_FILE="$TMP_DIR/docker-console.log"
-HA_IMAGE="${HEP_HA_IMAGE:-ghcr.io/home-assistant/home-assistant:stable}"
+HA_IMAGE="${HEP_HA_IMAGE:-$(python3 "$ROOT_DIR/scripts/support_policy.py" image)}"
 
 cleanup() {
   if [[ "${KEEP_HA_SMOKE:-0}" == "1" ]]; then
@@ -24,7 +24,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TMP_DIR/custom_components" "$TMP_DIR/.storage"
-cp -R "$ROOT_DIR/custom_components/ha_energy_planner" "$TMP_DIR/custom_components/"
+cp -R "${HEP_COMPONENT_DIR:-$ROOT_DIR/custom_components/ha_energy_planner}" "$TMP_DIR/custom_components/"
 mkdir -p "$TMP_DIR/custom_components/fake_planner_test"
 cat > "$TMP_DIR/custom_components/fake_planner_test/manifest.json" <<'JSON'
 {

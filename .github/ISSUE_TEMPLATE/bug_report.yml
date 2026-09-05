@@ -6,7 +6,7 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a problem. Do not include API keys, tokens, addresses, private location history, or raw AI prompt/response content.
+        Use the export_support_bundle action or download integration diagnostics; see README Troubleshooting. Thanks for reporting a problem. Do not include API keys, tokens, addresses, private location history, or raw AI prompt/response content.
   - type: dropdown
     id: primary_area
     attributes:
@@ -19,7 +19,6 @@ body:
         - Climate control, presence, or thermal model
         - Enphase profile or battery mode control
         - AI advisory service
-        - HAEO optimizer integration
         - Diagnostics, repairs, or logs
         - Documentation
         - Developer workflow / repository tooling
@@ -31,6 +30,7 @@ body:
     attributes:
       label: Installation method
       options:
+        - HACS
         - Manual install in custom_components
         - Development checkout
         - Other
@@ -40,8 +40,8 @@ body:
     id: homeassistant_version
     attributes:
       label: Home Assistant version
-      description: "Example: 2026.3.0"
-      placeholder: "2026.3.0"
+      description: "Example: 2026.9.0"
+      placeholder: "2026.9.0"
     validations:
       required: true
   - type: input
@@ -49,7 +49,7 @@ body:
     attributes:
       label: Energy Planner integration version
       description: Use the release tag, manifest version, or commit SHA.
-      placeholder: "0.1.27"
+      placeholder: "Current manifest version"
     validations:
       required: true
   - type: textarea

@@ -30,7 +30,7 @@ def test_release_metadata_versions_match() -> None:
     root = Path(__file__).resolve().parents[1]
     pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert _manifest()["version"] == pyproject["project"]["version"] == "0.9.18"
+    assert _manifest()["version"] == pyproject["project"]["version"]
 
 
 def test_manifest_keeps_dependency_surface_explicit() -> None:
@@ -53,4 +53,7 @@ def test_hacs_metadata_sets_minimum_home_assistant_version() -> None:
     hacs_manifest = _hacs_manifest()
 
     assert hacs_manifest["name"] == "Energy Planner"
-    assert hacs_manifest["homeassistant"] == "2026.6.0"
+    minimum = tuple(map(int, hacs_manifest["homeassistant"].split(".")))
+    root = Path(__file__).resolve().parents[1]
+    policy = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["energy-planner"]["support"]
+    assert minimum <= tuple(map(int, policy["baseline"].split(".")))

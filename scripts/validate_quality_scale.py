@@ -177,8 +177,9 @@ def _strict_typing_gate_is_configured(root: Path) -> bool:
         and not mypy.get("disable_error_code")
         and not mypy.get("overrides")
         and mypy_script_path.stat().st_mode & 0o111
-        and "ghcr.io/home-assistant/home-assistant:2026.8.2" in mypy_script
-        and '"mypy==1.19.1"' in mypy_script
+        and "scripts/support_policy.py image" in mypy_script
+        and "scripts/support_policy.py mypy" in mypy_script
+        and '"mypy==$MYPY_VERSION"' in mypy_script
         and "python3 -m mypy" in mypy_script
         and "run scripts/docker-mypy.sh" in validation_script
         and "run: scripts/docker-mypy.sh" in quality_workflow

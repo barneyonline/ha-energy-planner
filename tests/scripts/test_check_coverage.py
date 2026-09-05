@@ -51,6 +51,13 @@ def test_missing_or_uninstrumented_evidence_fails() -> None:
     assert check(report)[0] == 1
 
 
+def test_reviewed_branch_baseline_rejects_regressions_and_new_gaps() -> None:
+    check = _checker()
+    assert check(_report(), {"component.py": 5})[0] == 0
+    assert check(_report(), {"component.py": 4})[0] == 1
+    assert check(_report(), {})[0] == 1
+
+
 def test_modules_without_branches_are_valid() -> None:
     assert _checker()(_report(branches=0)) == (
         0, ["Statement coverage: 1000/1000 (100.00%)", "Branch coverage: no branches"]
