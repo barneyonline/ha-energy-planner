@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from itertools import product
+
+import pytest
 
 from custom_components.ha_energy_planner.ev import (
     _best_continuous_slots,
@@ -18,6 +21,73 @@ from custom_components.ha_energy_planner.ev import (
     ev_charging_state_proves_safe,
 )
 from custom_components.ha_energy_planner.models import DecisionSlot
+
+
+@pytest.mark.parametrize("required_soc", [5.0, 7.5, 10.0, 12.5])
+@pytest.mark.parametrize("pv", [(0, 0, 0, 0), (0, 4, 8, 2), (8, 8, 8, 8)])
+def test_continuous_schedule_matches_exhaustive_energy_cost_oracle(required_soc, pv) -> None:
+    """An independent money calculation catches rank sums and partial-slot errors."""
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    for prices in product((-0.10, 0.10, 1.00), repeat=4):
+        slots = [
+            DecisionSlot(now + timedelta(minutes=5 * index), price, 0.05, pv[index], 1.0)
+            for index, price in enumerate(prices)
+        ]
+        schedule = allocate_least_cost_charging(
+            slots, current_soc_percent=40, target_soc_percent=40 + required_soc,
+            ready_by=now + timedelta(minutes=20), charge_rate_kw=6, soc_per_kwh=10,
+            interval_minutes=5, continuous=True,
+        )
+        count = int((required_soc + 4.999999) // 5)
+
+        def actual_cost(start, count=count, prices=prices):
+            remaining_kwh = required_soc / 10
+            cost = 0.0
+            for index in range(start, start + count):
+                energy = min(0.5, remaining_kwh)
+                solar_energy = min(energy, max(pv[index] - 1, 0) / 12)
+                cost += solar_energy * 0.05 + (energy - solar_energy) * prices[index]
+                remaining_kwh -= energy
+            return round(cost, 9)
+
+        cheapest_start = min(range(5 - count), key=lambda start: (actual_cost(start), start))
+        selected = [int((item.valid_at - now).total_seconds() / 300) for item in schedule.allocations]
+        assert selected == list(range(cheapest_start, cheapest_start + count)), (prices, pv, required_soc)
+        assert schedule.infeasible is False
+        assert sum(item.added_soc_percent for item in schedule.allocations) == pytest.approx(required_soc)
+
+
+def test_continuous_window_compares_price_magnitudes_not_rank_sums() -> None:
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    slots = [
+        DecisionSlot(now + timedelta(minutes=5 * index), price, 0.05, 0, 1)
+        for index, price in enumerate((0.01, 1.00, 0.40, 0.41))
+    ]
+    schedule = allocate_least_cost_charging(
+        slots, current_soc_percent=40, target_soc_percent=50,
+        ready_by=now + timedelta(minutes=20), charge_rate_kw=6, soc_per_kwh=10,
+        interval_minutes=5, continuous=True,
+    )
+    assert [item.valid_at for item in schedule.allocations] == [slots[2].valid_at, slots[3].valid_at]
+    assert sum(item.charge_kw / 12 * item.import_price for item in schedule.allocations) == pytest.approx(0.405)
+
+
+@pytest.mark.parametrize("carbon_weight,expected_start", [(0, 0), (0.8, 2), (1, 2)])
+def test_continuous_window_preserves_carbon_preference(carbon_weight, expected_start) -> None:
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    slots = [
+        DecisionSlot(
+            now + timedelta(minutes=5 * index), price, 0.05, 0, 1,
+            carbon_intensity_g_per_kwh=carbon,
+        )
+        for index, (price, carbon) in enumerate(((0.1, 800), (0.1, None), (0.3, 50), (0.3, 50)))
+    ]
+    schedule = allocate_least_cost_charging(
+        slots, current_soc_percent=40, target_soc_percent=50,
+        ready_by=now + timedelta(minutes=20), charge_rate_kw=6, soc_per_kwh=10,
+        interval_minutes=5, continuous=True, carbon_weight=carbon_weight,
+    )
+    assert schedule.allocations[0].valid_at == slots[expected_start].valid_at
 
 
 def test_ev_charging_state_distinguishes_suspended_power_from_connection() -> None:
@@ -289,7 +359,10 @@ def test_allocate_native_charging_honors_force_current_and_price_limit() -> None
 
     assert [allocation.valid_at for allocation in schedule.allocations] == [now, now + timedelta(minutes=5)]
     assert schedule.infeasible is False
-    assert _best_continuous_slots([], [], required_slots=0, interval_minutes=5, force_current=False) == []
+    assert _best_continuous_slots(
+        [], required_slots=0, interval_minutes=5, force_current=False,
+        charge_rate_kw=6, required_soc_percent=0, soc_per_slot=5, carbon_weight=0,
+    ) == []
 
 
 def test_forced_current_slot_bypasses_earliest_start_without_moving_future_window() -> None:

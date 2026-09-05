@@ -365,24 +365,29 @@ def allocate_least_cost_charging(
         required_slots = ceil(required / soc_per_slot)
         if current_outside_window and current_slot in price_eligible:
             regular_price_eligible = [slot for slot in price_eligible if slot is not current_slot]
-            regular_ranked = [slot for slot in ranked if slot is not current_slot]
             ordered = [
                 current_slot,
                 *_best_continuous_slots(
                     regular_price_eligible,
-                    regular_ranked,
                     required_slots=max(required_slots - 1, 0),
                     interval_minutes=interval_minutes,
                     force_current=False,
+                    charge_rate_kw=charge_rate_kw,
+                    required_soc_percent=max(required - soc_per_slot, 0.0),
+                    soc_per_slot=soc_per_slot,
+                    carbon_weight=carbon_weight,
                 ),
             ]
         else:
             ordered = _best_continuous_slots(
                 price_eligible,
-                ranked,
                 required_slots=required_slots,
                 interval_minutes=interval_minutes,
                 force_current=anchor_current,
+                charge_rate_kw=charge_rate_kw,
+                required_soc_percent=required,
+                soc_per_slot=soc_per_slot,
+                carbon_weight=carbon_weight,
             )
     elif force_current and current_slot in ranked:
         ordered = [current_slot, *(slot for slot in ranked if slot is not current_slot)]
@@ -440,17 +445,19 @@ def allocate_least_cost_charging(
 
 def _best_continuous_slots(
     feasible_slots: list[Any],
-    ranked_slots: list[Any],
     *,
     required_slots: int,
     interval_minutes: int,
     force_current: bool,
+    charge_rate_kw: float,
+    required_soc_percent: float,
+    soc_per_slot: float,
+    carbon_weight: float,
 ) -> list[Any]:
-    """Return the lowest-ranked contiguous window in chronological order."""
+    """Minimize whole-window cost/carbon, including a partial final slot."""
     chronological = sorted(feasible_slots, key=lambda slot: slot.valid_at)
     if required_slots <= 0 or not chronological:
         return []
-    rank = {slot.valid_at: index for index, slot in enumerate(ranked_slots)}
     windows: list[list[Any]] = []
     for index in range(len(chronological)):
         window = chronological[index : index + required_slots]
@@ -464,12 +471,9 @@ def _best_continuous_slots(
     if force_current:
         windows = [window for window in windows if window[0] is chronological[0]]
     if windows:
-        return min(
+        return _lowest_cost_window(
             windows,
-            key=lambda window: (
-                sum(rank[slot.valid_at] for slot in window),
-                window[0].valid_at,
-            ),
+            charge_rate_kw, required_soc_percent, soc_per_slot, interval_minutes, carbon_weight,
         )
 
     # Missing/price-ineligible slots can make a full continuous window
@@ -488,15 +492,61 @@ def _best_continuous_slots(
     if force_current:
         runs = [run for run in runs if run[0] is chronological[0]]
     candidates = [run[:required_slots] for run in runs if run]
-    return min(
-        candidates,
-        key=lambda run: (
-            -len(run),
-            sum(rank[slot.valid_at] for slot in run),
-            run[0].valid_at,
-        ),
-        default=[],
+    longest = max(len(run) for run in candidates)
+    return _lowest_cost_window(
+        [run for run in candidates if len(run) == longest],
+        charge_rate_kw, required_soc_percent, soc_per_slot, interval_minutes, carbon_weight,
     )
+
+
+def _lowest_cost_window(
+    windows: list[list[Any]],
+    charge_rate_kw: float,
+    required_soc_percent: float,
+    soc_per_slot: float,
+    interval_minutes: int,
+    carbon_weight: float,
+) -> list[Any]:
+    """Score complete alternatives by money and grid emissions, not price ranks."""
+    known_intensities = [
+        value for window in windows for slot in window
+        if (value := _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))) is not None
+    ]
+    worst_intensity = max(known_intensities, default=0.0)
+    rows = []
+    for window in windows:
+        remaining = required_soc_percent
+        cost = carbon = 0.0
+        for slot in window:
+            added = min(soc_per_slot, remaining)
+            charge_kw = charge_rate_kw * added / soc_per_slot
+            _effective, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
+            hours = interval_minutes / 60.0
+            cost += hours * (solar_kw * (slot.export_price or 0.0) + grid_kw * slot.import_price)
+            intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
+            carbon += hours * grid_kw * (worst_intensity if intensity is None else intensity)
+            remaining -= added
+        rows.append((window, cost, carbon if known_intensities else None))
+    weighted_carbon = min(max(float(carbon_weight), 0.0), 1.0)
+    emissions = [carbon for _window, _cost, carbon in rows if carbon is not None]
+    if not emissions or weighted_carbon == 0:
+        return min(rows, key=lambda row: (row[1], row[0][0].valid_at))[0]
+    costs = [cost for _window, cost, _carbon in rows]
+    min_cost, max_cost = min(costs), max(costs)
+    min_carbon, max_carbon = min(emissions), max(emissions)
+
+    def score(row: tuple[list[Any], float, float | None]) -> tuple[float, float, datetime]:
+        window, cost, carbon = row
+        return (
+            (1.0 - weighted_carbon) * _normalize_range(cost, min_cost, max_cost)
+            + weighted_carbon * _normalize_range(
+                max_carbon if carbon is None else carbon, min_carbon, max_carbon
+            ),
+            cost,
+            window[0].valid_at,
+        )
+
+    return min(rows, key=score)[0]
 
 
 def _rank_charging_slots(slots: list[Any], charge_kw: float, carbon_weight: float) -> list[Any]:

@@ -1271,6 +1271,26 @@ def test_next_ready_by_rolls_over_in_local_calendar_and_handles_dst_gap() -> Non
     assert _next_ready_by(after_ready, "07:00", "Invalid/Timezone") == datetime(2026, 7, 12, 7, 0, tzinfo=UTC)
 
 
+@pytest.mark.parametrize(
+    "created,expected",
+    [
+        ("2026-04-04T15:00:00+00:00", "2026-04-04T15:30:00+00:00"),
+        ("2026-04-04T15:30:00+00:00", "2026-04-04T16:30:00+00:00"),
+        ("2026-04-04T15:45:00+00:00", "2026-04-04T16:30:00+00:00"),
+        ("2026-04-04T16:45:00+00:00", "2026-04-05T16:30:00+00:00"),
+    ],
+)
+def test_ready_by_selects_next_occurrence_during_autumn_repeated_hour(created, expected) -> None:
+    now = datetime.fromisoformat(created)
+    deadline = _next_ready_by(now, "02:30", "Australia/Melbourne")
+    assert deadline == datetime.fromisoformat(expected)
+    start = _ev_earliest_start(now, deadline, "02:00", "Australia/Melbourne")
+    assert now <= start < deadline
+    # A 02:00 window belongs to the same occurrence as its 02:30 deadline;
+    # after the first deadline, it must reopen in the second repeated hour.
+    assert start == max(now, deadline - timedelta(minutes=30))
+
+
 def test_estimated_cost_reports_its_non_daily_horizon() -> None:
     options = {
         **DEFAULT_OPTIONS,

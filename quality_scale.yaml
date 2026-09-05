@@ -98,6 +98,7 @@ rules:
         - custom_components/ha_energy_planner/inputs.py
         - custom_components/ha_energy_planner/forecasts.py
         - custom_components/ha_energy_planner/storage.py
+        - custom_components/ha_energy_planner/durable_storage.py
         - custom_components/ha_energy_planner/preflight.py
         - custom_components/ha_energy_planner/ev.py
         - custom_components/ha_energy_planner/ev_adapter.py
@@ -240,10 +241,11 @@ rules:
         - tests/test_storage.py
   action-exceptions:
     status: done
-    comment: Automated execution remains fail-closed and auditable; device control selectors persist disable before a best-effort restore and report incomplete recovery without re-enabling control, mapped EV charging feedback must confirm bounded start/stop and plug-in auto-start compensation attempts, and explicit action services and buttons raise translated Home Assistant errors for missing or ambiguous runtime state and rejected device commands.
+    comment: Automated execution remains fail-closed and auditable; operator disarm revokes authority and restores owned HVAC before flushing state, with real Store failures retaining retryable state and reporting the persistence error after restoration. Device control selectors persist disable before a best-effort restore and report incomplete recovery without re-enabling control, mapped EV charging feedback must confirm bounded start/stop and plug-in auto-start compensation attempts, and explicit action services and buttons raise translated Home Assistant errors for missing or ambiguous runtime state and rejected device commands.
     references:
       code:
         - custom_components/ha_energy_planner/__init__.py
+        - custom_components/ha_energy_planner/coordinator.py
         - custom_components/ha_energy_planner/button.py
         - custom_components/ha_energy_planner/executor.py
         - custom_components/ha_energy_planner/ev_adapter.py
@@ -254,6 +256,7 @@ rules:
         - tests/test_services.py
         - tests/test_switch_button.py
         - tests/test_executor.py
+        - tests/test_control_runtime.py
         - tests/test_ev_adapter.py
         - tests/test_hvac_adapter.py
         - tests/test_enphase_adapter.py
@@ -329,6 +332,9 @@ rules:
     references:
       tests:
         - tests/test_ha_runtime.py
+        - tests/test_control_runtime.py
+        - tests/fixtures/decision_replay/ev_reprice_override_recovery.json
+        - tests/fixtures/decision_replay/ev_autumn_ready_by.json
         - tests/test_device_registry_runtime.py
         - tests/test_training.py
         - scripts/docker-compatibility.sh

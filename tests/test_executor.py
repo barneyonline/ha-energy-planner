@@ -4716,6 +4716,148 @@ def test_executor_message_and_service_target_helpers_cover_edge_cases() -> None:
     )
 
 
+@pytest.mark.parametrize("interruption", ["none", "failure", "cancel"])
+@pytest.mark.parametrize("barrier_phase", ["persistence", "dispatch"])
+def test_concurrent_ev_starts_hold_capacity_across_persistence_and_dispatch(interruption, barrier_phase) -> None:
+    async def run() -> None:
+        persisted = asyncio.Event()
+        release_save = asyncio.Event()
+
+        class BarrierStore(FakeStore):
+            async def async_flush(self) -> None:
+                if self.flush_count == 0 and barrier_phase == "persistence":
+                    persisted.set()
+                    await release_save.wait()
+                await super().async_flush()
+
+        now = datetime.now(UTC)
+        hass = FakeHass({"switch.a": "off", "switch.b": "off", "binary_sensor.connected": "on"})
+        hass.data = {}
+        hass.config_entries = SimpleNamespace(async_entries=lambda domain: [
+            SimpleNamespace(entry_id=name, runtime_data=object()) for name in ("a", "b")
+        ])
+        options = {
+            CONF_EV_CHARGE_RATE_KW: 7.0, CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+            CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0, CONF_EV_CONFIRMATION_RETRIES: 0,
+        }
+        first = Executor(BarrierStore(), hass=hass, entry_id="a", options=options,
+                         entry_data={CONF_EV_CHARGER: "switch.a", CONF_EV_CONNECTED: "binary_sensor.connected"})
+        second = Executor(FakeStore(), hass=hass, entry_id="b", options=options,
+                          entry_data={CONF_EV_CHARGER: "switch.b", CONF_EV_CONNECTED: "binary_sensor.connected"})
+        context = _context(now)
+        context.ev_connected = True
+        context.slots[0].projected_ev_load_kw = 7.0
+        original = hass.services.async_call
+
+        async def accept_or_interrupt(domain, service, data, **kwargs):
+            await original(domain, service, data, **kwargs)
+            if data.get("entity_id") == "switch.a" and service == "turn_on":
+                if barrier_phase == "dispatch":
+                    persisted.set()
+                    await release_save.wait()
+                if interruption == "failure":
+                    raise RuntimeError("accepted but response failed")
+                if interruption == "cancel":
+                    raise asyncio.CancelledError
+
+        hass.services.async_call = accept_or_interrupt
+        task = asyncio.create_task(first.async_manual_ev_charging(True, context))
+        try:
+            await asyncio.wait_for(persisted.wait(), timeout=2)
+            assert hass.states.values["switch.a"] == ("off" if barrier_phase == "persistence" else "on")
+            rejected = await asyncio.wait_for(second.async_manual_ev_charging(True, context), timeout=2)
+            assert rejected.reason == "multi_ev_grid_import_limit_exceeded"
+            assert hass.states.values["switch.b"] == "off"
+            reservations = hass.data["ha_energy_planner"]["ev_grid_reservations"]
+            assert set(reservations) == {"a"}
+            assert sum(item["load_kw"] for item in reservations.values()) + 1 <= 10
+            release_save.set()
+            if interruption == "cancel":
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert set(reservations) == {"a"}
+                assert first.store.data["ownership"]
+            else:
+                result = await task
+                assert result.applied is (interruption == "none")
+                if interruption == "failure":
+                    assert result.rollback_succeeded is True
+                    assert reservations == {}
+            hass.services.async_call = original
+            # Confirmed stop releases both successful and uncertain accepted starts.
+            stopped = await first.async_manual_ev_charging(False, context)
+            assert stopped.applied
+            assert reservations == {}
+            admitted = await second.async_manual_ev_charging(True, context)
+            assert admitted.applied
+            assert set(reservations) == {"b"}
+            assert hass.states.values["switch.a"] == "off"
+            assert hass.states.values["switch.b"] == "on"
+        finally:
+            release_save.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop_confirmed", [True, False])
+def test_concurrent_ev_start_cannot_use_capacity_until_stop_is_confirmed(stop_confirmed) -> None:
+    async def run() -> None:
+        stopping = asyncio.Event()
+        release_stop = asyncio.Event()
+        hass = FakeHass({"switch.a": "off", "switch.b": "off", "binary_sensor.connected": "on"})
+        hass.data = {}
+        hass.config_entries = SimpleNamespace(async_entries=lambda domain: [
+            SimpleNamespace(entry_id=name, runtime_data=object()) for name in ("a", "b")
+        ])
+        options = {
+            CONF_EV_CHARGE_RATE_KW: 7.0, CONF_GRID_IMPORT_LIMIT_KW: 10.0,
+            CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0, CONF_EV_CONFIRMATION_RETRIES: 0,
+        }
+        first, second = [
+            Executor(FakeStore(), hass=hass, entry_id=name, options=options,
+                     entry_data={CONF_EV_CHARGER: f"switch.{name}", CONF_EV_CONNECTED: "binary_sensor.connected"})
+            for name in ("a", "b")
+        ]
+        context = _context(datetime.now(UTC))
+        context.ev_connected = True
+        context.slots[0].projected_ev_load_kw = 7.0
+        assert (await first.async_manual_ev_charging(True, context)).applied
+        original = hass.services.async_call
+
+        async def delayed_stop(domain, service, data, **kwargs):
+            if data.get("entity_id") == "switch.a" and service == "turn_off":
+                stopping.set()
+                await release_stop.wait()
+                if not stop_confirmed:
+                    return
+            await original(domain, service, data, **kwargs)
+
+        hass.services.async_call = delayed_stop
+        task = asyncio.create_task(first.async_manual_ev_charging(False, context))
+        try:
+            await asyncio.wait_for(stopping.wait(), timeout=2)
+            waiting = await second.async_manual_ev_charging(True, context)
+            assert waiting.reason == "multi_ev_grid_import_limit_exceeded"
+            release_stop.set()
+            stopped = await task
+            assert stopped.applied is stop_confirmed
+            result = await second.async_manual_ev_charging(True, context)
+            assert result.applied is stop_confirmed
+            reservations = hass.data["ha_energy_planner"]["ev_grid_reservations"]
+            assert set(reservations) == ({"b"} if stop_confirmed else {"a"})
+            assert not (hass.states.values["switch.a"] == hass.states.values["switch.b"] == "on")
+        finally:
+            release_stop.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(run())
+
+
 def test_multiple_ev_entries_share_atomic_grid_capacity_reservations() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(

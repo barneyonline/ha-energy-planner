@@ -38,6 +38,17 @@ Planning and control include:
 - Independent switches for climate, EV, and Enphase control, plus a guarded Automatic control switch.
 - Optional AI Task explanations that remain advisory and cannot call services or bypass constraints.
 
+Continuous EV charging compares the total energy cost of feasible charging
+windows, including solar opportunity cost and partial final slots. Configured
+carbon preferences, active-session continuity, and ready-by limits still apply.
+
+Before acquiring device control, Energy Planner requires confirmation that
+recovery metadata was written to storage. Failed or deferred writes block new
+commands and remain pending for retry.
+Disarming still restores planner-owned HVAC zones and automations when storage
+is unavailable. A failed save is reported after restoration, and the resulting
+state remains pending for retry.
+
 Provided Home Assistant actions:
 
 - `ha_energy_planner.replan`: request an immediate planner refresh.
