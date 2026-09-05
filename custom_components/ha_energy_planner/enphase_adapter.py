@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, State
 
+from .adapter_helpers import async_call_device_service, available_state
+from .adapter_helpers import profile_control_service as _profile_control_service
 from .const import (
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_PROFILE,
-    CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
-    STATE_UNKNOWN_VALUES,
 )
 from .models import ActionKind, PlanAction
 
@@ -48,6 +49,7 @@ class EnphaseProfileAdapter:
         self.entry_data = entry_data
         self.confirmation_attempts = max(int(confirmation_attempts), 1)
         self.confirmation_interval_seconds = max(float(confirmation_interval_seconds), 0.0)
+        self.before_dispatch: Callable[[str], Awaitable[None]] | None = None
 
     async def async_execute(self, action: PlanAction) -> EnphaseCommandResult:
         """Execute an Enphase profile action."""
@@ -96,8 +98,12 @@ class EnphaseProfileAdapter:
 
         domain, service = str(control_service).split(".", 1)
         service_data = self._service_data(profile_entity, desired_profile)
+        if self.before_dispatch is not None and current_profile is not None:
+            # Persistence is outside the service-error boundary: a failed save
+            # must prevent both the requested command and compensation.
+            await self.before_dispatch(current_profile)
         try:
-            await self.hass.services.async_call(domain, service, service_data, blocking=True)
+            await async_call_device_service(self.hass, domain, service, service_data, blocking=True)
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
             rollback_succeeded = await self._async_rollback_profile(
                 profile_entity,
@@ -166,7 +172,8 @@ class EnphaseProfileAdapter:
             return False
         domain, service = control_service.split(".", 1)
         try:
-            await self.hass.services.async_call(
+            await async_call_device_service(
+                self.hass,
                 domain,
                 service,
                 self._service_data(profile_entity, saved_profile),
@@ -191,12 +198,7 @@ class EnphaseProfileAdapter:
         return {CONF_ENPHASE_PROFILE: self._state_value(profile_entity)}
 
     def _state(self, entity_id: str | None) -> State | None:
-        if not entity_id:
-            return None
-        state = self.hass.states.get(entity_id)
-        if state is None or state.state in STATE_UNKNOWN_VALUES:
-            return None
-        return state
+        return available_state(self.hass, entity_id)
 
     def _state_value(self, entity_id: str) -> str | None:
         state = self._state(entity_id)
@@ -218,16 +220,3 @@ class EnphaseProfileAdapter:
             saved_profile=saved_profile,
             changed_profile_at=changed_profile_at,
         )
-
-
-def _profile_control_service(entry_data: dict[str, Any], profile_entity: str | None) -> str | None:
-    """Return the service used to select an Enphase profile."""
-    service = entry_data.get(CONF_ENPHASE_PROFILE_CONTROL_SERVICE)
-    if service:
-        return str(service)
-    if not profile_entity or "." not in str(profile_entity):
-        return None
-    domain = str(profile_entity).split(".", 1)[0]
-    if domain in {"select", "input_select"}:
-        return f"{domain}.select_option"
-    return None

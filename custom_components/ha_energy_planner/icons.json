@@ -1,0 +1,77 @@
+{
+  "entity": {
+    "sensor": {
+      "mode": {
+        "default": "mdi:state-machine"
+      },
+      "system_current_state": {
+        "default": "mdi:home-lightning-bolt-outline"
+      },
+      "next_actions": {
+        "default": "mdi:timeline-clock-outline"
+      },
+      "load_forecast_coverage_score": {
+        "default": "mdi:shield-percent-outline"
+      },
+      "decision_summary": {
+        "default": "mdi:clipboard-list-outline"
+      },
+      "plan_health": {
+        "default": "mdi:heart-pulse"
+      },
+      "current_load_forecast": {
+        "default": "mdi:home-lightning-bolt"
+      },
+      "planning_duration": {
+        "default": "mdi:timer-outline"
+      }
+    },
+    "binary_sensor": {
+      "armed": {
+        "default": "mdi:shield-check-outline"
+      }
+    },
+    "button": {
+      "replan": {
+        "default": "mdi:refresh"
+      },
+      "restore_safe_state": {
+        "default": "mdi:backup-restore"
+      },
+      "request_ai_advice": {
+        "default": "mdi:comment-question-outline"
+      },
+      "run_preflight": {
+        "default": "mdi:clipboard-check-outline"
+      },
+      "arm_production_control": {
+        "default": "mdi:shield-check"
+      },
+      "disarm_production_control": {
+        "default": "mdi:shield-off"
+      },
+      "resume_control": {
+        "default": "mdi:play-circle-outline"
+      }
+    },
+    "switch": {
+      "active_control": {
+        "default": "mdi:home-automation"
+      },
+      "climate_control": {
+        "default": "mdi:thermostat-auto"
+      },
+      "ev_control": {
+        "default": "mdi:ev-station"
+      },
+      "enphase_control": {
+        "default": "mdi:home-battery-outline"
+      }
+    },
+    "calendar": {
+      "plan": {
+        "default": "mdi:calendar-clock"
+      }
+    }
+  }
+}

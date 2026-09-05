@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import sys
 import tomllib
@@ -91,7 +92,6 @@ EXEMPT_ALLOWED_RULES = {
     "entity-disabled-by-default",
     "entity-event-setup",
     "entity-unavailable",
-    "icon-translations",
     "inject-websession",
     "reauthentication-flow",
     "reconfiguration-flow",
@@ -185,6 +185,70 @@ def _strict_typing_gate_is_configured(root: Path) -> bool:
     )
 
 
+def _platform_contract_errors(root: Path, rules: dict[str, Any]) -> list[str]:
+    """Verify observable platform contracts instead of trusting evidence comments."""
+    component = root / "custom_components" / DOMAIN
+    errors: list[str] = []
+    try:
+        constants = ast.parse((component / "const.py").read_text(encoding="utf-8"))
+        platforms = next(
+            ast.literal_eval(node.value)
+            for node in constants.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name) and target.id == "PLATFORMS" for target in node.targets)
+        )
+        if not isinstance(platforms, list) or not platforms or not all(isinstance(item, str) for item in platforms):
+            raise ValueError("PLATFORMS must be a nonempty literal list")
+        platform_trees = {
+            platform: ast.parse((component / f"{platform}.py").read_text(encoding="utf-8"))
+            for platform in platforms
+        }
+    except (OSError, SyntaxError, StopIteration, ValueError, TypeError) as err:
+        return [f"ERROR: Cannot verify platform contracts: {err}"]
+    if _status_for_rule(rules.get("parallel-updates")) == "done":
+        for platform, tree in platform_trees.items():
+            declarations = [
+                node.value for node in tree.body if isinstance(node, ast.Assign)
+                and any(isinstance(target, ast.Name) and target.id == "PARALLEL_UPDATES" for target in node.targets)
+            ]
+            if len(declarations) != 1 or not isinstance(declarations[0], ast.Constant) or (
+                type(declarations[0].value) is not int or declarations[0].value < 0
+            ):
+                errors.append(f"ERROR: {platform} must declare an explicit nonnegative PARALLEL_UPDATES")
+    if _status_for_rule(rules.get("icon-translations")) == "done":
+        try:
+            icons = json.loads((component / "icons.json").read_text(encoding="utf-8"))["entity"]
+            strings = json.loads((component / "strings.json").read_text(encoding="utf-8"))["entity"]
+            if not isinstance(icons, dict) or not icons:
+                raise ValueError("icons.entity must be a nonempty mapping")
+            if not isinstance(strings, dict):
+                raise ValueError("strings.entity must be a mapping")
+            for platform, entries in icons.items():
+                if platform not in platform_trees or not isinstance(entries, dict):
+                    errors.append(f"ERROR: invalid icon platform {platform}")
+                    continue
+                for key, value in entries.items():
+                    if key not in strings.get(platform, {}) or not isinstance(value, dict) or not value:
+                        errors.append(f"ERROR: icon {platform}.{key} lacks a matching entity translation/definition")
+            for platform, tree in platform_trees.items():
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.keyword) and node.arg == "icon":
+                        errors.append(f"ERROR: {platform}:{node.lineno} sets a Python icon instead of icons.json")
+                    targets = (
+                        node.targets if isinstance(node, ast.Assign)
+                        else [node.target] if isinstance(node, ast.AnnAssign) else []
+                    )
+                    if any(
+                        isinstance(target, ast.Name) and target.id == "_attr_icon"
+                        or isinstance(target, ast.Attribute) and target.attr == "_attr_icon"
+                        for target in targets
+                    ):
+                        errors.append(f"ERROR: {platform}:{node.lineno} sets _attr_icon instead of icons.json")
+        except (OSError, ValueError, KeyError, TypeError) as err:
+            errors.append(f"ERROR: Cannot verify icon translations: {err}")
+    return errors
+
+
 def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
     """Return exit code and validation messages."""
 
@@ -274,6 +338,9 @@ def validate_quality_scale(root: Path) -> tuple[int, list[str]]:
             "ERROR: strict-typing cannot be marked done without strict mypy configuration "
             "enforced by scripts/docker-validate.sh"
         )
+
+    if any(_status_for_rule(rules.get(rule)) == "done" for rule in ("parallel-updates", "icon-translations")):
+        messages.extend(_platform_contract_errors(root, rules))
 
     return (1 if messages else 0), messages
 

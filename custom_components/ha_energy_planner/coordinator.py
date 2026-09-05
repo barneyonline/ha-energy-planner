@@ -10,26 +10,50 @@ import re
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from math import ceil, isfinite
+from functools import cached_property
+from math import isfinite
 from time import monotonic, perf_counter
-from typing import Any, Never
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
-from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
-from .ai_advisor import AI_ACTION_TARGETS, AIAdviceResult, LocalAIAdvisor
+from . import advice_runtime, startup_recovery, task_lifecycle
+from .adapter_helpers import async_call_device_service
+from .advice_runtime import (
+    _AI_ADVICE_NOTIFICATION_ID as _AI_ADVICE_NOTIFICATION_ID,
+)
+from .advice_runtime import (
+    _ai_advice_notification_message as _ai_advice_notification_message,
+)
+from .advice_runtime import (
+    _ai_recommendation_fingerprint as _ai_recommendation_fingerprint,
+)
+from .advice_runtime import (
+    _latest_accepted_ai_recommendation as _latest_accepted_ai_recommendation,
+)
+from .advice_runtime import (
+    _latest_ai_attempt_at as _latest_ai_attempt_at,
+)
+from .advice_runtime import (
+    _latest_ai_plan_fingerprint as _latest_ai_plan_fingerprint,
+)
+from .advice_runtime import (
+    _latest_ai_service_call_at as _latest_ai_service_call_at,
+)
+from .advice_runtime import (
+    _material_plan_fingerprint as _material_plan_fingerprint,
+)
+from .advice_runtime import (
+    _material_preview as _material_preview,
+)
 from .const import (
-    AI_ADVICE_MIN_INTERVAL_SECONDS,
-    CONF_AI_TASK_ENTITY,
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
     CONF_BATTERY_SOC,
-    CONF_BYPASS_SAFETY_GATES,
     CONF_CARBON_INTENSITY_FORECAST,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
     CONF_CLIMATE_CONTROL_ENABLED,
@@ -42,7 +66,6 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_PROFILE,
-    CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
@@ -53,7 +76,6 @@ from .const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
-    CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -87,7 +109,6 @@ from .models import (
     PlannerMode,
     to_jsonable,
 )
-from .notifications import defer_persistent_notification
 from .planner import DryRunPlanner
 from .preflight import (
     _control_area_report,
@@ -96,8 +117,6 @@ from .preflight import (
     production_evidence_fingerprint,
 )
 from .recorder_import import (
-    async_update_builtin_load_forecast,
-    async_update_ev_charge_calibration,
     load_forecast_source_available,
 )
 from .safety import (
@@ -107,29 +126,55 @@ from .safety import (
     partition_control_areas_by_pause,
     strict_bool,
 )
+from .startup_recovery import (
+    STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES as STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES,
+)
+from .startup_recovery import (
+    STARTUP_AUTO_RECOVERY_REQUIRED_RUNS as STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
+)
+from .startup_recovery import (
+    STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS as STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS,
+)
+from .startup_recovery import (
+    STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS as STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS,
+)
+from .startup_recovery import (
+    _action_outcome_failed as _action_outcome_failed,
+)
+from .startup_recovery import (
+    _active_control_not_ready_reason as _active_control_not_ready_reason,
+)
+from .startup_recovery import (
+    _startup_auto_recovery_prerequisites as _startup_auto_recovery_prerequisites,
+)
+from .startup_recovery import (
+    _startup_auto_recovery_successful_runs as _startup_auto_recovery_successful_runs,
+)
+from .startup_recovery import (
+    _startup_auto_recovery_validation_ready as _startup_auto_recovery_validation_ready,
+)
 from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
+from .training import HistoryTraining, TrainingRequest, TrainingResult, training_request
 from .type_defs import EnergyPlannerConfigEntry
+from .weather import (
+    _bounded_reason as _bounded_reason,
+)
+from .weather import (
+    _normalize_hourly_forecast as _normalize_hourly_forecast,
+)
+from .weather import _parse_datetime_or_none as _parse_datetime_or_none
+from .weather import (
+    _weather_forecast_from_response as _weather_forecast_from_response,
+)
+from .weather import (
+    async_weather_forecast,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
-_AI_ADVICE_NOTIFICATION_ID = "ha_energy_planner_ai_explanation"
 
-
-STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
-STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
-STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
 EV_AUTO_START_COMPENSATION_RETRY_SECONDS = 30
-STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
-    {
-        "waiting",
-        "waiting_for_home_assistant",
-        "grace",
-        "waiting_for_safe",
-        "restoring",
-        "validating",
-    }
-)
 
 _LOAD_FORECAST_TRAINING_DEFERRED_REASONS = frozenset(
     {
@@ -178,67 +223,6 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
 def _updated_load_forecast_training_attempted(previously_attempted: bool, reason: str) -> bool:
     """Keep the startup attempt pending while training is deferred."""
     return previously_attempted or reason not in _LOAD_FORECAST_TRAINING_DEFERRED_REASONS
-
-
-def _active_control_not_ready_reason(report: dict[str, Any]) -> str:
-    """Return one actionable reason that the combined activation was rejected."""
-    production = dict(report.get("production", {}))
-    ready_cycles = parse_production_state(production).dry_run_ready_cycles
-    if not production.get("dry_run_evidence_complete"):
-        return (
-            f"review mode has recorded {ready_cycles}/{DRY_RUN_READY_CYCLES_REQUIRED} healthy plans; "
-            "wait for the readiness sensor, review the plan, then turn Automatic control on again"
-        )
-    for check in report.get("checks", []):
-        if check.get("blocking") and not check.get("ok"):
-            return str(check.get("message") or "a safety check failed")
-    return str(report.get("current_plan", {}).get("message") or "a safety check failed")
-
-
-def _startup_auto_recovery_prerequisites(
-    report: dict[str, Any],
-    entry_data: dict[str, Any],
-) -> tuple[bool, str]:
-    """Return whether startup dependencies are ready without trusting bypasses."""
-    control_areas = dict(report.get("control_areas", {}))
-    required = list(control_areas.get("required", []))
-    if not required:
-        return False, "no_required_control_areas"
-    if not control_areas.get("ready"):
-        return False, "no_ready_control_area"
-    if not control_areas.get("available"):
-        return False, "control_paused"
-    if not control_areas.get("confidence_eligible"):
-        return False, "no_confidence_eligible_control_area"
-    if entry_data.get(CONF_HOUSEHOLD_LOAD) and not bool(dict(report.get("recorder", {})).get("available")):
-        return False, "recorder_unavailable"
-    return True, "startup_dependencies_ready"
-
-
-def _startup_auto_recovery_validation_ready(
-    report: dict[str, Any],
-    entry_data: dict[str, Any],
-) -> tuple[bool, str]:
-    """Return whether a committed recovery plan passes all non-production gates."""
-    ready, reason = _startup_auto_recovery_prerequisites(report, entry_data)
-    if not ready:
-        return ready, reason
-    if not bool(dict(report.get("current_plan", {})).get("safe")):
-        return False, "current_plan_unsafe"
-    return True, "validation_succeeded"
-
-
-def _action_outcome_failed(outcome: Any) -> bool:
-    """Return whether a restore outcome explicitly reports failure."""
-    result = getattr(outcome, "result", None)
-    return str(getattr(result, "value", result)).lower() == "failed"
-
-
-def _startup_auto_recovery_successful_runs(value: Any) -> int:
-    """Return a bounded fail-closed recovery progress counter."""
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        return 0
-    return min(value, STARTUP_AUTO_RECOVERY_REQUIRED_RUNS)
 
 
 _HVAC_CONTROL_ATTRIBUTE_KEYS = frozenset(
@@ -368,12 +352,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._weather_forecast_cache: dict[str, Any] = {}
         self.weather_forecast_diagnostics: dict[str, Any] = {}
         self._load_forecast_training_attempted = False
-        self._refresh_counters: dict[str, int] = {
-            "requested": 0,
-            "completed": 0,
-            "coalesced": 0,
-            "fingerprint_skipped": 0,
-        }
         self._refresh_completed_times: list[float] = []
         self._refresh_trigger_counts: dict[str, int] = {}
         self._last_phase_durations: dict[str, float] = {}
@@ -398,6 +376,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             hass,
             logger=_LOGGER,
             name=DOMAIN,
+            config_entry=entry,
             update_interval=None,
         )
 
@@ -466,6 +445,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     def async_start_listeners(self) -> None:
         """Start debounced state listeners for configured input entities."""
         self._tearing_down = False
+        training = self.__dict__.get("history_training")
+        if training is not None and training.closed:
+            self.__dict__.pop("history_training")
         self._schedule_next_boundary_refresh()
         entry_data = self.entry_data
         self._start_load_forecast_source_listener(entry_data)
@@ -511,7 +493,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         self._clear_ev_auto_start_compensation()
                         return
                     self._ev_auto_start_compensation_pending = True
-                    self.hass.async_create_task(
+                    self._async_create_listener_task(
                         self._async_compensate_ev_auto_start(
                             require_unowned=True,
                             generation=self._ev_auto_start_compensation_generation,
@@ -534,7 +516,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     # command. The durable override/release task necessarily
                     # waits for the coordinator command lock.
                     mark_manual_override()
-                self.hass.async_create_task(
+                self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "daikin_state_changed",
                         preserve_main_state=True,
@@ -554,7 +536,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
                 if callable(mark_zone_manual_override):
                     mark_zone_manual_override(pending_zone_entity_id)
-                self.hass.async_create_task(
+                self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "climate_zone_changed",
                         preserve_zone_entity_id=pending_zone_entity_id,
@@ -568,10 +550,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     self._manual_override_helper_guard = None
                     return
                 self._manual_override_helper_guard = None
-                self.hass.async_create_task(self._async_handle_manual_override_helper(helper_state == "on"))
+                self._async_create_listener_task(self._async_handle_manual_override_helper(helper_state == "on"))
                 return
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
-                self.hass.async_create_task(
+                self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "daikin_state_changed",
                         preserve_main_state=True,
@@ -579,7 +561,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
                 return
             if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
-                self.hass.async_create_task(
+                self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "climate_zone_changed",
                         preserve_zone_entity_id=str(event.data.get("entity_id") or ""),
@@ -609,7 +591,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._clear_ev_auto_start_compensation()
             else:
                 self._ev_auto_start_compensation_pending = True
-                self.hass.async_create_task(
+                self._async_create_listener_task(
                     self._async_compensate_ev_auto_start(
                         require_unowned=True,
                         generation=self._ev_auto_start_compensation_generation,
@@ -623,64 +605,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             override.kind == "manual_hvac" and getattr(override, "source", None) == "helper" for override in overrides
         )
         if helper_value == "on" and not any(override.kind == "manual_hvac" for override in overrides):
-            self.hass.async_create_task(self._async_handle_manual_override_helper(True))
+            self._async_create_listener_task(self._async_handle_manual_override_helper(True))
         elif helper_value == "off" and helper_override_active:
-            self.hass.async_create_task(self._async_handle_manual_override_helper(False))
+            self._async_create_listener_task(self._async_handle_manual_override_helper(False))
 
-    def async_start_startup_auto_recovery(self) -> None:
-        """Start recovery only after Home Assistant has fully started."""
-        if not getattr(self, "_startup_auto_recovery_authorized", False):
-            return
-        task = getattr(self, "_startup_auto_recovery_task", None)
-        if task is not None and not task.done():
-            return
-        if getattr(self, "_startup_auto_recovery_start_unsub", None) is not None:
-            return
+    async_start_startup_auto_recovery = startup_recovery.async_start_startup_auto_recovery
 
-        async def _async_start_recovery(_hass: HomeAssistant) -> None:
-            self._startup_auto_recovery_start_unsub = None
-            if not self._startup_auto_recovery_authorized:
-                return
-            store_data = getattr(getattr(self, "store", None), "data", {})
-            production = parse_production_state(
-                store_data.get("production") if isinstance(store_data, dict) else None
-            )
-            if production.armed:
-                self._startup_auto_recovery_deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-                self.executor.notification_grace_until = dt_util.utcnow() + timedelta(
-                    seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-                )
-                await self._async_update_startup_auto_recovery(
-                    "grace",
-                    successful_runs=0,
-                    required_runs=1,
-                    reason="startup_grace_in_progress",
-                    started=True,
-                )
-            else:
-                self._startup_auto_recovery_deadline = None
-                await self._async_update_startup_auto_recovery(
-                    "waiting_for_safe",
-                    successful_runs=0,
-                    reason="startup_safe_recovery_resumed",
-                )
-            self._startup_auto_recovery_task = self.entry.async_create_background_task(
-                self.hass,
-                self._async_run_startup_auto_recovery(),
-                f"{DOMAIN} startup automatic-control recovery",
-            )
-
-        self._startup_auto_recovery_start_unsub = async_at_started(
-            self.hass,
-            _async_start_recovery,
-        )
-
-    @callback
-    def _wake_startup_auto_recovery(self) -> None:
-        """Wake a recovery task waiting for startup dependencies."""
-        event = getattr(self, "_startup_auto_recovery_wakeup", None)
-        if event is not None:
-            event.set()
+    _wake_startup_auto_recovery = startup_recovery._wake_startup_auto_recovery
 
     def _start_load_forecast_source_listener(self, entry_data: dict[str, Any]) -> None:
         """Retry startup training once when the mapped load source appears."""
@@ -721,65 +652,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # but before this state-change listener is registered.
         _retry_if_available(self.hass.states.get(load_entity))
 
-    def _begin_shutdown(self) -> None:
-        """Stop new coordinator work while preserving an in-flight command."""
-        # A refresh task may already be queued even after its timer/listener is
-        # cancelled. Suppress its eventual commit until setup is resumed.
-        self._tearing_down = True
-        self._clear_ev_auto_start_compensation()
-        if self._debounce_cancel is not None:
-            self._debounce_cancel()
-            self._debounce_cancel = None
-        if self._boundary_cancel is not None:
-            self._boundary_cancel()
-            self._boundary_cancel = None
-        ai_task = getattr(self, "_ai_advice_task", None)
-        if ai_task is not None and not ai_task.done():
-            ai_task.cancel()
-        self._ai_advice_task = None
-        # Device execution may already have changed external state and still be
-        # confirming, rolling back, or persisting ownership. Let that single
-        # transaction reach its safe boundary; lifecycle cleanup explicitly
-        # awaits it after this method has prevented any newer work from running.
-        self._pending_plan_execution = None
-        self._deferred_plan_execution = None
-        recovery_task = getattr(self, "_startup_auto_recovery_task", None)
-        if recovery_task is not None and not recovery_task.done():
-            recovery_task.cancel()
-        self._startup_auto_recovery_task = None
-        recovery_start_unsub = getattr(self, "_startup_auto_recovery_start_unsub", None)
-        if recovery_start_unsub is not None:
-            recovery_start_unsub()
-        self._startup_auto_recovery_start_unsub = None
-        self._startup_auto_recovery_authorized = False
-        self._startup_auto_recovery_deadline = None
-        if hasattr(self, "executor"):
-            self.executor.notification_grace_until = None
-        while self._unsub_listeners:
-            self._unsub_listeners.pop()()
+    _async_create_listener_task = task_lifecycle._async_create_listener_task
+
+    _begin_shutdown = task_lifecycle._begin_shutdown
 
     async def async_shutdown(self) -> None:
         """Stop integration work and release coordinator resources."""
         self._begin_shutdown()
         await super().async_shutdown()
 
-    async def async_wait_for_plan_execution(self) -> None:
-        """Wait for the current device transaction without cancelling it."""
-        execution_task = getattr(self, "_plan_execution_task", None)
-        if execution_task is None:
-            return
-        try:
-            await asyncio.shield(execution_task)
-        except Exception:
-            # An unexpected executor failure is logged by the drain loop. Keep
-            # lifecycle restoration moving even for an independently supplied
-            # or already-failed background task.
-            _LOGGER.exception("Unexpected failure while awaiting plan execution shutdown")
+    async_wait_for_plan_execution = task_lifecycle.async_wait_for_plan_execution
 
-    async def async_wait_for_refresh_shutdown(self) -> None:
-        """Wait until any refresh already inside the planner lock has finished."""
-        async with self._planner_lock:
-            return
+    async_wait_for_refresh_shutdown = task_lifecycle.async_wait_for_refresh_shutdown
 
     @callback
     def _schedule_debounced_refresh(
@@ -803,7 +687,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._pending_refresh_trigger = trigger
             self._last_non_manual_refresh_requested_at = monotonic()
             self._increment_refresh_counter("requested")
-            self.hass.async_create_task(self.async_request_refresh())
+            self._async_create_listener_task(self.async_request_refresh())
 
         self._debounce_cancel = async_call_later(self.hass, delay, _refresh)
 
@@ -927,37 +811,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.entry_data = entry_data
         discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
         await self.store.async_save_discovery(discovery.as_dict())
-        ev_charge_calibration = dict(self.store.data.get("ev_charge_calibration", {}))
-        ev_charge_calibration, ev_calibration_changed, ev_calibration_reason = (
-            await async_update_ev_charge_calibration(
-                self.hass,
-                entry_data,
-                ev_charge_calibration,
-                charge_rate_kw=float(options[CONF_EV_CHARGE_RATE_KW]),
-                now=dt_util.utcnow(),
-            )
-        )
-        if ev_calibration_changed:
-            await self.store.async_save_ev_charge_calibration(ev_charge_calibration)
-        load_forecast_model = dict(self.store.data.get("built_in_load_forecast", {}))
-        load_forecast_model, load_forecast_changed, load_forecast_reason = await async_update_builtin_load_forecast(
-            self.hass,
-            entry_data,
-            load_forecast_model,
-            now=dt_util.utcnow(),
-            timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
-            force=not getattr(self, "_load_forecast_training_attempted", False),
-            bypass_conservative_bound_gate=strict_bool(
-                options.get(CONF_BYPASS_SAFETY_GATES),
-                default=False,
-            ),
-        )
-        self._load_forecast_training_attempted = _updated_load_forecast_training_attempted(
-            getattr(self, "_load_forecast_training_attempted", False),
-            load_forecast_reason,
-        )
-        if load_forecast_changed:
-            await self.store.async_save_builtin_load_forecast(load_forecast_model)
+        request = self._training_request()
+        self.history_training.request(request)
+        ev_charge_calibration = request.ev_model
+        load_forecast_model = request.load_model
+        training_result = self.history_training.last_result
+        ev_calibration_reason = training_result.ev_reason if training_result else "ev_charge_calibration_pending"
+        load_forecast_reason = training_result.load_reason if training_result else "load_forecast_training_pending"
         manager = InputManager(
             self.hass,
             entry_data,
@@ -1022,6 +882,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 plan.status = "unsafe"
             if plan.mode == PlannerMode.ACTIVE_HEALTHY:
                 plan.mode = PlannerMode.ACTIVE_DEGRADED
+        self._log_availability_transition(plan.input_issues)
         self._record_startup_auto_recovery_validation_candidate(plan, violations)
         await self.executor.async_notify_plan_fallback(plan, violations)
         await self.store.async_add_forecast_snapshot(
@@ -1077,6 +938,60 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._last_decision_fingerprint = decision_fingerprint
             self._sync_ai_request_to_plan(plan)
         return result
+
+    _availability_unavailable = False
+
+    def _log_availability_transition(self, issues: list[str]) -> None:
+        """Log our required-input degradation once, without upstream payloads."""
+        unavailable = any(
+            "unavailable" in issue or "not_found" in issue or "missing" in issue
+            for issue in issues
+        )
+        if unavailable == self._availability_unavailable:
+            return
+        self._availability_unavailable = unavailable
+        if unavailable:
+            _LOGGER.warning("Planner required input or service unavailable: required_evidence_missing")
+        else:
+            _LOGGER.info("Planner required inputs and services recovered: required_evidence_restored")
+
+    @cached_property
+    def _listener_tasks(self) -> set[asyncio.Task[Any]]:
+        """Allocate the entry task registry when the first listener is admitted."""
+        return set()
+
+    @cached_property
+    def history_training(self) -> HistoryTraining:
+        """Keep training admission independent of the planner refresh lock."""
+        return HistoryTraining(self.hass, self.entry.entry_id, self._async_publish_training)
+
+    def _training_request(self) -> TrainingRequest:
+        return training_request(
+            self.entry_data, self.planner_options, self.store.data,
+            str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
+        )
+
+    async def _async_publish_training(
+        self, generation: int, request: TrainingRequest, result: TrainingResult
+    ) -> None:
+        """Publish only current source/lifetime results under the planner lock."""
+        async with self._planner_lock:
+            if (
+                self._tearing_down
+                or not self.history_training.is_current(generation)
+                or request.identity != self._training_request().identity
+            ):
+                return
+            self._load_forecast_training_attempted = _updated_load_forecast_training_attempted(
+                self._load_forecast_training_attempted, result.load_reason
+            )
+            async with self.store.async_delay_save():
+                if result.ev_changed:
+                    await self.store.async_save_ev_charge_calibration(result.ev_model)
+                if result.load_changed:
+                    await self.store.async_save_builtin_load_forecast(result.load_model)
+            if result.ev_changed or result.load_changed:
+                self._schedule_debounced_refresh("history_training", debounce_seconds=0, force=True)
 
     async def async_request_replan(self) -> None:
         """Request immediate refresh."""
@@ -1189,368 +1104,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_disarm_production_control("production_evidence_contract_changed")
         return True
 
-    async def async_cancel_startup_auto_recovery(
-        self,
-        reason: str,
-        *,
-        preserve_control: bool = False,
-        restore_owned_state: bool = True,
-    ) -> None:
-        """Cancel startup recovery without treating persisted progress as authorization."""
-        store_data = getattr(getattr(self, "store", None), "data", None)
-        recovery = (
-            parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
-            if isinstance(store_data, dict)
-            else None
-        )
-        recovery_active = bool(
-            getattr(self, "_startup_auto_recovery_authorized", False)
-            or (isinstance(recovery, dict) and recovery.get("status") in STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES)
-        )
-        self._startup_auto_recovery_authorized = False
-        self._startup_auto_recovery_deadline = None
-        if hasattr(self, "executor"):
-            self.executor.notification_grace_until = None
-        start_unsub = getattr(self, "_startup_auto_recovery_start_unsub", None)
-        if start_unsub is not None:
-            start_unsub()
-        self._startup_auto_recovery_start_unsub = None
-        task = getattr(self, "_startup_auto_recovery_task", None)
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-        self._startup_auto_recovery_task = None
-        if not isinstance(store_data, dict):
-            return
-        production = parse_production_state(store_data.get("production"))
-        cancel_requires_restore = bool(
-            recovery_active
-            and production.armed
-            and restore_owned_state
-            and not preserve_control
-            and reason not in {"automatic_control_disabled", "entry_unload", "setup_entry_failed"}
-        )
-        if cancel_requires_restore:
-            await self.async_disarm_production_control(f"startup_auto_recovery_cancelled:{reason}")
-            try:
-                await self.async_restore_safe_state(
-                    f"startup_auto_recovery_cancelled:{reason}",
-                    refresh=False,
-                )
-            except Exception:  # noqa: BLE001 - the production gate is already disarmed.
-                _LOGGER.exception("Could not restore safe state after startup recovery cancellation")
-        recovery = parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
-        if not recovery_active or not isinstance(recovery, dict):
-            return
-        if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload"}:
-            # Persist the current grace/recovery state verbatim so the next
-            # process can distinguish an armed restart from disarmed recovery.
-            return
-        await self._async_update_startup_auto_recovery(
-            "interrupted" if preserve_control else "cancelled",
-            successful_runs=_startup_auto_recovery_successful_runs(recovery.get("successful_runs")),
-            reason=reason,
-            completed=True,
-        )
-        await self.executor.async_dismiss_startup_recovery_notification()
+    async_cancel_startup_auto_recovery = startup_recovery.async_cancel_startup_auto_recovery
 
-    async def _async_run_startup_auto_recovery(self) -> None:
-        """Apply the armed startup grace, then recover indefinitely if unsafe."""
-        try:
-            production = parse_production_state(self.store.data.get("production"))
-            if production.armed:
-                grace_safe, reason = await self._async_complete_startup_grace()
-                if grace_safe or not self._startup_auto_recovery_authorized:
-                    return
-                await self._async_enter_startup_safe_recovery(reason)
-            await self._async_retry_startup_safe_recovery()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - startup recovery is strictly fail closed.
-            _LOGGER.exception("Unexpected startup automatic-control recovery failure")
-            if self.automatic_control_requested:
-                try:
-                    await self._async_enter_startup_safe_recovery("unexpected_recovery_error")
-                except Exception:  # noqa: BLE001 - keep the production gate fail closed.
-                    _LOGGER.exception("Could not persist the startup recovery failure state")
-                    try:
-                        await self.async_disarm_production_control("unexpected_recovery_error")
-                    except Exception:  # noqa: BLE001 - persistence may itself be unavailable.
-                        _LOGGER.exception("Could not persist startup recovery disarming")
-                self._startup_auto_recovery_authorized = True
-                self._startup_auto_recovery_task = self.entry.async_create_background_task(
-                    self.hass,
-                    self._async_run_startup_auto_recovery(),
-                    f"{DOMAIN} startup automatic-control recovery",
-                )
+    _async_run_startup_auto_recovery = startup_recovery._async_run_startup_auto_recovery
 
-    async def _async_complete_startup_grace(self) -> tuple[bool, str]:
-        """Wait for the full grace period and evaluate one fresh committed plan."""
-        deadline = self._startup_auto_recovery_deadline
-        if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
-            deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
-            self._startup_auto_recovery_deadline = deadline
-        remaining = max(deadline - monotonic(), 0.0)
-        if remaining:
-            await asyncio.sleep(remaining)
-        if not self._startup_auto_recovery_authorized:
-            return False, "startup_recovery_cancelled"
-        # Keep ordinary transient fallback notifications suppressed while the
-        # awaited deadline refresh is in flight. The result below either clears
-        # this suppression silently or replaces it with one recovery warning.
-        self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
-        validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
-        if not validation_ok:
-            return False, reason
-        self._startup_auto_recovery_authorized = False
-        await self._async_update_startup_auto_recovery(
-            "recovered",
-            successful_runs=1,
-            required_runs=1,
-            reason="startup_grace_completed_healthy",
-            completed=True,
-        )
-        self.executor.notification_grace_until = None
-        await self.executor.async_dismiss_startup_recovery_notification()
-        return True, "startup_grace_completed_healthy"
+    _async_complete_startup_grace = startup_recovery._async_complete_startup_grace
 
-    async def _async_enter_startup_safe_recovery(self, reason: str) -> None:
-        """Disarm an unsafe startup while preserving automatic-control intent."""
-        self._startup_auto_recovery_authorized = True
-        self._startup_auto_recovery_deadline = None
-        # Persist a restart-resumable transition before the first operation
-        # that changes command authority. If shutdown cancels the subsequent
-        # restore, the next process must still recognize this as disarmed
-        # recovery rather than a previously operator-disarmed installation.
-        await self._async_update_startup_auto_recovery(
-            "restoring",
-            successful_runs=0,
-            reason=reason,
-        )
-        await self.async_disarm_production_control("startup_grace_unsafe")
-        restore_reason = reason
-        try:
-            restore = await self.async_restore_safe_state("startup_grace_unsafe", refresh=False)
-            if _action_outcome_failed(restore):
-                restore_reason = str(getattr(restore, "reason", "safe_state_restore_failed"))
-        except Exception:  # noqa: BLE001 - the production gate is already disarmed.
-            _LOGGER.exception("Could not restore safe state after unsafe startup grace")
-            restore_reason = "safe_state_restore_failed"
-        await self._async_update_startup_auto_recovery(
-            "waiting_for_safe",
-            successful_runs=0,
-            reason=restore_reason or reason,
-        )
-        await self.executor.async_notify_startup_recovery_unsafe(restore_reason or reason)
-        self.executor.notification_grace_until = None
+    _async_enter_startup_safe_recovery = startup_recovery._async_enter_startup_safe_recovery
 
-    async def _async_retry_startup_safe_recovery(self) -> None:
-        """Retry indefinitely until three fresh healthy plans can reactivate control."""
-        successful_runs = 0
-        while self._startup_auto_recovery_authorized and self.automatic_control_requested:
-            await asyncio.sleep(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS)
-            if not self._startup_auto_recovery_authorized or not self.automatic_control_requested:
-                return
-            await self._async_update_startup_auto_recovery(
-                "validating",
-                successful_runs=successful_runs,
-                reason="validation_in_progress",
-            )
-            validation_ok, reason = await self._async_run_startup_auto_recovery_validation()
-            if not validation_ok:
-                successful_runs = 0
-                await self._async_update_startup_auto_recovery(
-                    "waiting_for_safe",
-                    successful_runs=0,
-                    reason=reason,
-                )
-                await self.executor.async_notify_startup_recovery_unsafe(reason)
-            else:
-                successful_runs += 1
-                await self._async_update_startup_auto_recovery(
-                    "validating",
-                    successful_runs=successful_runs,
-                    reason="validation_succeeded",
-                )
-                if successful_runs >= STARTUP_AUTO_RECOVERY_REQUIRED_RUNS:
-                    recovered, reason = await self._async_reactivate_after_startup_recovery(
-                        successful_runs
-                    )
-                    if recovered:
-                        return
-                    successful_runs = 0
-                    await self._async_update_startup_auto_recovery(
-                        "waiting_for_safe",
-                        successful_runs=0,
-                        reason=reason,
-                    )
-                    await self.executor.async_notify_startup_recovery_unsafe(reason)
+    _async_retry_startup_safe_recovery = startup_recovery._async_retry_startup_safe_recovery
 
-    async def _async_reactivate_after_startup_recovery(
-        self,
-        successful_runs: int,
-    ) -> tuple[bool, str]:
-        """Restore, arm, and verify a recovered startup installation."""
-        await self._async_update_startup_auto_recovery(
-            "restoring",
-            successful_runs=successful_runs,
-            reason="healthy_validation_sequence_complete",
-        )
-        try:
-            restore = await self.async_restore_safe_state("startup_auto_recovery", refresh=False)
-        except Exception:  # noqa: BLE001 - recovery remains disarmed and retries.
-            _LOGGER.exception("Could not restore safe state before startup reactivation")
-            return False, "safe_state_restore_failed"
-        if _action_outcome_failed(restore):
-            return False, str(getattr(restore, "reason", "safe_state_restore_failed"))
+    _async_reactivate_after_startup_recovery = startup_recovery._async_reactivate_after_startup_recovery
 
-        production = parse_production_state(self.store.data.get("production")).raw
-        production.update(
-            {
-                "dry_run_evidence_fingerprint": production_evidence_fingerprint(
-                    self.entry_data,
-                    self.options,
-                ),
-                "dry_run_ready_cycles": DRY_RUN_READY_CYCLES_REQUIRED,
-                "last_dry_run_ready_at": dt_util.utcnow(),
-            }
-        )
-        await self._async_save_production(production)
-        report = build_preflight_report(self.hass, self)
-        final_ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
-        if not final_ready or not report.get("safe_to_activate_now"):
-            return False, reason if not final_ready else "final_preflight_failed"
+    _async_run_startup_auto_recovery_validation = startup_recovery._async_run_startup_auto_recovery_validation
 
-        await self.async_arm_production_control("startup_auto_recovered")
-        try:
-            await self._async_compensate_ev_auto_start(
-                require_unowned=False,
-                refresh=False,
-            )
-            self._mark_forced_refresh("startup_auto_recovery_activation")
-            await self.async_refresh()
-        except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
-            _LOGGER.exception("Startup automatic-control activation refresh failed")
-            await self.async_disarm_production_control("startup_auto_recovery_replan_failed")
-            try:
-                await self.async_restore_safe_state(
-                    "startup_auto_recovery_replan_failed",
-                    refresh=False,
-                )
-            except Exception:  # noqa: BLE001 - the production gate remains disarmed.
-                _LOGGER.exception("Could not restore safe state after failed recovery refresh")
-            return False, "active_replan_failed"
+    _record_startup_auto_recovery_validation_candidate = (
+        startup_recovery._record_startup_auto_recovery_validation_candidate
+    )
 
-        final_report = build_preflight_report(self.hass, self)
-        final_ready, reason = _startup_auto_recovery_validation_ready(final_report, self.entry_data)
-        if not final_ready or not final_report.get("active_control_ready"):
-            await self.async_disarm_production_control("startup_auto_recovery_replan_unsafe")
-            try:
-                await self.async_restore_safe_state(
-                    "startup_auto_recovery_replan_unsafe",
-                    refresh=False,
-                )
-            except Exception:  # noqa: BLE001 - the production gate remains disarmed.
-                _LOGGER.exception("Could not restore safe state after unsafe recovery replan")
-            return False, reason if not final_ready else "active_replan_unsafe"
-
-        self._startup_auto_recovery_authorized = False
-        await self._async_update_startup_auto_recovery(
-            "recovered",
-            successful_runs=successful_runs,
-            reason="automatic_control_reactivated",
-            completed=True,
-        )
-        await self.executor.async_dismiss_startup_recovery_notification()
-        return True, "automatic_control_reactivated"
-
-    async def _async_run_startup_auto_recovery_validation(self) -> tuple[bool, str]:
-        """Run one forced refresh while suppressing every device action."""
-        self._startup_auto_recovery_validation_active = True
-        self._last_startup_auto_recovery_validation = None
-        try:
-            self._mark_forced_refresh("startup_auto_recovery_validation")
-            # This check is a safety boundary: it must await a newly committed
-            # plan instead of returning after the coordinator debounce accepts
-            # a refresh request.
-            await self.async_refresh()
-        except Exception:  # noqa: BLE001 - one failed validation resets the sequence.
-            _LOGGER.exception("Startup automatic-control validation refresh failed")
-            return False, "validation_refresh_failed"
-        finally:
-            self._startup_auto_recovery_validation_active = False
-        validation = self._last_startup_auto_recovery_validation
-        if not isinstance(validation, dict) or validation.get("committed") is not True:
-            return False, "validation_plan_not_committed"
-        if validation.get("safe") is not True or validation.get("violations"):
-            return False, "validation_plan_unsafe"
-        report = build_preflight_report(self.hass, self)
-        ready, reason = _startup_auto_recovery_validation_ready(report, self.entry_data)
-        return (True, "validation_succeeded") if ready else (False, reason)
-
-    def _record_startup_auto_recovery_validation_candidate(
-        self,
-        plan: EnergyPlan,
-        violations: list[str],
-    ) -> None:
-        """Capture one validation candidate before the generation-safe commit."""
-        if not getattr(self, "_startup_auto_recovery_validation_active", False):
-            return
-        self._last_startup_auto_recovery_validation = {
-            "plan_id": plan.plan_id,
-            "healthy": plan.health == InputHealth.HEALTHY and plan.status != "unsafe",
-            "safe": plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
-            and plan.status == "current",
-            "violations": list(violations),
-            "committed": False,
-        }
-
-    async def _async_update_startup_auto_recovery(
-        self,
-        status: str,
-        *,
-        successful_runs: int,
-        reason: str,
-        required_runs: int = STARTUP_AUTO_RECOVERY_REQUIRED_RUNS,
-        started: bool = False,
-        completed: bool = False,
-    ) -> None:
-        """Persist compact recovery progress for entities and diagnostics."""
-        production = parse_production_state(self.store.data.get("production")).raw
-        current = production.get("startup_auto_recovery")
-        recovery = dict(current) if isinstance(current, dict) else {}
-        now = dt_util.utcnow()
-        recovery.update(
-            {
-                "status": status,
-                "successful_runs": _startup_auto_recovery_successful_runs(successful_runs),
-                "required_runs": required_runs,
-                "last_reason": str(reason)[:160],
-                "updated_at": now,
-            }
-        )
-        if status == "waiting_for_home_assistant":
-            recovery.pop("started_at", None)
-            recovery.pop("deadline", None)
-            recovery.pop("completed_at", None)
-        if started:
-            recovery.update(
-                {
-                    "started_at": now,
-                    "deadline": now + timedelta(seconds=STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS),
-                }
-            )
-            recovery.pop("completed_at", None)
-        if completed:
-            self._startup_auto_recovery_authorized = False
-            self._startup_auto_recovery_deadline = None
-            recovery["completed_at"] = now
-        production["startup_auto_recovery"] = recovery
-        await self._async_save_production(production)
-        self.async_update_listeners()
+    _async_update_startup_auto_recovery = startup_recovery._async_update_startup_auto_recovery
 
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
@@ -1823,6 +1395,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     ) -> ActionOutcome | None:
         """Serialize an operator HVAC override with automatic device execution."""
         async with self._command_lock:
+            if getattr(self, "_tearing_down", False):
+                return None
             return await self._async_set_manual_hvac_override(
                 duration_minutes,
                 reason,
@@ -1886,7 +1460,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if manual_override_entity and source != "helper":
                 self._manual_override_helper_guard = ("on", dt_util.utcnow() + timedelta(minutes=2))
                 try:
-                    await self.hass.services.async_call(
+                    await async_call_device_service(
+                        self.hass,
                         "input_boolean",
                         "turn_on",
                         {"entity_id": manual_override_entity},
@@ -1949,6 +1524,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
             return
         async with self._planner_lock:
+            if getattr(self, "_tearing_down", False):
+                return
             self.overrides = [
                 override
                 for override in self.overrides
@@ -2257,7 +1834,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 != getattr(self, "_ev_auto_start_compensation_generation", 0)
             ):
                 return
-            self.hass.async_create_task(
+            self._async_create_listener_task(
                 self._async_compensate_ev_auto_start(
                     require_unowned=True,
                     generation=generation,
@@ -2381,30 +1958,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self._async_save_production(production)
 
     async def _async_save_production(self, production: dict[str, object]) -> None:
-        """Persist production gate state with compatibility for test stores."""
-        save_production = getattr(self.store, "async_save_production", None)
-        if callable(save_production):
-            await save_production(production)
-        else:
-            self.store.data["production"] = to_jsonable(production)
+        await self.store.async_save_production(production)
 
     async def _async_save_control_pause(self, pause: dict[str, object]) -> None:
-        """Persist control pause state with compatibility for test stores."""
-        save_pause = getattr(self.store, "async_save_control_pause", None)
-        if callable(save_pause):
-            await save_pause(pause)
-        else:
-            self.store.data["control_pause"] = to_jsonable(pause)
+        await self.store.async_save_control_pause(pause)
 
     async def _async_save_load_source_outage(self, outage: dict[str, Any]) -> None:
-        """Persist continuous load-source outage evidence when supported."""
-        if self.store.data.get("load_source_outage") == outage:
-            return
-        save_outage = getattr(self.store, "async_save_load_source_outage", None)
-        if callable(save_outage):
-            await save_outage(outage)
-        else:
-            self.store.data["load_source_outage"] = to_jsonable(outage)
+        await self.store.async_save_load_source_outage(outage)
 
     async def _async_clear_expired_manual_hvac_state(self) -> bool:
         """Clear planner-managed manual HVAC exposure after its timeout."""
@@ -2412,7 +1972,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if manual_override_entity:
             try:
                 self._manual_override_helper_guard = ("off", dt_util.utcnow() + timedelta(minutes=2))
-                await self.hass.services.async_call(
+                await async_call_device_service(
+                        self.hass,
                     "input_boolean",
                     "turn_off",
                     {"entity_id": manual_override_entity},
@@ -2446,13 +2007,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             "recent_outcome_count": len(outcomes[-10:]),
             "recent_outcomes": outcomes[-5:],
         }
-        add_comparison = getattr(self.store, "async_add_dry_run_comparison", None)
-        if callable(add_comparison):
-            await add_comparison(comparison)
-        else:
-            comparisons = list(self.store.data.get("dry_run_comparisons", []))
-            comparisons.append(to_jsonable(comparison))
-            self.store.data["dry_run_comparisons"] = comparisons[-96:]
+        await self.store.async_add_dry_run_comparison(comparison)
 
     @callback
     def _mark_replan_requested(self, *, force: bool = False) -> None:
@@ -2492,7 +2047,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._refresh_generation,
             )
             if hasattr(self, "hass"):
-                self.hass.async_create_task(self.async_request_refresh())
+                self._async_create_listener_task(self.async_request_refresh())
             return self.data or plan
         self._last_decision_context = context
         await self.store.async_save_plan(plan)
@@ -2510,164 +2065,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         return plan
 
     async def _async_weather_forecast(
-        self,
-        entry_data: dict[str, Any],
-        options: dict[str, Any],
-        *,
-        now: datetime,
-        force: bool,
+        self, entry_data: dict[str, Any], options: dict[str, Any], *, now: datetime, force: bool
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Return an hourly weather response with bounded cache fallback."""
-        prior_details = dict(
-            getattr(self, "weather_forecast_diagnostics", {}) or {}
-        )
-
-        def result(
-            forecast_result: dict[str, Any],
-            details: dict[str, Any],
-        ) -> tuple[dict[str, Any], dict[str, Any]]:
-            effective_details = {**details, "entity_id": entity_id}
-            if (
-                effective_details.get("source_type")
-                == "legacy_attributes_or_point_value"
-                and prior_details.get("entity_id") == entity_id
-                and prior_details.get("source_type")
-                in {
-                    "legacy_entity_attributes",
-                    "legacy_entity_attributes_partial",
-                    "point_value_repeated",
-                    "unavailable_state",
-                    "invalid_state",
-                }
-            ):
-                for key in (
-                    "source_type",
-                    "point_count",
-                    "coverage_start",
-                    "coverage_end",
-                    "classification",
-                    "covered_hours",
-                    "continuous_hours",
-                    "requested_hours",
-                ):
-                    if key in prior_details:
-                        effective_details[key] = prior_details[key]
-            self.weather_forecast_diagnostics = dict(effective_details)
-            return forecast_result, effective_details
-
-        entity_id = str(entry_data.get(CONF_WEATHER) or "").strip()
-        if not entity_id:
-            return result(
-                {},
-                {"fetch_status": "not_configured", "source_type": "none"},
-            )
-
-        cache = getattr(self, "_weather_forecast_cache", {})
-        cached_entity = str(cache.get("entity_id") or "")
-        cached_at = _parse_datetime_or_none(cache.get("fetched_at"))
-        cached_forecast_value = cache.get("forecast")
-        cached_forecast = (
-            [dict(item) for item in cached_forecast_value if isinstance(item, dict)]
-            if isinstance(cached_forecast_value, list)
-            else []
-        )
-        cache_age_seconds = (
-            max((dt_util.as_utc(now) - dt_util.as_utc(cached_at)).total_seconds(), 0.0)
-            if cached_at is not None
-            else None
-        )
-        planning_minutes = max(int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), 1)
-        freshness_minutes = max(
-            int(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)),
-            0,
-        )
-        refresh_after_seconds = min(planning_minutes, 15, freshness_minutes) * 60
-        cache_matches = (
-            cached_entity == entity_id
-            and bool(cached_forecast)
-            and cache_age_seconds is not None
-        )
-        if (
-            not force
-            and cache_matches
-            and cache_age_seconds is not None
-            and cache_age_seconds < refresh_after_seconds
-        ):
-            return result(
-                {"forecast": list(cached_forecast)},
-                _weather_forecast_details(
-                    fetch_status="cache_hit",
-                    source_type="weather_service_hourly",
-                    forecast=cached_forecast,
-                    cache_age_seconds=cache_age_seconds,
-                ),
-            )
-
-        failure_reason: str | None = None
-        try:
-            response = await self.hass.services.async_call(
-                "weather",
-                "get_forecasts",
-                {"entity_id": entity_id, "type": "hourly"},
-                blocking=True,
-                return_response=True,
-            )
-            forecast = _weather_forecast_from_response(response, entity_id)
-            if not forecast:
-                raise ValueError("weather_forecast_response_empty")
-            normalized = _normalize_hourly_forecast(
-                forecast,
-                timezone=str(
-                    getattr(getattr(self.hass, "config", None), "time_zone", None)
-                    or "UTC"
-                ),
-            )
-            if not normalized:
-                raise ValueError("weather_forecast_response_invalid")
-            self._weather_forecast_cache = {
-                "entity_id": entity_id,
-                "fetched_at": now,
-                "forecast": normalized,
-            }
-            return result(
-                {"forecast": normalized},
-                _weather_forecast_details(
-                    fetch_status="fetched",
-                    source_type="weather_service_hourly",
-                    forecast=normalized,
-                    cache_age_seconds=0.0,
-                ),
-            )
-        except Exception as err:  # noqa: BLE001 - weather is advisory and falls back safely.
-            failure_reason = _bounded_reason(err)
-            _LOGGER.debug("Hourly weather forecast fetch failed: %s", failure_reason)
-
-        freshness_seconds = freshness_minutes * 60
-        if (
-            cache_matches
-            and cache_age_seconds is not None
-            and cache_age_seconds <= freshness_seconds
-        ):
-            return result(
-                {"forecast": list(cached_forecast)},
-                _weather_forecast_details(
-                    fetch_status="cached_after_error",
-                    source_type="weather_service_hourly_cache",
-                    forecast=cached_forecast,
-                    cache_age_seconds=cache_age_seconds,
-                    failure_reason=failure_reason,
-                ),
-            )
-        return result(
-            {},
-            _weather_forecast_details(
-                fetch_status="failed",
-                source_type="legacy_attributes_or_point_value",
-                forecast=[],
-                cache_age_seconds=cache_age_seconds,
-                failure_reason=failure_reason,
-            ),
-        )
+        return await async_weather_forecast(self, entry_data, options, now=now, force=force)
 
     @callback
     def _schedule_plan_execution(
@@ -2687,10 +2087,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             f"{DOMAIN} plan execution",
         )
         self._plan_execution_task = created
-        # Lightweight test doubles may deliberately close background coroutines
-        # instead of returning a Task. Do not retain a request they cannot run.
-        if created is None:
-            self._pending_plan_execution = None
 
     async def _async_drain_plan_execution(self) -> None:
         """Execute committed plans without holding the coordinator refresh lock."""
@@ -2763,315 +2159,27 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     self._refresh_generation,
                 )
                 if hasattr(self, "hass"):
-                    self.hass.async_create_task(self.async_request_refresh())
+                    self._async_create_listener_task(self.async_request_refresh())
                 break
             # The priority score orders presentation and the first command, but
             # every coordinated device action keeps its own execution gate.
             await self.executor.async_evaluate(replace(plan, actions=[action]), context)
 
-    async def _async_get_throttled_ai_advice(
-        self,
-        context: Any,
-        plan: EnergyPlan,
-        entry_data: dict[str, Any],
-        options: dict[str, Any],
-        *,
-        force_current_plan: bool = False,
-    ) -> tuple[AIAdviceResult, bool]:
-        """Return AI troubleshooting only for safe, materially changed plans."""
-        if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
-            return (
-                AIAdviceResult(
-                    status="skipped",
-                    accepted={},
-                    rejected_reason="ai_skipped_unsafe_plan",
-                    rejected_detail={
-                        "reason": "ai_skipped_unsafe_plan",
-                        "message": "AI troubleshooting was skipped because the plan is unsafe or has zero confidence.",
-                    },
-                    service_called=None,
-                ),
-                False,
-            )
-        plan_fingerprint = _material_plan_fingerprint(plan)
-        if (
-            not force_current_plan
-            and _latest_ai_plan_fingerprint(self.store.data.get("ai_recommendations")) == plan_fingerprint
-        ):
-            return (
-                AIAdviceResult(
-                    status="skipped",
-                    accepted={},
-                    rejected_reason="ai_plan_unchanged",
-                    rejected_detail={
-                        "reason": "ai_plan_unchanged",
-                        "message": "AI troubleshooting was reused because the material plan has not changed.",
-                    },
-                    service_called=None,
-                ),
-                False,
-            )
-        last_called_at = _latest_ai_service_call_at(self.store.data.get("ai_recommendations"))
-        if last_called_at is not None:
-            elapsed = context.created_at - last_called_at
-            if elapsed < timedelta(seconds=AI_ADVICE_MIN_INTERVAL_SECONDS):
-                remaining_seconds = max(
-                    ceil(AI_ADVICE_MIN_INTERVAL_SECONDS - elapsed.total_seconds()),
-                    1,
-                )
-                return (
-                    AIAdviceResult(
-                        status="skipped",
-                        accepted={},
-                        rejected_reason="ai_rate_limited",
-                        rejected_detail={
-                            "reason": "ai_rate_limited",
-                            "message": (
-                                "AI troubleshooting was skipped because the last provider call was less than "
-                                "5 minutes ago."
-                            ),
-                            "retry_after_seconds": remaining_seconds,
-                            "last_called_at": last_called_at.isoformat(),
-                        },
-                        service_called=None,
-                    ),
-                    False,
-                )
-        result = await LocalAIAdvisor(self.hass, entry_data, options).async_get_advice(context, plan)
-        # The caller persists provider metadata; attach the stable key without
-        # widening the public AI result contract.
-        result.rejected_detail.setdefault("plan_fingerprint", plan_fingerprint)
-        return result, True
+    _async_get_throttled_ai_advice = advice_runtime._async_get_throttled_ai_advice
 
-    async def async_request_ai_advice(self) -> None:
-        """Schedule a fresh bounded explanation for the current safe plan."""
-        if not str(self.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip():
-            await self._async_reject_ai_advice_request(
-                "AI troubleshooting is not ready: no AI Task entity is configured.",
-                "No AI Task entity is configured.",
-            )
-        plan = self.data
-        context = getattr(self, "_last_decision_context", None)
-        if plan is None or context is None:
-            await self._async_reject_ai_advice_request(
-                "AI troubleshooting is not ready: no current plan is available.",
-                "No current plan is available.",
-            )
-        if plan.health == InputHealth.UNSAFE or plan.status == "unsafe" or plan.confidence <= 0:
-            await self._async_reject_ai_advice_request(
-                "AI troubleshooting is not ready: the current plan is unsafe.",
-                "The current plan is unsafe or has zero confidence.",
-            )
-        now = dt_util.utcnow()
-        last_called_at = _latest_ai_service_call_at(self.store.data.get("ai_recommendations"))
-        if last_called_at is not None:
-            remaining = AI_ADVICE_MIN_INTERVAL_SECONDS - (now - last_called_at).total_seconds()
-            if remaining > 0:
-                seconds = max(ceil(remaining), 1)
-                await self._async_reject_ai_advice_request(
-                    f"AI troubleshooting is rate limited for another {seconds} seconds.",
-                    f"Try again in {seconds} seconds.",
-                )
-        fingerprint = _material_plan_fingerprint(plan)
-        current = getattr(self, "_ai_advice_task", None)
-        if getattr(self, "_ai_advice_pending_fingerprint", None) == fingerprint or (
-            current is not None and not current.done()
-        ):
-            self._set_ai_advice_pending(fingerprint, "request_in_flight")
-            await self._async_notify_ai_advice("An explanation is already being prepared.")
-            return
-        self._ai_current_plan_safe = True
-        self._ai_current_plan_fingerprint = fingerprint
-        self._ai_advice_fingerprint = fingerprint
-        self._set_ai_advice_pending(fingerprint, "request_in_flight")
-        request_context = replace(context, created_at=now)
-        self.async_update_listeners()
-        await self._async_notify_ai_advice("Preparing an explanation for the current plan…")
-        self._ai_advice_task = self.hass.async_create_task(
-            self._async_run_ai_advice(
-                request_context,
-                plan,
-                self.entry_data,
-                self.options,
-                fingerprint,
-                force_current_plan=True,
-            )
-        )
+    async_request_ai_advice = advice_runtime.async_request_ai_advice
 
-    @callback
-    def _sync_ai_request_to_plan(self, plan: EnergyPlan) -> None:
-        """Cancel an in-flight explanation if its deterministic plan is obsolete."""
-        safe = plan.health != InputHealth.UNSAFE and plan.status != "unsafe" and plan.confidence > 0
-        fingerprint = _material_plan_fingerprint(plan) if safe else None
-        self._ai_current_plan_safe = safe
-        self._ai_current_plan_fingerprint = fingerprint
-        current = getattr(self, "_ai_advice_task", None)
-        if current is None or current.done():
-            return
-        if not safe or getattr(self, "_ai_advice_fingerprint", None) != fingerprint:
-            current.cancel()
-            self._clear_ai_advice_pending()
-            self.async_update_listeners()
+    _sync_ai_request_to_plan = advice_runtime._sync_ai_request_to_plan
 
-    async def _async_run_ai_advice(
-        self,
-        context: Any,
-        plan: EnergyPlan,
-        entry_data: dict[str, Any],
-        options: dict[str, Any],
-        fingerprint: str,
-        *,
-        force_current_plan: bool = False,
-    ) -> None:
-        """Persist one bounded button-triggered troubleshooting result."""
-        started = perf_counter()
-        try:
-            if force_current_plan:
-                ai_result, should_store = await self._async_get_throttled_ai_advice(
-                    context,
-                    plan,
-                    entry_data,
-                    options,
-                    force_current_plan=True,
-                )
-            else:
-                ai_result, should_store = await self._async_get_throttled_ai_advice(context, plan, entry_data, options)
-            if not should_store:
-                self._clear_ai_advice_pending(fingerprint)
-                self.async_update_listeners()
-                if force_current_plan:
-                    await self._async_notify_ai_advice(_ai_advice_notification_message(ai_result))
-                return
-            if (
-                self._ai_advice_fingerprint != fingerprint
-                or not self._ai_current_plan_safe
-                or self._ai_current_plan_fingerprint != fingerprint
-            ):
-                self._clear_ai_advice_pending(fingerprint)
-                if force_current_plan:
-                    await self._async_notify_ai_advice(
-                        "The plan changed before the explanation completed. Press Explain to try again."
-                    )
-                return
-            plan_changed_while_waiting = False
-            async with self._planner_lock:
-                if not self._ai_current_plan_safe or self._ai_current_plan_fingerprint != fingerprint:
-                    self._clear_ai_advice_pending(fingerprint)
-                    plan_changed_while_waiting = True
-                else:
-                    await self.store.async_add_ai_recommendation(
-                        {
-                            "created_at": context.created_at,
-                            "plan_id": plan.plan_id,
-                            "plan_fingerprint": fingerprint,
-                            "plan_health": str(plan.health),
-                            "status": ai_result.status,
-                            "accepted": ai_result.accepted,
-                            "rejected_reason": ai_result.rejected_reason,
-                            "rejected_detail": ai_result.rejected_detail,
-                            "service_called": ai_result.service_called,
-                            CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                        }
-                    )
-                    await self.store.async_attach_ai_to_forecast_snapshot(
-                        plan.plan_id,
-                        {
-                            "status": ai_result.status,
-                            "accepted_fields": sorted(ai_result.accepted),
-                            "rejected_reason": ai_result.rejected_reason,
-                            "rejected_detail": ai_result.rejected_detail,
-                            "service_called": ai_result.service_called,
-                            CONF_AI_TASK_ENTITY: ai_result.ai_task_entity,
-                        },
-                    )
-            if plan_changed_while_waiting:
-                if force_current_plan:
-                    await self._async_notify_ai_advice(
-                        "The plan changed before the explanation completed. Press Explain to try again."
-                    )
-                return
-            self._clear_ai_advice_pending(fingerprint)
-            self._last_phase_durations["ai_background_ms"] = round((perf_counter() - started) * 1000, 3)
-            self.async_update_listeners()
-            if force_current_plan:
-                await self._async_notify_ai_advice(_ai_advice_notification_message(ai_result))
-        except asyncio.CancelledError:
-            self._clear_ai_advice_pending(fingerprint)
-            if force_current_plan and not getattr(self, "_tearing_down", False):
-                await self._async_notify_ai_advice(
-                    "The plan changed before the explanation completed. Press Explain to try again."
-                )
-            raise
-        except Exception:  # noqa: BLE001 - advice must never fail the planner task.
-            self._clear_ai_advice_pending(fingerprint)
-            self.async_update_listeners()
-            _LOGGER.exception("AI troubleshooting failed")
-            if force_current_plan:
-                await self._async_notify_ai_advice(
-                    "The explanation could not be completed. Check the Energy Planner logs and try again."
-                )
-        finally:
-            if getattr(self, "_ai_advice_task", None) is asyncio.current_task():
-                self._ai_advice_task = None
+    _async_run_ai_advice = advice_runtime._async_run_ai_advice
 
-    @callback
-    def _set_ai_advice_pending(self, fingerprint: str, reason: str) -> None:
-        """Expose bounded in-memory status for advice awaiting completion."""
-        self._ai_advice_pending_fingerprint = fingerprint
-        self._ai_advice_pending_reason = reason
+    _set_ai_advice_pending = advice_runtime._set_ai_advice_pending
 
-    @callback
-    def _clear_ai_advice_pending(self, fingerprint: str | None = None) -> None:
-        """Clear pending status when it still belongs to the selected plan."""
-        current = getattr(self, "_ai_advice_pending_fingerprint", None)
-        if fingerprint is not None and current != fingerprint:
-            return
-        self._ai_advice_pending_fingerprint = None
-        self._ai_advice_pending_reason = None
+    _clear_ai_advice_pending = advice_runtime._clear_ai_advice_pending
 
-    async def _async_notify_ai_advice(self, message: str) -> None:
-        """Publish bounded button feedback without affecting planner operation."""
-        entry = getattr(self, "entry", None)
-        entry_id = getattr(entry, "entry_id", None)
-        notification_id = f"{_AI_ADVICE_NOTIFICATION_ID}_{entry_id}" if entry_id else _AI_ADVICE_NOTIFICATION_ID
-        if defer_persistent_notification(
-            self.hass,
-            notification_id,
-            lambda: self._async_notify_ai_advice(message),
-        ):
-            return
-        services = getattr(getattr(self, "hass", None), "services", None)
-        async_call = getattr(services, "async_call", None)
-        if not callable(async_call):
-            return
-        title = getattr(entry, "title", None) or "Energy Planner"
-        try:
-            await async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": f"{title}: explanation",
-                    "message": message[:2000],
-                    "notification_id": notification_id,
-                },
-                blocking=False,
-            )
-        except Exception:  # noqa: BLE001 - notification failure must not discard advice.
-            _LOGGER.warning("Could not publish the Energy Planner explanation notification")
+    _async_notify_ai_advice = advice_runtime._async_notify_ai_advice
 
-    async def _async_reject_ai_advice_request(
-        self,
-        error_message: str,
-        reason: str,
-    ) -> Never:
-        """Notify the operator and reject an explanation that cannot start."""
-        await self._async_notify_ai_advice(f"**Explanation unavailable.**\n\n{reason}")
-        raise HomeAssistantError(
-            error_message,
-            translation_domain=DOMAIN,
-            translation_key="ai_advice_not_ready",
-            translation_placeholders={"reason": reason},
-        )
+    _async_reject_ai_advice_request = advice_runtime._async_reject_ai_advice_request
 
     def _non_manual_refresh_delay(self) -> float:
         """Return delay needed to enforce the safe non-manual refresh cadence."""
@@ -3081,26 +2189,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         elapsed = monotonic() - last_requested
         return float(max(float(MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS) - elapsed, 0.0))
 
+    @cached_property
+    def _refresh_counters(self) -> dict[str, int]:
+        """Allocate bounded telemetry counters on first use."""
+        return {"requested": 0, "completed": 0, "coalesced": 0, "fingerprint_skipped": 0}
+
     def _increment_refresh_counter(self, key: str) -> None:
-        """Increment in-memory refresh telemetry with test-object compatibility."""
-        counters = getattr(self, "_refresh_counters", None)
-        if counters is None:
-            counters = {"requested": 0, "completed": 0, "coalesced": 0, "fingerprint_skipped": 0}
-            self._refresh_counters = counters
-        counters[key] = int(counters.get(key, 0)) + 1
-
-
-def _weather_forecast_from_response(response: Any, entity_id: str) -> list[dict[str, Any]]:
-    """Extract the documented per-entity forecast response."""
-    if not isinstance(response, dict):
-        return []
-    entity_response = response.get(entity_id)
-    if not isinstance(entity_response, dict):
-        return []
-    forecast = entity_response.get("forecast")
-    if not isinstance(forecast, list):
-        return []
-    return [dict(item) for item in forecast if isinstance(item, dict)]
+        """Increment the coordinator's bounded telemetry."""
+        self._refresh_counters[key] = self._refresh_counters.get(key, 0) + 1
 
 
 def _updated_load_source_outage(
@@ -3184,83 +2280,6 @@ def _updated_load_source_outage(
     }
 
 
-def _normalize_hourly_forecast(
-    forecast: list[dict[str, Any]],
-    *,
-    timezone: str,
-) -> list[dict[str, Any]]:
-    """Normalize forecast datetimes to UTC, treating naive values as HA local time."""
-    try:
-        local_timezone = ZoneInfo(timezone)
-    except ZoneInfoNotFoundError:
-        local_timezone = ZoneInfo("UTC")
-    normalized: list[dict[str, Any]] = []
-    previous_naive_utc: datetime | None = None
-    for item in forecast:
-        parsed = _parse_datetime_or_none(item.get("datetime"))
-        if parsed is None:
-            continue
-        if parsed.tzinfo is None:
-            candidates = _naive_local_utc_candidates(parsed, local_timezone)
-            parsed_utc = next(
-                (
-                    candidate
-                    for candidate in candidates
-                    if previous_naive_utc is None or candidate > previous_naive_utc
-                ),
-                None,
-            )
-            if parsed_utc is None:
-                continue
-            previous_naive_utc = parsed_utc
-        else:
-            parsed_utc = parsed.astimezone(UTC)
-        normalized_item = dict(item)
-        normalized_item["datetime"] = parsed_utc.isoformat()
-        normalized.append(normalized_item)
-    return normalized
-
-
-def _naive_local_utc_candidates(value: datetime, timezone: ZoneInfo) -> list[datetime]:
-    """Return valid UTC instants for a naive wall time, including DST folds."""
-    candidates: list[datetime] = []
-    for fold in (0, 1):
-        candidate = value.replace(tzinfo=timezone, fold=fold).astimezone(UTC)
-        round_trip = candidate.astimezone(timezone).replace(tzinfo=None)
-        if round_trip == value and candidate not in candidates:
-            candidates.append(candidate)
-    return sorted(candidates)
-
-
-def _weather_forecast_details(
-    *,
-    fetch_status: str,
-    source_type: str,
-    forecast: list[dict[str, Any]],
-    cache_age_seconds: float | None,
-    failure_reason: str | None = None,
-) -> dict[str, Any]:
-    """Return bounded operator diagnostics for the hourly forecast fetch."""
-    datetimes = [str(item.get("datetime")) for item in forecast if item.get("datetime")]
-    return {
-        "fetch_status": fetch_status,
-        "source_type": source_type,
-        "cache_age_seconds": (
-            round(cache_age_seconds, 3) if cache_age_seconds is not None else None
-        ),
-        "point_count": len(forecast),
-        "coverage_start": min(datetimes) if datetimes else None,
-        "coverage_end": max(datetimes) if datetimes else None,
-        "failure_reason": failure_reason,
-    }
-
-
-def _bounded_reason(error: Exception) -> str:
-    """Return a bounded service failure reason without leaking payloads."""
-    message = str(error).strip().replace("\n", " ")[:160]
-    return f"{type(error).__name__}:{message}" if message else type(error).__name__
-
-
 def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     """Return explicit decision-input entity IDs that may trigger replanning."""
     entity_ids: set[str] = set()
@@ -3301,92 +2320,6 @@ def _decision_input_fingerprint(
     }
     encoded = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _material_plan_fingerprint(plan: EnergyPlan) -> str:
-    """Return a stable key excluding generated plan IDs and timestamps."""
-    payload = {
-        "health": plan.health,
-        "mode": plan.mode,
-        "confidence": plan.confidence,
-        "status": plan.status,
-        "issues": sorted(plan.input_issues),
-        "actions": [
-            {
-                "asset": action.asset,
-                "kind": action.kind,
-                "desired_state": action.desired_state,
-                "reason_codes": action.reason_codes,
-                "confidence": action.confidence,
-            }
-            for action in plan.actions
-        ],
-        "estimated_daily_cost": plan.estimated_daily_cost,
-        "preview": _material_preview(plan.preview[:24]),
-    }
-    encoded = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
-    return hashlib.sha256(encoded.encode()).hexdigest()
-
-
-def _material_preview(value: Any) -> Any:
-    """Remove refresh-relative timestamps while retaining decision values."""
-    if isinstance(value, dict):
-        return {
-            str(key): _material_preview(item)
-            for key, item in value.items()
-            if str(key) not in {"valid_at", "created_at", "execute_not_before", "execute_not_after"}
-        }
-    if isinstance(value, list):
-        return [_material_preview(item) for item in value]
-    return to_jsonable(value)
-
-
-def _latest_ai_plan_fingerprint(recommendations: Any) -> str | None:
-    """Return the last stored material plan fingerprint."""
-    latest = _latest_accepted_ai_recommendation(recommendations)
-    return _ai_recommendation_fingerprint(latest)
-
-
-def _ai_recommendation_fingerprint(recommendation: Any) -> str | None:
-    """Return the current or legacy material fingerprint for one recommendation."""
-    if not isinstance(recommendation, dict):
-        return None
-    fingerprint = recommendation.get("plan_fingerprint")
-    if isinstance(fingerprint, str) and fingerprint:
-        return fingerprint
-    detail = recommendation.get("rejected_detail")
-    if isinstance(detail, dict):
-        detail_fingerprint = detail.get("plan_fingerprint")
-        if isinstance(detail_fingerprint, str):
-            return detail_fingerprint
-    return None
-
-
-def _latest_accepted_ai_recommendation(recommendations: Any) -> dict[str, Any] | None:
-    """Return the latest accepted recommendation eligible for reuse."""
-    if not isinstance(recommendations, list):
-        return None
-    for item in reversed(recommendations):
-        if isinstance(item, dict) and item.get("status") == "accepted":
-            return item
-    return None
-
-
-def _latest_ai_service_call_at(recommendations: Any) -> datetime | None:
-    """Return the latest timestamp where an AI provider service was actually called."""
-    if not isinstance(recommendations, list):
-        return None
-    for item in reversed(recommendations):
-        if not isinstance(item, dict) or not item.get("service_called"):
-            continue
-        created_at = item.get("created_at")
-        if isinstance(created_at, datetime):
-            return created_at
-        if isinstance(created_at, str):
-            parsed = dt_util.parse_datetime(created_at)
-            if isinstance(parsed, datetime):
-                return parsed
-    return None
 
 
 def _seconds_until_next_interval_boundary(now: Any, interval_minutes: int) -> float:
@@ -4133,39 +3066,6 @@ def _float_state_value(hass: HomeAssistant, entity_id: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return value if isfinite(value) else None
-
-
-def _ai_advice_notification_message(result: AIAdviceResult) -> str:
-    """Render a bounded, user-visible explanation result."""
-    accepted = result.accepted if isinstance(result.accepted, dict) else {}
-    outcome = accepted.get("outcome")
-    summary = str(accepted.get("summary", "") or "").strip()
-    if outcome == "no_action_needed" and summary:
-        return f"**No action needed.**\n\n{summary}"
-    if outcome == "action_required" and summary:
-        target = str(accepted.get("affected_item", "") or "")
-        target_name = AI_ACTION_TARGETS.get(target, (target.replace("_", " ").title(), ()))[0]
-        return (
-            f"{summary}\n\n"
-            f"- **Affected item:** {target_name}\n"
-            f"- **Problem:** {accepted.get('problem', 'Not provided')}\n"
-            f"- **Next step:** {accepted.get('next_step', 'Not provided')}\n"
-            f"- **Expected benefit:** {accepted.get('expected_benefit', 'Not provided')}\n"
-            f"- **Verify:** {accepted.get('verification', 'Not provided')}"
-        )
-    detail = result.rejected_detail if isinstance(result.rejected_detail, dict) else {}
-    message = str(detail.get("message", "") or "").strip()
-    return f"**No explanation available.**\n\n{message or 'The AI response was not usable. Try again.'}"
-
-
-def _parse_datetime_or_none(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if hasattr(value, "tzinfo"):
-        return value
-    if isinstance(value, str):
-        return dt_util.parse_datetime(value)
-    return None
 
 
 def _overrides_from_store(

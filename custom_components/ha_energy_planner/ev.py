@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import ceil, isfinite
@@ -246,16 +247,13 @@ def _ev_charge_calibration_samples(
             active_start = None
             continue
         duration_minutes = (timestamp - active_start).total_seconds() / 60.0
-        start_soc = _soc_at_or_before(soc_points, active_start)
-        end_soc = _soc_at_or_before(soc_points, timestamp)
         active_start_value = active_start
         active_start = None
-        if (
-            duration_minutes < MIN_EV_CHARGE_CALIBRATION_MINUTES
-            or duration_minutes > 12 * 60
-            or start_soc is None
-            or end_soc is None
-        ):
+        if duration_minutes < MIN_EV_CHARGE_CALIBRATION_MINUTES or duration_minutes > 12 * 60:
+            continue
+        start_soc = _soc_at_or_before(soc_points, active_start_value)
+        end_soc = _soc_at_or_before(soc_points, timestamp)
+        if start_soc is None or end_soc is None:
             continue
         soc_gain = end_soc - start_soc
         if soc_gain < MIN_EV_CHARGE_CALIBRATION_SOC_GAIN:
@@ -283,7 +281,8 @@ def _soc_at_or_before(
     points: list[tuple[datetime, float]],
     timestamp: datetime,
 ) -> float | None:
-    point = next(((instant, value) for instant, value in reversed(points) if instant <= timestamp), None)
+    index = bisect_right(points, timestamp, key=lambda point: point[0]) - 1
+    point = points[index] if index >= 0 else None
     if point is None or timestamp - point[0] > timedelta(minutes=15):
         return None
     return point[1]

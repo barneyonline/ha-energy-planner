@@ -101,8 +101,15 @@ rules:
         - custom_components/ha_energy_planner/preflight.py
         - custom_components/ha_energy_planner/ev.py
         - custom_components/ha_energy_planner/ev_adapter.py
-        - custom_components/ha_energy_planner/number.py
-        - custom_components/ha_energy_planner/time.py
+        - custom_components/ha_energy_planner/entity_registry_migration.py
+        - custom_components/ha_energy_planner/adapter_helpers.py
+        - custom_components/ha_energy_planner/command_models.py
+        - custom_components/ha_energy_planner/enphase_control.py
+        - custom_components/ha_energy_planner/ev_control.py
+        - custom_components/ha_energy_planner/hvac_control.py
+        - custom_components/ha_energy_planner/plan_presentation.py
+        - custom_components/ha_energy_planner/training.py
+        - custom_components/ha_energy_planner/weather.py
       tests:
         - tests/test_planner.py
         - tests/test_inputs.py
@@ -271,14 +278,14 @@ rules:
         - README.md
   entity-unavailable:
     status: done
-    comment: Required input health is surfaced as a binary sensor and unsafe inputs block execution. AI Task discovery permits the valid first-use unknown state while still rejecting missing and explicitly unavailable providers.
+    comment: Live Plan health and decision diagnostics expose degraded or unsafe inputs and execution fails closed. CoordinatorEntity marks entities unavailable on refresh failure. AI Task discovery allows first-use unknown while rejecting missing and explicitly unavailable providers.
     references:
       code:
         - custom_components/ha_energy_planner/binary_sensor.py
         - custom_components/ha_energy_planner/inputs.py
         - custom_components/ha_energy_planner/discovery.py
       tests:
-        - tests/test_binary_sensor.py
+        - tests/test_sensor.py
         - tests/test_inputs.py
         - tests/test_discovery.py
         - tests/fixtures/replay/stale_input_suppresses_control.json
@@ -289,7 +296,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   log-when-unavailable:
     status: done
-    comment: Unavailable required inputs and configured service failures are persisted with compact reasons instead of noisy repeated logs.
+    comment: Planner-owned unavailable and recovery transitions are logged once per transition with bounded reasons. Upstream integrations retain responsibility for their raw provider outages; repeated refreshes do not duplicate planner warnings.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -299,14 +306,16 @@ rules:
         - scripts/docker-ha-smoke.sh
   parallel-updates:
     status: done
-    comment: Coordinator refreshes are serialized and coalesced with trigger/phase telemetry. Committed plans execute afterward through an independent command lock, queued generations collapse to the newest plan, per-plan failures leave newer queued work drainable, Store-backed execution state notifies entities, and unload awaits both in-flight command and refresh safe boundaries without cancellation. Queued teardown refreshes are suppressed and post-await ownership cleanup preserves concurrent command state. Device execution remains rate-limited per asset/action kind, so feedback waits do not hold refresh or persistence scopes.
+    comment: All live platforms declare PARALLEL_UPDATES=0. Coordinator command and device locks serialize outbound transactions across platforms and domain services while keeping disarm dispatchable. Listener jobs are entry-owned and drained safely on unload; queued jobs reject teardown after acquiring their lock.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
         - custom_components/ha_energy_planner/executor.py
+        - custom_components/ha_energy_planner/task_lifecycle.py
       tests:
         - tests/test_coordinator.py
         - tests/test_executor.py
+        - tests/scripts/test_validate_quality_scale.py
   reauthentication-flow:
     status: exempt
     comment: This local-first integration stores entity/service mappings and no remote account credential that requires Home Assistant reauthentication.
@@ -316,9 +325,14 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; pushes and manual Tests runs retain the full non-smoke CI set.
+    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent and branch evidence is published separately.
     references:
       tests:
+        - tests/test_ha_runtime.py
+        - tests/test_device_registry_runtime.py
+        - tests/test_training.py
+        - scripts/docker-compatibility.sh
+        - scripts/check_coverage.py
         - tests/test_planner.py
         - tests/test_ev.py
         - tests/test_executor.py
@@ -434,7 +448,7 @@ rules:
         - custom_components/ha_energy_planner/sensor.py
         - custom_components/ha_energy_planner/binary_sensor.py
         - custom_components/ha_energy_planner/switch.py
-        - custom_components/ha_energy_planner/number.py
+        - custom_components/ha_energy_planner/entity_registry_migration.py
         - custom_components/ha_energy_planner/button.py
         - custom_components/ha_energy_planner/calendar.py
       tests:
@@ -484,11 +498,15 @@ rules:
         - tests/test_services.py
         - tests/test_switch_button.py
   icon-translations:
-    status: exempt
-    comment: No custom icon translation file is required for the current entity set.
+    status: done
+    comment: Live custom icons are keyed by entity translation keys in icons.json. The quality validator rejects Python icons and invalid exemptions, and real Home Assistant icon loading is tested on the minimum, pinned baseline and stable releases.
     references:
       code:
+        - custom_components/ha_energy_planner/icons.json
         - custom_components/ha_energy_planner/strings.json
+      tests:
+        - tests/test_ha_runtime.py
+        - tests/scripts/test_validate_quality_scale.py
   reconfiguration-flow:
     status: done
     comment: Every input mapping and policy section is editable from the integration's central Configure flow, with runtime topology rebuilt after mapping changes.

@@ -155,20 +155,6 @@ class FakeServices:
         return self.response
 
 
-class FakeFallbackServices(FakeServices):
-    """Service bus that simulates HA versions without return_response support."""
-
-    async def async_call(
-        self,
-        domain: str,
-        service: str,
-        data: dict[str, Any],
-        blocking: bool = False,
-    ) -> Any:
-        self.calls.append((domain, service, data))
-        return self.response
-
-
 class FakeFailingServices(FakeServices):
     """Service bus that raises during provider calls."""
 
@@ -486,33 +472,24 @@ def test_local_ai_advisor_rejects_missing_and_invalid_service() -> None:
     assert invalid.rejected_reason == "ai_service_not_configured"
 
 
-def test_local_ai_advisor_supports_service_call_without_return_response() -> None:
-    hass = FakeHass(
-        {
-            "response": json.dumps(
-                {
-                    "outcome": "no_action_needed",
-                    "summary": "Fallback call shape worked.",
-                }
-            )
-        },
-        entity_ids=["ai_task.extended_openai_ai_task"],
-    )
-    hass.services = FakeFallbackServices(hass.services.response)
+def test_local_ai_advisor_calls_type_error_provider_only_once() -> None:
+    hass = FakeHass({}, entity_ids=["ai_task.extended_openai_ai_task"])
 
+    async def fail_after_work(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> Any:
+        hass.services.calls.append((domain, service, data))
+        raise TypeError("provider internal failure")
+
+    hass.services.async_call = fail_after_work
     result = asyncio.run(
         LocalAIAdvisor(
             hass,
-            {
-                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
-                CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task",
-            },
+            {CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task"},
             DEFAULT_OPTIONS,
         ).async_get_advice(_context(), _plan())
     )
-
-    assert result.status == "accepted"
-    assert result.accepted["summary"] == "Fallback call shape worked."
+    assert result.status == "rejected"
+    assert result.rejected_reason == "ai_service_failed:TypeError"
+    assert len(hass.services.calls) == 1
 
 
 def test_local_ai_advisor_rejects_timeout_and_service_failure(monkeypatch: object) -> None:
@@ -726,3 +703,47 @@ def test_ai_rejection_evidence_helpers_ignore_bad_rows_and_bound_shapes() -> Non
             "evidence": "required_hours_missing",
         }
     ]
+
+
+def test_provider_response_limits_bound_wrappers_strings_and_decoded_json() -> None:
+    from custom_components.ha_energy_planner.ai_advisor import (
+        MAX_AI_RESPONSE_CHARACTERS,
+        MAX_AI_RESPONSE_NODES,
+        _loads,
+        _parse_response,
+        _response_within_limits,
+    )
+
+    assert not _response_within_limits("x" * (MAX_AI_RESPONSE_CHARACTERS + 1))
+    assert not _response_within_limits([None] * (MAX_AI_RESPONSE_NODES + 1))
+    assert not _response_within_limits({str(i): None for i in range(MAX_AI_RESPONSE_NODES)})
+    assert not _response_within_limits([[None] * 400, [None] * 400, [None] * 400])
+    assert _response_within_limits({"count": 1, "nested": [True, None]})
+    recursive: dict[str, Any] = {}
+    recursive["response"] = recursive
+    assert not _response_within_limits(recursive)
+    assert _parse_response(recursive) is None
+    assert _loads("x" * (MAX_AI_RESPONSE_CHARACTERS + 1)) is None
+    nested_json = '[' * 20 + '0' + ']' * 20
+    assert _loads(nested_json) is None
+    assert _loads('[' * 2000 + '0' + ']' * 2000) is None
+    assert _loads('```json\n{"nested":' + nested_json + '}\n```') is None
+    assert _loads('prefix {"nested":' + nested_json + '} suffix') is None
+    hass = FakeHass("x" * (MAX_AI_RESPONSE_CHARACTERS + 1), entity_ids=["ai_task.extended_openai_ai_task"])
+    result = asyncio.run(LocalAIAdvisor(
+        hass, {CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task"}, DEFAULT_OPTIONS
+    ).async_get_advice(_context(), _plan()))
+    assert result.rejected_reason == "ai_response_too_large"
+
+
+def test_large_json_integer_is_rejected_without_escaping_provider_boundary() -> None:
+    from custom_components.ha_energy_planner.ai_advisor import _loads
+    numeric_bomb = '{"summary":' + '9' * 5000 + '}'
+    for payload in (numeric_bomb, '```json\n' + numeric_bomb + '\n```', 'prefix ' + numeric_bomb + ' suffix'):
+        assert _loads(payload) is None
+    hass = FakeHass(numeric_bomb, entity_ids=["ai_task.extended_openai_ai_task"])
+    result = asyncio.run(LocalAIAdvisor(
+        hass, {CONF_AI_TASK_ENTITY: "ai_task.extended_openai_ai_task"}, DEFAULT_OPTIONS,
+    ).async_get_advice(_context(), _plan()))
+    assert result.rejected_reason == "ai_response_not_json"
+    assert len(hass.services.calls) == 1

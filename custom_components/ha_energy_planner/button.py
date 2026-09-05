@@ -10,19 +10,22 @@ from homeassistant.components.button import ButtonEntity, ButtonEntityDescriptio
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import EnergyPlannerCoordinator
 from .discovery import CapabilityDiscovery
-from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .entity import EnergyPlannerEntity
 from .models import OutcomeResult
 from .notifications import defer_persistent_notification
 from .preflight import build_preflight_report
 from .type_defs import EnergyPlannerConfigEntry
 
 _PREFLIGHT_NOTIFICATION_ID = "ha_energy_planner_preflight"
+
+
+# Coordinator locks serialize commands; allow stop controls to dispatch immediately.
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -53,11 +56,15 @@ async def _request_ai_advice(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 def _ai_advice_available(coordinator: EnergyPlannerCoordinator) -> bool:
-    return CapabilityDiscovery(
-        coordinator.hass,
-        coordinator.entry_data,
-        coordinator.options,
-    ).inspect().ai.supported
+    return (
+        CapabilityDiscovery(
+            coordinator.hass,
+            coordinator.entry_data,
+            coordinator.options,
+        )
+        .inspect()
+        .ai.supported
+    )
 
 
 async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
@@ -69,6 +76,7 @@ async def _run_preflight(coordinator: EnergyPlannerCoordinator) -> None:
         coordinator.hass,
         notification_id,
         lambda: _run_preflight(coordinator),
+        owner_id=entry_id,
     ):
         return
     report = build_preflight_report(coordinator.hass, coordinator)
@@ -116,7 +124,6 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="replan",
         translation_key="replan",
-        icon="mdi:refresh",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         press_fn=_replan,
@@ -124,21 +131,18 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="restore_safe_state",
         translation_key="restore_safe_state",
-        icon="mdi:backup-restore",
         entity_category=EntityCategory.CONFIG,
         press_fn=_restore,
     ),
     PlannerButtonDescription(
         key="request_ai_advice",
         translation_key="request_ai_advice",
-        icon="mdi:comment-question-outline",
         press_fn=_request_ai_advice,
         available_fn=_ai_advice_available,
     ),
     PlannerButtonDescription(
         key="run_preflight",
         translation_key="run_preflight",
-        icon="mdi:clipboard-check-outline",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         press_fn=_run_preflight,
@@ -146,7 +150,6 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="arm_production_control",
         translation_key="arm_production_control",
-        icon="mdi:shield-check",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         press_fn=_arm,
@@ -154,7 +157,6 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="disarm_production_control",
         translation_key="disarm_production_control",
-        icon="mdi:shield-off",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         press_fn=_disarm,
@@ -162,18 +164,10 @@ BUTTONS: tuple[PlannerButtonDescription, ...] = (
     PlannerButtonDescription(
         key="resume_control",
         translation_key="resume_control",
-        icon="mdi:play-circle-outline",
         entity_category=EntityCategory.CONFIG,
         entity_registry_enabled_default=False,
         press_fn=_resume,
     ),
-)
-
-_RETIRED_BUTTON_KEYS = (
-    "ev_start_charging",
-    "ev_stop_charging",
-    "pause_control_1h",
-    "pause_control_4h",
 )
 
 
@@ -184,19 +178,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up buttons."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    _remove_retired_buttons(hass, entry)
-    async_add_planner_entities(
-        entry, async_add_entities, (PlannerButton(coordinator, description) for description in BUTTONS)
-    )
-
-
-def _remove_retired_buttons(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Remove retired command buttons from the entity registry."""
-    registry = er.async_get(hass)
-    for key in _RETIRED_BUTTON_KEYS:
-        entity_id = registry.async_get_entity_id("button", DOMAIN, f"{entry.entry_id}_{key}")
-        if entity_id is not None:
-            registry.async_remove(entity_id)
+    async_add_entities(PlannerButton(coordinator, description) for description in BUTTONS)
 
 
 class PlannerButton(EnergyPlannerEntity, ButtonEntity):

@@ -15,8 +15,10 @@ import pytest
 from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
 
+from custom_components.ha_energy_planner import advice_runtime as advice_runtime_module
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner import notifications as notifications_module
+from custom_components.ha_energy_planner import startup_recovery as startup_recovery_module
 from custom_components.ha_energy_planner.ai_advisor import AIAdviceResult
 from custom_components.ha_energy_planner.const import (
     CONF_AI_ENABLED,
@@ -209,7 +211,7 @@ def test_load_source_outage_handles_missing_and_malformed_persisted_evidence() -
     assert malformed["started_at"] == "invalid"
 
 
-def test_coordinator_persists_load_source_outage_with_store_compatibility() -> None:
+def test_coordinator_persists_load_source_outage_through_store_contract() -> None:
     save_outage = AsyncMock()
     coordinator = SimpleNamespace(
         store=SimpleNamespace(
@@ -236,9 +238,9 @@ def test_coordinator_persists_load_source_outage_with_store_compatibility() -> N
         )
     )
 
-    assert save_outage.await_count == 1
+    assert save_outage.await_count == 2
 
-    legacy = SimpleNamespace(store=SimpleNamespace(data={}))
+    legacy = SimpleNamespace(store=FakeStore())
     asyncio.run(
         EnergyPlannerCoordinator._async_save_load_source_outage(
             legacy,
@@ -442,7 +444,7 @@ def test_hourly_weather_forecast_failure_uses_fresh_cache_then_legacy_fallback()
     )
     assert cached == {"forecast": cached_forecast}
     assert details["fetch_status"] == "cached_after_error"
-    assert details["failure_reason"].startswith("RuntimeError:")
+    assert details["failure_reason"] == "RuntimeError"
     assert coordinator.weather_forecast_diagnostics == details
 
     coordinator._weather_forecast_cache = {}
@@ -717,20 +719,35 @@ class FakeStates:
         return FakeState(value, attributes)
 
 
+class CompletedTask:
+    """Synchronous scheduler result honoring the task callback contract."""
+
+    def add_done_callback(self, callback: Any) -> None:
+        callback(self)
+
+    def done(self) -> bool:
+        return True
+
+
 class FakeHass:
     """Minimal HA object."""
 
     def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.state = CoreState.running
+        self.data = {}
         self.states = FakeStates(values or {})
         self.services = SimpleNamespace(calls=[], async_call=self._async_call_service)
         self.created_tasks: list[object] = []
 
-    def async_create_task(self, task: object) -> None:
+    def async_create_task(self, task: object) -> CompletedTask:
         close = getattr(task, "close", None)
         if callable(close):
             close()
         self.created_tasks.append(task)
+        return CompletedTask()
+
+    def async_create_background_task(self, coroutine: object, name: str) -> asyncio.Task:
+        return asyncio.create_task(coroutine)
 
     def async_run_hass_job(self, job: object, *args: object) -> None:
         self.async_create_task(job.target(*args))
@@ -792,12 +809,18 @@ class FakeStore:
         self.load_forecasts.append(model)
         self.data["built_in_load_forecast"] = model
 
+    async def async_save_load_source_outage(self, outage: dict[str, object]) -> None:
+        self.data["load_source_outage"] = outage
+
     async def async_save_thermal_model(self, thermal_model: dict[str, object]) -> None:
         self.thermal_models.append(thermal_model)
         self.data["thermal_model"] = thermal_model
 
     async def async_add_haeo_run(self, run: dict[str, object]) -> None:
         self.haeo_runs.append(run)
+
+    async def async_save_ai_attempt(self, attempt: dict[str, object]) -> None:
+        self.data["ai_last_attempt"] = attempt
 
     async def async_add_ai_recommendation(self, recommendation: dict[str, object]) -> None:
         self.ai_recommendations.append(recommendation)
@@ -1617,7 +1640,7 @@ def test_startup_auto_recovery_begins_only_after_home_assistant_started(monkeypa
         callbacks.append(action)
         return lambda: unsubscribed.append(True)
 
-    monkeypatch.setattr(coordinator_module, "async_at_started", at_started)
+    monkeypatch.setattr(startup_recovery_module, "async_at_started", at_started)
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = object()
@@ -1752,7 +1775,7 @@ def test_coordinator_init_sets_runtime_state_without_real_data_update_coordinato
     monkeypatch: object, caplog: object
 ) -> None:
     def fake_data_update_init(
-        self: object, hass: object, *, logger: object, name: str, update_interval: object
+        self: object, hass: object, *, logger: object, name: str, update_interval: object, config_entry: object
     ) -> None:
         self.hass = hass
         self.data = None
@@ -2575,7 +2598,7 @@ def test_current_planner_result_can_defer_execution_until_refresh_scopes_exit() 
     assert coordinator._deferred_plan_execution == (3, plan, context, options)
 
 
-def test_plan_execution_scheduler_handles_teardown_and_non_task_test_hass() -> None:
+def test_plan_execution_scheduler_handles_teardown_and_tracks_admitted_task() -> None:
     plan = _plan("scheduled")
     request = (1, plan, object(), {})
     coordinator = _coordinator_for_runtime_services()
@@ -2588,8 +2611,8 @@ def test_plan_execution_scheduler_handles_teardown_and_non_task_test_hass() -> N
 
     coordinator._tearing_down = False
     coordinator._schedule_plan_execution(request)
-    assert coordinator._plan_execution_task is None
-    assert coordinator._pending_plan_execution is None
+    assert isinstance(coordinator._plan_execution_task, CompletedTask)
+    assert coordinator._pending_plan_execution is request
 
 
 def test_plan_execution_drain_and_executor_drop_stale_generations() -> None:
@@ -2717,6 +2740,7 @@ def test_startup_recovery_validation_candidate_and_result_branches(monkeypatch: 
         "current_plan": {"safe": False},
     }
     monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda hass, item: blocked)
+    monkeypatch.setattr(startup_recovery_module, "build_preflight_report", lambda hass, item: blocked)
     assert asyncio.run(coordinator._async_run_startup_auto_recovery_validation()) == (
         False,
         "current_plan_unsafe",
@@ -2908,8 +2932,9 @@ def test_planner_options_include_runtime_ready_by_override() -> None:
     assert coordinator.entry.options[CONF_DEFAULT_READY_BY] == "07:00"
 
 
-def test_ai_advice_is_rate_limited_to_five_minutes() -> None:
+def test_ai_advice_is_rate_limited_to_five_minutes(monkeypatch: Any) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
+    monkeypatch.setattr(advice_runtime_module.dt_util, "utcnow", lambda: now)
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.store = FakeStore(
         {
@@ -3111,6 +3136,7 @@ def test_manual_ai_advice_button_rejects_missing_config_unsafe_plan_and_rate_lim
 
 def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
+    monkeypatch.setattr(advice_runtime_module.dt_util, "utcnow", lambda: now)
     calls = 0
 
     class FakeAIAdvisor:
@@ -3128,7 +3154,7 @@ def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
                 service_called="ai_task.generate_data",
             )
 
-    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.LocalAIAdvisor", FakeAIAdvisor)
+    monkeypatch.setattr("custom_components.ha_energy_planner.advice_runtime.LocalAIAdvisor", FakeAIAdvisor)
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
     coordinator.store = FakeStore(
@@ -3153,6 +3179,7 @@ def test_ai_advice_runs_after_rate_limit_window(monkeypatch: object) -> None:
 
 def test_manual_ai_advice_forces_refresh_for_unchanged_plan(monkeypatch: object) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
+    monkeypatch.setattr(advice_runtime_module.dt_util, "utcnow", lambda: now)
     plan = _plan("force-ai")
     fingerprint = _material_plan_fingerprint(plan)
     calls = 0
@@ -3171,7 +3198,7 @@ def test_manual_ai_advice_forces_refresh_for_unchanged_plan(monkeypatch: object)
                 "ai_task.generate_data",
             )
 
-    monkeypatch.setattr(coordinator_module, "LocalAIAdvisor", FakeAIAdvisor)
+    monkeypatch.setattr(advice_runtime_module, "LocalAIAdvisor", FakeAIAdvisor)
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
     coordinator.store = FakeStore(
@@ -3206,6 +3233,7 @@ def test_manual_ai_advice_forces_refresh_for_unchanged_plan(monkeypatch: object)
     assert forced_store is True
     assert calls == 1
 
+    now += timedelta(minutes=6)
     coordinator._ai_advice_fingerprint = fingerprint
     coordinator._ai_current_plan_fingerprint = fingerprint
     coordinator._ai_current_plan_safe = True
@@ -3216,7 +3244,7 @@ def test_manual_ai_advice_forces_refresh_for_unchanged_plan(monkeypatch: object)
     coordinator.async_update_listeners = lambda: None
     asyncio.run(
         coordinator._async_run_ai_advice(
-            SimpleNamespace(created_at=now),
+            SimpleNamespace(created_at=now + timedelta(minutes=6)),
             plan,
             {},
             {},
@@ -4690,11 +4718,11 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         ),
     )
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_update_ev_charge_calibration",
+        "custom_components.ha_energy_planner.training.async_update_ev_charge_calibration",
         fake_update_ev_charge_calibration,
     )
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.async_update_builtin_load_forecast",
+        "custom_components.ha_energy_planner.training.async_update_builtin_load_forecast",
         fake_update_load_forecast,
     )
     monkeypatch.setattr(
@@ -4734,7 +4762,17 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
     coordinator.ready_by = "07:00"
     coordinator._refresh_generation = 0
 
-    result = asyncio.run(coordinator._async_update_data_locked())
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator._tearing_down = False
+    coordinator._load_forecast_training_attempted = False
+    coordinator._schedule_debounced_refresh = lambda *args, **kwargs: None
+
+    async def refresh_and_train() -> EnergyPlan:
+        result = await coordinator._async_update_data_locked()
+        await coordinator.history_training.task
+        return result
+
+    result = asyncio.run(refresh_and_train())
 
     assert result.mode == PlannerMode.DRY_RUN
     assert coordinator.store.dry_run_comparisons[0]["plan_id"] == "plan-dry"
@@ -4749,7 +4787,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
     context.plan_id = "plan-active"
     coordinator._force_next_refresh = True
 
-    active_result = asyncio.run(coordinator._async_update_data_locked())
+    active_result = asyncio.run(refresh_and_train())
 
     assert active_result.status == "unsafe"
     assert active_result.mode == PlannerMode.ACTIVE_DEGRADED
@@ -5103,7 +5141,7 @@ def test_failed_ev_auto_start_compensation_retries_until_applied(
         store_data={"production": {"armed": True}},
     )
     coordinator.async_update_listeners = lambda: None
-    coordinator.hass.async_create_task = lambda task: queued_tasks.append(task)
+    coordinator._async_create_listener_task = lambda task: queued_tasks.append(task)
     coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
         side_effect=[
             SimpleNamespace(applied=False),
@@ -5163,7 +5201,7 @@ def test_queued_ev_auto_start_retry_is_invalidated_when_compensation_clears(
         store_data={"production": {"armed": True}},
     )
     coordinator.async_update_listeners = lambda: None
-    coordinator.hass.async_create_task = lambda task: queued_tasks.append(task)
+    coordinator._async_create_listener_task = lambda task: queued_tasks.append(task)
     coordinator.executor.async_compensate_ev_auto_start = AsyncMock(
         return_value=SimpleNamespace(applied=False)
     )
@@ -5682,6 +5720,11 @@ def test_combined_active_control_respects_selected_areas_and_arms(monkeypatch: o
         "build_preflight_report",
         lambda hass, coordinator_arg: {"safe_to_activate_now": True},
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"safe_to_activate_now": True},
+    )
 
     asyncio.run(coordinator.async_set_active_control(True))
 
@@ -5720,6 +5763,11 @@ def test_enabling_master_control_compensates_running_ev(
         "build_preflight_report",
         lambda hass, coordinator_arg: {"safe_to_activate_now": True},
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"safe_to_activate_now": True},
+    )
     compensate = AsyncMock(return_value=None)
     coordinator._async_compensate_ev_auto_start = compensate
 
@@ -5736,6 +5784,11 @@ def test_effective_control_requires_active_intent_and_current_preflight(monkeypa
     report = {"active_control_ready": True}
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: report,
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, coordinator_arg: report,
     )
@@ -5775,6 +5828,15 @@ def test_combined_active_control_stays_in_review_until_evidence_is_ready(monkeyp
             "checks": [],
         },
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "safe_to_activate_now": False,
+            "production": {"dry_run_ready_cycles": 1, "dry_run_evidence_complete": False},
+            "checks": [],
+        },
+    )
 
     with pytest.raises(HomeAssistantError) as error:
         asyncio.run(coordinator.async_set_active_control(True))
@@ -5800,6 +5862,16 @@ def test_combined_active_control_requires_a_selected_device(monkeypatch: object)
     coordinator._last_control_mode_state = (False, True)
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "safe_to_activate_now": True,
+            "production": {
+                "device_controls": {"ev": False, "climate": False, "enphase": False},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, coordinator_arg: {
             "safe_to_activate_now": True,
@@ -6067,6 +6139,7 @@ def test_device_control_enable_while_active_preflights_without_disarming(monkeyp
         }
 
     monkeypatch.setattr(coordinator_module, "build_preflight_report", preflight)
+    monkeypatch.setattr(startup_recovery_module, "build_preflight_report", preflight)
 
     asyncio.run(coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, True))
 
@@ -6106,6 +6179,18 @@ def test_enabling_ev_control_while_active_compensates_running_charger(
     )
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": True,
+            "control_areas": {
+                "ready": ["ev"],
+                "available": ["ev"],
+                "confidence_eligible": ["ev"],
+            },
+        },
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, coordinator_arg, *, options_override: {
             "safe_to_activate_now": True,
@@ -6178,6 +6263,14 @@ def test_device_control_enable_while_active_requires_selected_area_readiness(
             "control_areas": control_areas,
         },
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": True,
+            "control_areas": control_areas,
+        },
+    )
 
     with pytest.raises(HomeAssistantError) as error:
         asyncio.run(coordinator.async_set_device_control(CONF_CLIMATE_CONTROL_ENABLED, True))
@@ -6202,6 +6295,14 @@ def test_device_control_enable_while_active_rejects_failed_preflight(monkeypatch
     )
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg, *, options_override: {
+            "safe_to_activate_now": False,
+            "production": {"dry_run_ready_cycles": 2, "dry_run_evidence_complete": False},
+        },
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, coordinator_arg, *, options_override: {
             "safe_to_activate_now": False,
@@ -6300,9 +6401,9 @@ def test_combined_active_control_reports_blocking_or_current_plan_reason() -> No
     assert fallback == "a safety check failed"
 
 
-def test_production_pause_fallback_persistence_handles_lightweight_stores() -> None:
+def test_production_pause_persists_through_store_contract() -> None:
     coordinator = _coordinator_for_runtime_services()
-    coordinator.store = type("Store", (), {"data": {}})()
+    coordinator.store = FakeStore()
 
     asyncio.run(coordinator.async_arm_production_control("ack"))
     asyncio.run(coordinator.async_pause_control(10, "pause", "invalid"))
@@ -6770,6 +6871,7 @@ def test_degraded_ready_area_passes_complete_startup_grace(monkeypatch: object) 
         "current_plan": {"safe": True},
     }
     monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda hass, item: report)
+    monkeypatch.setattr(startup_recovery_module, "build_preflight_report", lambda hass, item: report)
 
     assert asyncio.run(coordinator._async_complete_startup_grace()) == (
         True,
@@ -6848,7 +6950,12 @@ def test_startup_safe_recovery_rearms_after_three_awaited_healthy_checks(
         "build_preflight_report",
         lambda hass, item: _startup_recovery_report(item),
     )
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(startup_recovery_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
 
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
@@ -6886,7 +6993,12 @@ def test_startup_safe_recovery_resets_consecutive_checks_on_unsafe(
         "build_preflight_report",
         lambda hass, item: _startup_recovery_report(item),
     )
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(startup_recovery_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
 
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
@@ -6918,7 +7030,12 @@ def test_reactivation_failure_stays_disarmed_then_retries_automatically(
         "build_preflight_report",
         lambda hass, item: _startup_recovery_report(item),
     )
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(startup_recovery_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
 
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
@@ -6984,6 +7101,11 @@ def test_operator_arm_cancels_disarmed_recovery_before_granting_authority(
         "build_preflight_report",
         lambda hass, coordinator_arg: {"safe_to_activate_now": True},
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {"safe_to_activate_now": True},
+    )
     compensate = AsyncMock(return_value=None)
     coordinator._async_compensate_ev_auto_start = compensate
 
@@ -7017,6 +7139,18 @@ def test_operator_arm_rejects_stale_evidence_without_cancelling_recovery(
     coordinator._startup_auto_recovery_task = None
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, coordinator_arg: {
+            "safe_to_activate_now": False,
+            "production": {
+                "dry_run_ready_cycles": 3,
+                "dry_run_evidence_complete": False,
+            },
+            "checks": [],
+        },
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, coordinator_arg: {
             "safe_to_activate_now": False,
@@ -7180,7 +7314,7 @@ def test_startup_recovery_start_callback_and_shutdown_edge_paths(monkeypatch: ob
         callbacks.append(action)
         return lambda: unsubscribed.append(True)
 
-    monkeypatch.setattr(coordinator_module, "async_at_started", at_started)
+    monkeypatch.setattr(startup_recovery_module, "async_at_started", at_started)
     coordinator = _startup_recovery_test_coordinator()
     coordinator._startup_auto_recovery_start_unsub = None
     coordinator.executor.notification_grace_until = None
@@ -7290,7 +7424,7 @@ def test_startup_grace_default_deadline_sleep_and_cancel(monkeypatch: object) ->
     )
     sleep = AsyncMock()
     monkeypatch.setattr(coordinator_module.asyncio, "sleep", sleep)
-    monkeypatch.setattr(coordinator_module, "STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(startup_recovery_module, "STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS", 1)
 
     assert asyncio.run(coordinator._async_complete_startup_grace())[0] is True
     sleep.assert_awaited_once()
@@ -7350,6 +7484,14 @@ def test_startup_reactivation_failure_branches(monkeypatch: object) -> None:
             "current_plan": {"safe": False},
         },
     )
+    monkeypatch.setattr(
+        startup_recovery_module,
+        "build_preflight_report",
+        lambda hass, item: {
+            **_startup_recovery_report(item),
+            "current_plan": {"safe": False},
+        },
+    )
     assert asyncio.run(blocked._async_reactivate_after_startup_recovery(3)) == (
         False,
         "current_plan_unsafe",
@@ -7361,6 +7503,11 @@ def test_startup_reactivation_failure_branches(monkeypatch: object) -> None:
     )
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: {**_startup_recovery_report(item), "safe_to_activate_now": False},
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, item: {**_startup_recovery_report(item), "safe_to_activate_now": False},
     )
@@ -7376,6 +7523,11 @@ def test_startup_reactivation_failure_branches(monkeypatch: object) -> None:
     refresh_failed.async_refresh = AsyncMock(side_effect=RuntimeError("refresh failed"))
     monkeypatch.setattr(
         coordinator_module,
+        "build_preflight_report",
+        lambda hass, item: _startup_recovery_report(item),
+    )
+    monkeypatch.setattr(
+        startup_recovery_module,
         "build_preflight_report",
         lambda hass, item: _startup_recovery_report(item),
     )
@@ -7398,6 +7550,7 @@ def test_startup_reactivation_failure_branches(monkeypatch: object) -> None:
         return report
 
     monkeypatch.setattr(coordinator_module, "build_preflight_report", active_unsafe_preflight)
+    monkeypatch.setattr(startup_recovery_module, "build_preflight_report", active_unsafe_preflight)
     assert asyncio.run(active_unsafe._async_reactivate_after_startup_recovery(3)) == (
         False,
         "active_replan_unsafe",
@@ -7521,6 +7674,7 @@ def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None
 def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution(monkeypatch: object) -> None:
     calls: list[str] = []
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = SimpleNamespace(data={})
     coordinator._debounce_cancel = lambda: calls.append("debounce")
     coordinator._boundary_cancel = lambda: calls.append("boundary")
     coordinator._ai_advice_task = SimpleNamespace(
@@ -7752,3 +7906,283 @@ def _plan(plan_id: str) -> EnergyPlan:
         actions=[],
         preview=[],
     )
+
+
+def test_shutdown_waits_for_started_listener_transaction_without_cancelling() -> None:
+    async def run() -> None:
+        coordinator = object.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = SimpleNamespace(async_create_task=asyncio.create_task)
+        coordinator._listener_tasks = set()
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        effects: list[str] = []
+        async def transaction() -> None:
+            effects.append("device_command")
+            entered.set()
+            await release.wait()
+            effects.append("durable_ownership")
+        coordinator._async_create_listener_task(transaction())
+        await entered.wait()
+        coordinator._tearing_down = True
+        waiter = asyncio.create_task(coordinator.async_wait_for_plan_execution())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        release.set()
+        await waiter
+        assert effects == ["device_command", "durable_ownership"]
+        assert not coordinator._listener_tasks
+    asyncio.run(run())
+
+
+def test_weather_deadline_respects_elapsed_cache_age_and_cancellation(monkeypatch: Any) -> None:
+    from custom_components.ha_energy_planner import weather as weather_module
+
+    async def run() -> None:
+        now = datetime(2026, 9, 5, tzinfo=UTC)
+        async def hung(*args: Any, **kwargs: Any) -> None:
+            await asyncio.Event().wait()
+        hass = SimpleNamespace(services=SimpleNamespace(async_call=hung))
+        cache = {
+            "entity_id": "weather.home", "fetched_at": now - timedelta(seconds=59),
+            "forecast": [{"datetime": now.isoformat(), "temperature": 20}],
+        }
+        owner = SimpleNamespace(hass=hass, _weather_forecast_cache=cache, weather_forecast_diagnostics={})
+        options = {"forecast_freshness_minutes": 1, "planning_interval_minutes": 5}
+        monkeypatch.setattr(weather_module, "WEATHER_FORECAST_TIMEOUT_SECONDS", 0.001)
+        times = iter((0.0, 2.0))
+        monkeypatch.setattr(weather_module, "monotonic", lambda: next(times))
+        forecast, details = await owner_fetch(owner, options, now)
+        assert forecast == {}
+        assert details["failure_reason"] == "TimeoutError"
+        assert details["cache_age_seconds"] == 61
+        times = iter((0.0, 0.1))
+        forecast, details = await owner_fetch(owner, options, now)
+        assert forecast["forecast"] == cache["forecast"]
+        assert details["fetch_status"] == "cached_after_error"
+        owner._weather_forecast_cache = {**cache, "entity_id": "weather.other"}
+        times = iter((0.0, 0.1))
+        assert (await owner_fetch(owner, options, now))[0] == {}
+        owner._weather_forecast_cache = cache
+        monkeypatch.setattr(weather_module, "monotonic", lambda: 0.0)
+        monkeypatch.setattr(weather_module, "WEATHER_FORECAST_TIMEOUT_SECONDS", 60)
+        task = asyncio.create_task(owner_fetch(owner, options, now))
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert owner._weather_forecast_cache is cache
+
+    async def owner_fetch(owner: Any, options: dict, now: datetime) -> Any:
+        return await EnergyPlannerCoordinator._async_weather_forecast(
+            owner, {"weather_entity": "weather.home"}, options, now=now, force=True
+        )
+    asyncio.run(run())
+    assert _bounded_reason(RuntimeError("api_key=private raw provider content")) == "RuntimeError"
+    assert _bounded_reason(ValueError("secret provider data")) == "ValueError"
+    assert (_bounded_reason(ValueError("weather_forecast_response_invalid"))
+            == "ValueError:weather_forecast_response_invalid")
+
+
+def test_cancelled_ai_attempt_is_persisted_and_rate_limited(monkeypatch: Any) -> None:
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    monkeypatch.setattr(advice_runtime_module.dt_util, "utcnow", lambda: now)
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.hass = FakeHass()
+    coordinator.store = FakeStore()
+    calls = 0
+    class CancelledAdvisor:
+        def __init__(self, *args: Any) -> None:
+            pass
+        async def async_get_advice(self, *args: Any) -> None:
+            nonlocal calls
+            calls += 1
+            raise asyncio.CancelledError
+    monkeypatch.setattr(advice_runtime_module, "LocalAIAdvisor", CancelledAdvisor)
+    async def run() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await coordinator._async_get_throttled_ai_advice(SimpleNamespace(created_at=now), _plan("ai"), {}, {})
+        result, save = await coordinator._async_get_throttled_ai_advice(
+            SimpleNamespace(created_at=now + timedelta(seconds=1)), _plan("ai"), {}, {}, force_current_plan=True,
+        )
+        assert result.rejected_reason == "ai_rate_limited"
+        assert not save and calls == 1
+        assert set(coordinator.store.data["ai_last_attempt"]) == {"created_at"}
+    asyncio.run(run())
+    assert advice_runtime_module._latest_ai_attempt_at({"ai_last_attempt": {"created_at": "bad"}}) is None
+
+
+def test_training_publication_rechecks_source_generation_and_lifetime() -> None:
+    from custom_components.ha_energy_planner.training import TrainingResult
+
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator._tearing_down = False
+    coordinator._load_forecast_training_attempted = False
+    scheduled: list[str] = []
+    coordinator._schedule_debounced_refresh = lambda trigger, **kwargs: scheduled.append(trigger)
+    request = coordinator._training_request()
+    result = TrainingResult({"status": "ready"}, {"status": "ready"}, True, True, "ev_ready", "load_ready")
+    async def run() -> None:
+        await coordinator._async_publish_training(0, request, result)
+        assert scheduled == ["history_training"]
+        await coordinator._async_publish_training(1, request, result)
+        assert len(scheduled) == 1
+        coordinator.entry.data[CONF_HOUSEHOLD_LOAD] = "sensor.changed"
+        await coordinator._async_publish_training(0, request, result)
+        assert len(scheduled) == 1
+        coordinator._tearing_down = True
+        await coordinator._async_publish_training(0, request, result)
+        assert len(scheduled) == 1
+        coordinator._tearing_down = False
+        unchanged = TrainingResult({}, {}, False, False, "recent", "load_forecast_household_load_unavailable")
+        await coordinator._async_publish_training(0, coordinator._training_request(), unchanged)
+        assert len(scheduled) == 1
+    asyncio.run(run())
+
+
+def test_planner_availability_logs_only_transitions_without_private_data(caplog: Any) -> None:
+    coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    caplog.set_level(logging.INFO)
+    coordinator._log_availability_transition([])
+    coordinator._log_availability_transition(["private_entity_unavailable_token=secret"])
+    coordinator._log_availability_transition(["private_entity_unavailable_token=secret"])
+    coordinator._log_availability_transition([])
+    coordinator._log_availability_transition([])
+    assert len(caplog.records) == 2
+    assert "required_evidence_missing" in caplog.records[0].message
+    assert "required_evidence_restored" in caplog.records[1].message
+    assert "secret" not in caplog.text
+
+
+def test_ai_provider_suppressing_cancellation_cannot_publish_after_shutdown() -> None:
+    async def run() -> None:
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._tearing_down = False
+        coordinator._ai_current_plan_safe = True
+        coordinator._ai_current_plan_fingerprint = "fingerprint"
+        coordinator._ai_advice_fingerprint = "fingerprint"
+        started, release = asyncio.Event(), asyncio.Event()
+        listeners: list[bool] = []
+        coordinator.async_update_listeners = lambda: listeners.append(True)
+        async def suppressing_provider(*args: Any, **kwargs: Any) -> Any:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+            return AIAdviceResult("accepted", {"summary": "late"}, None, "ai_task.generate_data"), True
+        coordinator._async_get_throttled_ai_advice = suppressing_provider
+        task = asyncio.create_task(coordinator._async_run_ai_advice(
+            SimpleNamespace(created_at=datetime.now(UTC)), _plan("ai"), {}, {}, "fingerprint", force_current_plan=True,
+        ))
+        coordinator._ai_advice_task = task
+        await started.wait()
+        coordinator._begin_shutdown()
+        await asyncio.sleep(0)
+        release.set()
+        await task
+        await coordinator._async_notify_ai_advice("late notification")
+        await coordinator.async_request_ai_advice()
+        assert coordinator.store.ai_recommendations == []
+        assert coordinator.hass.services.calls == []
+        assert listeners == []
+    asyncio.run(run())
+
+
+def test_ai_waiting_for_planner_lock_rechecks_teardown() -> None:
+    async def run() -> None:
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._tearing_down = False
+        coordinator._ai_current_plan_safe = True
+        coordinator._ai_current_plan_fingerprint = "fingerprint"
+        coordinator._ai_advice_fingerprint = "fingerprint"
+        coordinator._async_get_throttled_ai_advice = AsyncMock(return_value=(
+            AIAdviceResult("accepted", {}, None, "ai_task.generate_data"), True,
+        ))
+        await coordinator._planner_lock.acquire()
+        task = asyncio.create_task(coordinator._async_run_ai_advice(
+            SimpleNamespace(created_at=datetime.now(UTC)), _plan("ai"), {}, {}, "fingerprint",
+        ))
+        await asyncio.sleep(0)
+        coordinator._tearing_down = True
+        coordinator._planner_lock.release()
+        await task
+        assert coordinator.store.ai_recommendations == []
+    asyncio.run(run())
+
+
+def test_ai_admission_stops_before_or_during_durable_attempt_save() -> None:
+    async def run() -> None:
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._tearing_down = True
+        args = (SimpleNamespace(created_at=datetime.now(UTC)), _plan("ai"), {}, {})
+        result, save = await coordinator._async_get_throttled_ai_advice(*args)
+        assert result.rejected_reason == "ai_entry_unloading" and not save
+        assert "ai_last_attempt" not in coordinator.store.data
+        coordinator._tearing_down = False
+        async def save_while_unloading(attempt: dict) -> None:
+            coordinator.store.data["ai_last_attempt"] = attempt
+            coordinator._tearing_down = True
+        coordinator.store.async_save_ai_attempt = save_while_unloading
+        result, save = await coordinator._async_get_throttled_ai_advice(*args)
+        assert result.rejected_reason == "ai_entry_unloading" and not save
+        assert coordinator.hass.services.calls == []
+    asyncio.run(run())
+
+
+def test_ai_request_cannot_launch_after_notification_yields_to_teardown() -> None:
+    @dataclass
+    class RequestContext:
+        created_at: datetime
+    async def run() -> None:
+        coordinator = _coordinator_for_runtime_services(entry_data={CONF_AI_TASK_ENTITY: "ai_task.local"})
+        coordinator._tearing_down = False
+        coordinator.data = _plan("ai")
+        coordinator._last_decision_context = RequestContext(datetime.now(UTC))
+        async def notification(message: str) -> None:
+            coordinator._tearing_down = True
+        coordinator._async_notify_ai_advice = notification
+        await coordinator.async_request_ai_advice()
+        assert coordinator.hass.created_tasks == []
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["save", "provider_error"])
+def test_ai_resumed_during_teardown_does_not_update_entities_or_notify(phase: str, caplog: Any) -> None:
+    async def run() -> None:
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._tearing_down = False
+        coordinator._ai_current_plan_safe = True
+        coordinator._ai_current_plan_fingerprint = "fingerprint"
+        coordinator._ai_advice_fingerprint = "fingerprint"
+        updated: list[bool] = []
+        coordinator.async_update_listeners = lambda: updated.append(True)
+        async def provider(*args: Any, **kwargs: Any) -> Any:
+            if phase == "provider_error":
+                coordinator._tearing_down = True
+                raise RuntimeError("provider cancelled during unload")
+            return AIAdviceResult("accepted", {}, None, "ai_task.generate_data"), True
+        async def attach(*args: Any) -> None:
+            coordinator._tearing_down = True
+        coordinator._async_get_throttled_ai_advice = provider
+        coordinator.store.async_attach_ai_to_forecast_snapshot = attach
+        await coordinator._async_run_ai_advice(
+            SimpleNamespace(created_at=datetime.now(UTC)), _plan("ai"), {}, {}, "fingerprint", force_current_plan=True,
+        )
+        assert updated == []
+        assert coordinator.hass.services.calls == []
+        assert "provider cancelled during unload" not in caplog.text
+    asyncio.run(run())
+
+
+def test_failed_unload_restarts_training_with_same_shared_entry_lock() -> None:
+    from custom_components.ha_energy_planner import weather as weather_module
+    coordinator = _coordinator_for_runtime_services()
+    old = coordinator.history_training
+    old.stop()
+    coordinator._schedule_next_boundary_refresh = lambda: None
+    coordinator._start_load_forecast_source_listener = lambda data: None
+    coordinator.async_start_listeners()
+    assert coordinator.history_training is not old
+    assert coordinator.history_training._lock is old._lock
+    assert weather_module._parse_datetime_or_none(object()) is None

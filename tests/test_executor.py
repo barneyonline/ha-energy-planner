@@ -63,6 +63,7 @@ from custom_components.ha_energy_planner.executor import (
     _restore_notification_message,
     _service_target_for_action,
 )
+from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -77,6 +78,16 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+
+class _HVACAdapterDouble(DaikinHVACAdapter):
+    """Fake device behavior with the real adapter's persistence-hook contract."""
+
+    def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
+        return {}, {}
+
+    def main_takeover_snapshot(self) -> dict[str, Any]:
+        return {}
 
 
 def test_only_actionable_load_forecast_failures_request_notifications() -> None:
@@ -123,16 +134,17 @@ def test_failed_ev_safety_stop_retries_are_bounded_over_a_rolling_day() -> None:
         [{**failed_stop, "attempted_at": now.replace(tzinfo=None).isoformat()}] * 3,
         now,
     )
-    assert _ev_safety_stop_attempt_limit_reached(
-        [{**failed_stop, "attempted_at": "invalid"}] * 3,
-        now,
-    ) is False
+    assert (
+        _ev_safety_stop_attempt_limit_reached(
+            [{**failed_stop, "attempted_at": "invalid"}] * 3,
+            now,
+        )
+        is False
+    )
     assert _ev_safety_stop_attempt_limit_reached(["invalid", {"asset": "climate"}], now) is False
     assert _ev_safety_stop_failure_pause(None) is False
     assert _ev_safety_stop_failure_pause({"reason": "ev_stop_not_confirmed"}) is False
-    assert _ev_safety_stop_failure_pause(
-        {"reason": "ev_stop_not_confirmed", "safety_stop_failure": True}
-    ) is True
+    assert _ev_safety_stop_failure_pause({"reason": "ev_stop_not_confirmed", "safety_stop_failure": True}) is True
 
 
 def test_failed_ev_safety_stop_backoff_survives_unrelated_pause_overwrite() -> None:
@@ -169,15 +181,21 @@ def test_failed_ev_safety_stop_backoff_survives_unrelated_pause_overwrite() -> N
         slots=[],
     )
     assert executor._owned_ev_safety_stop(SimpleNamespace(created_at=now), context) is None
-    assert _ev_safety_stop_backoff_active(
-        [{**failed_stop, "attempted_at": now - timedelta(minutes=11)}],
-        now,
-    ) is False
+    assert (
+        _ev_safety_stop_backoff_active(
+            [{**failed_stop, "attempted_at": now - timedelta(minutes=11)}],
+            now,
+        )
+        is False
+    )
     assert _ev_safety_stop_backoff_active("invalid", now) is False
-    assert _ev_safety_stop_backoff_active(
-        ["invalid", {**failed_stop, "attempted_at": "invalid"}],
-        now,
-    ) is False
+    assert (
+        _ev_safety_stop_backoff_active(
+            ["invalid", {**failed_stop, "attempted_at": "invalid"}],
+            now,
+        )
+        is False
+    )
 
 
 def test_persisted_ev_safety_stop_block_survives_audit_rotation() -> None:
@@ -185,14 +203,20 @@ def test_persisted_ev_safety_stop_block_survives_audit_rotation() -> None:
     limits = {"ev_safety_stop_blocked_until": now + timedelta(hours=23)}
 
     assert _ev_safety_stop_block_active(limits, now) is True
-    assert _ev_safety_stop_block_active(
-        {"ev_safety_stop_blocked_until": now - timedelta(seconds=1)},
-        now,
-    ) is False
-    assert _ev_safety_stop_block_active(
-        {"ev_safety_stop_blocked_until": "invalid"},
-        now,
-    ) is False
+    assert (
+        _ev_safety_stop_block_active(
+            {"ev_safety_stop_blocked_until": now - timedelta(seconds=1)},
+            now,
+        )
+        is False
+    )
+    assert (
+        _ev_safety_stop_block_active(
+            {"ev_safety_stop_blocked_until": "invalid"},
+            now,
+        )
+        is False
+    )
     assert _ev_safety_stop_block_active(None, now) is False
 
 
@@ -645,9 +669,7 @@ def test_recovered_restore_cancels_deferred_startup_notification(monkeypatch: ob
     monkeypatch.setattr(
         notifications_module,
         "async_at_started",
-        lambda hass_arg, callback: (
-            start_callbacks.append(callback) or (lambda: listener_cancelled.append(True))
-        ),
+        lambda hass_arg, callback: (start_callbacks.append(callback) or (lambda: listener_cancelled.append(True))),
     )
 
     asyncio.run(
@@ -656,9 +678,7 @@ def test_recovered_restore_cancels_deferred_startup_notification(monkeypatch: ob
         )
     )
     asyncio.run(
-        executor._async_notify_restore(
-            SimpleNamespace(result=OutcomeResult.RESTORED, reason="enphase_profile_applied")
-        )
+        executor._async_notify_restore(SimpleNamespace(result=OutcomeResult.RESTORED, reason="enphase_profile_applied"))
     )
 
     assert listener_cancelled == [True]
@@ -757,9 +777,7 @@ def test_manual_restore_fails_for_unowned_enphase_fallback_failure(
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FailedEnphaseAdapter)
     hass = FakeHass()
 
-    outcome = asyncio.run(
-        Executor(FakeStore(), hass=hass).async_restore_safe_state("manual_service_call")
-    )
+    outcome = asyncio.run(Executor(FakeStore(), hass=hass).async_restore_safe_state("manual_service_call"))
 
     assert outcome.result == OutcomeResult.FAILED
     assert outcome.reason == "manual_service_call:enphase_profile_service_failed"
@@ -778,9 +796,7 @@ def test_unowned_enphase_fallback_exception_remains_a_restore_failure(
 
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", RaisingEnphaseAdapter)
 
-    outcome = asyncio.run(
-        Executor(FakeStore(), hass=FakeHass()).async_restore_safe_state("manual_service_call")
-    )
+    outcome = asyncio.run(Executor(FakeStore(), hass=FakeHass()).async_restore_safe_state("manual_service_call"))
 
     assert outcome.result == OutcomeResult.FAILED
     assert outcome.reason == "manual_service_call:enphase_restore_exception"
@@ -1260,9 +1276,7 @@ def test_startup_recovery_notification_is_deduplicated_and_dismissed() -> None:
 
     create_calls = [call for call in hass.services.calls if call[1] == "create"]
     assert len(create_calls) == 1
-    assert create_calls[0][2]["notification_id"] == (
-        "ha_energy_planner_startup_recovery_entry-1"
-    )
+    assert create_calls[0][2]["notification_id"] == ("ha_energy_planner_startup_recovery_entry-1")
     assert "retry automatically every 30 seconds" in create_calls[0][2]["message"]
     assert hass.services.calls[-1] == (
         "persistent_notification",
@@ -1798,7 +1812,7 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 rollback_succeeded=False,
             )
 
-    class FailedHVACAdapter:
+    class FailedHVACAdapter(_HVACAdapterDouble):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
@@ -1809,6 +1823,10 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 pre_state={},
                 post_state={},
                 saved_automation_states={},
+                saved_zone_states={},
+                saved_main_state={},
+                rollback_succeeded=None,
+                command_sent=False,
             )
 
     class FailedEnphaseAdapter:
@@ -1823,6 +1841,8 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 post_state={},
                 saved_profile=None,
                 changed_profile_at=False,
+                command_sent=True,
+                rollback_succeeded=None,
             )
 
     monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedEVAdapter)
@@ -2384,7 +2404,7 @@ def test_executor_reports_dry_run_as_skipped_before_plan_violations() -> None:
 
 
 def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             self.persist_main_state: Any = None
             self.manual_override_check: Any = None
@@ -2443,36 +2463,26 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
             assert callable(self.persist_zone_supersession)
             assert callable(self.persist_supersessions)
             self.set_turn_on_feedback(True)
-            assert executor.pending_hvac_desired_state[
-                "turn_on_feedback_expected"
-            ] is True
+            assert executor.pending_hvac_desired_state["turn_on_feedback_expected"] is True
             self.set_turn_on_feedback(False)
             self.set_coupled_zone_feedback(
                 "switch.zone",
                 "on",
                 "planner-context",
             )
-            assert executor.pending_hvac_desired_state[
-                "coupled_zone_feedback_expected"
-            ] == {
+            assert executor.pending_hvac_desired_state["coupled_zone_feedback_expected"] == {
                 "actuator_entity_id": "switch.zone",
                 "context_id": "planner-context",
                 "state": "on",
             }
             self.set_coupled_zone_feedback(None, None, None)
-            self.set_pending_main_restore(
-                {"hvac_mode": "off", "target_temperature": 20}
-            )
+            self.set_pending_main_restore({"hvac_mode": "off", "target_temperature": 20})
             assert executor.pending_hvac_desired_state["restore_main"] == {
                 "hvac_mode": "off",
                 "target_temperature": 20,
             }
-            self.set_pending_zone_restore(
-                {"switch.zone": "off"}
-            )
-            assert executor.pending_hvac_desired_state["restore_zones"] == {
-                "switch.zone": "off"
-            }
+            self.set_pending_zone_restore({"switch.zone": "off"})
+            assert executor.pending_hvac_desired_state["restore_zones"] == {"switch.zone": "off"}
             assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
             assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
             assert store.data["ownership"]["hvac_control"]["main_state"] == {
@@ -2505,6 +2515,9 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
                     "post_state": {"climate.daikin": "heat"},
                     "saved_automation_states": {"automation.hvac": "on"},
                     "saved_zone_states": {"switch.zone": "off"},
+                    "saved_main_state": {},
+                    "rollback_succeeded": None,
+                    "command_sent": False,
                 },
             )()
 
@@ -2585,7 +2598,7 @@ def test_executor_rechecks_climate_rollback_capability_before_mutation(
     monkeypatch: object,
     synchronize_zone_temperatures: bool,
 ) -> None:
-    class UnexpectedAdapter:
+    class UnexpectedAdapter(_HVACAdapterDouble):
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             raise AssertionError("adapter must not be constructed")
 
@@ -2692,11 +2705,7 @@ def test_executor_flushes_manual_zone_supersession_without_losing_other_evidence
     }
     executor = Executor(store)
 
-    asyncio.run(
-        executor._async_persist_provisional_hvac_zone_supersession(
-            {"climate.manual_zone"}
-        )
-    )
+    asyncio.run(executor._async_persist_provisional_hvac_zone_supersession({"climate.manual_zone"}))
 
     assert store.data["ownership"] == {
         "climate_automations": {"automation.hvac": "on"},
@@ -2711,7 +2720,7 @@ def test_executor_flushes_manual_zone_supersession_without_losing_other_evidence
 def test_executor_marks_away_off_without_taking_zone_ownership(
     monkeypatch: object,
 ) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -2729,9 +2738,7 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
                 # The away-off phase already created an empty zone ownership
                 # map. A later phase must merge this newly acquired baseline
                 # before the adapter can mutate the zone.
-                assert store.data["ownership"]["hvac_control"][
-                    "zone_states"
-                ] == {"switch.zone": "off"}
+                assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
                 saved_zone_states = {"switch.zone": "off"}
                 post_state = {
                     "climate.daikin": "heat",
@@ -2744,6 +2751,9 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
                 post_state=post_state,
                 saved_automation_states={"automation.hvac": "on"},
                 saved_zone_states=saved_zone_states,
+                saved_main_state={},
+                rollback_succeeded=None,
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -2820,7 +2830,7 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
     command_sent: bool,
     expected_result: OutcomeResult,
 ) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -2836,6 +2846,8 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
                 saved_automation_states={"automation.hvac": "off"},
                 saved_zone_states={"switch.zone": "on"},
                 command_sent=command_sent,
+                saved_main_state={},
+                rollback_succeeded=None,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -2941,7 +2953,7 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
 def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
     monkeypatch: object,
 ) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -2958,6 +2970,8 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
                 saved_automation_states={},
                 saved_zone_states={},
                 rollback_succeeded=True,
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3008,7 +3022,7 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
 def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
     monkeypatch: object,
 ) -> None:
-    class RaisingDaikinAdapter:
+    class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3023,9 +3037,7 @@ def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
 
         async def async_execute(self, action: PlanAction) -> object:
             assert executor.mark_pending_hvac_manual_override() is True
-            assert executor.mark_pending_hvac_zone_manual_override(
-                "climate.bedrooms"
-            ) is True
+            assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             raise RuntimeError("unexpected adapter failure")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
@@ -3086,7 +3098,7 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
     monkeypatch: object,
     rollback_succeeded: bool,
 ) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             self.persist_zone_supersession: Any = None
 
@@ -3101,9 +3113,7 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
 
         async def async_execute(self, action: PlanAction) -> object:
             assert executor.mark_pending_hvac_manual_override() is True
-            assert executor.mark_pending_hvac_zone_manual_override(
-                "climate.manual_zone"
-            ) is True
+            assert executor.mark_pending_hvac_zone_manual_override("climate.manual_zone") is True
             await self.persist_zone_supersession({"climate.manual_zone"})
             return SimpleNamespace(
                 applied=False,
@@ -3115,6 +3125,8 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
                     "climate.manual_zone": {"target_temperature": 20},
                 },
                 rollback_succeeded=rollback_succeeded,
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3173,21 +3185,17 @@ def test_executor_does_not_reintroduce_inherited_manual_state_after_rollback(
 
     asyncio.run(executor.async_evaluate(plan))
 
-    assert store.data["ownership"]["hvac_control"]["zone_states"] == {
-        "switch.other_zone": "off"
-    }
+    assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.other_zone": "off"}
     assert "main_state" not in store.data["ownership"]["hvac_control"]
     if not rollback_succeeded:
-        assert store.data["ownership"]["hvac_control"][
-            "required_evidence_lost"
-        ] == "hvac_acquisition_rollback_failed"
+        assert store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "hvac_acquisition_rollback_failed"
     assert store.data["outcomes"][0].reason == "manual_hvac_override_detected"
 
 
 def test_hvac_specific_release_restores_zones_without_touching_other_assets(monkeypatch: object) -> None:
     restored: list[tuple[dict[str, str], dict[str, str]]] = []
 
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3205,6 +3213,8 @@ def test_hvac_specific_release_restores_zones_without_touching_other_assets(monk
                 post_state={"switch.zone": "off"},
                 saved_automation_states={},
                 saved_zone_states={},
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3231,7 +3241,7 @@ def test_hvac_specific_release_restores_zones_without_touching_other_assets(monk
 def test_hvac_specific_release_restores_persisted_main_state(monkeypatch: object) -> None:
     restored: list[tuple[dict[str, str], dict[str, Any], dict[str, Any]]] = []
 
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3251,6 +3261,7 @@ def test_hvac_specific_release_restores_persisted_main_state(monkeypatch: object
                 saved_automation_states={},
                 saved_zone_states={},
                 saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3264,9 +3275,7 @@ def test_hvac_specific_release_restores_persisted_main_state(monkeypatch: object
         },
     }
 
-    outcome = asyncio.run(
-        Executor(store, hass=FakeHass()).async_release_hvac_control("retry")
-    )
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_release_hvac_control("retry"))
 
     assert outcome.result == OutcomeResult.RESTORED
     assert restored == [
@@ -3280,7 +3289,7 @@ def test_hvac_specific_release_restores_persisted_main_state(monkeypatch: object
 
 
 def test_hvac_specific_release_retains_unresolved_main_state(monkeypatch: object) -> None:
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3299,6 +3308,7 @@ def test_hvac_specific_release_retains_unresolved_main_state(monkeypatch: object
                 saved_automation_states={},
                 saved_zone_states={},
                 saved_main_state=main_state,
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3311,9 +3321,7 @@ def test_hvac_specific_release_retains_unresolved_main_state(monkeypatch: object
         },
     }
 
-    outcome = asyncio.run(
-        Executor(store, hass=FakeHass()).async_release_hvac_control("retry")
-    )
+    outcome = asyncio.run(Executor(store, hass=FakeHass()).async_release_hvac_control("retry"))
 
     assert outcome.result == OutcomeResult.FAILED
     assert store.data["ownership"]["hvac_control"] == {
@@ -3326,7 +3334,7 @@ def test_hvac_specific_release_retains_unresolved_main_state(monkeypatch: object
 def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) -> None:
     restored: list[dict[str, Any]] = []
 
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3335,9 +3343,7 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
             automations: dict[str, str],
             zones: dict[str, Any],
         ) -> object:
-            assert "climate.bedrooms" not in store.data["ownership"][
-                "hvac_control"
-            ]["zone_states"]
+            assert "climate.bedrooms" not in store.data["ownership"]["hvac_control"]["zone_states"]
             assert store.flush_count == 1
             restored.append(dict(zones))
             return SimpleNamespace(
@@ -3348,6 +3354,8 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
                 post_state={},
                 saved_automation_states={},
                 saved_zone_states={},
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3374,14 +3382,12 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
     assert restored == [{"switch.living": "off"}]
     assert store.data["ownership"] == {}
 
-    class FailingDaikinAdapter:
+    class FailingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, *args: object) -> object:
-            assert "climate.bedrooms" not in failed_store.data["ownership"][
-                "hvac_control"
-            ]["zone_states"]
+            assert "climate.bedrooms" not in failed_store.data["ownership"]["hvac_control"]["zone_states"]
             assert failed_store.flush_count == 1
             raise RuntimeError("restore failed")
 
@@ -3409,7 +3415,7 @@ def test_manual_hvac_release_preserves_changed_zone_target(monkeypatch: object) 
 def test_manual_hvac_release_preserves_changed_main_state(monkeypatch: object) -> None:
     restored: list[tuple[dict[str, str], dict[str, Any]]] = []
 
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3429,6 +3435,8 @@ def test_manual_hvac_release_preserves_changed_main_state(monkeypatch: object) -
                 post_state={},
                 saved_automation_states={},
                 saved_zone_states={},
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
@@ -3450,24 +3458,20 @@ def test_manual_hvac_release_preserves_changed_main_state(monkeypatch: object) -
     )
 
     assert outcome.result == OutcomeResult.RESTORED
-    assert restored == [
-        ({"automation.hvac": "on"}, {"switch.zone": "off"})
-    ]
+    assert restored == [({"automation.hvac": "on"}, {"switch.zone": "off"})]
     assert store.data["ownership"] == {}
 
 
 def test_hvac_release_exception_does_not_reintroduce_inflight_manual_changes(
     monkeypatch: object,
 ) -> None:
-    class RaisingDaikinAdapter:
+    class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, *args: object) -> object:
             assert executor.mark_pending_hvac_manual_override() is True
-            assert executor.mark_pending_hvac_zone_manual_override(
-                "climate.bedrooms"
-            ) is True
+            assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             raise RuntimeError("unexpected adapter failure")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
@@ -3641,7 +3645,7 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
         is None
     )
 
-    class RaisingAdapter:
+    class RaisingAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3650,9 +3654,7 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingAdapter)
     unowned_store = FakeStore()
-    unowned = asyncio.run(
-        Executor(unowned_store, hass=FakeHass()).async_release_hvac_control("no_ownership")
-    )
+    unowned = asyncio.run(Executor(unowned_store, hass=FakeHass()).async_release_hvac_control("no_ownership"))
     assert unowned.result == OutcomeResult.SKIPPED
     assert unowned.reason == "already_released_hvac_control"
 
@@ -3669,7 +3671,7 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
     assert failed_store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
     assert failed_store.data["ownership"]["hvac_control"]["required_evidence_lost"] == "hvac_release_failed"
 
-    class PartialAdapter:
+    class PartialAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3682,6 +3684,8 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
                 post_state={},
                 saved_automation_states={"automation.hvac": "on"},
                 saved_zone_states={"switch.zone": "off"},
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", PartialAdapter)
@@ -3716,6 +3720,8 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
                 post_state={},
                 saved_automation_states={},
                 saved_zone_states={},
+                saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", SuccessfulAdapter)
@@ -3741,11 +3747,9 @@ def test_hvac_release_handles_no_hass_exception_partial_retry_and_hold(monkeypat
 
 
 def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: object) -> None:
-    restored_states: list[
-        tuple[dict[str, str], dict[str, str], dict[str, Any]]
-    ] = []
+    restored_states: list[tuple[dict[str, str], dict[str, str], dict[str, Any]]] = []
 
-    class TransactionalDaikinAdapter:
+    class TransactionalDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3774,6 +3778,7 @@ def test_executor_retains_failed_hvac_rollback_for_later_restore(monkeypatch: ob
                 saved_zone_states={"switch.zone": "off"},
                 saved_main_state={"hvac_mode": "heat", "target_temperature": 20},
                 rollback_succeeded=False,
+                command_sent=False,
             )
 
         async def async_restore(
@@ -3854,7 +3859,7 @@ def test_executor_recovers_unresolved_main_before_new_acquisition(
 ) -> None:
     restored_main_states: list[dict[str, Any]] = []
 
-    class RecoveryOnlyDaikinAdapter:
+    class RecoveryOnlyDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3877,6 +3882,7 @@ def test_executor_recovers_unresolved_main_before_new_acquisition(
                 saved_automation_states=states,
                 saved_zone_states=zones,
                 saved_main_state=main_state,
+                command_sent=False,
             )
 
     monkeypatch.setattr(
@@ -3949,7 +3955,7 @@ def test_executor_recovers_unresolved_main_before_new_acquisition(
 def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
     monkeypatch: object,
 ) -> None:
-    class PartialDaikinAdapter:
+    class PartialDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -3977,6 +3983,7 @@ def test_executor_safe_restore_retains_only_unresolved_hvac_actuators(
                 saved_automation_states={"automation.failed": "on"},
                 saved_zone_states={"switch.failed": "off"},
                 saved_main_state={"hvac_mode": "heat", "target_temperature": 20},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", PartialDaikinAdapter)
@@ -4031,6 +4038,8 @@ def test_executor_applies_enphase_profile_and_saves_original(monkeypatch: object
                     "post_state": {"select.enphase": "Self-Consumption"},
                     "saved_profile": "AI Optimisation",
                     "changed_profile_at": True,
+                    "command_sent": True,
+                    "rollback_succeeded": None,
                 },
             )()
 
@@ -4173,7 +4182,7 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
                 {"applied": False, "reason": "ev_restore_failed", "pre_state": {"ev": "on"}, "post_state": {}},
             )()
 
-    class FakeDaikinAdapter:
+    class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -4254,7 +4263,7 @@ def test_executor_restore_device_control_restores_only_selected_asset(monkeypatc
                 post_state={"switch.ev": "off"},
             )
 
-    class UnexpectedAdapter:
+    class UnexpectedAdapter(_HVACAdapterDouble):
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise AssertionError("An unrelated device adapter was constructed")
 
@@ -4473,7 +4482,7 @@ def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch
         async def async_restore(self, state: dict[str, Any]) -> object:
             raise RuntimeError("service failure")
 
-    class SuccessfulDaikinAdapter:
+    class SuccessfulDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -4510,7 +4519,7 @@ def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypa
         async def async_restore(self, state: dict[str, Any]) -> object:
             return SimpleNamespace(applied=True, reason="ev_restored", pre_state={}, post_state={})
 
-    class FailedDaikinAdapter:
+    class FailedDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -4549,7 +4558,7 @@ def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypa
 
 
 def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: object) -> None:
-    class RaisingDaikinAdapter:
+    class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
@@ -4576,15 +4585,13 @@ def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: obje
 def test_safe_state_exception_does_not_reintroduce_inflight_manual_hvac_changes(
     monkeypatch: object,
 ) -> None:
-    class RaisingDaikinAdapter:
+    class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, *args: object) -> object:
             assert executor.mark_pending_hvac_manual_override() is True
-            assert executor.mark_pending_hvac_zone_manual_override(
-                "climate.bedrooms"
-            ) is True
+            assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             raise RuntimeError("unexpected adapter failure")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
@@ -4620,14 +4627,12 @@ def test_safe_state_exception_does_not_reintroduce_inflight_manual_hvac_changes(
 def test_safe_state_failed_result_filters_inflight_manual_zone(
     monkeypatch: object,
 ) -> None:
-    class FailedDaikinAdapter:
+    class FailedDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, *args: object) -> object:
-            assert executor.mark_pending_hvac_zone_manual_override(
-                "climate.bedrooms"
-            ) is True
+            assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             return SimpleNamespace(
                 applied=False,
                 rollback_succeeded=False,
@@ -4640,6 +4645,7 @@ def test_safe_state_failed_result_filters_inflight_manual_zone(
                     "switch.living": "off",
                 },
                 saved_main_state={},
+                command_sent=False,
             )
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedDaikinAdapter)
@@ -5031,9 +5037,7 @@ def test_ev_auto_start_compensation_uses_audited_stop_path() -> None:
 
     assert result.applied is True
     assert hass.states.values["input_boolean.ev_charger"] == "off"
-    assert hass.services.calls == [
-        ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_charger"})
-    ]
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_charger"})]
     outcome = store.data["outcomes"][-1]
     assert outcome.action_id == "ev_auto_start_compensation"
     assert outcome.kind == "ev_stop"
@@ -7294,3 +7298,72 @@ def test_ev_grid_reservation_defensive_branches() -> None:
     asyncio.run(executor._async_clear_provisional_ev_ownership())
     assert executor.ev_start_feedback_expected_until is None
     assert executor.store.data["ownership"] == {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
+
+
+def test_enphase_interrupted_command_is_restored_by_targeted_disable() -> None:
+    async def run() -> None:
+        now = datetime.now(UTC)
+        hass = FakeHass({"select.enphase": "Custom Baseline"})
+        store = FakeStore()
+        executor = Executor(
+            store,
+            hass=hass,
+            entry_data={CONF_ENPHASE_PROFILE: "select.enphase", CONF_ENPHASE_AI_PROFILE: "AI Optimisation"},
+            options={CONF_ENPHASE_CONTROL_ENABLED: True},
+        )
+        _arm_store(store, executor)
+        action = PlanAction(
+            "profile",
+            "plan",
+            now - timedelta(minutes=1),
+            now + timedelta(minutes=1),
+            ActionAsset.ENPHASE,
+            ActionKind.SET_PROFILE,
+            {"profile": "Self Consumption"},
+            [],
+            [],
+            1.0,
+            1.0,
+        )
+        plan = EnergyPlan(
+            "plan",
+            now,
+            24,
+            5,
+            "current",
+            InputHealth.HEALTHY,
+            PlannerMode.ACTIVE_HEALTHY,
+            "test",
+            1.0,
+            None,
+            [action],
+            [],
+        )
+        original = hass.services.async_call
+
+        async def accepted_then_cancelled(
+            domain: str, service: str, data: dict[str, Any], blocking: bool = False
+        ) -> None:
+            assert store.flush_count == 1
+            await original(domain, service, data, blocking)
+            raise asyncio.CancelledError
+
+        hass.services.async_call = accepted_then_cancelled
+        with pytest.raises(asyncio.CancelledError):
+            await executor.async_evaluate(plan)
+        assert hass.states.values["select.enphase"] == "Self Consumption"
+        assert store.data["ownership"]["enphase_profile"] == "Custom Baseline"
+        hass.services.async_call = original
+        restored = await executor.async_restore_device_control("enphase", "enphase_control_disabled")
+        assert restored.result == OutcomeResult.RESTORED
+        assert hass.states.values["select.enphase"] == "Custom Baseline"
+        assert "enphase_profile" not in store.data["ownership"]
+
+        # An observed no-op does not acquire ownership or consume command limits.
+        action.desired_state["profile"] = "Custom Baseline"
+        await executor.async_evaluate(plan)
+        assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+        assert "enphase_profile" not in store.data["ownership"]
+        assert store.data.get("command_rate_limits", {}) == {}
+
+    asyncio.run(run())

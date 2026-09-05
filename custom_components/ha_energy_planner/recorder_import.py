@@ -15,7 +15,7 @@ from .const import (
     CONF_HOUSEHOLD_LOAD,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import build_ev_charge_calibration, ev_charge_calibration_matches
+from .ev import EV_CHARGE_CALIBRATION_MODEL_VERSION, build_ev_charge_calibration, ev_charge_calibration_matches
 from .load_forecast import (
     FORECAST_CONTRACT_VERSION,
     HISTORY_LOOKBACK,
@@ -26,6 +26,7 @@ from .load_forecast import (
 )
 
 RECORDER_IMPORT_INTERVAL = timedelta(hours=24)
+EV_IMPORT_FAILURE_RETRY_INTERVAL = timedelta(minutes=15)
 RECORDER_IMPORT_LOOKBACK = timedelta(days=30)
 MAX_EV_HISTORY_STATES_PER_ENTITY_CHUNK = 50_000
 MAX_COMPACT_EV_HISTORY_STATES = 20_000
@@ -211,26 +212,32 @@ async def async_update_ev_charge_calibration(
         return model, False, "ev_charge_calibration_recent"
     try:
         executor = _recorder_executor(hass)
-        charging_states, soc_states = await executor(
-            _load_bounded_ev_history,
+        updated = await executor(
+            _build_ev_charge_calibration_from_history,
             hass,
             charging_entity,
             soc_entity,
-            now - RECORDER_IMPORT_LOOKBACK,
+            charge_rate_kw,
             now,
         )
-        updated = build_ev_charge_calibration(
-            charging_states,
-            soc_states,
-            charge_rate_kw=charge_rate_kw,
-            trained_at=now,
-            charging_entity_id=charging_entity,
-            soc_entity_id=soc_entity,
+    except Exception as err:  # noqa: BLE001 - retain safe coefficients and back off failed imports.
+        reason = (
+            "ev_charge_calibration_history_limit_exceeded"
+            if isinstance(err, EVHistoryLimitError)
+            else f"ev_charge_calibration_unavailable:{err.__class__.__name__}"
         )
-    except Exception as err:  # noqa: BLE001 - retain the last safe calibration.
-        if isinstance(err, EVHistoryLimitError):
-            return model, False, "ev_charge_calibration_history_limit_exceeded"
-        return model, False, f"ev_charge_calibration_unavailable:{err.__class__.__name__}"
+        attempted = {
+            **model,
+            "failed_attempt": {
+                "model_version": EV_CHARGE_CALIBRATION_MODEL_VERSION,
+                "charging_entity_id": charging_entity,
+                "soc_entity_id": soc_entity,
+                "charge_rate_kw": round(float(charge_rate_kw), 4),
+                "attempted_at": now.isoformat(),
+                "reason": reason,
+            },
+        }
+        return attempted, attempted != model, reason
     if updated.get("status") != "ready" and _ev_charge_calibration_matches(
         model,
         charging_entity=charging_entity,
@@ -243,8 +250,30 @@ async def async_update_ev_charge_calibration(
             "last_attempt_status": updated.get("status"),
             "last_attempt_sample_count": updated.get("sample_count", 0),
         }
+        retained.pop("failed_attempt", None)
         return retained, retained != model, "ev_charge_calibration_insufficient_history_retained"
     return updated, updated != model, f"ev_charge_calibration_{updated.get('status', 'failed')}"
+
+
+def _build_ev_charge_calibration_from_history(
+    hass: HomeAssistant,
+    charging_entity: str,
+    soc_entity: str,
+    charge_rate_kw: float,
+    now: datetime,
+) -> dict[str, Any]:
+    """Read and calibrate within Recorder's executor, never the HA event loop."""
+    charging_states, soc_states = _load_bounded_ev_history(
+        hass, charging_entity, soc_entity, now - RECORDER_IMPORT_LOOKBACK, now
+    )
+    return build_ev_charge_calibration(
+        charging_states,
+        soc_states,
+        charge_rate_kw=charge_rate_kw,
+        trained_at=now,
+        charging_entity_id=charging_entity,
+        soc_entity_id=soc_entity,
+    )
 
 
 def _load_recorder_states(
@@ -538,6 +567,23 @@ def _ev_charge_calibration_due(
     soc_entity: str,
     charge_rate_kw: float,
 ) -> bool:
+    failed_attempt = model.get("failed_attempt")
+    if isinstance(failed_attempt, dict) and _ev_charge_calibration_matches(
+        failed_attempt,
+        charging_entity=charging_entity,
+        soc_entity=soc_entity,
+        charge_rate_kw=charge_rate_kw,
+    ):
+        attempted_at = failed_attempt.get("attempted_at")
+        try:
+            parsed_attempt = datetime.fromisoformat(str(attempted_at).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        parsed_attempt = _align_timestamp(parsed_attempt, now)
+        return (
+            parsed_attempt > now + timedelta(minutes=5)
+            or now >= parsed_attempt + EV_IMPORT_FAILURE_RETRY_INTERVAL
+        )
     if not _ev_charge_calibration_matches(
         model,
         charging_entity=charging_entity,
@@ -552,7 +598,8 @@ def _ev_charge_calibration_due(
         parsed = datetime.fromisoformat(trained_at.replace("Z", "+00:00"))
     except ValueError:
         return True
-    return now >= _align_timestamp(parsed, now) + RECORDER_IMPORT_INTERVAL
+    aligned = _align_timestamp(parsed, now)
+    return aligned > now + timedelta(minutes=5) or now >= aligned + RECORDER_IMPORT_INTERVAL
 
 
 def _ev_charge_calibration_matches(

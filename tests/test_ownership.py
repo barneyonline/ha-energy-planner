@@ -34,3 +34,18 @@ def test_enphase_profile_guard_reports_remaining_hold() -> None:
     assert guard.can_change(now) is False
     assert guard.remaining_hold(now) == timedelta(minutes=20)
     assert guard.can_change(now + timedelta(minutes=20)) is True
+
+
+def test_enphase_ownership_validates_legacy_records_and_preserves_other_fields() -> None:
+    from custom_components.ha_energy_planner.ownership import EnphaseOwnership
+
+    assert EnphaseOwnership.from_mapping(None) == EnphaseOwnership()
+    assert (
+        EnphaseOwnership.from_mapping({"enphase_profile": 123, "enphase_profile_changed_at": []}) == EnphaseOwnership()
+    )
+    previous = {"enphase_profile": "AI", "enphase_profile_changed_at": "2026-01-01T00:00:00Z", "hvac": "keep"}
+    saved = EnphaseOwnership.from_mapping(previous)
+    saved.apply_to(previous)
+    assert previous["enphase_profile"] == "AI"
+    EnphaseOwnership().apply_to(previous)
+    assert previous == {"hvac": "keep"}

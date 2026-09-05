@@ -12,3 +12,5 @@ junit.xml
 docker/
 .ha-smoke.*/
 .ha-check-config.*/
+
+coverage.json

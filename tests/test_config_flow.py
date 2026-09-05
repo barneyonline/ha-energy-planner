@@ -121,8 +121,7 @@ def test_newer_selector_filter_type_is_not_a_runtime_dependency() -> None:
     runtime_selector_imports = {
         alias.name
         for node in module.body
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "homeassistant.helpers.selector"
+        if isinstance(node, ast.ImportFrom) and node.module == "homeassistant.helpers.selector"
         for alias in node.names
     }
 
@@ -295,15 +294,11 @@ def test_validate_config_accepts_available_entities_and_services() -> None:
 def test_validate_config_requires_complete_scheduler_guard_pair() -> None:
     missing_timer = _validate_config(
         _valid_hass(),
-        _valid_input(
-            {CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change"}
-        ),
+        _valid_input({CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change"}),
     )
     missing_boolean = _validate_config(
         _valid_hass(),
-        _valid_input(
-            {CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard"}
-        ),
+        _valid_input({CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard"}),
     )
     complete = _validate_config(
         _valid_hass(),
@@ -315,12 +310,8 @@ def test_validate_config_requires_complete_scheduler_guard_pair() -> None:
         ),
     )
 
-    assert missing_timer[CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == (
-        "climate_scheduler_guard_pair_required"
-    )
-    assert missing_boolean[CONF_CLIMATE_CHANGE_FROM_SCHEDULER] == (
-        "climate_scheduler_guard_pair_required"
-    )
+    assert missing_timer[CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == ("climate_scheduler_guard_pair_required")
+    assert missing_boolean[CONF_CLIMATE_CHANGE_FROM_SCHEDULER] == ("climate_scheduler_guard_pair_required")
     assert complete == {}
 
 
@@ -354,14 +345,10 @@ def test_subentry_validation_rejects_household_actuators_owned_by_another_entry(
                     CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.hvac_override",
                 }
             ),
-            "enphase": SimpleNamespace(
-                data={CONF_ENPHASE_PROFILE: "select.enphase_profile"}
-            ),
+            "enphase": SimpleNamespace(data={CONF_ENPHASE_PROFILE: "select.enphase_profile"}),
         },
     )
-    hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [current_entry, other_entry]
-    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry, other_entry])
 
     errors = _validate_subentry_config(
         hass,
@@ -389,9 +376,7 @@ def test_subentry_validation_allows_current_entry_to_keep_its_actuators() -> Non
     current_entry = SimpleNamespace(
         entry_id="entry-current",
         data={},
-        subentries={
-            "climate": SimpleNamespace(data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
-        },
+        subentries={"climate": SimpleNamespace(data={CONF_DAIKIN_CLIMATE: "climate.daikin"})},
     )
     hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry])
 
@@ -414,11 +399,7 @@ def test_ev_subentry_allows_its_legacy_aliased_actuator_on_reconfigure() -> None
         entry_id="entry-current",
         data={},
         options={},
-        subentries={
-            "ev": SimpleNamespace(
-                data={CONF_EV_SMART_CHARGING: "switch.shared_charger"}
-            )
-        },
+        subentries={"ev": SimpleNamespace(data={CONF_EV_SMART_CHARGING: "switch.shared_charger"})},
     )
     hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry])
 
@@ -443,15 +424,9 @@ def test_subentry_validation_rejects_ev_controls_owned_under_another_key() -> No
     other_entry = SimpleNamespace(
         entry_id="entry-other",
         data={},
-        subentries={
-            "ev": SimpleNamespace(
-                data={CONF_EV_SMART_CHARGING: "switch.shared_charger"}
-            )
-        },
+        subentries={"ev": SimpleNamespace(data={CONF_EV_SMART_CHARGING: "switch.shared_charger"})},
     )
-    hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [current_entry, other_entry]
-    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry, other_entry])
 
     errors = _validate_subentry_config(
         hass,
@@ -468,20 +443,14 @@ def test_subentry_validation_rejects_cross_role_actuator_collisions() -> None:
     current_entry = SimpleNamespace(
         entry_id="entry-current",
         data={},
-        subentries={
-            "ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.shared_charger"})
-        },
+        subentries={"ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.shared_charger"})},
     )
     other_entry = SimpleNamespace(
         entry_id="entry-other",
         data={},
-        subentries={
-            "ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.living_zone"})
-        },
+        subentries={"ev": SimpleNamespace(data={CONF_EV_CHARGER: "switch.living_zone"})},
     )
-    hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [current_entry, other_entry]
-    )
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry, other_entry])
 
     errors = _validate_subentry_config(
         hass,
@@ -792,9 +761,7 @@ def test_central_input_sections_have_readable_translation_labels() -> None:
             assert "_" not in labels[key]
 
     climate_section = strings["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE]
-    assert climate_section["data"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == (
-        "Climate Scheduler Guard Timer"
-    )
+    assert climate_section["data"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == ("Climate Scheduler Guard Timer")
     assert climate_section["data_description"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER].startswith(
         "Select the timer paired with Scheduler Change Helper."
     )
@@ -831,9 +798,9 @@ def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_ENERGY][
-            "data_description"
-        ][CONF_PV_FORECAST]
+        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_ENERGY]["data_description"][
+            CONF_PV_FORECAST
+        ]
 
         assert "Forecast Today" in description
         assert "Peak Forecast Today" in description
@@ -845,9 +812,9 @@ def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE][
-            "data_description"
-        ][CONF_WEATHER]
+        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE]["data_description"][
+            CONF_WEATHER
+        ]
 
         assert "Bureau of Meteorology" in description
         assert "Hourly" in description
@@ -859,9 +826,7 @@ def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        label = translations["options"]["step"]["init"]["sections"][INPUT_STEP_EV]["data"][
-            CONF_EV_CHARGE_RATE_KW
-        ]
+        label = translations["options"]["step"]["init"]["sections"][INPUT_STEP_EV]["data"][CONF_EV_CHARGE_RATE_KW]
 
         assert label == "EV charge rate (kW)"
 
@@ -990,9 +955,7 @@ def test_options_flow_accepts_a_partial_combined_section_submission() -> None:
         if str(getattr(marker, "schema", marker)) == POLICY_STEP_PRIORITIES
     )
 
-    result = asyncio.run(
-        flow.async_step_init({POLICY_STEP_PRIORITIES: planning({})})
-    )
+    result = asyncio.run(flow.async_step_init({POLICY_STEP_PRIORITIES: planning({})}))
 
     assert result["type"] == "create_entry"
 
@@ -1004,10 +967,7 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
         for marker, validator in schema.schema.items()
         if str(getattr(marker, "schema", marker)) == INPUT_STEP_EV
     )
-    ordered_fields = [
-        str(getattr(marker, "schema", marker))
-        for marker in ev_section.schema.schema
-    ]
+    ordered_fields = [str(getattr(marker, "schema", marker)) for marker in ev_section.schema.schema]
     fields = set(ordered_fields)
 
     assert {
@@ -1019,23 +979,19 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
         CONF_EV_LOW_PRICE_THRESHOLD,
         CONF_EV_KEEP_CHARGER_ON,
     } <= fields
-    assert ordered_fields.index(CONF_EV_LOW_PRICE_CHARGING_ENABLED) < ordered_fields.index(
-        CONF_EV_LOW_PRICE_THRESHOLD
-    ) < ordered_fields.index(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED)
+    assert (
+        ordered_fields.index(CONF_EV_LOW_PRICE_CHARGING_ENABLED)
+        < ordered_fields.index(CONF_EV_LOW_PRICE_THRESHOLD)
+        < ordered_fields.index(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED)
+    )
 
     ev_strings = _strings()["options"]["step"]["init"]["sections"][INPUT_STEP_EV]
-    assert (
-        ev_strings["data"][CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED]
-        == "Enable lowest-cost daylight charging"
-    )
+    assert ev_strings["data"][CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED] == "Enable lowest-cost daylight charging"
     assert "lowest-cost daylight charging" in ev_strings["description"]
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
-    schema_keys = {
-        str(getattr(key, "schema", key))
-        for key in _options_schema(dict(DEFAULT_OPTIONS)).schema
-    }
+    schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
 
     assert schema_keys.isdisjoint(
         {
@@ -1119,10 +1075,7 @@ def test_options_flow_sections_prefill_saved_policy_values() -> None:
         for marker, validator in schema.schema.items()
         if str(getattr(marker, "schema", marker)) == POLICY_STEP_PRIORITIES
     )
-    fields = {
-        str(getattr(marker, "schema", marker)): marker
-        for marker in schedule.schema.schema
-    }
+    fields = {str(getattr(marker, "schema", marker)): marker for marker in schedule.schema.schema}
 
     assert fields[CONF_PLANNING_HORIZON_HOURS].default() == 36
     assert fields[CONF_PLANNING_INTERVAL_MINUTES].default() == 10
@@ -1184,9 +1137,7 @@ def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
     flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
     submission = _settings_submission(
         flow,
-        policy_overrides={
-            POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: True}
-        },
+        policy_overrides={POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: True}},
     )
 
     result = asyncio.run(flow.async_step_init(submission))
@@ -1228,9 +1179,7 @@ def test_options_flow_rejects_zone_only_preconditioning_without_zone_thermostat(
     result = asyncio.run(flow.async_step_init(submission))
 
     assert result["type"] == "form"
-    assert result["errors"] == {
-        "base": "zone_only_preconditioning_requires_climate_zone"
-    }
+    assert result["errors"] == {"base": "zone_only_preconditioning_requires_climate_zone"}
 
 
 def test_options_flow_accepts_zone_only_preconditioning_with_zone_thermostat() -> None:
@@ -1379,15 +1328,15 @@ def test_central_energy_settings_updates_main_entry_data() -> None:
     assert result["type"] == "create_entry"
     assert updates == [
         {
-                "data": {
-                    CONF_INSTANCE_NAME: "Energy Planner",
-                    CONF_AI_TASK_ENTITY: "ai_task.old",
-                    CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
-                    CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
-                    CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
-                    CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
-                    **energy,
-                }
+            "data": {
+                CONF_INSTANCE_NAME: "Energy Planner",
+                CONF_AI_TASK_ENTITY: "ai_task.old",
+                CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+                CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
+                CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
+                **energy,
+            }
         }
     ]
 
@@ -1408,10 +1357,7 @@ def test_central_input_settings_prefill_and_validate_sections() -> None:
         for marker, validator in form["data_schema"].schema.items()
         if str(getattr(marker, "schema", marker)) == INPUT_STEP_ENERGY
     )
-    fields = {
-        str(getattr(marker, "schema", marker)): marker
-        for marker in energy_section.schema.schema
-    }
+    fields = {str(getattr(marker, "schema", marker)): marker for marker in energy_section.schema.schema}
 
     invalid = asyncio.run(
         flow.async_step_init(
@@ -1487,9 +1433,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
         if str(getattr(marker, "schema", marker)) == INPUT_STEP_AI
     )
     ai_task_marker = next(
-        marker
-        for marker in ai_section.schema.schema
-        if str(getattr(marker, "schema", marker)) == CONF_AI_TASK_ENTITY
+        marker for marker in ai_section.schema.schema if str(getattr(marker, "schema", marker)) == CONF_AI_TASK_ENTITY
     )
     assert ai_task_marker.description["suggested_value"] == "ai_task.old"
 
@@ -1497,11 +1441,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
         flow.async_step_init(
             _settings_submission(
                 flow,
-                input_sections={
-                    INPUT_STEP_AI: {
-                        CONF_AI_TASK_ENTITY: " ai_task.extended_openai_ai_task "
-                    }
-                },
+                input_sections={INPUT_STEP_AI: {CONF_AI_TASK_ENTITY: " ai_task.extended_openai_ai_task "}},
             )
         )
     )
@@ -1536,10 +1476,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
 def test_consolidated_settings_sections_are_required_collapsible_groups() -> None:
     flow = OptionsFlow(SimpleNamespace(data={}, options={}))
     schema = flow._settings_schema()
-    fields = {
-        str(getattr(marker, "schema", marker)): marker
-        for marker in schema.schema
-    }
+    fields = {str(getattr(marker, "schema", marker)): marker for marker in schema.schema}
 
     for step_id in (
         INPUT_STEP_ENERGY,
@@ -1700,9 +1637,7 @@ def test_migration_removes_retired_config_from_entry_without_subentries() -> Non
     )
 
     assert async_migrate_subentries_to_entry_data(hass, entry) is True
-    assert hass.config_entries.entry_updates == [
-        (entry, {"data": {CONF_INSTANCE_NAME: "Energy Planner"}})
-    ]
+    assert hass.config_entries.entry_updates == [(entry, {"data": {CONF_INSTANCE_NAME: "Energy Planner"}})]
 
 
 def test_validate_config_accepts_compatible_units() -> None:
@@ -1798,14 +1733,20 @@ def test_validate_config_accepts_zone_climate_entity() -> None:
 
 
 def test_validate_config_rejects_empty_ai_service_parts() -> None:
-    assert _validate_config(
-        _valid_hass(),
-        _valid_input({CONF_AI_ADVISOR_SERVICE: ".generate_data"}),
-    )[CONF_AI_ADVISOR_SERVICE] == "invalid_service_name"
-    assert _validate_config(
-        _valid_hass(),
-        _valid_input({CONF_AI_ADVISOR_SERVICE: "ai_task."}),
-    )[CONF_AI_ADVISOR_SERVICE] == "invalid_service_name"
+    assert (
+        _validate_config(
+            _valid_hass(),
+            _valid_input({CONF_AI_ADVISOR_SERVICE: ".generate_data"}),
+        )[CONF_AI_ADVISOR_SERVICE]
+        == "invalid_service_name"
+    )
+    assert (
+        _validate_config(
+            _valid_hass(),
+            _valid_input({CONF_AI_ADVISOR_SERVICE: "ai_task."}),
+        )[CONF_AI_ADVISOR_SERVICE]
+        == "invalid_service_name"
+    )
 
 
 def test_validate_config_rejects_invalid_or_missing_entities() -> None:
@@ -1844,13 +1785,9 @@ def test_validate_options_accepts_default_policy_values() -> None:
 def test_validate_options_rejects_invalid_household_load_outage_grace(
     value: object,
 ) -> None:
-    errors = _validate_options(
-        {**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: value}
-    )
+    errors = _validate_options({**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: value})
 
-    assert errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] == (
-        "invalid_load_outage_grace"
-    )
+    assert errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] == ("invalid_load_outage_grace")
 
 
 def test_default_options_require_intentional_active_mode_enablement() -> None:
@@ -1891,3 +1828,43 @@ def test_validate_options_rejects_invalid_priority_weights() -> None:
 def _strings() -> dict[str, Any]:
     path = Path(__file__).parents[1] / "custom_components" / "ha_energy_planner" / "strings.json"
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("enable_keep_on", [False, True])
+def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on: bool) -> None:
+    sensors = {
+        CONF_EV_SOC: "sensor.ev_soc",
+        CONF_EV_CHARGING: "binary_sensor.ev_charging",
+        CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
+    }
+    switch = {CONF_EV_CHARGER: "switch.shared_charger"}
+    buttons = {CONF_EV_CHARGER_START: "button.ev_start", CONF_EV_CHARGER_STOP: "button.ev_stop"}
+    entry = SimpleNamespace(
+        entry_id="entry-current",
+        data={**sensors, **(buttons if enable_keep_on else switch)},
+        options={CONF_EV_KEEP_CHARGER_ON: not enable_keep_on},
+        subentries={},
+    )
+    flow = OptionsFlow(entry)
+    flow.hass = _valid_hass()
+    flow.hass.states.entity_ids.update({"button.ev_start", "button.ev_stop"})
+    manager = SimpleNamespace(async_entries=lambda domain: [entry], async_update_entry=Mock())
+    flow.hass.config_entries = manager
+    submission = _settings_submission(
+        flow,
+        input_sections={INPUT_STEP_EV: {**sensors, **(switch if enable_keep_on else buttons)}},
+        policy_overrides={POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: enable_keep_on}},
+    )
+    result = asyncio.run(flow.async_step_init(submission))
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_EV_KEEP_CHARGER_ON] is enable_keep_on
+    saved = manager.async_update_entry.call_args.kwargs["data"]
+    assert {key: value for key, value in saved.items() if key.startswith("ev_")} == {
+        **sensors, **(switch if enable_keep_on else buttons)
+    }
+
+
+@pytest.mark.parametrize("service_name, expected", [("missing_separator", "invalid_service_name"),
+                                                     ("ai_task.missing", "service_not_found")])
+def test_validate_service_rejects_malformed_or_missing_service(service_name: str, expected: str) -> None:
+    assert config_flow_module._validate_service(_valid_hass(), service_name) == expected
