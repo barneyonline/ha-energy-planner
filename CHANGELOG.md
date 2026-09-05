@@ -12,6 +12,15 @@
 
 ### 🐛 Bug fixes
 
+- Device control now requires a confirmed, atomic storage write before dispatch.
+  Home Assistant write failures and shutdown-deferred saves retain pending
+  recovery metadata for retry instead of being mistaken for durable saves.
+- Disarming restores planner-owned HVAC zones and automations before saving
+  the disarmed state, so storage failures cannot prevent that restoration.
+  Failed saves remain visible and retryable, including unresolved restoration.
+- Continuous EV charging compares whole-window energy costs instead of summed
+  price ranks, including partial final slots and solar opportunity cost while
+  retaining configured carbon preferences and active-session continuity.
 - Newly created AI Task providers can now be used by Explain while their initial
   Home Assistant state is `unknown`; missing and explicitly `unavailable`
   providers remain blocked.
@@ -31,6 +40,10 @@
 
 ### 🔧 Improvements
 
+- Added real storage-failure and fresh-runtime restart tests for EV, HVAC, and
+  Enphase, overlapping multi-EV start/stop tests, exhaustive small charging-cost
+  comparisons, decision replays across repricing/manual overrides/stale-input
+  recovery, and autumn repeated-hour ready-by coverage.
 - History training runs in the background with source and lifetime checks before
   publication. Failed EV history imports back off, and indexed calibration and
   forecast lookups reduce work on larger histories.

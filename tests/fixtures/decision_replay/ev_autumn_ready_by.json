@@ -1,0 +1,11 @@
+{
+  "name": "Both occurrences of the autumn 02:30 deadline",
+  "timezone": "Australia/Melbourne",
+  "ready_by": "02:30",
+  "target_soc": 50,
+  "steps": [
+    {"at": "2026-04-04T15:20:00+00:00", "soc": 40, "prices": [0.2, 0.2, 0.01, 0.01], "offsets": [0, 5], "deadline": "2026-04-04T15:30:00+00:00", "charging": true, "commands": ["turn_on"]},
+    {"at": "2026-04-04T15:35:00+00:00", "soc": 45, "prices": [0.3, 0.2, 0.1, 0.1], "offsets": [0], "deadline": "2026-04-04T16:30:00+00:00", "charging": true, "commands": []},
+    {"at": "2026-04-04T15:40:00+00:00", "soc": 50, "prices": [0.1, 0.1, 0.1, 0.1], "offsets": [], "deadline": "2026-04-04T16:30:00+00:00", "charging": false, "commands": ["turn_off"]}
+  ]
+}
