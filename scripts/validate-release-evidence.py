@@ -25,7 +25,8 @@ def validate_evidence(evidence: dict, commit: str, version: str) -> None:
         raise ValueError("Observation must already be complete")
     for name in SCENARIOS:
         result = evidence.get("scenarios", {}).get(name, {})
-        if result.get("result") != "passed" or not str(result.get("evidence", "")).strip():
+        reference = result.get("evidence")
+        if result.get("result") != "passed" or not isinstance(reference, str) or not reference.strip():
             raise ValueError(f"Completed evidence is required for {name}")
 
 

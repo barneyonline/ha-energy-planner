@@ -37,6 +37,8 @@ normally 48–72, extending until each scenario has completed:
 Use real HA traces, state history and redacted support bundles. For hardware
 missing from the release environment, obtain a representative tester's evidence;
 do not silently mark a scenario passed. No operating record is bundled by default.
+Each scenario's evidence must be a nonempty text reference; null, booleans,
+numbers, collections, and blank text are rejected.
 
 ## Package and publication
 

@@ -342,6 +342,7 @@ rules:
         - tests/fixtures/decision_replay/ev_autumn_ready_by.json
         - tests/test_storage_runtime.py
         - tests/test_upgrade_runtime.py
+        - tests/scripts/test_release_tools.py
         - tests/test_device_registry_runtime.py
         - tests/test_training.py
         - scripts/docker-compatibility.sh

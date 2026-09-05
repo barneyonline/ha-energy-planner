@@ -849,3 +849,5 @@ use throughout; the Docker and pull-request gates enforce that result.
 - `docs/release-checklist.md` and the observation validator require real operating
   evidence before a stable 1.x release. That observation is pending; synthetic
   validation does not claim household acceptance.
+  `tests/scripts/test_release_tools.py` verifies that every scenario rejects
+  missing, blank, and non-string evidence references.
