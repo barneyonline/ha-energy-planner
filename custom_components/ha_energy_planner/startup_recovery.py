@@ -200,6 +200,11 @@ async def _async_run_startup_auto_recovery(self: EnergyPlannerCoordinator) -> No
                     await self.async_disarm_production_control("unexpected_recovery_error")
                 except Exception:  # noqa: BLE001 - persistence may itself be unavailable.
                     _LOGGER.exception("Could not persist startup recovery disarming")
+            # A persistent storage failure must not spin up an immediate retry
+            # loop. Recheck operator intent after the cancellable delay.
+            await asyncio.sleep(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS)
+            if getattr(self, "_tearing_down", False) or not self.automatic_control_requested:
+                return
             self._startup_auto_recovery_authorized = True
             self._startup_auto_recovery_task = self.entry.async_create_background_task(
                 self.hass,

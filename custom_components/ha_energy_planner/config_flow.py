@@ -679,6 +679,37 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 5
 
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Repair an older entry's missing vehicle target without replacing it."""
+        entry = self._get_reconfigure_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            errors = _validate_config(self.hass, user_input)
+            if not errors:
+                data = {**entry.data, **user_input}
+                # Legacy subentries are merged during setup and must not
+                # overwrite the repaired target with an obsolete value.
+                for subentry in entry.subentries.values():
+                    if CONF_EV_SMART_CHARGING_TARGET_SOC in subentry.data:
+                        self.hass.config_entries.async_update_subentry(
+                            entry, subentry, data={**subentry.data, **user_input}
+                        )
+                self.hass.config_entries.async_update_entry(entry, data=data)
+                # Loaded entries use their options/data listener for reload;
+                # failed migrations have no listener and need an explicit retry.
+                if not entry.update_listeners:
+                    self.hass.config_entries.async_schedule_reload(entry.entry_id)
+                return self.async_abort(reason="reconfigure_successful")
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=vol.Schema({
+                vol.Required(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(entity_filter=_EV_TARGET_SOC_FILTER),
+            }),
+            errors=errors,
+        )
+
     async def async_step_user(
         self,
         user_input: dict[str, Any] | None = None,

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 export PYTHONDONTWRITEBYTECODE=1
+HA_IMAGE="${HEP_HA_IMAGE:-$(python3 scripts/support_policy.py image)}"
+export HEP_HA_IMAGE="$HA_IMAGE"
 PYCACHE_DIR="$(mktemp -d "$ROOT_DIR/.pycache-validate.XXXXXX")"
 CHECK_CONFIG_DIR="$(mktemp -d "$ROOT_DIR/.ha-check-config.XXXXXX")"
 
@@ -25,7 +27,7 @@ cleanup_path() {
   docker run --rm \
     -v "$path:/cleanup" \
     --entrypoint /bin/sh \
-    ghcr.io/home-assistant/home-assistant:stable \
+    "$HA_IMAGE" \
     -c 'find /cleanup -mindepth 1 -exec rm -rf {} +' >/dev/null 2>&1 || true
   rm -rf "$path" 2>/dev/null || true
 }
@@ -35,22 +37,23 @@ run() {
   "$@"
 }
 
+run scripts/validation-environment.sh
 run env PYTHONPYCACHEPREFIX="$PYCACHE_DIR" python3 -m compileall -q custom_components tests scripts
 run docker run --rm -v "$PWD:/work" -w /work ghcr.io/astral-sh/ruff:0.14.1 check custom_components tests scripts
 run scripts/docker-mypy.sh
-run bash -n scripts/docker-compatibility.sh scripts/docker-ha-smoke.sh scripts/docker-mypy.sh scripts/docker-pytest-fast.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
+run bash -n scripts/docker-package-smoke.sh scripts/validation-environment.sh scripts/docker-compatibility.sh scripts/docker-ha-smoke.sh scripts/docker-mypy.sh scripts/docker-pytest-fast.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run
 run scripts/export-real-validation-bundle.sh --dry-run
 if [[ "${HEP_SKIP_QUALITY_SCALE:-0}" == "1" ]]; then
   printf '\n==> scripts/validate_quality_scale.py (skipped: HEP_SKIP_QUALITY_SCALE=1)\n'
 else
-  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable python3 scripts/validate_quality_scale.py
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work "$HA_IMAGE" python3 scripts/validate_quality_scale.py
 fi
 if [[ "${HEP_SKIP_PYTEST:-0}" == "1" ]]; then
   printf '\n==> pytest with coverage (skipped: HEP_SKIP_PYTEST=1)\n'
 else
-  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable sh -c 'python3 -m coverage run --branch -m pytest -q --durations=15 && python3 -m coverage json --fail-under=0 -o coverage.json && python3 -m coverage report -m --fail-under=0 && python3 scripts/check_coverage.py coverage.json'
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work "$HA_IMAGE" sh -c 'python3 -m coverage run --branch -m pytest -q --durations=15 && python3 -m coverage json --fail-under=0 -o coverage.json && python3 -m coverage report -m --fail-under=0 && python3 scripts/check_coverage.py coverage.json'
 fi
 run python3 scripts/replay-fixture.py tests/fixtures/replay/*.json
 run python3 scripts/validate-live-schema-fixture.py tests/fixtures/live_schema/*.json
@@ -103,13 +106,13 @@ run docker run --rm \
   -e PYTHONDONTWRITEBYTECODE=1 \
   -v "$CHECK_CONFIG_DIR:/config" \
   -v "$PWD/custom_components/ha_energy_planner:/config/custom_components/ha_energy_planner:ro" \
-  ghcr.io/home-assistant/home-assistant:stable \
+  "$HA_IMAGE" \
   python3 -m homeassistant --config /config --script check_config
 if [[ "${HEP_SKIP_HA_SMOKE:-0}" == "1" ]]; then
   printf '\n==> scripts/docker-ha-smoke.sh (skipped: HEP_SKIP_HA_SMOKE=1)\n'
 else
   run scripts/docker-compatibility.sh
-  run scripts/docker-ha-smoke.sh
+  run scripts/docker-package-smoke.sh
 fi
 
 printf '\nHA Energy Planner Docker validation passed\n'

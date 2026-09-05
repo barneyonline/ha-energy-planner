@@ -491,6 +491,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
             coordinator.async_start_listeners()
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
+    """Remove resolved per-entry history; retain uncertain recovery evidence."""
+    from .storage import PlannerStore
+
+    if not await PlannerStore(hass, entry.entry_id).async_remove_if_safe():
+        _LOGGER.warning("Energy Planner retained recovery storage for removed entry %s", entry.entry_id)
+
+
 async def _async_rehydrate_all_ev_grid_reservations(hass: HomeAssistant) -> None:
     """Restore conservative EV reservations before config entries can execute."""
     from .storage import PlannerStore

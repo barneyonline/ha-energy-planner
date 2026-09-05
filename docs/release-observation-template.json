@@ -1,0 +1,14 @@
+{
+  "commit": "REPLACE_WITH_FULL_CANDIDATE_COMMIT",
+  "version": "REPLACE_WITH_RELEASE_VERSION",
+  "started_at": "",
+  "ended_at": "",
+  "scenarios": {
+    "startup_reload": {"result": "pending", "evidence": ""},
+    "ev_cycle": {"result": "pending", "evidence": ""},
+    "unavailable_feedback": {"result": "pending", "evidence": ""},
+    "hvac_override": {"result": "pending", "evidence": ""},
+    "enphase_restore": {"result": "pending", "evidence": ""},
+    "performance": {"result": "pending", "evidence": ""}
+  }
+}

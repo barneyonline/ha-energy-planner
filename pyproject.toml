@@ -4,6 +4,11 @@ version = "0.9.18"
 requires-python = ">=3.14"
 dependencies = []
 
+[tool.energy-planner.support]
+baseline = "2026.9.0"
+previous = ["2026.8.2"]
+mypy = "1.19.1"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

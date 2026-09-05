@@ -14,3 +14,8 @@ docker/
 .ha-check-config.*/
 
 coverage.json
+
+dist/
+.package-smoke.*/
+validation-environment.txt
+release-evidence.json

@@ -3,72 +3,19 @@
     "step": {
       "user": {
         "title": "Energy Planner",
-        "description": "Name this Planner Hub, then add energy, climate, EV, and Enphase inputs from the integration page. Create one named hub per EV when managing multiple vehicles.",
+        "description": "Name this planner, then open Configure to map energy, climate, EV and Enphase inputs. Create one named planner per EV when managing multiple vehicles.",
         "data": {
-          "instance_name": "Planner name",
-          "amber_import_price_entity": "Amber import price sensor",
-          "amber_export_price_entity": "Amber export price sensor",
-          "pv_forecast_entity": "PV forecast sensor",
-          "pv_forecast_secondary_entity": "Second PV forecast sensor",
-          "household_load_entity": "Household load sensor",
-          "carbon_intensity_forecast_entity": "Grid carbon intensity forecast sensor",
-          "pv_observed_entity": "Observed PV power sensor",
-          "battery_soc_entity": "Battery SOC sensor",
-          "enphase_profile_entity": "Enphase Profile",
-          "enphase_ai_profile": "Enphase Restore Profile",
-          "enphase_self_consumption_profile": "Enphase Consume Battery Profile",
-          "enphase_full_backup_profile": "Enphase Charge Battery Profile",
-          "daikin_climate_entity": "Daikin Climate",
-          "daikin_power_entity": "Daikin Power Sensor",
-          "climate_automation_entities": "Climate Automations",
-          "climate_zone_entities": "Climate Zones",
-          "climate_change_from_scheduler_entity": "Scheduler Change Helper",
-          "climate_scheduler_guard_timer_entity": "Climate Scheduler Guard Timer",
-          "climate_manual_override_entity": "Manual Override Helper",
-          "climate_target_low_entity": "Occupied Low Temperature",
-          "climate_target_high_entity": "Occupied High Temperature",
-          "person_entities": "People",
-          "ev_soc_entity": "EV SOC sensor",
-          "ev_charging_entity": "EV charging state entity",
-          "ev_connected_entity": "EV connected entity",
-          "ev_charger_entity": "EV charger control",
-          "ev_charger_start_entity": "EV charger start control",
-          "ev_charger_stop_entity": "EV charger stop control",
-          "ai_advisor_service": "AI troubleshooting provider",
-          "weather_entity": "Weather Forecast"
+          "instance_name": "Planner name"
         },
         "data_description": {
-          "instance_name": "Unique name for this planner and its EV, for example Energy Planner - Commuter EV.",
-          "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
-          "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
-          "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
-          "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timezone-aware timestamped values after Forecast Today.",
-          "household_load_entity": "Measured whole-home power sensor in W, kW, or MW. Energy Planner learns a local load forecast from Recorder history and excludes known EV charging and measured HVAC power where possible.",
-          "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
-          "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
-          "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value.",
-          "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
-          "enphase_ai_profile": "Profile name to restore when planner ownership ends, normally AI Optimisation.",
-          "enphase_self_consumption_profile": "Profile name used when the planner wants the battery to serve local load or export, normally Self-Consumption.",
-          "enphase_full_backup_profile": "Profile name used when the planner wants to charge or preserve the battery, normally Full Backup.",
-          "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
-          "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
-          "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
-          "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
-          "climate_scheduler_guard_timer_entity": "Select the timer paired with Scheduler Change Helper. Energy Planner keeps it active while applying climate changes so the manual-change classifier ignores planner control. Configure both fields or leave both empty.",
-          "climate_manual_override_entity": "Input_boolean that immediately releases and blocks planner HVAC control. An on state is automatically cleared after the configured manual override duration.",
-          "climate_zone_entities": "Zone switches or helpers are enabled and restored; zone climate entities receive the main thermostat target temperature only when zone temperature synchronisation is enabled.",
-          "climate_target_low_entity": "Input number containing the occupied low comfort target.",
-          "climate_target_high_entity": "Input number containing the occupied high comfort target.",
-          "person_entities": "Person entities used to infer occupied or away state.",
-          "ev_soc_entity": "EV state-of-charge sensor.",
-          "ev_charging_entity": "Optional entity that reports whether the EV is charging.",
-          "ev_connected_entity": "Optional entity that reports whether the EV is plugged in.",
-          "ev_charger_entity": "Switch or input boolean that directly enables and disables the charger.",
-          "ev_charger_start_entity": "Optional separate switch or button used to start charging.",
-          "ev_charger_stop_entity": "Optional separate switch or button used to stop charging.",
-          "ai_advisor_service": "Optional AI Task provider for on-demand explanation and troubleshooting.",
-          "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points."
+          "instance_name": "Unique name for this planner and its EV, for example Energy Planner - Commuter EV."
+        }
+      },
+      "reconfigure": {
+        "title": "Repair vehicle target mapping",
+        "description": "Select the vehicle target-SOC entity to repair an older configuration. Existing ownership and settings are preserved. Use Configure for other mappings.",
+        "data": {
+          "ev_smart_charging_target_soc_entity": "Vehicle target SOC"
         }
       }
     },
@@ -149,7 +96,7 @@
               "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
               "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timezone-aware timestamped values after Forecast Today.",
               "household_load_entity": "Measured whole-home power sensor in W, kW, or MW. Energy Planner learns a local load forecast from Recorder history and excludes known EV charging and measured HVAC power where possible.",
-              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
+              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO\u2082/kWh or kgCO\u2082/kWh.",
               "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
               "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value.",
               "battery_min_soc_percent": "Minimum home battery state of charge the planner tries to preserve.",
@@ -423,6 +370,9 @@
     },
     "ai_advice_not_ready": {
       "message": "AI troubleshooting is not ready: {reason}"
+    },
+    "storage_write_failed": {
+      "message": "Energy Planner could not save recovery evidence. Check Home Assistant storage and available disk space, then retry. New device control remains blocked until the save succeeds."
     }
   },
   "entity": {
