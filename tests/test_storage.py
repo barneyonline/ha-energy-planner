@@ -165,7 +165,7 @@ def test_store_load_fills_missing_schema_defaults(monkeypatch: object) -> None:
     asyncio.run(store.async_load())
 
     assert store.data["ownership"] == {"enphase_profile": "AI Optimisation"}
-    assert store.data["outcomes"] == []
+    assert "outcomes" not in store.data
     assert store.data["forecast_snapshots"] == []
     assert store.data["command_rate_limits"] == {}
     assert store.data["built_in_load_forecast"] == {}
@@ -191,7 +191,7 @@ def test_store_load_repairs_malformed_known_fields_and_preserves_unknown(monkeyp
     asyncio.run(store.async_load())
 
     assert store.data["active_plan"] is None
-    assert store.data["outcomes"] == []
+    assert "outcomes" not in store.data
     assert store.data["forecast_snapshots"] == []
     assert store.data["ownership"] == {}
     assert store.data["ev_charge_calibration"] == {}
@@ -918,9 +918,7 @@ def test_store_coalesces_materially_identical_dry_run_outcomes(monkeypatch: obje
     assert len(store.data["execution_audit"]) == 1
     assert store.data["execution_audit"][0]["occurrence_count"] == 2
     assert store.data["execution_audit"][0]["last_attempted_at"] == second_at.isoformat()
-    assert len(store.data["outcomes"]) == 1
-    assert store.data["outcomes"][0]["occurrence_count"] == 2
-    assert store.data["outcomes"][0]["last_attempted_at"] == second_at.isoformat()
+    assert "outcomes" not in store.data
 
 
 def test_store_does_not_coalesce_applied_outcomes(monkeypatch: object) -> None:
@@ -933,7 +931,7 @@ def test_store_does_not_coalesce_applied_outcomes(monkeypatch: object) -> None:
     asyncio.run(store.async_add_outcome(outcome))
 
     assert len(store.data["execution_audit"]) == 2
-    assert len(store.data["outcomes"]) == 2
+    assert "outcomes" not in store.data
 
 
 def test_time_based_retention_preserves_recent_evidence_across_bursts(monkeypatch: object) -> None:
@@ -1030,3 +1028,39 @@ def test_audit_dedup_helpers_handle_malformed_and_sparse_records() -> None:
     assert _record_timestamp({"created_at": naive}) == naive.replace(tzinfo=UTC)
     assert _record_timestamp({"created_at": "bad"}) is None
     assert _record_timestamp("bad") is None
+
+
+def test_canonical_audit_migrates_legacy_once_and_preserves_provenance() -> None:
+    legacy = {
+        "attempted_at": "2026-09-05T00:00:00+00:00", "action_id": "action",
+        "asset": "ev", "result": "skipped", "reason": "unchanged",
+        "desired_state": {"enabled": True}, "occurrence_count": 3,
+        "last_attempted_at": "2026-09-05T00:10:00+00:00",
+        "pre_state": {}, "post_state": {}, "raw_prompt": "must disappear",
+    }
+    normalized = storage_module._normalize_loaded_data({"outcomes": [None, legacy]})
+    assert "outcomes" not in normalized
+    assert normalized["audit_history_version"] == 1
+    record = normalized["execution_audit"][0]
+    assert record["occurrence_count"] == 3
+    assert record["last_attempted_at"] == legacy["last_attempted_at"]
+    assert record["desired_state"] == {"enabled": True}
+    assert "raw_prompt" not in record
+    assert storage_module._normalize_loaded_data(normalized) == normalized
+    both = storage_module._normalize_loaded_data({"execution_audit": [record], "outcomes": [legacy, legacy]})
+    assert both["execution_audit"] == [record]
+    assert storage_module.audit_records({"execution_audit": ["bad"], "outcomes": [legacy]}) == [legacy]
+    assert storage_module.audit_records({"execution_audit": None, "outcomes": None}) == []
+    invalid = storage_module._audit_entry({**legacy, "occurrence_count": True, "last_attempted_at": 3})
+    assert "occurrence_count" not in invalid and "last_attempted_at" not in invalid
+
+
+def test_ai_attempt_is_durable_before_dispatch_inside_refresh_batch(monkeypatch: Any) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.saved = None
+    store = PlannerStore(object())
+    async def run() -> None:
+        async with store.async_delay_save():
+            await store.async_save_ai_attempt({"created_at": "2026-09-05T00:00:00+00:00"})
+            assert FakeStore.saved["ai_last_attempt"]["created_at"] == "2026-09-05T00:00:00+00:00"
+    asyncio.run(run())

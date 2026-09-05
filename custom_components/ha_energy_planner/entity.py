@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
 from typing import Any
 
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -13,7 +12,6 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import DOMAIN, INTEGRATION_NAME
 from .coordinator import EnergyPlannerCoordinator
 from .models import to_jsonable
-from .type_defs import EnergyPlannerConfigEntry
 
 RECORDER_MAX_STATE_ATTRIBUTES_BYTES = 16_384
 """Home Assistant Recorder's hard limit for serialized state attributes."""
@@ -35,16 +33,6 @@ def planner_device_identifier(entry_id: str) -> tuple[str, str]:
     return DOMAIN, entry_id
 
 
-def async_add_planner_entities(
-    entry: EnergyPlannerConfigEntry,
-    async_add_entities: Any,
-    entities: Iterable[Any],
-) -> None:
-    """Add all planner entities to the main config entry."""
-    del entry
-    async_add_entities(list(entities))
-
-
 class EnergyPlannerEntity(CoordinatorEntity[EnergyPlannerCoordinator]):
     """Base coordinator entity."""
 
@@ -54,11 +42,9 @@ class EnergyPlannerEntity(CoordinatorEntity[EnergyPlannerCoordinator]):
         self,
         coordinator: EnergyPlannerCoordinator,
         key: str,
-        device_key: str | None = None,
     ) -> None:
         """Initialize entity on the single Energy Planner device."""
         super().__init__(coordinator)
-        del device_key
         entry = coordinator.entry
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_suggested_object_id = f"{DOMAIN}_{key}"
@@ -127,10 +113,7 @@ def _normalize_attribute_value(value: Any, *, depth: int = 0) -> Any:
     if value is None or isinstance(value, str | int | float | bool):
         return value
     if isinstance(value, dict):
-        return {
-            str(key): _normalize_attribute_value(item, depth=depth + 1)
-            for key, item in value.items()
-        }
+        return {str(key): _normalize_attribute_value(item, depth=depth + 1) for key, item in value.items()}
     if isinstance(value, list | tuple | set):
         return [_normalize_attribute_value(item, depth=depth + 1) for item in value]
     return str(value)

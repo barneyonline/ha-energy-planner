@@ -73,10 +73,9 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
     assert "Confidence:" not in (entity.event.description or "")
     assert "Data quality\n• " in (entity.event.description or "")
     assert "Constraints\n• " in (entity.event.description or "")
-    assert (
-        "Load forecast\n• Status: Ready\n• Expected load: 1.40 kW\n"
-        "• Conservative load: 1.80 kW"
-    ) in (entity.event.description or "")
+    assert ("Load forecast\n• Status: Ready\n• Expected load: 1.40 kW\n• Conservative load: 1.80 kW") in (
+        entity.event.description or ""
+    )
 
     events = asyncio.run(
         entity.async_get_events(
@@ -88,9 +87,7 @@ def test_calendar_exposes_current_and_upcoming_actions() -> None:
 
     assert [event.uid for event in events] == ["ev-start", "climate-precondition"]
     assert "Planned state\n" in (events[1].description or "")
-    assert "• Expected load: 2.20 kW\n• Conservative load: 2.70 kW" in (
-        events[1].description or ""
-    )
+    assert "• Expected load: 2.20 kW\n• Conservative load: 2.70 kW" in (events[1].description or "")
 
 
 def test_calendar_handles_empty_plan_and_requested_ranges() -> None:
@@ -335,9 +332,7 @@ def test_calendar_description_uses_readable_sections_and_local_time(monkeypatch:
     description = calendar_module._calendar_events(_coordinator(_plan([action])))[0].description or ""
 
     assert (
-        "Schedule\n"
-        "• Period Start: Sat 15 Aug 2026, 9:38 PM AEST\n"
-        "• Period End: Sat 15 Aug 2026, 10:38 PM AEST"
+        "Schedule\n• Period Start: Sat 15 Aug 2026, 9:38 PM AEST\n• Period End: Sat 15 Aug 2026, 10:38 PM AEST"
     ) in description
     assert (
         "Planned state\n"
@@ -354,9 +349,7 @@ def test_calendar_description_uses_readable_sections_and_local_time(monkeypatch:
 def test_calendar_detail_formatting_handles_units_and_nested_values() -> None:
     now = datetime(2026, 8, 15, tzinfo=UTC)
 
-    assert calendar_module._calendar_detail("Projected HVAC load kW", 1.5) == (
-        "Projected HVAC load: 1.5 kW"
-    )
+    assert calendar_module._calendar_detail("Projected HVAC load kW", 1.5) == ("Projected HVAC load: 1.5 kW")
     assert calendar_module._calendar_detail("Target SOC percent", 80) == "Target SOC: 80%"
     assert calendar_module._calendar_value_text(False) == "No"
     assert calendar_module._calendar_value_text({"enabled": True, "at": now}) == (
@@ -389,13 +382,7 @@ def test_calendar_platform_adds_one_system_calendar(monkeypatch: object) -> None
     entry = SimpleNamespace(runtime_data=coordinator)
     added: list[object] = []
 
-    monkeypatch.setattr(
-        calendar_module,
-        "async_add_planner_entities",
-        lambda entry_arg, add_entities, entities: added.extend(entities),
-    )
-
-    asyncio.run(calendar_module.async_setup_entry(coordinator.hass, entry, None))
+    asyncio.run(calendar_module.async_setup_entry(coordinator.hass, entry, added.extend))
 
     assert len(added) == 1
     assert isinstance(added[0], EnergyPlannerCalendar)

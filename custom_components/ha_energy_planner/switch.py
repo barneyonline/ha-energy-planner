@@ -6,18 +6,19 @@ from dataclasses import dataclass
 
 from homeassistant.components.switch import SwitchEntity, SwitchEntityDescription
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
-    DOMAIN,
 )
 from .coordinator import EnergyPlannerCoordinator
-from .entity import EnergyPlannerEntity, async_add_planner_entities
+from .entity import EnergyPlannerEntity
 from .type_defs import EnergyPlannerConfigEntry
+
+# Coordinator locks serialize commands; allow stop controls to dispatch immediately.
+PARALLEL_UPDATES = 0
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -27,14 +28,12 @@ class PlannerSwitchDescription(SwitchEntityDescription):
     option_key: str | None
     default: bool
     active_control: bool = False
-    reload_required: bool = False
 
 
 SWITCHES: tuple[PlannerSwitchDescription, ...] = (
     PlannerSwitchDescription(
         key="active_control",
         translation_key="active_control",
-        icon="mdi:home-automation",
         option_key=None,
         default=False,
         active_control=True,
@@ -42,36 +41,21 @@ SWITCHES: tuple[PlannerSwitchDescription, ...] = (
     PlannerSwitchDescription(
         key="climate_control",
         translation_key="climate_control",
-        icon="mdi:thermostat-auto",
         option_key=CONF_CLIMATE_CONTROL_ENABLED,
         default=False,
     ),
     PlannerSwitchDescription(
         key="ev_control",
         translation_key="ev_control",
-        icon="mdi:ev-station",
         option_key=CONF_EV_CONTROL_ENABLED,
         default=False,
     ),
     PlannerSwitchDescription(
         key="enphase_control",
         translation_key="enphase_control",
-        icon="mdi:home-battery-outline",
         option_key=CONF_ENPHASE_CONTROL_ENABLED,
         default=False,
     ),
-)
-
-_RETIRED_CONTROL_SWITCH_KEYS = (
-    "enabled",
-    "dry_run",
-    "ai_enabled",
-    "ev_control_enabled",
-    "climate_control_enabled",
-    "enphase_control_enabled",
-    "ev_connected_helper",
-    "ev_opportunistic_charging",
-    "ev_keep_charger_on",
 )
 
 
@@ -82,19 +66,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up switches."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
-    _remove_retired_control_switches(hass, entry)
-    async_add_planner_entities(
-        entry, async_add_entities, (PlannerSwitch(coordinator, description) for description in SWITCHES)
-    )
-
-
-def _remove_retired_control_switches(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Remove obsolete activation switches from the entity registry on upgrade."""
-    registry = er.async_get(hass)
-    for key in _RETIRED_CONTROL_SWITCH_KEYS:
-        entity_id = registry.async_get_entity_id("switch", DOMAIN, f"{entry.entry_id}_{key}")
-        if entity_id is not None:
-            registry.async_remove(entity_id)
+    async_add_entities(PlannerSwitch(coordinator, description) for description in SWITCHES)
 
 
 class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):

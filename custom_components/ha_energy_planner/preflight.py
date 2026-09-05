@@ -45,6 +45,7 @@ from .safety import (
     partition_control_areas_by_pause,
     strict_bool,
 )
+from .storage import audit_records
 
 _SERVICE_KEYS = (CONF_AI_ADVISOR_SERVICE,)
 _EVIDENCE_OPTION_EXCLUSIONS = {
@@ -728,7 +729,7 @@ def _control_area_message(control_areas: dict[str, Any], discovery: dict[str, An
 
 
 def _audit_report(store_data: dict[str, Any]) -> dict[str, Any]:
-    entries = list(store_data.get("execution_audit") or store_data.get("outcomes") or [])
+    entries = audit_records(store_data)
     recent = [_bounded_audit_entry(entry) for entry in entries[-10:]]
     return {
         "outcome_count": len(entries),
@@ -778,9 +779,8 @@ def _split_entities(value: Any) -> list[str]:
     return []
 
 
-def _bounded_audit_entry(entry: object) -> dict[str, Any]:
-    if not isinstance(entry, dict):
-        return {}
+def _bounded_audit_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Project a record already validated by the canonical audit boundary."""
     allowed = {
         "attempted_at",
         "plan_id",

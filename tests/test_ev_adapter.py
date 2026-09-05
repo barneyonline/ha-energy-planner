@@ -1383,9 +1383,7 @@ def test_existing_safe_ev_state_still_neutralizes_separate_start_switch() -> Non
     assert result.reason == "ev_charging_stopped_and_start_reset"
     assert result.command_sent is True
     assert result.safe_state_confirmed is True
-    assert hass.services.calls == [
-        ("switch", "turn_off", {"entity_id": "switch.ev_start"})
-    ]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.ev_start"})]
 
 
 def test_ev_restore_momentary_takeover_uses_configured_safe_stop() -> None:
@@ -1909,3 +1907,40 @@ def test_native_schedule_and_manual_commands_control_charger_directly() -> None:
         ("switch", "turn_on", {"entity_id": "switch.charger"}),
         ("switch", "turn_off", {"entity_id": "switch.charger"}),
     ]
+
+
+def test_ev_dispatch_timeout_accepts_observed_feedback_without_retry(monkeypatch: Any) -> None:
+    from custom_components.ha_energy_planner import adapter_helpers
+
+    monkeypatch.setattr(adapter_helpers, "DEVICE_SERVICE_TIMEOUT_SECONDS", 0.005)
+    hass = FakeHass(
+        {
+            "binary_sensor.ev_connected": "on",
+            "sensor.feedback": "SUSPENDED_EVSE",
+            "button.start": "unknown",
+            "button.stop": "unknown",
+        }
+    )
+    calls: list[str] = []
+
+    async def accepted(domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+        calls.append(data["entity_id"])
+        hass.states.values["sensor.feedback"] = "CHARGING"
+        await asyncio.Event().wait()
+
+    hass.services.async_call = accepted
+    adapter = EVSmartChargingAdapter(
+        hass,
+        {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGING: "sensor.feedback",
+            CONF_EV_CHARGER_START: "button.start",
+            CONF_EV_CHARGER_STOP: "button.stop",
+        },
+        confirmation_timeout_seconds=0.02,
+        confirmation_poll_seconds=0.001,
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START)))
+    assert result.applied and result.command_sent
+    assert result.reason == "ev_charging_confirmed_after_service_error"
+    assert calls == ["button.start"]

@@ -4,6 +4,50 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from typing import Any, Protocol
+
+
+class OwnershipStore(Protocol):
+    """Durability boundary required by actuator ownership transactions."""
+
+    data: dict[str, Any]
+
+    async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
+        """Persist ownership through the integration Store."""
+
+    async def async_flush(self) -> None:
+        """Wait until all pending mutations are durable."""
+
+
+@dataclass(frozen=True, slots=True)
+class EnphaseOwnership:
+    """Validated profile baseline at the persisted-dictionary boundary."""
+
+    profile: str | None = None
+    changed_at: datetime | str | None = None
+
+    @classmethod
+    def from_mapping(cls, value: Any) -> EnphaseOwnership:
+        """Read legacy Store values without retaining invalid profile baselines."""
+        if not isinstance(value, dict):
+            return cls()
+        profile = value.get("enphase_profile")
+        changed_at = value.get("enphase_profile_changed_at")
+        return cls(
+            profile if isinstance(profile, str) and profile else None,
+            changed_at if isinstance(changed_at, datetime | str) else None,
+        )
+
+    def apply_to(self, ownership: dict[str, Any]) -> None:
+        """Replace only Enphase fields, preserving other assets and unknown fields."""
+        for key, value in (
+            ("enphase_profile", self.profile),
+            ("enphase_profile_changed_at", self.changed_at),
+        ):
+            if value is None:
+                ownership.pop(key, None)
+            else:
+                ownership[key] = value
 
 
 @dataclass(slots=True)

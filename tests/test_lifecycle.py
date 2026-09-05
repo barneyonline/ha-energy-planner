@@ -139,9 +139,7 @@ def test_config_entry_migration_uses_only_measured_legacy_load() -> None:
     assert asyncio.run(async_migrate_entry(hass, measured)) is True
     assert measured.data == {CONF_HOUSEHOLD_LOAD: "sensor.whole_home_power"}
     assert manager.updated_entries[-1][1]["version"] == 5
-    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == DEFAULT_OPTIONS[
-        CONF_EV_SOC_PER_KWH
-    ]
+    assert manager.updated_entries[-1][1]["options"][CONF_EV_SOC_PER_KWH] == DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
     assert asyncio.run(async_migrate_entry(hass, forecast_only)) is True
     assert forecast_only.data == {}
 
@@ -192,9 +190,7 @@ def test_config_entry_migration_accepts_vehicle_target_from_legacy_subentry() ->
         data={CONF_EV_SOC: "sensor.ev_soc"},
         options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
     )
-    entry.subentries["ev"].data = {
-        CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target_soc"
-    }
+    entry.subentries["ev"].data = {CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target_soc"}
 
     assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
     assert manager.updated_entries[-1][1]["version"] == 5
@@ -431,9 +427,7 @@ def test_failed_configuration_reload_handoff_restarts_safe_recovery() -> None:
 def test_unload_stops_when_safe_state_restore_fails() -> None:
     coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
     coordinator.restore_outcome = SimpleNamespace(result=OutcomeResult.FAILED)
-    coordinator.store.data["ownership"] = {
-        "ev_smart_charging_state": {"switch.ev": "on"}
-    }
+    coordinator.store.data["ownership"] = {"ev_smart_charging_state": {"switch.ev": "on"}}
     entry = FakeEntry(runtime_data=coordinator)
     hass = FakeHass(FakeConfigEntries())
 
@@ -637,20 +631,14 @@ def test_rehydrate_all_loads_unstarted_entry_stores(monkeypatch: pytest.MonkeyPa
             )
             constructed.append((entry_id, legacy_fallback))
             if legacy_fallback:
-                self.data["ownership"] = {
-                    "ev_smart_charging_state": {
-                        "input_boolean.ev_start": "off"
-                    }
-                }
+                self.data["ownership"] = {"ev_smart_charging_state": {"input_boolean.ev_start": "off"}}
 
     monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", OwnedStore)
 
     asyncio.run(_async_rehydrate_all_ev_grid_reservations(hass))
 
     assert constructed == [("named", False), ("legacy", True)]
-    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {
-        "legacy"
-    }
+    assert set(hass.data["ha_energy_planner"]["ev_grid_reservations"]) == {"legacy"}
 
 
 def test_rehydrate_reservation_defensive_branches() -> None:
@@ -847,7 +835,7 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
 ) -> None:
     updated: list[tuple[str, dict[str, Any]]] = []
     created: list[dict[str, Any]] = []
-    lookups: list[tuple[tuple[str, str], str]] = []
+    lookups: list[str] = []
     removed: list[str] = []
 
     class FakeEntityRegistry:
@@ -875,6 +863,9 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
             ),
         }
 
+        def async_get_entity_id(self, platform: str, domain: str, unique_id: str) -> None:
+            return None
+
         def async_update_entity(self, entity_id: str, **kwargs: Any) -> None:
             updated.append((entity_id, kwargs))
 
@@ -883,20 +874,22 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
             created.append(kwargs)
             return SimpleNamespace(id="planner_device")
 
-        def async_get_device_by_identifier(
-            self, identifier: tuple[str, str], config_entry_id: str
-        ) -> Any:
-            lookups.append((identifier, config_entry_id))
-            identifier = identifier[1]
-            if identifier in {"test_entry_system", "test_entry_ai", "test_entry_controls"}:
-                return SimpleNamespace(id=f"old_{identifier.rsplit('_', 1)[-1]}")
-            return None
-
         def async_remove_device(self, device_id: str) -> None:
             removed.append(device_id)
 
+    def devices_for_entry(registry: Any, config_entry_id: str) -> list[Any]:
+        lookups.append(config_entry_id)
+        devices = [
+            SimpleNamespace(id=f"old_{suffix}", identifiers={("ha_energy_planner", f"test_entry_{suffix}")})
+            for suffix in ("system", "ai", "controls")
+        ]
+        devices.append(SimpleNamespace(id="planner_device", identifiers={("ha_energy_planner", "test_entry")}))
+        devices.append(SimpleNamespace(id="unrelated_device", identifiers={("ha_energy_planner", "unrelated")}))
+        return devices
+
     monkeypatch.setattr("homeassistant.helpers.entity_registry.async_get", lambda hass: FakeEntityRegistry())
     monkeypatch.setattr("homeassistant.helpers.device_registry.async_get", lambda hass: FakeDeviceRegistry())
+    monkeypatch.setattr("homeassistant.helpers.device_registry.async_entries_for_config_entry", devices_for_entry)
 
     _async_sync_planner_device(FakeHass(FakeConfigEntries()), FakeEntry(title="House Planner"))
 
@@ -919,8 +912,154 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
             {"device_id": "planner_device", "config_subentry_id": None},
         ),
     ]
-    assert lookups == [
-        (("ha_energy_planner", f"test_entry_{suffix}"), "test_entry")
-        for suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls")
-    ]
+    assert lookups == ["test_entry"]
     assert removed == ["old_system", "old_ai", "old_controls"]
+
+
+@pytest.mark.parametrize("stage", ["refresh", "forward"])
+def test_setup_cancellation_cleans_all_resources(monkeypatch: pytest.MonkeyPatch, stage: str) -> None:
+    async def run() -> None:
+        entered = asyncio.Event()
+
+        class CancelCoordinator(FakeCoordinator):
+            async def async_config_entry_first_refresh(self) -> None:
+                await super().async_config_entry_first_refresh()
+                if stage == "refresh":
+                    entered.set()
+                    await asyncio.Event().wait()
+
+        class Manager(FakeConfigEntries):
+            async def async_forward_entry_setups(self, entry: Any, platforms: Any) -> None:
+                entered.set()
+                await asyncio.Event().wait()
+
+        monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", FakeStore)
+        monkeypatch.setattr(
+            "custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", CancelCoordinator
+        )
+        entry = FakeEntry()
+        manager = Manager()
+        task = asyncio.create_task(async_setup_entry(FakeHass(manager), entry))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        coordinator = FakeCoordinator.last_instance
+        assert coordinator is not None
+        assert coordinator.final_shutdown_count == 1
+        assert coordinator.restore_calls == [("setup_entry_failed", False)]
+        assert coordinator.auto_recovery_cancel_reasons == ["setup_entry_failed"]
+        assert not hasattr(entry, "runtime_data")
+        assert bool(manager.unloaded) is (stage == "forward")
+
+    asyncio.run(run())
+
+
+def test_setup_cleanup_continues_after_failure_and_repeated_cancel(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def run() -> None:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class CleanupCoordinator(FakeCoordinator):
+            async def async_shutdown(self) -> None:
+                entered.set()
+                await release.wait()
+                raise RuntimeError("shutdown failed")
+
+            async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> Any:
+                from custom_components.ha_energy_planner.notifications import defer_persistent_notification
+
+                await super().async_restore_safe_state(reason, refresh=refresh)
+                defer_persistent_notification(
+                    self.hass, "cleanup_notice", lambda: asyncio.sleep(0), owner_id=self.entry.entry_id
+                )
+
+        monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", FakeStore)
+        monkeypatch.setattr(
+            "custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", CleanupCoordinator
+        )
+        entry = FakeEntry()
+        monkeypatch.setattr(
+            "custom_components.ha_energy_planner.notifications.async_at_started", lambda *args: lambda: None
+        )
+        hass = FakeHass(FakeConfigEntries(fail_forward=True), state=CoreState.starting)
+        task = asyncio.create_task(async_setup_entry(hass, entry))
+        await entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(RuntimeError, match="platform setup failed"):
+            await task
+        coordinator = FakeCoordinator.last_instance
+        assert coordinator is not None
+        assert coordinator.restore_calls == [("setup_entry_failed", False)]
+        assert not hasattr(entry, "runtime_data")
+        assert hass.data == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("helper_off", [False, True])
+def test_reload_drains_and_suppresses_queued_manual_listener_jobs(helper_off: bool) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from custom_components.ha_energy_planner.const import CONF_CLIMATE_MANUAL_OVERRIDE
+    from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+
+    async def run() -> None:
+        coordinator = object.__new__(EnergyPlannerCoordinator)
+        coordinator._command_lock = asyncio.Lock()
+        coordinator._planner_lock = asyncio.Lock()
+        coordinator._debounce_cancel = None
+        coordinator._boundary_cancel = None
+        coordinator._unsub_listeners = []
+        coordinator._configuration_reload_handoff = True
+        coordinator.overrides = []
+        entry = SimpleNamespace(
+            entry_id="test",
+            data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+            options={},
+            subentries={},
+            runtime_data=coordinator,
+        )
+        coordinator.entry = entry
+        coordinator.store = SimpleNamespace(
+            data={"ownership": {}}, async_save_overrides=AsyncMock(), async_save_ownership=AsyncMock()
+        )
+        coordinator.executor = SimpleNamespace(async_release_hvac_control=AsyncMock())
+        coordinator.hass = SimpleNamespace(
+            state=CoreState.running,
+            data={},
+            async_create_task=asyncio.create_task,
+            services=SimpleNamespace(async_call=AsyncMock()),
+            config_entries=SimpleNamespace(async_unload_platforms=AsyncMock(return_value=True)),
+        )
+        coordinator._mark_forced_refresh = Mock()
+        coordinator.async_request_refresh = AsyncMock()
+        coordinator.async_cancel_startup_auto_recovery = AsyncMock()
+        lock = coordinator._planner_lock if helper_off else coordinator._command_lock
+        await lock.acquire()
+        job = (
+            coordinator._async_handle_manual_override_helper(False)
+            if helper_off
+            else coordinator.async_set_manual_hvac_override(10, "queued_manual")
+        )
+        coordinator._async_create_listener_task(job)
+        await asyncio.sleep(0)
+        unload = asyncio.create_task(async_unload_entry(coordinator.hass, entry))
+        await asyncio.sleep(0)
+        assert not unload.done()
+        lock.release()
+        assert await unload is True
+        assert not hasattr(entry, "runtime_data")
+        assert not coordinator._listener_tasks
+        coordinator.store.async_save_overrides.assert_not_called()
+        coordinator.store.async_save_ownership.assert_not_called()
+        coordinator.hass.services.async_call.assert_not_called()
+        coordinator.executor.async_release_hvac_control.assert_not_called()
+        rejected = coordinator.async_set_manual_hvac_override(10, "too_late")
+        coordinator._async_create_listener_task(rejected)
+        assert rejected.cr_frame is None
+
+    asyncio.run(run())

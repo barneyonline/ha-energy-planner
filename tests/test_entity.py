@@ -12,7 +12,6 @@ from custom_components.ha_energy_planner.entity import (
     EnergyPlannerEntity,
     _compact_attribute_value,
     _normalize_attribute_value,
-    async_add_planner_entities,
     planner_device_identifier,
     recorder_safe_attributes,
     recorder_safe_identifier,
@@ -21,9 +20,7 @@ from custom_components.ha_energy_planner.entity import (
 
 
 def test_planner_entity_uses_single_named_device() -> None:
-    coordinator = SimpleNamespace(
-        entry=SimpleNamespace(entry_id="entry-1", title="House Energy Planner")
-    )
+    coordinator = SimpleNamespace(entry=SimpleNamespace(entry_id="entry-1", title="House Energy Planner"))
 
     entity = EnergyPlannerEntity(coordinator, "plan_status")
 
@@ -32,30 +29,6 @@ def test_planner_entity_uses_single_named_device() -> None:
     assert entity.device_info["name"] == "House Energy Planner"
     assert entity.device_info["model"] == "Energy Planner"
     assert planner_device_identifier("entry-1") == (DOMAIN, "entry-1")
-
-
-def test_planner_entity_ignores_legacy_group_hint() -> None:
-    coordinator = SimpleNamespace(
-        entry=SimpleNamespace(entry_id="entry-1", title="Energy Planner")
-    )
-
-    entity = EnergyPlannerEntity(coordinator, "ai_enabled", "ai")
-
-    assert entity.device_info["identifiers"] == {(DOMAIN, "entry-1")}
-    assert entity.device_info["name"] == "Energy Planner"
-
-
-def test_add_planner_entities_adds_every_entity_to_main_entry() -> None:
-    entities = [object(), object()]
-    calls: list[list[object]] = []
-
-    async_add_planner_entities(
-        SimpleNamespace(),
-        lambda added: calls.append(added),
-        entities,
-    )
-
-    assert calls == [entities]
 
 
 def test_recorder_safe_attributes_preserve_small_payloads() -> None:
@@ -111,15 +84,13 @@ def test_attribute_normalization_and_compaction_handle_defensive_boundaries() ->
         )["nested"]
         == "<truncated>"
     )
-    assert (
-        _compact_attribute_value(
-            object(),
-            string_bytes=64,
-            list_items=2,
-            mapping_items=2,
-            max_depth=1,
-        ).startswith("<object object at")
-    )
+    assert _compact_attribute_value(
+        object(),
+        string_bytes=64,
+        list_items=2,
+        mapping_items=2,
+        max_depth=1,
+    ).startswith("<object object at")
 
 
 def test_recorder_safe_text_observes_utf8_byte_limit() -> None:
