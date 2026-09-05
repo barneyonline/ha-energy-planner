@@ -11,15 +11,15 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Actuator recovery metadata uses atomic Home Assistant Store writes with an
   explicit successful-write acknowledgement. Home Assistant's logged write
-  failures and shutdown-deferred saves cannot acknowledge the pending generation
-  or permit new device dispatch. `tests/test_control_runtime.py` injects real
+  failures cannot acknowledge the pending generation or permit new device
+  dispatch; shutdown-deferred writes must be flushed before acknowledgement. `tests/test_control_runtime.py` injects real
   Store write failures before EV, HVAC and Enphase commands, verifies retries,
   and recovers interrupted commands using newly constructed HA/Store/executor
   instances and persisted ownership/reservations. The compatibility matrix runs
   these contracts on the minimum, pinned and stable Home Assistant versions.
 - Operator disarm revokes command authority and restores owned HVAC before
   flushing the resulting state. Real Store tests cover disk failures and
-  shutdown-deferred saves after takeover, including partial restoration failure,
+  write failures during shutdown after takeover, including partial restoration failure,
   retained durable recovery evidence, listener updates, and successful retries.
   Acquisition continues to require its explicit durable flush.
 - Continuous EV windows minimize total energy cost, including fractional final
@@ -345,11 +345,11 @@ use throughout; the Docker and pull-request gates enforce that result.
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
   fails safe to the full CI set for an unclassified trigger path.
   Behavioral changes also run real runtime contracts and smoke tests on the HACS
-  minimum version, pinned HA 2026.8.2, and current stable. Documentation-only
+  minimum version, pinned HA 2026.9.0, previous HA 2026.8.2, and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
-  complete local gate including minimum/pinned runtime contracts and stable smoke.
+  complete local gate including minimum/pinned runtime contracts and package smoke.
   Coverage instruments branches, enforces exactly 100% statement coverage with
-  `scripts/check_coverage.py`, and publishes branch evidence separately. The smoke test
+  `scripts/check_coverage.py`, and rejects per-module branch regressions against the reviewed baseline. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
@@ -827,3 +827,27 @@ use throughout; the Docker and pull-request gates enforce that result.
   `scripts/export-real-validation-bundle.sh` command remains available for
   later validation against an operator's actual Home Assistant instance, but
   real-instance execution is not required for the current covered status.
+
+
+## Stable release preparation (September 2026)
+
+- Recovery persistence observes the actual Home Assistant Store write hook. Write
+  and serialization failures remain dirty and block new acquisitions; cancellation
+  drains the write and shutdown flushes deferred data before acknowledging it.
+  Evidence: `durable_storage.py`, `tests/test_storage_runtime.py`.
+- Real HA upgrade/reload/restart tests use a synthetic 0.9.18 Store/config fixture,
+  preserve the live Mode entity ID, manual override and unresolved ownership and
+  reservation. Missing legacy vehicle targets can be repaired with Reconfigure.
+  Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
+- Entry deletion removes resolved per-entry storage and retains unresolved evidence.
+- Support policy and tooling versions come from HACS/pyproject through
+  `scripts/support_policy.py`. Weekly compatibility jobs pull their runtime image.
+- Deterministic component ZIP/checksum creation runs before publication; runtime
+  smoke installs the unpacked artifact. Exact image/tool metadata is retained.
+- Current configuration, public contracts, upgrade/rollback and data-retention
+  policy are in `docs/stable-release.md`; the old specification is archived.
+- `docs/release-checklist.md` and the observation validator require real operating
+  evidence before a stable 1.x release. That observation is pending; synthetic
+  validation does not claim household acceptance.
+  `tests/scripts/test_release_tools.py` verifies that every scenario rejects
+  missing, blank, and non-string evidence references.

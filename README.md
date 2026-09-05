@@ -43,8 +43,8 @@ windows, including solar opportunity cost and partial final slots. Configured
 carbon preferences, active-session continuity, and ready-by limits still apply.
 
 Before acquiring device control, Energy Planner requires confirmation that
-recovery metadata was written to storage. Failed or deferred writes block new
-commands and remain pending for retry.
+recovery metadata was written to storage. Failed writes block new commands and remain pending for retry.
+Shutdown-deferred writes are flushed before command authority is granted.
 Disarming still restores planner-owned HVAC zones and automations when storage
 is unavailable. A failed save is reported after restoration, and the resulting
 state remains pending for retry.
@@ -87,7 +87,7 @@ blocks when automating planner behavior.
 
 ## Requirements
 
-- Home Assistant `2026.6.0` or newer.
+- Home Assistant `2026.6.0` or newer; the pinned release-validation baseline is `2026.9.0`.
 - Import and export tariff forecast sensors, commonly supplied by Amber Electric.
 - An external PV forecast, commonly Solcast Forecast Today and optionally Forecast Tomorrow.
 - A measured whole-home instantaneous consumption sensor in W, kW, or MW.
@@ -98,7 +98,7 @@ Weather, carbon intensity, measured PV power, and AI explanations are optional. 
 
 ## Configuration
 
-Initial setup asks for a name and the core planning inputs. After adding the integration, open **Configure** to manage six areas:
+Initial setup asks for a planner name. Then open **Configure** to map inputs and manage six areas:
 
 - Energy, battery, grid, and data.
 - Climate and presence.
@@ -132,13 +132,14 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - Optional AI explanations depend on a configured Home Assistant `ai_task`
   entity and remain advisory only. A newly created AI Task with state `unknown`
   can be used immediately; only a missing or explicitly `unavailable` provider
-  blocks Explain.
+  blocks Explain. A configured provider may run locally or in a cloud service;
+  selected planner context is sent to that provider when Explain is requested.
 - Bypassing safety gates is an advanced, default-off setting that reduces protection and should be used only with an explicit understanding of the risk.
 
 ## Troubleshooting
 
 - **Load model stays in learning:** verify Recorder history, the sensor unit, and that the source represents gross household demand rather than solar, energy totals, forecasts, or signed net grid flow.
-- **Automatic control is on but Armed is off:** check Production readiness, Current state, Next actions, active pauses, review evidence, and the latest preflight result.
+- **Automatic control is on but Armed is off:** check Current state, Next actions, active pauses, and the output of Run safety check or `ha_energy_planner.run_preflight`.
 - **No action is planned:** confirm the relevant device-control switch is on and that the required tariff, PV, load, SOC, presence, and device inputs are current.
 - **A device command fails or is not confirmed:** turn off Automatic control, run `ha_energy_planner.restore_safe_state`, and verify the mapped services and feedback entities.
 - **Control should stop immediately:** turn off the relevant device-control switch or Automatic control. Use `ha_energy_planner.pause_control` for a bounded pause.
@@ -153,6 +154,8 @@ the background, publishes only for the current configuration, and backs off
 failed EV history imports for 15 minutes. Plans remain subject to the existing
 input-health and control safety gates while training is pending.
 
+Storage errors block new device acquisitions until recovery evidence is successfully written. Check disk space and Home Assistant storage permissions if a save fails. Startup recovery waits 30 seconds between unexpected failures. Use the restore action for existing ownership and verify device feedback before resuming control.
+
 ## Removal
 
 1. Turn off **Automatic control** and each device-control switch.
@@ -161,10 +164,14 @@ input-health and control safety gates while training is pending.
 4. If installed through HACS, remove Energy Planner from HACS. For a manual install, delete `custom_components/ha_energy_planner`.
 5. Restart Home Assistant if you removed the custom integration files.
 
+Deleting an entry removes its retained model and audit storage only when its saved ownership and EV reservation are resolved. Uncertain recovery evidence is retained and logged; resolve device state before deleting the entry. The shared legacy import archive is retained.
+
 Removing Energy Planner stops future plans and commands. It does not remove source integrations, their entities, vendor accounts, or vendor data.
 
 ## Useful Links
 
+- [Setup examples, upgrades and stable contracts](docs/stable-release.md)
+- [Release acceptance checklist](docs/release-checklist.md)
 - [Releases](https://github.com/barneyonline/ha-energy-planner/releases)
 - [Issue tracker](https://github.com/barneyonline/ha-energy-planner/issues)
 - [Release notes](CHANGELOG.md)

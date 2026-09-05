@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant, ServiceCall
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
 
@@ -147,7 +148,7 @@ def test_real_disk_failure_blocks_device_dispatch_and_remains_retryable(tmp_path
 
             with monkeypatch.context() as patch:
                 patch.setattr(ha_storage, "write_utf8_file_atomic", disk_failure)
-                with pytest.raises(OSError, match="write was not confirmed"):
+                with pytest.raises(HomeAssistantError):
                     await executor.async_evaluate(*_command(area))
             assert calls == []
             assert store._is_dirty
@@ -269,11 +270,10 @@ def test_operator_disarm_restores_hvac_before_failed_persistence(
                 patch.setattr(
                     "custom_components.ha_energy_planner.hvac_adapter.async_call_device_service", restore,
                 )
-                if failure == "disk":
-                    patch.setattr(ha_storage, "write_utf8_file_atomic", disk_failure)
-                else:
+                patch.setattr(ha_storage, "write_utf8_file_atomic", disk_failure)
+                if failure == "shutdown":
                     hass.state = CoreState.stopping
-                with pytest.raises(OSError, match="write was not confirmed"):
+                with pytest.raises(HomeAssistantError):
                     await coordinator.async_operator_disarm_production_control()
             hass.state = CoreState.running
             assert calls[before:] == [
@@ -314,7 +314,7 @@ def test_serialization_failure_preserves_last_durable_ownership(tmp_path) -> Non
         try:
             baseline = {"enphase_profile": "Original profile"}
             await store.async_save_ownership(baseline)
-            with pytest.raises(OSError, match="write was not confirmed"):
+            with pytest.raises(HomeAssistantError):
                 await store.async_save_ownership({**baseline, "invalid": object()})
             assert store._is_dirty
             fresh = PlannerStore(hass, "runtime")
@@ -328,19 +328,17 @@ def test_serialization_failure_preserves_last_durable_ownership(tmp_path) -> Non
     asyncio.run(run())
 
 
-def test_real_store_deferred_shutdown_write_is_not_acknowledged(tmp_path) -> None:
+def test_real_store_deferred_shutdown_write_is_flushed_before_acknowledgement(tmp_path) -> None:
     async def run() -> None:
         hass = HomeAssistant(str(tmp_path))
         store = PlannerStore(hass, "runtime")
         try:
             hass.state = CoreState.stopping
-            with pytest.raises(OSError, match="write was not confirmed"):
-                await store.async_save_ownership({"enphase_profile": "Original profile"})
-            assert store._is_dirty
-            # A later explicit retry must still write the same pending value.
-            hass.state = CoreState.running
             await store.async_save_ownership({"enphase_profile": "Original profile"})
             assert not store._is_dirty
+            # Verify actual disk contents before Core final_write can run.
+            persisted = json.loads(Path(store._store.path).read_text())
+            assert persisted["data"]["ownership"] == {"enphase_profile": "Original profile"}
             fresh = PlannerStore(hass, "runtime")
             await fresh.async_load()
             assert fresh.data["ownership"] == {"enphase_profile": "Original profile"}

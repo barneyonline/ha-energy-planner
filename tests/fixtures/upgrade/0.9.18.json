@@ -1,0 +1,21 @@
+{
+  "provenance": "Synthetic household using config version 5 and Store version 1 contracts from v0.9.18 (7ac59526c3f505cc03222b9d9307fd6d5da93548). No private household data.",
+  "entry": {
+    "title": "Upgrade fixture",
+    "data": {"instance_name": "Upgrade fixture"},
+    "options": {"planner_enabled": false, "dry_run": true, "climate_control_enabled": false, "ev_control_enabled": false, "enphase_control_enabled": false},
+    "version": 5
+  },
+  "store": {
+    "version": 1,
+    "minor_version": 1,
+    "data": {
+      "ownership": {"enphase_profile": "AI Optimisation"},
+      "ev_grid_reservation": {"active": true, "load_kw": 7.2},
+      "production": {"armed": false},
+      "overrides": [{"kind": "manual_hvac", "source": "service", "expires_at": "2099-01-01T00:00:00+00:00", "reason": "operator_requested"}],
+      "outcomes": [{"attempted_at": "2026-09-02T08:00:00+00:00", "action_id": "legacy-skip", "asset": "ev", "result": "skipped", "reason": "dry_run", "pre_state": {}, "post_state": {}}],
+      "execution_audit": [{"attempted_at": "2026-09-02T08:00:00+00:00", "action_id": "legacy-skip", "asset": "ev", "result": "skipped", "reason": "dry_run", "pre_state": {}, "post_state": {}}]
+    }
+  }
+}
