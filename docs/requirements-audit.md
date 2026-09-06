@@ -432,6 +432,29 @@ use throughout; the Docker and pull-request gates enforce that result.
   non-numeric interludes, reloads, and restarts. Missing or non-numeric evidence
   makes the continuous outage ineligible for fallback until numeric recovery.
   The option participates in production-evidence fingerprinting.
+- Load-fallback evidence includes `fallback_status`, `fallback_reason`, a plain
+  explanation, and remaining grace seconds in Current load forecast, the
+  existing plan presentation, and exported diagnostics. Tests distinguish
+  bridging, expired/disabled grace, missing/non-numeric inputs, invalid outage
+  timing, ineligible continuous outages, and unready/incomplete models without
+  weakening the 10-minute default or model-quality gate.
+- PV freshness uses the planning parser's final-interval coverage and the same
+  timestamp validation used to admit tomorrow's forecast. Regression cases
+  cover 23:30, the exclusive midnight endpoint, valid tomorrow coverage, absent
+  or expired tomorrow data, naive timestamps, invalid values, and leading gaps.
+  Existing continuous-horizon checks continue to reject incomplete plans.
+  Freshness interval checks require a parsed timestamped value; regression
+  tests reject old numeric arrays mixed with invalid dated records in both
+  primary and secondary sources, while fresh ordered sources remain supported.
+- Availability logging resolves known codes to bounded configured entity IDs,
+  reports per-input recovery duration, and suppresses unchanged outages.
+  Stable input identities group multiple reasons and discovery aliases,
+  preserving the first-loss time through stale/unavailable/non-numeric
+  transitions and partial issue resolution. Tests verify independent input
+  recovery and genuine entity remapping.
+  Arbitrary issue text and invalid entity values never enter logs. Evidence:
+  `availability.py`, `coordinator.py`, `tests/test_availability.py`, and the
+  coordinator transition/recovery tests.
 - Conservative-bound calibration treats each local day as one dependent block:
   it computes a finite-sample 90% positive-residual score per day and applies a
   conservative 95% finite-sample upper quantile across those day scores. This
