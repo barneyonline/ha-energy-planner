@@ -50,7 +50,7 @@ from .advice_runtime import (
 from .advice_runtime import (
     _material_preview as _material_preview,
 )
-from .availability import availability_details
+from .availability import AvailabilityIdentity, availability_details
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -942,17 +942,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     def _log_availability_transition(self, issues: list[str]) -> None:
         """Log each input transition with bounded details and recovery duration."""
-        active = set(availability_details(issues, self.entry_data))
-        previous: dict[str, float] = getattr(self, "_availability_outages", {})
+        active = availability_details(issues, self.entry_data)
+        previous: dict[AvailabilityIdentity, tuple[float, str]] = getattr(self, "_availability_outages", {})
         now = monotonic()
-        for detail in sorted(active - previous.keys()):
-            _LOGGER.warning("Planner required input or service unavailable: required_evidence_missing %s", detail)
-        for detail in sorted(previous.keys() - active):
+        for identity in sorted(active.keys() - previous.keys()):
+            _LOGGER.warning(
+                "Planner required input or service unavailable: required_evidence_missing %s", active[identity],
+            )
+        for identity in sorted(active.keys() & previous.keys()):
+            if active[identity] != previous[identity][1]:
+                _LOGGER.info("Planner required input still unavailable: required_evidence_changed %s", active[identity])
+        for identity in sorted(previous.keys() - active.keys()):
             _LOGGER.info(
                 "Planner required inputs and services recovered: required_evidence_restored %s outage_seconds=%.1f",
-                detail, max(now - previous[detail], 0),
+                previous[identity][1], max(now - previous[identity][0], 0),
             )
-        self._availability_outages = {detail: previous.get(detail, now) for detail in active}
+        self._availability_outages = {
+            identity: (previous[identity][0] if identity in previous else now, detail)
+            for identity, detail in active.items()
+        }
 
     @cached_property
     def _listener_tasks(self) -> set[asyncio.Task[Any]]:

@@ -8242,3 +8242,32 @@ def test_availability_logs_per_input_recovery_duration_and_mapping_changes(caplo
     coordinator._log_availability_transition(["household_load_entity_unavailable"])
     assert "entities=sensor.replacement" in caplog.records[-2].message
     assert "entities=sensor.house" in caplog.records[-1].message
+
+
+def test_availability_reason_changes_preserve_one_continuous_input_outage(caplog: Any, monkeypatch: Any) -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.entry.data["household_load_entity"] = "sensor.house"
+    coordinator.entry.data["pv_forecast_entity"] = "sensor.pv"
+    clock = [100.0]
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.monotonic", lambda: clock[0])
+    caplog.set_level(logging.INFO)
+    coordinator._log_availability_transition(["household_load_entity_stale", "pv_forecast_entity_stale"])
+    clock[0] = 400.0
+    coordinator._log_availability_transition(["household_load_entity_unavailable", "pv_forecast_entity_stale"])
+    clock[0] = 420.0
+    coordinator._log_availability_transition([
+        "household_load_entity_unavailable", "household_load_entity_non_numeric", "pv_forecast_entity_stale",
+    ])
+    clock[0] = 440.0
+    coordinator._log_availability_transition(["household_load_entity_non_numeric", "pv_forecast_entity_stale"])
+    coordinator._log_availability_transition(["pv_forecast_entity_stale", "household_load_entity_non_numeric"])
+    assert not any("required_evidence_restored" in record.message for record in caplog.records)
+    assert len([record for record in caplog.records if record.levelno == logging.WARNING]) == 2
+    assert len([record for record in caplog.records if "required_evidence_changed" in record.message]) == 3
+    clock[0] = 460.0
+    coordinator._log_availability_transition(["pv_forecast_entity_stale"])
+    assert "household_load_entity_non_numeric entities=sensor.house outage_seconds=360.0" in caplog.records[-1].message
+    clock[0] = 500.0
+    coordinator._log_availability_transition([])
+    assert "pv_forecast_entity_stale entities=sensor.pv outage_seconds=400.0" in caplog.records[-1].message
+    assert len([record for record in caplog.records if "required_evidence_restored" in record.message]) == 2
