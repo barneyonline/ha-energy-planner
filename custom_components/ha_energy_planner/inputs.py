@@ -136,6 +136,20 @@ _REQUIRED_FORECAST_CONFIGS = {
     CONF_PV_FORECAST,
 }
 
+_LOAD_FALLBACK_SUMMARIES = {
+    "live_source_available": "The live household-load sensor is available; outage fallback is not needed.",
+    "source_missing": "Fallback is unavailable because the configured household-load entity is missing.",
+    "source_non_numeric": "Fallback is unavailable because the household-load value is not numeric.",
+    "outage_ineligible": "Missing or invalid readings made this outage ineligible; a numeric recovery is required.",
+    "outage_start_unknown": "Fallback is unavailable because the outage start time cannot be verified.",
+    "outage_start_in_future": "Fallback is unavailable because the outage start time is in the future.",
+    "grace_disabled": "Household-load outage fallback is disabled by the configured grace period.",
+    "grace_expired": "The household-load outage has exceeded the configured grace period.",
+    "model_not_ready": "Fallback is unavailable because the load model is not current and quality-approved.",
+    "forecast_incomplete": "Fallback is unavailable because the model does not cover the whole planning horizon.",
+    "model_covering_outage": "The quality-approved load model is covering a temporary live-sensor outage.",
+}
+
 
 class InputManager:
     """Build normalized planner inputs from configured Home Assistant entities."""
@@ -411,6 +425,7 @@ class InputManager:
                 freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
                 value_keys=value_keys,
                 require_timestamped=True,
+                interval_minutes=interval,
             )
             if secondary_status == "usable":
                 assert secondary_state is not None
@@ -593,7 +608,7 @@ class InputManager:
             current_load_kw=clean_current_load if recent_load_is_clean else None,
             current_ev_charging=current_ev_charging,
         )
-        fallback_active, outage_seconds = self._load_model_fallback_status(
+        fallback_active, outage_seconds, fallback_reason = self._load_model_fallback_status(
             state,
             now=now,
             source_issue=source_issue,
@@ -603,8 +618,18 @@ class InputManager:
         )
         if fallback_active:
             source_issue = "household_load_model_fallback_active"
+        grace_seconds = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)), 0) * 60
+        fallback_details = {
+            "fallback_status": "active" if fallback_active else "unavailable" if source_issue else "not_needed",
+            "fallback_reason": fallback_reason,
+            "fallback_remaining_seconds": (
+                None if outage_seconds is None else round(max(grace_seconds - outage_seconds, 0), 3)
+            ),
+            "fallback_summary": _LOAD_FALLBACK_SUMMARIES[fallback_reason],
+        }
         self.load_forecast_details = {
             **result.details,
+            **fallback_details,
             "update_reason": self.load_forecast_update_reason,
             "live_source_status": (
                 "model_fallback"
@@ -629,6 +654,7 @@ class InputManager:
         )
         coverage_details = {
             **result.details,
+            **fallback_details,
             "classification": "degraded" if fallback_active else source_issue or (
                 "healthy" if result.status == "ready" else result.status
             ),
@@ -700,37 +726,50 @@ class InputManager:
         model_status: str,
         expected: list[float | None],
         upper: list[float | None],
-    ) -> tuple[bool, float | None]:
+    ) -> tuple[bool, float | None, str]:
         """Return whether a short known live-source outage may use the safe model."""
-        if state is None or source_issue != f"{CONF_HOUSEHOLD_LOAD}_unavailable":
-            return False, None
+        if state is None:
+            return False, None, "source_missing"
+        if source_issue is None:
+            return False, None, "live_source_available"
+        if source_issue != f"{CONF_HOUSEHOLD_LOAD}_unavailable":
+            return False, None, "source_non_numeric"
         if str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}:
-            return False, None
+            return False, None, "source_non_numeric"
         entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
         changed_at: Any = None
         if self.load_source_outage.get("entity_id") == entity_id:
             if self.load_source_outage.get("fallback_eligible") not in (None, True):
-                return False, None
+                return False, None, "outage_ineligible"
             changed_at = dt_util.parse_datetime(
                 str(self.load_source_outage.get("started_at") or "")
             )
             if changed_at is None:
-                return False, None
+                return False, None, "outage_start_unknown"
         else:
             changed_at = getattr(state, "last_changed", None)
         if not isinstance(changed_at, datetime):
-            return False, None
+            return False, None, "outage_start_unknown"
         if changed_at.tzinfo is None:
             changed_at = changed_at.replace(tzinfo=UTC)
         outage_seconds = (dt_util.as_utc(now) - dt_util.as_utc(changed_at)).total_seconds()
         if outage_seconds < 0:
-            return False, None
+            return False, None, "outage_start_in_future"
         grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)), 0)
-        within_grace = grace_minutes > 0 and outage_seconds < grace_minutes * 60
+        elapsed_seconds = outage_seconds
+        outage_seconds = round(outage_seconds, 3)
+        if grace_minutes == 0:
+            return False, outage_seconds, "grace_disabled"
+        if elapsed_seconds >= grace_minutes * 60:
+            return False, outage_seconds, "grace_expired"
+        if model_status != "ready":
+            return False, outage_seconds, "model_not_ready"
         complete = bool(expected) and len(expected) == len(upper) and all(
             value is not None for value in (*expected, *upper)
         )
-        return within_grace and model_status == "ready" and complete, round(outage_seconds, 3)
+        if not complete:
+            return False, outage_seconds, "forecast_incomplete"
+        return True, outage_seconds, "model_covering_outage"
 
     def _optional_series(
         self,
@@ -1023,7 +1062,9 @@ class InputManager:
                     state,
                     now,
                     _FORECAST_VALUE_KEYS_BY_CONFIG[key],
+                    interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
                 )
+                and not (key == CONF_PV_FORECAST and self._secondary_pv_covers_now(now))
             ):
                 issue = f"{key}_stale"
                 if key == CONF_CARBON_INTENSITY_FORECAST:
@@ -1037,6 +1078,25 @@ class InputManager:
         if load_state and now - load_state.last_updated > forecast_timeout:
             issues.append(f"{CONF_HOUSEHOLD_LOAD}_stale")
         return issues
+
+    def _secondary_pv_covers_now(self, now: datetime) -> bool:
+        """Use the same validated secondary source admitted by PV stitching."""
+        entity_id = self.entry_data.get(CONF_PV_FORECAST_SECONDARY)
+        state = self._state(entity_id) if entity_id else None
+        value_keys = _FORECAST_VALUE_KEYS_BY_CONFIG[CONF_PV_FORECAST]
+        if _forecast_source_status(
+            state,
+            now=now,
+            freshness_minutes=int(self.options[CONF_FORECAST_FRESHNESS_MINUTES]),
+            value_keys=value_keys,
+            require_timestamped=True,
+            interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+        ) != "usable":
+            return False
+        assert state is not None
+        return _has_current_forecast_slot(
+            state, now, value_keys, interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+        )
 
     def current_forecast_observations(self) -> dict[str, dict[str, Any] | None]:
         """Return timestamped observed power from dedicated ground-truth entities."""
@@ -1312,9 +1372,28 @@ def _combined_confidence(values: list[float]) -> float:
     return round(min(values), 4)
 
 
-def _has_current_forecast_data(state: State, now: datetime, value_keys: tuple[str, ...]) -> bool:
+def _has_current_forecast_data(
+    state: State, now: datetime, value_keys: tuple[str, ...], *, interval_minutes: int,
+) -> bool:
     latest_valid_at = latest_forecast_valid_at_from_state(state, value_keys=value_keys)
-    return latest_valid_at is not None and latest_valid_at >= now
+    return latest_valid_at is not None and (
+        latest_valid_at >= now or _has_current_forecast_slot(state, now, value_keys, interval_minutes=interval_minutes)
+    )
+
+
+def _has_current_forecast_slot(
+    state: State, now: datetime, value_keys: tuple[str, ...], *, interval_minutes: int,
+) -> bool:
+    """Respect the same final-interval cadence and exclusive end as planning."""
+    series = forecast_series_from_state(
+        state,
+        issued_at=now,
+        horizon_hours=1,
+        interval_minutes=interval_minutes,
+        value_keys=value_keys,
+        value_kind="power",
+    )
+    return bool(series and series[0] is not None)
 
 
 def _forecast_source_status(
@@ -1324,6 +1403,7 @@ def _forecast_source_status(
     freshness_minutes: int,
     value_keys: tuple[str, ...],
     require_timestamped: bool = False,
+    interval_minutes: int = 5,
 ) -> str:
     """Classify an optional forecast source without affecting usable siblings."""
     if state is None or state.state in STATE_UNKNOWN_VALUES:
@@ -1332,6 +1412,7 @@ def _forecast_source_status(
         state,
         now,
         value_keys,
+        interval_minutes=interval_minutes,
     ):
         return "stale"
     if require_timestamped:

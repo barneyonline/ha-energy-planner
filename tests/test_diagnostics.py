@@ -71,6 +71,13 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
             store=FakeStore(
                 {
                     "discovery": {"longitude": 145.1, "status": "ok"},
+                    "forecast_snapshots": [{"plan_id": "plan-1", "built_in_load_forecast": {
+                        "fallback_status": "active",
+                        "fallback_reason": "model_covering_outage",
+                        "fallback_remaining_seconds": 420,
+                        "fallback_summary": "The model is covering a temporary outage.",
+                        "api_token": "secret-value",
+                    }}],
                     "haeo_runs": [{"baseline": {"status": "stale"}}],
                     "production": {
                         "startup_auto_recovery": {
@@ -101,6 +108,9 @@ def test_diagnostics_redacts_sensitive_keys() -> None:
 
     diagnostics = asyncio.run(async_get_config_entry_diagnostics(None, entry))
 
+    assert diagnostics["load_forecast"]["fallback_remaining_seconds"] == 420
+    assert diagnostics["load_forecast"]["fallback_reason"] == "model_covering_outage"
+    assert "api_token" not in diagnostics["load_forecast"]
     assert diagnostics["entry"]["data"]["api_token"] == "**REDACTED**"
     assert diagnostics["entry"]["data"]["latitude"] == "**REDACTED**"
     assert diagnostics["entry"]["data"]["safe"] == "value"

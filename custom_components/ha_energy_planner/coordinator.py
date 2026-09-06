@@ -50,6 +50,7 @@ from .advice_runtime import (
 from .advice_runtime import (
     _material_preview as _material_preview,
 )
+from .availability import availability_details
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -939,21 +940,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._sync_ai_request_to_plan(plan)
         return result
 
-    _availability_unavailable = False
-
     def _log_availability_transition(self, issues: list[str]) -> None:
-        """Log our required-input degradation once, without upstream payloads."""
-        unavailable = any(
-            "unavailable" in issue or "not_found" in issue or "missing" in issue
-            for issue in issues
-        )
-        if unavailable == self._availability_unavailable:
-            return
-        self._availability_unavailable = unavailable
-        if unavailable:
-            _LOGGER.warning("Planner required input or service unavailable: required_evidence_missing")
-        else:
-            _LOGGER.info("Planner required inputs and services recovered: required_evidence_restored")
+        """Log each input transition with bounded details and recovery duration."""
+        active = set(availability_details(issues, self.entry_data))
+        previous: dict[str, float] = getattr(self, "_availability_outages", {})
+        now = monotonic()
+        for detail in sorted(active - previous.keys()):
+            _LOGGER.warning("Planner required input or service unavailable: required_evidence_missing %s", detail)
+        for detail in sorted(previous.keys() - active):
+            _LOGGER.info(
+                "Planner required inputs and services recovered: required_evidence_restored %s outage_seconds=%.1f",
+                detail, max(now - previous[detail], 0),
+            )
+        self._availability_outages = {detail: previous.get(detail, now) for detail in active}
 
     @cached_property
     def _listener_tasks(self) -> set[asyncio.Task[Any]]:

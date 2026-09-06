@@ -12,11 +12,17 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Solar forecasts remain valid through their final interval and across midnight
+  when the configured tomorrow forecast supplies current coverage. Missing or
+  expired forecast coverage continues to block unsafe plans.
 
 ### 🔧 Improvements
 
-- None
+- Availability warnings identify known issue codes and mapped entities, with
+  per-input recovery durations and no repeated messages for unchanged outages.
+- Current load forecast attributes and diagnostics explain whether the model
+  is bridging a sensor outage, the remaining grace time, and why fallback is
+  unavailable. The default 10-minute grace and safety requirements are unchanged.
 
 ### 🔄 Other changes
 

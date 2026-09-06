@@ -286,6 +286,12 @@ def _current_load_forecast_attrs(
         "recent_correction_factor": model.get("recent_correction_factor"),
         "current_correction_applied": model.get("current_correction_applied"),
         "fallback_applied": model.get("fallback_applied"),
+        "live_source_outage_seconds": model.get("live_source_outage_seconds"),
+        "outage_grace_minutes": model.get("outage_grace_minutes"),
+        "fallback_status": model.get("fallback_status"),
+        "fallback_reason": model.get("fallback_reason"),
+        "fallback_summary": model.get("fallback_summary"),
+        "fallback_remaining_seconds": model.get("fallback_remaining_seconds"),
         "update_reason": model.get("update_reason"),
         "quality_failures": model.get("quality_failures", []),
     }
