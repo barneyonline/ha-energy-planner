@@ -298,6 +298,12 @@ def test_current_load_forecast_sensor_exposes_expected_and_conservative_power() 
         "recent_correction_factor": 1.1,
         "current_correction_applied": True,
         "fallback_applied": False,
+        "live_source_outage_seconds": None,
+        "outage_grace_minutes": None,
+        "fallback_status": None,
+        "fallback_reason": None,
+        "fallback_summary": None,
+        "fallback_remaining_seconds": None,
         "update_reason": "load_forecast_ready",
         "quality_failures": [],
     }
@@ -463,6 +469,10 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
                         "first_upper_kw": 1.3,
                         "live_source_status": "model_fallback",
                         "live_source_outage_seconds": 120,
+                        "fallback_status": "active",
+                        "fallback_reason": "model_covering_outage",
+                        "fallback_remaining_seconds": 480,
+                        "fallback_summary": "The model is covering a temporary outage.",
                         "outage_grace_minutes": 10,
                         "current_correction_applied": False,
                         "fallback_applied": True,
@@ -502,6 +512,12 @@ def test_consolidated_status_entities_show_live_state_and_action_determination()
     assert current_attrs["weather_forecast"]["fetch_status"] == "cached_after_error"
     assert current_attrs["load_forecast"]["live_source_status"] == "model_fallback"
     assert current_attrs["load_forecast"]["fallback_applied"] is True
+    load_description = next(item for item in SENSORS if item.key == "current_load_forecast")
+    load_attrs = load_description.attrs_fn(coordinator)
+    assert load_attrs["fallback_remaining_seconds"] == 480
+    assert load_attrs["fallback_reason"] == "model_covering_outage"
+    assert load_attrs["fallback_status"] == "active"
+    assert "temporary outage" in load_attrs["fallback_summary"]
 
     assert next_actions.value_fn(coordinator) == ("Climate: Preconditioning: Heat to 21 C | EV: Start EV charging")
     action_attrs = next_actions.attrs_fn(coordinator)

@@ -353,6 +353,10 @@ def built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[
         "outage_grace_minutes",
         "current_correction_applied",
         "fallback_applied",
+        "fallback_status",
+        "fallback_reason",
+        "fallback_summary",
+        "fallback_remaining_seconds",
     )
     return {key: bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
 
