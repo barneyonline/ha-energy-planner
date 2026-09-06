@@ -59,12 +59,16 @@ def forecast_series_from_state(
     interval_minutes: int,
     value_keys: tuple[str, ...],
     value_kind: str,
+    require_timestamped: bool = False,
 ) -> list[float | None] | None:
     """Return a slot-aligned numeric forecast series from common HA attributes.
 
     Supports two common integration shapes:
     - list attributes such as ``forecast`` or ``forecasts`` with timestamped dicts
     - list attributes with ordered numeric values and no timestamps
+
+    Set ``require_timestamped`` for freshness evidence: ordered values have no
+    source interval and must not be treated as proof of current coverage.
     """
     attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
     raw_items = _forecast_items(attributes, value_keys)
@@ -88,6 +92,8 @@ def forecast_series_from_state(
         return None
 
     if all(valid_at is None for valid_at, _value in parsed):
+        if require_timestamped:
+            return None
         # Ordered payloads have no temporal metadata. Treat each source position as
         # exactly one planner interval and retain invalid positions as gaps. This is
         # deliberately conservative: inventing a longer cadence would silently

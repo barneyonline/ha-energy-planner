@@ -26,11 +26,13 @@ _DISCOVERY_KEYS = {
     "ev_stop_control_unavailable": ("ev_charger_stop_entity", "ev_charger_entity"),
 }
 
+type AvailabilityIdentity = tuple[tuple[str, ...], tuple[str, ...]]
 
-def availability_details(issues: list[str], entry_data: dict[str, Any]) -> list[str]:
+
+def availability_details(issues: list[str], entry_data: dict[str, Any]) -> dict[AvailabilityIdentity, str]:
     """Never put arbitrary issue text, configuration values or payloads in logs."""
-    details: set[str] = set()
-    for issue in issues:
+    details: dict[AvailabilityIdentity, set[str]] = {}
+    for issue in sorted(set(issues)):
         if issue.startswith("advisory_") or not any(part in issue for part in _ISSUE_SUFFIXES):
             continue
         keys = _DISCOVERY_KEYS.get(issue)
@@ -39,7 +41,7 @@ def availability_details(issues: list[str], entry_data: dict[str, Any]) -> list[
                 f"{key}_{suffix}" for suffix in _ISSUE_SUFFIXES
             })
         if not keys:
-            details.add("issue=required_evidence_missing entities=unidentified")
+            details.setdefault(((), ()), set()).add("issue=required_evidence_missing entities=unidentified")
             continue
         entities: set[str] = set()
         for key in keys:
@@ -48,5 +50,10 @@ def availability_details(issues: list[str], entry_data: dict[str, Any]) -> list[
             for entity in values:
                 if isinstance(entity, str) and re.fullmatch(r"[a-z_]+\.[a-z0-9_]{1,100}", entity.strip()):
                     entities.add(entity.strip())
-        details.add(f"issue={issue} entities={','.join(sorted(entities)[:4]) or 'not_configured'}")
-    return sorted(details)[:20]
+        # An input remains in one outage when its reason changes or only some
+        # of its issues clear. A genuine entity remapping starts a new outage.
+        identity = (tuple(sorted(keys)), tuple(sorted(entities)))
+        details.setdefault(identity, set()).add(
+            f"issue={issue} entities={','.join(sorted(entities)[:4]) or 'not_configured'}"
+        )
+    return {identity: "; ".join(sorted(reasons)[:20]) for identity, reasons in sorted(details.items())[:20]}

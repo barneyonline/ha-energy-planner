@@ -2130,3 +2130,50 @@ def test_load_fallback_requires_verifiable_transition_time() -> None:
         state, now=now, source_issue="household_load_entity_unavailable",
         model_status="ready", expected=[1.0], upper=[1.2],
     ) == (False, None, "outage_start_unknown")
+
+
+@pytest.mark.parametrize("invalid_value", ["invalid", "nan", None])
+def test_old_ordered_forecast_with_invalid_dated_record_stays_stale(invalid_value: Any) -> None:
+    now = datetime(2026, 9, 6, 14, tzinfo=UTC)
+    old = now - timedelta(days=2)
+    state = FakeState("1.0", {
+        "unit_of_measurement": "kW",
+        "forecast": [1.0] * 48 + [{"period_start": old.isoformat(), "pv_estimate": invalid_value}],
+    }, last_updated=old)
+    manager = _RawInputManager(FakeHass({"sensor.pv": state}), {
+        CONF_PV_FORECAST: "sensor.pv",
+    }, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    values, issue = manager._required_series(
+        CONF_PV_FORECAST, ("pv_estimate", "value"), "power", now, 12, 15,
+    )
+    # Ordered forecasts retain normal planning support, but cannot manufacture
+    # current temporal evidence to bypass their entity freshness timeout.
+    assert values == [1.0] * 48
+    assert issue is None
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now + timedelta(days=1))
+    state.last_updated = now
+    assert "pv_forecast_entity_stale" not in manager._freshness_issues(now)
+
+
+def test_old_mixed_secondary_forecast_cannot_supply_midnight_coverage() -> None:
+    now = datetime(2026, 9, 6, 14, tzinfo=UTC)
+    old = now - timedelta(days=2)
+    manager = _RawInputManager(FakeHass({
+        "sensor.today": FakeState("0", {"forecast": [
+            {"period_start": (old + timedelta(minutes=30 * i)).isoformat(), "pv_estimate": 0.0}
+            for i in range(48)
+        ]}, last_updated=old),
+        "sensor.tomorrow": FakeState("1", {"forecast": [1.0] * 48 + [
+            {"period_start": old.isoformat(), "pv_estimate": "invalid"},
+        ]}, last_updated=old),
+    }), {
+        CONF_PV_FORECAST: "sensor.today", CONF_PV_FORECAST_SECONDARY: "sensor.tomorrow",
+    }, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    _values, issue = manager._required_series(
+        CONF_PV_FORECAST, ("pv_estimate", "value"), "power", now, 12, 15,
+        secondary_config_key=CONF_PV_FORECAST_SECONDARY,
+    )
+    assert issue == "pv_forecast_entity_incomplete_horizon"
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
+    assert manager.forecast_coverage_details[0]["classification"] == "stale"

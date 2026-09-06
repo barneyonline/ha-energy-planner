@@ -1392,6 +1392,7 @@ def _has_current_forecast_slot(
         interval_minutes=interval_minutes,
         value_keys=value_keys,
         value_kind="power",
+        require_timestamped=True,
     )
     return bool(series and series[0] is not None)
 
