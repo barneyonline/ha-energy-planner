@@ -15,11 +15,6 @@
 
 Energy Planner is a local-first Home Assistant custom integration that coordinates tariffs, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles in one guarded plan.
 
-> [!IMPORTANT]
-> Energy Planner is an unofficial community project in active development. It is not affiliated with, endorsed by, or supported by Home Assistant, Enphase, Amber Electric, Solcast, Daikin, or other vendors.
->
-> Automatic control can issue real device commands. Begin in review mode, check the proposed plan and safety evidence, and keep the vendors' own protections and limits enabled.
-
 The Platinum quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
 
 ## Supported Functionality
@@ -141,6 +136,9 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 ## Troubleshooting
 
 - **Load model stays in learning:** verify Recorder history, the sensor unit, and that the source represents gross household demand rather than solar, energy totals, forecasts, or signed net grid flow.
+- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default 10-minute grace requires a current, quality-approved model with complete coverage; missing or invalid readings and expired grace still fail closed.
+- **Input availability warnings:** warnings identify the issue code and configured entities. Each input logs once on loss and once on recovery, including its observed outage duration. Reason changes are logged at info level and preserve the outage start; recovery requires every issue for that input to clear. Unrecognised issue text is omitted from logs.
+- **Solar forecasts near midnight:** configure both today and tomorrow forecasts. Freshness follows the forecast intervals used by planning, including the final interval through its end and validated tomorrow coverage after rollover. Missing or expired coverage still blocks unsafe plans. Untimestamped values remain subject to the entity freshness timeout even when mixed with malformed dated records.
 - **Automatic control is on but Armed is off:** check Current state, Next actions, active pauses, and the output of Run safety check or `ha_energy_planner.run_preflight`.
 - **No action is planned:** confirm the relevant device-control switch is on and that the required tariff, PV, load, SOC, presence, and device inputs are current.
 - **A device command fails or is not confirmed:** turn off Automatic control, run `ha_energy_planner.restore_safe_state`, and verify the mapped services and feedback entities.

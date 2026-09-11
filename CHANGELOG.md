@@ -15,10 +15,20 @@
 - Expired climate comfort holds no longer masquerade as active ownership and repeatedly release already-released control. Eligible preconditioning resumes at hold expiry, while future holds and unresolved restoration remain protected.
 - Preserve Solcast interval estimates as kW when their daily sensor reports kWh, preventing doubled solar forecasts and false grid-export-limit warnings. Explicit power units remain respected, and interval energy units still convert to average power. Calibration models and training snapshots from the previous conversion are invalidated once and rebuilt from new evidence.
 - Defer temperature synchronisation for off climate zones with no exposed target instead of blocking all climate control. Deferred zones receive no target writes through takeover, retries, and rollback; command-linked target recovery no longer looks like a manual override, while unrelated user changes remain protected; active zones with missing targets still block takeover.
+- Solar forecasts remain valid through their final interval and across midnight
+  when the configured tomorrow forecast supplies current coverage. Missing or
+  expired forecast coverage continues to block unsafe plans. Malformed dated
+  records cannot let old untimestamped values bypass the freshness timeout.
 
 ### 🔧 Improvements
 
-- None
+- Availability warnings identify known issue codes and mapped entities, with
+  per-input recovery durations and no repeated messages for unchanged outages.
+  Reason changes retain the original outage start and only log a recovery when
+  all issues for that input clear.
+- Current load forecast attributes and diagnostics explain whether the model
+  is bridging a sensor outage, the remaining grace time, and why fallback is
+  unavailable. The default 10-minute grace and safety requirements are unchanged.
 
 ### 🔄 Other changes
 
