@@ -563,6 +563,7 @@ def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
             "issues": ["home_assistant_unavailable"],
             "main_target_unavailable": [],
             "zone_targets_unavailable": [],
+            "zone_targets_deferred": [],
             "synchronize_zone_temperatures": False,
         }
     evidence = (
@@ -579,6 +580,7 @@ def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
         "issues": list(evidence.issues),
         "main_target_unavailable": list(evidence.details.get("main_target_unavailable", [])),
         "zone_targets_unavailable": list(evidence.details.get("zone_targets_unavailable", [])),
+        "zone_targets_deferred": list(evidence.details.get("zone_targets_deferred", [])),
         "synchronize_zone_temperatures": evidence.details.get("synchronize_zone_temperatures", False),
     }
 

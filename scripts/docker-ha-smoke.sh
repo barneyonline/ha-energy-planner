@@ -81,6 +81,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                 {
                     "created_at": valid_at.isoformat(),
                     "plan_id": "docker_smoke_calibration",
+                    "forecast_calibration_version": 4,
                     "forecast_training_slots": [
                         {
                             "valid_at": valid_at.isoformat(),
@@ -1386,7 +1387,7 @@ if "forecast_calibration" not in store_data:
     raise SystemExit("Planner Store did not initialize forecast calibration state")
 forecast_calibration = store_data.get("forecast_calibration", {})
 calibration = forecast_calibration.get("pv_forecast_kw", {})
-if calibration.get("model_version") != 3 or calibration.get("sample_count", 0) < 1:
+if calibration.get("model_version") != 4 or calibration.get("sample_count", 0) < 1:
     raise SystemExit(f"Forecast calibration did not store PV samples: {forecast_calibration}")
 if not any(sample.get("forecast") == 1.0 and sample.get("actual") == 2.0 for sample in calibration.get("samples", [])):
     raise SystemExit(f"Forecast calibration did not consume the aligned PV smoke sample: {calibration}")

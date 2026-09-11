@@ -8,6 +8,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from .adapter_helpers import zone_temperature_sync_deferred
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
@@ -172,11 +173,10 @@ class CapabilityDiscovery:
         unavailable_zones = [entity_id for entity_id in zones if _state_missing(self.hass, entity_id)]
         if unavailable_zones:
             issues.append("climate_zone_unavailable")
-        synchronize_targets = (
-            self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is True
-        )
+        synchronize_targets = self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY) is True
         main_target_unavailable: list[str] = []
         zone_targets_unavailable: list[str] = []
+        zone_targets_deferred: list[str] = []
         if climate and not _state_missing(self.hass, climate):
             climate_state = self.hass.states.get(climate)
             if not _has_finite_temperature_target(climate_state):
@@ -186,7 +186,9 @@ class CapabilityDiscovery:
             for entity_id in zones:
                 if not entity_id.startswith("climate.") or _state_missing(self.hass, entity_id):
                     continue
-                if not _has_finite_temperature_target(self.hass.states.get(entity_id)):
+                if zone_temperature_sync_deferred(self.hass.states.get(entity_id)):
+                    zone_targets_deferred.append(entity_id)
+                elif not _has_finite_temperature_target(self.hass.states.get(entity_id)):
                     zone_targets_unavailable.append(entity_id)
             if zone_targets_unavailable:
                 issues.append("climate_zone_target_unavailable")
@@ -198,8 +200,7 @@ class CapabilityDiscovery:
         if bool(scheduler_guard) != bool(scheduler_timer):
             issues.append("climate_scheduler_guard_incomplete")
         elif scheduler_guard and (
-            _state_missing(self.hass, str(scheduler_guard))
-            or _state_missing(self.hass, str(scheduler_timer))
+            _state_missing(self.hass, str(scheduler_guard)) or _state_missing(self.hass, str(scheduler_timer))
         ):
             issues.append("climate_scheduler_guard_unavailable")
         return CapabilityEvidence(
@@ -214,6 +215,7 @@ class CapabilityDiscovery:
                 "synchronize_zone_temperatures": synchronize_targets,
                 "main_target_unavailable": main_target_unavailable,
                 "zone_targets_unavailable": zone_targets_unavailable,
+                "zone_targets_deferred": zone_targets_deferred,
                 "manual_override_entity": manual_override,
                 "scheduler_guard_entity": scheduler_guard,
                 "scheduler_guard_timer_entity": scheduler_timer,
