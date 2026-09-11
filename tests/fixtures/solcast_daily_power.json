@@ -1,0 +1,20 @@
+{
+  "state": "42.0",
+  "attributes": {
+    "unit_of_measurement": "kWh",
+    "detailedForecast": [
+      {
+        "period_start": "2026-09-11T12:30:00+10:00",
+        "pv_estimate": 5.6506,
+        "pv_estimate10": 5.6506,
+        "pv_estimate90": 5.6506
+      },
+      {
+        "period_start": "2026-09-11T13:00:00+10:00",
+        "pv_estimate": 5.4,
+        "pv_estimate10": 5.4,
+        "pv_estimate90": 5.4
+      }
+    ]
+  }
+}

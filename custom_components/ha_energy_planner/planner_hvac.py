@@ -77,6 +77,14 @@ class HVACPlanningPolicy:
         high = context.occupied_temperature_high_c
         current = context.current_hvac_temperature_c
         interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        released_until = _datetime_value(active.get("released_until"))
+        if released_until is not None and set(active) == {"released_until"}:
+            # A hold survives release, but does not represent actuator ownership.
+            # Resolve it before comfort/override checks can emit another release.
+            if now < released_until:
+                return []
+            active = {}
+
         active_override = any(
             override.kind == "manual_hvac" and (override.expires_at is None or now < override.expires_at)
             for override in context.active_overrides
@@ -145,8 +153,6 @@ class HVACPlanningPolicy:
         released_until = _datetime_value(active.get("released_until"))
         if released_until is not None and now < released_until:
             return []
-        if released_until is not None and set(active) <= {"released_until"}:
-            active = {}
 
         if active:
             period_start = _datetime_value(active.get("period_start"))

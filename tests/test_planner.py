@@ -3296,6 +3296,10 @@ def test_comfort_release_holds_out_reacquisition_until_period_end() -> None:
     assert release.desired_state["released_until"] == period_end
     assert held == []
 
+    # Legacy ownership alongside a hold keeps its existing no-reacquisition gate.
+    context.hvac_control["legacy_ownership"] = True
+    assert DryRunPlanner(options).create_plan(context).actions == []
+
 
 def test_hvac_lifecycle_fail_safe_release_branches() -> None:
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}
@@ -3642,3 +3646,57 @@ def test_hvac_lifecycle_transitions_to_pre_peak_coast_after_selected_run() -> No
     assert active_action.desired_state["phase"] == "pre_peak_coast"
     assert active_action.desired_state["target_temperature"] == 19.0
     assert context.slots[0].projected_hvac_load_kw == 0.0
+
+
+@pytest.mark.parametrize("hold_offset_seconds", [-1, 0, 1])
+@pytest.mark.parametrize("temperature", [18.0, 19.0, 24.0, 25.0])
+def test_hold_only_state_expires_before_comfort_handoff(
+    hold_offset_seconds: int, temperature: float
+) -> None:
+    """A persisted hold is not ownership, including at either comfort boundary."""
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_precondition_lead_minutes": 30,
+        "hvac_precondition_min_price_delta": 0.20,
+    }
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_temperature_c = temperature
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 24
+    context.slots = [
+        DecisionSlot(context.created_at + timedelta(minutes=index * 5), price, 0.05, 1.0, 2.0)
+        for index, price in enumerate([0.10, 0.12, 0.15, 0.14, 0.13, 0.11, 0.45])
+    ]
+    hold = (context.created_at + timedelta(seconds=hold_offset_seconds)).isoformat()
+    context.hvac_control = {"released_until": hold}
+
+    plan = DryRunPlanner(options).create_plan(context)
+    climate_actions = [action for action in plan.actions if action.asset == ActionAsset.DAIKIN]
+
+    assert context.hvac_control == {"released_until": hold}
+    if hold_offset_seconds > 0:
+        assert climate_actions == []
+    else:
+        assert climate_actions[0].kind == ActionKind.SET_HVAC
+        assert climate_actions[0].desired_state["phase"] == "preconditioning"
+        assert climate_actions[0].desired_state["target_temperature"] == (24 if temperature <= 19 else 19)
+
+
+def test_expired_hold_keeps_unresolved_hvac_ownership_recovery() -> None:
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_temperature_c = 18
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 24
+    context.hvac_control = {
+        "released_until": (context.created_at - timedelta(days=7)).isoformat(),
+        "required_evidence_lost": "hvac_acquisition_rollback_failed",
+        "zone_states": {"switch.zone": "off"},
+    }
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).create_plan(context)
+    assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
+    assert plan.actions[0].desired_state["release_reason"] == "hvac_required_evidence_lost"

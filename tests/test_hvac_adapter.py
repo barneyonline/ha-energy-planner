@@ -3236,3 +3236,159 @@ def test_hvac_dispatch_timeout_bounds_failed_compensation(monkeypatch: Any) -> N
     assert result.rollback_succeeded is False
     assert result.saved_automation_states == {"automation.climate": "on"}
     assert calls == ["turn_off", "turn_on"]
+
+
+@pytest.mark.parametrize("recovers_during_takeover", [False, True])
+def test_off_zone_without_target_is_excluded_through_takeover_and_release(recovers_during_takeover: bool) -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("off", {"temperature": 19}),
+            "climate.empty": FakeState("off", {"temperature": None}),
+            "climate.valid": FakeState("heat", {"temperature": 20}),
+            "switch.zone": "off",
+            "automation.climate": "on",
+        }
+    )
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.empty", "climate.valid", "switch.zone"],
+            CONF_CLIMATE_AUTOMATIONS: ["automation.climate"],
+        },
+    )
+    # The executor persists this snapshot before making any device calls.
+    _, snapshot = adapter.takeover_snapshot()
+    assert "climate.empty" not in snapshot
+    assert snapshot["climate.valid"] == {"target_temperature": 20}
+    # Even if the zone exposes a target during acquisition, this transaction
+    # must not touch it because no rollback baseline was persisted for it.
+    if recovers_during_takeover:
+        hass.states.values["climate.empty"] = FakeState("heat", {"temperature": 18})
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                    "suppress_automations": True,
+                }
+            )
+        )
+    )
+    assert result.applied
+    assert "climate.empty" not in result.saved_zone_states
+    assert hass.states.get("climate.valid").attributes["temperature"] == 23
+    assert hass.states.get("switch.zone").state == "on"
+    assert all(call[2]["entity_id"] != "climate.empty" for call in hass.services.calls)
+    restored = asyncio.run(adapter.async_restore(result.saved_automation_states, result.saved_zone_states))
+    assert restored.applied
+    assert hass.states.get("climate.valid").attributes["temperature"] == 20
+    assert hass.states.get("switch.zone").state == "off"
+    assert hass.states.get("automation.climate").state == "on"
+    assert hass.states.get("climate.empty").attributes["temperature"] == (18 if recovers_during_takeover else None)
+    hass.states.values["climate.empty"] = FakeState("heat", {"temperature": 18})
+    # A subsequent transaction can now safely include the recovered target.
+    assert adapter.takeover_snapshot()[1]["climate.empty"] == {"target_temperature": 18}
+
+
+def test_off_zone_stays_untouched_when_main_command_fails() -> None:
+    hass = FakeHass(
+        {
+            "climate.daikin": FakeState("heat", {"temperature": 19}),
+            "climate.empty": FakeState("off", {"temperature": None}),
+            "switch.zone": "off",
+            "automation.climate": "on",
+        }
+    )
+    hass.services.fail_services.add(("climate", "set_temperature"))
+    adapter = DaikinHVACAdapter(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.empty", "switch.zone"],
+            CONF_CLIMATE_AUTOMATIONS: ["automation.climate"],
+        },
+    )
+    result = asyncio.run(
+        adapter.async_execute(
+            _action(
+                {
+                    "hvac_mode": "heat",
+                    "target_temperature": 23,
+                    "enable_zones": True,
+                    "configured_zones_only": True,
+                    "suppress_automations": True,
+                }
+            )
+        )
+    )
+    assert not result.applied
+    assert result.rollback_succeeded
+    assert hass.states.get("automation.climate").state == "on"
+    assert hass.states.get("switch.zone").state == "off"
+    assert all(call[2]["entity_id"] != "climate.empty" for call in hass.services.calls)
+
+
+@pytest.mark.parametrize("actuator", ["climate.daikin", "switch.living"])
+def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -> None:
+    from custom_components.ha_energy_planner.executor import Executor
+
+    zone = "climate.living_temperature"
+    entry_data = {
+        CONF_DAIKIN_CLIMATE: "climate.daikin",
+        CONF_CLIMATE_ZONES: ["switch.living", zone],
+    }
+    hass = FakeHass({
+        "climate.daikin": FakeState("off" if actuator == "climate.daikin" else "heat", {"temperature": 20}),
+        "switch.living": "on" if actuator == "climate.daikin" else "off",
+        zone: FakeState("off", {"temperature": None}),
+    })
+    adapter = DaikinHVACAdapter(hass, entry_data)
+    assert zone not in adapter.takeover_snapshot()[1]
+    pending = {"enable_zones": True, "configured_zones_only": True, "target_temperature": 23}
+    Executor._configure_pending_hvac_adapter(Executor.__new__(Executor), adapter, pending)
+    assert pending["deferred_zone_entities"] == [zone]
+    feedback = []
+    original_call = hass.services.async_call
+
+    async def publish_recovery(domain, service, data, blocking=False, context=None):
+        if data["entity_id"] == actuator and service == "turn_on":
+            assert context is not None
+            for event_context, attributes, expected in [
+                (context, {"temperature": 18}, True),
+                (Context(parent_id=context.id), {"temperature": 18}, True),
+                (Context(user_id="manual-user"), {"temperature": 18}, False),
+                (Context(), {"temperature": 18}, False),
+                (context, {"temperature": 18, "fan_mode": "high"}, False),
+                (context, {"temperature": float("nan")}, False),
+            ]:
+                event = SimpleNamespace(context=event_context, data={
+                    "entity_id": zone,
+                    "old_state": FakeState("off", {"temperature": None}),
+                    "new_state": FakeState("heat", attributes),
+                })
+                assert _is_planner_owned_control_feedback(
+                    entry_data, {"execution_audit": []}, event, datetime.now(UTC),
+                    pending_hvac_desired_state=pending,
+                ) is expected
+                assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) == (
+                    None if expected else zone
+                )
+            feedback.append(True)
+            hass.states.values[zone] = FakeState("heat", {"temperature": 18})
+        await original_call(domain, service, data, blocking, context)
+
+    hass.services.async_call = publish_recovery
+    result = asyncio.run(adapter.async_execute(_action({
+        "hvac_mode": "heat", "target_temperature": 23,
+        "enable_zones": True, "configured_zones_only": True,
+    })))
+    assert result.applied
+    assert feedback == [True]
+    assert pending["coupled_zone_feedback_expected"] is None
+    assert zone not in result.saved_zone_states
+    assert not any(data["entity_id"] == zone for _, _, data in hass.services.calls)
+    assert hass.states.get(zone).attributes["temperature"] == 18
