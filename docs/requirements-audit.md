@@ -323,6 +323,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   12 hours, and unsafe below 8 hours; thresholds are capped by deliberately
   shorter configured horizons. Degraded inputs remain action-ineligible under
   the planner's existing healthy-input action gate.
+- Solcast `pv_estimate`, `pv_estimate10`, and `pv_estimate90` interval fields retain their kW semantics independently of the daily sensor's kWh unit. Explicit interval units and inherited power units take precedence, and generic energy buckets still convert by duration. Calibration model version 4 and versioned training snapshots prevent pre-correction samples from biasing corrected forecasts; unversioned snapshots cannot repopulate the reset model. `tests/test_forecast_calibration.py` covers upgrade invalidation and fresh retraining. `tests/test_forecasts.py` exercises a sanitised live-shaped fixture in `tests/fixtures/solcast_daily_power.json`.
 - A second optional PV entity supports timestamp-safe Solcast Today/Tomorrow
   stitching across midnight and daylight-saving changes. Secondary series must
   expose timezone-aware timestamps; untimestamped and naive timestamps are
@@ -549,7 +550,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   target, and failed acquisition restores the captured main mode and target before reporting
   rollback success. Options-aware discovery always validates the finite main
   rollback target and additionally validates configured-zone targets when
-  synchronisation is enabled. It publishes affected entity IDs in Current state
+  synchronisation is enabled. Off zones with entirely absent target attributes are
+  deferred for that takeover, including provisional ownership persistence, retries,
+  confirmation, and rollback; the planner never invents a rollback temperature.
+  Main control, switch/helper takeover, and other zones remain eligible.
+  `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
+  recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
+  Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
+  frozen exclusions, failed-command rollback, and context-linked recovery during main-unit or zone-switch activation. Unrelated contexts, manual changes, auxiliary-setting changes, and invalid recovered targets retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping
   releases eligible, and creates one recovery-aware notification.
   Execution repeats the check immediately before adapter construction so the
@@ -851,3 +859,15 @@ use throughout; the Docker and pull-request gates enforce that result.
   validation does not claim household acceptance.
   `tests/scripts/test_release_tools.py` verifies that every scenario rejects
   missing, blank, and non-string evidence references.
+
+### Expired climate comfort holds
+
+- `planner_hvac.py` resolves a persisted hold-only `released_until` before
+  ownership-dependent comfort and override checks. A future hold prevents
+  reacquisition, and an expired hold permits normal preconditioning immediately,
+  including at or beyond either comfort boundary. Additional ownership and failed
+  restoration metadata retain the existing recovery path.
+- `tests/test_planner.py::test_hold_only_state_expires_before_comfort_handoff`
+  covers serialized timestamps before, at, and after expiry on both boundaries.
+  `test_expired_hold_keeps_unresolved_hvac_ownership_recovery` verifies that
+  unresolved actuator ownership is still restored before any new takeover.

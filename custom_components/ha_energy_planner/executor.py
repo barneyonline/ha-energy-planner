@@ -2218,6 +2218,7 @@ class Executor:
 
     def _configure_pending_hvac_adapter(self, adapter: DaikinHVACAdapter, pending: dict[str, Any]) -> None:
         """Wire one adapter to the shared pending-transaction protocol."""
+        pending["deferred_zone_entities"] = adapter.deferred_zone_entities
         adapter.set_manual_override_check(lambda: pending.get(_PENDING_HVAC_MANUAL_OVERRIDE_KEY) is True)
         adapter.set_manual_override_persistence_callback(self._async_persist_provisional_hvac_manual_supersession)
         adapter.set_zone_manual_override_check(

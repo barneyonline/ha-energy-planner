@@ -22,7 +22,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import advice_runtime, startup_recovery, task_lifecycle
-from .adapter_helpers import async_call_device_service
+from .adapter_helpers import async_call_device_service, zone_temperature_sync_deferred
 from .advice_runtime import (
     _AI_ADVICE_NOTIFICATION_ID as _AI_ADVICE_NOTIFICATION_ID,
 )
@@ -97,7 +97,7 @@ from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
-from .forecast_calibration import update_forecast_calibration
+from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .inputs import InputManager
 from .load_forecast import normalize_power_kw
 from .models import (
@@ -900,6 +900,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     "soc_per_kwh": ev_charge_calibration.get("soc_per_kwh"),
                 },
                 "thermal_model": thermal_model_summary(thermal_model),
+                "forecast_calibration_version": FORECAST_CALIBRATION_VERSION,
                 "forecast_training_slots": manager.forecast_training_slots,
                 "forecast_calibration": {
                     "pv_forecast_kw": _calibration_summary(forecast_calibration, "pv_forecast_kw"),
@@ -2793,10 +2794,24 @@ def _matches_pending_coupled_zone_hvac_feedback(
         return False
     old_attributes = getattr(old_state, "attributes", {}) or {}
     new_attributes = getattr(new_state, "attributes", {}) or {}
-    return not any(
-        old_attributes.get(attribute) != new_attributes.get(attribute)
-        for attribute in _HVAC_CONTROL_ATTRIBUTE_KEYS
-    )
+    changed_attributes = {
+        attribute for attribute in _HVAC_CONTROL_ATTRIBUTE_KEYS
+        if old_attributes.get(attribute) != new_attributes.get(attribute)
+    }
+    if (
+        context_matches
+        and expected_state == "on"
+        and event.data.get("entity_id") in pending.get("deferred_zone_entities", [])
+        and zone_temperature_sync_deferred(old_state)
+        and changed_attributes <= {"temperature", "target_temp_low", "target_temp_high"}
+    ):
+        # A linked off zone may recover its previous target when our command
+        # wakes the unit. It was excluded from target writes before persistence.
+        return all(
+            _matching_hvac_target(new_attributes.get(attribute), new_attributes.get(attribute))
+            for attribute in changed_attributes
+        )
+    return not changed_attributes
 
 
 def _coupled_zone_entity_ids_match(actuator_entity_id: Any, climate_entity_id: Any) -> bool:

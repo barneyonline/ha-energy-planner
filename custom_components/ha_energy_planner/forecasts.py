@@ -378,7 +378,7 @@ def _parse_item(
         return None
     if not isfinite(value):
         return None
-    unit = str(item.get("unit", item.get("units", item.get("unit_of_measurement", default_unit))))
+    unit = _forecast_item_unit(item, value_key, default_unit)
     value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_key, unit=unit)
 
     valid_at = None
@@ -389,6 +389,19 @@ def _parse_item(
         if valid_at is not None:
             break
     return valid_at, value
+
+
+def _forecast_item_unit(item: dict[str, Any], value_key: str | None, default_unit: str) -> str:
+    """Use Solcast power-field units independently of the daily energy sensor."""
+    # Solcast's daily sensor is kWh, but its interval estimates are average kW.
+    # Explicit item units still take precedence for other forecast producers.
+    field_unit = (
+        "kW"
+        if value_key in {"pv_estimate", "pv_estimate10", "pv_estimate90"}
+        and _normalize_unit(default_unit) in _ENERGY_UNITS
+        else default_unit
+    )
+    return str(item.get("unit", item.get("units", item.get("unit_of_measurement", field_unit))))
 
 
 def _energy_items_as_average_power(
@@ -420,12 +433,7 @@ def _energy_items_as_average_power(
             converted.append(item)
             continue
         value_key = next((key for key in value_keys if key in prepared_flattened), None)
-        unit = str(
-            prepared_flattened.get(
-                "unit",
-                prepared_flattened.get("units", prepared_flattened.get("unit_of_measurement", default_unit)),
-            )
-        )
+        unit = _forecast_item_unit(prepared_flattened, value_key, default_unit)
         if value_key is None or _normalize_unit(unit) not in _ENERGY_UNITS:
             converted.append(item)
             continue

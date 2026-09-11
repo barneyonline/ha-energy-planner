@@ -977,7 +977,7 @@ def test_secondary_pv_slots_are_excluded_from_primary_calibration() -> None:
     now = datetime(2026, 7, 12, 0, 0, tzinfo=UTC)
     calibration = {
         "pv_forecast_kw": {
-            "model_version": 3,
+            "model_version": 4,
             "buckets": {
                 str(index): {
                     "enabled": True,
@@ -1507,14 +1507,14 @@ def test_input_manager_applies_enabled_forecast_calibration_to_planning_slots() 
     )
     calibration = {
         "pv_forecast_kw": {
-            "model_version": 3,
+            "model_version": 4,
             "buckets": {
                 "0": {"enabled": True, "factor": 1.2, "lower_factor": 0.7},
                 "1": {"enabled": True, "factor": 1.2, "lower_factor": 0.8},
             },
         },
         "baseline_load_forecast_kw": {
-            "model_version": 3,
+            "model_version": 4,
             "buckets": {
                 "0": {"enabled": True, "factor": 0.8, "upper_factor": 1.3},
                 "1": {"enabled": True, "factor": 0.8, "upper_factor": 1.2},
