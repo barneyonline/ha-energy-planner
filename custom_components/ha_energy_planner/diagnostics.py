@@ -9,6 +9,7 @@ from homeassistant.util import dt as dt_util
 
 from .entry_data import combined_entry_data
 from .models import to_jsonable
+from .plan_presentation import built_in_load_forecast_attrs
 from .safety import control_pause_status
 from .storage import audit_records
 from .type_defs import EnergyPlannerConfigEntry
@@ -84,6 +85,7 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "refresh_performance": _redact(_refresh_performance(coordinator)),
+        "load_forecast": _redact(built_in_load_forecast_attrs(coordinator)),
         "weather_forecast": _redact(
             dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
         ),

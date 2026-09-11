@@ -407,6 +407,10 @@ def test_builtin_load_uses_ready_model_during_short_known_outage(
     assert manager.load_forecast_details["fallback_applied"] is True
     assert manager.load_forecast_details["current_correction_applied"] is False
     assert manager.load_forecast_details["live_source_outage_seconds"] == outage_seconds
+    assert manager.load_forecast_details["fallback_status"] == "active"
+    assert manager.load_forecast_details["fallback_reason"] == "model_covering_outage"
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 600 - outage_seconds
+    assert "covering a temporary" in manager.load_forecast_details["fallback_summary"]
     assert manager.forecast_confidence_details[-1]["confidence"] == 0.65
     assert manager._health_from_issues([issue]) == InputHealth.DEGRADED
 
@@ -477,9 +481,9 @@ def test_builtin_load_fallback_requires_outage_state_and_normalizes_naive_transi
         upper=[1.2],
     )
 
-    assert invalid_state == (False, None)
-    assert naive_transition == (True, 0.0)
-    assert future_transition == (False, None)
+    assert invalid_state == (False, None, "source_non_numeric")
+    assert naive_transition == (True, 0.0, "model_covering_outage")
+    assert future_transition == (False, None, "outage_start_in_future")
 
 
 def test_builtin_load_fallback_uses_persisted_continuous_outage_start() -> None:
@@ -511,6 +515,9 @@ def test_builtin_load_fallback_uses_persisted_continuous_outage_start() -> None:
     assert issue == "household_load_entity_unavailable"
     assert manager.load_forecast_details["fallback_applied"] is False
     assert manager.load_forecast_details["live_source_outage_seconds"] == 660
+    assert manager.load_forecast_details["fallback_status"] == "unavailable"
+    assert manager.load_forecast_details["fallback_reason"] == "grace_expired"
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 0
 
     malformed = _RawInputManager(
         manager.hass,
@@ -528,7 +535,7 @@ def test_builtin_load_fallback_uses_persisted_continuous_outage_start() -> None:
         model_status="ready",
         expected=[1.0],
         upper=[1.2],
-    ) == (False, None)
+    ) == (False, None, "outage_start_unknown")
 
     invalidated = _RawInputManager(
         manager.hass,
@@ -548,7 +555,7 @@ def test_builtin_load_fallback_uses_persisted_continuous_outage_start() -> None:
         model_status="ready",
         expected=[1.0],
         upper=[1.2],
-    ) == (False, None)
+    ) == (False, None, "outage_ineligible")
 
 
 def test_forecast_source_issue_time_parses_string_attribute() -> None:
@@ -2021,3 +2028,152 @@ def test_input_manager_state_cache_and_small_helpers() -> None:
     assert _combined_confidence([]) == 1.0
     assert _RawInputManager._health_from_issues(["weather_entity_unavailable"]) == InputHealth.DEGRADED
     assert _RawInputManager._health_from_issues([]) == InputHealth.HEALTHY
+
+
+@pytest.mark.parametrize(
+    ("at", "secondary", "stale", "series_issue"),
+    [
+        ("2026-09-06T23:30:00.001+10:00", "valid", False, None),
+        ("2026-09-06T23:59:59+10:00", "valid", False, None),
+        ("2026-09-07T00:00:00+10:00", "valid", False, None),
+        ("2026-09-07T00:01:00+10:00", "valid", False, None),
+        ("2026-09-06T23:45:00+10:00", "missing", False, "pv_forecast_entity_incomplete_horizon"),
+        ("2026-09-07T00:00:00+10:00", "missing", True, "pv_forecast_entity_incomplete_horizon"),
+        ("2026-09-07T00:00:00+10:00", "expired", True, "pv_forecast_entity_incomplete_horizon"),
+        ("2026-09-07T00:00:00+10:00", "naive", True, "pv_forecast_entity_incomplete_horizon"),
+        ("2026-09-07T00:00:00+10:00", "gap", True, "pv_forecast_entity_incomplete_horizon"),
+        ("2026-09-07T00:00:00+10:00", "invalid", True, "pv_forecast_entity_incomplete_horizon"),
+    ],
+)
+def test_solar_freshness_tracks_stitched_intervals_at_midnight(
+    at: str, secondary: str, stale: bool, series_issue: str | None,
+) -> None:
+    now = datetime.fromisoformat(at)
+    start = datetime.fromisoformat("2026-09-06T00:00:00+10:00")
+    def source(day: int) -> FakeState:
+        return FakeState("0", {
+            "unit_of_measurement": "kW",
+            "detailedForecast": [
+                {"period_start": (start + timedelta(days=day, minutes=30 * i)).isoformat(), "pv_estimate": 0.0}
+                for i in range(48)
+            ],
+        }, last_updated=start)
+    today, tomorrow = source(0), source(1)
+    if secondary == "expired":
+        tomorrow = source(0)
+    elif secondary == "naive":
+        for row in tomorrow.attributes["detailedForecast"]:
+            row["period_start"] = row["period_start"].replace("+10:00", "")
+    elif secondary == "gap":
+        tomorrow.attributes["detailedForecast"] = tomorrow.attributes["detailedForecast"][2:]
+    elif secondary == "invalid":
+        for row in tomorrow.attributes["detailedForecast"]:
+            row["pv_estimate"] = "bad"
+    states = {"sensor.today": today}
+    if secondary != "missing":
+        states["sensor.tomorrow"] = tomorrow
+    manager = _RawInputManager(FakeHass(states, "Australia/Melbourne"), {
+        CONF_PV_FORECAST: "sensor.today", CONF_PV_FORECAST_SECONDARY: "sensor.tomorrow",
+    }, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    values, issue = manager._required_series(
+        CONF_PV_FORECAST, ("pv_estimate", "value"), "power", now, 12, 15,
+        secondary_config_key=CONF_PV_FORECAST_SECONDARY,
+    )
+    assert issue == series_issue
+    assert ("pv_forecast_entity_stale" in manager._freshness_issues(now)) is stale
+    if series_issue is None:
+        assert values == [0.0] * 48
+    else:
+        assert any(value is None for value in values)
+
+
+@pytest.mark.parametrize(
+    ("state_value", "elapsed", "grace", "model_status", "expected", "reason"),
+    [
+        (None, 0, 10, "ready", [1.0], "source_missing"),
+        ("2.0", 0, 10, "ready", [1.0], "live_source_available"),
+        ("bad", 0, 10, "ready", [1.0], "source_non_numeric"),
+        ("unavailable", 0, 0, "ready", [1.0], "grace_disabled"),
+        ("unavailable", 600, 10, "ready", [1.0], "grace_expired"),
+        ("unavailable", 30, 10, "degraded", [1.0], "model_not_ready"),
+        ("unavailable", 30, 10, "stale", [1.0], "model_not_ready"),
+        ("unavailable", 30, 10, "ready", [None], "forecast_incomplete"),
+        ("unknown", 599.9999, 10, "ready", [1.0], "model_covering_outage"),
+    ],
+)
+def test_load_fallback_reason_preserves_safety_decision(
+    state_value: str | None, elapsed: float, grace: int, model_status: str,
+    expected: list[float | None], reason: str,
+) -> None:
+    now = datetime(2026, 9, 6, tzinfo=UTC)
+    state = None if state_value is None else FakeState(state_value, last_changed=now - timedelta(seconds=elapsed))
+    manager = _RawInputManager(FakeHass({}), {}, {
+        **DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: grace,
+    })
+    active, _age, actual_reason = manager._load_model_fallback_status(
+        state, now=now,
+        source_issue=(
+            None if state_value == "2.0" else "household_load_entity_non_numeric"
+            if state_value == "bad" else "household_load_entity_unavailable"
+        ),
+        model_status=model_status, expected=expected, upper=[1.2],
+    )
+    assert actual_reason == reason
+    assert active is (reason == "model_covering_outage")
+
+
+def test_load_fallback_requires_verifiable_transition_time() -> None:
+    now = datetime(2026, 9, 6, tzinfo=UTC)
+    manager = _RawInputManager(FakeHass({}), {}, DEFAULT_OPTIONS)
+    state = SimpleNamespace(state="unavailable", last_changed=None)
+    assert manager._load_model_fallback_status(
+        state, now=now, source_issue="household_load_entity_unavailable",
+        model_status="ready", expected=[1.0], upper=[1.2],
+    ) == (False, None, "outage_start_unknown")
+
+
+@pytest.mark.parametrize("invalid_value", ["invalid", "nan", None])
+def test_old_ordered_forecast_with_invalid_dated_record_stays_stale(invalid_value: Any) -> None:
+    now = datetime(2026, 9, 6, 14, tzinfo=UTC)
+    old = now - timedelta(days=2)
+    state = FakeState("1.0", {
+        "unit_of_measurement": "kW",
+        "forecast": [1.0] * 48 + [{"period_start": old.isoformat(), "pv_estimate": invalid_value}],
+    }, last_updated=old)
+    manager = _RawInputManager(FakeHass({"sensor.pv": state}), {
+        CONF_PV_FORECAST: "sensor.pv",
+    }, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    values, issue = manager._required_series(
+        CONF_PV_FORECAST, ("pv_estimate", "value"), "power", now, 12, 15,
+    )
+    # Ordered forecasts retain normal planning support, but cannot manufacture
+    # current temporal evidence to bypass their entity freshness timeout.
+    assert values == [1.0] * 48
+    assert issue is None
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now + timedelta(days=1))
+    state.last_updated = now
+    assert "pv_forecast_entity_stale" not in manager._freshness_issues(now)
+
+
+def test_old_mixed_secondary_forecast_cannot_supply_midnight_coverage() -> None:
+    now = datetime(2026, 9, 6, 14, tzinfo=UTC)
+    old = now - timedelta(days=2)
+    manager = _RawInputManager(FakeHass({
+        "sensor.today": FakeState("0", {"forecast": [
+            {"period_start": (old + timedelta(minutes=30 * i)).isoformat(), "pv_estimate": 0.0}
+            for i in range(48)
+        ]}, last_updated=old),
+        "sensor.tomorrow": FakeState("1", {"forecast": [1.0] * 48 + [
+            {"period_start": old.isoformat(), "pv_estimate": "invalid"},
+        ]}, last_updated=old),
+    }), {
+        CONF_PV_FORECAST: "sensor.today", CONF_PV_FORECAST_SECONDARY: "sensor.tomorrow",
+    }, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    _values, issue = manager._required_series(
+        CONF_PV_FORECAST, ("pv_estimate", "value"), "power", now, 12, 15,
+        secondary_config_key=CONF_PV_FORECAST_SECONDARY,
+    )
+    assert issue == "pv_forecast_entity_incomplete_horizon"
+    assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
+    assert manager.forecast_coverage_details[0]["classification"] == "stale"
