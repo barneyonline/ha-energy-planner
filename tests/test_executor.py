@@ -83,6 +83,10 @@ from custom_components.ha_energy_planner.preflight import production_evidence_fi
 class _HVACAdapterDouble(DaikinHVACAdapter):
     """Fake device behavior with the real adapter's persistence-hook contract."""
 
+    @property
+    def deferred_zone_entities(self) -> list[str]:
+        return []
+
     def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
         return {}, {}
 

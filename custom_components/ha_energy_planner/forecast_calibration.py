@@ -9,6 +9,7 @@ from math import isfinite
 from statistics import median
 from typing import Any
 
+FORECAST_CALIBRATION_VERSION = 4
 FORECAST_CALIBRATION_FIELDS = ("pv_forecast_kw",)
 MIN_CALIBRATION_SAMPLES = 48
 MIN_HOLDOUT_SAMPLES = 12
@@ -35,7 +36,7 @@ def apply_forecast_calibration(
 ) -> list[float | None]:
     """Adjust values with a proven expected or conservative lead-time factor."""
     calibration = dict((model or {}).get(field, {}))
-    if calibration.get("model_version") != 3:
+    if calibration.get("model_version") != FORECAST_CALIBRATION_VERSION:
         return list(values)
     buckets = calibration.get("buckets")
     if not isinstance(buckets, Mapping):
@@ -105,6 +106,8 @@ def update_forecast_calibration(
         newly_processed_ids: set[str] = set()
 
         for snapshot in snapshots:
+            if snapshot.get("forecast_calibration_version") != FORECAST_CALIBRATION_VERSION:
+                continue
             slots = snapshot.get("forecast_training_slots", [])
             if not isinstance(slots, list):
                 continue
@@ -160,7 +163,7 @@ def _migrate_calibration_model(
         value = updated.get(field)
         if value is None:
             continue
-        if not isinstance(value, Mapping) or value.get("model_version") != 3:
+        if not isinstance(value, Mapping) or value.get("model_version") != FORECAST_CALIBRATION_VERSION:
             updated.pop(field, None)
             changed = True
             continue
@@ -226,7 +229,7 @@ def _rebuild_model(samples: list[dict[str, Any]]) -> dict[str, Any]:
     enabled_buckets = [bucket for bucket in buckets.values() if bucket["enabled"]]
     uncertainty_buckets = [bucket for bucket in buckets.values() if bucket["uncertainty_enabled"]]
     return {
-        "model_version": 3,
+        "model_version": FORECAST_CALIBRATION_VERSION,
         "sample_count": len({str(sample["valid_at"]) for sample in samples}),
         "raw_sample_count": len(samples),
         "factor": enabled_buckets[0]["factor"] if enabled_buckets else 1.0,

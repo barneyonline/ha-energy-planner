@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+import pytest
 
 from custom_components.ha_energy_planner.forecasts import (
     _energy_items_as_average_power,
@@ -135,7 +139,7 @@ def test_forecast_series_converts_megawatt_power_units_to_kw() -> None:
     assert series == [1.0, 2.0, None, None]
 
 
-def test_forecast_series_converts_solcast_energy_buckets_to_average_kw() -> None:
+def test_forecast_series_preserves_solcast_power_under_daily_energy_sensor() -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
         "3.0",
@@ -157,7 +161,7 @@ def test_forecast_series_converts_solcast_energy_buckets_to_average_kw() -> None
         value_kind="power",
     )
 
-    assert series == [1.0, 1.0, 2.0, 2.0]
+    assert series == [0.5, 0.5, 1.0, 1.0]
 
 
 def test_latest_forecast_valid_at_reads_solcast_detailed_forecast() -> None:
@@ -229,15 +233,15 @@ def test_forecast_timestamp_status_distinguishes_aware_naive_and_ordered_payload
     )
 
 
-def test_forecast_series_converts_solcast_wh_energy_buckets_to_average_kw() -> None:
+def test_forecast_series_honours_explicit_interval_energy_units() -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
         "0",
         {
             "unit_of_measurement": "Wh",
             "detailedForecast": [
-                {"period_start": "2026-06-27T00:00:00+00:00", "pv_estimate": 500},
-                {"period_start": "2026-06-27T00:30:00+00:00", "pv_estimate": 1000},
+                {"period_start": "2026-06-27T00:00:00+00:00", "pv_estimate": 500, "unit": "Wh"},
+                {"period_start": "2026-06-27T00:30:00+00:00", "pv_estimate": 1000, "units": "Wh"},
             ],
         },
     )
@@ -631,3 +635,53 @@ def test_indexed_forecast_alignment_preserves_duplicates_and_expired_gaps() -> N
     assert _value_for_slot(start, [], final_cadence=cadence) is None
     sparse = [points[0], points[-1]]
     assert _value_for_slot(start + cadence, sparse, final_cadence=cadence) is None
+
+
+@pytest.mark.parametrize("value_key", ["pv_estimate", "pv_estimate10", "pv_estimate90"])
+def test_solcast_live_shape_does_not_double_forecast(value_key: str) -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "solcast_daily_power.json").read_text())
+    series = forecast_series_from_state(
+        FakeState(fixture["state"], fixture["attributes"]),
+        issued_at=datetime(2026, 9, 11, 2, 30, tzinfo=UTC),
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=(value_key,),
+        value_kind="power",
+    )
+    assert series == [5.6506, 5.6506, 5.4, 5.4]
+    assert max(series) < 10
+
+
+def test_generic_energy_forecast_still_converts_inherited_kwh() -> None:
+    state = FakeState(
+        "0",
+        {
+            "unit_of_measurement": "kWh",
+            "forecast": [
+                {"period_start": "2026-09-11T00:00:00Z", "energy": 2},
+                {"period_start": "2026-09-11T00:30:00Z", "energy": 3},
+            ],
+        },
+    )
+    assert forecast_series_from_state(
+        state,
+        issued_at=datetime(2026, 9, 11, tzinfo=UTC),
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("energy",),
+        value_kind="power",
+    ) == [4, 4, 6, 6]
+
+
+@pytest.mark.parametrize("unit,value", [(" W ", 1500), ("watts", 1500), ("kW", 1.5), ("MW", 0.0015)])
+@pytest.mark.parametrize("key", ["pv_estimate", "pv_estimate10", "pv_estimate90"])
+def test_pv_estimate_preserves_inherited_power_units(unit: str, value: float, key: str) -> None:
+    now = datetime(2026, 9, 11, tzinfo=UTC)
+    state = FakeState("0", {
+        "unit_of_measurement": unit,
+        "forecast": [{"period_start": now.isoformat(), key: value}],
+    })
+    assert forecast_series_from_state(
+        state, issued_at=now, horizon_hours=1, interval_minutes=30,
+        value_keys=(key,), value_kind="power",
+    ) == [1.5, None]

@@ -123,7 +123,9 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - Missing, stale, invalid, or unconfirmed inputs fail closed. This can suppress otherwise economical actions.
 - Enphase control is limited to the verified profiles exposed by the mapped Home Assistant integration; it does not directly command battery charge or discharge power.
 - EV control requires a mapped target-SOC entity and confirmed charger feedback. Multiple EVs require separate Energy Planner entries.
-- Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely.
+- After the Solcast unit correction, PV calibration restarts from new forecast evidence; older models and training snapshots are discarded. Explicit W/kW/MW forecast units remain supported.
+- Climate comfort holds prevent reacquisition until their expiry. An expired hold alone does not block a new preconditioning cycle.
+- Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely. Off zones that expose no temperature target are left out of temperature synchronisation for that takeover; the main thermostat, zone switches, and zones with valid targets remain eligible. Command-linked target recovery is accepted without suppressing unrelated manual changes. A later takeover can synchronise a recovered zone.
 - Optional AI explanations depend on a configured Home Assistant `ai_task`
   entity and remain advisory only. A newly created AI Task with state `unknown`
   can be used immediately; only a missing or explicitly `unavailable` provider

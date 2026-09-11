@@ -37,6 +37,7 @@ def _evidence(
         snapshots.append(
             {
                 "plan_id": f"plan-{index}",
+                "forecast_calibration_version": 4,
                 "forecast_training_slots": [
                     {
                         "issued_at": valid_at - timedelta(hours=1),
@@ -74,6 +75,7 @@ def test_update_requires_timestamped_observation_and_rejects_overdue_slots() -> 
     old = now - timedelta(hours=1)
     snapshots = [
         {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {"issued_at": old - timedelta(hours=1), "valid_at": old, "pv_forecast_kw": 1.0}
             ]
@@ -93,6 +95,7 @@ def test_update_matches_small_timestamp_skew_and_deduplicates_lead_bucket() -> N
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     snapshots = [
         {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {
                     "issued_at": now - timedelta(minutes=65),
@@ -124,6 +127,7 @@ def test_field_issue_time_prevents_refresh_origins_creating_lead_samples() -> No
     source_issued = valid_at - timedelta(hours=1)
     snapshots = [
         {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {
                     "issued_at": refresh_issued,
@@ -159,7 +163,7 @@ def test_correlated_lead_buckets_do_not_count_as_distinct_observations() -> None
 
     model, changed = update_forecast_calibration(
         {},
-        [{"forecast_training_slots": slots}],
+        [{"forecast_calibration_version": 4, "forecast_training_slots": slots}],
         {"pv_forecast_kw": {valid_at.isoformat(): 1.2}},
         now=now,
     )
@@ -194,11 +198,11 @@ def test_calibration_requires_a_real_time_span_and_improving_holdout() -> None:
 
 def test_apply_forecast_calibration_requires_enabled_finite_model() -> None:
     values = [1.0, None, 2.0]
-    disabled = {"pv_forecast_kw": {"model_version": 3, "buckets": {"0": {"enabled": False, "factor": 1.3}}}}
-    enabled = {"pv_forecast_kw": {"model_version": 3, "buckets": {"0": {"enabled": True, "factor": 1.3}}}}
-    invalid = {"pv_forecast_kw": {"model_version": 3, "buckets": {"0": {"enabled": True, "factor": "inf"}}}}
+    disabled = {"pv_forecast_kw": {"model_version": 4, "buckets": {"0": {"enabled": False, "factor": 1.3}}}}
+    enabled = {"pv_forecast_kw": {"model_version": 4, "buckets": {"0": {"enabled": True, "factor": 1.3}}}}
+    invalid = {"pv_forecast_kw": {"model_version": 4, "buckets": {"0": {"enabled": True, "factor": "inf"}}}}
     legacy = {"pv_forecast_kw": {"model_version": 2, "enabled": True, "factor": 1.3}}
-    bad_buckets = {"pv_forecast_kw": {"model_version": 3, "buckets": []}}
+    bad_buckets = {"pv_forecast_kw": {"model_version": 4, "buckets": []}}
 
     assert apply_forecast_calibration(values, disabled, "pv_forecast_kw") == values
     assert apply_forecast_calibration(values, enabled, "pv_forecast_kw") == [1.3, None, 2.6]
@@ -207,12 +211,12 @@ def test_apply_forecast_calibration_requires_enabled_finite_model() -> None:
     assert apply_forecast_calibration([1.0], bad_buckets, "pv_forecast_kw") == [1.0]
     assert apply_forecast_calibration(
         [1.0],
-        {"pv_forecast_kw": {"model_version": 3, "buckets": {"0": {"enabled": True, "factor": object()}}}},
+        {"pv_forecast_kw": {"model_version": 4, "buckets": {"0": {"enabled": True, "factor": object()}}}},
         "pv_forecast_kw",
     ) == [1.0]
     assert apply_forecast_calibration(
         ["bad", -2.0],
-        {"pv_forecast_kw": {"model_version": 3, "buckets": {"0": {"enabled": True, "factor": 1.2}}}},
+        {"pv_forecast_kw": {"model_version": 4, "buckets": {"0": {"enabled": True, "factor": 1.2}}}},
         "pv_forecast_kw",
     ) == [None, 0.0]
 
@@ -220,7 +224,7 @@ def test_apply_forecast_calibration_requires_enabled_finite_model() -> None:
 def test_near_term_factor_does_not_change_day_ahead_slots() -> None:
     model = {
         "pv_forecast_kw": {
-            "model_version": 3,
+            "model_version": 4,
             "buckets": {"0": {"enabled": True, "factor": 1.2}},
         }
     }
@@ -242,6 +246,7 @@ def test_lead_buckets_train_and_apply_independent_factors() -> None:
         valid_at = start + timedelta(minutes=10 * index)
         snapshots.append(
             {
+                "forecast_calibration_version": 4,
                 "forecast_training_slots": [
                     {
                         "pv_forecast_kw_issued_at": valid_at - timedelta(minutes=5),
@@ -272,7 +277,7 @@ def test_lead_buckets_train_and_apply_independent_factors() -> None:
 def test_apply_forecast_calibration_uses_conservative_uncertainty_factors() -> None:
     model = {
         "pv_forecast_kw": {
-            "model_version": 3,
+            "model_version": 4,
             "buckets": {
                 "0": {
                     "enabled": True,
@@ -346,10 +351,14 @@ def test_percentile_interpolates_and_bounds_quantile() -> None:
 def test_forecast_calibration_rejects_malformed_evidence() -> None:
     now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
     snapshots = [
-        {"forecast_training_slots": "bad"},
-        {"forecast_training_slots": ["bad"]},
-        {"forecast_training_slots": [{"issued_at": now, "valid_at": "bad", "pv_forecast_kw": 1.0}]},
+        {"forecast_calibration_version": 4, "forecast_training_slots": "bad"},
+        {"forecast_calibration_version": 4, "forecast_training_slots": ["bad"]},
         {
+            "forecast_calibration_version": 4,
+            "forecast_training_slots": [{"issued_at": now, "valid_at": "bad", "pv_forecast_kw": 1.0}],
+        },
+        {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {"issued_at": now + timedelta(hours=1), "valid_at": now, "pv_forecast_kw": 1.0}
             ]
@@ -413,7 +422,7 @@ def test_forecast_calibration_resets_legacy_and_million_scale_counters() -> None
     contaminated, contaminated_changed = update_forecast_calibration(
         {
             "pv_forecast_kw": {
-                "model_version": 3,
+                "model_version": 4,
                 "sample_count": 2_000_000,
                 "raw_sample_count": 2_000_000,
                 "samples": [],
@@ -438,7 +447,7 @@ def test_forecast_calibration_rebuild_preserves_processed_identities() -> None:
     model, changed = update_forecast_calibration(
         {
             "pv_forecast_kw": {
-                "model_version": 3,
+                "model_version": 4,
                 "sample_count": 2_000_000,
                 "raw_sample_count": 2_000_000,
                 "samples": [
@@ -467,6 +476,7 @@ def test_forecast_calibration_only_processes_new_mature_observations() -> None:
     valid_at = now - timedelta(minutes=5)
     snapshots = [
         {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {
                     "issued_at": valid_at - timedelta(hours=1),
@@ -494,6 +504,7 @@ def test_forecast_calibration_accepts_out_of_order_unprocessed_observation() -> 
 
     def snapshot(valid_at: datetime) -> dict[str, object]:
         return {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {
                     "issued_at": valid_at - timedelta(hours=1),
@@ -522,6 +533,7 @@ def test_forecast_calibration_backfills_new_lead_bucket_for_processed_observatio
 
     def snapshot(hours_before: int) -> dict[str, object]:
         return {
+            "forecast_calibration_version": 4,
             "forecast_training_slots": [
                 {
                     "issued_at": valid_at - timedelta(hours=hours_before),
@@ -552,7 +564,7 @@ def test_forecast_calibration_rebuilds_inconsistent_unique_sample_count() -> Non
     model, changed = update_forecast_calibration(
         {
             "pv_forecast_kw": {
-                "model_version": 3,
+                "model_version": 4,
                 "sample_count": 999,
                 "raw_sample_count": 1,
                 "samples": [sample],
@@ -565,3 +577,26 @@ def test_forecast_calibration_rebuilds_inconsistent_unique_sample_count() -> Non
 
     assert changed is True
     assert model["pv_forecast_kw"]["sample_count"] == 1
+
+
+def test_pre_unit_fix_models_and_snapshots_cannot_bias_corrected_forecasts() -> None:
+    now = datetime(2026, 9, 11, 12, tzinfo=UTC)
+    snapshots, actuals = _evidence(now=now, forecast=2.0, actual=1.0)
+    old_model, _ = update_forecast_calibration({}, snapshots, actuals, now=now)
+    old_model["pv_forecast_kw"]["model_version"] = 3
+    for snapshot in snapshots:
+        snapshot.pop("forecast_calibration_version")
+
+    assert apply_forecast_calibration(
+        [1.0], old_model, "pv_forecast_kw", lead_offset_minutes=60,
+    ) == [1.0]
+    assert update_forecast_calibration(old_model, snapshots, actuals, now=now) == ({}, True)
+    assert update_forecast_calibration({}, snapshots, actuals, now=now) == ({}, False)
+
+    fresh_snapshots, actuals = _evidence(now=now, forecast=1.0, actual=1.2)
+    model, changed = update_forecast_calibration({}, snapshots + fresh_snapshots, actuals, now=now)
+    assert changed
+    assert model["pv_forecast_kw"]["sample_count"] == MIN_CALIBRATION_SAMPLES
+    assert apply_forecast_calibration(
+        [1.0], model, "pv_forecast_kw", lead_offset_minutes=60,
+    ) == [1.2]

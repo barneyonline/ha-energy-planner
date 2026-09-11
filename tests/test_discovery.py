@@ -109,7 +109,7 @@ def test_climate_target_discovery_is_options_aware_and_reports_entities() -> Non
     hass = FakeHass(
         {
             "climate.main": FakeState("heat", {"temperature": None}),
-            "climate.zone": FakeState("off", {"temperature": None}),
+            "climate.zone": FakeState("heat", {"temperature": None}),
             "switch.zone": "on",
         },
         set(),
@@ -120,11 +120,15 @@ def test_climate_target_discovery_is_options_aware_and_reports_entities() -> Non
     }
 
     disabled = CapabilityDiscovery(hass, entry_data, {}).inspect().hvac
-    enabled = CapabilityDiscovery(
-        hass,
-        entry_data,
-        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
-    ).inspect().hvac
+    enabled = (
+        CapabilityDiscovery(
+            hass,
+            entry_data,
+            {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+        )
+        .inspect()
+        .hvac
+    )
 
     assert "main_climate_target_unavailable" in disabled.issues
     assert "climate_zone_target_unavailable" not in disabled.issues
@@ -136,14 +140,16 @@ def test_climate_target_discovery_is_options_aware_and_reports_entities() -> Non
     assert enabled.details["zone_targets_unavailable"] == ["climate.zone"]
 
     hass.states.values["climate.main"] = FakeState("heat", {"temperature": 21})
-    hass.states.values["climate.zone"] = FakeState(
-        "heat", {"target_temp_low": 19, "target_temp_high": 23}
+    hass.states.values["climate.zone"] = FakeState("heat", {"target_temp_low": 19, "target_temp_high": 23})
+    recovered = (
+        CapabilityDiscovery(
+            hass,
+            entry_data,
+            {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+        )
+        .inspect()
+        .hvac
     )
-    recovered = CapabilityDiscovery(
-        hass,
-        entry_data,
-        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
-    ).inspect().hvac
     assert recovered.supported is True
 
 
@@ -401,3 +407,29 @@ def test_discovery_low_level_service_and_profile_helpers() -> None:
     assert _service_evidence(no_has_service, "domain.service", "test").supported is True
     assert _profile_control_service(None) is None
     assert _profile_control_service("sensor.profile") is None
+
+
+def test_off_zone_without_target_defers_only_zone_synchronisation() -> None:
+    hass = FakeHass(
+        {
+            "climate.main": FakeState("off", {"temperature": 19}),
+            "climate.zone": FakeState("off", {"temperature": None}),
+        },
+        set(),
+    )
+    discovery = CapabilityDiscovery(
+        hass,
+        {
+            CONF_DAIKIN_CLIMATE: "climate.main",
+            CONF_CLIMATE_ZONES: ["climate.zone"],
+        },
+        {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+    report = discovery.inspect().hvac
+    assert report.supported
+    assert report.details["zone_targets_deferred"] == ["climate.zone"]
+    assert report.details["zone_targets_unavailable"] == []
+    hass.states.values["climate.zone"] = FakeState("heat", {"temperature": None})
+    assert "climate_zone_target_unavailable" in discovery.inspect().hvac.issues
+    hass.states.values["climate.zone"] = FakeState("heat", {"temperature": 20})
+    assert discovery.inspect().hvac.details["zone_targets_deferred"] == []

@@ -55,3 +55,12 @@ def profile_control_service(entry_data: dict[str, Any], profile_entity: str | No
     if domain in {"select", "input_select"}:
         return f"{domain}.select_option"
     return None
+
+
+def zone_temperature_sync_deferred(state: State | None) -> bool:
+    """Leave an off zone with no exposed target untouched for this takeover."""
+    return (
+        state is not None
+        and state.state == "off"
+        and all(state.attributes.get(key) is None for key in ("temperature", "target_temp_low", "target_temp_high"))
+    )
