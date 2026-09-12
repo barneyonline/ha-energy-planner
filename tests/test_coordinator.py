@@ -4508,9 +4508,10 @@ def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
     assert present != missing
 
 
-def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline() -> None:
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: Any) -> None:
     coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
     coordinator.data = _plan("existing")
+    coordinator.data.input_issues = ["amber_import_price_entity_unavailable"]
     coordinator._last_decision_fingerprint = _decision_input_fingerprint(
         coordinator.hass,
         coordinator.entry_data,
@@ -4528,6 +4529,7 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline() -> Non
 
     assert result is coordinator.data
     assert coordinator._refresh_counters["fingerprint_skipped"] == 1
+    assert "required_evidence_missing" in caplog.text
 
 
 def test_active_load_outage_bypasses_unchanged_fingerprint(
@@ -8271,3 +8273,69 @@ def test_availability_reason_changes_preserve_one_continuous_input_outage(caplog
     coordinator._log_availability_transition([])
     assert "pv_forecast_entity_stale entities=sensor.pv outage_seconds=400.0" in caplog.records[-1].message
     assert len([record for record in caplog.records if "required_evidence_restored" in record.message]) == 2
+
+
+def test_startup_availability_grace_warns_once_for_persistent_outage(caplog: Any, monkeypatch: Any) -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.entry.data["household_load_entity"] = "sensor.house"
+    coordinator.entry.data["pv_forecast_entity"] = "sensor.pv"
+    coordinator._availability_startup_deadline = 700.0
+    clock = [100.0]
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.monotonic", lambda: clock[0])
+    caplog.set_level(logging.INFO)
+    coordinator._log_availability_transition(["household_load_entity_unavailable", "pv_forecast_entity_unavailable"])
+    clock[0] = 130.0
+    coordinator._log_availability_transition(["household_load_entity_unavailable"])
+    assert not caplog.records
+    clock[0] = 700.0
+    coordinator._log_availability_transition(["household_load_entity_unavailable"])
+    coordinator._log_availability_transition(["household_load_entity_unavailable"])
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    clock[0] = 720.0
+    coordinator._log_availability_transition([])
+    assert "outage_seconds=620.0" in caplog.records[-1].message
+    coordinator._log_availability_transition(["pv_forecast_entity_unavailable"])
+    assert caplog.records[-1].levelno == logging.WARNING
+
+
+def test_zone_bound_changes_trigger_replanning_without_manual_override() -> None:
+    old = SimpleNamespace(state="heat", attributes={"temperature": 24, "min_temp": 22, "max_temp": 26})
+    new = SimpleNamespace(state="heat", attributes={"temperature": 24, "min_temp": 16, "max_temp": 30})
+    assert coordinator_module._material_attributes_changed(old, new)
+    assert not ({"min_temp", "max_temp"} & coordinator_module._HVAC_CONTROL_ATTRIBUTE_KEYS)
+
+
+def test_startup_warning_grace_ends_when_inputs_recover(caplog: Any, monkeypatch: Any) -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.entry.data["household_load_entity"] = "sensor.house"
+    coordinator._availability_startup_deadline = 700.0
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.monotonic", lambda: 100.0)
+    caplog.set_level(logging.INFO)
+    coordinator._log_availability_transition(["household_load_entity_unavailable"])
+    coordinator._log_availability_transition([])
+    assert not caplog.records
+    coordinator._log_availability_transition(["household_load_entity_unavailable"])
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+
+
+@pytest.mark.parametrize("initial_load_unavailable", [False, True])
+def test_runtime_outage_warns_while_another_input_is_still_starting(
+    caplog: Any, monkeypatch: Any, initial_load_unavailable: bool,
+) -> None:
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.entry.data.update({"household_load_entity": "sensor.house", "pv_forecast_entity": "sensor.pv"})
+    coordinator._availability_startup_deadline = 700.0
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.monotonic", lambda: 100.0)
+    caplog.set_level(logging.INFO)
+    initial = ["pv_forecast_entity_unavailable"]
+    if initial_load_unavailable:
+        initial.append("household_load_entity_unavailable")
+    coordinator._log_availability_transition(initial)
+    coordinator._log_availability_transition(["pv_forecast_entity_unavailable"])
+    coordinator._log_availability_transition(["pv_forecast_entity_unavailable", "household_load_entity_unavailable"])
+    coordinator._log_availability_transition(["pv_forecast_entity_unavailable", "household_load_entity_unavailable"])
+    assert len(caplog.records) == 1
+    assert caplog.records[0].levelno == logging.WARNING
+    assert "sensor.house" in caplog.records[0].message
