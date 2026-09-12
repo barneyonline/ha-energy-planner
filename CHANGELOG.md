@@ -12,6 +12,8 @@
 
 ### 🐛 Bug fixes
 
+- Keep corrective heating and cooling preconditioning active at the starting comfort boundary instead of cancelling on the next plan; retain opposite-boundary and coasting comfort handoffs.
+
 - Defer unavailable or out-of-range climate zone restores without repeatedly issuing invalid commands or restarting the scheduler guard; retain original targets for recovery.
 - Show unresolved climate restoration as degraded Plan health with pending-target details.
 - Suppress transient input warnings during a bounded Home Assistant startup grace while retaining immediate safety checks and warning on persistent outages.

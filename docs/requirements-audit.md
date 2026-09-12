@@ -9,6 +9,8 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Preconditioning acquisition survives the next planning cycle when heating from at or below the lower comfort boundary or cooling from at or above the upper boundary. Opposite-boundary handoffs remain active, and scheduled coasting boundaries override stale persisted phases. Home/away, mirrored heating/cooling, manual override, missing evidence, and unsafe-input regressions are covered in `tests/test_planner.py`.
+
 - Startup input warnings have a bounded ten-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
 - Zone restoration retains incompatible targets without repeated device or scheduler-guard commands, releases other eligible states, and retries the original target after recovery, and accepts an already-observed baseline despite changed command bounds (`tests/test_hvac_adapter.py`). Plan health exposes unresolved durable HVAC restoration as degraded independently of input quality and handles legacy non-mapping HVAC ownership (`tests/test_sensor.py`).
 
