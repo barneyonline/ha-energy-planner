@@ -234,6 +234,8 @@ def _plan_health_state(coordinator: EnergyPlannerCoordinator) -> str | None:
     if plan is None:
         return None
     health = str(plan.health)
+    if health == str(InputHealth.HEALTHY) and _pending_hvac_restore(coordinator):
+        return str(InputHealth.DEGRADED)
     return health if health in {str(item) for item in InputHealth} else None
 
 
@@ -243,6 +245,9 @@ def _plan_health_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     if plan is None:
         return {}
     issue_codes = [str(issue) for issue in plan.input_issues[:20]]
+    pending_restore = _pending_hvac_restore(coordinator)
+    if pending_restore:
+        issue_codes.append("hvac_release_failed")
     return {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
@@ -250,9 +255,26 @@ def _plan_health_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         "mode": str(plan.mode),
         "summary": plan.summary,
         "confidence_percent": round(plan.confidence * 100, 1),
-        "issue_count": len(plan.input_issues),
+        "issue_count": len(plan.input_issues) + bool(pending_restore),
+        "input_health": str(plan.health),
+        "pending_hvac_restore": pending_restore,
         "issues": [{"code": issue, "description": plain_reason(issue)} for issue in issue_codes],
         "data_quality": decision_data_quality_attrs(coordinator),
+    }
+
+
+def _pending_hvac_restore(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Expose unresolved durable restoration independently of input quality."""
+    store = getattr(getattr(coordinator, "store", None), "data", {})
+    ownership = store.get("ownership", {})
+    control = ownership.get("hvac_control", {})
+    if not isinstance(control, dict) or control.get("required_evidence_lost") != "hvac_release_failed":
+        return {}
+    return {
+        "reason": "hvac_release_failed",
+        "zone_targets": to_jsonable(control.get("zone_states", {})),
+        "main_target": to_jsonable(control.get("main_state", {})),
+        "automations": to_jsonable(ownership.get("climate_automations", {})),
     }
 
 
