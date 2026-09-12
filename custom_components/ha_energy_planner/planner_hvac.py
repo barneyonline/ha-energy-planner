@@ -137,7 +137,22 @@ class HVACPlanningPolicy:
                 if active
                 else []
             )
-        comfort_boundary_breached = float(current) <= float(low) or float(current) >= float(high)
+        # Preconditioning moves toward comfort from the cold/hot boundary.
+        # Use the scheduled boundaries as well as the persisted phase so a
+        # stale preconditioning record cannot bypass comfort protection in coast.
+        active_period_start = _datetime_value(active.get("period_start"))
+        active_precondition_end = _datetime_value(active.get("precondition_end")) or active_period_start
+        preconditioning_now = (
+            active.get("phase") == "preconditioning"
+            and active_period_start is not None
+            and active_precondition_end is not None
+            and now < min(active_period_start, active_precondition_end)
+        )
+        warming = preconditioning_now and active.get("mode") == "heat"
+        cooling = preconditioning_now and active.get("mode") == "cool"
+        comfort_boundary_breached = (
+            float(current) <= float(low) and not warming
+        ) or (float(current) >= float(high) and not cooling)
         if comfort_boundary_breached and active:
             active_end = _datetime_value(active.get("period_end"))
             return [
