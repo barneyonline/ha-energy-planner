@@ -3700,3 +3700,117 @@ def test_expired_hold_keeps_unresolved_hvac_ownership_recovery() -> None:
     plan = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).create_plan(context)
     assert plan.actions[0].kind == ActionKind.RELEASE_HVAC
     assert plan.actions[0].desired_state["release_reason"] == "hvac_required_evidence_lost"
+
+
+def _boundary_preconditioning_context(mode: str, temperature: float) -> DecisionContext:
+    context = _context()
+    context.created_at = datetime(2026, 9, 12, 5, 0, tzinfo=UTC)
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = mode
+    context.current_hvac_temperature_c = temperature
+    context.occupied_temperature_low_c = 19
+    context.occupied_temperature_high_c = 24
+    context.slots = [
+        DecisionSlot(
+            valid_at=context.created_at + timedelta(minutes=offset),
+            import_price=0.10 if offset < 60 or offset >= 120 else 0.60,
+            export_price=0.05,
+            pv_forecast_kw=1.0,
+            baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5.0 if mode == "heat" else 32.0,
+        )
+        for offset in range(0, 135, 15)
+    ]
+    return context
+
+
+@pytest.mark.parametrize(("mode", "temperature", "target"), [
+    ("heat", 18.0, 24.0), ("heat", 19.0, 24.0),
+    ("cool", 24.0, 19.0), ("cool", 25.0, 19.0),
+])
+@pytest.mark.parametrize("away", [False, True])
+def test_preconditioning_continues_toward_comfort_after_acquisition(
+    mode: str, temperature: float, target: float, away: bool,
+) -> None:
+    options = {
+        **DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+        "planning_interval_minutes": 15, "hvac_precondition_lead_minutes": 60,
+        "hvac_precondition_while_away": away,
+    }
+    context = _boundary_preconditioning_context(mode, temperature)
+    if away:
+        context.occupancy_state = OccupancyState.AWAY
+    planner = DryRunPlanner(options)
+    initial = next(a for a in planner.create_plan(context).actions if a.asset == ActionAsset.DAIKIN)
+    assert initial.kind == ActionKind.SET_HVAC
+    assert initial.desired_state["phase"] == "preconditioning"
+    assert initial.execute_not_before == context.created_at
+    context.hvac_control = dict(initial.desired_state)
+    # The observed failure occurred ten seconds after acquiring control.
+    context.created_at += timedelta(seconds=10)
+    continued = next(a for a in planner.create_plan(context).actions if a.asset == ActionAsset.DAIKIN)
+    assert continued.kind == ActionKind.SET_HVAC
+    assert continued.desired_state["phase"] == "preconditioning"
+    assert continued.desired_state["target_temperature"] == target
+    assert "released_until" not in continued.desired_state
+
+
+@pytest.mark.parametrize(("mode", "temperature"), [("heat", 24.0), ("heat", 25.0), ("cool", 19.0), ("cool", 18.0)])
+def test_preconditioning_hands_off_at_opposite_comfort_boundary(mode: str, temperature: float) -> None:
+    context = _boundary_preconditioning_context(mode, temperature)
+    period_end = context.created_at + timedelta(hours=2)
+    context.hvac_control = {
+        "phase": "preconditioning", "mode": mode, "baseline_price": 0.10,
+        "period_start": context.created_at + timedelta(hours=1), "period_end": period_end,
+    }
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+    action = planner.create_plan(context).actions[0]
+    assert action.kind == ActionKind.RELEASE_HVAC
+    assert action.desired_state == {"release_reason": "hvac_comfort_handoff", "released_until": period_end}
+
+
+@pytest.mark.parametrize("phase", ["preconditioning", "pre_peak_coast", "peak_coast"])
+@pytest.mark.parametrize("elapsed_minutes", [45, 60])
+@pytest.mark.parametrize(("mode", "temperature"), [("heat", 19.0), ("cool", 24.0)])
+def test_coasting_preserves_comfort_handoff_even_with_stale_phase(
+    phase: str, elapsed_minutes: int, mode: str, temperature: float,
+) -> None:
+    context = _boundary_preconditioning_context(mode, temperature)
+    period_end = context.created_at + timedelta(hours=2)
+    context.hvac_control = {
+        "phase": phase, "mode": mode, "baseline_price": 0.10,
+        "precondition_end": context.created_at + timedelta(minutes=45),
+        "period_start": context.created_at + timedelta(hours=1), "period_end": period_end,
+    }
+    context.created_at += timedelta(minutes=elapsed_minutes)
+    context.slots = [slot for slot in context.slots if slot.valid_at >= context.created_at]
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+    action = planner.create_plan(context).actions[0]
+    assert action.kind == ActionKind.RELEASE_HVAC
+    assert action.desired_state == {"release_reason": "hvac_comfort_handoff", "released_until": period_end}
+
+
+@pytest.mark.parametrize("failure", ["manual_override", "missing_temperature", "lost_evidence", "unsafe_inputs"])
+def test_preconditioning_boundary_exception_preserves_safety_handoffs(failure: str) -> None:
+    context = _boundary_preconditioning_context("heat", 18.0)
+    context.hvac_control = {
+        "phase": "preconditioning", "mode": "heat", "baseline_price": 0.10,
+        "period_start": context.created_at + timedelta(hours=1),
+        "period_end": context.created_at + timedelta(hours=2),
+    }
+    if failure == "manual_override":
+        context.active_overrides = [
+            Override("manual_hvac", "service", context.created_at + timedelta(minutes=30), "manual")
+        ]
+    elif failure == "missing_temperature":
+        context.current_hvac_temperature_c = None
+    elif failure == "lost_evidence":
+        context.hvac_control["required_evidence_lost"] = "climate_zone_unavailable"
+    else:
+        context.input_health = InputHealth.UNSAFE
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+    action = planner.create_plan(context).actions[0]
+    assert action.kind == ActionKind.RELEASE_HVAC
+    assert action.desired_state["release_reason"] == (
+        "manual_hvac_override" if failure == "manual_override" else "hvac_required_evidence_lost"
+    )
