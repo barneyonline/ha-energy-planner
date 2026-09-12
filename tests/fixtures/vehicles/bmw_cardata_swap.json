@@ -1,0 +1,11 @@
+{
+  "description": "Synthetic BMW CarData-style scalar states; old vehicle telemetry lags the home charger.",
+  "steps": [
+    {"states": {}, "vehicle": "A", "reason": "detected_automatically"},
+    {"states": {"binary_sensor.plug": "off"}, "vehicle": null, "reason": "unplugged"},
+    {"states": {"binary_sensor.plug": "on"}, "vehicle": null, "reason": "waiting_for_vehicle_disconnect"},
+    {"states": {"sensor.b_port": "CONNECTED"}, "vehicle": null, "reason": "multiple_vehicles_connected"},
+    {"states": {"sensor.a_port": "DISCONNECTED"}, "vehicle": "B", "reason": "detected_automatically"},
+    {"states": {"sensor.a_port": "CONNECTED", "device_tracker.a": "not_home"}, "vehicle": "B", "reason": "detected_automatically"}
+  ]
+}

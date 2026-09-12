@@ -134,6 +134,7 @@ from .const import (
 )
 from .entry_data import combined_entry_data
 from .type_defs import EnergyPlannerConfigEntry
+from .vehicles import AUTO, HOME, MANUAL, PORT, VEHICLE, VEHICLES
 
 SUBENTRY_ENERGY = "energy"
 SUBENTRY_CLIMATE = "climate"
@@ -679,6 +680,13 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     VERSION = 5
 
+    @classmethod
+    def async_get_supported_subentry_types(
+        cls, config_entry: EnergyPlannerConfigEntry,
+    ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
+        """Expose repeatable vehicle profiles on the shared planner entry."""
+        return {VEHICLE: VehicleFlow}
+
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
@@ -692,7 +700,10 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 # Legacy subentries are merged during setup and must not
                 # overwrite the repaired target with an obsolete value.
                 for subentry in entry.subentries.values():
-                    if CONF_EV_SMART_CHARGING_TARGET_SOC in subentry.data:
+                    if (
+                        getattr(subentry, "subentry_type", None) != VEHICLE
+                        and CONF_EV_SMART_CHARGING_TARGET_SOC in subentry.data
+                    ):
                         self.hass.config_entries.async_update_subentry(
                             entry, subentry, data={**subentry.data, **user_input}
                         )
@@ -855,6 +866,11 @@ class OptionsFlow(config_entries.OptionsFlow):
                 schema_fields.update(_schema_field_names(data_schema))
             option_fields = _SETTINGS_SECTION_OPTION_FIELDS[step_id]
             nested_fields.update(_options_section_schema(options, option_fields).schema)
+            if VEHICLES in combined_entry_data(self._config_entry):
+                profile_fields = {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_EV_SOC_PER_KWH,
+                                  CONF_DEFAULT_READY_BY}
+                nested_fields = {marker: value for marker, value in nested_fields.items()
+                                 if str(getattr(marker, "schema", marker)) not in profile_fields}
             current = {
                 key: value
                 for key, value in self._data.items()
@@ -1018,12 +1034,26 @@ def _validate_subentry_config(
         {**DEFAULT_OPTIONS, **(dict(getattr(entry, "options", {})) if options is None else options)},
     ):
         errors.setdefault("base", "ev_keep_on_requires_persistent_control")
-    if subentry_type == SUBENTRY_EV and any(user_input.values()):
+    if (
+        subentry_type == SUBENTRY_EV
+        and any(user_input.values())
+        and VEHICLES not in combined_entry_data(entry)
+        and not (
+            user_input.get(CONF_EV_CONNECTED)
+            and user_input.get(CONF_EV_CHARGING)
+            and not user_input.get(CONF_EV_SOC)
+            and not user_input.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
+        )
+    ):
         for required_key in (
             CONF_EV_SOC,
             CONF_EV_CHARGING,
             CONF_EV_SMART_CHARGING_TARGET_SOC,
         ):
+            if not user_input.get(required_key):
+                errors.setdefault(required_key, "ev_planning_sensor_required")
+    if subentry_type == SUBENTRY_EV and VEHICLES in combined_entry_data(entry):
+        for required_key in (CONF_EV_CONNECTED, CONF_EV_CHARGING):
             if not user_input.get(required_key):
                 errors.setdefault(required_key, "ev_planning_sensor_required")
     return errors
@@ -1277,3 +1307,83 @@ _ENTITY_UNIT_RULES = {
     CONF_DAIKIN_POWER: _POWER_UNITS,
     CONF_EV_SOC: _PERCENT_UNITS,
 }
+
+
+class VehicleFlow(config_entries.ConfigSubentryFlow):
+    """Add or edit a tracked vehicle independently of the shared charger."""
+
+    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.SubentryFlowResult:
+        """Configure a named vehicle with required telemetry and its own ready-by."""
+        return await self._async_vehicle_form(user_input, reconfigure=False)
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.SubentryFlowResult:
+        """Edit an existing profile without replacing its identity or calibration."""
+        return await self._async_vehicle_form(user_input, reconfigure=True)
+
+    async def _async_vehicle_form(
+        self, user_input: dict[str, Any] | None, *, reconfigure: bool,
+    ) -> config_entries.SubentryFlowResult:
+        entry = self._get_entry()
+        current = self._get_reconfigure_subentry() if reconfigure else None
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            name = str(user_input.get("name", "")).strip()
+            if not name or name in {AUTO, MANUAL} or any(
+                s.title == name and s != current for s in entry.subentries.values() if s.subentry_type == VEHICLE
+            ):
+                errors["name"] = "vehicle_name_in_use"
+            for key in (CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, PORT, HOME):
+                entity_id = str(user_input.get(key, ""))
+                state = self.hass.states.get(entity_id)
+                allowed = {"sensor"} if key in {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC} else (
+                    {"sensor", "binary_sensor"} if key == PORT
+                    else {"sensor", "binary_sensor", "device_tracker", "person"}
+                )
+                if state is None or entity_id.split(".", 1)[0] not in allowed:
+                    errors[key] = "entity_not_found"
+            for key in (CONF_EV_SOC, PORT):
+                if any(
+                    s != current and s.subentry_type == VEHICLE and s.data.get(key) == user_input.get(key)
+                    for s in entry.subentries.values()
+                ):
+                    errors[key] = "vehicle_entity_in_use"
+            try:
+                cv.time(user_input.get(CONF_DEFAULT_READY_BY))
+                for key in (CONF_EV_CHARGE_RATE_KW, CONF_EV_SOC_PER_KWH):
+                    value = float(user_input.get(key, 0))
+                    if not 0 < value <= (50 if key == CONF_EV_CHARGE_RATE_KW else 10):
+                        raise ValueError
+            except (vol.Invalid, ValueError, TypeError):
+                errors["base"] = "invalid_vehicle_settings"
+            if not combined_entry_data(entry).get(CONF_EV_CONNECTED):
+                errors["base"] = "vehicle_requires_charger_connection"
+            if not errors:
+                data = {**user_input, "name": name}
+                if current is not None:
+                    return self.async_update_and_abort(entry, current, title=name, data=data)
+                self.hass.config_entries.async_update_entry(
+                    entry, data={**entry.data, "ev_vehicle_mode": True},
+                )
+                return self.async_create_entry(title=name, data=data)
+        defaults = dict(current.data) if current else {
+            CONF_DEFAULT_READY_BY: "07:00",
+            CONF_EV_CHARGE_RATE_KW: DEFAULT_OPTIONS[CONF_EV_CHARGE_RATE_KW],
+            CONF_EV_SOC_PER_KWH: DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
+        }
+        schema = vol.Schema({
+            vol.Required("name"): TextSelector(),
+            vol.Required(PORT): _entity_selector(["sensor", "binary_sensor"]),
+            vol.Required(HOME): _entity_selector(["sensor", "binary_sensor", "device_tracker", "person"]),
+            vol.Required(CONF_EV_SOC): _entity_selector("sensor"),
+            vol.Required(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector("sensor"),
+            vol.Required(CONF_DEFAULT_READY_BY): TextSelector(),
+            vol.Required(CONF_EV_CHARGE_RATE_KW): _option_selector(CONF_EV_CHARGE_RATE_KW),
+            vol.Required(CONF_EV_SOC_PER_KWH): _option_selector(CONF_EV_SOC_PER_KWH),
+        })
+        return self.async_show_form(
+            step_id="reconfigure" if reconfigure else "user",
+            data_schema=self.add_suggested_values_to_schema(schema, user_input or defaults),
+            errors=errors,
+        )

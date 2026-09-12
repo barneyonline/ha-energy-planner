@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from homeassistant.helpers.entity import EntityDescription
+
 from custom_components.ha_energy_planner.binary_sensor import BINARY_SENSORS
 from custom_components.ha_energy_planner.button import BUTTONS
 from custom_components.ha_energy_planner.sensor import SENSORS
@@ -14,7 +16,8 @@ from custom_components.ha_energy_planner.switch import SWITCHES
 ENTITY_DESCRIPTIONS = {
     "binary_sensor": BINARY_SENSORS,
     "button": BUTTONS,
-    "sensor": SENSORS,
+    "sensor": (*SENSORS, EntityDescription(key="active_ev_vehicle", translation_key="active_ev_vehicle")),
+    "select": (EntityDescription(key="ev_vehicle", translation_key="ev_vehicle"),),
     "switch": SWITCHES,
 }
 

@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant
 
 from .entry_data import remove_retired_config_keys
 from .type_defs import EnergyPlannerConfigEntry
+from .vehicles import VEHICLE
 
 SUBENTRY_SYSTEM = "system"
 SUBENTRY_ENERGY = "energy"
@@ -96,7 +97,7 @@ def grouped_subentry_data(entry: EnergyPlannerConfigEntry) -> dict[str, dict[str
 
 def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Move every legacy Add device section into the main config entry."""
-    subentries = list(getattr(entry, "subentries", {}).values())
+    subentries = [s for s in getattr(entry, "subentries", {}).values() if s.subentry_type != VEHICLE]
     if not subentries:
         data = _migrate_load_keys(dict(entry.data))
         if data == dict(entry.data):

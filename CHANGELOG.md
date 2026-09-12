@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Add tracked vehicle profiles for cars sharing one charger, home-aware identification, automatic swap handling, per-vehicle ready-by and calibration, and a Manual guest-charging mode that resets on unplug. Preserve guest load accounting, clear reservations on confirmed unplug, and update ready-by without interrupting household control. Reset manual charging overrides before planning a replacement car and discard calibration across queued feedback interruptions. Preserve port-disconnect evidence across reloads and handle unplug boundaries after charger-state outages or during pending ownership writes.
 
 ### 🐛 Bug fixes
 
