@@ -134,6 +134,9 @@ class DecisionContext:
     current_hvac_temperature_c: float | None = None
     current_hvac_power_kw: float | None = None
     current_outdoor_temperature_c: float | None = None
+    ev_policy_allowed: bool = True
+    ev_vehicle_id: str | None = None
+    ev_session_generation: int | None = None
     ev_connected: bool | None = None
     ev_charging: bool | None = None
     ev_target_soc_percent: float | None = None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
@@ -25,6 +26,7 @@ from .const import (
     CONF_EV_CHARGING,
     CONF_EV_CONFIRMATION_RETRIES,
     CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
+    CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_START,
@@ -70,6 +72,7 @@ from .safety import (
     strict_bool,
 )
 from .storage import PlannerStore
+from .vehicles import connection, state_value
 
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
@@ -142,6 +145,8 @@ class Executor:
         self.entry_id = entry_id
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
+        self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
+        self.ev_restore_guard: Callable[[], bool] = lambda: True
         self.ev_start_feedback_expected_until: datetime | None = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
         self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
@@ -163,6 +168,21 @@ class Executor:
         entity_ids.add(entity_id)
         pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(entity_ids)
         return True
+
+    async def async_release_ev_policy(self, *, unplugged: bool = False) -> None:
+        """Forget charger command ownership while preserving external load accounting."""
+        ownership = {k: v for k, v in self.store.data.get("ownership", {}).items()
+                     if not k.startswith("ev_")}
+        await self.store.async_save_ownership(ownership)
+        self.ev_start_feedback_expected_until = None
+        if unplugged or (
+            self.hass is not None
+            and connection(state_value(self.hass, self.entry_data.get(CONF_EV_CONNECTED))) is False
+        ):
+            self._release_ev_grid_reservation()
+        else:
+            self._retain_external_ev_grid_reservation()
+        await self.async_persist_ev_grid_reservation()
 
     async def async_manual_ev_charging(
         self,
@@ -198,6 +218,9 @@ class Executor:
         charging_reason: str,
     ) -> EVCommandResult:
         """Apply one EV command with shared capacity and recovery tracking."""
+        command_guard = self.ev_command_guard()
+        if not command_guard():
+            return EVCommandResult(False, "ev_vehicle_policy_withheld", {}, {})
         now = dt_util.utcnow()
         action = ManualControlAction(
             action_id=action_id,
@@ -313,6 +336,7 @@ class Executor:
         result = await EVSmartChargingAdapter(
             self.hass,
             ev_entry_data,
+            command_guard=command_guard,
             confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
             confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
         ).async_set_charging(enabled)
@@ -431,6 +455,9 @@ class Executor:
         context: DecisionContext | None = None,
     ) -> PlanAction | None:
         """Audit why an action was not executed."""
+        command_guard = self.ev_command_guard()
+        if not command_guard():
+            plan = replace(plan, actions=[a for a in plan.actions if a.asset != ActionAsset.EV])
         action = plan.next_action
         safety_stop = self._owned_ev_safety_stop(plan, context)
         if safety_stop is not None and self._ev_safety_stop_attempted_plan_id != plan.plan_id:
@@ -648,6 +675,7 @@ class Executor:
             ev_result = await EVSmartChargingAdapter(
                 self.hass,
                 ev_entry_data,
+                command_guard=command_guard,
                 confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                 confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
             ).async_execute(action)
@@ -910,6 +938,8 @@ class Executor:
         context: DecisionContext | None,
     ) -> PlanAction | None:
         """Return a stop when planner-owned EV power must be made safe."""
+        if not self.ev_command_guard()():
+            return None
         manual_start_override = bool(
             context is not None
             and any(
@@ -1240,6 +1270,7 @@ class Executor:
         assets: set[str] | None,
     ) -> ActionOutcome:
         """Restore all planner ownership or the selected device control areas."""
+        command_guard = self.ev_command_guard()
         now = dt_util.utcnow()
         ownership = dict(self.store.data.get("ownership", {}))
         remaining_ownership = dict(ownership)
@@ -1260,7 +1291,7 @@ class Executor:
         hvac_zone_state = dict(hvac_control.get("zone_states", {}))
         hvac_main_state = dict(hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY, {}))
         enphase_owned = bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
-        restore_ev = assets is None or "ev" in assets
+        restore_ev = (assets is None or "ev" in assets) and command_guard() and self.ev_restore_guard()
         restore_hvac = assets is None or "daikin" in assets
         restore_enphase = assets is None or "enphase" in assets
         restore_requested = bool(
@@ -1282,6 +1313,7 @@ class Executor:
                             if isinstance(ev_control_topology, dict) and ev_control_topology
                             else self.entry_data
                         ),
+                        command_guard=command_guard,
                         confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                         confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
                     )

@@ -55,7 +55,7 @@ Provided Home Assistant actions:
 - `ha_energy_planner.export_diagnostics` and `ha_energy_planner.export_support_bundle`: return redacted troubleshooting evidence.
 - `ha_energy_planner.arm_production_control` and `ha_energy_planner.disarm_production_control`: explicitly manage the advanced production safety gate.
 
-With multiple planner entries, provide `config_entry_id` when calling an action. Create one named Energy Planner entry per EV when managing multiple vehicles.
+With multiple planner entries, provide `config_entry_id` when calling an action. Use one planner with vehicle profiles for cars sharing one charger; separate chargers use separate planner entries.
 
 Energy Planner does not provide custom automation triggers or conditions; use
 its entity state changes and the standard Home Assistant automation building
@@ -122,7 +122,7 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - The load model needs at least three qualifying days of Recorder history and must pass coverage and holdout checks before forecast-dependent commands are allowed.
 - Missing, stale, invalid, or unconfirmed inputs fail closed. This can suppress otherwise economical actions.
 - Enphase control is limited to the verified profiles exposed by the mapped Home Assistant integration; it does not directly command battery charge or discharge power.
-- EV control requires a mapped target-SOC entity and confirmed charger feedback. Multiple EVs require separate Energy Planner entries.
+- EV control requires a mapped target-SOC entity and confirmed charger feedback. Cars sharing one charger use tracked vehicle profiles.
 - After the Solcast unit correction, PV calibration restarts from new forecast evidence; older models and training snapshots are discarded. Explicit W/kW/MW forecast units remain supported.
 - Climate comfort holds prevent reacquisition until their expiry. An expired hold alone does not block a new preconditioning cycle.
 - Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely. Off zones that expose no temperature target are left out of temperature synchronisation for that takeover; the main thermostat, zone switches, and zones with valid targets remain eligible. Command-linked target recovery is accepted without suppressing unrelated manual changes. A later takeover can synchronise a recovered zone.
@@ -180,3 +180,19 @@ Removing Energy Planner stops future plans and commands. It does not remove sour
 - [Architecture review and implementation evidence](docs/architecture-review-2026-09-05.md)
 - [Quality-scale evidence](quality_scale.yaml)
 - [Home Assistant Integration Quality Scale](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
+
+### Multiple cars sharing one charger
+
+Configure the shared charger's Plugged In sensor, charging feedback and start/stop controls in **Configure**. Then use **Add device → Vehicle** for each car. Each profile requires its own charging-port sensor, home-presence entity, SOC sensor and target-SOC sensor, plus a ready-by time and charging characteristics. BMW CarData `CONNECTED` / `DISCONNECTED` and location `home` are supported. A home binary sensor may report `on` / `off`. Target SOC is read only: there is no configured target or target fallback.
+
+The **EV vehicle** selector offers **Auto**, each vehicle name, and **Manual — no tracked charging**. Auto requires the home charger to be plugged in and exactly one vehicle to be connected at home; another vehicle with missing evidence must be ruled out before identification. **Active EV vehicle** shows the result, with the detection reason in its attributes. Manual vehicle selection overrides identity detection but still requires a plugged-in charger and valid SOC/target readings.
+
+When identification is uncertain, target/SOC is unavailable, or Manual is selected, Energy Planner withholds all EV commands and leaves charging untouched. Selecting Manual invalidates pending starts, stops and retries and releases planner ownership without sending a charger command. Charger-native schedules and limits still apply. Manual can be selected before a guest plugs in and resets to Auto on unplug; its selection survives reloads while still plugged in.
+
+Unplugging ends the session. After another car is plugged in, the planner identifies it and builds a new plan with its SOC, target and ready-by time. Delayed telemetry showing both cars connected causes a wait, never a guess. A car that still reports connected from the previous session cannot be selected automatically again until its port reports disconnected; manual vehicle selection can resolve a missed port update. This handles physical swaps automatically; it does not schedule future cable swaps or promise readiness for cars that are not connected.
+
+Manual charging overrides reset before a replacement vehicle’s plan is built. Ready-by times and charging characteristics belong to each vehicle; electricity-price policies remain shared. Charging calibration is learned separately from completed charging intervals observed while that car is identified at home. Interrupted, ambiguous and Manual intervals are discarded, including stop/resume or unavailable feedback between planner refreshes; the configured initial SOC-per-kWh estimate is used until sufficient per-car evidence exists. Set effective vehicle power no higher than the shared charger can deliver.
+
+Existing single-vehicle configurations continue unchanged until profiles are added. Configure **every** tracked car before enabling Auto control. Once profiles are enabled, old single-car SOC/target mappings are ignored, including after the last profile is removed. Removing profiles never silently reactivates the old mapping. Use the profile's Configure action to edit its settings; `set_ev_ready_by` updates the currently identified or manually selected tracked vehicle. Ready-by changes replan without reloading the integration or restoring other devices. A new installation can save charger connection and charging feedback before adding its first vehicle.
+
+Manual and unidentified charging still reserve the configured charging power in household load and cost projections, conservatively throughout the horizon until feedback confirms charging has stopped or the cable is unplugged. No EV commands are issued in these modes. Confirmed unplug events release the previous session’s grid reservation, including rapid swaps between refreshes, during pending storage writes, or immediately after a charger-state outage. Port-disconnect evidence is saved even while no vehicle is selected, so a reload cannot reinstate a cleared stale-connection block.

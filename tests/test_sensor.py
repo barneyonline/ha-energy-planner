@@ -689,7 +689,7 @@ def test_confidence_helper_edge_cases_are_readable() -> None:
 
 def test_sensor_platform_setup_groups_planner_sensors(monkeypatch: object) -> None:
     coordinator = _coordinator(_plan())
-    entry = SimpleNamespace(entry_id="test_entry", runtime_data=coordinator)
+    entry = SimpleNamespace(entry_id="test_entry", runtime_data=coordinator, data={})
     added: list[object] = []
 
     asyncio.run(sensor_module.async_setup_entry(SimpleNamespace(), entry, added.extend))

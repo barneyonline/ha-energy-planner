@@ -87,9 +87,11 @@ use throughout; the Docker and pull-request gates enforce that result.
   than receiving environment-specific person defaults in production Python.
   Central settings validation enforces coherent device constraints and supported
   unique priority-weight tokens before configuration values reach the planner.
-  Ready by, opportunistic charging, and opt-in lowest-cost daylight charging are configured centrally. The EV
-  mapping requires SOC, charging feedback, and the authoritative vehicle target
-  SOC entity. Retired number, time, and switch entities, the duplicate
+  Opportunistic charging and opt-in lowest-cost daylight charging are configured centrally;
+  ready-by belongs to each tracked vehicle when profiles are enabled. Legacy EV
+  mappings require SOC, charging feedback, and the authoritative target SOC entity.
+  Shared-charger setup accepts connection and charging feedback before the first
+  vehicle profile is added. Retired number, time, and switch entities, the duplicate
   keep-charger-on switch, the fixed-duration pause buttons, the manual EV
   start/stop buttons, and the connected helper are removed from the entity
   registry during setup. Keep charger on remains editable in EV settings and
@@ -221,7 +223,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   kWh from SOC gain, configured charger power, and active duration. At least 60
   minutes and 3% gain are required; the learned rate carries a 10% conservative
   margin and the configured 2% estimate is used only while history is insufficient.
-- Multiple EVs are supported as separate named config entries. Entry-scoped
+- Multiple chargers are supported as separate named config entries. Entry-scoped
   storage isolates plans, history, production state, pauses, and audit records;
   services require `config_entry_id` when multiple runtimes are loaded. Each
   planner remains independent for cost optimization, while active EV commands
@@ -897,3 +899,13 @@ use throughout; the Docker and pull-request gates enforce that result.
   covers serialized timestamps before, at, and after expiry on both boundaries.
   `test_expired_hold_keeps_unresolved_hvac_ownership_recovery` verifies that
   unresolved actuator ownership is still restored before any new takeover.
+
+
+### Shared charger vehicle profiles
+
+- `vehicles.py`, `config_flow.py`, and `entry_data.py` provide repeatable vehicle profiles without flattening car telemetry into charger settings. `select.py` and `sensor.py` expose selection, resolved identity, and detection reasons. Required target SOC comes from a sensor only; ready-by and charging characteristics are per vehicle.
+- `coordinator.py` resolves home/port/charger evidence, listens to all vehicle entities, persists Manual selection across reloads and resets it on unplug. EV charging overrides are removed synchronously at a session boundary before the replacement vehicle’s planning context is built. Previously connected vehicle IDs are excluded from automatic reuse until port-disconnect evidence is observed, including across restart. Listener saves also persist port-only evidence changes, and queued unplug boundaries following unknown feedback reset the session. Queued saves read the current session to preserve newer selections. Ambiguous or unavailable evidence withholds EV commands while permitting unrelated household planning.
+- `executor.py` releases old session ownership without commanding the charger. `ev_adapter.py` checks the captured vehicle/session token at each service boundary, including retries, helper writes and restoration. A previous vehicle's pending command cannot cross a detected session boundary.
+- `VehicleCalibration` learns separately from completed, continuously attributed local charging intervals. `training.py` excludes shared-charger Recorder history from vehicle calibration. Queued charging stop/resume and unavailable events discard pending learning even without an intervening refresh. Incomplete learning is discarded on restart or interrupted identity; completed per-car models persist.
+- Runtime profile deadlines are excluded from topology and production-evidence fingerprints; updates invalidate pending plans and replan without disarming household control. Charger-first setup accepts shared feedback without legacy vehicle mappings. Unmanaged charging retains conservative load projections, and confirmed unplug events release stale reservations even across rapid replug. Monotonic unplug generations ensure an older pending ownership write cannot consume a newer unplug boundary, including same-car reconnection. Percent-suffixed SOC uses the same normalization in session validation and calibration.
+- `tests/test_vehicles.py` exercises these regression paths plus BMW-style connection/location states, away charging, unknown/ambiguous identity, target loss, guest mode, unplug reset, reload, physical swaps, stale command tokens, storage isolation, profile configuration and UI entities. Full validation remains `scripts/docker-validate.sh`.

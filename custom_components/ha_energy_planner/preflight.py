@@ -566,7 +566,13 @@ def _production_report(
 
 def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[str, Any]) -> str:
     """Bind dry-run evidence to the currently configured control contract."""
-    entry_data = dict(entry_data)
+    entry_data = dict(entry_data.get("_ev_configuration", entry_data))
+    options = options.get("_ev_shared_options", options)
+    if "ev_vehicles" in entry_data:
+        entry_data["ev_vehicles"] = [
+            {key: value for key, value in profile.items() if key != CONF_DEFAULT_READY_BY}
+            for profile in entry_data["ev_vehicles"]
+        ]
     aliases = {
         CONF_EV_CHARGER: CONF_EV_SMART_CHARGING,
         CONF_EV_CHARGER_START: CONF_EV_SMART_CHARGING_START,

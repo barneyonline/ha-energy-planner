@@ -780,7 +780,7 @@ def test_english_locale_files_include_central_input_section_labels() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        assert "config_subentries" not in translations
+        assert set(translations["config_subentries"]) == {"vehicle"}
         assert expected_steps <= translations["options"]["step"]["init"]["sections"].keys()
 
 
@@ -930,11 +930,13 @@ def test_config_flow_rejects_blank_planner_name() -> None:
     assert flow.async_show_form.call_args.kwargs["errors"] == {CONF_INSTANCE_NAME: "instance_name_required"}
 
 
-def test_config_flow_reports_options_without_add_device_subentry_flows() -> None:
+def test_config_flow_reports_options_and_vehicle_subentry_flow() -> None:
     options_flow = ConfigFlow.async_get_options_flow(SimpleNamespace(options={}))
 
     assert isinstance(options_flow, OptionsFlow)
-    assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {}
+    assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {
+        "vehicle": config_flow_module.VehicleFlow,
+    }
 
 
 def test_options_flow_consolidates_related_settings_sections() -> None:

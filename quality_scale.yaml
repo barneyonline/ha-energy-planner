@@ -1,3 +1,4 @@
+# Shared-charger vehicle evidence: vehicles.py, select.py, tests/test_vehicles.py (guest load accounting, unplug reservation release, runtime deadlines, charger-first setup, SOC normalization, pre-plan override reset, queued calibration interruptions, restart evidence, outage unplug boundaries, unplug during pending ownership writes); see docs/requirements-audit.md.
 levels:
   bronze:
     required:

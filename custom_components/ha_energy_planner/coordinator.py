@@ -158,6 +158,16 @@ from .storage import PlannerStore
 from .thermal_model import thermal_model_summary, update_thermal_model
 from .training import HistoryTraining, TrainingRequest, TrainingResult, training_request
 from .type_defs import EnergyPlannerConfigEntry
+from .vehicles import (
+    AUTO,
+    MANUAL,
+    VEHICLES,
+    VehicleCalibration,
+    VehicleSession,
+    connection,
+    state_value,
+    vehicle_entity_ids,
+)
 from .weather import (
     _bounded_reason as _bounded_reason,
 )
@@ -281,8 +291,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._availability_startup_deadline = monotonic() + (
             0 if getattr(hass, "is_running", True) else startup_recovery.STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
         )
+        self.hass = hass
         self.entry = entry
         self.store = store
+        self.vehicle_session = VehicleSession(store.data.get("ev_vehicle_session"))
+        self.vehicle_calibration = VehicleCalibration()
+        self._vehicle_ownership_key: tuple[Any, ...] | None = None
         now = dt_util.utcnow()
         self.overrides: list[Override] = _overrides_from_store(store.data, now)
         helper_override_expiry = now + timedelta(
@@ -325,6 +339,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
             )
         self.ready_by = str(self.options.get(CONF_DEFAULT_READY_BY, "07:00"))
+        self._vehicle_ready_by_settings = {
+            p["id"]: p[CONF_DEFAULT_READY_BY] for p in combined_entry_data(self.entry).get(VEHICLES, [])
+        }
         self.executor = Executor(
             store,
             hass=hass,
@@ -334,6 +351,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entry_id=getattr(entry, "entry_id", None),
             entry_title=getattr(entry, "title", None),
         )
+        self.executor.ev_command_guard = self._ev_command_guard
+        self.executor.ev_restore_guard = self._ev_restore_allowed
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
@@ -394,12 +413,102 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     @property
     def planner_options(self) -> dict[str, Any]:
         """Return options including runtime service overrides used by planning."""
-        return {**self.options, CONF_DEFAULT_READY_BY: self.ready_by}
+        options = {**self.options, CONF_DEFAULT_READY_BY: self.ready_by}
+        if VEHICLES in combined_entry_data(self.entry):
+            self._update_vehicle_session()
+            return self.vehicle_session.options(options)
+        return options
 
     @property
     def entry_data(self) -> dict[str, Any]:
         """Return merged hub and input subentry data."""
-        return combined_entry_data(self.entry)
+        data = combined_entry_data(self.entry)
+        if VEHICLES in data:
+            self._update_vehicle_session()
+            return self.vehicle_session.resolve(data)
+        return data
+
+    def _update_vehicle_session(self) -> bool:
+        """Reconcile identity synchronously, including during an adapter retry."""
+        data = combined_entry_data(self.entry)
+        if VEHICLES not in data:
+            return False
+        if (self.vehicle_session.was_plugged
+            and connection(state_value(self.hass, data.get(CONF_EV_CONNECTED))) is False
+        ):
+            self._ev_unplug_generation = getattr(self, "_ev_unplug_generation", 0) + 1
+        old_signature = self.vehicle_session.signature
+        changed = self.vehicle_session.update(self.hass, data)
+        if changed and self.vehicle_session.signature is not None and (
+            old_signature is None or self.vehicle_session.signature[:4] != old_signature[:4]
+        ):
+            self.vehicle_calibration.pending = None
+            # Reset before InputManager builds the new vehicle's context. Waiting
+            # until execution would let the old override shape its charging plan.
+            self.overrides = [o for o in getattr(self, "overrides", []) if o.kind != "manual_ev_charging"]
+        if changed and hasattr(self, "_refresh_generation"):
+            self._refresh_generation += 1
+            self._clear_ev_auto_start_compensation()
+        return changed
+
+    def _ev_command_guard(self) -> Callable[[], bool]:
+        """Capture a session token and revalidate it at every service boundary."""
+        if VEHICLES not in combined_entry_data(self.entry):
+            return lambda: True
+        self._update_vehicle_session()
+        generation = self.vehicle_session.generation
+
+        def permitted() -> bool:
+            self._update_vehicle_session()
+            return self.vehicle_session.allowed and self.vehicle_session.generation == generation
+
+        return permitted
+
+    def _ev_restore_allowed(self) -> bool:
+        """Never restore a previous vehicle's baseline during startup or a swap."""
+        if VEHICLES not in combined_entry_data(self.entry):
+            return True
+        self._update_vehicle_session()
+        signature = self.vehicle_session.signature
+        return bool(signature and self._vehicle_ownership_key == signature[:4] and self.vehicle_session.allowed)
+
+    async def _async_reconcile_vehicle_ownership(self) -> None:
+        """Drop old session control without changing the charger state."""
+        if VEHICLES not in combined_entry_data(self.entry):
+            return
+        self._update_vehicle_session()
+        key = self.vehicle_session.signature[:4] if self.vehicle_session.signature else None
+        unplug_generation = getattr(self, "_ev_unplug_generation", 0)
+        unplugged = unplug_generation != getattr(self, "_ev_reconciled_unplug_generation", 0)
+        if key != self._vehicle_ownership_key or unplugged:
+            await self.executor.async_release_ev_policy(unplugged=unplugged)
+            self.overrides = [o for o in self.overrides if o.kind != "manual_ev_charging"]
+            await self.store.async_save_overrides(self.overrides)
+            self._vehicle_ownership_key = key
+            # Only acknowledge boundaries included in this release. A newer
+            # unplug can arrive while either durable write is awaiting I/O.
+            self._ev_reconciled_unplug_generation = unplug_generation
+
+    async def _async_save_vehicle_session(self) -> None:
+        """Save current evidence when a queued listener task runs."""
+        await self.store.async_save_vehicle_session(self.vehicle_session.snapshot())
+
+    async def async_select_vehicle(self, selection: str) -> None:
+        """Select a vehicle or release charging policy until the next unplug."""
+        profiles = combined_entry_data(self.entry).get(VEHICLES, [])
+        if selection not in {AUTO, MANUAL, *(p["id"] for p in profiles)}:
+            raise ValueError("Unknown vehicle selection")
+        self._update_vehicle_session()
+        self.vehicle_session.selection = selection
+        self._update_vehicle_session()
+        # Invalidate in-flight adapters before waiting for command ownership.
+        self._clear_ev_auto_start_compensation()
+        await self.store.async_save_vehicle_session(self.vehicle_session.snapshot())
+        async with self._command_lock:
+            await self._async_reconcile_vehicle_ownership()
+        self.async_update_listeners()
+        self._mark_forced_refresh("vehicle_selection")
+        await self.async_request_refresh()
 
     @property
     def planner_enabled(self) -> bool:
@@ -464,6 +573,38 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def _handle_state_change(event: Any) -> None:
             self._wake_startup_auto_recovery()
+            raw_data = combined_entry_data(self.entry)
+            if (
+                VEHICLES in raw_data
+                and event.data.get("entity_id") == raw_data.get(CONF_EV_CONNECTED)
+                and connection(getattr(event.data.get("new_state"), "state", None)) is False
+                and (
+                    connection(getattr(event.data.get("old_state"), "state", None)) is True
+                    or (
+                        connection(getattr(event.data.get("old_state"), "state", None)) is None
+                        and self.vehicle_session.was_plugged
+                    )
+                )
+            ):
+                # Events can be queued across a rapid unplug/replug. Preserve
+                # the observed boundary even if hass.states already says on.
+                self._ev_unplug_generation = getattr(self, "_ev_unplug_generation", 0) + 1
+                self.vehicle_session.note_unplug()
+                self.vehicle_calibration.pending = None
+                self._vehicle_ownership_key = None
+            if VEHICLES in raw_data and connection(getattr(event.data.get("new_state"), "state", None)) is False:
+                self.vehicle_session.blocked_vehicle_ids.difference_update(
+                    p["id"] for p in raw_data[VEHICLES] if p.get("port_entity") == event.data.get("entity_id")
+                )
+            session_changed = self._update_vehicle_session()
+            if VEHICLES in raw_data and (
+                self.vehicle_session.snapshot() != self.store.data.get("ev_vehicle_session")
+            ):
+                # Port-disconnect evidence can change without changing the
+                # resolved vehicle. Persist it before a reload can lose it.
+                self._async_create_listener_task(self._async_save_vehicle_session())
+            if session_changed:
+                self.async_update_listeners()
             entry_data = self.entry_data
             now = dt_util.utcnow()
             executor = getattr(self, "executor", None)
@@ -471,6 +612,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if charging_entity and event.data.get("entity_id") == charging_entity:
                 new_state = event.data.get("new_state")
                 new_value = getattr(new_state, "state", None)
+                if VEHICLES in raw_data:
+                    self.vehicle_calibration.note_charging_change(
+                        getattr(event.data.get("old_state"), "state", None), new_value,
+                    )
                 if (
                     new_value is not None
                     and str(new_value).strip().lower() not in STATE_UNKNOWN_VALUES
@@ -491,7 +636,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ):
                 return
             if _event_reports_ev_charging_started(entry_data, event):
-                if self.active_control and strict_bool(
+                if self._ev_command_guard()() and self.active_control and strict_bool(
                     self.options.get(CONF_EV_CONTROL_ENABLED),
                     default=False,
                 ):
@@ -585,6 +730,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             charging_state is not None
             and ev_charging_state(charging_state.state) is True
             and self.active_control
+            and self._ev_command_guard()()
             and strict_bool(
                 self.options.get(CONF_EV_CONTROL_ENABLED),
                 default=False,
@@ -761,6 +907,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def _async_update_data_locked(self, *, defer_execution: bool = False) -> EnergyPlan:
         """Refresh planner data while holding the planner lock."""
         preparation_started = perf_counter()
+        self._update_vehicle_session()
+        if VEHICLES in combined_entry_data(self.entry):
+            await self.store.async_save_vehicle_session(self.vehicle_session.snapshot())
         started_generation = self._refresh_generation
         now = dt_util.utcnow()
         active_overrides = _unexpired_overrides(
@@ -780,6 +929,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self._async_reconcile_expired_manual_hvac_state(expired_manual_hvac_state)
         options = self.planner_options
         entry_data = self.entry_data
+        if VEHICLES in entry_data:
+            profile = self.vehicle_session.profile
+            model = self.store.data.get("ev_vehicle_calibrations", {}).get(profile["id"], {}) if profile else {}
+            updated_model = self.vehicle_calibration.observe(
+                self.hass, self.vehicle_session, entry_data, model, now,
+                charge_rate_kw=float(options["ev_charge_rate_kw"]),
+            )
+            if updated_model is not None and profile is not None:
+                await self.store.async_save_vehicle_calibration(profile["id"], updated_model)
+                self._force_next_refresh = True
         self.executor.options = options
         force_refresh = bool(getattr(self, "_force_next_refresh", False))
         self._force_next_refresh = False
@@ -1339,8 +1498,29 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
             self._configuration_reload_handoff = True
 
+    async def async_handle_vehicle_settings_update(self) -> None:
+        """Replan runtime vehicle deadlines without relinquishing device control."""
+        deadlines = {p["id"]: p[CONF_DEFAULT_READY_BY] for p in combined_entry_data(self.entry).get(VEHICLES, [])}
+        if deadlines == getattr(self, "_vehicle_ready_by_settings", {}):
+            return
+        self._vehicle_ready_by_settings = deadlines
+        self._update_vehicle_session()
+        self._mark_forced_refresh("ready_by_changed")
+        await self.async_request_refresh()
+
     async def async_set_ready_by(self, ready_by: str) -> None:
         """Persist the native EV ready-by setting and replan."""
+        if VEHICLES in combined_entry_data(self.entry):
+            self._update_vehicle_session()
+            profile = self.vehicle_session.profile
+            if profile is None:
+                raise ValueError("Select a tracked vehicle before changing its ready-by time")
+            subentry = self.entry.subentries[profile["id"]]
+            self.hass.config_entries.async_update_subentry(
+                self.entry, subentry, data={**subentry.data, CONF_DEFAULT_READY_BY: ready_by},
+            )
+            await self.async_handle_vehicle_settings_update()
+            return
         self.ready_by = ready_by
         options = self.options
         options[CONF_DEFAULT_READY_BY] = ready_by
@@ -1787,6 +1967,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return None
             if (
                 getattr(self, "_tearing_down", False)
+                or not self._ev_command_guard()()
                 or not self.active_control
                 or not strict_bool(
                     self.options.get(CONF_EV_CONTROL_ENABLED),
@@ -1795,6 +1976,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ):
                 self._clear_ev_auto_start_compensation()
                 return None
+            await self._async_reconcile_vehicle_ownership()
             charging_entity = self.entry_data.get(CONF_EV_CHARGING)
             charging_state = self.hass.states.get(charging_entity) if charging_entity else None
             charging_value = getattr(charging_state, "state", None)
@@ -2170,8 +2352,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             or started_generation != self._refresh_generation
         ):
             return
+        await self._async_reconcile_vehicle_ownership()
         self.executor.options = options
         self.executor.entry_data = self.entry_data
+        if started_generation != self._refresh_generation:
+            return
         consumed_action = await self.executor.async_evaluate(plan, context)
         evaluated_action = consumed_action if consumed_action in plan.actions else plan.next_action
         for action in plan.actions:
@@ -2314,7 +2499,7 @@ def _updated_load_source_outage(
 
 def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     """Return explicit decision-input entity IDs that may trigger replanning."""
-    entity_ids: set[str] = set()
+    entity_ids: set[str] = vehicle_entity_ids(entry_data)
     for key in _DECISION_INPUT_ENTITY_KEYS:
         for entity_id in _split_entity_values(entry_data.get(key)):
             entity_ids.add(entity_id)
