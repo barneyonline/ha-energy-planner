@@ -204,6 +204,8 @@ _MATERIAL_STATE_ATTRIBUTE_KEYS = frozenset(
         "value",
         "outdoor_temperature_forecast_c",
         "temperature",
+        "min_temp",
+        "max_temp",
         "native_temperature",
         "current_temperature",
         "temp",
@@ -276,6 +278,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     def __init__(self, hass: HomeAssistant, entry: EnergyPlannerConfigEntry, store: PlannerStore) -> None:
         """Initialize coordinator."""
+        self._availability_startup_deadline = monotonic() + (
+            0 if getattr(hass, "is_running", True) else startup_recovery.STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
+        )
         self.entry = entry
         self.store = store
         now = dt_util.utcnow()
@@ -808,6 +813,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._increment_refresh_counter("fingerprint_skipped")
             self._last_phase_durations = {"fingerprint_ms": round((perf_counter() - preparation_started) * 1000, 3)}
             assert self.data is not None
+            self._log_availability_transition(self.data.input_issues)
             return self.data
         self.executor.entry_data = entry_data
         discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
@@ -946,7 +952,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         active = availability_details(issues, self.entry_data)
         previous: dict[AvailabilityIdentity, tuple[float, str]] = getattr(self, "_availability_outages", {})
         now = monotonic()
-        for identity in sorted(active.keys() - previous.keys()):
+        warned: set[AvailabilityIdentity] = getattr(self, "_availability_warned", set())
+        startup_grace = now < getattr(self, "_availability_startup_deadline", 0)
+        startup_pending: set[AvailabilityIdentity] = getattr(self, "_availability_startup_pending", set(active))
+        self._availability_startup_pending = startup_pending & active.keys()
+        if startup_grace and not active:
+            self._availability_startup_deadline = now
+        for identity in sorted(active.keys() - warned):
+            if startup_grace and identity in self._availability_startup_pending:
+                continue
+            warned.add(identity)
             _LOGGER.warning(
                 "Planner required input or service unavailable: required_evidence_missing %s", active[identity],
             )
@@ -954,10 +969,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if active[identity] != previous[identity][1]:
                 _LOGGER.info("Planner required input still unavailable: required_evidence_changed %s", active[identity])
         for identity in sorted(previous.keys() - active.keys()):
-            _LOGGER.info(
+            log = _LOGGER.info if identity in warned else _LOGGER.debug
+            log(
                 "Planner required inputs and services recovered: required_evidence_restored %s outage_seconds=%.1f",
                 previous[identity][1], max(now - previous[identity][0], 0),
             )
+        self._availability_warned = warned & active.keys()
         self._availability_outages = {
             identity: (previous[identity][0] if identity in previous else now, detail)
             for identity, detail in active.items()

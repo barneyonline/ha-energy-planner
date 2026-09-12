@@ -3392,3 +3392,80 @@ def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -
     assert zone not in result.saved_zone_states
     assert not any(data["entity_id"] == zone for _, _, data in hass.services.calls)
     assert hass.states.get(zone).attributes["temperature"] == 18
+
+
+@pytest.mark.parametrize("attributes", [
+    {"temperature": None, "min_temp": 22, "max_temp": 26},
+    {"temperature": 24, "min_temp": 22, "max_temp": 26},
+    {"temperature": 24, "min_temp": None},
+])
+def test_zone_restore_waits_without_commands_then_restores_original_target(attributes: dict[str, Any]) -> None:
+    hass = FakeHass({"climate.zone": FakeState("off", attributes), "automation.climate": "on"})
+    adapter = DaikinHVACAdapter(hass, {CONF_CLIMATE_AUTOMATIONS: ["automation.climate"]})
+    baseline = {"climate.zone": {"target_temperature": 20.0}}
+    for _ in range(2):
+        result = asyncio.run(adapter.async_restore({}, baseline))
+        assert result.reason == "hvac_zone_restore_pending"
+        assert result.saved_zone_states == baseline
+        assert result.rollback_succeeded is False
+        assert hass.services.calls == []
+    # Recovery also works with a fresh adapter using the retained durable baseline.
+    hass.states.values["climate.zone"] = FakeState("heat", {"temperature": 24, "min_temp": 16, "max_temp": 30})
+    adapter = DaikinHVACAdapter(hass, {CONF_CLIMATE_AUTOMATIONS: ["automation.climate"]})
+    result = asyncio.run(adapter.async_restore({}, result.saved_zone_states))
+    assert result.applied
+    assert result.saved_zone_states == {}
+    assert hass.states.get("climate.zone").attributes["temperature"] == 20.0
+
+
+def test_blocked_zone_does_not_prevent_other_zone_and_automation_restoration() -> None:
+    hass = FakeHass({
+        "climate.blocked": FakeState("off", {"temperature": None}),
+        "climate.ready": FakeState("heat", {"temperature": 24}),
+        "automation.climate": "off",
+    })
+    adapter = DaikinHVACAdapter(hass, {CONF_CLIMATE_AUTOMATIONS: ["automation.climate"]})
+    result = asyncio.run(adapter.async_restore(
+        {"automation.climate": "on"},
+        {"climate.blocked": {"target_temperature": 20}, "climate.ready": {"target_temperature": 19}},
+    ))
+    assert result.saved_zone_states == {"climate.blocked": {"target_temperature": 20}}
+    assert hass.states.get("climate.ready").attributes["temperature"] == 19
+    assert hass.states.get("automation.climate").state == "on"
+    assert not any(data["entity_id"] == "climate.blocked" for _, _, data in hass.services.calls)
+
+
+def test_pending_zone_restore_preserves_user_supersession_before_deferral() -> None:
+    hass = FakeHass({"climate.zone": FakeState("off", {"temperature": None})})
+    adapter = DaikinHVACAdapter(hass, {})
+    adapter.set_zone_manual_override_check(lambda: {"climate.zone"})
+    persisted: list[set[str]] = []
+
+    async def persist(main_superseded: bool, zone_ids: set[str]) -> None:
+        persisted.append(set(zone_ids))
+
+    adapter.set_manual_supersession_persistence_callback(persist)
+    result = asyncio.run(adapter.async_restore({}, {"climate.zone": {"target_temperature": 20}}))
+    assert persisted == [{"climate.zone"}]
+    assert result.saved_zone_states == {}
+    assert result.rollback_succeeded is True
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize(("attributes", "baseline"), [
+    ({"temperature": 20, "min_temp": 22, "max_temp": 26}, {"target_temperature": 20}),
+    (
+        {"target_temp_low": 19, "target_temp_high": 21, "min_temp": 22, "max_temp": 26},
+        {"target_temp_low": 19, "target_temp_high": 21},
+    ),
+])
+def test_zone_restore_accepts_observed_baseline_after_bounds_change(
+    attributes: dict[str, Any], baseline: dict[str, Any],
+) -> None:
+    hass = FakeHass({"climate.zone": FakeState("heat", attributes)})
+    adapter = DaikinHVACAdapter(hass, {})
+    result = asyncio.run(adapter.async_restore({}, {"climate.zone": baseline}))
+    assert result.applied
+    assert result.rollback_succeeded is True
+    assert result.saved_zone_states == {}
+    assert hass.services.calls == []
