@@ -125,6 +125,7 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - EV control requires a mapped target-SOC entity and confirmed charger feedback. Cars sharing one charger use tracked vehicle profiles.
 - After the Solcast unit correction, PV calibration restarts from new forecast evidence; older models and training snapshots are discarded. Explicit W/kW/MW forecast units remain supported.
 - Climate comfort holds prevent reacquisition until their expiry. An expired hold alone does not block a new preconditioning cycle.
+- During preconditioning, heating can continue at or below the lower comfort boundary and cooling at or above the upper boundary. Reaching the opposite boundary hands control back. During pre-peak and peak coasting, either boundary triggers a handoff.
 - Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely. Off zones that expose no temperature target are left out of temperature synchronisation for that takeover; the main thermostat, zone switches, and zones with valid targets remain eligible. Command-linked target recovery is accepted without suppressing unrelated manual changes. A later takeover can synchronise a recovered zone.
 - Optional AI explanations depend on a configured Home Assistant `ai_task`
   entity and remain advisory only. A newly created AI Task with state `unknown`
