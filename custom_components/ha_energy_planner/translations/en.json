@@ -470,6 +470,11 @@
   },
   "config_subentries": {
     "vehicle": {
+      "entry_type": "Vehicle",
+      "initiate_flow": {
+        "user": "Add vehicle",
+        "reconfigure": "Configure vehicle"
+      },
       "title": "Vehicle",
       "step": {
         "user": {
