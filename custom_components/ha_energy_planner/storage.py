@@ -27,6 +27,8 @@ _DICT_FIELDS = {
     "discovery",
     "ev_grid_reservation",
     "ev_charge_calibration",
+    "ev_vehicle_session",
+    "ev_vehicle_calibrations",
     "forecast_calibration",
     "built_in_load_forecast",
     "load_source_outage",
@@ -219,6 +221,16 @@ class PlannerStore:
         """Persist latest non-commanding discovery report."""
         await self._async_set_if_changed("discovery", report)
 
+    async def async_save_vehicle_session(self, session: dict[str, Any]) -> None:
+        """Persist manual selection across reload without retaining location."""
+        await self._async_set_if_changed("ev_vehicle_session", session)
+
+    async def async_save_vehicle_calibration(self, vehicle_id: str, model: dict[str, Any]) -> None:
+        """Keep each vehicle's learned charging model separate."""
+        models = dict(self.data.get("ev_vehicle_calibrations", {}))
+        models[vehicle_id] = model
+        await self._async_set_if_changed("ev_vehicle_calibrations", models)
+
     async def async_save_ev_charge_calibration(self, model: dict[str, Any]) -> None:
         """Persist the compact Recorder-trained EV charging calibration."""
         await self._async_set_if_changed("ev_charge_calibration", model)
@@ -316,6 +328,8 @@ def _default_data() -> dict[str, Any]:
         "dry_run_comparisons": [],
         "ev_grid_reservation": {},
         "ev_charge_calibration": {},
+        "ev_vehicle_session": {},
+        "ev_vehicle_calibrations": {},
         "forecast_calibration": {},
         "built_in_load_forecast": {},
         "load_source_outage": {},

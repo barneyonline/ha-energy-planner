@@ -17,6 +17,7 @@ from .const import (
     ATTR_REASON,
     CONF_BASELINE_LOAD_FORECAST,
     CONF_BASELINE_LOAD_OBSERVED,
+    CONF_DEFAULT_READY_BY,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_FALLBACK_TARGET_SOC_PERCENT,
     CONF_EV_MAX_SOC_PERCENT,
@@ -46,6 +47,7 @@ from .const import (
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .type_defs import EnergyPlannerConfigEntry
+from .vehicles import VEHICLE
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
@@ -601,6 +603,9 @@ async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfig
     handle_options_update = getattr(coordinator, "async_handle_options_update", None)
     if callable(handle_options_update):
         await handle_options_update()
+        handle_vehicle_update = getattr(coordinator, "async_handle_vehicle_settings_update", None)
+        if callable(handle_vehicle_update):
+            await handle_vehicle_update()
         return
     request_replan = getattr(coordinator, "async_request_replan", None)
     if callable(request_replan):
@@ -617,7 +622,10 @@ def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...
                 (
                     str(getattr(subentry, "subentry_id", subentry_id)),
                     str(getattr(subentry, "subentry_type", "")),
-                    _freeze_config_value(getattr(subentry, "data", {})),
+                    _freeze_config_value({
+                        key: value for key, value in getattr(subentry, "data", {}).items()
+                        if getattr(subentry, "subentry_type", "") != VEHICLE or key != CONF_DEFAULT_READY_BY
+                    }),
                 )
                 for subentry_id, subentry in subentries.items()
             )

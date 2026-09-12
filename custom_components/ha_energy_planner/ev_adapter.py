@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
@@ -62,6 +63,7 @@ class EVChargerAdapter:
         confirmation_retries: int = 1,
         confirmation_poll_seconds: float = 1.0,
         connected_override: bool | None = None,
+        command_guard: Callable[[], bool] | None = None,
     ) -> None:
         """Initialize adapter."""
         self.hass = hass
@@ -70,6 +72,7 @@ class EVChargerAdapter:
         self.confirmation_retries = max(int(confirmation_retries), 0)
         self.confirmation_poll_seconds = max(float(confirmation_poll_seconds), 0.01)
         self.connected_override = connected_override
+        self.command_guard = command_guard or (lambda: True)
 
     async def async_execute(self, action: PlanAction) -> EVCommandResult:
         """Execute a supported EV action through Home Assistant services."""
@@ -700,6 +703,8 @@ class EVChargerAdapter:
         press_button: bool = True,
         force: bool = False,
     ) -> EVCommandResult:
+        if not self.command_guard():
+            return EVCommandResult(False, "ev_vehicle_session_changed", self._snapshot(), self._snapshot())
         raw_state = self.hass.states.get(entity_id)
         if raw_state is None:
             return EVCommandResult(False, "ev_control_unavailable", self._snapshot(), self._snapshot())
@@ -738,6 +743,8 @@ class EVChargerAdapter:
         return EVCommandResult(False, "ev_control_domain_unsupported", self._snapshot(), self._snapshot())
 
     async def _async_set_entity_value(self, entity_id: str, value: Any) -> bool:
+        if not self.command_guard():
+            return False
         domain = entity_id.split(".", 1)[0]
         if self._entity_value_matches(entity_id, value):
             return True

@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Energy Planner",
-        "description": "Name this Planner Hub, then add energy, climate, EV, and Enphase inputs from the integration page. Create one named hub per EV when managing multiple vehicles.",
+        "description": "Name this planner, then open Configure to map the shared charger and household inputs. Use Add device to add tracked vehicle profiles for cars sharing one charger.",
         "data": {
           "instance_name": "Planner name",
           "amber_import_price_entity": "Amber import price sensor",
@@ -38,7 +38,7 @@
           "weather_entity": "Weather Forecast"
         },
         "data_description": {
-          "instance_name": "Unique name for this planner and its EV, for example Energy Planner - Commuter EV.",
+          "instance_name": "Unique name for this household planner.",
           "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
           "amber_export_price_entity": "Sensor that exposes current and forecast feed-in prices in $/kWh, AUD/kWh, or c/kWh.",
           "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
@@ -460,6 +460,9 @@
           "recovery": "Recovery",
           "active": "Active"
         }
+      },
+      "active_ev_vehicle": {
+        "name": "Active EV vehicle"
       }
     },
     "binary_sensor": {
@@ -507,6 +510,56 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
+      }
+    },
+    "select": {
+      "ev_vehicle": {
+        "name": "EV vehicle"
+      }
+    }
+  },
+  "config_subentries": {
+    "vehicle": {
+      "title": "Vehicle",
+      "step": {
+        "user": {
+          "title": "Tracked vehicle",
+          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+          "data": {
+            "name": "Vehicle name",
+            "port_entity": "Charging port connection sensor",
+            "home_entity": "Home presence entity",
+            "ev_soc_entity": "Vehicle SOC sensor",
+            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+            "default_ready_by": "Ready by",
+            "ev_charge_rate_kw": "Effective charging power (kW)",
+            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          }
+        },
+        "reconfigure": {
+          "title": "Tracked vehicle",
+          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+          "data": {
+            "name": "Vehicle name",
+            "port_entity": "Charging port connection sensor",
+            "home_entity": "Home presence entity",
+            "ev_soc_entity": "Vehicle SOC sensor",
+            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+            "default_ready_by": "Ready by",
+            "ev_charge_rate_kw": "Effective charging power (kW)",
+            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          }
+        }
+      },
+      "error": {
+        "vehicle_name_in_use": "Choose a unique vehicle name other than Auto or Manual.",
+        "entity_not_found": "Choose an existing entity of the supported type.",
+        "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
+        "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
+        "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure."
+      },
+      "abort": {
+        "reconfigure_successful": "Vehicle updated."
       }
     }
   }

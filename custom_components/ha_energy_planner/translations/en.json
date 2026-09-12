@@ -3,12 +3,12 @@
     "step": {
       "user": {
         "title": "Energy Planner",
-        "description": "Name this planner, then open Configure to map energy, climate, EV and Enphase inputs. Create one named planner per EV when managing multiple vehicles.",
+        "description": "Name this planner, then open Configure to map the shared charger and household inputs. Use Add device to add tracked vehicle profiles for cars sharing one charger.",
         "data": {
           "instance_name": "Planner name"
         },
         "data_description": {
-          "instance_name": "Unique name for this planner and its EV, for example Energy Planner - Commuter EV."
+          "instance_name": "Unique name for this household planner."
         }
       },
       "reconfigure": {
@@ -96,7 +96,7 @@
               "pv_forecast_entity": "Primary PV forecast sensor. For Solcast, select Forecast Today, not Peak Forecast Today; Energy Planner reads its detailedForecast values.",
               "pv_forecast_secondary_entity": "Optional continuation forecast. For Solcast, select Forecast Tomorrow; Energy Planner stitches its timezone-aware timestamped values after Forecast Today.",
               "household_load_entity": "Measured whole-home power sensor in W, kW, or MW. Energy Planner learns a local load forecast from Recorder history and excludes known EV charging and measured HVAC power where possible.",
-              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO\u2082/kWh or kgCO\u2082/kWh.",
+              "carbon_intensity_forecast_entity": "Optional sensor that exposes current and forecast grid carbon intensity in gCO₂/kWh or kgCO₂/kWh.",
               "pv_observed_entity": "Optional actual PV power sensor used to validate and calibrate forecasts. This must be a measured power sensor, not the forecast sensor.",
               "battery_soc_entity": "Battery state-of-charge sensor that exposes a percentage value.",
               "battery_min_soc_percent": "Minimum home battery state of charge the planner tries to preserve.",
@@ -410,6 +410,9 @@
           "recovery": "Recovery",
           "active": "Active"
         }
+      },
+      "active_ev_vehicle": {
+        "name": "Active EV vehicle"
       }
     },
     "binary_sensor": {
@@ -457,6 +460,56 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
+      }
+    },
+    "select": {
+      "ev_vehicle": {
+        "name": "EV vehicle"
+      }
+    }
+  },
+  "config_subentries": {
+    "vehicle": {
+      "title": "Vehicle",
+      "step": {
+        "user": {
+          "title": "Tracked vehicle",
+          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+          "data": {
+            "name": "Vehicle name",
+            "port_entity": "Charging port connection sensor",
+            "home_entity": "Home presence entity",
+            "ev_soc_entity": "Vehicle SOC sensor",
+            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+            "default_ready_by": "Ready by",
+            "ev_charge_rate_kw": "Effective charging power (kW)",
+            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          }
+        },
+        "reconfigure": {
+          "title": "Tracked vehicle",
+          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+          "data": {
+            "name": "Vehicle name",
+            "port_entity": "Charging port connection sensor",
+            "home_entity": "Home presence entity",
+            "ev_soc_entity": "Vehicle SOC sensor",
+            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+            "default_ready_by": "Ready by",
+            "ev_charge_rate_kw": "Effective charging power (kW)",
+            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          }
+        }
+      },
+      "error": {
+        "vehicle_name_in_use": "Choose a unique vehicle name other than Auto or Manual.",
+        "entity_not_found": "Choose an existing entity of the supported type.",
+        "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
+        "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
+        "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure."
+      },
+      "abort": {
+        "reconfigure_successful": "Vehicle updated."
       }
     }
   }
