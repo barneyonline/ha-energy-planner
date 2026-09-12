@@ -21,6 +21,7 @@ from .const import (
 )
 from .recorder_import import async_update_builtin_load_forecast, async_update_ev_charge_calibration
 from .safety import strict_bool
+from .vehicles import VEHICLES
 
 _LOGGER = logging.getLogger(__name__)
 _LOCKS_KEY = f"{DOMAIN}_history_training_locks"
@@ -66,7 +67,8 @@ def training_request(
     return TrainingRequest(
         dict(entry_data), float(options[CONF_EV_CHARGE_RATE_KW]), timezone,
         strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False),
-        dict(store_data.get("ev_charge_calibration", {})),
+        dict(store_data.get("ev_vehicle_calibrations", {}).get(entry_data.get("ev_vehicle_id"), {}))
+        if VEHICLES in entry_data else dict(store_data.get("ev_charge_calibration", {})),
         dict(store_data.get("built_in_load_forecast", {})),
     )
 
@@ -121,10 +123,13 @@ class HistoryTraining:
 
     async def _train(self, request: TrainingRequest) -> TrainingResult:
         now = dt_util.utcnow()
-        ev, ev_changed, ev_reason = await async_update_ev_charge_calibration(
-            self.hass, request.entry_data, request.ev_model,
-            charge_rate_kw=request.charge_rate_kw, now=now,
-        )
+        if VEHICLES in request.entry_data:
+            ev, ev_changed, ev_reason = request.ev_model, False, "ev_vehicle_session_calibration"
+        else:
+            ev, ev_changed, ev_reason = await async_update_ev_charge_calibration(
+                self.hass, request.entry_data, request.ev_model,
+                charge_rate_kw=request.charge_rate_kw, now=now,
+            )
         load, load_changed, load_reason = await async_update_builtin_load_forecast(
             self.hass, request.entry_data, request.load_model, now=now, timezone=request.timezone,
             force=not self.load_training_attempted,

@@ -46,6 +46,7 @@ from .coordinator import (
 )
 from .discovery import CapabilityDiscovery
 from .entity import EnergyPlannerEntity, recorder_safe_attributes
+from .entry_data import combined_entry_data
 from .load_forecast import MIN_UPPER_COVERAGE
 from .models import ActionAsset, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .plan_presentation import (
@@ -65,6 +66,7 @@ from .safety import (
     strict_bool,
 )
 from .type_defs import EnergyPlannerConfigEntry
+from .vehicles import VEHICLES
 
 # Read-only entities receive coordinator updates.
 PARALLEL_UPDATES = 0
@@ -166,6 +168,8 @@ async def async_setup_entry(
     """Set up sensors."""
     coordinator: EnergyPlannerCoordinator = entry.runtime_data
     async_add_entities(PlannerSensor(coordinator, description) for description in SENSORS)
+    if VEHICLES in combined_entry_data(entry):
+        async_add_entities([ActiveVehicleSensor(coordinator, "active_ev_vehicle")])
 
 
 class PlannerSensor(EnergyPlannerEntity, SensorEntity):
@@ -969,3 +973,19 @@ def _device_plan_for_asset(plan: EnergyPlan, asset: ActionAsset) -> dict[str, An
     }
     device_plan = plan.device_plans.get(key_by_asset[asset], {})
     return device_plan if isinstance(device_plan, dict) else {}
+
+
+class ActiveVehicleSensor(EnergyPlannerEntity, SensorEntity):
+    """Expose resolved identity separately from the Auto/manual selector."""
+
+    _attr_translation_key = "active_ev_vehicle"
+
+    @property
+    def native_value(self) -> str | None:
+        profile = self.coordinator.vehicle_session.profile
+        return profile["name"] if profile else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        session = self.coordinator.vehicle_session
+        return {"detection_reason": session.reason, "vehicle_inputs_ready": session.allowed}

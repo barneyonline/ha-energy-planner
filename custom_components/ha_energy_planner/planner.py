@@ -87,6 +87,12 @@ class DryRunPlanner:
 
     def create_plan(self, context: DecisionContext) -> EnergyPlan:
         """Create a dry-run plan from the current decision context."""
+        # Unmanaged charging still consumes household headroom. Without an
+        # attributed target or end time, reserve the configured rate throughout
+        # the horizon until charger feedback proves that consumption has stopped.
+        if not context.ev_policy_allowed and context.ev_charging is not False and context.ev_connected is not False:
+            for slot in context.slots:
+                slot.projected_ev_load_kw = max(slot.projected_ev_load_kw, float(self.options[CONF_EV_CHARGE_RATE_KW]))
         mode = self._mode(context)
         confidence = self._confidence(context)
         actions = self._actions(context, mode)
@@ -264,7 +270,8 @@ class DryRunPlanner:
                 )
             )
         if (
-            context.ev_connected is not False
+            context.ev_policy_allowed
+            and context.ev_connected is not False
             and context.current_ev_soc_percent is not None
             and context.ev_target_soc_percent is not None
         ):

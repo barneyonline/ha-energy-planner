@@ -266,6 +266,8 @@ class InputManager:
         else:
             ev_ready_by = str(self.options.get(CONF_DEFAULT_READY_BY, "07:00"))
             ev_ready_by_issue = None
+        if not self.entry_data.get("ev_policy_allowed", True):
+            ev_issue = ev_connected_issue = ev_charging_issue = ev_target_soc_issue = ev_ready_by_issue = None
         enphase_profile, enphase_profile_issue = self._optional_string_state(CONF_ENPHASE_PROFILE)
         hvac_mode, hvac_temperature, hvac_issue = self._optional_climate_state(CONF_DAIKIN_CLIMATE)
         hvac_power, hvac_power_issue = self._optional_numeric_state(CONF_DAIKIN_POWER)
@@ -369,6 +371,9 @@ class InputManager:
             current_hvac_temperature_c=hvac_temperature,
             current_hvac_power_kw=hvac_power,
             current_outdoor_temperature_c=outdoor_temperature,
+            ev_policy_allowed=self.entry_data.get("ev_policy_allowed", True),
+            ev_vehicle_id=self.entry_data.get("ev_vehicle_id"),
+            ev_session_generation=self.entry_data.get("ev_session_generation"),
             ev_connected=ev_connected,
             ev_charging=ev_charging,
             ev_target_soc_percent=ev_target_soc,

@@ -24,6 +24,9 @@
       },
       "planning_duration": {
         "default": "mdi:timer-outline"
+      },
+      "active_ev_vehicle": {
+        "default": "mdi:car-connected"
       }
     },
     "binary_sensor": {
@@ -71,6 +74,11 @@
     "calendar": {
       "plan": {
         "default": "mdi:calendar-clock"
+      }
+    },
+    "select": {
+      "ev_vehicle": {
+        "default": "mdi:car-electric"
       }
     }
   }

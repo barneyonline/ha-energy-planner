@@ -4243,6 +4243,7 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
         "enphase_profile_changed_at",
         "ev_smart_charging_state",
     ]
+    assert callable(ev_adapter_kwargs[0].pop("command_guard"))
     assert ev_adapter_kwargs == [
         {
             "confirmation_timeout_seconds": 17.0,
