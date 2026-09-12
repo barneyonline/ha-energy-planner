@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from math import isfinite
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
@@ -572,6 +573,18 @@ class DaikinHVACAdapter:
         states = dict(saved_automation_states or {})
         zones = dict(saved_zone_states or {})
         main_state = dict(saved_main_state or {})
+        # Retain blocked targets without repeatedly arming the scheduler guard.
+        # Still restore any other actuator or automation that can be released.
+        for entity_id in list(zones):
+            if await self._async_zone_restore_is_superseded(entity_id):
+                zones.pop(entity_id)
+        if zones and not states and not main_state and all(
+            self._zone_restore_deferred(entity_id, target) for entity_id, target in zones.items()
+        ):
+            return HVACCommandResult(
+                False, "hvac_zone_restore_pending", pre_state, self._snapshot(), {},
+                rollback_succeeded=False, saved_zone_states=zones,
+            )
         if (
             states or zones or main_state or self._automation_entities()
         ) and not await self._async_arm_scheduler_guard():
@@ -785,11 +798,38 @@ class DaikinHVACAdapter:
                     self._set_coupled_zone_feedback_expected(None, None, None)
         return True, changed
 
+    def _zone_restore_deferred(self, entity_id: str, target: Any) -> bool:
+        """Wait for a zone to expose a target and bounds compatible with its baseline."""
+        if not entity_id.startswith("climate.") or not isinstance(target, dict):
+            return False
+        observed = self._state(entity_id)
+        if observed is None or zone_temperature_sync_deferred(observed):
+            return True
+        # Bounds constrain new commands, not confirmation of an already restored baseline.
+        if (
+            _has_restorable_temperature_target(target)
+            and _mode_matches(observed, target.get("hvac_mode"))
+            and _temperature_matches(observed, target.get("target_temperature"))
+            and _temperature_range_matches(observed, target.get("target_temp_low"), target.get("target_temp_high"))
+        ):
+            return False
+        attributes = observed.attributes
+        try:
+            values = [float(value) for value in _temperature_desired_state(target).values()]
+            low = float(attributes.get("min_temp", float("-inf")))
+            high = float(attributes.get("max_temp", float("inf")))
+            return any(not isfinite(value) or not low <= value <= high for value in values)
+        except (TypeError, ValueError):
+            return True
+
     async def _async_restore_zone_states(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Restore captured zone states."""
         unresolved: dict[str, Any] = {}
         for entity_id, state in states.items():
             if await self._async_zone_restore_is_superseded(entity_id):
+                continue
+            if self._zone_restore_deferred(entity_id, state):
+                unresolved[entity_id] = state
                 continue
             confirmed = False
             if entity_id.split(".", 1)[0] == "climate":

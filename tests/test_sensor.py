@@ -1523,3 +1523,33 @@ def test_shared_data_quality_handles_unsafe_and_missing_plan() -> None:
     attrs = sensor_module._next_actions_attrs(_coordinator(plan))["data_quality"]
     assert attrs["status"] == "Unsafe inputs"
     assert presentation_module.display_state("   ") == "Unknown"
+
+
+def test_plan_health_exposes_pending_restore_until_durable_ownership_clears() -> None:
+    coordinator = _coordinator(_plan(), store_data={"ownership": {"hvac_control": {
+        "required_evidence_lost": "hvac_release_failed",
+        "zone_states": {"climate.zone": {"target_temperature": 20}},
+    }}})
+    health = next(item for item in SENSORS if item.key == "plan_health")
+    assert health.value_fn(coordinator) == "degraded"
+    attrs = health.attrs_fn(coordinator)
+    assert attrs["input_health"] == "healthy"
+    assert attrs["pending_hvac_restore"]["zone_targets"] == {"climate.zone": {"target_temperature": 20}}
+    assert attrs["issues"][-1]["code"] == "hvac_release_failed"
+    coordinator.data.health = InputHealth.UNSAFE
+    assert health.value_fn(coordinator) == "unsafe"
+    coordinator.data.health = InputHealth.HEALTHY
+    coordinator.store.data["ownership"] = {}
+    assert health.value_fn(coordinator) == "healthy"
+    assert health.attrs_fn(coordinator)["pending_hvac_restore"] == {}
+
+
+def test_plan_health_handles_legacy_non_mapping_hvac_ownership() -> None:
+    from custom_components.ha_energy_planner.storage import _normalize_loaded_data
+
+    health = next(item for item in SENSORS if item.key == "plan_health")
+    for legacy_control in (None, [], "legacy"):
+        stored = _normalize_loaded_data({"ownership": {"hvac_control": legacy_control}})
+        coordinator = _coordinator(_plan(), store_data=stored)
+        assert health.value_fn(coordinator) == "healthy"
+        assert health.attrs_fn(coordinator)["pending_hvac_restore"] == {}

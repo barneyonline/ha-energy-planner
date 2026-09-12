@@ -9,6 +9,9 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Startup input warnings have a bounded ten-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
+- Zone restoration retains incompatible targets without repeated device or scheduler-guard commands, releases other eligible states, and retries the original target after recovery, and accepts an already-observed baseline despite changed command bounds (`tests/test_hvac_adapter.py`). Plan health exposes unresolved durable HVAC restoration as degraded independently of input quality and handles legacy non-mapping HVAC ownership (`tests/test_sensor.py`).
+
 - Actuator recovery metadata uses atomic Home Assistant Store writes with an
   explicit successful-write acknowledgement. Home Assistant's logged write
   failures cannot acknowledge the pending generation or permit new device
