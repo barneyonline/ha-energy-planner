@@ -1,0 +1,22 @@
+{
+  "kind": "ev_power_control",
+  "name": "synthetic_current_limit",
+  "number_state": {
+    "entity_id": "number.charger_limit",
+    "state": "32",
+    "attributes": {
+      "unit_of_measurement": "A",
+      "min": 6,
+      "max": 32,
+      "step": 1
+    }
+  },
+  "options": {
+    "ev_limit_min": 6,
+    "ev_limit_max": 32,
+    "ev_voltage": 250,
+    "ev_phases": 1
+  },
+  "headroom_kw": 3.1,
+  "expected_power_kw": 3.0
+}

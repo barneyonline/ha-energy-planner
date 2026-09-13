@@ -29,7 +29,9 @@ def _fixtures() -> list[dict[str, Any]]:
 
 def test_representative_live_schema_fixtures_parse_successfully() -> None:
     for fixture in _fixtures():
-        if fixture["kind"] == "forecast_state":
+        if fixture["kind"] == "ev_power_control":
+            _load_validator()._validate_fixture(fixture)
+        elif fixture["kind"] == "forecast_state":
             _assert_forecast_fixture(fixture)
         elif fixture["kind"] == "climate_inputs":
             assert _load_validator()._validate_fixture(fixture)["ok"]
@@ -161,3 +163,12 @@ def _load_validator() -> Any:
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_invalid_ev_power_schema_fails_validation() -> None:
+    import pytest
+
+    fixture = json.loads((FIXTURE_DIR / "ev_current_limit.json").read_text())
+    fixture["number_state"]["attributes"]["unit_of_measurement"] = "unsupported"
+    with pytest.raises(ValueError, match="safe setpoint"):
+        _load_validator()._validate_fixture(fixture)

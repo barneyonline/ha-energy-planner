@@ -99,6 +99,8 @@ from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
+from .ev_runtime import audit_evidence
+from .ev_telemetry import sample_ev, update_ev_telemetry
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .inputs import InputManager
@@ -262,6 +264,7 @@ _ACTIVE_HVAC_MODES = frozenset(
 # entities are sampled on the scheduled planning boundary.
 _DECISION_INPUT_ENTITY_KEYS = frozenset(
     {
+        "ev_power_entity", "ev_energy_entity", "ev_power_limit_entity",
         CONF_AMBER_IMPORT_PRICE,
         CONF_AMBER_EXPORT_PRICE,
         CONF_PV_FORECAST,
@@ -355,6 +358,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         self.executor.ev_command_guard = self._ev_command_guard
         self.executor.ev_restore_guard = self._ev_restore_allowed
+        self.executor.ev_allocation_deadline_callback = self._schedule_ev_allocation_deadline
+        self._ev_allocation_cancel: Callable[[], None] | None = None
+        self._ev_allocation_deadline: Any = None
+
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
@@ -610,6 +617,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entry_data = self.entry_data
             now = dt_util.utcnow()
             executor = getattr(self, "executor", None)
+            limit_entity = entry_data.get("ev_power_limit_entity")
+            if (event.data.get("entity_id") in {limit_entity, entry_data.get("ev_power_entity")}
+                    and executor is not None):
+                executor.sync_ev_grid_reservation()
             charging_entity = entry_data.get(CONF_EV_CHARGING)
             if charging_entity and event.data.get("entity_id") == charging_entity:
                 new_state = event.data.get("new_state")
@@ -846,6 +857,31 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._debounce_cancel = async_call_later(self.hass, delay, _refresh)
 
     @callback
+    def _schedule_ev_allocation_deadline(self, deadline: Any) -> None:
+        if self._ev_allocation_cancel is not None:
+            self._ev_allocation_cancel()
+        self._ev_allocation_deadline = deadline
+        self._ev_allocation_cancel = None
+        if deadline is None:
+            return
+
+        async def expire() -> None:
+            async with self._command_lock:
+                if self._tearing_down or self._ev_allocation_deadline != deadline:
+                    return
+                await self.executor.async_restore_device_control("ev", "ev_allocation_expired")
+            self._mark_forced_refresh("ev_allocation_expired")
+            await self.async_request_refresh()
+
+        @callback
+        def due(_now: Any) -> None:
+            self._ev_allocation_cancel = None
+            self._async_create_listener_task(expire())
+
+        self._ev_allocation_cancel = async_call_later(
+            self.hass, max((deadline-dt_util.utcnow()).total_seconds(), 0), due)
+
+    @callback
     def _schedule_next_boundary_refresh(self) -> None:
         """Schedule the next planning-interval boundary refresh."""
         if self._boundary_cancel is not None:
@@ -1007,6 +1043,34 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        ev_sample = sample_ev(self.hass, entry_data, options, context)
+        reservation = self.store.data.get("ev_grid_reservation", {})
+        telemetry = update_ev_telemetry(
+            self.store.data.get("ev_telemetry", {}), ev_sample,
+            reserved_kw=float(reservation.get("load_kw", 0) or 0),
+        )
+        if (any(entry_data.get(key) for key in ("ev_power_entity", "ev_energy_entity", "ev_power_limit_entity"))
+                or options.get("ev_price_limit_enabled") or self.store.data.get("ev_telemetry")):
+            await self.store.async_save_ev_telemetry(telemetry)
+        context.ev_evidence.update({
+            "performance": telemetry.get("performance", {}),
+            "emergency_spend": telemetry.get("emergency_spend", 0),
+            "budget_uncertain": telemetry.get("budget_uncertain", False),
+            "delivery_status": telemetry.get("delivery_status"),
+            "power_capability": ev_sample["power_capability"],
+            "power_limit_mapped": ev_sample["power_limit_mapped"],
+        })
+        if ev_sample["power_limit_mapped"] and ev_sample["power_kw"] is None:
+            context.ev_evidence["power_capability"] = None
+            context.input_issues.append("ev_power_feedback_unavailable")
+        context.ev_evidence.update(audit_evidence(
+            self.store.data.get("execution_audit", []), options, context.created_at))
+        previous_plan = self.store.data.get("active_plan", {})
+        for previous_action in previous_plan.get("actions", []) if isinstance(previous_plan, dict) else []:
+            if previous_action.get("asset") == "ev":
+                context.ev_evidence["retained_schedule"] = previous_action.get("desired_state", {}).get(
+                    "allocated_slots", [])
+
         self.weather_forecast_diagnostics = dict(
             getattr(manager, "weather_forecast_details", weather_forecast_details)
         )
