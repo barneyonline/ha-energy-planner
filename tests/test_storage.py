@@ -1064,3 +1064,8 @@ def test_ai_attempt_is_durable_before_dispatch_inside_refresh_batch(monkeypatch:
             await store.async_save_ai_attempt({"created_at": "2026-09-05T00:00:00+00:00"})
             assert FakeStore.saved["ai_last_attempt"]["created_at"] == "2026-09-05T00:00:00+00:00"
     asyncio.run(run())
+
+
+def test_malformed_optional_ev_telemetry_is_normalized_without_rewriting_legacy_store() -> None:
+    assert "ev_telemetry" not in storage_module._normalize_loaded_data({})
+    assert storage_module._normalize_loaded_data({"ev_telemetry": []})["ev_telemetry"]["budget_uncertain"] is True

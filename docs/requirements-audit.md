@@ -939,3 +939,20 @@ tariffs, per-room arrival/recovery, zone activation prediction, observation-only
 legacy restoration, arrival beyond release, learned normal target selection and
 successful candidate selection on a covered 12-hour forecast. Normal-operation
 lookup uses the same 0.25°C grid in validation and runtime simulation.
+
+### EV scheduling extension
+
+- `ev_optimization.py` evaluates physical charging, partial slots, capacity, soft readiness margins, battery opportunity cost, and bounded search; `tests/test_ev_optimization.py` includes an exhaustive small oracle and a 48-hour runtime bound.
+- `ev_policy.py`, `ev_telemetry.py`, and `ev_runtime.py` define optional number capabilities, measured performance, conservative session spending, and command leases. `tests/test_ev_runtime.py` verifies ordering and failure paths; synthetic schema/history fixtures exercise the same parsers.
+- Existing multi-EV reservations remain authoritative; this change does not implement joint multi-EV scheduling. See `docs/ev-scheduling.md` for policy defaults and modelled-cost limitations.
+
+- `ev_capacity_readiness_buffer.json` replays capacity exclusion and buffer preservation through generated plans and real Home Assistant services. Calendar regressions distinguish physical limits, partial-slot energy, and actual completion times.
+- The full Docker gate includes optional number controls, feedback, persisted recovery metadata reload, packaged-install smoke validation, prior-release upgrade recovery, and unchanged cross-entry reservation tests. The 576-slot benchmarks include fixed and variable power with chronological battery economics and enforce the five-second limit.
+
+- Candidate-constraint regressions cover active Continuous sessions with retained future windows and low-price charge-now triggers in Split/Adaptive modes. Calibration regressions include measured stalls and immature-model diagnostics (`tests/test_ev_optimization.py`).
+
+- Runtime recovery regressions verify that lease expiry stops a previously-on baseline and that a confirmed stop ends spending despite failed number restoration (`tests/test_control_runtime.py`). A retained-night-window regression preserves selected daylight preference (`tests/test_ev_optimization.py`).
+
+- `test_confirmed_stop_is_not_billed_again_on_the_next_telemetry_update` exercises lease expiry followed by repeated telemetry updates with a retained reservation, preserving the settled spending total.
+
+- Rebase integration regressions cover vehicle-session guards before and after number writes and policy-release spending/timer cleanup. Confirmed unplug resets the budget and incomplete measurements; uncertain handoff retains spending (`tests/test_ev_runtime.py`, `tests/test_control_runtime.py`).

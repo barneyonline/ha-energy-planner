@@ -1088,7 +1088,8 @@ def test_unusable_secondary_pv_is_diagnosed_without_penalizing_healthy_primary(
     assert manager.forecast_coverage_details[0]["classification"] == status
 
 
-def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
+def test_input_manager_reads_ev_target_sensor_and_ready_by_select(monkeypatch) -> None:
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: datetime(2026, 6, 27, tzinfo=UTC))
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -1130,6 +1131,9 @@ def test_input_manager_reads_ev_target_sensor_and_ready_by_select() -> None:
     assert context.ev_target_soc_percent == 80
     assert context.ev_ready_by == "08:00"
     assert context.input_health == InputHealth.HEALTHY
+    assert len(context.slots) > 4
+    assert context.slots[-1].import_price is None
+    assert context.ev_evidence["extended_forecast_issues"]
 
     hass.states.values["sensor.ev_target"] = FakeState("unavailable")
     unavailable_context = InputManager(hass, entry_data, options).build_context()

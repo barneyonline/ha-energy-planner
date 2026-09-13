@@ -17,10 +17,17 @@
 - Preserve exact scheduled phase times and legacy releases; compare both demand uncertainty directions, use learned normal targets and account for room recovery and planned zone activation.
 
 - Stop presenting a climate tariff difference as a monetary saving; economic savings are recorded once per lifecycle.
+- Prevent telemetry from charging the EV session budget again after a confirmed stop, including while capacity remains reserved for recovery.
+- Stop charging when a charging lease expires even if the saved baseline was on, end spending accrual after a confirmed stop despite failed limit restoration, and preserve selected daylight preferences when comparing retained schedules.
+- Preserve active Continuous charging and low-price charge-now requests across every candidate, include measured stalls in learned duration, and distinguish immature measurements from the model actually used.
+- Keep EV emergency spending conservative with delayed energy reports and prefer feasible normal-price windows before spending on emergency slots.
+- Learn performance relative to commanded charging power, accept native watt limits, release capacity after delayed power confirmation, and retain failed original-limit restoration for retry.
 
 ### 🔧 Improvements
 
-- None
+- Plan EV charging around conservative household capacity and a configurable readiness buffer, with bounded cost search and optional home-battery opportunity-cost evaluation.
+- Learn charging performance from optional power/energy observations; expose completion, capacity, spending, and schedule-change evidence.
+- Add adaptive schedule stability, opt-in emergency price/budget authority, and guarded Home Assistant number-entity charging limits while retaining existing price ceilings and continuous preferences.
 
 ### 🔄 Other changes
 

@@ -19,12 +19,24 @@ def plain_action(action: PlanAction) -> dict[str, Any]:
         "action": action_label(action),
         "decision": action_sentence(action),
         "when": action_window(action),
-        "why": reason_summary(action.reason_codes),
+        "why": reason_summary(action.reason_codes) + ev_decision_explanation(action.desired_state),
         "constraints": [plain_reason(item) for item in action.hard_constraints[:8]],
         "desired_state": plain_state_details(action.desired_state),
         "estimated_value": action.expected_cost_delta,
     }
     return {key: value for key, value in attrs.items() if value not in (None, [], {})}
+
+
+def ev_decision_explanation(desired: dict[str, Any]) -> str:
+    """Render factual readiness evidence without relying on an AI explanation."""
+    evidence = desired.get("optimization")
+    if not isinstance(evidence, dict):
+        return ""
+    status = plain_key(str(evidence.get("search_status", "unknown")))
+    margin = evidence.get("readiness_margin_minutes")
+    readiness = (f" Conservative readiness margin: {margin:g} minutes."
+                 if isinstance(margin, int | float) else " Completion before departure is not established.")
+    return f" {status}." + readiness + " Savings and completion are modelled estimates."
 
 
 def plain_state_details(state: dict[str, Any]) -> dict[str, Any]:

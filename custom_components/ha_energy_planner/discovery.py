@@ -34,6 +34,7 @@ from .const import (
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     DEFAULT_OPTIONS,
 )
+from .ev_policy import power_capability
 from .models import ActionAsset
 
 
@@ -144,6 +145,16 @@ class CapabilityDiscovery:
             ),
         }
         details["controller"] = "ha_energy_planner"
+        limit_entity = self.entry_data.get("ev_power_limit_entity")
+        if limit_entity:
+            capability = power_capability(self.hass.states.get(limit_entity), self.options)
+            details["power_limit"] = {"entity_id": limit_entity, "available": capability is not None}
+            if capability is None:
+                issues.append("ev_power_control_unavailable")
+            power_entity = self.entry_data.get("ev_power_entity")
+            if not power_entity or _state_missing(self.hass, power_entity):
+                issues.append("ev_power_feedback_unavailable")
+
         target_soc_entity = self.entry_data.get(CONF_EV_SMART_CHARGING_TARGET_SOC)
         if target_soc_entity:
             details[CONF_EV_SMART_CHARGING_TARGET_SOC] = {

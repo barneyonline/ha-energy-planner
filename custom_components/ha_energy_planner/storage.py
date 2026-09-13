@@ -232,6 +232,10 @@ class PlannerStore:
         models[vehicle_id] = model
         await self._async_set_if_changed("ev_vehicle_calibrations", models)
 
+    async def async_save_ev_telemetry(self, record: dict[str, Any]) -> None:
+        """Persist versioned performance and unresolved session spending."""
+        await self._async_set_if_changed("ev_telemetry", record)
+
     async def async_save_ev_charge_calibration(self, model: dict[str, Any]) -> None:
         """Persist the compact Recorder-trained EV charging calibration."""
         await self._async_set_if_changed("ev_charge_calibration", model)
@@ -363,6 +367,8 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     for key in _DICT_FIELDS:
         if not isinstance(data.get(key), dict):
             data[key] = {}
+    if "ev_telemetry" in data and not isinstance(data["ev_telemetry"], dict):
+        data["ev_telemetry"] = {"version": 1, "budget_uncertain": True}
     active_plan = data.get("active_plan")
     if active_plan is not None and not isinstance(active_plan, dict):
         data["active_plan"] = None

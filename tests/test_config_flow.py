@@ -904,7 +904,7 @@ def test_config_flow_user_step_creates_entry_after_confirmation() -> None:
     flow.async_create_entry.assert_called_once_with(
         title="Commuter EV",
         data={CONF_INSTANCE_NAME: "Commuter EV"},
-        options=DEFAULT_OPTIONS,
+        options={**DEFAULT_OPTIONS, "ev_price_policy": "departure_priority"},
     )
 
 
@@ -1870,3 +1870,40 @@ def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on
                                                      ("ai_task.missing", "service_not_found")])
 def test_validate_service_rejects_malformed_or_missing_service(service_name: str, expected: str) -> None:
     assert config_flow_module._validate_service(_valid_hass(), service_name) == expected
+
+
+def test_ev_policy_rejects_invalid_thresholds_and_unfunded_emergency():
+    for change in ({"ev_readiness_buffer_minutes": float("nan")}, {"ev_charging_strategy": "wrong"},
+                   {"ev_price_policy": "wrong"}, {"ev_price_policy": "departure_priority",
+                    "ev_price_limit_enabled": True, "ev_emergency_price": 0, "ev_emergency_budget": 0}):
+        assert "invalid_ev_policy" in _validate_options({**DEFAULT_OPTIONS, **change}).values()
+
+
+def test_ev_power_mapping_requires_supported_capability_and_feedback():
+    from homeassistant.core import State
+
+    state = State("number.limit", "6", {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1})
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda _: state),
+                           config_entries=SimpleNamespace(async_entries=lambda _: []))
+    entry = SimpleNamespace(entry_id="entry", data={}, subentries={}, options={})
+    errors = _validate_subentry_config(hass, entry, {"ev_power_limit_entity": "number.limit"},
+                                      options={"ev_limit_min": 1, "ev_limit_max": 6})
+    assert errors["ev_power_limit_entity"] == "invalid_ev_policy"
+
+
+def test_ev_power_mapping_accepts_valid_capability_and_feedback():
+    from homeassistant.core import State
+
+    state = State("number.limit", "6", {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1})
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda _: state),
+                           config_entries=SimpleNamespace(async_entries=lambda _: []))
+    entry = SimpleNamespace(entry_id="entry", data={}, subentries={}, options={})
+    errors = _validate_subentry_config(
+        hass, entry, {"ev_power_limit_entity": "number.limit", "ev_power_entity": "sensor.power"},
+                                      options={"ev_limit_min": 1, "ev_limit_max": 6})
+    assert "ev_power_limit_entity" not in errors
+
+
+def test_review_watt_limit_settings_accept_typical_ev_charging_power():
+    assert config_flow_module._option_selector("ev_limit_max")(7400) == 7400
+    assert config_flow_module._option_selector("ev_limit_min")(1400) == 1400

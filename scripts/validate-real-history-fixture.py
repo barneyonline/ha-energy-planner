@@ -98,6 +98,16 @@ def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         if actual != fixture["expected"]:
             raise ValueError(f"Climate fixture mismatch: {actual}")
         return {"kind": kind, "name": fixture["name"], "ok": True, "actual": actual}
+    if kind == "ev_measured_performance":
+        from custom_components.ha_energy_planner.ev_telemetry import update_ev_telemetry
+
+        record: dict[str, Any] = {}
+        for sample in fixture["samples"]:
+            record = update_ev_telemetry(record, sample, reserved_kw=float(fixture["charge_rate_kw"]))
+        actual = record.get("performance", {}).get("aggregate", {}).get("soc_per_kwh")
+        if actual != fixture["expected_soc_per_kwh"]:
+            raise ValueError("Measured charging history does not match expected performance")
+        return {"kind": kind, "soc_per_kwh": actual}
     if kind == "ev_charge_calibration":
         return _validate_ev_charge_calibration_fixture(fixture)
     if kind == "thermal_history":

@@ -188,8 +188,38 @@ class InputManager:
         self._state_cache: dict[str, State | None] = {}
 
     def build_context(self, overrides: list[Override] | None = None) -> DecisionContext:
-        """Build the current 24-hour decision context."""
-        now = dt_util.utcnow()
+        """Extend EV forecasts without weakening the configured control-health horizon."""
+        from math import ceil
+
+        from .planner_ev import _next_ready_by
+
+        context = self._build_context(overrides)
+        if (not self.entry_data.get(CONF_EV_SOC) or context.ev_target_soc_percent is None
+                or context.ev_connected is False):
+            return context
+        ready = _next_ready_by(context.created_at, context.ev_ready_by or "07:00", context.local_timezone)
+        configured = int(self.options[CONF_PLANNING_HORIZON_HOURS])
+        horizon = min(48, max(configured, ceil((ready-context.created_at).total_seconds()/3600)))
+        if horizon <= configured:
+            return context
+        extended_manager = InputManager(
+            self.hass, self.entry_data, {**self.options, CONF_PLANNING_HORIZON_HOURS: horizon},
+            forecast_calibration=self.forecast_calibration, load_forecast_model=self.load_forecast_model,
+            load_forecast_update_reason=self.load_forecast_update_reason, load_source_outage=self.load_source_outage,
+            weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
+        )
+        extended = extended_manager._build_context(overrides, now=context.created_at)
+        context.slots.extend(extended.slots[len(context.slots):])
+        context.daylight_windows = extended.daylight_windows
+        context.ev_evidence["requested_horizon_hours"] = horizon
+        context.ev_evidence["extended_forecast_issues"] = extended.input_issues[:12]
+        return context
+
+    def _build_context(
+        self, overrides: list[Override] | None = None, *, now: datetime | None = None
+    ) -> DecisionContext:
+        """Build one detached context at an explicit shared forecast origin."""
+        now = now or dt_util.utcnow()
         self._forecast_confidence_scores = []
         self.forecast_confidence_details = []
         self.forecast_coverage_details = []

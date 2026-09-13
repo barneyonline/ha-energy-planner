@@ -108,6 +108,10 @@ rules:
         - custom_components/ha_energy_planner/command_models.py
         - custom_components/ha_energy_planner/enphase_control.py
         - custom_components/ha_energy_planner/ev_control.py
+        - custom_components/ha_energy_planner/ev_optimization.py
+        - custom_components/ha_energy_planner/ev_policy.py
+        - custom_components/ha_energy_planner/ev_runtime.py
+        - custom_components/ha_energy_planner/ev_telemetry.py
         - custom_components/ha_energy_planner/hvac_control.py
         - custom_components/ha_energy_planner/planner_hvac.py
         - custom_components/ha_energy_planner/plan_presentation.py
@@ -121,6 +125,8 @@ rules:
         - tests/test_storage.py
         - tests/test_services.py
         - tests/test_ev.py
+        - tests/test_ev_optimization.py
+        - tests/test_ev_runtime.py
         - tests/test_ev_adapter.py
         - tests/test_ev_control_entities.py
   config-flow-test-coverage:
@@ -276,7 +282,7 @@ rules:
         - tests/test_lifecycle.py
   docs-configuration-parameters:
     status: done
-    comment: Central settings document the 0–30 minute conservative household-load outage grace, climate away-preconditioning opt-in, catch-up windows, default-off configured-zone synchronisation, discovery and execution-time rollback-target gates, main-first target ordering, disabled-sync target isolation, acquisition rollback and retry of the complete main state including Daikin's remembered active mode, independent off cleanup and blocking of reacquisition while main recovery remains unresolved, exact pending main/zone targets and explicitly phased main turn-on and context-correlated coupled zone-actuator feedback classification, synchronous in-flight abort across acquisition rollback and recovery, crash-safe preservation of superseding manual main changes, and per-zone supersession that removes only the user's zone before remaining rollback actuators run, zone switch/helper restoration and zone-climate target propagation, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards with corrective preconditioning continuation and both-boundary coasting handoffs even for stale persisted phases, and bounded manual-override helper behavior.
+    comment: EV readiness, capacity, optional power controls, measured learning, and emergency spending are documented in docs/ev-scheduling.md. Central settings document the 0–30 minute conservative household-load outage grace, climate away-preconditioning opt-in, catch-up windows, default-off configured-zone synchronisation, discovery and execution-time rollback-target gates, main-first target ordering, disabled-sync target isolation, acquisition rollback and retry of the complete main state including Daikin's remembered active mode, independent off cleanup and blocking of reacquisition while main recovery remains unresolved, exact pending main/zone targets and explicitly phased main turn-on and context-correlated coupled zone-actuator feedback classification, synchronous in-flight abort across acquisition rollback and recovery, crash-safe preservation of superseding manual main changes, and per-zone supersession that removes only the user's zone before remaining rollback actuators run, zone switch/helper restoration and zone-climate target propagation, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards with corrective preconditioning continuation and both-boundary coasting handoffs even for stale persisted phases, and bounded manual-override helper behavior.
     references:
       docs:
         - README.md

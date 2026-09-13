@@ -37,6 +37,10 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
         self.hass, getattr(getattr(self, "entry", None), "entry_id", None)
     )
     self._clear_ev_auto_start_compensation()
+    ev_deadline_cancel = getattr(self, "_ev_allocation_cancel", None)
+    if ev_deadline_cancel is not None:
+        ev_deadline_cancel()
+        self._ev_allocation_cancel = None
     if self._debounce_cancel is not None:
         self._debounce_cancel()
         self._debounce_cancel = None

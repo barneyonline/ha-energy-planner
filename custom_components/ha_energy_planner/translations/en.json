@@ -35,7 +35,8 @@
       "ev_planning_sensor_required": "EV SOC, charging state, and vehicle target SOC entities are required for EV planning.",
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones.",
-      "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values."
+      "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
+      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -89,7 +90,19 @@
               "minimum_load_confidence": "Minimum load confidence",
               "minimum_climate_confidence": "Minimum climate confidence",
               "minimum_ev_confidence": "Minimum EV confidence",
-              "minimum_enphase_confidence": "Minimum Enphase confidence"
+              "minimum_enphase_confidence": "Minimum Enphase confidence",
+              "ev_charging_strategy": "Charging strategy",
+              "ev_readiness_buffer_minutes": "Readiness buffer (minutes)",
+              "ev_schedule_min_saving": "Minimum saving to change schedule",
+              "ev_schedule_min_saving_percent": "Minimum relative saving (%)",
+              "ev_min_dwell_minutes": "Minimum charging or pause duration (minutes)",
+              "ev_price_policy": "Price and departure policy",
+              "ev_emergency_price": "Emergency import price ceiling",
+              "ev_emergency_budget": "Maximum extra cost per plug-in session",
+              "ev_limit_min": "Minimum nonzero charger limit",
+              "ev_limit_max": "Maximum charger limit",
+              "ev_voltage": "Conservative phase voltage (V)",
+              "ev_phases": "Charging phases"
             },
             "data_description": {
               "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
@@ -129,7 +142,19 @@
               "minimum_load_confidence": "Lowest load forecast confidence allowed before load-driven decisions should be treated as degraded.",
               "minimum_climate_confidence": "Lowest climate confidence allowed before climate decisions should be treated as degraded.",
               "minimum_ev_confidence": "Lowest EV confidence allowed before EV charging decisions should be treated as degraded.",
-              "minimum_enphase_confidence": "Lowest Enphase confidence allowed before battery profile decisions should be treated as degraded."
+              "minimum_enphase_confidence": "Lowest Enphase confidence allowed before battery profile decisions should be treated as degraded.",
+              "ev_charging_strategy": "Charging strategy",
+              "ev_readiness_buffer_minutes": "Readiness buffer (minutes)",
+              "ev_schedule_min_saving": "Minimum saving to change schedule",
+              "ev_schedule_min_saving_percent": "Minimum relative saving (%)",
+              "ev_min_dwell_minutes": "Minimum charging or pause duration (minutes)",
+              "ev_price_policy": "Price and departure policy",
+              "ev_emergency_price": "Emergency import price ceiling",
+              "ev_emergency_budget": "Maximum extra cost per plug-in session",
+              "ev_limit_min": "Minimum nonzero charger limit",
+              "ev_limit_max": "Maximum charger limit",
+              "ev_voltage": "Conservative phase voltage (V)",
+              "ev_phases": "Charging phases"
             }
           },
           "climate_inputs": {
@@ -282,7 +307,22 @@
               "grid_export_limit_kw": "Grid export limit",
               "planning_horizon_hours": "Planning horizon",
               "planning_interval_minutes": "Planning interval",
-              "default_ready_by": "Default EV ready-by time"
+              "default_ready_by": "Default EV ready-by time",
+              "ev_charging_strategy": "Charging strategy",
+              "ev_readiness_buffer_minutes": "Readiness buffer (minutes)",
+              "ev_schedule_min_saving": "Minimum saving to change schedule",
+              "ev_schedule_min_saving_percent": "Minimum relative saving (%)",
+              "ev_min_dwell_minutes": "Minimum charging or pause duration (minutes)",
+              "ev_price_policy": "Price and departure policy",
+              "ev_emergency_price": "Emergency import price ceiling",
+              "ev_emergency_budget": "Maximum extra cost per plug-in session",
+              "ev_limit_min": "Minimum nonzero charger limit",
+              "ev_limit_max": "Maximum charger limit",
+              "ev_voltage": "Conservative phase voltage (V)",
+              "ev_phases": "Charging phases",
+              "ev_power_entity": "EV measured charging power",
+              "ev_energy_entity": "EV cumulative charging energy",
+              "ev_power_limit_entity": "EV charging current or power limit"
             },
             "data_description": {
               "ev_soc_entity": "Required EV state-of-charge sensor used for planning and automatic charge-rate calibration.",
@@ -313,7 +353,22 @@
               "grid_export_limit_kw": "Maximum grid export power allowed in planned actions.",
               "planning_horizon_hours": "How many hours ahead each planning run evaluates. Twelve hours is recommended for Amber forecasts; at least 12 continuous hours is healthy, 8 to under 12 is degraded, and under 8 is unsafe.",
               "planning_interval_minutes": "Size of each planning slot in minutes. Smaller intervals give finer control but create more forecast slots.",
-              "default_ready_by": "Local completion time exposed by the native EV Ready by entity."
+              "default_ready_by": "Local completion time exposed by the native EV Ready by entity.",
+              "ev_charging_strategy": "Charging strategy",
+              "ev_readiness_buffer_minutes": "Readiness buffer (minutes)",
+              "ev_schedule_min_saving": "Minimum saving to change schedule",
+              "ev_schedule_min_saving_percent": "Minimum relative saving (%)",
+              "ev_min_dwell_minutes": "Minimum charging or pause duration (minutes)",
+              "ev_price_policy": "Price and departure policy",
+              "ev_emergency_price": "Emergency import price ceiling",
+              "ev_emergency_budget": "Maximum extra cost per plug-in session",
+              "ev_limit_min": "Minimum nonzero charger limit",
+              "ev_limit_max": "Maximum charger limit",
+              "ev_voltage": "Conservative phase voltage (V)",
+              "ev_phases": "Charging phases",
+              "ev_power_entity": "EV measured charging power",
+              "ev_energy_entity": "EV cumulative charging energy",
+              "ev_power_limit_entity": "EV charging current or power limit"
             }
           },
           "priorities": {
@@ -353,7 +408,8 @@
       "invalid_load_outage_grace": "Household-load outage grace must be between 0 and 30 minutes.",
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones.",
-      "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values."
+      "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
+      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget."
     }
   },
   "exceptions": {

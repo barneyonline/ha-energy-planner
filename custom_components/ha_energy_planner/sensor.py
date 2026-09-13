@@ -227,6 +227,9 @@ def _decision_summary_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         ],
         "rejected_action_count": len(rejected),
         "rejected_actions": bounded_json([item for item in rejected if isinstance(item, dict)][:12]),
+        "ev_optimization": bounded_json(next((
+            action.desired_state.get("optimization", {}) for action in plan.actions if action.asset == ActionAsset.EV
+        ), {})),
         "estimated_cost": plan.estimated_daily_cost,
         "estimated_cost_horizon_hours": plan.estimated_cost_horizon_hours,
     }

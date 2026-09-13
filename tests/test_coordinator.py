@@ -797,6 +797,9 @@ class FakeStore:
     async def async_save_discovery(self, discovery: dict[str, object]) -> None:
         self.discovery.append(discovery)
 
+    async def async_save_ev_telemetry(self, model: dict[str, object]) -> None:
+        self.data["ev_telemetry"] = model
+
     async def async_save_ev_charge_calibration(self, model: dict[str, object]) -> None:
         self.ev_charge_calibrations.append(model)
         self.data["ev_charge_calibration"] = model
@@ -2073,6 +2076,9 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     coordinator._unsub_listeners = []
     coordinator._refresh_generation = 0
 
+    synced = []
+    coordinator.entry.data["ev_power_limit_entity"] = "number.limit"
+    coordinator.executor = SimpleNamespace(sync_ev_grid_reservation=lambda: synced.append(True))
     coordinator.async_start_listeners()
     callback = callbacks[0]
     callback(FakeEvent("climate.daikin", "off", "heat"))
@@ -2086,6 +2092,8 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
     assert coordinator._refresh_generation == 1
     assert coordinator._debounce_cancel is not None
     assert len(scheduled) >= 2
+    callback(FakeEvent("number.limit", "3", "4"))
+    assert synced == [True]
 
 
 def test_start_listeners_queues_stop_for_unsolicited_ev_charging(
@@ -4648,11 +4656,13 @@ def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> N
     )
 
 
-def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> None:
+@pytest.mark.parametrize("mapped_power", [False, True])
+def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapped_power: bool) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = SimpleNamespace(
         created_at=now,
         plan_id="plan-dry",
+        current_ev_soc_percent=None, ev_connected=None, ev_charging=None, ev_evidence={},
         slots=[DecisionSlot(now, 0.2, 0.05, 0, 1)],
         input_health=InputHealth.HEALTHY,
         input_issues=[],
@@ -4750,10 +4760,13 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry({}, {"ai_enabled": False})
+    coordinator.entry = FakeEntry({"ev_power_limit_entity": "number.unavailable"} if mapped_power else {},
+                                  {"ai_enabled": False})
     coordinator.store = FakeStore(
         {
             "ev_charge_calibration": {},
+            "active_plan": {"actions": [
+                {"asset": "enphase"}, {"asset": "ev", "desired_state": {"allocated_slots": []}}]},
             "forecast_snapshots": [],
             "overrides": [{"kind": "other"}],
             "ownership": {"hvac_control": {"phase": "preconditioning"}},
@@ -4783,6 +4796,9 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
 
     result = asyncio.run(refresh_and_train())
 
+    if mapped_power:
+        assert "ev_power_feedback_unavailable" in context.input_issues
+        assert coordinator.store.data["ev_telemetry"]["version"] == 1
     assert result.mode == PlannerMode.DRY_RUN
     assert coordinator.store.dry_run_comparisons[0]["plan_id"] == "plan-dry"
     assert coordinator.store.ev_charge_calibrations
@@ -7711,6 +7727,7 @@ def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution(monkeyp
     calls: list[str] = []
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.hass = SimpleNamespace(data={})
+    coordinator._ev_allocation_cancel = lambda: calls.append("ev_deadline")
     coordinator._debounce_cancel = lambda: calls.append("debounce")
     coordinator._boundary_cancel = lambda: calls.append("boundary")
     coordinator._ai_advice_task = SimpleNamespace(
@@ -7735,7 +7752,7 @@ def test_shutdown_cancels_advisory_work_but_preserves_inflight_execution(monkeyp
     monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "async_shutdown", base_shutdown)
     asyncio.run(coordinator.async_shutdown())
 
-    assert calls == ["debounce", "boundary", "ai", "listener_2", "listener_1", "base"]
+    assert calls == ["ev_deadline", "debounce", "boundary", "ai", "listener_2", "listener_1", "base"]
     assert coordinator._debounce_cancel is None
     assert coordinator._boundary_cancel is None
     assert coordinator._ai_advice_task is None
@@ -8369,3 +8386,38 @@ def test_climate_training_publication_and_nested_input_listeners() -> None:
     values = coordinator_module._configured_entity_ids({'hvac_zone_mappings': {
         'climate.room': {'temperature': 'sensor.room', 'maximum_humidity': 60}, 'invalid': None}})
     assert values == ['sensor.room']
+
+
+def test_ev_allocation_deadline_is_serialized_and_stale_callbacks_cannot_stop_new_plan(monkeypatch) -> None:
+    async def run():
+        coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator.hass = SimpleNamespace()
+        coordinator._ev_allocation_cancel = None
+        coordinator._ev_allocation_deadline = None
+        coordinator._tearing_down = False
+        coordinator._command_lock = asyncio.Lock()
+        coordinator.executor = SimpleNamespace(async_restore_device_control=AsyncMock())
+        coordinator.async_request_refresh = AsyncMock()
+        coordinator._mark_forced_refresh = lambda *_: None
+        pending = []
+        callbacks = []
+        cancelled = []
+        coordinator._async_create_listener_task = lambda coroutine: pending.append(asyncio.create_task(coroutine))
+        def later(hass, seconds, callback):
+            callbacks.append(callback)
+            return lambda: cancelled.append(seconds)
+        monkeypatch.setattr(coordinator_module, "async_call_later", later)
+        now = coordinator_module.dt_util.utcnow()
+        coordinator._schedule_ev_allocation_deadline(now + timedelta(minutes=1))
+        coordinator._schedule_ev_allocation_deadline(now + timedelta(minutes=2))
+        assert cancelled
+        callbacks[0](now)
+        await pending.pop()
+        coordinator.executor.async_restore_device_control.assert_not_awaited()
+        callbacks[1](now)
+        await pending.pop()
+        coordinator.executor.async_restore_device_control.assert_awaited_once_with("ev", "ev_allocation_expired")
+        coordinator.async_request_refresh.assert_awaited_once()
+        coordinator._schedule_ev_allocation_deadline(None)
+        assert coordinator._ev_allocation_cancel is None
+    asyncio.run(run())

@@ -112,9 +112,21 @@ def _ev_charging_events(
     interval = timedelta(minutes=interval_minutes)
     valid_slots = _valid_ev_charging_slots(action)
     windows: list[dict[str, Any]] = []
+    details = {item.get("valid_at"): item for item in action.desired_state.get("allocated_slots", [])
+               if isinstance(item, dict)}
     for start, charge_kw, allocation_source in valid_slots:
+        item = details.get(start.isoformat(), {})
+        interval_start = dt_util.parse_datetime(str(item.get("interval_start", "")))
+        interval_end = dt_util.parse_datetime(str(item.get("interval_end", "")))
         end = start + interval
         energy_kwh = charge_kw * interval_minutes / 60
+        if (interval_start is not None and interval_end is not None
+                and interval_start.tzinfo is not None and interval_end.tzinfo is not None
+                and start <= interval_start < interval_end <= end):
+            start, end = interval_start, interval_end
+            energy = item.get("energy_kwh")
+            if isinstance(energy, int | float) and isfinite(energy) and energy >= 0:
+                energy_kwh = energy
         if windows and start == windows[-1]["end"] and allocation_source == windows[-1]["allocation_source"]:
             windows[-1]["end"] = end
             windows[-1]["energy_kwh"] += energy_kwh
@@ -198,6 +210,28 @@ def _ev_charging_event(
     elif isinstance(daylight, dict) and daylight.get("selected") and allocation_source == "ready_by_fallback":
         charging_details.append("Policy: Ready-by fallback after daylight preference")
         charging_details.append("Allocation: Ready-by fallback")
+    evidence = action.desired_state.get("optimization")
+    if isinstance(evidence, dict):
+        for key, label in (
+            ("strategy", "Strategy"), ("expected_completion", "Expected completion"),
+            ("conservative_completion", "Conservative completion"),
+            ("latest_validated_start", "Latest validated start"),
+            ("projected_departure_soc", "Projected departure SOC (%)"), ("charging_model_source", "Charging model"),
+            ("capacity_excluded_slots", "Capacity exclusions"), ("battery_cost_reason", "Battery cost model"),
+            ("modelled_incremental_cost", "Modelled incremental cost"), ("emergency_policy", "Price policy"),
+            ("emergency_spend_used", "Emergency spending used"),
+            ("emergency_budget_remaining", "Emergency budget remaining"),
+            ("retained_schedule_saving", "Modelled saving over retained schedule"),
+            ("schedule_change_reason", "Schedule decision"), ("search_status", "Search status"),
+        ):
+            if evidence.get(key) is not None:
+                charging_details.append(f"{label}: {evidence[key]}")
+        physical = evidence.get("physical_power_by_time", {})
+        intervals = evidence.get("allocation_intervals", {})
+        rates = [float(value) for instant, value in physical.items()
+                 if start <= datetime.fromisoformat(intervals.get(instant, {}).get("interval_start", instant)) < end]
+        if rates:
+            charging_details[0] = f"Physical limit: {min(rates):g}-{max(rates):g} kW; modelled average: {rate_text}"
     _append_description_section(description_lines, "Charging", charging_details)
     _append_description_section(
         description_lines,

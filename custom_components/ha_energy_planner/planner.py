@@ -15,7 +15,6 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_EV_CHARGE_RATE_KW,
-    CONF_EV_CONTINUOUS_CHARGING,
     CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
     CONF_EV_EARLIEST_START,
     CONF_EV_KEEP_CHARGER_ON,
@@ -32,6 +31,8 @@ from .const import (
     CONF_PRIORITY_WEIGHTS,
 )
 from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
+from .ev_optimization import optimise_ev
+from .ev_policy import strategy
 from .models import (
     ActionAsset,
     ActionKind,
@@ -312,7 +313,7 @@ class DryRunPlanner:
                 and float(current_slot.import_price) <= float(self.options[CONF_EV_LOW_PRICE_THRESHOLD])
                 and (max_import_price is None or float(current_slot.import_price) <= max_import_price)
             )
-            continuous_charging = bool(self.options.get(CONF_EV_CONTINUOUS_CHARGING, True))
+            continuous_charging = strategy(self.options) == "continuous"
             daylight_lowest_cost_enabled = bool(self.options.get(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED, False))
             continue_current_charging = continuous_charging and context.ev_charging is True
             available_charge_hours = max((ready_by - earliest_start).total_seconds() / 3600, 0.0)
@@ -370,6 +371,14 @@ class DryRunPlanner:
                 force_current=low_price_charge,
                 max_import_price=max_import_price,
             )
+            schedule, optimization_evidence = optimise_ev(
+                context, {**self.options,
+                          "ev_daylight_lowest_cost_charging_enabled": bool(daylight_evidence.get("selected"))},
+                target=target_soc, ready_by=ready_by,
+                earliest_start=earliest_start, charge_rate_kw=charge_rate_kw,
+                soc_per_kwh=soc_per_kwh, standard=schedule,
+                carbon_weight=_carbon_schedule_weight(self.options), force_current=low_price_charge,
+            )
             max_attainable_soc_percent = max(
                 max_attainable_soc_percent,
                 schedule.scheduled_soc_percent,
@@ -379,7 +388,8 @@ class DryRunPlanner:
             current_allocation = allocation_by_time.get(current_slot.valid_at) if current_slot else None
             for slot in context.slots:
                 if slot.valid_at in allocation_by_time:
-                    slot.projected_ev_load_kw = allocation_by_time[slot.valid_at].charge_kw
+                    slot.projected_ev_load_kw = optimization_evidence["physical_power_by_time"].get(
+                        slot.valid_at.isoformat(), charge_rate_kw)
             charging_required_now = bool(current_slot and current_slot.valid_at in allocation_by_time)
             keep_charger_on = bool(self.options.get(CONF_EV_KEEP_CHARGER_ON, False))
             keep_on_after_target = bool(
@@ -408,7 +418,8 @@ class DryRunPlanner:
             else:
                 charging_reason = "ev_outside_allocated_charging_window"
             if charging_required_now and current_slot is not None:
-                current_slot.projected_ev_load_kw = max(current_slot.projected_ev_load_kw, charge_rate_kw)
+                current_slot.projected_ev_load_kw = optimization_evidence["physical_power_by_time"].get(
+                    current_slot.valid_at.isoformat(), charge_rate_kw)
             projected_load_kw_now = (
                 max(float(current_slot.projected_ev_load_kw), 0.0)
                 if charging_required_now and current_slot is not None
@@ -424,6 +435,8 @@ class DryRunPlanner:
                     kind=ActionKind.EV_SCHEDULE,
                     desired_state={
                         "charging_required_now": charging_required_now,
+                        "optimization": optimization_evidence,
+                        **self._ev_power_command(context, optimization_evidence, charging_required_now),
                         "charging_observed": context.ev_charging,
                         "charging_reason": charging_reason,
                         "target_soc_percent": target_soc,
@@ -468,6 +481,9 @@ class DryRunPlanner:
                             {
                                 "valid_at": allocation.valid_at.isoformat(),
                                 "charge_kw": allocation.charge_kw,
+                                **optimization_evidence["allocation_intervals"][allocation.valid_at.isoformat()],
+                                "physical_power_kw": optimization_evidence["physical_power_by_time"].get(
+                                    allocation.valid_at.isoformat(), charge_rate_kw),
                                 "added_soc_percent": allocation.added_soc_percent,
                                 "import_price": allocation.import_price,
                                 "effective_price": allocation.effective_price,
@@ -611,6 +627,20 @@ class DryRunPlanner:
                 confidence=confidence_from_context(context),
             )
         return None
+
+    def _ev_power_command(self, context: DecisionContext, evidence: Mapping[str, Any], enabled: bool) -> dict[str, Any]:
+        capability = context.ev_evidence.get("power_capability")
+        if not enabled or capability is None or not context.slots:
+            return {}
+        power = evidence["physical_power_by_time"].get(context.slots[0].valid_at.isoformat())
+        if power is None:
+            power = capability.power(float(self.options[CONF_EV_CHARGE_RATE_KW]))
+        if power <= 0:
+            return {}
+        return {"power_limit": {
+            "entity_id": capability.entity_id, "value": capability.setpoint(power),
+            "unit": capability.unit, "physical_power_kw": power,
+        }}
 
     def _estimate_cost(self, context: DecisionContext) -> float | None:
         total = 0.0
