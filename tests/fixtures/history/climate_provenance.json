@@ -1,0 +1,35 @@
+{
+  "kind": "climate_history",
+  "name": "synthetic_untrusted_climate_history",
+  "end": "2026-09-13T13:00:00+00:00",
+  "observations": [
+    {
+      "at": "2026-09-13T12:00:00+00:00",
+      "temperature": 21.0,
+      "outdoor": 10.0,
+      "power_kw": 1.0,
+      "mode": "heat",
+      "occupied": "occupied",
+      "target": 21.0,
+      "low": 20.0,
+      "high": 24.0,
+      "provenance": "unknown"
+    },
+    {
+      "at": "2026-09-13T12:05:00+00:00",
+      "temperature": 21.1,
+      "outdoor": 10.0,
+      "power_kw": 1.0,
+      "mode": "heat",
+      "occupied": "occupied",
+      "target": 21.0,
+      "low": 20.0,
+      "high": 24.0,
+      "provenance": "planner"
+    }
+  ],
+  "expected": {
+    "normal_observations": 0,
+    "ready_modes": []
+  }
+}

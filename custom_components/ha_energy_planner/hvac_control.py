@@ -16,6 +16,10 @@ from .hvac_adapter import HVACCommandResult
 _HVAC_MAIN_STATE_OWNERSHIP_KEY = "main_state"
 
 HVAC_LIFECYCLE_FIELDS = (
+    "economic_policy_version",
+    "lifecycle_id",
+    "configuration_identity",
+    "arrival",
     "phase",
     "period_start",
     "period_end",

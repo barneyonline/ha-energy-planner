@@ -24,7 +24,7 @@ Energy Planner reads existing Home Assistant entities and calls Home Assistant s
 Planning and control include:
 
 - Tariff-aware EV charging with ready-by, target-SOC, solar, battery-reserve, and grid-limit constraints.
-- Climate preconditioning around expensive tariff periods, with presence, comfort, manual-override, ownership, and rollback safeguards.
+- Climate preconditioning with learned normal-operation comparisons, bounded schedule search, tariff/solar/battery economics, optional room and arrival inputs, and existing comfort, manual-override and rollback safeguards. See [Climate decision policy](docs/climate-decisions.md).
 - Enphase self-consumption, backup, and AI-profile selection where mapped controls support it.
 - A Recorder-trained household-load forecast with conservative validation and fail-closed handling of missing or stale data.
 - A plan calendar, current state, next actions, input health, forecast confidence, production readiness, and redacted support data.

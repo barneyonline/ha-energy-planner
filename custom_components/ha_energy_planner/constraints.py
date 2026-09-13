@@ -256,6 +256,14 @@ class ConstraintValidator:
                     "HVAC action cannot run while occupancy is unknown.",
                 )
             ]
+        if action.desired_state.get("economic_policy_version") and (
+            action.desired_state["economic_policy_version"] != 1
+            or context.climate_engine.get("status") != "active"
+            or action.desired_state.get("configuration_identity") != context.climate_inputs.get("identity")
+            or action.desired_state.get("lifecycle_id") != context.climate_decision.get("lifecycle_id")
+        ):
+            violations.append(_action_violation(action, "economic_climate_authority_missing",
+                                                "Economic climate actions require current validated authority."))
         away_preconditioning_allowed = (
             context.occupancy_state == OccupancyState.AWAY
             and strict_bool(self.options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False), default=False)

@@ -9,11 +9,14 @@ import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from custom_components.ha_energy_planner.climate_inputs import read_climate_inputs  # noqa: E402
+from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS  # noqa: E402
 from custom_components.ha_energy_planner.forecasts import forecast_series_from_state  # noqa: E402
 
 V1_REAL_PROFILE_REQUIREMENTS = {
@@ -81,6 +84,17 @@ def main() -> int:
 
 def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     kind = fixture.get("kind")
+    if kind == "climate_inputs":
+        now = datetime.fromisoformat(fixture["now"])
+        states = {entity: SimpleNamespace(state=value["state"], attributes=value.get("attributes", {}),
+                                         last_updated=datetime.fromisoformat(value["last_updated"]))
+                  for entity, value in fixture["states"].items()}
+        result = read_climate_inputs(SimpleNamespace(states=SimpleNamespace(get=states.get)), fixture["data"],
+                                     DEFAULT_OPTIONS, now, datetime.fromisoformat(fixture["end"]), {})
+        actual = {key: result[key] for key in fixture["expected"]}
+        if actual != fixture["expected"]:
+            raise ValueError(f"Climate fixture mismatch: {actual}")
+        return {"kind": kind, "name": fixture["name"], "ok": True, "actual": actual}
     if kind == "forecast_state":
         return _validate_forecast_fixture(fixture)
     raise ValueError(f"Unsupported fixture kind: {kind!r}")

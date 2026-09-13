@@ -31,6 +31,8 @@ def test_representative_live_schema_fixtures_parse_successfully() -> None:
     for fixture in _fixtures():
         if fixture["kind"] == "forecast_state":
             _assert_forecast_fixture(fixture)
+        elif fixture["kind"] == "climate_inputs":
+            assert _load_validator()._validate_fixture(fixture)["ok"]
         else:
             raise AssertionError(f"Unsupported fixture kind: {fixture['kind']}")
 

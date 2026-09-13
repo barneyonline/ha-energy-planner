@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.sun import get_astral_event_date
 from homeassistant.util import dt as dt_util
 
+from .climate_inputs import read_climate_inputs
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -387,6 +388,11 @@ class InputManager:
             forecast_confidence_by_source=forecast_confidence_by_source,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
             daylight_windows=daylight_windows,
+            climate_inputs=read_climate_inputs(
+                self.hass, dict(self.entry_data), dict(self.options), now, now + timedelta(hours=horizon),
+                {**self.load_forecast_details,
+                 "hvac_power_subtracted": self.load_forecast_model.get("cleaning", {}).get("hvac_power_subtracted")},
+            ),
         )
 
     def _numeric_state(self, config_key: str) -> tuple[float | None, str | None]:
