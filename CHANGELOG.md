@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.1.0 - 2026-09-13
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add tracked vehicle profiles for cars sharing one charger, home-aware identification, automatic swap handling, per-vehicle ready-by and calibration, and a Manual guest-charging mode that resets on unplug. Preserve guest load accounting, clear reservations on confirmed unplug, and update ready-by without interrupting household control. Reset manual charging overrides before planning a replacement car and discard calibration across queued feedback interruptions. Preserve port-disconnect evidence across reloads and handle unplug boundaries after charger-state outages or during pending ownership writes.
 - Add automatic climate learning and economic preconditioning comparisons, optional arrival, room, humidity and irradiance inputs, equipment curves, and observation-cycle diagnostics.
 
@@ -15,7 +37,6 @@
 
 - Harden economic climate lifecycle release, arrival deadlines, room validation, evidence freshness, observation timing and bounded candidate search.
 - Preserve exact scheduled phase times and legacy releases; compare both demand uncertainty directions, use learned normal targets and account for room recovery and planned zone activation.
-
 - Stop presenting a climate tariff difference as a monetary saving; economic savings are recorded once per lifecycle.
 - Prevent telemetry from charging the EV session budget again after a confirmed stop, including while capacity remains reserved for recovery.
 - Stop charging when a charging lease expires even if the saved baseline was on, end spending accrual after a confirmed stop despite failed limit restoration, and preserve selected daylight preferences when comparing retained schedules.
