@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict
 from datetime import timedelta
 from typing import Any
 
+from .climate_optimizer import revalidate_schedule
+from .climate_runtime import economic_actions, release_action
 from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_DEFAULT_READY_BY,
@@ -100,6 +103,8 @@ class DryRunPlanner:
         estimated_cost = self._estimate_cost(context)
         estimated_cost_horizon = self._estimated_cost_horizon_hours(context)
         device_plans = build_device_plans(context, actions, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        if context.climate_decision:
+            device_plans.setdefault("climate", {}).update({"economics": context.climate_decision})
         confidence_breakdown = _confidence_breakdown(context, actions)
         decision_audit = _decision_audit(context, actions, self.options)
         rejected_actions = _rejected_actions(context, actions, self.options)
@@ -269,6 +274,10 @@ class DryRunPlanner:
                     execute_not_after,
                 )
             )
+        legacy_hvac_loads = [slot.projected_hvac_load_kw for slot in context.slots]
+        if context.climate_inputs and self.options.get("hvac_decision_policy", "automatic") != "legacy":
+            for slot in context.slots:
+                slot.projected_hvac_load_kw = 0.0
         if (
             context.ev_policy_allowed
             and context.ev_connected is not False
@@ -491,7 +500,47 @@ class DryRunPlanner:
                     confidence=confidence_from_context(context),
                 )
             )
+        for slot, power in zip(context.slots, legacy_hvac_loads, strict=True):
+            slot.projected_hvac_load_kw = power
+        legacy_climate = [action for action in actions if action.asset == ActionAsset.DAIKIN]
+        actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
+        actions.extend(economic_actions(context, dict(self.options), legacy_climate))
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
+        if enphase_action is not None and context.climate_decision.get("commands_selected"):
+            original_profile = context.current_enphase_profile
+            context.current_enphase_profile = enphase_action.desired_state.get("profile")
+            rechecked = revalidate_schedule(context, dict(self.options), context.climate_engine.get("model", {}),
+                                           context.climate_decision)
+            context.current_enphase_profile = original_profile
+            if rechecked is None:
+                actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
+                baseline_powers = context.climate_decision.get("baseline_powers_kw") or legacy_hvac_loads
+                for slot, power in zip(context.slots, baseline_powers, strict=True):
+                    slot.projected_hvac_load_kw = power
+                context.climate_decision["summary"] = (
+                    "Normal climate controls retain authority because "
+                    "the final battery profile invalidated the comparison."
+                )
+                context.climate_engine.pop("scheduled", None)
+                context.climate_decision["rejected_final_profile"] = True
+                context.climate_decision["commands_selected"] = False
+                if context.hvac_control.get("economic_policy_version"):
+                    actions.append(release_action(context, "economic_final_profile_changed",
+                                                  execute_not_after - execute_not_before))
+                enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
+            else:
+                economics = {
+                    "expected_saving": rechecked.expected_saving,
+                    "conservative_saving": rechecked.conservative_saving,
+                    "baseline": asdict(rechecked.baseline_cost),
+                    "candidate": asdict(rechecked.candidate_cost),
+                }
+                context.climate_decision.update(economics)
+                if context.climate_engine.get("scheduled") is not None:
+                    context.climate_engine["scheduled"].update(economics)
+                for action in actions:
+                    if action.asset == ActionAsset.DAIKIN and action.expected_cost_delta is not None:
+                        action.expected_cost_delta = rechecked.expected_saving
         if enphase_action is not None:
             actions.append(enphase_action)
         hvac_capability_blocked = _hvac_rollback_capability_unavailable(context)
@@ -816,6 +865,8 @@ def _rejected_climate_decision(
     options: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return why climate control was not selected."""
+    if context.climate_decision.get("summary"):
+        return {"device": "Climate", "action": "Precondition", "reason": context.climate_decision["summary"]}
     confidence_reason = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
     if confidence_reason is not None:
         reason = confidence_reason

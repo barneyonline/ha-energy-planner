@@ -14,6 +14,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from custom_components.ha_energy_planner.climate_learning import train_climate  # noqa: E402
 from custom_components.ha_energy_planner.ev import build_ev_charge_calibration  # noqa: E402
 from custom_components.ha_energy_planner.forecast_accuracy import (  # noqa: E402
     accuracy_threshold_errors,
@@ -89,6 +90,14 @@ def main() -> int:
 
 def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     kind = fixture.get("kind")
+    if kind == "climate_history":
+        model = train_climate({"observations": fixture["observations"]}, fixture.get("timezone", "UTC"),
+                              fixture.get("window_minutes", 30), datetime.fromisoformat(fixture["end"]))
+        actual = {"normal_observations": len(model["normal"]),
+                  "ready_modes": sorted(mode for mode, result in model["validation"].items() if not result["blockers"])}
+        if actual != fixture["expected"]:
+            raise ValueError(f"Climate fixture mismatch: {actual}")
+        return {"kind": kind, "name": fixture["name"], "ok": True, "actual": actual}
     if kind == "ev_charge_calibration":
         return _validate_ev_charge_calibration_fixture(fixture)
     if kind == "thermal_history":

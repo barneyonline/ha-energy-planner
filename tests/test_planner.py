@@ -3814,3 +3814,60 @@ def test_preconditioning_boundary_exception_preserves_safety_handoffs(failure: s
     assert action.desired_state["release_reason"] == (
         "manual_hvac_override" if failure == "manual_override" else "hvac_required_evidence_lost"
     )
+
+
+@pytest.mark.parametrize('owned,valid', [(False, False), (True, False), (False, True), (True, True)])
+def test_economic_climate_rechecks_final_battery_profile(monkeypatch, owned, valid):
+    from custom_components.ha_energy_planner.climate_models import ClimateCandidate, ClimateTrajectory, SiteCost
+    context = _context()
+    context.climate_inputs = {'identity': 'test'}
+    if owned:
+        context.hvac_control = {'economic_policy_version': 1}
+    options = {**DEFAULT_OPTIONS, 'planner_enabled': True}
+    def climate(ctx, opts, legacy):
+        ctx.climate_decision = {'lifecycle_id': 'cycle', 'commands_selected': True}
+        if owned:
+            ctx.climate_decision['baseline_powers_kw'] = [.4] * len(ctx.slots)
+        ctx.climate_engine = {'scheduled': {}, 'model': {}}
+        if owned:
+            ctx.climate_engine.pop('scheduled')
+        return [PlanAction('climate', ctx.plan_id, ctx.created_at, ctx.created_at + timedelta(minutes=5),
+                           ActionAsset.DAIKIN, ActionKind.SET_HVAC, {}, [], [], 1, 1)]
+    def battery(*args):
+        return PlanAction('battery', context.plan_id, context.created_at, context.created_at + timedelta(minutes=5),
+                          ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {'profile': 'new'}, [], [], 1, 1)
+    checked = []
+    def recheck(ctx, opts, model, decision):
+        checked.append(ctx.current_enphase_profile)
+        return ClimateCandidate(0, 1, 2, "heat", 22, ClimateTrajectory((), ()), .1 if owned else 1, .05,
+                                SiteCost(2, 0, 0, 0, 0), SiteCost(1, 0, 0, 0, 0)) if valid else None
+    monkeypatch.setattr(planner_module, 'economic_actions', climate)
+    monkeypatch.setattr(planner_module, 'revalidate_schedule', recheck)
+    planner = DryRunPlanner(options)
+    monkeypatch.setattr(planner, '_enphase_action', battery)
+    plan = planner.create_plan(context)
+    assert checked == ['new']
+    assert context.current_enphase_profile is None
+    assert bool(context.climate_decision.get('rejected_final_profile')) is not valid
+    if owned and not valid:
+        assert any(action.kind == ActionKind.RELEASE_HVAC for action in plan.actions)
+        assert all(slot.projected_hvac_load_kw == .4 for slot in context.slots)
+
+
+def test_observation_only_comparison_does_not_discard_legacy_release(monkeypatch):
+    context = _context()
+    context.climate_inputs = {'identity': 'test'}
+    def climate(ctx, opts, legacy):
+        ctx.climate_decision = {'lifecycle_id': 'observation', 'commands_selected': False}
+        return [PlanAction('release', ctx.plan_id, ctx.created_at, ctx.created_at + timedelta(minutes=5),
+                           ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC, {}, [], [], None, 1)]
+    def battery(*args):
+        return PlanAction('battery', context.plan_id, context.created_at, context.created_at + timedelta(minutes=5),
+                          ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {'profile': 'new'}, [], [], 1, 1)
+    def recheck(*args):
+        raise AssertionError('An unselected observation cannot veto legacy recovery')
+    monkeypatch.setattr(planner_module, 'economic_actions', climate)
+    monkeypatch.setattr(planner_module, 'revalidate_schedule', recheck)
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, 'planner_enabled': True})
+    monkeypatch.setattr(planner, '_enphase_action', battery)
+    assert any(action.kind == ActionKind.RELEASE_HVAC for action in planner.create_plan(context).actions)

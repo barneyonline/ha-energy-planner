@@ -144,3 +144,27 @@ def test_training_failure_is_bounded_and_request_models_are_detached(monkeypatch
         assert replace(base, timezone="Australia/Melbourne").identity != base.identity
         assert replace(base, bypass_safety_gates=True).identity != base.identity
     asyncio.run(run())
+
+
+def test_climate_training_runs_detached_once_per_day(monkeypatch: Any) -> None:
+    class ClimateHass(Hass):
+        async def async_add_executor_job(self, function: Any, *args: Any) -> Any:
+            return function(*args)
+
+    async def unchanged(*args: Any, **kwargs: Any) -> tuple:
+        return {}, False, 'unchanged'
+
+    monkeypatch.setattr(module, 'async_update_ev_charge_calibration', unchanged)
+    monkeypatch.setattr(module, 'async_update_builtin_load_forecast', unchanged)
+    called = []
+    monkeypatch.setattr(
+        module, 'train_climate', lambda *args: called.append(args) or {'trained_at': args[-1].isoformat()}
+    )
+    async def run() -> None:
+        manager = module.HistoryTraining(ClimateHass(), 'climate-training', lambda *args: None)
+        source = replace(request(), climate_state={'identity': 'test', 'observations': [{}]})
+        result = await manager._train(source)
+        assert called and result.climate_model['trained_at']
+        await manager._train(replace(source, climate_state={**source.climate_state, 'model': result.climate_model}))
+        assert len(called) == 1
+    asyncio.run(run())

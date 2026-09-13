@@ -72,6 +72,8 @@ class HVACPlanningPolicy:
     ) -> list[PlanAction]:
         """Plan precondition, peak-coast, and release lifecycle actions."""
         active = dict(context.hvac_control or {})
+        if active.get("economic_policy_version"):
+            return []
         now = context.created_at
         low = context.occupied_temperature_low_c
         high = context.occupied_temperature_high_c
@@ -676,7 +678,7 @@ class HVACPlanningPolicy:
                 "hvac_min_cycle",
             ],
             reason_codes=[f"hvac_{phase}"],
-            expected_cost_delta=float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
+            expected_cost_delta=None,
             confidence=confidence_from_context(context),
         )
 

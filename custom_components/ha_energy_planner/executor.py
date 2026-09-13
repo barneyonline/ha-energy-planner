@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .adapter_helpers import profile_control_service as _profile_control_service_for_target
+from .climate_runtime import command_rejection
 from .command_models import ControlAction, ManualControlAction
 from .const import (
     CONF_BYPASS_SAFETY_GATES,
@@ -1585,6 +1586,12 @@ class Executor:
 
     def _control_rejection_reason(self, action: ControlAction, now: datetime) -> str | None:
         """Return production-control rejection reason for active device commands."""
+        climate_rejection = command_rejection(
+            self.hass, self.entry_data, self.options, dict(self.store.data.get("climate_engine", {})),
+            action.desired_state, now,
+        )
+        if climate_rejection is not None:
+            return climate_rejection
         safety_ev_stop = _ev_action_is_safety_stop(action)
         owned_safety_stop = _ev_action_is_owned_safety_stop(action)
         pause = self.store.data.get("control_pause")

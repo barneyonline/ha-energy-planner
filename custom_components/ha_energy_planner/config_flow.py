@@ -16,6 +16,7 @@ from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
+    ObjectSelector,
     SelectOptionDict,
     SelectSelector,
     SelectSelectorConfig,
@@ -28,6 +29,7 @@ from voluptuous import Invalid
 if TYPE_CHECKING:
     from homeassistant.helpers.selector import EntityWithDeviceFilterSelectorConfig
 
+from .climate_inputs import validate_climate_config
 from .const import (
     CONF_AI_ADVISOR_SERVICE,
     CONF_AI_TASK_ENTITY,
@@ -95,12 +97,22 @@ from .const import (
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
     CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
+    CONF_HVAC_ARRIVAL,
+    CONF_HVAC_COP_TABLE,
+    CONF_HVAC_HUMIDITY,
+    CONF_HVAC_IRRADIANCE,
+    CONF_HVAC_IRRADIANCE_FORECAST,
+    CONF_HVAC_MAX_HUMIDITY,
     CONF_HVAC_MIN_CYCLE_MINUTES,
+    CONF_HVAC_MIN_SAVING,
+    CONF_HVAC_OBSERVATION_CADENCE,
+    CONF_HVAC_POLICY,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
+    CONF_HVAC_ZONE_MAPPINGS,
     CONF_INSTANCE_NAME,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -252,6 +264,13 @@ AI_DATA_SCHEMA = vol.Schema(
 
 CLIMATE_DATA_SCHEMA = vol.Schema(
     {
+        vol.Optional(CONF_HVAC_ARRIVAL): _entity_selector(["input_datetime", "sensor"]),
+        vol.Optional(CONF_HVAC_HUMIDITY): _entity_selector("sensor"),
+        vol.Optional(CONF_HVAC_IRRADIANCE): _entity_selector("sensor"),
+        vol.Optional(CONF_HVAC_IRRADIANCE_FORECAST): _entity_selector("sensor"),
+        vol.Optional(CONF_HVAC_MAX_HUMIDITY): NumberSelector(NumberSelectorConfig(min=1, max=100, step=1)),
+        vol.Optional(CONF_HVAC_ZONE_MAPPINGS): ObjectSelector(),
+        vol.Optional(CONF_HVAC_COP_TABLE): ObjectSelector(),
         vol.Required(CONF_DAIKIN_CLIMATE): _entity_selector("climate"),
         vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
@@ -400,6 +419,9 @@ _POLICY_SECTION_FIELDS = {
         CONF_GRID_EXPORT_LIMIT_KW,
     ),
     POLICY_STEP_CLIMATE: (
+        CONF_HVAC_POLICY,
+        CONF_HVAC_MIN_SAVING,
+        CONF_HVAC_OBSERVATION_CADENCE,
         CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_LEAD_MINUTES,
@@ -596,6 +618,9 @@ def _option_selector(field: str) -> Any:
         CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=50, step=1, mode=NumberSelectorMode.BOX)
         ),
+        CONF_HVAC_POLICY: SelectSelector(SelectSelectorConfig(options=["automatic", "observe", "legacy"])),
+        CONF_HVAC_MIN_SAVING: NumberSelector(NumberSelectorConfig(min=0, max=100, step=0.01)),
+        CONF_HVAC_OBSERVATION_CADENCE: NumberSelector(NumberSelectorConfig(min=1, max=100, step=1)),
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
         ),
@@ -969,6 +994,7 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
 def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[str, str]:
     """Validate configured entities without calling device services."""
     errors: dict[str, str] = {}
+    errors.update(validate_climate_config(user_input))
     scheduler_guard = bool(user_input.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER))
     scheduler_timer = bool(user_input.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER))
     if scheduler_guard != scheduler_timer:
@@ -1139,6 +1165,10 @@ def _zone_only_preconditioning_compatible(
 
 
 _ENTITY_DOMAIN_RULES = {
+    CONF_HVAC_ARRIVAL: {"input_datetime", "sensor"},
+    CONF_HVAC_HUMIDITY: {"sensor"},
+    CONF_HVAC_IRRADIANCE: {"sensor"},
+    CONF_HVAC_IRRADIANCE_FORECAST: {"sensor"},
     CONF_AMBER_IMPORT_PRICE: {"sensor"},
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},

@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .climate_inputs import climate_identity
+from .climate_learning import train_climate
 from .const import (
     CONF_BYPASS_SAFETY_GATES,
     CONF_DAIKIN_POWER,
@@ -17,6 +19,7 @@ from .const import (
     CONF_EV_CHARGING,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_PLANNING_HORIZON_HOURS,
     DOMAIN,
 )
 from .recorder_import import async_update_builtin_load_forecast, async_update_ev_charge_calibration
@@ -37,6 +40,8 @@ class TrainingRequest:
     bypass_safety_gates: bool
     ev_model: dict[str, Any]
     load_model: dict[str, Any]
+    climate_state: dict[str, Any] = field(default_factory=dict)
+    climate_window_minutes: int = 30
 
     @property
     def identity(self) -> tuple[Any, ...]:
@@ -45,6 +50,8 @@ class TrainingRequest:
                 CONF_HOUSEHOLD_LOAD, CONF_EV_CHARGING, CONF_EV_SOC, CONF_DAIKIN_POWER,
             )),
             self.charge_rate_kw, self.timezone, self.bypass_safety_gates,
+            self.climate_state.get("identity"), self.climate_window_minutes,
+            self.climate_state.get("comfort_signature"),
         )
 
 
@@ -58,18 +65,25 @@ class TrainingResult:
     load_changed: bool
     ev_reason: str
     load_reason: str
+    climate_model: dict[str, Any] = field(default_factory=dict)
 
 
 def training_request(
     entry_data: dict[str, Any], options: dict[str, Any], store_data: dict[str, Any], timezone: str
 ) -> TrainingRequest:
     """Detach all model/configuration roots before yielding to background work."""
+    identity = climate_identity(entry_data, options)
+    climate_state = dict(store_data.get("climate_engine", {}))
+    if climate_state.get("identity") != identity:
+        climate_state = {"identity": identity}
     return TrainingRequest(
         dict(entry_data), float(options[CONF_EV_CHARGE_RATE_KW]), timezone,
         strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False),
         dict(store_data.get("ev_vehicle_calibrations", {}).get(entry_data.get("ev_vehicle_id"), {}))
         if VEHICLES in entry_data else dict(store_data.get("ev_charge_calibration", {})),
         dict(store_data.get("built_in_load_forecast", {})),
+        climate_state,
+        int(options.get(CONF_PLANNING_HORIZON_HOURS, 12)) * 60,
     )
 
 
@@ -135,7 +149,12 @@ class HistoryTraining:
             force=not self.load_training_attempted,
             bypass_conservative_bound_gate=request.bypass_safety_gates,
         )
-        return TrainingResult(ev, load, ev_changed, load_changed, ev_reason, load_reason)
+        climate_model = request.climate_state.get("model", {})
+        if (request.climate_state.get("observations")
+                and str(climate_model.get("trained_at", ""))[:10] != now.date().isoformat()):
+            climate_model = await self.hass.async_add_executor_job(
+                train_climate, request.climate_state, request.timezone, request.climate_window_minutes, now)
+        return TrainingResult(ev, load, ev_changed, load_changed, ev_reason, load_reason, climate_model)
 
     async def _run(self) -> None:
         try:
