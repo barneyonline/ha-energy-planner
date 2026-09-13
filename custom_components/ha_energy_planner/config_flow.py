@@ -145,6 +145,7 @@ from .const import (
     INTEGRATION_NAME,
 )
 from .entry_data import combined_entry_data
+from .ev_policy import EV_DEFAULTS, finite, power_capability, strategy
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import AUTO, HOME, MANUAL, PORT, VEHICLE, VEHICLES
 
@@ -294,6 +295,9 @@ PRESENCE_DATA_SCHEMA = vol.Schema(
 
 EV_DATA_SCHEMA = vol.Schema(
     {
+        vol.Optional("ev_power_entity"): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Optional("ev_energy_entity"): _entity_selector("sensor"),
+        vol.Optional("ev_power_limit_entity"): _entity_selector("number"),
         vol.Optional(CONF_EV_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
         vol.Optional(CONF_EV_CHARGING): _entity_selector(["binary_sensor", "sensor", "switch"]),
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
@@ -337,6 +341,7 @@ _HOUSEHOLD_ACTUATOR_KEYS = (
     CONF_ENPHASE_PROFILE,
 )
 _EV_ACTUATOR_KEYS = (
+    "ev_power_limit_entity",
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
@@ -405,7 +410,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_BATTERY_MAX_DISCHARGE_KW,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
-        CONF_EV_CONTINUOUS_CHARGING,
+        *EV_DEFAULTS,
         CONF_EV_EARLIEST_START,
         CONF_EV_PRICE_LIMIT_ENABLED,
         CONF_EV_MAX_IMPORT_PRICE,
@@ -505,7 +510,7 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
         CONF_DEFAULT_READY_BY,
         CONF_EV_CHARGE_RATE_KW,
         CONF_EV_SOC_PER_KWH,
-        CONF_EV_CONTINUOUS_CHARGING,
+        *EV_DEFAULTS,
         CONF_EV_EARLIEST_START,
         CONF_EV_PRICE_LIMIT_ENABLED,
         CONF_EV_MAX_IMPORT_PRICE,
@@ -534,6 +539,7 @@ def _options_schema(options: dict[str, Any]) -> vol.Schema:
 def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) -> vol.Schema:
     """Return an options schema for a policy section."""
     merged = {**DEFAULT_OPTIONS, **options}
+    merged["ev_charging_strategy"] = strategy(merged)
     priority_values = _priority_values_from_options(merged)
     schema: dict[Any, Any] = {}
     for field in fields:
@@ -562,6 +568,19 @@ def _priority_selector() -> SelectSelector:
 
 def _option_selector(field: str) -> Any:
     """Return the selector for a policy option."""
+    if field in EV_DEFAULTS:
+        choices = {
+            "ev_charging_strategy": ["continuous", "split", "adaptive"],
+            "ev_price_policy": ["hard_ceiling", "departure_priority"],
+        }
+        if field in choices:
+            return SelectSelector(SelectSelectorConfig(options=choices[field], mode=SelectSelectorMode.DROPDOWN))
+        limits = {"ev_limit_min": (0, 1_000_000, 0.01), "ev_limit_max": (0, 1_000_000, 0.01),
+                  "ev_voltage": (100, 300, 1), "ev_phases": (1, 3, 2),
+                  "ev_readiness_buffer_minutes": (0, 240, 5), "ev_min_dwell_minutes": (0, 120, 1),
+                  "ev_schedule_min_saving_percent": (0, 100, 1)}
+        low, high, step = limits.get(field, (0, 1000, 0.01))
+        return NumberSelector(NumberSelectorConfig(min=low, max=high, step=step, mode=NumberSelectorMode.BOX))
     selectors: dict[str, Any] = {
         CONF_PLANNING_HORIZON_HOURS: NumberSelector(
             NumberSelectorConfig(min=1, max=48, step=1, mode=NumberSelectorMode.BOX)
@@ -769,7 +788,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             return self.async_create_entry(
                 title=title,
                 data={CONF_INSTANCE_NAME: title},
-                options=DEFAULT_OPTIONS,
+                options={**DEFAULT_OPTIONS, "ev_price_policy": "departure_priority"},
             )
         return self.async_show_form(
             step_id="user",
@@ -988,6 +1007,20 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
         load_grace = -1
     if not 0 <= load_grace <= 30:
         errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] = "invalid_load_outage_grace"
+    for key, default in EV_DEFAULTS.items():
+        if isinstance(default, (int, float)) and key in user_input:
+            value = finite(user_input[key])
+            if value is None or value < 0:
+                errors[key] = "invalid_ev_policy"
+    if user_input.get("ev_charging_strategy", "legacy") not in {"legacy", "continuous", "split", "adaptive"}:
+        errors["ev_charging_strategy"] = "invalid_ev_policy"
+    if user_input.get("ev_price_policy", "hard_ceiling") not in {"hard_ceiling", "departure_priority"}:
+        errors["ev_price_policy"] = "invalid_ev_policy"
+    if (user_input.get("ev_price_policy") == "departure_priority" and user_input.get(CONF_EV_PRICE_LIMIT_ENABLED)
+            and ((finite(user_input.get("ev_emergency_price")) or 0)
+                 <= (finite(user_input.get(CONF_EV_MAX_IMPORT_PRICE)) or 0)
+                 or (finite(user_input.get("ev_emergency_budget")) or 0) <= 0)):
+        errors["ev_emergency_price"] = "invalid_ev_policy"
     return errors
 
 
@@ -1082,6 +1115,11 @@ def _validate_subentry_config(
         for required_key in (CONF_EV_CONNECTED, CONF_EV_CHARGING):
             if not user_input.get(required_key):
                 errors.setdefault(required_key, "ev_planning_sensor_required")
+    if user_input.get("ev_power_limit_entity"):
+        capability = power_capability(hass.states.get(user_input["ev_power_limit_entity"]),
+                                     {**DEFAULT_OPTIONS, **(options or dict(getattr(entry, "options", {})))})
+        if capability is None or not user_input.get("ev_power_entity"):
+            errors["ev_power_limit_entity"] = "invalid_ev_policy"
     return errors
 
 
@@ -1169,6 +1207,9 @@ _ENTITY_DOMAIN_RULES = {
     CONF_HVAC_HUMIDITY: {"sensor"},
     CONF_HVAC_IRRADIANCE: {"sensor"},
     CONF_HVAC_IRRADIANCE_FORECAST: {"sensor"},
+    "ev_power_entity": {"sensor"},
+    "ev_energy_entity": {"sensor"},
+    "ev_power_limit_entity": {"number"},
     CONF_AMBER_IMPORT_PRICE: {"sensor"},
     CONF_AMBER_EXPORT_PRICE: {"sensor"},
     CONF_PV_FORECAST: {"sensor"},
@@ -1326,6 +1367,9 @@ _PERCENT_UNITS = {"%", "percent", "percentage"}
 _CARBON_INTENSITY_UNITS = {"gco2/kwh", "kgco2/kwh"}
 
 _ENTITY_UNIT_RULES = {
+    "ev_power_entity": {"w", "kw"},
+    "ev_energy_entity": {"wh", "kwh"},
+    "ev_power_limit_entity": {"a", "w", "kw"},
     CONF_AMBER_IMPORT_PRICE: _PRICE_UNITS,
     CONF_AMBER_EXPORT_PRICE: _PRICE_UNITS,
     CONF_PV_FORECAST: _POWER_UNITS | _ENERGY_UNITS,

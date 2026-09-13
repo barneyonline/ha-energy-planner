@@ -308,3 +308,13 @@ def test_forecast_accuracy_history_is_matched_to_valid_time_without_lookahead() 
     assert [sample["actual"] for sample in samples] == [1.2, 2.1]
     assert [sample["baseline"] for sample in samples] == [1.2, 1.2]
     assert [sample["lead_hours"] for sample in samples] == [0.0, 1.0]
+
+
+def test_measured_ev_history_rejects_wrong_expected_model() -> None:
+    import pytest
+
+    fixture = json.loads((FIXTURE_DIR / "ev_measured_performance.json").read_text())
+    assert _load_validator()._validate_fixture(fixture)["soc_per_kwh"] == 2
+    fixture["expected_soc_per_kwh"] = 3
+    with pytest.raises(ValueError, match="Measured charging"):
+        _load_validator()._validate_fixture(fixture)

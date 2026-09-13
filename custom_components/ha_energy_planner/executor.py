@@ -49,6 +49,9 @@ from .enphase_adapter import EnphaseCommandResult, EnphaseProfileAdapter
 from .enphase_control import EnphaseControlTransaction
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .ev_control import _ev_action_wants_power, _positive_float, reserve_ev_grid_capacity
+from .ev_policy import finite, power_capability
+from .ev_runtime import allocation_deadline, price_stop_required, settle_spending, timestamp
+from .ev_telemetry import measured, reported_at
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
 from .hvac_control import HVACOwnershipTransaction
 from .models import (
@@ -108,6 +111,9 @@ _HVAC_MAIN_STATE_OWNERSHIP_KEY = "main_state"
 _PENDING_HVAC_MANUAL_OVERRIDE_KEY = "manual_override_detected"
 _PENDING_HVAC_MANUAL_ZONE_IDS_KEY = "manual_zone_entity_ids"
 _EV_CONTROL_TOPOLOGY_KEYS = (
+    "ev_power_limit_entity",
+    "ev_power_entity",
+    "ev_energy_entity",
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
     CONF_EV_CHARGER_STOP,
@@ -149,6 +155,7 @@ class Executor:
         self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
         self.ev_restore_guard: Callable[[], bool] = lambda: True
         self.ev_start_feedback_expected_until: datetime | None = None
+        self.ev_allocation_deadline_callback: Any = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
         self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
 
@@ -176,10 +183,18 @@ class Executor:
                      if not k.startswith("ev_")}
         await self.store.async_save_ownership(ownership)
         self.ev_start_feedback_expected_until = None
+        await self._async_end_ev_exposure()
         if unplugged or (
             self.hass is not None
             and connection(state_value(self.hass, self.entry_data.get(CONF_EV_CONNECTED))) is False
         ):
+            telemetry = dict(self.store.data.get("ev_telemetry", {}))
+            if telemetry:
+                telemetry["emergency_spend"] = 0.0
+                telemetry.pop("budget_uncertain", None)
+                telemetry["pending"] = {}
+                telemetry.pop("last_sample", None)
+                await self.store.async_save_ev_telemetry(telemetry)
             self._release_ev_grid_reservation()
         else:
             self._retain_external_ev_grid_reservation()
@@ -305,6 +320,34 @@ class Executor:
                         rejected=True,
                     )
                     return result
+        ev_entry_data = self._ev_entry_data_for_action(action)
+        if enabled and ev_entry_data.get("ev_power_limit_entity"):
+            capability = power_capability(self.hass.states.get(ev_entry_data["ev_power_limit_entity"]), self.options)
+            power = capability.power(float(self.options.get(CONF_EV_CHARGE_RATE_KW, 0))) if capability else 0
+            if capability is None or power <= 0:
+                result = EVCommandResult(False, "ev_power_control_unavailable", {}, {})
+                await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id, rejected=True)
+                return result
+            action.desired_state["power_limit"] = {
+                "entity_id": capability.entity_id, "value": capability.setpoint(power),
+                "unit": capability.unit, "physical_power_kw": power,
+            }
+            action.desired_state["projected_load_kw_now"] = power
+        manual_lease = None
+        manual_cost_rate = 0.0
+        manual_telemetry = settle_spending(self.store.data.get("ev_telemetry", {}), now)
+        if enabled:
+            lease_action = PlanAction(action.action_id, plan_id, now, now + timedelta(minutes=5),
+                                      ActionAsset.EV, ActionKind.EV_START, action.desired_state, [], [], 0, 1)
+            manual_lease, manual_cost_rate, lease_reason = allocation_deadline(
+                lease_action, self.options, manual_telemetry, now,
+                context.slots[0].import_price if context is not None and context.slots else None)
+            if manual_lease is not None and not callable(self.ev_allocation_deadline_callback):
+                lease_reason = "ev_allocation_timer_unavailable"
+            if lease_reason is not None:
+                result = EVCommandResult(False, lease_reason, {}, {})
+                await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id, rejected=True)
+                return result
         reservation_reason, previous_reservation = self._reserve_ev_grid_capacity(action, context, now)
         if reservation_reason is not None:
             result = EVCommandResult(False, reservation_reason, {}, {})
@@ -328,22 +371,43 @@ class Executor:
                 ev_entry_data,
             )
             await self._async_flush_provisional_state()
+            if manual_cost_rate > 0 or manual_telemetry.get("command_exposure"):
+                manual_telemetry["version"] = 1
+                manual_telemetry["command_exposure"] = {"at": now.isoformat(), "cost_per_hour": manual_cost_rate}
+                await self.store.async_save_ev_telemetry(manual_telemetry)
+                await self._async_flush_provisional_state()
+            if callable(self.ev_allocation_deadline_callback):
+                self.ev_allocation_deadline_callback(manual_lease)
+            if manual_lease is not None:
+                action.desired_state["charge_lease_until"] = manual_lease.isoformat()
             self._expect_ev_start_feedback()
         owned_manual_stop = bool(
             not enabled and (self._owned_ev_control_topology() is not None or isinstance(previous_reservation, dict))
         )
         if not enabled:
             self.ev_start_feedback_expected_until = None
-        result = await EVSmartChargingAdapter(
+        manual_adapter = EVSmartChargingAdapter(
             self.hass,
             ev_entry_data,
             command_guard=command_guard,
+            power_options=dict(self.options),
             confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
             confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
-        ).async_set_charging(enabled)
+        )
+        if enabled and (action.desired_state.get("power_limit") or manual_lease is not None):
+            manual_plan_action = PlanAction(action.action_id, plan_id, now, now + timedelta(minutes=5),
+                                            ActionAsset.EV, ActionKind.EV_START, action.desired_state, [], [], 0, 1)
+            result = await manual_adapter.async_execute(manual_plan_action)
+        elif (not enabled and "ev_power_limit_entity" in
+              self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})):
+            result = await manual_adapter.async_restore(self.store.data["ownership"]["ev_smart_charging_state"])
+        else:
+            result = await manual_adapter.async_set_charging(enabled)
         if enabled:
             self._reconcile_ev_start_feedback_expectation(result)
         if not enabled:
+            if _ev_result_proves_safe(result):
+                await self._async_end_ev_exposure()
             result = _normalized_ev_stop_result(
                 result,
                 require_safe=owned_manual_stop,
@@ -371,7 +435,8 @@ class Executor:
                 _ev_control_topology(ev_entry_data),
             )
             await self.store.async_save_ownership(ownership)
-        elif not enabled and _ev_result_proves_safe(result):
+        elif not enabled and _ev_result_proves_safe(result) and result.applied:
+            await self._async_end_ev_exposure()
             ownership = dict(self.store.data.get("ownership", {}))
             ownership.pop("ev_smart_charging_state", None)
             ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
@@ -567,6 +632,8 @@ class Executor:
             keep_on_action = bool(action.asset == ActionAsset.EV and action.desired_state.get("keep_charger_on"))
             if safety_ev_stop or keep_on_action:
                 capability_issues = [issue for issue in capability_issues if not issue.startswith("ev_start_control_")]
+            if safety_ev_stop:
+                capability_issues = [issue for issue in capability_issues if not issue.startswith("ev_power_")]
             if keep_on_action:
                 persistent_control = capability.details.get(
                     "persistent_control",
@@ -645,6 +712,20 @@ class Executor:
             )
             return None
         if reason is None and action.asset == ActionAsset.EV and self.hass is not None:
+            telemetry = settle_spending(self.store.data.get("ev_telemetry", {}), now)
+            telemetry.setdefault("version", 1)
+            lease_deadline, cost_rate, lease_reason = (None, 0.0, None)
+            if _ev_action_wants_power(action):
+                lease_deadline, cost_rate, lease_reason = allocation_deadline(
+                    action, self.options, telemetry, now,
+                    context.slots[0].import_price if context is not None and context.slots else None)
+                if lease_deadline is not None and not callable(self.ev_allocation_deadline_callback):
+                    lease_reason = "ev_allocation_timer_unavailable"
+                if lease_reason is not None:
+                    await self.store.async_add_outcome(self._action_outcome(
+                        action, now, result=OutcomeResult.REJECTED, reason=lease_reason,
+                        pre_state={}, post_state={}, plan_id=plan.plan_id))
+                    return None
             reservation_reason, previous_reservation = self._reserve_ev_grid_capacity(action, context, now)
             if reservation_reason is not None:
                 await self.store.async_add_outcome(
@@ -669,14 +750,28 @@ class Executor:
                     action,
                     ev_entry_data,
                 )
+                if cost_rate > 0 or telemetry.get("command_exposure"):
+                    telemetry["command_exposure"] = {"at": now.isoformat(), "cost_per_hour": cost_rate}
+                    telemetry["lease_until"] = lease_deadline.isoformat() if lease_deadline else None
+                    await self.store.async_save_ev_telemetry(telemetry)
                 await self._async_flush_provisional_state()
+                if callable(self.ev_allocation_deadline_callback):
+                    self.ev_allocation_deadline_callback(lease_deadline)
+                if lease_deadline is not None:
+                    action.desired_state["charge_lease_until"] = lease_deadline.isoformat()
                 self._expect_ev_start_feedback()
             else:
                 self.ev_start_feedback_expected_until = None
+            if not _ev_action_wants_power(action):
+                saved_ev = self.store.data.get("ownership", {}).get("ev_smart_charging_state", {})
+                if "ev_power_limit_entity" in saved_ev:
+                    action.desired_state["restore_power_limit"] = saved_ev["ev_power_limit_entity"]
+                    action.desired_state["restore_power_limit_unit"] = saved_ev.get("ev_power_limit_unit")
             ev_result = await EVSmartChargingAdapter(
                 self.hass,
                 ev_entry_data,
                 command_guard=command_guard,
+                power_options=dict(self.options),
                 confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                 confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
             ).async_execute(action)
@@ -684,6 +779,9 @@ class Executor:
                 self._reconcile_ev_start_feedback_expectation(ev_result)
             no_change = ev_result.reason == "already_in_desired_state"
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
+            if not _ev_action_wants_power(action) and safe_stop_confirmed:
+                await self._async_end_ev_exposure()
+
             stored_ownership = self.store.data.get("ownership")
             planner_owned_stop = bool(
                 safety_ev_stop
@@ -989,6 +1087,10 @@ class Executor:
                 str(issue).startswith("ev_") for issue in context.input_issues if not str(issue).startswith("advisory_")
             )
         )
+        if context is not None:
+            ev_input_issue = ev_input_issue or price_stop_required(
+                self.options, settle_spending(self.store.data.get("ev_telemetry", {}), dt_util.utcnow()),
+                context.slots[0].import_price if context.slots else None)
         ev_confidence_ineligible = bool(
             context is not None
             and not asset_meets_confidence_threshold(
@@ -1318,10 +1420,10 @@ class Executor:
                         confirmation_timeout_seconds=float(self.options.get(CONF_EV_CONFIRMATION_TIMEOUT_SECONDS, 30)),
                         confirmation_retries=int(self.options.get(CONF_EV_CONFIRMATION_RETRIES, 1)),
                     )
-                    ev_control_disabled = assets == {"ev"} and reason == "ev_control_disabled"
-                    if ev_control_disabled:
-                        # An explicit control disable requests a safe stop, not
-                        # restoration of a previously-on charger baseline.
+                    ev_stop_required = assets == {"ev"} and reason in {"ev_control_disabled", "ev_allocation_expired"}
+                    if ev_stop_required and "ev_power_limit_entity" not in ev_state:
+                        # Disabling control or expiring a charging lease requires
+                        # a safe stop even when the saved baseline was active.
                         ev_result = await ev_adapter.async_restore()
                     elif isinstance(ev_command_entity_id, str) and ev_command_entity_id:
                         ev_result = await ev_adapter.async_restore(
@@ -1342,11 +1444,13 @@ class Executor:
                 else:
                     results.append(ev_result)
                     reasons.append(ev_result.reason)
+                    if _ev_result_proves_safe(ev_result):
+                        await self._async_end_ev_exposure()
                     if ev_result.applied:
                         remaining_ownership.pop("ev_smart_charging_state", None)
                         remaining_ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
                         remaining_ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
-                        if not ev_control_disabled and _restored_ev_baseline_is_active(ev_state):
+                        if not ev_stop_required and _restored_ev_baseline_is_active(ev_state):
                             self._retain_external_ev_grid_reservation()
                         else:
                             self._release_ev_grid_reservation()
@@ -1574,6 +1678,8 @@ class Executor:
     def _rate_limit_reason(self, action: ControlAction, now: datetime) -> str | None:
         """Return a rejection reason when an action is inside the command cooldown."""
         cooldown_seconds = int(self.options.get(CONF_COMMAND_RATE_LIMIT_SECONDS, 0) or 0)
+        if action.asset == ActionAsset.EV and action.desired_state.get("power_limit"):
+            cooldown_seconds = max(cooldown_seconds, 60)
         if cooldown_seconds <= 0:
             return None
         last_attempts = dict(self.store.data.get("command_rate_limits", {}))
@@ -1695,7 +1801,11 @@ class Executor:
         """Return a conflict reason when another automation appears to have changed planner-owned state."""
         if self.hass is None:
             return None
-        recent = _latest_applied_audit_for_asset(self.store.data.get("execution_audit"), action.asset, now)
+        persistent_power_control = bool(
+            action.asset == ActionAsset.EV and self.entry_data.get("ev_power_limit_entity")
+            and self.store.data.get("ownership", {}).get("ev_smart_charging_state"))
+        recent = _latest_applied_audit_for_asset(
+            self.store.data.get("execution_audit"), action.asset, now, persistent=persistent_power_control)
         if recent is None:
             return None
         target = (
@@ -1707,6 +1817,14 @@ class Executor:
         if not entity_id:
             return None
         post_state = dict(recent.get("post_state", {}))
+        if action.asset == ActionAsset.EV and _ev_action_wants_power(action):
+            power_id = self.entry_data.get("ev_power_limit_entity")
+            expected_power = post_state.get("ev_power_limit_entity")
+            actual_power = self.hass.states.get(power_id) if power_id else None
+            if (expected_power is not None and actual_power is not None
+                    and finite(actual_power.state) != finite(expected_power)):
+                return "external_ev_power_limit_conflict"
+
         if action.asset == ActionAsset.ENPHASE:
             state = self.hass.states.get(entity_id)
             if state is None:
@@ -2036,7 +2154,26 @@ class Executor:
         if reservations is None or not self.entry_id:
             return None, None
         self._discard_stale_ev_grid_reservations(reservations)
-        return reserve_ev_grid_capacity(reservations, self.entry_id, action, context, now, self.options)
+        if _ev_action_wants_power(action) and reservations.get(self.entry_id, {}).get("pending_power_limit"):
+            self.sync_ev_grid_reservation()
+        pending = reservations.get(self.entry_id, {}).get("pending_power_limit")
+        result = reserve_ev_grid_capacity(reservations, self.entry_id, action, context, now, self.options)
+        if pending and self.entry_id in reservations:
+            reservations[self.entry_id]["pending_power_limit"] = pending
+        return result
+
+    async def _async_end_ev_exposure(self) -> None:
+        if callable(self.ev_allocation_deadline_callback):
+            self.ev_allocation_deadline_callback(None)
+        telemetry = self.store.data.get("ev_telemetry", {})
+        if telemetry.get("command_exposure"):
+            telemetry = settle_spending(telemetry, dt_util.utcnow())
+            telemetry.pop("command_exposure", None)
+            # The preceding sample is no longer an unmetered billing exposure.
+            # Keep the physical reservation independent for unresolved recovery.
+            if isinstance(last_sample := telemetry.get("last_sample"), dict):
+                telemetry["last_sample"] = {**last_sample, "reserved_kw": 0}
+            await self.store.async_save_ev_telemetry(telemetry)
 
     def _reconcile_ev_grid_reservation(
         self,
@@ -2048,6 +2185,25 @@ class Executor:
         wants_power = _ev_action_wants_power(action)
         rollback_succeeded = getattr(result, "rollback_succeeded", None) is True
         command_sent = bool(getattr(result, "command_sent", False))
+        confirmed_power = _positive_float(getattr(result, "post_state", {}).get("confirmed_power_kw"))
+        pending = getattr(result, "post_state", {}).get("pending_power_limit")
+        reservations = self._ev_grid_reservations()
+        if (wants_power and result.applied and isinstance(pending, dict)
+                and reservations is not None and self.entry_id in reservations):
+            reservation = reservations[self.entry_id]
+            previous_pending = (previous_reservation or {}).get("pending_power_limit", {})
+            # A no-op must not move the original confirmation boundary forward.
+            reservation["pending_power_limit"] = previous_pending if (
+                isinstance(previous_pending, dict)
+                and all(previous_pending.get(key) == pending.get(key)
+                        for key in ("entity_id", "value", "unit", "physical_power_kw"))
+            ) else pending
+        if wants_power and result.applied and confirmed_power > 0:
+            reservations = self._ev_grid_reservations()
+            if reservations is not None and self.entry_id and self.entry_id in reservations:
+                reservations[self.entry_id]["load_kw"] = confirmed_power
+                reservations[self.entry_id]["confirmed_power_limit"] = True
+                reservations[self.entry_id].pop("pending_power_limit", None)
         if wants_power and not result.applied:
             if rollback_succeeded:
                 self._release_ev_grid_reservation()
@@ -2109,10 +2265,30 @@ class Executor:
         reservation = reservations.get(self.entry_id)
         if not isinstance(reservation, dict):
             return
-        reservation["load_kw"] = max(
-            _positive_float(reservation.get("load_kw")),
-            _positive_float(self.options.get(CONF_EV_CHARGE_RATE_KW)),
-        )
+        limit_id = self.entry_data.get("ev_power_limit_entity")
+        capability = power_capability(self.hass.states.get(limit_id), self.options) if self.hass and limit_id else None
+        pending = reservation.get("pending_power_limit", {})
+        power_id = self.entry_data.get("ev_power_entity")
+        power_state = self.hass.states.get(power_id) if self.hass and power_id else None
+        observed, reported = measured(power_state, dt_util.utcnow(), "power"), reported_at(power_state)
+        command_at = timestamp(pending.get("at")) if isinstance(pending, dict) else None
+        if (capability is not None and command_at is not None and reported is not None and reported >= command_at
+                and pending.get("version") == 1 and pending.get("entity_id") == limit_id
+                and pending.get("unit") == capability.unit and finite(pending.get("value")) == capability.current
+                and finite(pending.get("physical_power_kw")) == capability.current * capability.kw_per_unit
+                and observed is not None and observed <= capability.current * capability.kw_per_unit + .01):
+            reservation["load_kw"] = capability.current * capability.kw_per_unit
+            reservation["confirmed_power_limit"] = True
+            reservation.pop("pending_power_limit", None)
+        still_confirmed = bool(reservation.get("confirmed_power_limit") and capability is not None
+                               and capability.current * capability.kw_per_unit
+                               <= _positive_float(reservation.get("load_kw")))
+        if not still_confirmed:
+            reservation["load_kw"] = max(
+                _positive_float(reservation.get("load_kw")),
+                _positive_float(self.options.get(CONF_EV_CHARGE_RATE_KW)),
+                capability.current * capability.kw_per_unit if capability is not None else 0,
+            )
         reservation["limit_kw"] = _positive_float(self.options.get(CONF_GRID_IMPORT_LIMIT_KW))
 
     async def async_persist_ev_grid_reservation(self) -> None:
@@ -2160,6 +2336,18 @@ class Executor:
     ) -> bool:
         """Persist actuator identity before an EV start crosses the service boundary."""
         ownership = dict(self.store.data.get("ownership", {}))
+        if action.desired_state.get("power_limit"):
+            number_id = ev_entry_data.get("ev_power_limit_entity")
+            number_state = self.hass.states.get(number_id) if number_id and self.hass is not None else None
+            original = dict(ownership.get("ev_smart_charging_state", {}))
+            if number_state is not None and "ev_power_limit_entity" not in original:
+                original["ev_power_limit_entity"] = number_state.state
+                original["ev_power_limit_unit"] = number_state.attributes.get("unit_of_measurement")
+                original["ev_power_ownership_version"] = 1
+                ownership["ev_smart_charging_state"] = original
+                ownership[_EV_COMMAND_ENTITY_OWNERSHIP_KEY] = _ev_command_entity_for_action(action, ev_entry_data)
+                ownership[_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY] = _ev_control_topology(ev_entry_data)
+                await self.store.async_save_ownership(ownership)
         if ownership.get("ev_smart_charging_state"):
             return False
         command_entity_id = _ev_command_entity_for_action(action, ev_entry_data)
@@ -2430,6 +2618,8 @@ def _normalized_ev_stop_result(
     require_safe: bool,
 ) -> EVCommandResult:
     """Normalize manual-stop success when a safe state is authoritative."""
+    if result.reason in {"ev_power_limit_restore_failed", "ev_power_limit_unit_changed"}:
+        return result
     safe_state_confirmed = _ev_result_proves_safe(result)
     raw_applied = result.applied
     applied = safe_state_confirmed if require_safe else raw_applied or safe_state_confirmed
@@ -2542,18 +2732,20 @@ def _entity_id_from_service_target(target: str | None) -> str | None:
     return text if "." in text else None
 
 
-def _latest_applied_audit_for_asset(audit: Any, asset: ActionAsset, now: datetime) -> dict[str, Any] | None:
+def _latest_applied_audit_for_asset(
+    audit: Any, asset: ActionAsset, now: datetime, *, persistent: bool = False
+) -> dict[str, Any] | None:
     """Return the latest recent applied audit row for an asset."""
     if not isinstance(audit, list):
         return None
-    cutoff = now - CONFLICT_DETECTION_WINDOW
+    cutoff = None if persistent else now - CONFLICT_DETECTION_WINDOW
     for item in reversed(audit):
         if not isinstance(item, dict) or item.get("asset") != str(asset):
             continue
         if item.get("result") != str(OutcomeResult.APPLIED):
             continue
         attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
-        if attempted_at is None or attempted_at < cutoff:
+        if attempted_at is None or (cutoff is not None and attempted_at < cutoff):
             continue
         return item
     return None
