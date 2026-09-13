@@ -1,0 +1,29 @@
+{
+  "kind": "climate_inputs",
+  "name": "synthetic_climate_optional_input_contract",
+  "now": "2026-09-13T12:00:00+00:00",
+  "end": "2026-09-13T13:00:00+00:00",
+  "data": {
+    "hvac_humidity_entity": "sensor.indoor_humidity",
+    "hvac_arrival_entity": "sensor.expected_arrival"
+  },
+  "states": {
+    "sensor.indoor_humidity": {
+      "state": "55",
+      "attributes": {
+        "unit_of_measurement": "%"
+      },
+      "last_updated": "2026-09-13T12:00:00+00:00"
+    },
+    "sensor.expected_arrival": {
+      "state": "2026-09-13T12:30:00+00:00",
+      "attributes": {},
+      "last_updated": "2026-09-13T12:00:00+00:00"
+    }
+  },
+  "expected": {
+    "humidity": 55.0,
+    "arrival": "2026-09-13T12:30:00+00:00",
+    "load_excludes_hvac": false
+  }
+}

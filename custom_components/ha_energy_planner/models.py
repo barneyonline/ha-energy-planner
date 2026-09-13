@@ -151,6 +151,9 @@ class DecisionContext:
     forecast_confidence_by_source: dict[str, float] = field(default_factory=dict)
     local_timezone: str = "UTC"
     daylight_windows: list[DaylightWindow] = field(default_factory=list)
+    climate_inputs: dict[str, Any] = field(default_factory=dict)
+    climate_engine: dict[str, Any] = field(default_factory=dict)
+    climate_decision: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

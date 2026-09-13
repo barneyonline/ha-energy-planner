@@ -911,3 +911,31 @@ use throughout; the Docker and pull-request gates enforce that result.
 - `VehicleCalibration` learns separately from completed, continuously attributed local charging intervals. `training.py` excludes shared-charger Recorder history from vehicle calibration. Queued charging stop/resume and unavailable events discard pending learning even without an intervening refresh. Incomplete learning is discarded on restart or interrupted identity; completed per-car models persist.
 - Runtime profile deadlines are excluded from topology and production-evidence fingerprints; updates invalidate pending plans and replan without disarming household control. Charger-first setup accepts shared feedback without legacy vehicle mappings. Unmanaged charging retains conservative load projections, and confirmed unplug events release stale reservations even across rapid replug. Monotonic unplug generations ensure an older pending ownership write cannot consume a newer unplug boundary, including same-car reconnection. Percent-suffixed SOC uses the same normalization in session validation and calibration.
 - `tests/test_vehicles.py` exercises these regression paths plus BMW-style connection/location states, away charging, unknown/ambiguous identity, target loss, guest mode, unplug reset, reload, physical swaps, stale command tokens, storage isolation, profile configuration and UI entities. Full validation remains `scripts/docker-validate.sh`.
+## Economic climate planning
+
+The automatic climate policy collects ownership-tagged observations, validates a
+learned normal-operation baseline chronologically, and compares preconditioning
+with normal operation using the same EV allocation and site-energy model.
+Readiness never arms production control. Manual intervention, uncertain inputs,
+unsupported battery dispatch and failed restoration remain blocking conditions.
+
+Implementation evidence: `climate_inputs.py`, `climate_learning.py`,
+`climate_economics.py`, `climate_optimizer.py`, `climate_runtime.py` and the existing
+planner/executor transaction paths. Regression evidence is in
+`tests/test_climate_engine.py`; the complete Docker gate remains mandatory.
+See [Climate decision policy](climate-decisions.md) for settings, model limitations
+and the distinction between observed energy and estimated avoided cost.
+
+Climate review regressions additionally cover policy-switch restoration,
+arrival deadlines inside forecast slots, conservative terminal battery state,
+EV/grid capacity, per-room chronological validation, observation contamination,
+actual validation-window expiry and requalification, and interval-aligned energy
+comparisons. A bounded candidate set receives complete validation, with explicit failure when
+mandatory start/target coverage exceeds its budget; solar interpolation never extrapolates beyond forecast coverage.
+
+Further climate review coverage exercises exact persisted phase boundaries within
+new slots, candidate-order independence, paired demand uncertainty under negative
+tariffs, per-room arrival/recovery, zone activation prediction, observation-only
+legacy restoration, arrival beyond release, learned normal target selection and
+successful candidate selection on a covered 12-hour forecast. Normal-operation
+lookup uses the same 0.25°C grid in validation and runtime simulation.

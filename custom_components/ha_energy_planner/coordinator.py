@@ -51,6 +51,8 @@ from .advice_runtime import (
     _material_preview as _material_preview,
 )
 from .availability import AvailabilityIdentity, availability_details
+from .climate_learning import observe
+from .climate_runtime import update_readiness
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_AMBER_IMPORT_PRICE,
@@ -1029,6 +1031,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         if thermal_model_changed:
             await self.store.async_save_thermal_model(thermal_model)
+        climate_state = observe(dict(self.store.data.get("climate_engine", {})), context,
+                                int(options.get("hvac_min_cycle_minutes", 20)))
+        context.climate_engine = update_readiness(climate_state, climate_state.get("model", {}), context, options)
         preparation_ms = round((perf_counter() - preparation_started) * 1000, 3)
         planner = DryRunPlanner(
             options,
@@ -1040,6 +1045,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         planner_started = perf_counter()
         plan = await self.hass.async_add_executor_job(planner.create_plan, context)
         planner_ms = (perf_counter() - planner_started) * 1000
+        await self.store.async_save_climate_engine(context.climate_engine)
         persistence_started = perf_counter()
         violations = ConstraintValidator(options).validate_plan(context, plan)
         if violations:
@@ -1170,6 +1176,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._load_forecast_training_attempted, result.load_reason
             )
             async with self.store.async_delay_save():
+                if result.climate_model:
+                    state = dict(self.store.data.get("climate_engine", {}))
+                    if state.get("identity") == result.climate_model.get("identity"):
+                        state["model"] = result.climate_model
+                        await self.store.async_save_climate_engine(state)
                 if result.ev_changed:
                     await self.store.async_save_ev_charge_calibration(result.ev_model)
                 if result.load_changed:
@@ -2500,7 +2511,11 @@ def _updated_load_source_outage(
 def _configured_entity_ids(entry_data: dict[str, Any]) -> list[str]:
     """Return explicit decision-input entity IDs that may trigger replanning."""
     entity_ids: set[str] = vehicle_entity_ids(entry_data)
-    for key in _DECISION_INPUT_ENTITY_KEYS:
+    for mapping in entry_data.get("hvac_zone_mappings", {}).values():
+        if isinstance(mapping, dict):
+            entity_ids.update(value for value in mapping.values() if isinstance(value, str) and "." in value)
+    for key in (*_DECISION_INPUT_ENTITY_KEYS, "hvac_arrival_entity", "hvac_humidity_entity",
+                "hvac_irradiance_entity", "hvac_irradiance_forecast_entity"):
         for entity_id in _split_entity_values(entry_data.get(key)):
             entity_ids.add(entity_id)
     return sorted(entity_ids)
