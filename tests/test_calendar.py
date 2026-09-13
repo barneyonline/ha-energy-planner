@@ -434,3 +434,36 @@ def _coordinator(plan: EnergyPlan | None) -> SimpleNamespace:
         entry=SimpleNamespace(entry_id="entry-1"),
         hass=SimpleNamespace(),
     )
+
+
+def test_ev_calendar_includes_factual_readiness_and_physical_power():
+    now = datetime.now(UTC)
+    action = _action("ev", now, now + timedelta(minutes=5))
+    action.kind = ActionKind.EV_SCHEDULE
+    action.desired_state = {"allocated_slots": [{"valid_at": now.isoformat(), "charge_kw": 2}], "optimization": {
+        "strategy": "adaptive", "search_status": "valid_schedule", "readiness_margin_minutes": 30,
+        "physical_power_by_time": {now.isoformat(): 6}, "emergency_budget_remaining": 1,
+    }}
+    event = calendar_module._ev_charging_events(action, 5)[0]
+    assert "Physical limit: 6-6 kW; modelled average: 2 kW" in event.description
+    assert "Strategy: adaptive" in event.description
+    assert "Conservative readiness margin: 30 minutes" in event.description
+    assert "Emergency budget remaining: 1" in event.description
+    action.desired_state["optimization"]["readiness_margin_minutes"] = None
+    action.desired_state["optimization"]["physical_power_by_time"] = {}
+    assert "not established" in calendar_module._ev_charging_events(action, 5)[0].description
+
+
+def test_partial_ev_slot_calendar_uses_actual_duration_and_energy():
+    now = datetime.now(UTC)
+    action = _action("ev", now, now + timedelta(minutes=5))
+    action.kind = ActionKind.EV_SCHEDULE
+    item = {"valid_at": now.isoformat(), "charge_kw": 3, "interval_start": (now+timedelta(minutes=2)).isoformat(),
+            "interval_end": (now+timedelta(minutes=4)).isoformat(), "energy_kwh": 0.15}
+    action.desired_state = {"allocated_slots": [item]}
+    event = calendar_module._ev_charging_events(action, 5)[0]
+    assert event.start == now + timedelta(minutes=2)
+    assert event.end == now + timedelta(minutes=4)
+    assert "0.15 kWh" in event.description
+    item["energy_kwh"] = "invalid"
+    assert "0.25 kWh" in calendar_module._ev_charging_events(action, 5)[0].description

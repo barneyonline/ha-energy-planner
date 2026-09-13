@@ -33,6 +33,8 @@ Planning and control include:
 - Independent switches for climate, EV, and Enphase control, plus a guarded Automatic control switch.
 - Optional AI Task explanations that remain advisory and cannot call services or bypass constraints.
 
+EV planning includes capacity-aware slots, a soft readiness buffer, optional measured charging performance and number-entity power limits, battery opportunity-cost estimates, and guarded departure-priority spending. See [EV charging decisions](docs/ev-scheduling.md) for configuration, compatibility, and diagnostic evidence.
+
 Continuous EV charging compares the total energy cost of feasible charging
 windows, including solar opportunity cost and partial final slots. Configured
 carbon preferences, active-session continuity, and ready-by limits still apply.

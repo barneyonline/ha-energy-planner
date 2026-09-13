@@ -29,6 +29,7 @@ from custom_components.ha_energy_planner.const import (
     DOMAIN,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -178,11 +179,14 @@ def test_observation_sequences_regenerate_plans_and_execute_commands(tmp_path, m
         calls = _devices(hass)
         store = PlannerStore(hass, "runtime")
         executor = _executor(hass, store)
+        leases = []
+        executor.ev_allocation_deadline_callback = leases.append
         executor.options.update({
             "ev_charge_rate_kw": 6.0, "ev_soc_per_kwh": 10.0, "ev_continuous_charging": True,
             "ev_earliest_start": "None", "ev_low_price_charging_enabled": False,
             "command_rate_limit_seconds": 0, "max_daily_ev_actions": 50,
         })
+        executor.options.update(fixture.get("options", {}))
         _arm(store, executor)
         try:
             for index, step in enumerate(fixture["steps"]):
@@ -203,12 +207,18 @@ def test_observation_sequences_regenerate_plans_and_execute_commands(tmp_path, m
                     ]
                     if step.get("manual_stop") else [],
                 )
+                for slot, load in zip(context.slots, step.get("loads", []), strict=False):
+                    slot.baseline_load_forecast_upper_kw = load
                 plan = DryRunPlanner(executor.options).create_plan(context)
                 actions = [action for action in plan.actions if action.asset == ActionAsset.EV]
                 allocated = [slot for action in actions for slot in action.desired_state.get("allocated_slots", [])]
                 offsets = [int((datetime.fromisoformat(slot["valid_at"]) - now).total_seconds() / 60)
                            for slot in allocated]
                 assert offsets == step["offsets"], (fixture["name"], index)
+                if "expected_evidence" in step:
+                    evidence = actions[0].desired_state["optimization"]
+                    for key, value in step["expected_evidence"].items():
+                        assert evidence[key] == value
                 if "deadline" in step:
                     assert actions[0].desired_state["ready_by_utc"] == step["deadline"]
                     assert all(datetime.fromisoformat(slot["valid_at"]) < datetime.fromisoformat(step["deadline"])
@@ -408,4 +418,389 @@ def test_interrupted_command_recovers_from_disk_in_a_fresh_runtime(tmp_path: Pat
         finally:
             await hass.async_stop(force=True)
 
+    asyncio.run(run())
+
+
+def test_number_control_transaction_reserves_then_confirms_reduction_and_restores(tmp_path) -> None:
+    """Real HA services and disk state cover the complete number-control transaction."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+        hass.states.async_set("number.limit", 6, attrs)
+        hass.states.async_set("sensor.ev_power", 0, {"unit_of_measurement": "kW"})
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data.update({"ev_power_limit_entity": "number.limit", "ev_power_entity": "sensor.ev_power"})
+        executor.options.update({"ev_limit_min": 1, "ev_limit_max": 6, "command_rate_limit_seconds": 0})
+        _arm(store, executor)
+
+        async def limit(call):
+            # The original limit and conservative reservation must be durable
+            # before a service is allowed to mutate the charger.
+            assert store.data["ownership"]["ev_smart_charging_state"]["ev_power_limit_entity"] == "6"
+            if call.data["value"] == 3:
+                assert store.data["ev_grid_reservation"]["load_kw"] >= 3
+            calls.append(("number", "set_value", dict(call.data)))
+            hass.states.async_set("number.limit", call.data["value"], attrs)
+            hass.states.async_set("sensor.ev_power", call.data["value"], {"unit_of_measurement": "kW"})
+
+        hass.services.async_register("number", "set_value", limit)
+        plan, context = _command("ev")
+        plan.actions[0].desired_state.update({"projected_load_kw_now": 3, "power_limit": {
+            "entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3}})
+        context.slots[0].projected_ev_load_kw = 3
+        try:
+            await executor.async_evaluate(plan, context)
+            assert [service for _, service, _ in calls] == ["set_value", "turn_on"]
+            assert not await executor._async_save_provisional_ev_ownership(plan.actions[0], executor.entry_data)
+            assert store.data["ownership"]["ev_smart_charging_state"]["ev_power_limit_entity"] == "6"
+            assert store.data["ev_grid_reservation"]["load_kw"] == 3
+            executor.sync_ev_grid_reservation()
+            assert store.data["ev_grid_reservation"]["load_kw"] == 3
+            assert executor._rate_limit_reason(plan.actions[0], dt_util.utcnow()) == "device_command_rate_limited"
+            hass.states.async_set("number.limit", 4, attrs)
+            assert executor._observed_conflict_reason(
+                plan.actions[0], dt_util.utcnow()) == "external_ev_power_limit_conflict"
+            store.data["execution_audit"][-1]["attempted_at"] = (dt_util.utcnow()-timedelta(hours=1)).isoformat()
+            assert executor._observed_conflict_reason(
+                plan.actions[0], dt_util.utcnow()) == "external_ev_power_limit_conflict"
+            hass.states.async_set("number.limit", 3, attrs)
+            plan.actions[0].kind = ActionKind.EV_SCHEDULE
+            plan.plan_id = plan.actions[0].plan_id = "stop-plan"
+            plan.actions[0].action_id = "stop-command"
+            plan.actions[0].desired_state = {"charging_required_now": False}
+            store.data["ev_telemetry"] = {"version": 1, "command_exposure": {
+                "at": dt_util.utcnow().isoformat(), "cost_per_hour": 1}}
+            await executor.async_evaluate(plan, context)
+            assert calls[-2][1:] == ("turn_off", {"entity_id": "switch.charger"})
+            assert calls[-1][1] == "set_value"
+            assert hass.states.get("number.limit").state in {"6", "6.0"}
+            assert not store.data["ev_grid_reservation"]["active"]
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", [None, "no_timer", "budget", "price"])
+def test_premium_commands_require_durable_spending_and_timer(tmp_path, monkeypatch, failure) -> None:
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.options.update({"ev_price_limit_enabled": True, "ev_max_import_price": .2,
+                                "ev_price_policy": "departure_priority", "ev_emergency_price": .6,
+                                "ev_emergency_budget": .3, "command_rate_limit_seconds": 0})
+        leases = []
+        if failure != "no_timer":
+            executor.ev_allocation_deadline_callback = leases.append
+        if failure == "budget":
+            executor.options["ev_emergency_budget"] = .001
+        _arm(store, executor)
+        plan, context = _command("ev")
+        context.slots[0].import_price = .7 if failure == "price" else .4
+        try:
+            await executor.async_evaluate(plan, context)
+            if failure:
+                assert not calls
+                assert store.data["execution_audit"][-1]["result"] == "rejected"
+            else:
+                assert calls[-1][1] == "turn_on"
+                assert leases[-1] is not None
+                assert store.data["ev_telemetry"]["command_exposure"]["cost_per_hour"] > 0
+                checkpoint = PlannerStore(hass, "runtime")
+                await checkpoint.async_load()
+                assert checkpoint.data["ev_telemetry"] == store.data["ev_telemetry"]
+                later = dt_util.utcnow() + timedelta(minutes=1)
+                monkeypatch.setattr(dt_util, "utcnow", lambda: later)
+                result = await executor.async_restore_device_control("ev", "test_lease_expired")
+                assert result.result == OutcomeResult.RESTORED
+                assert leases[-1] is None
+                assert "command_exposure" not in store.data["ev_telemetry"]
+                assert store.data["ev_telemetry"]["emergency_spend"] > 0
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("premium,number_mapped,timer", [(False, True, True), (True, True, True),
+                                                       (True, False, False), (False, False, True)])
+def test_manual_ev_preserves_limits_and_durable_cost_authority(tmp_path, premium, number_mapped, timer):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        leases = []
+        if timer:
+            executor.ev_allocation_deadline_callback = leases.append
+        executor.options.update(ev_price_limit_enabled=premium, ev_max_import_price=0.1,
+                                ev_price_policy="departure_priority", ev_emergency_price=0.5, ev_emergency_budget=1)
+        if number_mapped:
+            attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+            hass.states.async_set("number.limit", 6, attrs)
+            hass.states.async_set("sensor.ev_power", 0, {"unit_of_measurement": "kW"})
+            executor.entry_data.update(ev_power_limit_entity="number.limit", ev_power_entity="sensor.ev_power")
+            executor.options.update(ev_limit_min=1, ev_limit_max=6)
+
+            async def limit(call):
+                hass.states.async_set("number.limit", call.data["value"], attrs)
+
+            hass.services.async_register("number", "set_value", limit)
+        _arm(store, executor)
+        _, context = _command("ev")
+        context.slots[0].import_price = 0.3 if premium else 0.1
+        try:
+            result = await executor.async_manual_ev_charging(True, context)
+            if premium and not timer:
+                assert result.reason == "ev_allocation_timer_unavailable"
+                assert not calls
+            else:
+                assert result.applied, result.reason
+                assert leases
+                if premium:
+                    assert store.data["ev_telemetry"]["command_exposure"]["cost_per_hour"] > 0
+                stopped = await executor.async_manual_ev_charging(False, context)
+                assert stopped.applied, stopped.reason
+                assert hass.states.get("switch.charger").state == "off"
+        finally:
+            await store.async_flush()
+
+    asyncio.run(run())
+
+
+def test_manual_start_below_minimum_physical_setpoint_is_rejected(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        hass.states.async_set("number.limit", 6, {"unit_of_measurement": "kW", "min": 5, "max": 6, "step": 1})
+        hass.states.async_set("sensor.power", 0, {"unit_of_measurement": "kW"})
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data.update(ev_power_limit_entity="number.limit", ev_power_entity="sensor.power")
+        executor.options.update(ev_limit_min=5, ev_limit_max=6, ev_charge_rate_kw=4)
+        _arm(store, executor)
+        _, context = _command("ev")
+        try:
+            result = await executor.async_manual_ev_charging(True, context)
+            assert result.reason == "ev_power_control_unavailable"
+            assert not calls
+        finally:
+            await store.async_flush()
+
+    asyncio.run(run())
+
+
+def test_confirmed_power_does_not_recreate_a_released_reservation(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        plan, _ = _command("ev")
+        executor._reconcile_ev_grid_reservation(plan.actions[0], SimpleNamespace(
+            applied=True, post_state={"confirmed_power_kw": 3}, command_sent=True), None)
+        assert executor._ev_grid_reservations() == {}
+
+    asyncio.run(run())
+
+
+def test_delayed_power_confirmation_releases_only_the_confirmed_reduction(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+        hass.states.async_set("number.limit", 6, attrs)
+        hass.states.async_set("sensor.ev_power", 6, {"unit_of_measurement": "kW"})
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data.update(ev_power_limit_entity="number.limit", ev_power_entity="sensor.ev_power")
+        executor.options.update(ev_limit_min=1, ev_limit_max=6, ev_charge_rate_kw=6, command_rate_limit_seconds=0)
+        _arm(store, executor)
+
+        async def limit(call):
+            hass.states.async_set("number.limit", call.data["value"], attrs)
+
+        hass.services.async_register("number", "set_value", limit)
+        plan, context = _command("ev")
+        plan.actions[0].desired_state.update(projected_load_kw_now=3, power_limit={
+            "entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3})
+        context.slots[0].projected_ev_load_kw = 3
+        executor._ev_grid_reservations()[executor.entry_id] = {"load_kw": 6, "limit_kw": 10}
+        try:
+            reason, previous = executor._reserve_ev_grid_capacity(plan.actions[0], context, dt_util.utcnow())
+            assert reason is None
+            adapter = EVChargerAdapter(hass, executor.entry_data, power_options=executor.options,
+                                       confirmation_timeout_seconds=0, confirmation_retries=0)
+            result = await adapter.async_execute(plan.actions[0])
+            assert result.applied
+            executor._reconcile_ev_grid_reservation(plan.actions[0], result, previous)
+            await executor.async_persist_ev_grid_reservation()
+            assert store.data["ev_grid_reservation"]["load_kw"] == 6
+            assert store.data["ev_grid_reservation"]["pending_power_limit"]["value"] == 3
+            executor.sync_ev_grid_reservation()
+            assert executor._ev_grid_reservations()[executor.entry_id]["load_kw"] == 6
+            original_boundary = store.data["ev_grid_reservation"]["pending_power_limit"]["at"]
+            reason, previous = executor._reserve_ev_grid_capacity(plan.actions[0], context, dt_util.utcnow())
+            assert reason is None
+            repeat = await adapter.async_execute(plan.actions[0])
+            executor._reconcile_ev_grid_reservation(plan.actions[0], repeat, previous)
+            assert executor._ev_grid_reservations()[executor.entry_id]["pending_power_limit"]["at"] == original_boundary
+            hass.states.async_set("sensor.ev_power", 3, {"unit_of_measurement": "kW"})
+            executor.sync_ev_grid_reservation()
+            await executor.async_persist_ev_grid_reservation()
+            assert store.data["ev_grid_reservation"]["load_kw"] == 3
+            assert "pending_power_limit" not in store.data["ev_grid_reservation"]
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+def test_manual_stop_keeps_original_limit_after_restore_failure_and_restart(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+        hass.states.async_set("number.limit", 3, attrs)
+        hass.states.async_set("switch.charger", "on")
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data.update(ev_power_limit_entity="number.limit")
+        _arm(store, executor)
+        store.data["ownership"] = {"ev_smart_charging_state": {
+            "ev_power_limit_entity": "6", "ev_power_limit_unit": "kW", "ev_power_ownership_version": 1}}
+        fail = True
+
+        async def limit(call):
+            if fail:
+                raise RuntimeError("restoration failed")
+            hass.states.async_set("number.limit", call.data["value"], attrs)
+
+        hass.services.async_register("number", "set_value", limit)
+        _, context = _command("ev")
+        try:
+            result = await executor.async_manual_ev_charging(False, context)
+            assert not result.applied and result.reason == "ev_power_limit_restore_failed"
+            assert hass.states.get("switch.charger").state == "off"
+            await store.async_flush()
+            fresh = PlannerStore(hass, "runtime")
+            await fresh.async_load()
+            assert fresh.data["ownership"]["ev_smart_charging_state"]["ev_power_limit_entity"] == "6"
+            fail = False
+            executor.store = fresh
+            result = await executor.async_manual_ev_charging(False, context)
+            assert result.applied
+            assert hass.states.get("number.limit").state == "6.0"
+            assert "ev_smart_charging_state" not in fresh.data["ownership"]
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+def test_expired_ev_allocation_stops_a_previously_on_baseline(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("switch.charger", "on")
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "on"}}
+        store.data["ev_telemetry"] = {"version": 1, "command_exposure": {
+            "at": (dt_util.utcnow()-timedelta(minutes=5)).isoformat(), "cost_per_hour": 3}}
+        try:
+            await executor.async_restore_device_control("ev", "ev_allocation_expired")
+            assert hass.states.get("switch.charger").state == "off"
+            assert "command_exposure" not in store.data["ev_telemetry"]
+            assert "ev_smart_charging_state" not in store.data["ownership"]
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+def test_failed_limit_restoration_does_not_accrue_spending_after_confirmed_stop(tmp_path):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("switch.charger", "on")
+        hass.states.async_set("number.limit", 3, {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1})
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data["ev_power_limit_entity"] = "number.limit"
+        store.data["ownership"] = {"ev_smart_charging_state": {
+            "ev_power_limit_entity": "6", "ev_power_limit_unit": "kW"}}
+        store.data["ev_telemetry"] = {"version": 1, "command_exposure": {
+            "at": (dt_util.utcnow()-timedelta(minutes=5)).isoformat(), "cost_per_hour": 3}}
+
+        async def fail_limit(call):
+            raise RuntimeError("number offline")
+
+        hass.services.async_register("number", "set_value", fail_limit)
+        try:
+            await executor.async_restore_device_control("ev", "ev_allocation_expired")
+            assert hass.states.get("switch.charger").state == "off"
+            assert "command_exposure" not in store.data["ev_telemetry"]
+            assert store.data["ownership"]["ev_smart_charging_state"]["ev_power_limit_entity"] == "6"
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+def test_confirmed_stop_is_not_billed_again_on_the_next_telemetry_update(tmp_path):
+    from custom_components.ha_energy_planner.ev_telemetry import update_ev_telemetry
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("switch.charger", "on")
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        start = dt_util.utcnow() - timedelta(minutes=5)
+        sample = {"identity": [None]*5+[6, 1, 6, 250, 1], "at": start.isoformat(),
+                  "soc": 40, "connected": True, "charging": True, "reserved_kw": 6,
+                  "price": 0.4, "normal_ceiling": 0.2}
+        store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
+        store.data["ev_telemetry"] = {"version": 1, "identity": sample["identity"], "last_sample": sample,
+                                    "command_exposure": {"at": start.isoformat(), "cost_per_hour": 1.2}}
+        try:
+            await executor.async_restore_device_control("ev", "ev_allocation_expired")
+            settled = store.data["ev_telemetry"]["emergency_spend"]
+            record = update_ev_telemetry(store.data["ev_telemetry"],
+                {**sample, "at": (start+timedelta(minutes=10)).isoformat(), "charging": False}, reserved_kw=6)
+            assert record["emergency_spend"] == settled
+            record = update_ev_telemetry(record,
+                {**sample, "at": (start+timedelta(minutes=15)).isoformat(), "charging": False}, reserved_kw=6)
+            assert record["emergency_spend"] == settled
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("unplugged", [False, True])
+def test_vehicle_policy_release_closes_old_spending_and_resets_only_on_unplug(tmp_path, unplugged):
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        store.data["ev_telemetry"] = {"version": 1, "emergency_spend": 0.5, "budget_uncertain": True,
+            "pending": {"aggregate": {"energy": 1}}, "last_sample": {"reserved_kw": 7},
+            "command_exposure": {"at": dt_util.utcnow().isoformat(), "cost_per_hour": 1}}
+        deadlines = []
+        executor.ev_allocation_deadline_callback = deadlines.append
+        try:
+            await executor.async_release_ev_policy(unplugged=unplugged)
+            assert deadlines == [None]
+            assert not calls
+            telemetry = store.data["ev_telemetry"]
+            assert "command_exposure" not in telemetry
+            if unplugged:
+                assert telemetry["emergency_spend"] == 0
+                assert "budget_uncertain" not in telemetry
+                assert not telemetry["pending"]
+                assert "last_sample" not in telemetry
+            else:
+                assert telemetry["emergency_spend"] >= 0.5
+                assert telemetry["budget_uncertain"]
+        finally:
+            await hass.async_stop()
     asyncio.run(run())

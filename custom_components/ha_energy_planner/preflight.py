@@ -36,6 +36,7 @@ from .const import (
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
+from .ev_policy import EV_DEFAULTS
 from .load_forecast import FORECAST_CONTRACT_VERSION
 from .planner import confidence_eligible_control_areas
 from .safety import (
@@ -590,7 +591,8 @@ def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[st
         "details": {area: {"configured": True} for area in configured},
         "entry_data": {key: entry_data[key] for key in sorted(entry_data) if key not in _EVIDENCE_ENTRY_EXCLUSIONS},
         "load_forecast_contract_version": FORECAST_CONTRACT_VERSION,
-        "options": {key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS},
+        "options": {key: options[key] for key in sorted(options) if key not in _EVIDENCE_OPTION_EXCLUSIONS
+                    and not (key in EV_DEFAULTS and options[key] == EV_DEFAULTS[key])},
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()

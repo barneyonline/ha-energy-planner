@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .ev_policy import EV_DEFAULTS
+
 DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"
 LEGACY_INTEGRATION_NAME = f"HA {INTEGRATION_NAME}"
@@ -222,3 +224,7 @@ ATTR_CONFIG_ENTRY_ID = "config_entry_id"
 STATE_UNKNOWN_VALUES = {"unknown", "unavailable", None}
 EV_RESERVATION_RETAIN_WHEN_UNLOADED = "retain_when_unloaded"
 EV_RESERVATION_EXTERNAL_BASELINE = "external_baseline"
+
+# Optional EV policies preserve legacy booleans and hard ceilings on upgrade.
+
+DEFAULT_OPTIONS.update(EV_DEFAULTS)

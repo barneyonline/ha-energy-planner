@@ -95,6 +95,14 @@ def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
         if actual != fixture["expected"]:
             raise ValueError(f"Climate fixture mismatch: {actual}")
         return {"kind": kind, "name": fixture["name"], "ok": True, "actual": actual}
+    if kind == "ev_power_control":
+        from custom_components.ha_energy_planner.ev_policy import power_capability
+
+        capability = power_capability(SimpleNamespace(**fixture["number_state"]), fixture["options"])
+        power = capability.power(float(fixture["headroom_kw"])) if capability else None
+        if power != fixture["expected_power_kw"]:
+            raise ValueError("EV number capability does not match the expected safe setpoint")
+        return {"power_kw": power}
     if kind == "forecast_state":
         return _validate_forecast_fixture(fixture)
     raise ValueError(f"Unsupported fixture kind: {kind!r}")

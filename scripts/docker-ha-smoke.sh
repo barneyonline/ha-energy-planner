@@ -227,6 +227,47 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                     await coordinator.async_refresh()
                     await asyncio.sleep(0.05)
 
+    async def assert_ev_power_control(call: ServiceCall) -> None:
+        """Exercise a real HA number service, feedback, and safe limit restoration."""
+        from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
+        from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, PlanAction
+
+        limit_id = "number.smoke_ev_limit"
+        power_id = "sensor.smoke_ev_power"
+        attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+        hass.states.async_set(limit_id, 6, attrs)
+        hass.states.async_set(power_id, 0, {"unit_of_measurement": "kW"})
+
+        async def set_limit(command: ServiceCall) -> None:
+            assert command.data["entity_id"] == limit_id
+            hass.states.async_set(limit_id, command.data["value"], attrs)
+            hass.states.async_set(power_id, command.data["value"], {"unit_of_measurement": "kW"})
+
+        hass.services.async_register("number", "set_value", set_limit)
+        adapter = EVChargerAdapter(hass, {
+            "ev_charger_entity": "input_boolean.ev_power_smoke_charger",
+            "ev_charging_entity": "input_boolean.ev_power_smoke_charger",
+            "ev_power_limit_entity": limit_id, "ev_power_entity": power_id,
+        }, power_options={"ev_limit_min": 1, "ev_limit_max": 6}, confirmation_timeout_seconds=2)
+        now = dt_util.utcnow()
+        action = PlanAction("power-smoke", "power-smoke", now, now+timedelta(minutes=5),
+            ActionAsset.EV, ActionKind.EV_SCHEDULE, {"charging_required_now": True,
+            "power_limit": {"entity_id": limit_id, "unit": "kW", "value": 3, "physical_power_kw": 3}},
+            [], [], 0, 1)
+        result = await adapter.async_execute(action)
+        assert result.applied and hass.states.get(limit_id).state in {"3", "3.0"}
+        from custom_components.ha_energy_planner.storage import PlannerStore
+
+        store = PlannerStore(hass, "smoke_ev_power")
+        await store.async_save_ownership({"ev_smart_charging_state": result.pre_state})
+        await store.async_flush()
+        reloaded = PlannerStore(hass, "smoke_ev_power")
+        await reloaded.async_load()
+        restored = await adapter.async_restore(reloaded.data["ownership"]["ev_smart_charging_state"])
+        assert restored.applied and hass.states.get(limit_id).state in {"6", "6.0"}
+        assert hass.states.get("input_boolean.ev_power_smoke_charger").state == "off"
+        Path(hass.config.config_dir, ".ev_power_smoke_complete").touch()
+
     async def mark_smoke_complete(call: ServiceCall) -> None:
         """Write a completion marker before Home Assistant shuts down."""
         Path(hass.config.config_dir, ".ha_energy_planner_smoke_complete").touch()
@@ -285,6 +326,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "wait_for_manual_override_clear", wait_for_manual_override_clear)
     hass.services.async_register(DOMAIN, "wait_for_hvac_away_off", wait_for_hvac_away_off)
     hass.services.async_register(DOMAIN, "mark_smoke_complete", mark_smoke_complete)
+    hass.services.async_register(DOMAIN, "assert_ev_power_control", assert_ev_power_control)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -370,6 +412,9 @@ input_number:
     initial: 1.7
 
 input_boolean:
+  ev_power_smoke_charger:
+    name: Isolated EV power smoke charger
+    initial: false
   climate_manual_override:
     name: Climate manual override
   climate_change_from_scheduler:
@@ -544,6 +589,7 @@ automation:
         continue_on_timeout: false
       # Explicit arming must not turn a persisted request into apparent command
       # authority before the current plan and reviewed evidence are healthy.
+      - action: fake_planner_test.assert_ev_power_control
       - action: fake_planner_test.assert_unsafe_arm_rejected
       - condition: state
         entity_id: binary_sensor.energy_planner_armed
@@ -1631,5 +1677,10 @@ if diagnostics_response_state != "1.0":
 
 print("HA Energy Planner entity/service storage assertions passed")
 PY
+
+if [[ ! -f "$TMP_DIR/.ev_power_smoke_complete" ]]; then
+  echo "EV number-control smoke did not complete" >&2
+  exit 1
+fi
 
 echo "HA Energy Planner Docker smoke test passed"
