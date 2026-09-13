@@ -36,6 +36,7 @@ _DICT_FIELDS = {
     "control_pause",
     "production",
     "thermal_model",
+    "climate_engine",
 }
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
@@ -239,6 +240,10 @@ class PlannerStore:
         """Persist compact HVAC thermal model state."""
         await self._async_set_if_changed("thermal_model", thermal_model)
 
+    async def async_save_climate_engine(self, state: dict[str, Any]) -> None:
+        """Durably save provenance and decision authority before execution."""
+        await self._async_set_if_changed("climate_engine", state)
+
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         """Persist planner ownership state."""
         await self._async_set_if_changed("ownership", ownership)
@@ -338,6 +343,7 @@ def _default_data() -> dict[str, Any]:
         "production": {},
         "control_pause": {},
         "thermal_model": {},
+        "climate_engine": {},
         "ai_recommendations": [],
         "ai_last_attempt": {},
     }

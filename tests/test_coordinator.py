@@ -812,6 +812,9 @@ class FakeStore:
     async def async_save_load_source_outage(self, outage: dict[str, object]) -> None:
         self.data["load_source_outage"] = outage
 
+    async def async_save_climate_engine(self, state: dict[str, object]) -> None:
+        self.data["climate_engine"] = state
+
     async def async_save_thermal_model(self, thermal_model: dict[str, object]) -> None:
         self.thermal_models.append(thermal_model)
         self.data["thermal_model"] = thermal_model
@@ -4654,6 +4657,10 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object) -> N
         input_health=InputHealth.HEALTHY,
         input_issues=[],
         occupancy_state=OccupancyState.OCCUPIED,
+        climate_inputs={}, climate_engine={}, active_overrides=[],
+        current_hvac_temperature_c=None, current_outdoor_temperature_c=None,
+        current_hvac_power_kw=None, occupied_temperature_low_c=None,
+        occupied_temperature_high_c=None, current_hvac_mode=None,
     )
 
     class FakePlanner:
@@ -8339,3 +8346,26 @@ def test_runtime_outage_warns_while_another_input_is_still_starting(
     assert len(caplog.records) == 1
     assert caplog.records[0].levelno == logging.WARNING
     assert "sensor.house" in caplog.records[0].message
+
+
+def test_climate_training_publication_and_nested_input_listeners() -> None:
+    from custom_components.ha_energy_planner.training import TrainingResult
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._planner_lock = asyncio.Lock()
+    coordinator._tearing_down = False
+    coordinator._load_forecast_training_attempted = False
+    request = coordinator._training_request()
+    identity = request.climate_state['identity']
+    coordinator.store.data['climate_engine'] = {'identity': identity}
+    request = coordinator._training_request()
+    result = TrainingResult({}, {}, False, False, 'unchanged', 'unchanged', {'identity': identity})
+    async def run() -> None:
+        await coordinator._async_publish_training(0, request, result)
+        assert coordinator.store.data['climate_engine']['model'] == {'identity': identity}
+        mismatched = TrainingResult({}, {}, False, False, 'unchanged', 'unchanged', {'identity': 'other'})
+        await coordinator._async_publish_training(0, request, mismatched)
+        assert coordinator.store.data['climate_engine']['model'] == {'identity': identity}
+    asyncio.run(run())
+    values = coordinator_module._configured_entity_ids({'hvac_zone_mappings': {
+        'climate.room': {'temperature': 'sensor.room', 'maximum_humidity': 60}, 'invalid': None}})
+    assert values == ['sensor.room']

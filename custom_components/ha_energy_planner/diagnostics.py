@@ -171,6 +171,8 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         "built_in_load_forecast": _load_forecast_summary(store_data.get("built_in_load_forecast", {})),
         "load_source_outage": store_data.get("load_source_outage", {}),
         "thermal_model": store_data.get("thermal_model", {}),
+        "climate_engine": {key: value for key, value in store_data.get("climate_engine", {}).items()
+                           if key not in {"observations", "model"}},
     }
 
 

@@ -171,6 +171,7 @@ rules:
     references:
       docs:
         - README.md
+        - docs/climate-decisions.md
         - docs/stable-release.md
         - docs/release-checklist.md
         - ha-energy-planner-spec.md
@@ -342,6 +343,7 @@ rules:
     comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, deferred-zone command-context recovery, PV unit-contract calibration migration, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent; branch evidence is published and per-module regressions are rejected. Runtime smoke installs a deterministic release package and upgrade tests preserve previous-release recovery evidence.
     references:
       tests:
+        - tests/test_climate_engine.py
         - tests/test_ha_runtime.py
         - tests/test_control_runtime.py
         - tests/fixtures/decision_replay/ev_reprice_override_recovery.json

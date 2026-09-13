@@ -91,6 +91,16 @@ CONF_HVAC_PRECONDITION_LEAD_MINUTES = "hvac_precondition_lead_minutes"
 CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA = "hvac_precondition_min_price_delta"
 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY = "hvac_precondition_configured_zones_only"
 CONF_HVAC_PRECONDITION_WHILE_AWAY = "hvac_precondition_while_away"
+CONF_HVAC_POLICY = "hvac_decision_policy"
+CONF_HVAC_MIN_SAVING = "hvac_minimum_saving"
+CONF_HVAC_OBSERVATION_CADENCE = "hvac_observation_cadence"
+CONF_HVAC_ARRIVAL = "hvac_arrival_entity"
+CONF_HVAC_HUMIDITY = "hvac_humidity_entity"
+CONF_HVAC_MAX_HUMIDITY = "hvac_maximum_humidity"
+CONF_HVAC_IRRADIANCE = "hvac_irradiance_entity"
+CONF_HVAC_IRRADIANCE_FORECAST = "hvac_irradiance_forecast_entity"
+CONF_HVAC_ZONE_MAPPINGS = "hvac_zone_mappings"
+CONF_HVAC_COP_TABLE = "hvac_cop_table"
 CONF_HVAC_MIN_CYCLE_MINUTES = "hvac_min_cycle_minutes"
 CONF_MANUAL_HVAC_OVERRIDE_MINUTES = "manual_hvac_override_minutes"
 CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES = "enphase_profile_min_hold_minutes"
@@ -151,6 +161,9 @@ DEFAULT_OPTIONS = {
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: 0.20,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False,
     CONF_HVAC_PRECONDITION_WHILE_AWAY: False,
+    CONF_HVAC_POLICY: "automatic",
+    CONF_HVAC_MIN_SAVING: 0.25,
+    CONF_HVAC_OBSERVATION_CADENCE: 10,
     CONF_HVAC_MIN_CYCLE_MINUTES: 20,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES: 120,
     CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES: 30,
