@@ -15,6 +15,7 @@ from custom_components.ha_energy_planner import (
     _async_rehydrate_all_ev_grid_reservations,
     _async_sync_planner_device,
     _async_update_listener,
+    _entry_topology_signature,
     _freeze_config_value,
     _non_negative_finite_float,
     _rehydrate_ev_grid_reservation,
@@ -315,6 +316,7 @@ class FakeRuntimeCoordinator:
     """Minimal runtime coordinator for update-listener tests."""
 
     def __init__(self) -> None:
+        self.entry_update_lock = asyncio.Lock()
         self.replan_count = 0
         self.options_update_count = 0
         self.prepare_reload_count = 0
@@ -328,6 +330,7 @@ class FakeRuntimeCoordinator:
 
     async def async_prepare_configuration_reload(self) -> None:
         self.prepare_reload_count += 1
+        self._configuration_reload_handoff = True
 
 
 def test_unload_restores_safe_state_without_refresh() -> None:
@@ -729,11 +732,78 @@ def test_subentry_update_listener_reloads_when_topology_changes() -> None:
     assert coordinator.prepare_reload_count == 1
 
 
+@pytest.mark.parametrize("change_during_reload", [False, True])
+def test_concurrent_entry_updates_do_not_reload_the_replacement_runtime(change_during_reload: bool) -> None:
+    """Data and options callbacks must share one recovery-preserving reload."""
+    async def run() -> None:
+        preparing = asyncio.Event()
+        finish_preparing = asyncio.Event()
+        coordinator = FakeRuntimeCoordinator()
+        entry = FakeEntry(runtime_data=coordinator)
+        coordinator.entry_topology_signature = _entry_topology_signature(entry)
+        entry.data = {"household_load_entity": "sensor.new_load"}
+
+        async def prepare() -> None:
+            coordinator.prepare_reload_count += 1
+            coordinator._configuration_reload_handoff = True
+            preparing.set()
+            await finish_preparing.wait()
+
+        coordinator.async_prepare_configuration_reload = prepare
+
+        class ReloadingConfigEntries(FakeConfigEntries):
+            def __init__(self) -> None:
+                super().__init__()
+                self.setup_lock = asyncio.Lock()
+                self.recovery_cancelled = False
+
+            async def async_reload(self, entry_id: str) -> None:
+                async with self.setup_lock:
+                    self.reloads.append(entry_id)
+                    self.recovery_cancelled |= not getattr(
+                        entry.runtime_data, "_configuration_reload_handoff", False
+                    )
+                    replacement = FakeRuntimeCoordinator()
+                    replacement.entry_topology_signature = _entry_topology_signature(entry)
+                    entry.runtime_data = replacement
+                    if change_during_reload and len(self.reloads) == 1:
+                        entry.data = {"household_load_entity": "sensor.latest_load"}
+                    await asyncio.sleep(0)
+
+        manager = ReloadingConfigEntries()
+        hass = FakeHass(manager)
+        data_update = asyncio.create_task(_async_update_listener(hass, entry))
+        await preparing.wait()
+        options_update = asyncio.create_task(_async_update_listener(hass, entry))
+        await asyncio.sleep(0)
+        finish_preparing.set()
+        await asyncio.gather(data_update, options_update)
+
+        assert manager.reloads == [entry.entry_id] * (2 if change_during_reload else 1)
+        assert not manager.recovery_cancelled
+        assert coordinator.prepare_reload_count == 1
+        assert entry.runtime_data.options_update_count == (0 if change_during_reload else 1)
+        assert entry.runtime_data.entry_topology_signature == _entry_topology_signature(entry)
+
+    asyncio.run(run())
+
+
+def test_update_listener_ignores_an_unloaded_entry() -> None:
+    entry = FakeEntry()
+    del entry.runtime_data
+    hass = FakeHass(FakeConfigEntries())
+
+    asyncio.run(_async_update_listener(hass, entry))
+
+    assert hass.config_entries.reloads == []
+
+
 def test_update_listener_supports_legacy_replan_runtime() -> None:
     class LegacyRuntime:
         entry_topology_signature = None
 
         def __init__(self) -> None:
+            self.entry_update_lock = asyncio.Lock()
             self.replan_count = 0
 
         async def async_request_replan(self) -> None:
