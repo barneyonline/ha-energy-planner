@@ -71,6 +71,8 @@ def test_disabled_entry_vehicle_options_survive_setup(tmp_path: Path, legacy: bo
                 submission = {"vehicle_id": original_ids[0]}
             else:
                 submission = dict(vehicles[2].data)
+            if action != "remove":
+                submission["advanced"] = {"ev_soc_per_kwh": submission.pop("ev_soc_per_kwh")}
             result = await hass.config_entries.options.async_configure(flow_id, submission)
             assert result["type"] == "create_entry"
             assert not entry.subentries

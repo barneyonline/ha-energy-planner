@@ -710,6 +710,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   superseded recovery warning. A failed configuration-reload platform unload
   resumes the disarmed recovery lifecycle on the still-loaded coordinator. A
   restarted disarmed recovery resumes with its counter reset.
+  Configuration callbacks serialize preparation and reload per coordinator,
+  then recheck the replacement runtime and latest topology. Separate data and
+  options writes from one settings save cannot queue a second unload that
+  cancels recovery. A genuine mapping change arriving during reload is still
+  applied with a fresh handoff. Real Home Assistant entry/platform regression
+  coverage in `tests/test_upgrade_runtime.py` verifies that recovery survives
+  separate data/options notifications; `tests/test_lifecycle.py` also covers
+  concurrent callbacks, later topology changes, and callbacks after unload.
   A production-evidence mismatch found while reconciling a previously armed
   startup follows the same disarmed recovery lifecycle, so migrations cannot
   leave automatic-control intent stranded without a background recovery task.
@@ -914,6 +922,8 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 
 ### Shared charger vehicle profiles
+
+- Planner settings expose shared charger power and charging policies; Vehicle settings own SOC, target SOC, ready-by, effective vehicle power and bootstrap efficiency. Vehicle power is an optional override capped at shared charger power; omitted overrides follow shared power changes. Existing overrides are preserved. Initial efficiency is in a collapsed Advanced calibration section and is stored flat for compatibility. The displayed hub schema also defines permitted writes. Profile-owned fields are excluded from hub form writes as well as display, preserving hidden legacy values even after the last profile is removed (`tests/test_vehicles.py`).
 
 - `vehicles.py`, `config_flow.py`, and `entry_data.py` provide repeatable vehicle profiles without flattening car telemetry into charger settings. `select.py` and `sensor.py` expose selection, resolved identity, and detection reasons. Required target SOC comes from a sensor only; ready-by and charging characteristics are per vehicle.
 - `coordinator.py` resolves home/port/charger evidence, listens to all vehicle entities, persists Manual selection across reloads and resets it on unplug. EV charging overrides are removed synchronously at a session boundary before the replacement vehicle’s planning context is built. Previously connected vehicle IDs are excluded from automatic reuse until port-disconnect evidence is observed, including across restart. Listener saves also persist port-only evidence changes, and queued unplug boundaries following unknown feedback reset the session. Queued saves read the current session to preserve newer selections. Ambiguous or unavailable evidence withholds EV commands while permitting unrelated household planning.

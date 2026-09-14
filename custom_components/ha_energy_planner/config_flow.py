@@ -828,12 +828,20 @@ class OptionsFlow(config_entries.OptionsFlow):
         """Show every input and policy group on one sectioned settings page."""
         errors: dict[str, str] = {}
         if user_input is not None:
+            settings_schema = self._settings_schema()
+            allowed_fields = {
+                marker.schema: _schema_field_names(group.schema)
+                for marker, group in settings_schema.schema.items()
+            }
             updated_data = dict(self._data)
             updated_options = {**DEFAULT_OPTIONS, **self._options}
             for step_id in _SETTINGS_SECTION_ORDER:
                 if step_id not in user_input:
                     continue
-                submitted = dict(user_input[step_id])
+                submitted = {
+                    key: value for key, value in user_input[step_id].items()
+                    if key in allowed_fields[step_id]
+                }
                 updated_options.update(
                     {
                         key: value
@@ -843,7 +851,7 @@ class OptionsFlow(config_entries.OptionsFlow):
                 )
                 for input_type in _SETTINGS_SECTION_INPUT_TYPES[step_id]:
                     data_schema = PLANNER_SUBENTRY_SCHEMAS[input_type]
-                    section_fields = _schema_field_names(data_schema)
+                    section_fields = _schema_field_names(data_schema) & allowed_fields[step_id]
                     if input_type == SUBENTRY_AI:
                         section_fields.add(CONF_AI_ADVISOR_SERVICE)
                     submitted_data = {
@@ -974,6 +982,14 @@ class OptionsFlow(config_entries.OptionsFlow):
             return self.async_abort(reason="vehicle_not_found")
         errors: dict[str, str] = {}
         if user_input is not None:
+            user_input = dict(user_input)
+            advanced = user_input.pop("advanced", {})
+            user_input[CONF_EV_SOC_PER_KWH] = advanced.get(
+                CONF_EV_SOC_PER_KWH,
+                user_input.get(CONF_EV_SOC_PER_KWH, (current or {}).get(
+                    CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
+                )),
+            )
             name = str(user_input.get("name", "")).strip()
             if not name or name in {AUTO, MANUAL} or any(
                 p["name"] == name and p != current for p in profiles
@@ -997,6 +1013,8 @@ class OptionsFlow(config_entries.OptionsFlow):
             try:
                 cv.time(user_input.get(CONF_DEFAULT_READY_BY))
                 for key in (CONF_EV_CHARGE_RATE_KW, CONF_EV_SOC_PER_KWH):
+                    if key == CONF_EV_CHARGE_RATE_KW and key not in user_input:
+                        continue
                     value = float(user_input.get(key, 0))
                     if not 0 < value <= (50 if key == CONF_EV_CHARGE_RATE_KW else 10):
                         raise ValueError
@@ -1013,9 +1031,14 @@ class OptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=dict(entry.options))
         defaults = dict(current) if current else {
             CONF_DEFAULT_READY_BY: "07:00",
-            CONF_EV_CHARGE_RATE_KW: DEFAULT_OPTIONS[CONF_EV_CHARGE_RATE_KW],
             CONF_EV_SOC_PER_KWH: DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
         }
+        suggested = dict(user_input if user_input is not None else defaults)
+        calibration = suggested.pop(CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH])
+        advanced_schema = self.add_suggested_values_to_schema(
+            vol.Schema({vol.Optional(CONF_EV_SOC_PER_KWH): _option_selector(CONF_EV_SOC_PER_KWH)}),
+            {CONF_EV_SOC_PER_KWH: calibration},
+        )
         schema = vol.Schema({
             vol.Required("name"): TextSelector(),
             vol.Required(PORT): _entity_selector(["sensor", "binary_sensor"]),
@@ -1023,14 +1046,23 @@ class OptionsFlow(config_entries.OptionsFlow):
             vol.Required(CONF_EV_SOC): _entity_selector("sensor"),
             vol.Required(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector("sensor"),
             vol.Required(CONF_DEFAULT_READY_BY): TextSelector(),
-            vol.Required(CONF_EV_CHARGE_RATE_KW): _option_selector(CONF_EV_CHARGE_RATE_KW),
-            vol.Required(CONF_EV_SOC_PER_KWH): _option_selector(CONF_EV_SOC_PER_KWH),
+            vol.Optional(CONF_EV_CHARGE_RATE_KW): _option_selector(CONF_EV_CHARGE_RATE_KW),
+            vol.Optional("advanced"): section(advanced_schema, SectionConfig(collapsed=True)),
         })
         return self.async_show_form(
             step_id="vehicle" if reconfigure else "add_vehicle",
-            data_schema=self.add_suggested_values_to_schema(schema, user_input or defaults),
+            data_schema=self.add_suggested_values_to_schema(schema, suggested),
             errors=errors,
         )
+
+    def _vehicle_managed_fields(self) -> frozenset[str]:
+        """Keep profile-owned settings out of both the hub form and its writes."""
+        if VEHICLES not in combined_entry_data(self._config_entry):
+            return frozenset()
+        return frozenset({
+            CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC,
+            CONF_EV_SOC_PER_KWH, CONF_DEFAULT_READY_BY,
+        })
 
     def _settings_schema(self) -> vol.Schema:
         """Return one form with collapsible sections for all settings."""
@@ -1046,11 +1078,11 @@ class OptionsFlow(config_entries.OptionsFlow):
                 schema_fields.update(_schema_field_names(data_schema))
             option_fields = _SETTINGS_SECTION_OPTION_FIELDS[step_id]
             nested_fields.update(_options_section_schema(options, option_fields).schema)
-            if VEHICLES in combined_entry_data(self._config_entry):
-                profile_fields = {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_EV_SOC_PER_KWH,
-                                  CONF_DEFAULT_READY_BY}
-                nested_fields = {marker: value for marker, value in nested_fields.items()
-                                 if str(getattr(marker, "schema", marker)) not in profile_fields}
+            profile_fields = self._vehicle_managed_fields()
+            nested_fields = {
+                marker: value for marker, value in nested_fields.items()
+                if str(getattr(marker, "schema", marker)) not in profile_fields
+            }
             current = {
                 key: value
                 for key, value in self._data.items()

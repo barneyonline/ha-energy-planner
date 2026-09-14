@@ -191,6 +191,7 @@ def make_coordinator(hass: Any, data: dict) -> EnergyPlannerCoordinator:
     coordinator._ev_auto_start_compensation_generation = 0
     coordinator._ev_auto_start_retry_cancel = None
     coordinator._command_lock = asyncio.Lock()
+    coordinator.entry_update_lock = asyncio.Lock()
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator.store = PlannerStore.__new__(PlannerStore)
@@ -440,7 +441,8 @@ def test_vehicle_flow_add_edit_and_validation(monkeypatch: Any) -> None:
     asyncio.run(run())
 
 
-def test_vehicle_runtime_refresh_swap_and_restart(tmp_path: Any, monkeypatch: Any) -> None:
+@pytest.mark.parametrize("inherit_power", [False, True])
+def test_vehicle_runtime_refresh_swap_and_restart(tmp_path: Any, monkeypatch: Any, inherit_power: bool) -> None:
     """Exercise real HA states/storage through coordinator context and execution."""
     from types import MappingProxyType
 
@@ -452,6 +454,9 @@ def test_vehicle_runtime_refresh_swap_and_restart(tmp_path: Any, monkeypatch: An
 
     async def run() -> None:
         fake, data = setup()
+        if inherit_power:
+            for vehicle in data[VEHICLES]:
+                vehicle.pop(CONF_EV_CHARGE_RATE_KW)
         hass = HomeAssistant(str(tmp_path))
         for entity, value in fake.states.values.items():
             hass.states.async_set(entity, value)
@@ -656,6 +661,53 @@ def test_vehicle_settings_hide_legacy_fields_and_require_charger_feedback() -> N
     session = VehicleSession()
     session.update(hass, data)
     assert session.options(DEFAULT_OPTIONS)[CONF_EV_CHARGE_RATE_KW] == 7
+
+
+@pytest.mark.parametrize("vehicle_mode", [False, True])
+def test_charger_settings_preserve_vehicle_owned_values(monkeypatch: Any, vehicle_mode: bool) -> None:
+    from custom_components.ha_energy_planner.config_flow import INPUT_STEP_EV, OptionsFlow
+
+    async def run() -> None:
+        hass, data = setup()
+        data.pop(VEHICLES)
+        data.update({CONF_EV_SOC: "sensor.a_soc", CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.a_target"})
+        if vehicle_mode:
+            # Mode remains enabled even after the last profile is removed.
+            data["ev_vehicle_mode"] = True
+        entry = SimpleNamespace(
+            data=data, options={CONF_DEFAULT_READY_BY: "06:00", CONF_EV_SOC_PER_KWH: 1.5},
+            subentries={}, entry_id="entry",
+        )
+        hass.config_entries = SimpleNamespace(async_update_entry=Mock(), async_entries=lambda *a: [])
+        flow = OptionsFlow(entry)
+        flow.hass = hass
+        monkeypatch.setattr(flow, "async_create_entry", lambda **kwargs: kwargs)
+        monkeypatch.setattr(flow, "async_show_form", lambda **kwargs: kwargs)
+        ev_section = next(
+            validator for marker, validator in flow._settings_schema().schema.items()
+            if marker.schema == INPUT_STEP_EV
+        )
+        names = {marker.schema for marker in ev_section.schema.schema}
+        owned = {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, CONF_DEFAULT_READY_BY, CONF_EV_SOC_PER_KWH}
+        assert bool(names & owned) is not vehicle_mode
+        assert CONF_EV_CHARGE_RATE_KW in names
+        submitted = {key: value for key, value in data.items() if key in names}
+        submitted.update({CONF_EV_CHARGE_RATE_KW: 11})
+        if vehicle_mode:
+            # Stale submissions cannot overwrite hidden profile-owned settings.
+            submitted.update({CONF_DEFAULT_READY_BY: "09:00", CONF_EV_SOC_PER_KWH: 3,
+                              CONF_EV_SOC: "sensor.missing"})
+        result = await flow.async_step_settings({INPUT_STEP_EV: submitted})
+        assert "errors" not in result
+        assert result["data"][CONF_EV_CHARGE_RATE_KW] == 11
+        assert result["data"][CONF_DEFAULT_READY_BY] == "06:00"
+        assert result["data"][CONF_EV_SOC_PER_KWH] == 1.5
+        saved = hass.config_entries.async_update_entry.call_args.kwargs["data"]
+        assert saved[CONF_EV_SOC] == "sensor.a_soc"
+        assert saved[CONF_EV_SMART_CHARGING_TARGET_SOC] == "sensor.a_target"
+        assert not hass.services.async_call.called
+
+    asyncio.run(run())
 
 
 def test_connection_outage_preserves_manual_until_confirmed_unplug() -> None:
@@ -1014,5 +1066,77 @@ def test_unplug_during_ownership_write_is_not_consumed_by_older_release(same_veh
         assert "entry" not in reservations
         assert coordinator.store.data["ev_grid_reservation"]["active"] is False
         assert not hass.services.async_call.called
+
+    asyncio.run(run())
+
+
+def test_vehicle_power_inheritance_follows_charger_changes() -> None:
+    hass, data = setup()
+    data[VEHICLES][0].pop(CONF_EV_CHARGE_RATE_KW)
+    session = VehicleSession()
+    session.update(hass, data)
+    for shared_power in (11, 3.6):
+        options = {**DEFAULT_OPTIONS, CONF_EV_CHARGE_RATE_KW: shared_power}
+        assert session.options(options)[CONF_EV_CHARGE_RATE_KW] == shared_power
+        session.profile[CONF_EV_CHARGE_RATE_KW] = 7
+        assert session.options(options)[CONF_EV_CHARGE_RATE_KW] == min(7, shared_power)
+        session.profile.pop(CONF_EV_CHARGE_RATE_KW)
+    session.selection = MANUAL
+    session.update(hass, data)
+    assert session.options(options)[CONF_EV_CHARGE_RATE_KW] == shared_power
+
+
+def test_inherited_power_calibration_requires_resolved_power() -> None:
+    hass, data = setup()
+    data[VEHICLES][0].pop(CONF_EV_CHARGE_RATE_KW)
+    session = VehicleSession()
+    session.update(hass, data)
+    learner = VehicleCalibration()
+    now = datetime(2026, 9, 14, tzinfo=UTC)
+    learner.pending = ("A", now, 20)
+    assert learner.observe(hass, session, data, {}, now) is None
+    assert learner.pending is None
+
+
+def test_vehicle_form_optional_power_and_advanced_calibration(monkeypatch: Any) -> None:
+    async def run() -> None:
+        hass, _ = setup()
+        entry = SimpleNamespace(data={CONF_EV_CONNECTED: "binary_sensor.plug"}, options={}, subentries={})
+        hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, **kwargs: setattr(entry, "data", kwargs["data"]),
+        )
+        flow = OptionsFlow(entry)
+        flow.hass = hass
+        monkeypatch.setattr(flow, "async_show_form", lambda **kwargs: kwargs)
+        monkeypatch.setattr(flow, "async_create_entry", lambda **kwargs: kwargs)
+        form = await flow.async_step_add_vehicle()
+        schema = form["data_schema"]
+        basic = {k: v for k, v in profile("A").items()
+                 if k not in {"id", CONF_EV_CHARGE_RATE_KW, CONF_EV_SOC_PER_KWH}}
+        # Validate the actual sectioned HA form, then exercise flat persistence.
+        await flow.async_step_add_vehicle(schema(basic))
+        assert CONF_EV_CHARGE_RATE_KW not in entry.data[VEHICLES][0]
+        assert entry.data[VEHICLES][0][CONF_EV_SOC_PER_KWH] == DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
+        existing = {**entry.data[VEHICLES][0], CONF_EV_CHARGE_RATE_KW: 5, CONF_EV_SOC_PER_KWH: 1.4}
+        entry.data[VEHICLES] = [existing]
+        flow._vehicle_id = existing["id"]
+        form = await flow.async_step_vehicle()
+        fields = {marker.schema: (marker, validator) for marker, validator in form["data_schema"].schema.items()}
+        assert CONF_EV_SOC_PER_KWH not in fields
+        assert fields[CONF_EV_CHARGE_RATE_KW][0].description["suggested_value"] == 5
+        calibration_fields = fields["advanced"][1].schema.schema
+        marker = next(iter(calibration_fields))
+        assert marker.description["suggested_value"] == 1.4
+        await flow.async_step_vehicle(form["data_schema"]({**basic, CONF_EV_CHARGE_RATE_KW: 5}))
+        assert entry.data[VEHICLES][0][CONF_EV_CHARGE_RATE_KW] == 5
+        assert entry.data[VEHICLES][0][CONF_EV_SOC_PER_KWH] == 1.4
+        await flow.async_step_vehicle(form["data_schema"]({
+            **basic, "advanced": {CONF_EV_SOC_PER_KWH: 1.8},
+        }))
+        assert CONF_EV_CHARGE_RATE_KW not in entry.data[VEHICLES][0]
+        assert "advanced" not in entry.data[VEHICLES][0]
+        assert entry.data[VEHICLES][0][CONF_EV_SOC_PER_KWH] == 1.8
+        invalid = await flow.async_step_vehicle({**basic, "advanced": {CONF_EV_SOC_PER_KWH: 0}})
+        assert invalid["errors"]["base"] == "invalid_vehicle_settings"
 
     asyncio.run(run())

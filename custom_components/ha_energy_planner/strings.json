@@ -66,7 +66,7 @@
               "battery_round_trip_efficiency_percent": "Battery round-trip efficiency (%)",
               "battery_max_charge_kw": "Battery maximum charge power (kW)",
               "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
-              "ev_charge_rate_kw": "EV charge rate (kW)",
+              "ev_charge_rate_kw": "Shared charger power (kW)",
               "ev_soc_per_kwh": "Bootstrap EV SOC gained per kWh",
               "ev_continuous_charging": "Prefer one continuous charging session",
               "ev_earliest_start": "Earliest charging start",
@@ -118,7 +118,7 @@
               "battery_round_trip_efficiency_percent": "Estimated battery round-trip efficiency used when valuing stored solar or tariff arbitrage.",
               "battery_max_charge_kw": "Maximum battery charge power used when estimating whether surplus solar can be absorbed.",
               "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
-              "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
+              "ev_charge_rate_kw": "Power available from the shared charger. Caps each tracked vehicle’s effective charging power and reserves load for Manual or unidentified charging. Also used for legacy single-vehicle schedule projections.",
               "ev_soc_per_kwh": "Conservative bootstrap estimate used until Recorder has enough completed charging history to learn the vehicle-specific percentage gained per kWh.",
               "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
               "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
@@ -276,8 +276,8 @@
             }
           },
           "ev_inputs": {
-            "name": "EV charging",
-            "description": "Configure EV inputs, charger controls, ready-by time, opportunistic and lowest-cost daylight charging, and charging policy.",
+            "name": "Charger and charging policy",
+            "description": "Configure shared charger inputs, controls, power and electricity-price policies. With vehicle profiles enabled, configure SOC, target SOC, ready-by and charging characteristics on each Vehicle.",
             "data": {
               "ev_soc_entity": "EV SOC sensor",
               "ev_charging_entity": "EV charging state entity",
@@ -291,7 +291,7 @@
               "battery_round_trip_efficiency_percent": "Battery round-trip efficiency (%)",
               "battery_max_charge_kw": "Battery maximum charge power (kW)",
               "battery_max_discharge_kw": "Battery maximum discharge power (kW)",
-              "ev_charge_rate_kw": "EV charge rate (kW)",
+              "ev_charge_rate_kw": "Shared charger power (kW)",
               "ev_soc_per_kwh": "Bootstrap EV SOC gained per kWh",
               "ev_continuous_charging": "Prefer one continuous charging session",
               "ev_earliest_start": "Earliest charging start",
@@ -337,7 +337,7 @@
               "battery_round_trip_efficiency_percent": "Estimated battery round-trip efficiency used when valuing stored solar or tariff arbitrage.",
               "battery_max_charge_kw": "Maximum battery charge power used when estimating whether surplus solar can be absorbed.",
               "battery_max_discharge_kw": "Maximum battery discharge power used when estimating whether stored energy can serve load or export.",
-              "ev_charge_rate_kw": "Assumed EV charging power used for schedule projections.",
+              "ev_charge_rate_kw": "Power available from the shared charger. Caps each tracked vehicle’s effective charging power and reserves load for Manual or unidentified charging. Also used for legacy single-vehicle schedule projections.",
               "ev_soc_per_kwh": "Conservative bootstrap estimate used until Recorder has enough completed charging history to learn the vehicle-specific percentage gained per kWh.",
               "ev_continuous_charging": "Choose the best continuous window to reduce charger cycling. Disable to select individual least-cost intervals.",
               "ev_earliest_start": "Local HH:MM time before which scheduled charging will not start, or None for no restriction.",
@@ -420,8 +420,23 @@
           "ev_soc_entity": "Vehicle SOC sensor",
           "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
           "default_ready_by": "Ready by",
-          "ev_charge_rate_kw": "Effective charging power (kW)",
-          "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          "ev_charge_rate_kw": "Vehicle charging power override (kW)"
+        },
+        "data_description": {
+          "ev_charge_rate_kw": "Leave blank to use Shared charger power from Energy Planner settings. Set an override if this vehicle charges more slowly. Planning uses the lower of the override and shared charger power.",
+          "default_ready_by": "Ready-by time for this vehicle only."
+        },
+        "sections": {
+          "advanced": {
+            "name": "Advanced calibration",
+            "description": "The planner learns charging efficiency separately for each vehicle. Change this initial estimate only if needed before enough charging history is available.",
+            "data": {
+              "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+            },
+            "data_description": {
+              "ev_soc_per_kwh": "Initial SOC gain estimate for this vehicle, used until enough completed charging intervals have been learned."
+            }
+          }
         }
       },
       "vehicle": {
@@ -434,8 +449,23 @@
           "ev_soc_entity": "Vehicle SOC sensor",
           "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
           "default_ready_by": "Ready by",
-          "ev_charge_rate_kw": "Effective charging power (kW)",
-          "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+          "ev_charge_rate_kw": "Vehicle charging power override (kW)"
+        },
+        "data_description": {
+          "ev_charge_rate_kw": "Leave blank to use Shared charger power from Energy Planner settings. Set an override if this vehicle charges more slowly. Planning uses the lower of the override and shared charger power.",
+          "default_ready_by": "Ready-by time for this vehicle only."
+        },
+        "sections": {
+          "advanced": {
+            "name": "Advanced calibration",
+            "description": "The planner learns charging efficiency separately for each vehicle. Change this initial estimate only if needed before enough charging history is available.",
+            "data": {
+              "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+            },
+            "data_description": {
+              "ev_soc_per_kwh": "Initial SOC gain estimate for this vehicle, used until enough completed charging intervals have been learned."
+            }
+          }
         }
       },
       "edit_vehicle": {

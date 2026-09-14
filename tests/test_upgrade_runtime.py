@@ -18,7 +18,7 @@ from homeassistant.helpers import entity_registry as er
 
 from custom_components.ha_energy_planner import async_migrate_entry
 from custom_components.ha_energy_planner.config_flow import ConfigFlow
-from custom_components.ha_energy_planner.const import CONF_EV_SMART_CHARGING_TARGET_SOC, DOMAIN
+from custom_components.ha_energy_planner.const import CONF_EV_SMART_CHARGING_TARGET_SOC, DEFAULT_OPTIONS, DOMAIN
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -123,6 +123,62 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
             await hass.async_stop(force=True)
     asyncio.run(lifetime())
     asyncio.run(lifetime(restart=True))
+
+
+def test_separate_data_and_options_writes_preserve_reload_recovery(tmp_path: Path) -> None:
+    """Exercise real HA callbacks, reload locking, platforms and persisted recovery."""
+    shutil.copytree(ROOT / "custom_components/ha_energy_planner", tmp_path / "custom_components/ha_energy_planner")
+
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        loader.async_setup(hass)
+        hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
+        dr.async_setup(hass)
+        await dr.async_load(hass)
+        await er.async_load(hass)
+        hass.auth = await auth.auth_manager_from_config(hass, [{"type": "homeassistant"}], [])
+        entry = make_entry({}, options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False})
+        hass.config_entries._entries[entry.entry_id] = entry
+        try:
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            coordinator = entry.runtime_data
+            await coordinator.async_arm_production_control("test_existing_operator_authority")
+            preparing = asyncio.Event()
+            finish_preparing = asyncio.Event()
+            prepare = type(coordinator).async_prepare_configuration_reload
+
+            async def gated_prepare(runtime):
+                preparing.set()
+                await finish_preparing.wait()
+                await prepare(runtime)
+
+            with (
+                patch.object(type(coordinator), "async_prepare_configuration_reload", gated_prepare),
+                patch.object(ConfigEntries, "async_reload", wraps=hass.config_entries.async_reload) as reload,
+            ):
+                # The central options form writes data before HA saves its options.
+                hass.config_entries.async_update_entry(entry, data={"household_load_entity": "sensor.new_load"})
+                hass.config_entries.async_update_entry(entry, options={**entry.options, "ev_keep_charger_on": True})
+                await asyncio.wait_for(preparing.wait(), 10)
+                await asyncio.sleep(0)
+                finish_preparing.set()
+                await asyncio.wait_for(hass.async_block_till_done(), 10)
+                assert reload.call_count == 1
+
+            replacement = entry.runtime_data
+            assert replacement is not coordinator
+            assert entry.state is ConfigEntryState.LOADED
+            assert replacement.automatic_control_requested
+            assert not replacement.active_control
+            assert replacement._startup_auto_recovery_authorized
+            production = replacement.store.data["production"]
+            assert production["disarmed_reason"] == "configuration_changed"
+            assert production["startup_auto_recovery"]["status"] == "waiting_for_home_assistant"
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
 
 
 def test_legacy_target_reconfigure_retries_migration_without_replacing_entry(tmp_path: Path) -> None:
