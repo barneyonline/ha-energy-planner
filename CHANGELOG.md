@@ -12,6 +12,28 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.1.1 - 2026-09-14
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Show the Energy Planner device and tracked vehicles directly beneath the Energy Planner service, without sub-entry groups. Existing profiles migrate with their identities and settings intact; add, edit, and remove vehicles through Configure. Vehicle changes made while the integration is disabled also migrate pending profiles so setup cannot undo them.
 - Simplify EV settings: inherit shared charger power unless a vehicle has an optional override, move the initial SOC-gain estimate into Advanced calibration, and group shared charger controls and policies clearly. Preserve existing vehicle power overrides and hidden legacy settings when saving the planner configuration.
 - Prevent concurrent settings updates from queuing duplicate integration reloads that cancel automatic recovery and leave EV and climate control disarmed while Automatic control remains on.
