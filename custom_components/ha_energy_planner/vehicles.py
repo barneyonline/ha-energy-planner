@@ -190,11 +190,13 @@ class VehicleSession:
                 key: self.profile[key]
                 for key in (
                     CONF_DEFAULT_READY_BY,
-                    CONF_EV_CHARGE_RATE_KW,
                     CONF_EV_SOC_PER_KWH,
                 )
             },
-            CONF_EV_CHARGE_RATE_KW: min(self.profile[CONF_EV_CHARGE_RATE_KW], options[CONF_EV_CHARGE_RATE_KW]),
+            CONF_EV_CHARGE_RATE_KW: min(
+                self.profile.get(CONF_EV_CHARGE_RATE_KW, options[CONF_EV_CHARGE_RATE_KW]),
+                options[CONF_EV_CHARGE_RATE_KW],
+            ),
         }
 
 
@@ -235,7 +237,10 @@ class VehicleCalibration:
         if not session.allowed or not profile or charging is None:
             self.pending = None
             return None
-        rate = charge_rate_kw if charge_rate_kw is not None else profile[CONF_EV_CHARGE_RATE_KW]
+        rate = charge_rate_kw if charge_rate_kw is not None else profile.get(CONF_EV_CHARGE_RATE_KW)
+        if rate is None:
+            self.pending = None
+            return None
         vehicle_id = profile["id"]
         soc = float(state_value(hass, profile[CONF_EV_SOC]).strip().removesuffix("%").strip())
         if charging:
