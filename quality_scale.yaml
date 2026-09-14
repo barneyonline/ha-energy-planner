@@ -542,12 +542,15 @@ rules:
         - tests/scripts/test_validate_quality_scale.py
   reconfiguration-flow:
     status: done
-    comment: Configure edits all input and policy sections with topology rebuilds; Reconfigure repairs missing legacy vehicle targets and retries migration without replacing the entry.
+    comment: Configure edits all input and policy sections with topology rebuilds; concurrent data/options callbacks serialize reload preparation and recheck the replacement runtime so duplicate reloads cannot cancel automatic recovery. Later topology changes remain effective. Reconfigure repairs missing legacy vehicle targets and retries migration without replacing the entry.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
+        - custom_components/ha_energy_planner/__init__.py
       tests:
         - tests/test_config_flow.py
+        - tests/test_lifecycle.py
+        - tests/test_upgrade_runtime.py
   repair-issues:
     status: exempt
     comment: Legacy target migration has an explicit Reconfigure recovery path. Runtime and storage failures use translated service errors, preflight evidence, and safe-state restoration; no separate Repairs flow is needed.
