@@ -116,6 +116,8 @@ For a safe initial rollout:
 
 **Automatic control** records the operator's request for active control. **Armed** is the actual command-authority gate; unsafe or incomplete evidence keeps it off even when automatic-control intent is retained.
 
+Saving mapped inputs may briefly make planner entities unavailable while their listeners are rebuilt. Concurrent updates from one settings save share that reload and preserve automatic recovery; after the required safety checks pass, Armed returns on. Policy-only changes apply without rebuilding the integration.
+
 When **Automatic control** is armed and **EV control** is enabled, Energy Planner immediately stops charging that a charger starts by itself on plug-in. If the stop cannot be confirmed, it retries every 30 seconds—even while charging feedback is temporarily unavailable—until charging is confirmed inactive or control is disabled. Starts actually issued by Energy Planner or its manual EV controls are ownership-tracked and are not mistaken for plug-in auto-starts; the next plan may start charging again when the current slot calls for it.
 
 ## Known Limitations

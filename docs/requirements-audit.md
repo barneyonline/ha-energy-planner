@@ -700,6 +700,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   superseded recovery warning. A failed configuration-reload platform unload
   resumes the disarmed recovery lifecycle on the still-loaded coordinator. A
   restarted disarmed recovery resumes with its counter reset.
+  Configuration callbacks serialize preparation and reload per coordinator,
+  then recheck the replacement runtime and latest topology. Separate data and
+  options writes from one settings save cannot queue a second unload that
+  cancels recovery. A genuine mapping change arriving during reload is still
+  applied with a fresh handoff. Real Home Assistant entry/platform regression
+  coverage in `tests/test_upgrade_runtime.py` verifies that recovery survives
+  separate data/options notifications; `tests/test_lifecycle.py` also covers
+  concurrent callbacks, later topology changes, and callbacks after unload.
   A production-evidence mismatch found while reconciling a previously armed
   startup follows the same disarmed recovery lifecycle, so migrations cannot
   leave automatic-control intent stranded without a background recovery task.

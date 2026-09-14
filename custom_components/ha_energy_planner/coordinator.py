@@ -369,6 +369,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._ev_auto_start_compensation_pending = False
         self._ev_auto_start_compensation_generation = 0
         self._planner_lock = asyncio.Lock()
+        self.entry_update_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
         self._device_control_lock = asyncio.Lock()
         self._command_lock = asyncio.Lock()
