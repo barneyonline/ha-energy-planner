@@ -191,6 +191,7 @@ def make_coordinator(hass: Any, data: dict) -> EnergyPlannerCoordinator:
     coordinator._ev_auto_start_compensation_generation = 0
     coordinator._ev_auto_start_retry_cancel = None
     coordinator._command_lock = asyncio.Lock()
+    coordinator.entry_update_lock = asyncio.Lock()
     coordinator.overrides = []
     coordinator.ready_by = "07:00"
     coordinator.store = PlannerStore.__new__(PlannerStore)
