@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Prevent concurrent settings updates from queuing duplicate integration reloads that cancel automatic recovery and leave EV and climate control disarmed while Automatic control remains on.
 
 ### 🔧 Improvements
 
