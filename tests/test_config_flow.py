@@ -828,7 +828,11 @@ def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
         label = translations["options"]["step"]["settings"]["sections"][INPUT_STEP_EV]["data"][CONF_EV_CHARGE_RATE_KW]
 
-        assert label == "EV charge rate (kW)"
+        assert label == "Shared charger power (kW)"
+        for step in ("add_vehicle", "vehicle"):
+            vehicle = translations["options"]["step"][step]
+            assert vehicle["data"][CONF_EV_CHARGE_RATE_KW] == "Vehicle charging power override (kW)"
+            assert "lower of" in vehicle["data_description"][CONF_EV_CHARGE_RATE_KW]
 
 
 def test_options_flow_fields_have_readable_translation_labels() -> None:
@@ -987,7 +991,8 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
 
     ev_strings = _strings()["options"]["step"]["settings"]["sections"][INPUT_STEP_EV]
     assert ev_strings["data"][CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED] == "Enable lowest-cost daylight charging"
-    assert "lowest-cost daylight charging" in ev_strings["description"]
+    assert "shared charger" in ev_strings["description"]
+    assert "on each Vehicle" in ev_strings["description"]
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
