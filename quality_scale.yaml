@@ -465,13 +465,18 @@ rules:
       docs:
         - ha-energy-planner-spec.md
   dynamic-devices:
-    status: exempt
-    comment: Energy Planner exposes one fixed service device per config entry and has no discovered device inventory that can appear dynamically.
+    status: done
+    comment: Planner and configured vehicle devices are registered during setup as siblings on the service entry. Adding or removing a profile reloads the entry and reconciles the device registry.
     references:
       code:
+        - custom_components/ha_energy_planner/__init__.py
+        - custom_components/ha_energy_planner/config_flow.py
         - custom_components/ha_energy_planner/entity.py
         - custom_components/ha_energy_planner/coordinator.py
       tests:
+        - tests/test_vehicle_options_runtime.py
+        - tests/test_device_registry_runtime.py
+        - tests/test_entity.py
         - scripts/docker-ha-smoke.sh
   entity-category:
     status: done
@@ -561,11 +566,13 @@ rules:
         - tests/test_executor.py
         - scripts/docker-ha-smoke.sh
   stale-devices:
-    status: exempt
-    comment: The integration has one config-entry device and no discovered device inventory to prune.
+    status: done
+    comment: Setup removes only stale vehicle profile devices belonging to this entry; the planner device, remaining profiles, and devices from other entries are retained.
     references:
       code:
-        - custom_components/ha_energy_planner/entity.py
+        - custom_components/ha_energy_planner/__init__.py
+      tests:
+        - tests/test_device_registry_runtime.py
   async-dependency:
     status: done
     comment: Integration I/O uses async Home Assistant services, async coordinators, executor-backed Recorder reads, off-event-loop Store serialization, and async HTTP export tooling; there are no synchronous third-party client dependencies.
