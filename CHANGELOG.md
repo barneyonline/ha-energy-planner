@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Show the Energy Planner device and tracked vehicles directly beneath the Energy Planner service, without sub-entry groups. Existing profiles migrate with their identities and settings intact; add, edit, and remove vehicles through Configure. Vehicle changes made while the integration is disabled also migrate pending profiles so setup cannot undo them.
 
 ### 🔧 Improvements
 

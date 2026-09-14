@@ -124,7 +124,7 @@
   },
   "options": {
     "step": {
-      "init": {
+      "settings": {
         "title": "Energy Planner settings",
         "description": "Configure each area in one place. Expand only the sections you need; connected inputs and planner policy are saved together.",
         "sections": {
@@ -479,6 +479,56 @@
             }
           }
         }
+      },
+      "init": {
+        "title": "Energy Planner settings",
+        "menu_options": {
+          "settings": "Planner settings",
+          "add_vehicle": "Add vehicle",
+          "edit_vehicle": "Edit vehicle",
+          "remove_vehicle": "Remove vehicle"
+        }
+      },
+      "add_vehicle": {
+        "title": "Tracked vehicle",
+        "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+        "data": {
+          "name": "Vehicle name",
+          "port_entity": "Charging port connection sensor",
+          "home_entity": "Home presence entity",
+          "ev_soc_entity": "Vehicle SOC sensor",
+          "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+          "default_ready_by": "Ready by",
+          "ev_charge_rate_kw": "Effective charging power (kW)",
+          "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+        }
+      },
+      "vehicle": {
+        "title": "Tracked vehicle",
+        "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
+        "data": {
+          "name": "Vehicle name",
+          "port_entity": "Charging port connection sensor",
+          "home_entity": "Home presence entity",
+          "ev_soc_entity": "Vehicle SOC sensor",
+          "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
+          "default_ready_by": "Ready by",
+          "ev_charge_rate_kw": "Effective charging power (kW)",
+          "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
+        }
+      },
+      "edit_vehicle": {
+        "title": "Edit vehicle",
+        "data": {
+          "vehicle_id": "Vehicle"
+        }
+      },
+      "remove_vehicle": {
+        "title": "Remove vehicle",
+        "description": "Remove this vehicle from Energy Planner. Its source integration and sensors are not removed. Tracked-vehicle mode remains enabled, even when no profiles remain.",
+        "data": {
+          "vehicle_id": "Vehicle"
+        }
       }
     },
     "error": {
@@ -488,7 +538,16 @@
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones.",
       "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
-      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget."
+      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget.",
+      "vehicle_name_in_use": "Choose a unique vehicle name other than Auto or Manual.",
+      "entity_not_found": "Choose an existing entity of the supported type.",
+      "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
+      "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
+      "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure."
+    },
+    "abort": {
+      "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",
+      "vehicle_not_found": "This vehicle was removed. Open Configure again."
     }
   },
   "exceptions": {
@@ -619,56 +678,6 @@
     "select": {
       "ev_vehicle": {
         "name": "EV vehicle"
-      }
-    }
-  },
-  "config_subentries": {
-    "vehicle": {
-      "entry_type": "Vehicle",
-      "initiate_flow": {
-        "user": "Add vehicle",
-        "reconfigure": "Configure vehicle"
-      },
-      "title": "Vehicle",
-      "step": {
-        "user": {
-          "title": "Tracked vehicle",
-          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
-          "data": {
-            "name": "Vehicle name",
-            "port_entity": "Charging port connection sensor",
-            "home_entity": "Home presence entity",
-            "ev_soc_entity": "Vehicle SOC sensor",
-            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
-            "default_ready_by": "Ready by",
-            "ev_charge_rate_kw": "Effective charging power (kW)",
-            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
-          }
-        },
-        "reconfigure": {
-          "title": "Tracked vehicle",
-          "description": "Choose the car’s own connection, home presence, SOC and target SOC sensors. Home presence must report home (or on for a home binary sensor). The target is read only; no manual target or fallback is used. Set ready-by in Home Assistant’s local timezone. Charging power must not exceed the shared charger’s limit. Configure every tracked car before enabling Auto control.",
-          "data": {
-            "name": "Vehicle name",
-            "port_entity": "Charging port connection sensor",
-            "home_entity": "Home presence entity",
-            "ev_soc_entity": "Vehicle SOC sensor",
-            "ev_smart_charging_target_soc_entity": "Vehicle target SOC sensor",
-            "default_ready_by": "Ready by",
-            "ev_charge_rate_kw": "Effective charging power (kW)",
-            "ev_soc_per_kwh": "Initial SOC gain per kWh (%)"
-          }
-        }
-      },
-      "error": {
-        "vehicle_name_in_use": "Choose a unique vehicle name other than Auto or Manual.",
-        "entity_not_found": "Choose an existing entity of the supported type.",
-        "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
-        "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
-        "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure."
-      },
-      "abort": {
-        "reconfigure_successful": "Vehicle updated."
       }
     }
   }

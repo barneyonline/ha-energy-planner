@@ -66,11 +66,21 @@ use throughout; the Docker and pull-request gates enforce that result.
   short recheck interval, groups event evidence into readable bulleted sections,
   renders embedded timestamps in Home Assistant's local timezone, and omits
   actions for device-control areas whose selector is off.
-- The integration creates one Energy Planner device and attaches every entity to
-  it. Connected inputs and policy are configured on one central **Configure**
-  page with collapsible Energy, Climate, Presence, Enphase, AI, and EV input
-  sections; the former Add device/config-subentry surface is removed. Existing
-  subentry mappings are folded into the main config entry during setup.
+- The Energy Planner service contains a flat device list: one planner device with
+  all planner entities, plus one device per tracked vehicle. Vehicle devices
+  represent saved profiles; telemetry entities remain owned by their source
+  integrations. Setup migrates vehicle subentries into entry data with stable
+  profile IDs and removes stale vehicle devices after profile removal. Repeated
+  migration and setup retain device IDs and user names
+  (`tests/test_device_registry_runtime.py`, `tests/test_vehicles.py`).
+- **Configure** offers Planner settings and Add/Edit/Remove vehicle actions.
+  Planner settings retains the central form with collapsible input and policy
+  sections. No config-subentry flows are exposed. Existing legacy input mappings
+  and vehicle profiles migrate to main-entry data during setup. Ready-by-only
+  updates still replan without a configuration reload or control handoff. Options
+  saves also migrate pending subentries when the integration is disabled, so
+  the first later setup cannot undo profile edits or resurrect removed profiles
+  (`tests/test_vehicle_options_runtime.py`).
 - Automatic control is the sole master intent switch. It remains on while
   startup safety temporarily disarms production command authority; Armed and
   the stable active/recovery/review Mode sensor expose actual lifecycle state. Separate Climate control,

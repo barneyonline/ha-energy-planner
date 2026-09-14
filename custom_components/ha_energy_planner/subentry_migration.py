@@ -8,7 +8,7 @@ from homeassistant.core import HomeAssistant
 
 from .entry_data import remove_retired_config_keys
 from .type_defs import EnergyPlannerConfigEntry
-from .vehicles import VEHICLE
+from .vehicles import VEHICLE, VEHICLES
 
 SUBENTRY_SYSTEM = "system"
 SUBENTRY_ENERGY = "energy"
@@ -97,7 +97,7 @@ def grouped_subentry_data(entry: EnergyPlannerConfigEntry) -> dict[str, dict[str
 
 def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Move every legacy Add device section into the main config entry."""
-    subentries = [s for s in getattr(entry, "subentries", {}).values() if s.subentry_type != VEHICLE]
+    subentries = list(getattr(entry, "subentries", {}).values())
     if not subentries:
         data = _migrate_load_keys(dict(entry.data))
         if data == dict(entry.data):
@@ -109,7 +109,11 @@ def async_migrate_subentries_to_entry_data(hass: HomeAssistant, entry: EnergyPla
     for section_data in grouped_subentry_data(entry).values():
         data.update(section_data)
     for subentry in subentries:
-        if subentry.subentry_type not in _LEGACY_TO_TARGET:
+        if subentry.subentry_type == VEHICLE:
+            profiles = [p for p in data.get(VEHICLES, []) if p["id"] != subentry.subentry_id]
+            data[VEHICLES] = [*profiles, {**subentry.data, "id": subentry.subentry_id, "name": subentry.title}]
+            data["ev_vehicle_mode"] = True
+        elif subentry.subentry_type not in _LEGACY_TO_TARGET:
             data.update(_migrate_load_keys(dict(subentry.data)))
 
     hass.config_entries.async_update_entry(entry, data=data)

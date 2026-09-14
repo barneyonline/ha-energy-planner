@@ -27,6 +27,7 @@ def test_planner_entity_uses_single_named_device() -> None:
     assert entity.unique_id == "entry-1_plan_status"
     assert entity.device_info["identifiers"] == {(DOMAIN, "entry-1")}
     assert entity.device_info["name"] == "House Energy Planner"
+    assert entity.device_info["entry_type"] is None
     assert entity.device_info["model"] == "Energy Planner"
     assert planner_device_identifier("entry-1") == (DOMAIN, "entry-1")
 
