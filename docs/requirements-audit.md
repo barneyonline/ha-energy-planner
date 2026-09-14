@@ -22,6 +22,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   and recovers interrupted commands using newly constructed HA/Store/executor
   instances and persisted ownership/reservations. The compatibility matrix runs
   these contracts on the minimum, pinned and stable Home Assistant versions.
+  The 2026.6.0 compatibility modules run in separate interpreters to avoid the
+  combined-process final garbage-collection crash in the 2026.6.0 AMD64 image.
+  Test failures and interpreter crashes still fail the gate; the full-suite
+  coverage job and newer compatibility images retain combined execution (`tests/scripts/test_docker_compatibility.py`).
 - Operator disarm revokes command authority and restores owned HVAC before
   flushing the resulting state. Real Store tests cover disk failures and
   write failures during shutdown after takeover, including partial restoration failure,

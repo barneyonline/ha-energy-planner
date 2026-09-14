@@ -183,7 +183,7 @@ Removing Energy Planner stops future plans and commands. It does not remove sour
 - [Releases](https://github.com/barneyonline/ha-energy-planner/releases)
 - [Issue tracker](https://github.com/barneyonline/ha-energy-planner/issues)
 - [Release notes](CHANGELOG.md)
-- [Requirements and implementation evidence](docs/requirements-audit.md)
+- [Requirements and implementation evidence](docs/requirements-audit.md) — `scripts/docker-validate.sh` runs the full suite and compatibility checks; the 2026.6.0 compatibility modules use separate interpreters and retain all failure exit codes.
 - [Architecture review and implementation evidence](docs/architecture-review-2026-09-05.md)
 - [Quality-scale evidence](quality_scale.yaml)
 - [Home Assistant Integration Quality Scale](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
