@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Simplify EV settings: inherit shared charger power unless a vehicle has an optional override, move the initial SOC-gain estimate into Advanced calibration, and group shared charger controls and policies clearly. Preserve existing vehicle power overrides and hidden legacy settings when saving the planner configuration.
 
 ### 🔧 Improvements
 
