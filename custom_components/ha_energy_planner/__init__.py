@@ -591,25 +591,34 @@ def _non_negative_finite_float(value: Any) -> float:
 
 async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
     """Handle options and subentry updates."""
-    coordinator = getattr(entry, "runtime_data", None)
-    topology_signature = _entry_topology_signature(entry)
-    previous_topology_signature = getattr(coordinator, "entry_topology_signature", None)
-    if previous_topology_signature is not None and topology_signature != previous_topology_signature:
-        prepare_reload = getattr(coordinator, "async_prepare_configuration_reload", None)
-        if callable(prepare_reload):
-            await prepare_reload()
-        await hass.config_entries.async_reload(entry.entry_id)
-        return
-    handle_options_update = getattr(coordinator, "async_handle_options_update", None)
-    if callable(handle_options_update):
-        await handle_options_update()
-        handle_vehicle_update = getattr(coordinator, "async_handle_vehicle_settings_update", None)
-        if callable(handle_vehicle_update):
-            await handle_vehicle_update()
-        return
-    request_replan = getattr(coordinator, "async_request_replan", None)
-    if callable(request_replan):
-        await request_replan()
+    while (coordinator := getattr(entry, "runtime_data", None)) is not None:
+        # Data and options writes can queue separate callbacks before either
+        # completes its reload. Only one may prepare and reload this runtime.
+        async with coordinator.entry_update_lock:
+            if getattr(entry, "runtime_data", None) is not coordinator:
+                # The preceding callback replaced the coordinator. Recheck
+                # the current topology instead of unloading its recovery task
+                # with a handoff prepared on the discarded coordinator.
+                continue
+            topology_signature = _entry_topology_signature(entry)
+            previous_topology_signature = getattr(coordinator, "entry_topology_signature", None)
+            if previous_topology_signature is not None and topology_signature != previous_topology_signature:
+                prepare_reload = getattr(coordinator, "async_prepare_configuration_reload", None)
+                if callable(prepare_reload):
+                    await prepare_reload()
+                await hass.config_entries.async_reload(entry.entry_id)
+                return
+            handle_options_update = getattr(coordinator, "async_handle_options_update", None)
+            if callable(handle_options_update):
+                await handle_options_update()
+                handle_vehicle_update = getattr(coordinator, "async_handle_vehicle_settings_update", None)
+                if callable(handle_vehicle_update):
+                    await handle_vehicle_update()
+                return
+            request_replan = getattr(coordinator, "async_request_replan", None)
+            if callable(request_replan):
+                await request_replan()
+            return
 
 
 def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...]:
