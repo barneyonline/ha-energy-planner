@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import voluptuous as vol
 from homeassistant import config_entries
@@ -146,6 +147,7 @@ from .const import (
 )
 from .entry_data import combined_entry_data
 from .ev_policy import EV_DEFAULTS, finite, power_capability, strategy
+from .subentry_migration import async_migrate_subentries_to_entry_data
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import AUTO, HOME, MANUAL, PORT, VEHICLE, VEHICLES
 
@@ -728,8 +730,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_supported_subentry_types(
         cls, config_entry: EnergyPlannerConfigEntry,
     ) -> dict[str, type[config_entries.ConfigSubentryFlow]]:
-        """Expose repeatable vehicle profiles on the shared planner entry."""
-        return {VEHICLE: VehicleFlow}
+        """Keep planner and vehicle devices directly on the service entry."""
+        return {}
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None,
@@ -809,8 +811,17 @@ class OptionsFlow(config_entries.OptionsFlow):
         self._config_entry = config_entry
         self._data = dict(getattr(config_entry, "data", {}))
         self._options = dict(config_entry.options)
+        self._vehicle_id: str | None = None
 
     async def async_step_init(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Choose central settings or vehicle profile management."""
+        return self.async_show_menu(
+            step_id="init", menu_options=["settings", "add_vehicle", "edit_vehicle", "remove_vehicle"],
+        )
+
+    async def async_step_settings(
         self,
         user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
@@ -898,10 +909,150 @@ class OptionsFlow(config_entries.OptionsFlow):
                 return self.async_create_entry(title="", data=self._options)
 
         return self.async_show_form(
-            step_id="init",
+            step_id="settings",
             data_schema=self._settings_schema(),
             errors=errors,
             last_step=True,
+        )
+
+    async def async_step_add_vehicle(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Add a tracked vehicle to the service's flat device list."""
+        return await self._async_vehicle_form(user_input, reconfigure=False)
+
+    async def async_step_edit_vehicle(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Select the profile to edit."""
+        if user_input is not None:
+            self._vehicle_id = user_input["vehicle_id"]
+            return await self.async_step_vehicle()
+        return self._vehicle_selection_form("edit_vehicle")
+
+    async def async_step_vehicle(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Edit a profile without changing its identity or calibration."""
+        return await self._async_vehicle_form(user_input, reconfigure=True)
+
+    async def async_step_remove_vehicle(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Remove a selected profile while retaining tracked-vehicle mode."""
+        if user_input is not None:
+            entry = self._config_entry
+            profiles = combined_entry_data(entry).get(VEHICLES, [])
+            if not any(p["id"] == user_input["vehicle_id"] for p in profiles):
+                return self.async_abort(reason="vehicle_not_found")
+            self._async_save_vehicle_profiles([p for p in profiles if p["id"] != user_input["vehicle_id"]])
+            return self.async_create_entry(title="", data=dict(entry.options))
+        return self._vehicle_selection_form("remove_vehicle")
+
+    def _async_save_vehicle_profiles(self, profiles: list[dict[str, Any]]) -> None:
+        """Consolidate old subentries before applying a profile edit or removal."""
+        entry = self._config_entry
+        # Options remain available while an entry is disabled, before setup has
+        # migrated its subentries. Otherwise those old profiles override this save.
+        async_migrate_subentries_to_entry_data(self.hass, entry)
+        self.hass.config_entries.async_update_entry(
+            entry, data={**entry.data, VEHICLES: profiles, "ev_vehicle_mode": True},
+        )
+
+    def _vehicle_selection_form(self, step_id: str) -> config_entries.ConfigFlowResult:
+        """Offer named profiles without exposing their internal identifiers."""
+        profiles = combined_entry_data(self._config_entry).get(VEHICLES, [])
+        if not profiles:
+            return self.async_abort(reason="no_vehicles")
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=vol.Schema({vol.Required("vehicle_id"): SelectSelector(SelectSelectorConfig(
+                options=[SelectOptionDict(value=p["id"], label=p["name"]) for p in profiles],
+                mode=SelectSelectorMode.DROPDOWN,
+            ))}),
+        )
+
+    async def _async_vehicle_form(
+        self, user_input: dict[str, Any] | None, *, reconfigure: bool,
+    ) -> config_entries.ConfigFlowResult:
+        entry = self._config_entry
+        profiles = combined_entry_data(entry).get(VEHICLES, [])
+        current = next((p for p in profiles if p["id"] == self._vehicle_id), None) if reconfigure else None
+        if reconfigure and current is None:
+            return self.async_abort(reason="vehicle_not_found")
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            user_input = dict(user_input)
+            advanced = user_input.pop("advanced", {})
+            user_input[CONF_EV_SOC_PER_KWH] = advanced.get(
+                CONF_EV_SOC_PER_KWH,
+                user_input.get(CONF_EV_SOC_PER_KWH, (current or {}).get(
+                    CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
+                )),
+            )
+            name = str(user_input.get("name", "")).strip()
+            if not name or name in {AUTO, MANUAL} or any(
+                p["name"] == name and p != current for p in profiles
+            ):
+                errors["name"] = "vehicle_name_in_use"
+            for key in (CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, PORT, HOME):
+                entity_id = str(user_input.get(key, ""))
+                state = self.hass.states.get(entity_id)
+                allowed = {"sensor"} if key in {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC} else (
+                    {"sensor", "binary_sensor"} if key == PORT
+                    else {"sensor", "binary_sensor", "device_tracker", "person"}
+                )
+                if state is None or entity_id.split(".", 1)[0] not in allowed:
+                    errors[key] = "entity_not_found"
+            for key in (CONF_EV_SOC, PORT):
+                if any(
+                    p != current and p.get(key) == user_input.get(key)
+                    for p in profiles
+                ):
+                    errors[key] = "vehicle_entity_in_use"
+            try:
+                cv.time(user_input.get(CONF_DEFAULT_READY_BY))
+                for key in (CONF_EV_CHARGE_RATE_KW, CONF_EV_SOC_PER_KWH):
+                    if key == CONF_EV_CHARGE_RATE_KW and key not in user_input:
+                        continue
+                    value = float(user_input.get(key, 0))
+                    if not 0 < value <= (50 if key == CONF_EV_CHARGE_RATE_KW else 10):
+                        raise ValueError
+            except (vol.Invalid, ValueError, TypeError):
+                errors["base"] = "invalid_vehicle_settings"
+            if not combined_entry_data(entry).get(CONF_EV_CONNECTED):
+                errors["base"] = "vehicle_requires_charger_connection"
+            if not errors:
+                profile = {**user_input, "name": name, "id": current["id"] if current else uuid4().hex}
+                updated = [profile if p["id"] == profile["id"] else p for p in profiles]
+                if current is None:
+                    updated.append(profile)
+                self._async_save_vehicle_profiles(updated)
+                return self.async_create_entry(title="", data=dict(entry.options))
+        defaults = dict(current) if current else {
+            CONF_DEFAULT_READY_BY: "07:00",
+            CONF_EV_SOC_PER_KWH: DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
+        }
+        suggested = dict(user_input if user_input is not None else defaults)
+        calibration = suggested.pop(CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH])
+        advanced_schema = self.add_suggested_values_to_schema(
+            vol.Schema({vol.Optional(CONF_EV_SOC_PER_KWH): _option_selector(CONF_EV_SOC_PER_KWH)}),
+            {CONF_EV_SOC_PER_KWH: calibration},
+        )
+        schema = vol.Schema({
+            vol.Required("name"): TextSelector(),
+            vol.Required(PORT): _entity_selector(["sensor", "binary_sensor"]),
+            vol.Required(HOME): _entity_selector(["sensor", "binary_sensor", "device_tracker", "person"]),
+            vol.Required(CONF_EV_SOC): _entity_selector("sensor"),
+            vol.Required(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector("sensor"),
+            vol.Required(CONF_DEFAULT_READY_BY): TextSelector(),
+            vol.Optional(CONF_EV_CHARGE_RATE_KW): _option_selector(CONF_EV_CHARGE_RATE_KW),
+            vol.Optional("advanced"): section(advanced_schema, SectionConfig(collapsed=True)),
+        })
+        return self.async_show_form(
+            step_id="vehicle" if reconfigure else "add_vehicle",
+            data_schema=self.add_suggested_values_to_schema(schema, suggested),
+            errors=errors,
         )
 
     def _vehicle_managed_fields(self) -> frozenset[str]:
@@ -946,6 +1097,8 @@ class OptionsFlow(config_entries.OptionsFlow):
 
     def _async_save_entry_data(self, data: dict[str, Any]) -> None:
         """Persist central input settings with the completed options form."""
+        latest = getattr(self._config_entry, "data", {})
+        data = {**data, **{key: latest[key] for key in (VEHICLES, "ev_vehicle_mode") if key in latest}}
         self._data = {
             key: value
             for key, value in data.items()
@@ -1398,98 +1551,3 @@ _ENTITY_UNIT_RULES = {
     CONF_DAIKIN_POWER: _POWER_UNITS,
     CONF_EV_SOC: _PERCENT_UNITS,
 }
-
-
-class VehicleFlow(config_entries.ConfigSubentryFlow):
-    """Add or edit a tracked vehicle independently of the shared charger."""
-
-    async def async_step_user(self, user_input: dict[str, Any] | None = None) -> config_entries.SubentryFlowResult:
-        """Configure a named vehicle with required telemetry and its own ready-by."""
-        return await self._async_vehicle_form(user_input, reconfigure=False)
-
-    async def async_step_reconfigure(
-        self, user_input: dict[str, Any] | None = None,
-    ) -> config_entries.SubentryFlowResult:
-        """Edit an existing profile without replacing its identity or calibration."""
-        return await self._async_vehicle_form(user_input, reconfigure=True)
-
-    async def _async_vehicle_form(
-        self, user_input: dict[str, Any] | None, *, reconfigure: bool,
-    ) -> config_entries.SubentryFlowResult:
-        entry = self._get_entry()
-        current = self._get_reconfigure_subentry() if reconfigure else None
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            user_input = dict(user_input)
-            advanced = user_input.pop("advanced", {})
-            user_input[CONF_EV_SOC_PER_KWH] = advanced.get(
-                CONF_EV_SOC_PER_KWH,
-                user_input.get(CONF_EV_SOC_PER_KWH, (current.data if current else {}).get(
-                    CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
-                )),
-            )
-            name = str(user_input.get("name", "")).strip()
-            if not name or name in {AUTO, MANUAL} or any(
-                s.title == name and s != current for s in entry.subentries.values() if s.subentry_type == VEHICLE
-            ):
-                errors["name"] = "vehicle_name_in_use"
-            for key in (CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC, PORT, HOME):
-                entity_id = str(user_input.get(key, ""))
-                state = self.hass.states.get(entity_id)
-                allowed = {"sensor"} if key in {CONF_EV_SOC, CONF_EV_SMART_CHARGING_TARGET_SOC} else (
-                    {"sensor", "binary_sensor"} if key == PORT
-                    else {"sensor", "binary_sensor", "device_tracker", "person"}
-                )
-                if state is None or entity_id.split(".", 1)[0] not in allowed:
-                    errors[key] = "entity_not_found"
-            for key in (CONF_EV_SOC, PORT):
-                if any(
-                    s != current and s.subentry_type == VEHICLE and s.data.get(key) == user_input.get(key)
-                    for s in entry.subentries.values()
-                ):
-                    errors[key] = "vehicle_entity_in_use"
-            try:
-                cv.time(user_input.get(CONF_DEFAULT_READY_BY))
-                for key in (CONF_EV_CHARGE_RATE_KW, CONF_EV_SOC_PER_KWH):
-                    if key == CONF_EV_CHARGE_RATE_KW and key not in user_input:
-                        continue
-                    value = float(user_input.get(key, 0))
-                    if not 0 < value <= (50 if key == CONF_EV_CHARGE_RATE_KW else 10):
-                        raise ValueError
-            except (vol.Invalid, ValueError, TypeError):
-                errors["base"] = "invalid_vehicle_settings"
-            if not combined_entry_data(entry).get(CONF_EV_CONNECTED):
-                errors["base"] = "vehicle_requires_charger_connection"
-            if not errors:
-                data = {**user_input, "name": name}
-                if current is not None:
-                    return self.async_update_and_abort(entry, current, title=name, data=data)
-                self.hass.config_entries.async_update_entry(
-                    entry, data={**entry.data, "ev_vehicle_mode": True},
-                )
-                return self.async_create_entry(title=name, data=data)
-        defaults = dict(current.data) if current else {
-            CONF_DEFAULT_READY_BY: "07:00",
-            CONF_EV_SOC_PER_KWH: DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH],
-        }
-        suggested = dict(user_input if user_input is not None else defaults)
-        calibration = suggested.pop(CONF_EV_SOC_PER_KWH, DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH])
-        advanced_schema = self.add_suggested_values_to_schema(
-            vol.Schema({vol.Optional(CONF_EV_SOC_PER_KWH): _option_selector(CONF_EV_SOC_PER_KWH)}),
-            {CONF_EV_SOC_PER_KWH: calibration},
-        )
-        schema = vol.Schema({
-            vol.Required("name"): TextSelector(),
-            vol.Required(PORT): _entity_selector(["sensor", "binary_sensor"]),
-            vol.Required(HOME): _entity_selector(["sensor", "binary_sensor", "device_tracker", "person"]),
-            vol.Required(CONF_EV_SOC): _entity_selector("sensor"),
-            vol.Required(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector("sensor"),
-            vol.Required(CONF_DEFAULT_READY_BY): TextSelector(),
-            vol.Optional(CONF_EV_CHARGE_RATE_KW): _option_selector(CONF_EV_CHARGE_RATE_KW),
-            vol.Optional("advanced"): section(advanced_schema, SectionConfig(collapsed=True)),
-        })
-        return self.async_show_form(
-            step_id="reconfigure" if reconfigure else "user",
-            data_schema=self.add_suggested_values_to_schema(schema, suggested),
-            errors=errors,
-        )

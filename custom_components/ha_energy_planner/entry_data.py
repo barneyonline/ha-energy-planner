@@ -36,9 +36,12 @@ def remove_retired_config_keys(data: Mapping[str, Any]) -> dict[str, Any]:
 def combined_entry_data(entry: EnergyPlannerConfigEntry) -> dict[str, Any]:
     """Return hub data merged with planner input subentry data."""
     data = remove_retired_config_keys(getattr(entry, "data", {}))
+    if VEHICLES in data:
+        data[VEHICLES] = [dict(profile) for profile in data[VEHICLES]]
     for subentry in getattr(entry, "subentries", {}).values():
         if getattr(subentry, "subentry_type", None) == VEHICLE:
-            data.setdefault(VEHICLES, []).append({**subentry.data, "id": subentry.subentry_id, "name": subentry.title})
+            profiles = [p for p in data.get(VEHICLES, []) if p["id"] != subentry.subentry_id]
+            data[VEHICLES] = [*profiles, {**subentry.data, "id": subentry.subentry_id, "name": subentry.title}]
             continue
         subentry_data = getattr(subentry, "data", None)
         if isinstance(subentry_data, Mapping):

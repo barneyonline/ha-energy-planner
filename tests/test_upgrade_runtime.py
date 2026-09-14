@@ -9,6 +9,7 @@ from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import patch
 
+import pytest
 from homeassistant import auth, loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState, ConfigSubentry
 from homeassistant.core import HomeAssistant
@@ -30,10 +31,20 @@ def make_entry(data, *, version=5, options=None):
     )
 
 
-def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path) -> None:
+@pytest.mark.parametrize("with_vehicle", [False, True])
+def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path, with_vehicle: bool) -> None:
     fixture = json.loads((ROOT / "tests/fixtures/upgrade/0.9.18.json").read_text())
     shutil.copytree(ROOT / "custom_components/ha_energy_planner", tmp_path / "custom_components/ha_energy_planner")
     entry = make_entry(fixture["entry"]["data"], options=fixture["entry"]["options"])
+    vehicle = ConfigSubentry(
+        data=MappingProxyType({"default_ready_by": "07:00"}),
+        subentry_type="vehicle", title="MINI Aceman", unique_id=None,
+    )
+    if with_vehicle:
+        fixture["store"]["data"]["ev_vehicle_calibrations"] = {
+            vehicle.subentry_id: {"status": "collecting", "sample_count": 1},
+        }
+    device_ids = set()
     key = f"{DOMAIN}_state_{entry.entry_id}"
     storage = tmp_path / ".storage"
     storage.mkdir()
@@ -55,6 +66,8 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
             current = entry
             hass.config_entries._entries[current.entry_id] = current
             hass.config_entries._async_schedule_save()
+            if with_vehicle:
+                hass.config_entries.async_add_subentry(current, vehicle)
             device = dr.async_get(hass).async_get_or_create(
                 config_entry_id=current.entry_id, identifiers={(DOMAIN, f"{current.entry_id}_system")}
             )
@@ -67,6 +80,31 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
             assert current.state is ConfigEntryState.LOADED
             coordinator = current.runtime_data
             assert coordinator.store.data["ownership"] == fixture["store"]["data"]["ownership"]
+            assert not current.subentries
+            if with_vehicle:
+                assert current.data["ev_vehicles"][0]["id"] == vehicle.subentry_id
+                assert current.runtime_data.store.data["ev_vehicle_calibrations"] == (
+                    fixture["store"]["data"]["ev_vehicle_calibrations"]
+                )
+                own_devices = dr.async_entries_for_config_entry(dr.async_get(hass), current.entry_id)
+                assert len(own_devices) == 2
+                assert {d.name for d in own_devices} == {"Upgrade fixture", "MINI Aceman"}
+                assert all(d.config_entries_subentries == {current.entry_id: {None}} for d in own_devices)
+                if restart:
+                    assert {d.id for d in own_devices} == device_ids
+                device_ids.update(d.id for d in own_devices)
+                menu = await hass.config_entries.options.async_init(current.entry_id)
+                assert menu["type"] == "menu"
+                assert menu["menu_options"] == ["settings", "add_vehicle", "edit_vehicle", "remove_vehicle"]
+                selection = await hass.config_entries.options.async_configure(
+                    menu["flow_id"], {"next_step_id": "edit_vehicle"},
+                )
+                assert selection["step_id"] == "edit_vehicle"
+                form = await hass.config_entries.options.async_configure(
+                    menu["flow_id"], {"vehicle_id": vehicle.subentry_id},
+                )
+                assert form["step_id"] == "vehicle"
+                hass.config_entries.options.async_abort(menu["flow_id"])
             assert coordinator.store.data["ev_grid_reservation"]["active"] is True
             assert coordinator.overrides[0].reason == "operator_requested"
             assert "outcomes" not in coordinator.store.data

@@ -966,6 +966,7 @@ def test_sync_planner_device_relinks_all_entities_and_removes_old_groups(
     assert created == [
         {
             "config_entry_id": "test_entry",
+            "entry_type": None,
             "identifiers": {("ha_energy_planner", "test_entry")},
             "manufacturer": "Energy Planner",
             "model": "Energy Planner",
