@@ -49,6 +49,7 @@ class EnergyPlannerEntity(CoordinatorEntity[EnergyPlannerCoordinator]):
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_suggested_object_id = f"{DOMAIN}_{key}"
         self._attr_device_info = DeviceInfo(
+            entry_type=None,
             identifiers={planner_device_identifier(entry.entry_id)},
             manufacturer=INTEGRATION_NAME,
             model=INTEGRATION_NAME,

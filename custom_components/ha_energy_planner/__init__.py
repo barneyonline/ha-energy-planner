@@ -46,8 +46,9 @@ from .const import (
     SERVICE_SET_EV_READY_BY,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
+from .entry_data import combined_entry_data
 from .type_defs import EnergyPlannerConfigEntry
-from .vehicles import VEHICLE
+from .vehicles import VEHICLE, VEHICLES
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant, ServiceCall
@@ -616,7 +617,11 @@ def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...
     """Return stable config data that requires rebuilding platforms and listeners."""
     subentries = getattr(entry, "subentries", {})
     return (
-        _freeze_config_value(getattr(entry, "data", {})),
+        _freeze_config_value({
+            key: [{k: v for k, v in p.items() if k != CONF_DEFAULT_READY_BY} for p in value]
+            if key == VEHICLES else value
+            for key, value in getattr(entry, "data", {}).items()
+        }),
         tuple(
             sorted(
                 (
@@ -645,7 +650,7 @@ def _freeze_config_value(value: Any) -> Any:
 
 
 def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
-    """Create one planner device, link every entity, and remove old group devices."""
+    """Keep planner and vehicle devices flat, preserving planner entity ownership."""
     from homeassistant.helpers import device_registry as dr
     from homeassistant.helpers import entity_registry as er
 
@@ -657,6 +662,7 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
     _async_migrate_duplicate_entity_ids(ent_reg)
     async_migrate_entity_registry(hass, entry)
     device = dev_reg.async_get_or_create(
+        entry_type=None,
         config_entry_id=entry.entry_id,
         identifiers={planner_device_identifier(entry.entry_id)},
         manufacturer=INTEGRATION_NAME,
@@ -674,6 +680,18 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
                 config_subentry_id=None,
             )
 
+    vehicle_identifiers = set()
+    vehicle_prefix = f"{entry.entry_id}_vehicle_"
+    for profile in combined_entry_data(entry).get(VEHICLES, []):
+        identifier = (DOMAIN, f"{vehicle_prefix}{profile['id']}")
+        vehicle_identifiers.add(identifier)
+        dev_reg.async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={identifier},
+            name=profile["name"],
+            manufacturer=INTEGRATION_NAME,
+            model="Vehicle",
+        )
     retired_identifiers = {
         (DOMAIN, f"{entry.entry_id}_{suffix}")
         for suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls")
@@ -681,7 +699,11 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
     # This entry-scoped API is supported throughout our HA version range;
     # async_get_device_by_identifier was only introduced after HA 2026.6.
     for old_device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
-        if old_device.id != device.id and old_device.identifiers & retired_identifiers:
+        stale_vehicle = any(domain == DOMAIN and identifier.startswith(vehicle_prefix)
+                            for domain, identifier in old_device.identifiers) and not (
+            old_device.identifiers & vehicle_identifiers
+        )
+        if stale_vehicle or (old_device.id != device.id and old_device.identifiers & retired_identifiers):
             dev_reg.async_remove_device(old_device.id)
 
 

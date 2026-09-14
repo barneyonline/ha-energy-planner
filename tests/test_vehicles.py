@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from homeassistant.core import State
 
-from custom_components.ha_energy_planner.config_flow import ConfigFlow, VehicleFlow
+from custom_components.ha_energy_planner.config_flow import ConfigFlow, OptionsFlow
 from custom_components.ha_energy_planner.const import (
     CONF_DEFAULT_READY_BY,
     CONF_EV_CHARGE_RATE_KW,
@@ -279,17 +279,28 @@ def test_all_vehicles_listened_to_and_production_identity_stays_stable() -> None
     assert production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options) == expected
 
 
-def test_profile_data_is_not_flattened_or_migrated_away() -> None:
+def test_profile_data_migrates_to_entry_without_changing_identity() -> None:
     hass, data = setup()
     subentry = SimpleNamespace(data=profile("A"), subentry_id="a", subentry_type=VEHICLE, title="A")
     entry = SimpleNamespace(data={CONF_EV_SOC: "sensor.old", "ev_vehicle_mode": True}, subentries={"a": subentry})
     combined = combined_entry_data(entry)
     assert CONF_EV_SOC not in combined
     assert combined[VEHICLES][0]["id"] == "a"
-    hass.config_entries = SimpleNamespace(async_update_entry=Mock(), async_remove_subentry=Mock())
+    hass.config_entries = SimpleNamespace(
+        async_update_entry=lambda entry, **kwargs: setattr(entry, "data", kwargs["data"]),
+        async_remove_subentry=lambda entry, subentry_id: entry.subentries.pop(subentry_id),
+    )
+    assert async_migrate_subentries_to_entry_data(hass, entry)
+    assert entry.subentries == {}
+    assert combined_entry_data(entry) == combined
     assert not async_migrate_subentries_to_entry_data(hass, entry)
-    assert not hass.config_entries.async_remove_subentry.called
-    entry.subentries = {}
+    # A retry after data persistence but before subentry removal must not duplicate profiles.
+    entry.subentries = {"a": subentry}
+    assert combined_entry_data(entry) == combined
+    assert len(entry.data[VEHICLES]) == 1
+    assert async_migrate_subentries_to_entry_data(hass, entry)
+    assert len(entry.data[VEHICLES]) == 1
+    entry.data[VEHICLES] = []
     assert combined_entry_data(entry)[VEHICLES] == []
 
 
@@ -386,42 +397,45 @@ def test_selection_and_active_vehicle_entities(monkeypatch: Any) -> None:
 def test_vehicle_flow_add_edit_and_validation(monkeypatch: Any) -> None:
     async def run() -> None:
         hass, data = setup()
-        entry = SimpleNamespace(data={CONF_EV_CONNECTED: "binary_sensor.plug"}, subentries={})
-        hass.config_entries = SimpleNamespace(async_update_entry=Mock())
-        flow = VehicleFlow()
+        entry = SimpleNamespace(data={CONF_EV_CONNECTED: "binary_sensor.plug"}, options={}, subentries={})
+        hass.config_entries = SimpleNamespace(
+            async_update_entry=Mock(side_effect=lambda entry, **kwargs: setattr(entry, "data", kwargs["data"])),
+        )
+        flow = OptionsFlow(entry)
         flow.hass = hass
-        monkeypatch.setattr(flow, "_get_entry", lambda: entry)
         monkeypatch.setattr(flow, "async_show_form", lambda **kwargs: kwargs)
         monkeypatch.setattr(flow, "async_create_entry", lambda **kwargs: kwargs)
-        monkeypatch.setattr(flow, "async_update_and_abort", lambda *args, **kwargs: kwargs)
-        assert ConfigFlow.async_get_supported_subentry_types(entry)[VEHICLE] == VehicleFlow
-        assert (await flow.async_step_user())["step_id"] == "user"
+        assert ConfigFlow.async_get_supported_subentry_types(entry) == {}
+        assert (await flow.async_step_init())["type"] == "menu"
+        assert (await flow.async_step_edit_vehicle())["reason"] == "no_vehicles"
+        assert (await flow.async_step_add_vehicle())["step_id"] == "add_vehicle"
         user_input = {k: v for k, v in profile("A").items() if k != "id"}
-        result = await flow.async_step_user(user_input)
-        assert result["title"] == "A"
-        assert hass.config_entries.async_update_entry.call_args.kwargs["data"]["ev_vehicle_mode"]
-        existing = SimpleNamespace(data=user_input, title="A", subentry_type=VEHICLE, subentry_id="a")
-        entry.subentries["a"] = existing
-        errors = (await flow.async_step_user(user_input))["errors"]
+        result = await flow.async_step_add_vehicle(user_input)
+        assert result["data"] == entry.options
+        assert entry.data["ev_vehicle_mode"]
+        existing = entry.data[VEHICLES][0]
+        errors = (await flow.async_step_add_vehicle(user_input))["errors"]
         assert errors["name"] == "vehicle_name_in_use" and errors[PORT] == "vehicle_entity_in_use"
-        monkeypatch.setattr(flow, "_get_reconfigure_subentry", lambda: existing)
-        assert (await flow.async_step_reconfigure())["step_id"] == "reconfigure"
-        assert (await flow.async_step_reconfigure(user_input))["title"] == "A"
+        assert (await flow.async_step_edit_vehicle())["step_id"] == "edit_vehicle"
+        assert (await flow.async_step_edit_vehicle({"vehicle_id": existing["id"]}))["step_id"] == "vehicle"
+        assert (await flow.async_step_vehicle(user_input))["data"] == entry.options
+        assert entry.data[VEHICLES][0]["id"] == existing["id"]
         invalid = {
-            **user_input,
-            "name": "",
-            PORT: "sensor.missing",
-            HOME: "switch.charger",
-            CONF_DEFAULT_READY_BY: "never",
+            **user_input, "name": "", PORT: "sensor.missing", HOME: "switch.charger", CONF_DEFAULT_READY_BY: "never",
         }
-        entry.data = {}
-        errors = (await flow.async_step_reconfigure(invalid))["errors"]
+        entry.data.pop(CONF_EV_CONNECTED)
+        errors = (await flow.async_step_vehicle(invalid))["errors"]
         assert errors["base"] == "vehicle_requires_charger_connection"
         assert errors[HOME] == "entity_not_found"
-        entry.data = {CONF_EV_CONNECTED: "binary_sensor.plug"}
+        entry.data[CONF_EV_CONNECTED] = "binary_sensor.plug"
         for rate in [0, 51, float("nan")]:
-            errors = (await flow.async_step_reconfigure({**user_input, CONF_EV_CHARGE_RATE_KW: rate}))["errors"]
+            errors = (await flow.async_step_vehicle({**user_input, CONF_EV_CHARGE_RATE_KW: rate}))["errors"]
             assert errors["base"] == "invalid_vehicle_settings"
+        assert (await flow.async_step_remove_vehicle())["step_id"] == "remove_vehicle"
+        assert (await flow.async_step_remove_vehicle({"vehicle_id": "missing"}))["reason"] == "vehicle_not_found"
+        await flow.async_step_remove_vehicle({"vehicle_id": existing["id"]})
+        assert entry.data[VEHICLES] == [] and entry.data["ev_vehicle_mode"]
+        assert (await flow.async_step_vehicle(user_input))["reason"] == "vehicle_not_found"
 
     asyncio.run(run())
 
@@ -549,12 +563,8 @@ def test_ready_by_updates_selected_profile_only() -> None:
 
     async def run() -> None:
         hass, data = setup()
-        coordinator = make_coordinator(hass, {k: v for k, v in data.items() if k != VEHICLES})
-        profiles = {
-            name: SimpleNamespace(data=profile(name), subentry_type=VEHICLE, subentry_id=name, title=name)
-            for name in ("A", "B")
-        }
-        coordinator.entry.subentries = profiles
+        coordinator = make_coordinator(hass, data)
+        coordinator.entry.subentries = {}
         coordinator.entry.runtime_data = coordinator
         coordinator.entry_topology_signature = _entry_topology_signature(coordinator.entry)
         coordinator.async_handle_options_update = AsyncMock()
@@ -564,16 +574,16 @@ def test_ready_by_updates_selected_profile_only() -> None:
         guard = coordinator._ev_command_guard()
         fingerprint = production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options)
 
-        def update_subentry(entry: Any, subentry: Any, *, data: dict) -> None:
-            subentry.data = data
+        def update_entry(entry: Any, *, data: dict) -> None:
+            entry.data = data
 
         hass.config_entries = SimpleNamespace(
-            async_update_subentry=Mock(side_effect=update_subentry), async_reload=AsyncMock(),
+            async_update_entry=Mock(side_effect=update_entry), async_reload=AsyncMock(),
         )
         await coordinator.async_set_ready_by("06:15")
         await _async_update_listener(hass, coordinator.entry)
-        assert profiles["A"].data[CONF_DEFAULT_READY_BY] == "06:15"
-        assert profiles["B"].data[CONF_DEFAULT_READY_BY] == "07:00"
+        assert coordinator.entry.data[VEHICLES][0][CONF_DEFAULT_READY_BY] == "06:15"
+        assert coordinator.entry.data[VEHICLES][1][CONF_DEFAULT_READY_BY] == "07:00"
         assert coordinator.planner_options[CONF_DEFAULT_READY_BY] == "06:15"
         assert coordinator.async_request_refresh.call_count == 1
         assert not coordinator.async_prepare_configuration_reload.called
@@ -582,7 +592,7 @@ def test_ready_by_updates_selected_profile_only() -> None:
         assert not guard()
         assert production_evidence_fingerprint(coordinator.entry_data, coordinator.planner_options) == fingerprint
         # Editing the profile through HA must take the same runtime update path.
-        profiles["A"].data = {**profiles["A"].data, CONF_DEFAULT_READY_BY: "06:30"}
+        coordinator.entry.data[VEHICLES][0][CONF_DEFAULT_READY_BY] = "06:30"
         await _async_update_listener(hass, coordinator.entry)
         assert coordinator.async_request_refresh.call_count == 2
         assert not hass.config_entries.async_reload.called
@@ -590,7 +600,7 @@ def test_ready_by_updates_selected_profile_only() -> None:
         with pytest.raises(ValueError, match="tracked vehicle"):
             await coordinator.async_set_ready_by("06:00")
         # Physical mappings still require the original reload handoff.
-        profiles["A"].data = {**profiles["A"].data, PORT: "sensor.replacement_port"}
+        coordinator.entry.data[VEHICLES][0][PORT] = "sensor.replacement_port"
         await _async_update_listener(hass, coordinator.entry)
         assert coordinator.async_prepare_configuration_reload.call_count == 1
         assert hass.config_entries.async_reload.call_count == 1
@@ -852,16 +862,15 @@ def test_charger_first_options_then_add_vehicle_flow(monkeypatch: Any) -> None:
         monkeypatch.setattr(options_flow, "async_create_entry", lambda **kwargs: kwargs)
         monkeypatch.setattr(options_flow, "async_show_form", lambda **kwargs: kwargs)
         charger = {key: data[key] for key in (CONF_EV_CONNECTED, CONF_EV_CHARGING, CONF_EV_CHARGER)}
-        result = await options_flow.async_step_init({INPUT_STEP_EV: charger})
+        result = await options_flow.async_step_settings({INPUT_STEP_EV: charger})
         assert "errors" not in result
         assert entry.data == charger
-        vehicle_flow = VehicleFlow()
+        vehicle_flow = OptionsFlow(entry)
         vehicle_flow.hass = hass
-        monkeypatch.setattr(vehicle_flow, "_get_entry", lambda: entry)
         monkeypatch.setattr(vehicle_flow, "async_create_entry", lambda **kwargs: kwargs)
         monkeypatch.setattr(vehicle_flow, "async_show_form", lambda **kwargs: kwargs)
-        result = await vehicle_flow.async_step_user({k: v for k, v in profile("A").items() if k != "id"})
-        assert result["title"] == "A"
+        result = await vehicle_flow.async_step_add_vehicle({k: v for k, v in profile("A").items() if k != "id"})
+        assert entry.data[VEHICLES][0]["name"] == "A"
         assert entry.data["ev_vehicle_mode"] is True
         assert not hass.services.async_call.called
 

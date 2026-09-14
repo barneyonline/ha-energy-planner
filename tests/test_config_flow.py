@@ -747,7 +747,7 @@ def test_central_input_sections_have_readable_translation_labels() -> None:
     }
 
     for input_type, schema in PLANNER_SUBENTRY_SCHEMAS.items():
-        section = strings["options"]["step"]["init"]["sections"][step_by_type[input_type]]
+        section = strings["options"]["step"]["settings"]["sections"][step_by_type[input_type]]
         labels = section["data"]
         descriptions = section["data_description"]
         schema_keys = {str(getattr(key, "schema", key)) for key in schema.schema}
@@ -760,7 +760,7 @@ def test_central_input_sections_have_readable_translation_labels() -> None:
             assert labels[key] != key
             assert "_" not in labels[key]
 
-    climate_section = strings["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE]
+    climate_section = strings["options"]["step"]["settings"]["sections"][INPUT_STEP_CLIMATE]
     assert climate_section["data"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER] == ("Climate Scheduler Guard Timer")
     assert climate_section["data_description"][CONF_CLIMATE_SCHEDULER_GUARD_TIMER].startswith(
         "Select the timer paired with Scheduler Change Helper."
@@ -780,8 +780,8 @@ def test_english_locale_files_include_central_input_section_labels() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        assert set(translations["config_subentries"]) == {"vehicle"}
-        assert expected_steps <= translations["options"]["step"]["init"]["sections"].keys()
+        assert "config_subentries" not in translations
+        assert expected_steps <= translations["options"]["step"]["settings"]["sections"].keys()
 
 
 def test_english_locale_files_translate_reconfigure_success() -> None:
@@ -798,7 +798,7 @@ def test_english_locale_files_explain_solcast_pv_forecast_sensor() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_ENERGY]["data_description"][
+        description = translations["options"]["step"]["settings"]["sections"][INPUT_STEP_ENERGY]["data_description"][
             CONF_PV_FORECAST
         ]
 
@@ -812,7 +812,7 @@ def test_english_locale_files_explain_bom_hourly_weather_forecast() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        description = translations["options"]["step"]["init"]["sections"][INPUT_STEP_CLIMATE]["data_description"][
+        description = translations["options"]["step"]["settings"]["sections"][INPUT_STEP_CLIMATE]["data_description"][
             CONF_WEATHER
         ]
 
@@ -826,7 +826,7 @@ def test_english_locale_files_label_ev_charge_rate_as_kw() -> None:
 
     for translations_path in (integration_dir / "translations").glob("en*.json"):
         translations = json.loads(translations_path.read_text(encoding="utf-8"))
-        label = translations["options"]["step"]["init"]["sections"][INPUT_STEP_EV]["data"][CONF_EV_CHARGE_RATE_KW]
+        label = translations["options"]["step"]["settings"]["sections"][INPUT_STEP_EV]["data"][CONF_EV_CHARGE_RATE_KW]
 
         assert label == "EV charge rate (kW)"
 
@@ -835,7 +835,7 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
     strings = _strings()
     labels: dict[str, str] = {}
     descriptions: dict[str, str] = {}
-    for section_strings in strings["options"]["step"]["init"]["sections"].values():
+    for section_strings in strings["options"]["step"]["settings"]["sections"].values():
         labels.update(section_strings.get("data", {}))
         descriptions.update(section_strings.get("data_description", {}))
     schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
@@ -864,7 +864,7 @@ def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
         integration_dir / "translations" / "en-GB.json",
     ):
         strings = json.loads(path.read_text(encoding="utf-8"))
-        section = strings["options"]["step"]["init"]["sections"][INPUT_STEP_AI]
+        section = strings["options"]["step"]["settings"]["sections"][INPUT_STEP_AI]
         assert section["data"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_heading
         assert section["data_description"][CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED] == expected_description
 
@@ -872,10 +872,10 @@ def test_plan_fallback_notification_option_copy_matches_toggle_style() -> None:
 def test_options_flow_init_shows_one_collapsible_settings_form() -> None:
     flow = OptionsFlow(SimpleNamespace(options={}))
 
-    result = asyncio.run(flow.async_step_init())
+    result = asyncio.run(flow.async_step_settings())
 
     assert result["type"] == "form"
-    assert result["step_id"] == "init"
+    assert result["step_id"] == "settings"
     assert result["last_step"] is True
     assert tuple(str(getattr(key, "schema", key)) for key in result["data_schema"].schema) == (
         INPUT_STEP_ENERGY,
@@ -934,9 +934,7 @@ def test_config_flow_reports_options_and_vehicle_subentry_flow() -> None:
     options_flow = ConfigFlow.async_get_options_flow(SimpleNamespace(options={}))
 
     assert isinstance(options_flow, OptionsFlow)
-    assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {
-        "vehicle": config_flow_module.VehicleFlow,
-    }
+    assert ConfigFlow.async_get_supported_subentry_types(SimpleNamespace()) == {}
 
 
 def test_options_flow_consolidates_related_settings_sections() -> None:
@@ -957,7 +955,7 @@ def test_options_flow_accepts_a_partial_combined_section_submission() -> None:
         if str(getattr(marker, "schema", marker)) == POLICY_STEP_PRIORITIES
     )
 
-    result = asyncio.run(flow.async_step_init({POLICY_STEP_PRIORITIES: planning({})}))
+    result = asyncio.run(flow.async_step_settings({POLICY_STEP_PRIORITIES: planning({})}))
 
     assert result["type"] == "create_entry"
 
@@ -987,7 +985,7 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
         < ordered_fields.index(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED)
     )
 
-    ev_strings = _strings()["options"]["step"]["init"]["sections"][INPUT_STEP_EV]
+    ev_strings = _strings()["options"]["step"]["settings"]["sections"][INPUT_STEP_EV]
     assert ev_strings["data"][CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED] == "Enable lowest-cost daylight charging"
     assert "lowest-cost daylight charging" in ev_strings["description"]
 
@@ -1040,7 +1038,7 @@ def test_options_flow_saves_all_sections_together_and_preserves_options() -> Non
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "create_entry"
     assert updates == [
@@ -1096,7 +1094,7 @@ def test_options_flow_discards_legacy_ev_soc_limits() -> None:
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "create_entry"
     assert CONF_EV_MAX_SOC_PERCENT not in result["data"]
@@ -1120,7 +1118,7 @@ def test_options_flow_rejects_incomplete_climate_scheduler_guard() -> None:
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "climate_scheduler_guard_pair_required"}
@@ -1142,7 +1140,7 @@ def test_options_flow_rejects_keep_on_without_persistent_control() -> None:
         policy_overrides={POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: True}},
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "ev_keep_on_requires_persistent_control"}
@@ -1178,7 +1176,7 @@ def test_options_flow_rejects_zone_only_preconditioning_without_zone_thermostat(
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "zone_only_preconditioning_requires_climate_zone"}
@@ -1212,7 +1210,7 @@ def test_options_flow_accepts_zone_only_preconditioning_with_zone_thermostat() -
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "create_entry"
     assert result["data"][CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY] is True
@@ -1319,7 +1317,7 @@ def test_central_energy_settings_updates_main_entry_data() -> None:
     }
 
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_settings(
             _settings_submission(
                 flow,
                 input_sections={INPUT_STEP_ENERGY: energy},
@@ -1353,7 +1351,7 @@ def test_central_input_settings_prefill_and_validate_sections() -> None:
     flow = OptionsFlow(entry)
     flow.hass = _valid_hass()
     flow.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
-    form = asyncio.run(flow.async_step_init())
+    form = asyncio.run(flow.async_step_settings())
     energy_section = next(
         validator
         for marker, validator in form["data_schema"].schema.items()
@@ -1362,7 +1360,7 @@ def test_central_input_settings_prefill_and_validate_sections() -> None:
     fields = {str(getattr(marker, "schema", marker)): marker for marker in energy_section.schema.schema}
 
     invalid = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_settings(
             _settings_submission(
                 flow,
                 input_sections={
@@ -1405,7 +1403,7 @@ def test_central_settings_reject_cross_section_actuator_collisions() -> None:
         },
     )
 
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
 
     assert result["type"] == "form"
     assert result["errors"] == {"base": "household_actuator_in_use"}
@@ -1440,7 +1438,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
     assert ai_task_marker.description["suggested_value"] == "ai_task.old"
 
     result = asyncio.run(
-        flow.async_step_init(
+        flow.async_step_settings(
             _settings_submission(
                 flow,
                 input_sections={INPUT_STEP_AI: {CONF_AI_TASK_ENTITY: " ai_task.extended_openai_ai_task "}},
@@ -1464,7 +1462,7 @@ def test_central_ai_settings_normalize_and_clear_task_configuration() -> None:
         async_update_entry=lambda entry_arg, **changes: updates.append(changes),
     )
     asyncio.run(
-        clear_flow.async_step_init(
+        clear_flow.async_step_settings(
             _settings_submission(
                 clear_flow,
                 input_sections={INPUT_STEP_AI: {}},
@@ -1857,7 +1855,7 @@ def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on
         input_sections={INPUT_STEP_EV: {**sensors, **(switch if enable_keep_on else buttons)}},
         policy_overrides={POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: enable_keep_on}},
     )
-    result = asyncio.run(flow.async_step_init(submission))
+    result = asyncio.run(flow.async_step_settings(submission))
     assert result["type"] == "create_entry"
     assert result["data"][CONF_EV_KEEP_CHARGER_ON] is enable_keep_on
     saved = manager.async_update_entry.call_args.kwargs["data"]

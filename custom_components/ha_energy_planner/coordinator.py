@@ -1590,9 +1590,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             profile = self.vehicle_session.profile
             if profile is None:
                 raise ValueError("Select a tracked vehicle before changing its ready-by time")
-            subentry = self.entry.subentries[profile["id"]]
-            self.hass.config_entries.async_update_subentry(
-                self.entry, subentry, data={**subentry.data, CONF_DEFAULT_READY_BY: ready_by},
+            profiles = combined_entry_data(self.entry)[VEHICLES]
+            self.hass.config_entries.async_update_entry(
+                self.entry, data={**self.entry.data, VEHICLES: [
+                    {**item, CONF_DEFAULT_READY_BY: ready_by} if item["id"] == profile["id"] else item
+                    for item in profiles
+                ]},
             )
             await self.async_handle_vehicle_settings_update()
             return
