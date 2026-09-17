@@ -2489,10 +2489,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
             assert executor.pending_hvac_desired_state["restore_zones"] == {"switch.zone": "off"}
             assert store.data["ownership"]["climate_automations"] == {"automation.hvac": "on"}
             assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
-            assert store.data["ownership"]["hvac_control"]["main_state"] == {
-                "hvac_mode": "off",
-                "target_temperature": 20,
-            }
+            assert store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 20
             assert store.flush_count >= 1
             await self.persist_main_state(
                 {
@@ -2581,7 +2578,8 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
     assert store.data["ownership"]["hvac_control"]["coast_target"] == 19.0
     assert store.data["ownership"]["hvac_control"]["projected_precondition_end_temperature"] == 21.0
     assert store.data["ownership"]["hvac_control"]["zone_states"] == {"switch.zone": "off"}
-    assert "main_state" not in store.data["ownership"]["hvac_control"]
+    assert store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 20
+    assert store.data["ownership"]["hvac_control"]["main_state_committed"] is True
     assert "planner_hvac_action_expires_at" in store.data["ownership"]
     assert store.flush_count == 2
 
@@ -2595,6 +2593,23 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
 
     assert store.data["ownership"]["planner_takeover_started_at"] == takeover_started_at
     assert store.flush_count == 4
+
+
+    # A new executor after restart must restore the original main baseline,
+    # not the setpoint from the later coast command.
+    restored_main = []
+
+    async def restore(self: Any, automations: Any, zones: Any, main: Any) -> Any:
+        from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+        restored_main.append(main)
+        return HVACCommandResult(True, "hvac_control_released", {}, {}, {}, rollback_succeeded=True)
+
+    monkeypatch.setattr(FakeDaikinAdapter, "async_restore", restore)
+    restarted = Executor(store, hass=executor.hass, entry_data=executor.entry_data, options=executor.options)
+    asyncio.run(restarted.async_release_hvac_control("cycle_ended"))
+    assert restored_main[0]["target_temperature"] == 20
+    assert restored_main[0]["hvac_mode"] == "off"
+    assert "hvac_control" not in store.data["ownership"]
 
 
 @pytest.mark.parametrize("synchronize_zone_temperatures", [False, True])
@@ -2681,6 +2696,7 @@ def test_executor_flushes_manual_main_supersession_without_losing_subordinates()
         "climate_automations": {"automation.hvac": "on"},
         "hvac_control": {
             "main_state": {"hvac_mode": "off", "target_temperature": 20},
+            "main_state_committed": True,
             "zone_states": {"switch.zone": "off"},
         },
     }
@@ -7514,3 +7530,48 @@ def test_enphase_interrupted_command_is_restored_by_targeted_disable() -> None:
         assert store.data.get("command_rate_limits", {}) == {}
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("applied", [True, False])
+def test_hvac_transaction_manual_change_discards_committed_baseline(applied: bool) -> None:
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    previous = {"hvac_control": {
+        "main_state": {"hvac_mode": "heat", "target_temperature": 20},
+        "main_state_committed": True,
+        "zone_states": {"switch.zone": "off"},
+    }}
+    transaction = HVACOwnershipTransaction(previous, datetime.now(UTC))
+    provisional = transaction.prepare({"phase": "peak_coast"}, {}, {}, {})
+    result = transaction.complete(
+        HVACCommandResult(applied, "manual_change", {}, {}, {}, rollback_succeeded=True),
+        provisional, {"phase": "peak_coast"},
+        main_state_superseded=True, superseded_zone_entity_ids=set(),
+    )
+    assert result is not None
+    control = result["hvac_control"]
+    assert "main_state" not in control
+    assert "main_state_committed" not in control
+    assert control["zone_states"] == {"switch.zone": "off"}
+
+
+def test_hvac_rollback_enrichment_preserves_original_cycle_baseline() -> None:
+    store = FakeStore()
+    original = {"hvac_mode": "off", "target_temperature": 20}
+    store.data["ownership"] = {"hvac_control": {"main_state": original}}
+    executor = Executor(store)
+    asyncio.run(executor._async_persist_provisional_hvac_main_state({
+        "hvac_mode": "off", "target_temperature": 24,
+        "rollback_hvac_mode_changed": True, "rollback_active_hvac_mode": "cool",
+    }))
+    expected = {**original, "rollback_hvac_mode_changed": True, "rollback_active_hvac_mode": "cool"}
+    assert store.data["ownership"]["hvac_control"]["main_state"] == expected
+    # A second phase must not replace either the original target or the
+    # remembered mode that startup recovery would read after a crash.
+    asyncio.run(executor._async_persist_provisional_hvac_main_state({
+        "hvac_mode": "off", "target_temperature": 25,
+        "rollback_hvac_mode_changed": True, "rollback_active_hvac_mode": "heat",
+    }))
+    assert store.data["ownership"]["hvac_control"]["main_state"] == expected
+    assert store.flush_count == 2

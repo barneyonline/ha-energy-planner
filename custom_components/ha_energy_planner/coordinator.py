@@ -1087,6 +1087,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         stored_ownership = self.store.data.get("ownership", {})
         if isinstance(stored_ownership, dict):
             context.hvac_control = _hvac_control_from_ownership(stored_ownership)
+        context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
         if context.hvac_control and climate_issues:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
         thermal_model, thermal_model_changed = update_thermal_model(

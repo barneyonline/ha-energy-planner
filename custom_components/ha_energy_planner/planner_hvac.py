@@ -812,13 +812,14 @@ def _persisted_hvac_period_qualifies(
     suppression_delta: float,
 ) -> bool:
     """Confirm that a future persisted peak still exists in valid tariff evidence."""
-    if len(context.slots) < 2:
+    slots = context.hvac_tariff_slots if context.hvac_tariff_slots is not None else context.slots
+    if len(slots) < 2:
         return False
-    interval = context.slots[1].valid_at - context.slots[0].valid_at
+    interval = slots[1].valid_at - slots[0].valid_at
     if interval <= timedelta(0):
         return False
     period_slots = [
-        slot for slot in context.slots if slot.valid_at < period_end and slot.valid_at + interval > period_start
+        slot for slot in slots if slot.valid_at < period_end and slot.valid_at + interval > period_start
     ]
     if (
         not period_slots
@@ -848,7 +849,8 @@ def _tariff_evidence_covers_period(
     interval: timedelta,
 ) -> bool:
     """Return whether contiguous priced tariff evidence covers the persisted period."""
-    remaining_slots = [slot for slot in context.slots if slot.valid_at < period_end]
+    slots = context.hvac_tariff_slots if context.hvac_tariff_slots is not None else context.slots
+    remaining_slots = [slot for slot in slots if slot.valid_at < period_end]
     if not remaining_slots or interval <= timedelta(0):
         return False
     if any(slot.import_price is None for slot in remaining_slots):

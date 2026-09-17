@@ -9,6 +9,8 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Active legacy HVAC cycles resample fresh timestamped import prices on their persisted tariff grid, avoiding false cancellation when refresh times move. Genuine price changes and source gaps still reject the cycle (`tests/test_inputs.py`). Successful acquisition retains the original main baseline separately from unresolved recovery; subsequent coast commands and a new executor preserve that baseline. Release restores main/zone target dependencies before damper closure or main shutdown, including dynamic Daikin bounds and mandatory off cleanup after persistence failures or cancellation (`tests/test_executor.py`, `tests/test_hvac_adapter.py`). Climate diagnostics distinguish model learning, legacy rejection, execution, and pending restoration with readable bounded blocker/target attributes and legacy non-mapping ownership compatibility (`tests/test_diagnostics.py`, `tests/test_planner.py`, `tests/test_sensor.py`).
+
 - Preconditioning acquisition survives the next planning cycle when heating from at or below the lower comfort boundary or cooling from at or above the upper boundary. Opposite-boundary handoffs remain active, and scheduled coasting boundaries override stale persisted phases. Home/away, mirrored heating/cooling, manual override, missing evidence, and unsafe-input regressions are covered in `tests/test_planner.py`.
 
 - Startup input warnings have a bounded ten-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
