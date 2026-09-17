@@ -2808,7 +2808,9 @@ def test_hvac_zone_failure_restores_main_target_and_off_mode() -> None:
             1,
         )
     ]
-    assert pending_main_restores == [persisted_main_states[0][0]]
+    assert pending_main_restores[0] == persisted_main_states[0][0]
+    assert pending_main_restores[-1] == persisted_main_states[0][0]
+    assert pending_main_restores[1]["hvac_mode"] == "cool"
     assert pending_zone_restores == [{"climate.zone_temperature": {"target_temperature": 20}}]
     assert hass.services.calls[persisted_main_states[0][1]] == (
         "climate",
@@ -3469,3 +3471,78 @@ def test_zone_restore_accepts_observed_baseline_after_bounds_change(
     assert result.rollback_succeeded is True
     assert result.saved_zone_states == {}
     assert hass.services.calls == []
+
+
+@pytest.mark.parametrize("original_mode", ["heat", "off"])
+def test_lifecycle_release_restores_dynamic_zone_bounds_before_closing_damper(original_mode: str) -> None:
+    """Reproduce the live 24C head / 20C saved zone restoration dependency."""
+    hass = FakeHass({
+        "climate.daikin": FakeState("heat", {"temperature": 24}),
+        "climate.zone": FakeState("heat", {"temperature": 24, "min_temp": 22, "max_temp": 26}),
+        "switch.zone": "on", "automation.schedule": "off",
+    })
+    original_call = hass.services.async_call
+
+    async def call(domain: str, service: str, data: dict[str, Any], **kwargs: Any) -> None:
+        if data["entity_id"] == "climate.zone" and service == "set_temperature":
+            main = hass.states.get("climate.daikin")
+            assert main.state == "heat"
+            assert main.attributes["temperature"] - 2 <= data["temperature"] <= main.attributes["temperature"] + 2
+            assert hass.states.get("switch.zone").state == "on"
+        before = hass.states.get(data["entity_id"])
+        await original_call(domain, service, data, **kwargs)
+        if data["entity_id"] == "climate.daikin" and service == "turn_off":
+            hass.states.values["climate.daikin"] = FakeState("off", dict(before.attributes))
+        if data["entity_id"] == "climate.daikin" and service == "set_temperature":
+            zone = hass.states.get("climate.zone")
+            zone.attributes.update(min_temp=data["temperature"] - 2, max_temp=data["temperature"] + 2)
+        if data["entity_id"] in {"switch.zone", "climate.daikin"} and service == "turn_off":
+            if hass.states.get("switch.zone").state == "on":
+                assert hass.states.get("climate.zone").attributes["temperature"] == 20
+            hass.states.values["climate.zone"] = FakeState("off", {"temperature": None})
+
+    hass.services.async_call = call
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["switch.zone", "climate.zone"],
+        CONF_CLIMATE_AUTOMATIONS: ["automation.schedule"],
+    })
+    result = asyncio.run(adapter.async_restore(
+        {"automation.schedule": "on"},
+        {"switch.zone": "off", "climate.zone": {"target_temperature": 20}},
+        {"hvac_mode": original_mode, "target_temperature": 19},
+    ))
+    assert result.applied
+    assert result.saved_zone_states == result.saved_main_state == {}
+    assert hass.states.get("automation.schedule").state == "on"
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("failure", [OSError, asyncio.CancelledError])
+def test_interrupted_zone_supersession_still_shuts_down_main(monkeypatch, rollback, failure) -> None:
+    """A failed durable zone supersession must not skip the saved off cleanup."""
+    hass = FakeHass({
+        "climate.daikin": FakeState("heat", {"temperature": 24}),
+        "climate.zone": FakeState("heat", {"temperature": 24}),
+    })
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    adapter.set_zone_manual_override_check(
+        lambda: {"climate.zone"} if hass.states.get("climate.daikin").attributes.get("temperature") == 20 else set()
+    )
+
+    async def persist(main, zones):
+        assert zones == {"climate.zone"}
+        raise failure("interrupted durable zone supersession")
+
+    adapter.set_manual_supersession_persistence_callback(persist)
+    monkeypatch.setattr(hvac_adapter_module, "_STATE_CONFIRMATION_TIMEOUT_SECONDS", 0)
+    main = {"hvac_mode": "off", "target_temperature": 20}
+    zones = {"climate.zone": {"target_temperature": 20}}
+    with pytest.raises(failure):
+        if rollback:
+            asyncio.run(adapter._async_rollback_takeover(
+                {}, zones, main_entity="climate.daikin", saved_main_state=main,
+            ))
+        else:
+            asyncio.run(adapter.async_restore({}, zones, main))
+    assert hass.states.get("climate.daikin").state == "off"
+    assert ("climate", "turn_off", {"entity_id": "climate.daikin"}) in hass.services.calls

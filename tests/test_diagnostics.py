@@ -270,3 +270,33 @@ def test_diagnostics_exposes_compact_operational_metadata() -> None:
     assert len(diagnostics["recent_outcomes"]) == 10
     assert diagnostics["recent_outcomes"][0]["action_id"] == "old-2"
     assert _load_forecast_summary([]) == {}
+
+
+def test_climate_diagnostics_distinguish_learning_from_failed_execution() -> None:
+    from types import SimpleNamespace
+
+    from custom_components.ha_energy_planner.diagnostics import climate_diagnostics
+
+    release = {"asset": "daikin", "kind": "release_hvac", "reason": "hvac_release_failed"}
+    rejection = {"asset": "daikin", "kind": "set_hvac", "reason": "manual_hvac_override_active"}
+    store = {
+        "climate_engine": {
+            "status": "learning", "modes": {"heat": {"blockers": ["history_days"]}},
+            "observations": [{"at": "2026-09-17T00:00:00", "provenance": "normal"},
+                             {"at": "2026-09-17T00:05:00", "provenance": "manual"}],
+            "model": {"trained_at": "2026-09-17", "validation": {
+                "heat": {"windows": 0, "residuals": [1] * 1000}}},
+        },
+        "ownership": {"hvac_control": {"required_evidence_lost": "hvac_release_failed", "zone_states": {}}},
+        "execution_audit": [release, rejection],
+    }
+    plan = SimpleNamespace(device_plans={"climate": {"economics": {"status": "learning"}}})
+    result = climate_diagnostics(store, plan)
+    assert result["economic_status"] == "learning"
+    assert result["observation_count"] == 2
+    assert result["normal_observation_count"] == result["normal_history_days"] == 1
+    assert result["last_release"] == release
+    assert result["last_outcome"] == rejection
+    assert result["validation"] == {"heat": {"windows": 0}}
+    assert result["pending_restore"]["required_evidence_lost"] == "hvac_release_failed"
+    assert climate_diagnostics({}, None)["last_release"] is None

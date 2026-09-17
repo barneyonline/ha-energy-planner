@@ -2181,3 +2181,72 @@ def test_old_mixed_secondary_forecast_cannot_supply_midnight_coverage() -> None:
     assert issue == "pv_forecast_entity_incomplete_horizon"
     assert "pv_forecast_entity_stale" in manager._freshness_issues(now)
     assert manager.forecast_coverage_details[0]["classification"] == "stale"
+
+
+@pytest.mark.parametrize("elapsed", [11, 901, 1800, 2700])
+def test_owned_climate_tariffs_keep_original_grid_across_refresh_and_restart(elapsed: int) -> None:
+    """An unchanged forecast must not cancel an owned cycle when wall time moves."""
+    import json
+
+    from custom_components.ha_energy_planner.models import DecisionContext, DecisionSlot
+    from custom_components.ha_energy_planner.planner_hvac import _persisted_hvac_period_qualifies
+
+    start = datetime(2026, 9, 17, 5, 0, 18, tzinfo=UTC)
+    source_start = start.replace(second=0)
+    forecast = [
+        {"time": (source_start + timedelta(minutes=30 * index)).isoformat(),
+         "value": 0.05 if index < 2 or index >= 12 else 0.35}
+        for index in range(30)
+    ]
+    state = FakeState("0.05", {"forecast": forecast, "unit_of_measurement": "AUD/kWh"})
+    manager = _RawInputManager(
+        FakeHass({"sensor.tariff": state}), {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"},
+        {**DEFAULT_OPTIONS, "planning_interval_minutes": 15},
+    )
+    peak = start + timedelta(hours=1)
+    end = start + timedelta(hours=6)
+    context = DecisionContext(start + timedelta(seconds=elapsed), "refresh", [], None, None,
+                              OccupancyState.OCCUPIED, InputHealth.HEALTHY)
+    # Ownership round-trips through JSON on restart; it cannot rely on old Python objects.
+    context.hvac_control = json.loads(json.dumps({"period_start": peak.isoformat()}))
+    context.slots = [DecisionSlot(context.created_at, 0.05, None, None, None)]
+    context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
+    assert context.hvac_tariff_slots
+    assert _persisted_hvac_period_qualifies(context, peak, end, 0.05, 0.2, 0.2)
+    # Always use newly fetched evidence: a real price change must still cancel.
+    forecast[2]["value"] = 0.10
+    context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
+    assert not _persisted_hvac_period_qualifies(context, peak, end, 0.05, 0.2, 0.2)
+    # Nor may missing future source intervals be bridged by a remembered value.
+    forecast[2]["value"] = 0.35
+    forecast.pop(4)
+    context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
+    assert not _persisted_hvac_period_qualifies(context, peak, end, 0.05, 0.2, 0.2)
+
+
+def test_retained_climate_tariff_evidence_fails_closed() -> None:
+    from custom_components.ha_energy_planner.models import DecisionContext, DecisionSlot
+
+    now = datetime(2026, 9, 17, 5, 0, tzinfo=UTC)
+    hass = FakeHass({})
+    manager = _RawInputManager(hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"}, DEFAULT_OPTIONS)
+    context = DecisionContext(now, "test", [], None, None, OccupancyState.OCCUPIED, InputHealth.HEALTHY)
+    assert manager.retained_hvac_tariff_slots(context) is None
+    for peak in ["bad", "2026-09-17T05:00:00", now.isoformat()]:
+        context.hvac_control = {"period_start": peak}
+        assert manager.retained_hvac_tariff_slots(context) == []
+    hass.states.values["sensor.tariff"] = FakeState("0.1", {"forecast": [0.1, 0.4]})
+    manager = _RawInputManager(hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"}, DEFAULT_OPTIONS)
+    assert manager.retained_hvac_tariff_slots(context) == []
+    context.hvac_control["economic_policy_version"] = 1
+    assert manager.retained_hvac_tariff_slots(context) is None
+    context.hvac_control.pop("economic_policy_version")
+    context.created_at += timedelta(minutes=1)
+    context.slots = [DecisionSlot(context.created_at, 0.1, None, None, None)]
+    hass.states.values["sensor.tariff"].attributes = {"unit_of_measurement": "AUD/kWh", "forecast": [
+        {"time": context.created_at.isoformat(), "value": 0.1},
+        {"time": (context.created_at + timedelta(minutes=30)).isoformat(), "value": 0.4},
+    ]}
+    manager = _RawInputManager(hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"}, DEFAULT_OPTIONS)
+    slots = manager.retained_hvac_tariff_slots(context)
+    assert slots and slots[0].import_price == 0.1

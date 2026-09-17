@@ -4731,6 +4731,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
         lambda *args, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {},
             build_context=lambda overrides: context,
+            retained_hvac_tariff_slots=lambda context: None,
             thermal_sample=lambda built_context: {},
             forecast_training_slots=[],
             forecast_calibration={},

@@ -892,7 +892,8 @@ class Executor:
             return None
         if reason is None and action.asset == ActionAsset.DAIKIN and self.hass is not None:
             existing_hvac_control = dict(dict(self.store.data.get("ownership", {})).get("hvac_control", {}))
-            if existing_hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY):
+            if (existing_hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY)
+                    and not existing_hvac_control.get("main_state_committed")):
                 # A prior failed transaction owns a main-state baseline that a
                 # new acquisition must neither overwrite nor clear. Recover it
                 # first; a later planner cycle may acquire only after release
@@ -1326,6 +1327,7 @@ class Executor:
                     hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = unresolved_main_state
                 else:
                     hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
+            hvac_control.pop("main_state_committed", None)
             hvac_control["required_evidence_lost"] = "hvac_release_failed"
             ownership["hvac_control"] = hvac_control
         await self.store.async_save_ownership(ownership)
@@ -1564,6 +1566,7 @@ class Executor:
                             retained_hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = unresolved_main_state
                         else:
                             retained_hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
+                        retained_hvac_control.pop("main_state_committed", None)
                         retained_hvac_control["required_evidence_lost"] = "hvac_release_failed"
                         remaining_ownership["hvac_control"] = retained_hvac_control
 
@@ -2406,7 +2409,11 @@ class Executor:
         """Persist evolving main rollback evidence before a thermostat command."""
         ownership = deepcopy(dict(self.store.data.get("ownership", {})))
         hvac_control = dict(ownership.get("hvac_control", {}))
-        hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = dict(main_state)
+        # Enrich remembered-mode evidence without replacing the original cycle
+        # target with a later phase snapshot, including if we stop mid-command.
+        baseline = dict(main_state)
+        baseline.update(hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY, {}))
+        hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = baseline
         ownership["hvac_control"] = hvac_control
         await self.store.async_save_ownership(ownership)
         await self._async_flush_provisional_state()
@@ -2435,6 +2442,7 @@ class Executor:
         hvac_control = dict(ownership.get("hvac_control", {}))
         if main_superseded:
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
+            hvac_control.pop("main_state_committed", None)
         zone_states = dict(hvac_control.get("zone_states", {}))
         for entity_id in zone_entity_ids:
             zone_states.pop(entity_id, None)

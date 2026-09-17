@@ -1553,3 +1553,17 @@ def test_plan_health_handles_legacy_non_mapping_hvac_ownership() -> None:
         coordinator = _coordinator(_plan(), store_data=stored)
         assert health.value_fn(coordinator) == "healthy"
         assert health.attrs_fn(coordinator)["pending_hvac_restore"] == {}
+        assert sensor_module._decision_summary_attrs(coordinator)["climate"]["pending_restore"] == {}
+
+
+def test_decision_summary_preserves_climate_blockers_and_restore_targets() -> None:
+    coordinator = _coordinator(_plan(), store_data={
+        "climate_engine": {"modes": {"heat": {"blockers": ["history_days", "validation_windows"]}}},
+        "ownership": {"hvac_control": {
+            "required_evidence_lost": "hvac_release_failed",
+            "zone_states": {"climate.zone": {"target_temperature": 20}},
+        }},
+    })
+    climate = sensor_module._decision_summary_attrs(coordinator)["climate"]
+    assert climate["readiness"]["heat"]["blockers"] == ["history_days", "validation_windows"]
+    assert climate["pending_restore"]["zone_states"]["climate.zone"]["target_temperature"] == 20

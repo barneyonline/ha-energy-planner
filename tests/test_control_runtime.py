@@ -287,6 +287,7 @@ def test_operator_disarm_restores_hvac_before_failed_persistence(
                     await coordinator.async_operator_disarm_production_control()
             hass.state = CoreState.running
             assert calls[before:] == [
+                ("climate", "set_temperature", {"entity_id": "climate.home", "temperature": 20.0}),
                 ("switch", "turn_off", {"entity_id": "switch.zone"}),
                 *([] if restore_fails else [("automation", "turn_on", {"entity_id": "automation.climate"})]),
             ]
