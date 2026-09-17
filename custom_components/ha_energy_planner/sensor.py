@@ -44,6 +44,7 @@ from .coordinator import (
     _ai_recommendation_fingerprint,
     _material_plan_fingerprint,
 )
+from .diagnostics import climate_diagnostics
 from .discovery import CapabilityDiscovery
 from .entity import EnergyPlannerEntity, recorder_safe_attributes
 from .entry_data import combined_entry_data
@@ -227,6 +228,10 @@ def _decision_summary_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         ],
         "rejected_action_count": len(rejected),
         "rejected_actions": bounded_json([item for item in rejected if isinstance(item, dict)][:12]),
+        "climate": {
+            key: bounded_json(value)
+            for key, value in climate_diagnostics(coordinator.store.data, plan).items()
+        },
         "ev_optimization": bounded_json(next((
             action.desired_state.get("optimization", {}) for action in plan.actions if action.asset == ActionAsset.EV
         ), {})),

@@ -89,6 +89,7 @@ async def async_get_config_entry_diagnostics(
         "weather_forecast": _redact(
             dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
         ),
+        "climate": _redact(climate_diagnostics(store_data, plan)),
         "automatic_control": {
             "requested": automatic_control_requested,
             "running": automatic_control_running,
@@ -104,6 +105,33 @@ async def async_get_config_entry_diagnostics(
         "store": _redact(_store_summary(store_data)),
     }
     return data
+
+
+def climate_diagnostics(store_data: dict[str, Any], plan: Any) -> dict[str, Any]:
+    """Separate model readiness from the last actual climate control outcome."""
+    engine = store_data.get("climate_engine", {})
+    model = engine.get("model", {})
+    observations = engine.get("observations", [])
+    normal = [row for row in observations if row.get("provenance") == "normal"]
+    outcomes = [item for item in audit_records(store_data) if item.get("asset") == "daikin"]
+    control = store_data.get("ownership", {}).get("hvac_control", {})
+    return {
+        "economic_status": engine.get("status", "learning"),
+        "ever_active": bool(engine.get("ever_active")),
+        "readiness": engine.get("modes", {}),
+        "observation_count": len(observations),
+        "normal_observation_count": len(normal),
+        "normal_history_days": len({str(row.get("at", ""))[:10] for row in normal if row.get("at")}),
+        "model_trained_at": model.get("trained_at"),
+        "validation": {
+            mode: {key: value for key, value in result.items() if key != "residuals"}
+            for mode, result in model.get("validation", {}).items()
+        },
+        "decision": {} if plan is None else plan.device_plans.get("climate", {}).get("economics", {}),
+        "last_outcome": outcomes[-1] if outcomes else None,
+        "last_release": next((item for item in reversed(outcomes) if item.get("kind") == "release_hvac"), None),
+        "pending_restore": control if isinstance(control, dict) and control.get("required_evidence_lost") else {},
+    }
 
 
 def _refresh_performance(coordinator: Any) -> dict[str, Any]:

@@ -69,6 +69,7 @@ class HVACOwnershipTransaction:
         for entity_id, state in zone_snapshot.items():
             provisional_zone_states.setdefault(entity_id, state)
         provisional_hvac_control["zone_states"] = provisional_zone_states
+        provisional_hvac_control.pop("main_state_committed", None)
         if main_snapshot:
             provisional_hvac_control.setdefault(_HVAC_MAIN_STATE_OWNERSHIP_KEY, main_snapshot)
         for key in HVAC_LIFECYCLE_FIELDS:
@@ -105,6 +106,7 @@ class HVACOwnershipTransaction:
                             _HVAC_MAIN_STATE_OWNERSHIP_KEY,
                             None,
                         )
+                        rollback_hvac_control.pop("main_state_committed", None)
                     rollback_zone_states = dict(rollback_hvac_control.get("zone_states", {}))
                     for entity_id in superseded_zone_entity_ids:
                         rollback_zone_states.pop(entity_id, None)
@@ -135,6 +137,7 @@ class HVACOwnershipTransaction:
                         _HVAC_MAIN_STATE_OWNERSHIP_KEY,
                         unresolved_main_state,
                     )
+                hvac_control.pop("main_state_committed", None)
                 hvac_control["required_evidence_lost"] = "hvac_acquisition_rollback_failed"
                 ownership_data["hvac_control"] = hvac_control
                 return ownership_data
@@ -149,7 +152,13 @@ class HVACOwnershipTransaction:
             for entity_id, state in hvac_result.saved_zone_states.items():
                 saved_zones.setdefault(entity_id, state)
             hvac_control["zone_states"] = saved_zones
-            hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
+            # Successful acquisition still owns the original thermostat baseline.
+            # Mark it as lifecycle ownership, distinct from failed recovery.
+            if main_state_superseded:
+                hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
+                hvac_control.pop("main_state_committed", None)
+            if hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY):
+                hvac_control["main_state_committed"] = True
             for key in HVAC_LIFECYCLE_FIELDS:
                 if desired.get(key) is not None:
                     hvac_control[key] = desired[key]
