@@ -437,6 +437,46 @@ class InputManager:
             return None, f"{config_key}_non_numeric"
         return value, None
 
+    def retained_hvac_tariff_slots(self, context: DecisionContext) -> list[DecisionSlot] | None:
+        """Resample fresh tariffs on the owned cycle's original grid, including after restart.
+
+        Rebuilding the grid at each refresh makes the preceding cheap slot overlap
+        a persisted peak by seconds. Keep the cycle's time origin, not its prices.
+        None means no legacy cycle; an empty list means its evidence is missing.
+        """
+        control = context.hvac_control
+        if not control.get("period_start") or control.get("economic_policy_version"):
+            return None
+        try:
+            peak = datetime.fromisoformat(str(control["period_start"]).replace("Z", "+00:00"))
+            if peak.tzinfo is None:
+                return []
+        except (TypeError, ValueError):
+            return []
+        interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        origin = peak + ((context.created_at - peak) // interval) * interval
+        state = self._state(self.entry_data.get(CONF_AMBER_IMPORT_PRICE))
+        if not self._valid_state(state):
+            return []
+        prices = forecast_series_from_state(
+            state, issued_at=origin,
+            horizon_hours=int(self.options[CONF_PLANNING_HORIZON_HOURS]) + 1,
+            interval_minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]),
+            value_keys=("import_price", "general_price", "per_kwh", "price", "value"),
+            value_kind="price", require_timestamped=True,
+        )
+        if not prices:
+            return []
+        # A provider can discard the source interval containing the old origin.
+        # Only the remaining current interval needs coverage, which the ordinary
+        # current-time input parser has already evaluated. Never fill future gaps.
+        if prices[0] is None and origin < context.created_at and context.slots:
+            prices[0] = context.slots[0].import_price
+        return [
+            DecisionSlot(origin + index * interval, price, None, None, None)
+            for index, price in enumerate(prices)
+        ]
+
     def _required_series(
         self,
         config_key: str,

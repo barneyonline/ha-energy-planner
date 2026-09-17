@@ -601,19 +601,11 @@ class DaikinHVACAdapter:
                 {entity_id: state for entity_id, state in zones.items() if entity_id not in superseded_zones},
                 {} if main_superseded else main_state,
             )
-        main_restored = True
-        unresolved_main_state: dict[str, Any] = {}
         climate_entity = self.entry_data.get(CONF_DAIKIN_CLIMATE)
-        await self._async_persist_requested_manual_supersessions()
-        if main_state:
-            main_restored = bool(climate_entity) and await self._async_restore_main_state_preserving_manual(
-                str(climate_entity),
-                main_state,
-            )
-            if not main_restored:
-                unresolved_main_state = main_state
-        await self._async_persist_requested_manual_supersessions()
-        zones_restored, unresolved_zones = await self._async_restore_zone_states(zones)
+        main_restored, zones_restored, unresolved_zones = await self._async_restore_main_and_zones(
+            str(climate_entity), main_state, zones,
+        )
+        unresolved_main_state = {} if main_restored else main_state
         await self._async_persist_requested_manual_supersessions()
         restored, unresolved_states = await self._async_enable_automation_entities(states)
         await self._async_persist_requested_manual_supersessions()
@@ -918,16 +910,9 @@ class DaikinHVACAdapter:
         if self._set_pending_zone_restore is not None:
             self._set_pending_zone_restore(dict(changed_zones))
         await self._async_persist_requested_manual_supersessions()
-        main_restored = (
-            await self._async_restore_main_state_preserving_manual(
-                main_entity,
-                saved_main_state,
-            )
-            if restore_main
-            else True
+        main_restored, zones_restored, unresolved_zones = await self._async_restore_main_and_zones(
+            main_entity, saved_main_state if restore_main else {}, changed_zones,
         )
-        await self._async_persist_requested_manual_supersessions()
-        zones_restored, unresolved_zones = await self._async_restore_zone_states(changed_zones)
         await self._async_persist_requested_manual_supersessions()
         automations_restored, unresolved_states = await self._async_enable_automation_entities(saved_automation_states)
         await self._async_persist_requested_manual_supersessions()
@@ -937,6 +922,48 @@ class DaikinHVACAdapter:
             unresolved_zones,
             {} if main_restored or not restore_main else saved_main_state,
         )
+
+    async def _async_restore_main_and_zones(
+        self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
+    ) -> tuple[bool, bool, dict[str, Any]]:
+        """Restore dependent targets before removing the mode that exposes them."""
+        observed = self._state(main_entity)
+        defer_off = (
+            main_state.get("hvac_mode") == "off"
+            and observed is not None and observed.state in _ACTIVE_HVAC_MODES
+            and any(entity.startswith("climate.") for entity in zones)
+        )
+        staged_main = dict(main_state)
+        if defer_off:
+            assert observed is not None
+            staged_main["hvac_mode"] = (
+                main_state.get(_ROLLBACK_ACTIVE_HVAC_MODE, observed.state)
+                if main_state.get(_ROLLBACK_HVAC_MODE_CHANGED) else observed.state
+            )
+        await self._async_persist_requested_manual_supersessions()
+        if self._set_pending_main_restore is not None:
+            self._set_pending_main_restore(staged_main)
+        off_restored = True
+        try:
+            main_restored = (
+                await self._async_restore_main_state_preserving_manual(main_entity, staged_main)
+                if main_state else True
+            )
+            await self._async_persist_requested_manual_supersessions()
+            # A damper or the main off command can hide a zone's target. Restore
+            # temperature snapshots first, then restore switches and main power.
+            ordered_zones = dict(sorted(zones.items(), key=lambda item: not item[0].startswith("climate.")))
+            zones_restored, unresolved_zones = await self._async_restore_zone_states(ordered_zones)
+        finally:
+            # Delaying off must not let a persistence error or task cancellation
+            # strand planner-owned heating/cooling. Manual main changes still win.
+            if defer_off:
+                if self._set_pending_main_restore is not None:
+                    self._set_pending_main_restore(main_state)
+                off_restored = await self._async_restore_main_state_preserving_manual(main_entity, main_state)
+        main_restored = main_restored and off_restored
+        await self._async_persist_requested_manual_supersessions()
+        return main_restored, zones_restored, unresolved_zones
 
     async def _async_manual_override_result(
         self,

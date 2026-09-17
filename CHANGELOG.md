@@ -12,11 +12,12 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep active climate tariff windows stable across refreshes and restarts while rechecking fresh prices and forecast gaps.
+- Preserve the original main thermostat baseline through successful preconditioning and coasting, and restore dependent zone temperatures before damper closure or main shutdown. Delayed shutdown still runs if restoration is interrupted by a persistence failure or cancellation.
 
 ### 🔧 Improvements
 
-- None
+- Separate economic climate learning from legacy preconditioning rejection reasons; expose validation progress, recent execution/release outcomes, and pending restoration in diagnostics and Decision summary, preserving blocker names and saved target values within attribute bounds and tolerating legacy non-mapping HVAC ownership.
 
 ### 🔄 Other changes
 

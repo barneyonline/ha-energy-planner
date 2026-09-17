@@ -895,11 +895,20 @@ def _rejected_climate_decision(
     options: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Return why climate control was not selected."""
-    if context.climate_decision.get("summary"):
+    legacy_fallback = (
+        context.climate_decision.get("status") == "learning"
+        and not context.climate_engine.get("ever_active")
+        and not context.climate_decision.get("observing")
+        and options.get("hvac_decision_policy", "automatic") == "automatic"
+    )
+    if context.climate_decision.get("summary") and not legacy_fallback:
         return {"device": "Climate", "action": "Precondition", "reason": context.climate_decision["summary"]}
     confidence_reason = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
     if confidence_reason is not None:
         reason = confidence_reason
+    elif any(o.kind == "manual_hvac" and (o.expires_at is None or context.created_at < o.expires_at)
+             for o in context.active_overrides):
+        reason = "Skipped climate preconditioning because a manual climate override is active."
     elif context.occupancy_state != OccupancyState.OCCUPIED and not (
         context.occupancy_state == OccupancyState.AWAY
         and strict_bool(options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY, False), default=False)

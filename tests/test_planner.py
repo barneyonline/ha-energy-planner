@@ -3871,3 +3871,17 @@ def test_observation_only_comparison_does_not_discard_legacy_release(monkeypatch
     planner = DryRunPlanner({**DEFAULT_OPTIONS, 'planner_enabled': True})
     monkeypatch.setattr(planner, '_enphase_action', battery)
     assert any(action.kind == ActionKind.RELEASE_HVAC for action in planner.create_plan(context).actions)
+
+
+def test_learning_message_does_not_hide_legacy_rejection_or_manual_override() -> None:
+    context = _context()
+    context.climate_decision = {"status": "learning", "summary": "Waiting for supported evidence."}
+    context.climate_engine = {"ever_active": False}
+    result = planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)
+    assert result["reason"] != "Waiting for supported evidence."
+    context.active_overrides = [Override("manual_hvac", "user", None, "manual")]
+    assert "manual climate override" in planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)["reason"]
+    context.climate_decision["observing"] = True
+    assert planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)["reason"] == (
+        "Waiting for supported evidence."
+    )
