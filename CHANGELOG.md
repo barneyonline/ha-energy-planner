@@ -12,6 +12,28 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.1.2 - 2026-09-17
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Keep active climate tariff windows stable across refreshes and restarts while rechecking fresh prices and forecast gaps.
 - Preserve the original main thermostat baseline through successful preconditioning and coasting, and restore dependent zone temperatures before damper closure or main shutdown. Delayed shutdown still runs if restoration is interrupted by a persistence failure or cancellation.
 
