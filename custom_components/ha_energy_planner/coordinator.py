@@ -3066,11 +3066,23 @@ def _matches_pending_coupled_zone_hvac_feedback(
         expected.get("actuator_entity_id"),
         event.data.get("entity_id"),
     )
-    if not context_matches and not (
-        entity_pair_matches
+    # Some Daikin integrations publish subordinate states with fresh contexts.
+    # Only the configured main unit's explicit turn-on phase may explain a
+    # deferred zone waking up without command ancestry.
+    main_startup_matches = (
+        expected.get("actuator_entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
+        and pending.get("turn_on_feedback_expected") is True
+        and expected_state == "on"
+        and event.data.get("entity_id") in pending.get("deferred_zone_entities", [])
+        and event.data.get("entity_id") in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+    )
+    unlinked_feedback = (
+        event_context is not None
         and getattr(event_context, "user_id", None) is None
         and getattr(event_context, "parent_id", None) is None
-    ):
+        and (entity_pair_matches or main_startup_matches)
+    )
+    if not context_matches and not unlinked_feedback:
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
@@ -3092,10 +3104,11 @@ def _matches_pending_coupled_zone_hvac_feedback(
         if old_attributes.get(attribute) != new_attributes.get(attribute)
     }
     if (
-        context_matches
+        (context_matches or (unlinked_feedback and new_mode == pending.get("hvac_mode")))
         and expected_state == "on"
         and event.data.get("entity_id") in pending.get("deferred_zone_entities", [])
         and zone_temperature_sync_deferred(old_state)
+        and bool(changed_attributes)
         and changed_attributes <= {"temperature", "target_temp_low", "target_temp_high"}
     ):
         # A linked off zone may recover its previous target when our command
@@ -3104,7 +3117,7 @@ def _matches_pending_coupled_zone_hvac_feedback(
             _matching_hvac_target(new_attributes.get(attribute), new_attributes.get(attribute))
             for attribute in changed_attributes
         )
-    return not changed_attributes
+    return not changed_attributes and (context_matches or entity_pair_matches)
 
 
 def _coupled_zone_entity_ids_match(actuator_entity_id: Any, climate_entity_id: Any) -> bool:
