@@ -35,7 +35,9 @@ def planning_status(
             "review policy and existing ownership.",
         )
     if not economic or economic.get("legacy_fallback"):
-        if any(
+        if _confidence_rejection_reason(ActionAsset.DAIKIN, context, options) is not None:
+            status, code = "blocked", "insufficient_confidence"
+        elif any(
             o.kind == "manual_hvac" and (o.expires_at is None or context.created_at < o.expires_at)
             for o in context.active_overrides
         ):
@@ -46,8 +48,6 @@ def planning_status(
             options.get("hvac_precondition_while_away"), default=False
         ):
             status, code = "blocked", "occupancy_away"
-        elif _confidence_rejection_reason(ActionAsset.DAIKIN, context, options) is not None:
-            status, code = "blocked", "insufficient_confidence"
         elif any(
             value is None
             for value in (

@@ -992,3 +992,5 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - `tests/test_preconditioning.py` covers blocker recovery, observation policy, hold expiry, forecast/price/lead/rest evidence, planned versus actual control, store reload, repeated refreshes, failed and successful attempts, expired/withdrawn windows, restored ownership, stale-outcome isolation, and attribute bounds. Existing climate/executor/adapter recovery regressions remain part of the full Docker gate.
 
 - Review regressions reproduce concurrent replan/late-outcome correlation, restart between committed ownership and audit writes, coasting-only false positives, post-planning validation downgrade, and the final restoration-target gate. Storage-level tests verify durable readback and immutable prior generations.
+
+- Simultaneous-blocker regressions verify that legacy confidence, manual override, and occupancy reason codes stay aligned with their explanations and move to the remaining blocker when confidence recovers.

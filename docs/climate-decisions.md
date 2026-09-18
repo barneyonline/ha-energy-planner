@@ -149,7 +149,9 @@ Open **Decision summary → climate → preconditioning**. The same evidence is
 included in downloaded diagnostics. `status` distinguishes `scheduled`, `running`,
 `learning`, `observation`, `blocked`, `no_opportunity`, and `restoring`.
 `summary` gives the explanation, `reason` is its stable code, `next_step` explains
-what to check, and `evaluated_at` and `next_start` show when it was assessed and
+what to check. When legacy planning has several blockers, confidence takes
+precedence over manual and occupancy blockers in both the reason code and explanation.
+`evaluated_at` and `next_start` show when it was assessed and
 when the next selected preconditioning command is due. A scheduled command still
 passes execution gates; it does not prove the heater or cooler ran. Running means
 planner ownership, including coasting, rather than measured compressor activity.
