@@ -603,7 +603,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
   recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
   Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
-  frozen exclusions, failed-command rollback, and context-linked recovery during main-unit or zone-switch activation. Unrelated contexts, manual changes, auxiliary-setting changes, and invalid recovered targets retain manual-override handling. It publishes affected entity IDs in Current state
+  frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution, the requested mode, and finite restored targets. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction; attributed changes, unrelated zones, wrong modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping
   releases eligible, and creates one recovery-aware notification.
   Execution repeats the check immediately before adapter construction so the
@@ -626,7 +626,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   may publish only the corresponding off-to-active or active-to-off transition
   with the actuator call's Home Assistant context while that call and
   confirmation are explicitly phased. A context-free sibling refresh requires
-  an unambiguous actuator/climate entity-ID pair; unrelated zone, user-context,
+  an unambiguous actuator/climate entity-ID pair, except for the bounded deferred-zone main-startup recovery described above; unrelated zone, user-context,
   target, and auxiliary-control changes still supersede the transaction. A different user
   target synchronously supersedes and durably removes only that zone's baseline
   before the remaining rollback actuators run. Await-to-actuator boundaries recheck supersession after main
