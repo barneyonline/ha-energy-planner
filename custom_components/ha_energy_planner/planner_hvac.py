@@ -71,6 +71,7 @@ class HVACPlanningPolicy:
         execute_not_after: datetime,
     ) -> list[PlanAction]:
         """Plan precondition, peak-coast, and release lifecycle actions."""
+        context.climate_legacy_decision = {}
         active = dict(context.hvac_control or {})
         if active.get("economic_policy_version"):
             return []
@@ -84,6 +85,7 @@ class HVACPlanningPolicy:
             # A hold survives release, but does not represent actuator ownership.
             # Resolve it before comfort/override checks can emit another release.
             if now < released_until:
+                _hvac_reject(context, "release_hold", {"until": released_until.isoformat()})
                 return []
             active = {}
 
@@ -169,6 +171,7 @@ class HVACPlanningPolicy:
 
         released_until = _datetime_value(active.get("released_until"))
         if released_until is not None and now < released_until:
+            _hvac_reject(context, "release_hold", {"until": released_until.isoformat()})
             return []
 
         if active:
@@ -398,15 +401,18 @@ class HVACPlanningPolicy:
     ) -> dict[str, Any] | None:
         """Return the earliest thermally feasible relative-price period."""
         if len(context.slots) < 2:
+            _hvac_reject(context, "forecast_too_short", {"available_slots": len(context.slots), "required_slots": 2})
             return None
         low = context.occupied_temperature_low_c
         high = context.occupied_temperature_high_c
         current = context.current_hvac_temperature_c
         if low is None or high is None or current is None:
+            _hvac_reject(context, "comfort_inputs_missing", {})
             return None
         interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         lead_minutes = int(self.options[CONF_HVAC_PRECONDITION_LEAD_MINUTES])
         if lead_minutes <= 0:
+            _hvac_reject(context, "lead_time_disabled", {"lead_minutes": lead_minutes})
             return None
         lead_slots = ceil(lead_minutes / interval_minutes)
         start_delta = max(
@@ -418,6 +424,7 @@ class HVACPlanningPolicy:
         while index < len(context.slots):
             slot = context.slots[index]
             if slot.import_price is None:
+                _hvac_reject(context, "forecast_gap", {"at": slot.valid_at.isoformat()})
                 index += 1
                 continue
             window_start = max(0, index - lead_slots)
@@ -427,10 +434,14 @@ class HVACPlanningPolicy:
                 if context.slots[position].import_price is not None
             ]
             if not priced_window:
+                _hvac_reject(context, "forecast_gap", {"at": slot.valid_at.isoformat()})
                 index += 1
                 continue
             baseline = min(price for _position, price in priced_window)
             if float(slot.import_price) < baseline + start_delta:
+                _hvac_reject(context, "price_difference",
+                    {"actual_delta": round(float(slot.import_price) - baseline, 6), "required_delta": start_delta}
+                )
                 index += 1
                 continue
             end_index = index + 1
@@ -442,6 +453,9 @@ class HVACPlanningPolicy:
                 end_index += 1
             mode = _future_hvac_mode(context, slot, current, low, high)
             if mode is None:
+                _hvac_reject(context, "thermal_direction",
+                    {"current_temperature": current, "comfort_low": low, "comfort_high": high}
+                )
                 index = end_index
                 continue
             target = high if mode == "heat" else low
@@ -460,6 +474,7 @@ class HVACPlanningPolicy:
                     and possible_start_at < earliest_start
                     and not (allow_immediate_start and possible_start_at <= context.created_at)
                 ):
+                    _hvac_reject(context, "minimum_cycle", {"earliest_start": earliest_start.isoformat()})
                     continue
                 if rate is None or rate <= 0:
                     required_slots = lead_slots
@@ -472,17 +487,28 @@ class HVACPlanningPolicy:
                     if passive_drift is not None:
                         projected_start_temperature += passive_drift * hours_to_start
                     if mode == "heat" and projected_start_temperature >= high:
+                        _hvac_reject(context, "comfort_target_reached",
+                            {"projected_temperature": projected_start_temperature, "target": high}
+                        )
                         continue
                     if mode == "cool" and projected_start_temperature <= low:
+                        _hvac_reject(context, "comfort_target_reached",
+                            {"projected_temperature": projected_start_temperature, "target": low}
+                        )
                         continue
                     required_slots = max(
                         1,
                         ceil(abs(target - projected_start_temperature) / rate / (interval_minutes / 60)),
                     )
                 if possible_start + required_slots > index:
+                    _hvac_reject(context, "preparation_time",
+                        {"required_minutes": required_slots * interval_minutes,
+                         "available_minutes": (index - possible_start) * interval_minutes}
+                    )
                     continue
                 run = context.slots[possible_start : possible_start + required_slots]
                 if any(item.import_price is None for item in run):
+                    _hvac_reject(context, "forecast_gap", {"at": possible_start_at.isoformat()})
                     continue
                 run_baseline = min(_known_float(item.import_price) for item in run)
                 if float(slot.import_price) < run_baseline + start_delta:
@@ -498,6 +524,9 @@ class HVACPlanningPolicy:
                         passive_drift_c_per_hour=drift,
                     )
                     if available_coast is None or available_coast < coast_hours:
+                        _hvac_reject(context, "thermal_coast",
+                            {"available_hours": available_coast, "required_hours": coast_hours}
+                        )
                         continue
                 cost = sum(_known_float(item.import_price) for item in run)
                 if (
@@ -528,6 +557,7 @@ class HVACPlanningPolicy:
                         and possible_start_at < earliest_start
                         and not (allow_immediate_start and possible_start_at <= context.created_at)
                     ):
+                        _hvac_reject(context, "minimum_cycle", {"earliest_start": earliest_start.isoformat()})
                         continue
                     hours_to_start = max(
                         (possible_start_at - context.created_at).total_seconds() / 3600,
@@ -537,11 +567,18 @@ class HVACPlanningPolicy:
                     if passive_drift is not None:
                         projected_start_temperature += passive_drift * hours_to_start
                     if mode == "heat" and projected_start_temperature >= high:
+                        _hvac_reject(context, "comfort_target_reached",
+                            {"projected_temperature": projected_start_temperature, "target": high}
+                        )
                         continue
                     if mode == "cool" and projected_start_temperature <= low:
+                        _hvac_reject(context, "comfort_target_reached",
+                            {"projected_temperature": projected_start_temperature, "target": low}
+                        )
                         continue
                     run = context.slots[possible_start:index]
                     if not run or any(item.import_price is None for item in run):
+                        _hvac_reject(context, "forecast_gap", {"at": possible_start_at.isoformat()})
                         continue
                     tail_baseline = min(_known_float(item.import_price) for item in run)
                     if float(slot.import_price) < tail_baseline + start_delta:
@@ -574,6 +611,9 @@ class HVACPlanningPolicy:
             if best_start is None or best_required_slots is None:
                 index = end_index
                 continue
+            context.climate_legacy_decision.update(
+                reason="schedule_selected", summary="A thermally feasible tariff window was selected."
+            )
             required_slots = best_required_slots
             baseline = best_baseline
             end_index = best_end_index
@@ -929,3 +969,28 @@ def _thermal_coast_hours(
     if mode == "cool" and passive_drift_c_per_hour > 0:
         return max((comfort_boundary - target_temperature) / passive_drift_c_per_hour, 0.0)
     return None
+
+
+_LEGACY_REASONS = {
+    "price_difference": "The forecast price difference is below the configured minimum.",
+    "thermal_direction": "The temperature forecast does not support heating or cooling preconditioning.",
+    "preparation_time": "The candidate leaves insufficient time to reach the preconditioning target.",
+    "thermal_coast": "The candidate cannot coast to the peak within the thermal limits.",
+    "comfort_target_reached": "The projected temperature already reaches the preconditioning target.",
+    "minimum_cycle": "The minimum climate rest period prevents this candidate from starting.",
+    "forecast_gap": "A candidate is missing tariff prices needed for preconditioning.",
+    "forecast_too_short": "At least two tariff slots are needed to compare a preconditioning window.",
+    "comfort_inputs_missing": "Climate temperature or comfort limits are unavailable.",
+    "lead_time_disabled": "The configured preconditioning lead time is zero.",
+    "release_hold": "A previous comfort handoff is holding off preconditioning until this tariff period ends.",
+}
+
+
+def _hvac_reject(context: DecisionContext, reason: str, evidence: dict[str, Any]) -> None:
+    """Keep bounded counts and one sample per cause, prioritising actionable blockers."""
+    decision = context.climate_legacy_decision
+    rejected = decision.setdefault("rejected", {})
+    previous = rejected.get(reason, {})
+    rejected[reason] = {"count": previous.get("count", 0) + 1, "evidence": evidence}
+    primary = max(rejected, key=list(_LEGACY_REASONS).index)
+    decision.update(reason=primary, summary=_LEGACY_REASONS[primary])

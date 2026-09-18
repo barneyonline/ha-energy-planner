@@ -10,6 +10,7 @@ from homeassistant.util import dt as dt_util
 from .entry_data import combined_entry_data
 from .models import to_jsonable
 from .plan_presentation import built_in_load_forecast_attrs
+from .preconditioning import current_status
 from .safety import control_pause_status
 from .storage import audit_records
 from .type_defs import EnergyPlannerConfigEntry
@@ -116,6 +117,7 @@ def climate_diagnostics(store_data: dict[str, Any], plan: Any) -> dict[str, Any]
     outcomes = [item for item in audit_records(store_data) if item.get("asset") == "daikin"]
     control = store_data.get("ownership", {}).get("hvac_control", {})
     return {
+        "preconditioning": current_status(store_data, plan),
         "economic_status": engine.get("status", "learning"),
         "ever_active": bool(engine.get("ever_active")),
         "readiness": engine.get("modes", {}),
