@@ -488,7 +488,7 @@ def test_final_rollback_gate_does_not_claim_legacy_schedule_selected():
     status = generated.device_plans["climate"]["preconditioning"]
     assert status["status"] == "blocked"
     assert status["reason"] == "rollback_target_unavailable"
-    assert "restor" in status["summary"].lower()
+    assert "restoration target" in status["summary"].lower()
     assert status["next_start"] is None
 
 
