@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Avoid aborting climate preconditioning as a manual override when Daikin restores a deferred zone target during planner startup with a fresh Home Assistant context. Keep manual protection for unrelated changes.
 
 ### 🔧 Improvements
 
