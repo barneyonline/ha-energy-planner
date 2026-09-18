@@ -141,3 +141,48 @@ coast target; coasting does not imply that the compressor must remain off.
 
 A failed restoration or an unrecognized owned economic lifecycle version forces
 another safe release attempt before any new climate command can be selected.
+
+
+## Why preconditioning did not run
+
+Open **Decision summary → climate → preconditioning**. The same evidence is
+included in downloaded diagnostics. `status` distinguishes `scheduled`, `running`,
+`learning`, `observation`, `blocked`, `no_opportunity`, and `restoring`.
+`summary` gives the explanation, `reason` is its stable code, `next_step` explains
+what to check, and `evaluated_at` and `next_start` show when it was assessed and
+when the next selected preconditioning command is due. A scheduled command still
+passes execution gates; it does not prove the heater or cooler ran. Running means
+planner ownership, including coasting, rather than measured compressor activity.
+
+Manual overrides, unknown occupancy, away policy, observation-only policy,
+scheduled observation periods, disabled Climate control, review mode, and an
+unarmed controller are distinguished from an uneconomic opportunity. Economic
+model readiness and validation progress remain alongside this status in the
+climate attributes. Automatic policy can still use legacy tariff control while
+its economic model is learning; learning alone does not prove climate is blocked.
+
+For legacy tariff planning, `legacy_rejections` contains bounded counts and one
+sample per rejection cause. Samples include actual and required price differences,
+preparation minutes, coast hours, missing price timestamps, comfort temperatures,
+and minimum-cycle or release-hold evidence. These describe candidates considered
+in the current refresh, not independent faults or proof that every candidate
+failed for the same reason. A selected catch-up window can coexist with rejection
+samples for earlier, infeasible candidates. Thresholds and safety rules are unchanged.
+
+`last_attempt` links a scheduled window to its execution result and reason.
+Only a matching current-plan rejection changes the current status to blocked;
+older attempts remain historical evidence. `last_missed_opportunity` retains the
+most recent planned window that expired or was withdrawn without confirmed
+applied preconditioning or an already-satisfied target, including original plan/action IDs, timestamps,
+and its last execution result when available. Missing execution evidence is not
+labelled a device failure. Confirmed existing thermostat ownership also prevents a false missed record after upgrade.
+A later successful retry of that same window clears
+its missed record. Successful other windows do not erase an earlier missed one.
+
+The pending window and last missed window survive restart and normal audit
+rotation. Only these two records are retained; this is not a complete event log.
+The next committed plan records expiry or withdrawal. A window that was never
+selected has no missed-window record: use the current reason and candidate
+rejections instead. Historical records from before this feature cannot be
+reconstructed. Pending restoration takes priority in the current status until
+ownership recovery is resolved.

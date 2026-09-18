@@ -154,6 +154,7 @@ When **Automatic control** is armed and **EV control** is enabled, Energy Planne
 - **A device command fails or is not confirmed:** turn off Automatic control, run `ha_energy_planner.restore_safe_state`, and verify the mapped services and feedback entities.
 - **Control should stop immediately:** turn off the relevant device-control switch or Automatic control. Use `ha_energy_planner.pause_control` for a bounded pause.
 - **Multiple entries call the wrong planner:** pass the intended `config_entry_id` to the action.
+- **Preconditioning did not run:** open **Decision summary → climate → preconditioning** for the current status, blocker, next start, candidate measurements, and retained missed window. See [climate decision explanations](docs/climate-decisions.md#why-preconditioning-did-not-run).
 - **More evidence is needed:** download diagnostics from the integration page or run `ha_energy_planner.export_support_bundle`. Secrets, raw AI content, and unnecessary location history are excluded.
 
 Device service dispatch is limited to 30 seconds per call, including restoration.

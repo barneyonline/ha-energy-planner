@@ -133,12 +133,23 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
     interval = timedelta(minutes=int(options[CONF_PLANNING_INTERVAL_MINUTES]))
     now = context.created_at
     if active.get("economic_policy_version") and (not owned_economic or active.get("required_evidence_lost")):
+        context.climate_decision = {
+            "reason": "pending_restore",
+            "preconditioning_status": "restoring",
+            "summary": "Previous economic climate ownership needs restoration before another cycle.",
+        }
         state.pop("scheduled", None)
         context.climate_engine = state
         return [release_action(context, "hvac_required_evidence_lost", interval)]
     if set(active) == {"released_until"}:
         held_until = instant(active.get("released_until"))
         if held_until is None or now < held_until:
+            context.climate_decision = {
+                "reason": "release_hold",
+                "preconditioning_status": "blocked",
+                "summary": "A previous comfort handoff is holding off preconditioning.",
+                "hold_until": active.get("released_until"),
+            }
             return []
         active = {}
     if owned_economic:
@@ -161,14 +172,16 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
                     context, "hvac_comfort_handoff", interval, released_until=instant(active.get("period_end"))
                 )
             ]
-    blocked = (
-        any(o.kind == "manual_hvac" and (o.expires_at is None or now < o.expires_at) for o in context.active_overrides)
-        or str(context.occupancy_state) == "unknown"
-        or (
-            str(context.occupancy_state) == "away"
-            and not strict_bool(options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY), default=False)
-        )
-    )
+    blocker = None
+    if any(o.kind == "manual_hvac" and (o.expires_at is None or now < o.expires_at) for o in context.active_overrides):
+        blocker = ("manual_hvac_override", "A manual climate override is active.")
+    elif str(context.occupancy_state) == "unknown":
+        blocker = ("occupancy_unknown", "Occupancy is unknown; preconditioning is withheld.")
+    elif str(context.occupancy_state) == "away" and not strict_bool(
+        options.get(CONF_HVAC_PRECONDITION_WHILE_AWAY), default=False
+    ):
+        blocker = ("occupancy_away", "Nobody is home and preconditioning while away is disabled.")
+    blocked = blocker is not None
     candidate = None
     decision: dict[str, Any] = {
         "status": state.get("status", "learning"),
@@ -256,6 +269,26 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         else "No candidate met the economic and comfort requirements."
         if candidate is None
         else "A supported preconditioning schedule has positive estimated and conservative savings."
+    )
+    decision["reason"] = "schedule_selected" if candidate is not None else "no_candidate"
+    decision["preconditioning_status"] = "scheduled" if candidate is not None else "no_opportunity"
+    if blocker is not None:
+        decision.update(reason=blocker[0], summary=blocker[1], preconditioning_status="blocked")
+    elif policy == "observe":
+        decision.update(
+            reason="observation_only",
+            summary="Observation-only policy evaluates opportunities without issuing economic commands.",
+            preconditioning_status="observation",
+        )
+    elif observing:
+        decision.update(reason="scheduled_observation", preconditioning_status="observation")
+    elif state.get("status", "learning") in {"learning", "degraded"}:
+        decision.update(
+            reason="model_" + state.get("status", "learning"),
+            preconditioning_status="blocked" if state.get("status") == "degraded" else "learning",
+        )
+    decision["legacy_fallback"] = bool(
+        not state.get("ever_active") and not observing and candidate is None and policy == "automatic" and not blocked
     )
     context.climate_decision = decision
     context.climate_engine = state
