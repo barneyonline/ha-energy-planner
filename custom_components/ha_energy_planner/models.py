@@ -155,6 +155,7 @@ class DecisionContext:
     climate_inputs: dict[str, Any] = field(default_factory=dict)
     climate_engine: dict[str, Any] = field(default_factory=dict)
     climate_decision: dict[str, Any] = field(default_factory=dict)
+    climate_legacy_decision: dict[str, Any] = field(default_factory=dict)
     ev_evidence: dict[str, Any] = field(default_factory=dict)
 
 

@@ -12,6 +12,7 @@ from homeassistant.core import HomeAssistant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
+from .preconditioning import record_outcome, record_plan
 
 _LIST_FIELDS = {
     "ai_recommendations",
@@ -37,6 +38,7 @@ _DICT_FIELDS = {
     "production",
     "thermal_model",
     "climate_engine",
+    "preconditioning_history",
 }
 
 _LEGACY_MIGRATION_MARKER = "_entry_store_migrated_to"
@@ -94,7 +96,12 @@ class PlannerStore:
 
     async def async_save_plan(self, plan: EnergyPlan) -> None:
         """Persist the compact active plan."""
-        self.data["active_plan"] = to_jsonable(plan)
+        serialized = to_jsonable(plan)
+        self.data["preconditioning_history"] = record_plan(
+            self.data.get("preconditioning_history", {}), serialized,
+            self.data.get("ownership", {}).get("hvac_control"),
+        )
+        self.data["active_plan"] = serialized
         await self._async_save()
 
     async def async_remove_if_safe(self) -> bool:
@@ -113,6 +120,9 @@ class PlannerStore:
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""
         audit = list(self.data.get("execution_audit", []))
+        self.data["preconditioning_history"] = record_outcome(
+            self.data.get("preconditioning_history", {}), to_jsonable(outcome)
+        )
         entry = _audit_entry(outcome)
         if audit and _deduplicable_outcome(entry) and _same_audit_outcome(audit[-1], entry):
             previous = dict(audit[-1])
@@ -348,6 +358,7 @@ def _default_data() -> dict[str, Any]:
         "control_pause": {},
         "thermal_model": {},
         "climate_engine": {},
+        "preconditioning_history": {},
         "ai_recommendations": [],
         "ai_last_attempt": {},
     }

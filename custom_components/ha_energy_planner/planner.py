@@ -67,6 +67,7 @@ from .planner_confidence import (
 from .planner_ev import _daylight_preferred_ev_schedule, _ev_earliest_start, _next_ready_by
 from .planner_hvac import HVACPlanningPolicy
 from .planner_presentation import _display_text, _timeline_card_rows, build_device_plans
+from .preconditioning import planning_status
 from .safety import strict_bool
 
 
@@ -109,6 +110,9 @@ class DryRunPlanner:
         confidence_breakdown = _confidence_breakdown(context, actions)
         decision_audit = _decision_audit(context, actions, self.options)
         rejected_actions = _rejected_actions(context, actions, self.options)
+        device_plans.setdefault("climate", {})["preconditioning"] = planning_status(
+            context, actions, mode, _rejected_climate_decision(context, self.options)["reason"], self.options
+        )
         timeline_card = _timeline_card_rows(device_plans)
 
         summary = "Planner disabled"
@@ -539,6 +543,8 @@ class DryRunPlanner:
                 )
                 context.climate_engine.pop("scheduled", None)
                 context.climate_decision["rejected_final_profile"] = True
+                context.climate_decision["reason"] = "final_battery_profile"
+                context.climate_decision["preconditioning_status"] = "no_opportunity"
                 context.climate_decision["commands_selected"] = False
                 if context.hvac_control.get("economic_policy_version"):
                     actions.append(release_action(context, "economic_final_profile_changed",
@@ -918,6 +924,8 @@ def _rejected_climate_decision(
         reason = "Skipped comfort preconditioning because climate comfort inputs are incomplete."
     elif not context.slots:
         reason = "Skipped comfort preconditioning because no tariff forecast slots are available."
+    elif context.climate_legacy_decision.get("summary"):
+        reason = context.climate_legacy_decision["summary"]
     else:
         reason = (
             "No climate preconditioning was selected because the forecast contained no price window "

@@ -12,11 +12,13 @@
 
 ### 🐛 Bug fixes
 
+- Explain manual, occupancy, observation-policy, missing restoration-target, and final validation climate blockers accurately instead of describing them as uneconomic or scheduled opportunities. Keep the reason code and explanation aligned when several blockers apply.
+- Reconcile late climate outcomes and restart-time ownership confirmation with missed-window history; coasting alone does not count as proof of preconditioning.
 - Avoid aborting climate preconditioning as a manual override when Daikin restores a deferred zone target during planner startup with a fresh Home Assistant context. Keep manual protection for unrelated changes.
 
 ### 🔧 Improvements
 
-- None
+- Add a clear preconditioning status, next step and scheduled start to Decision summary and diagnostics, with legacy candidate measurements and a restart-safe record of the last missed planned window and its execution outcome.
 
 ### 🔄 Other changes
 

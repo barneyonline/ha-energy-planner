@@ -982,3 +982,15 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - `test_confirmed_stop_is_not_billed_again_on_the_next_telemetry_update` exercises lease expiry followed by repeated telemetry updates with a retained reservation, preserving the settled spending total.
 
 - Rebase integration regressions cover vehicle-session guards before and after number writes and policy-release spending/timer cleanup. Confirmed unplug resets the budget and incomplete measurements; uncertain handoff retains spending (`tests/test_ev_runtime.py`, `tests/test_control_runtime.py`).
+
+
+## Preconditioning explanations and missed-window evidence
+
+- Planning records manual/occupancy and observation-policy blockers at the decision point and retains legacy candidate rejection counts with measured thresholds (`climate_runtime.py`, `planner_hvac.py`). Candidate evaluation is distinguished from command selection, including final battery-profile rejection.
+- `preconditioning.py` joins current planning evidence with ownership and matching execution outcomes. Decision summary and diagnostics expose current status, next start, next step, legacy measurements, and the most recent missed window without changing control authority or safety limits.
+- `PlannerStore` persists the pending and last missed windows with plan/outcome writes, preserving immutable save generations. Windows correlate across regenerated plan IDs; applied retries prevent false missed records and clear a recovered same-window record.
+- `tests/test_preconditioning.py` covers blocker recovery, observation policy, hold expiry, forecast/price/lead/rest evidence, planned versus actual control, store reload, repeated refreshes, failed and successful attempts, expired/withdrawn windows, restored ownership, stale-outcome isolation, and attribute bounds. Existing climate/executor/adapter recovery regressions remain part of the full Docker gate.
+
+- Review regressions reproduce concurrent replan/late-outcome correlation, restart between committed ownership and audit writes, coasting-only false positives, post-planning validation downgrade, and the final restoration-target gate. Storage-level tests verify durable readback and immutable prior generations.
+
+- Simultaneous-blocker regressions verify that legacy confidence, manual override, and occupancy reason codes stay aligned with their explanations and move to the remaining blocker when confidence recovers.
