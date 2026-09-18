@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- Explain manual, occupancy, observation-policy, missing restoration-target, and final validation climate blockers accurately instead of describing them as uneconomic or scheduled opportunities.
+- Explain manual, occupancy, observation-policy, missing restoration-target, and final validation climate blockers accurately instead of describing them as uneconomic or scheduled opportunities. Keep the reason code and explanation aligned when several blockers apply.
 - Reconcile late climate outcomes and restart-time ownership confirmation with missed-window history; coasting alone does not count as proof of preconditioning.
 
 ### 🔧 Improvements

@@ -541,3 +541,23 @@ def test_store_restart_between_ownership_and_outcome_writes_recovers_confirmatio
         assert persisted["preconditioning_history"] == {}
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("other_blocker", ["manual", "away"])
+def test_simultaneous_legacy_blockers_keep_code_and_summary_consistent(other_blocker):
+    ctx = context()
+    ctx.forecast_confidence = 0
+    if other_blocker == "manual":
+        ctx.active_overrides = [Override("manual_hvac", "test", None, "manual")]
+    else:
+        ctx.occupancy_state = OccupancyState.AWAY
+    generated = DryRunPlanner(OPTIONS).create_plan(ctx)
+    explanation = generated.device_plans["climate"]["preconditioning"]
+    assert explanation["reason"] == "insufficient_confidence"
+    assert "confidence is below" in explanation["summary"]
+    # Once confidence recovers, both fields must identify the remaining blocker.
+    ctx.forecast_confidence = 1
+    recovered = DryRunPlanner(OPTIONS).create_plan(ctx).device_plans["climate"]["preconditioning"]
+    assert recovered["reason"] == ("manual_hvac_override" if other_blocker == "manual" else "occupancy_away")
+    remaining_reason = "manual climate override" if other_blocker == "manual" else "nobody is currently home"
+    assert remaining_reason in recovered["summary"]
