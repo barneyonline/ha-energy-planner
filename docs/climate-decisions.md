@@ -156,7 +156,8 @@ planner ownership, including coasting, rather than measured compressor activity.
 
 Manual overrides, unknown occupancy, away policy, observation-only policy,
 scheduled observation periods, disabled Climate control, review mode, and an
-unarmed controller are distinguished from an uneconomic opportunity. Economic
+unarmed controller and final plan validation failures are distinguished from an uneconomic opportunity.
+Missing thermostat or zone restoration targets explicitly block takeover. Economic
 model readiness and validation progress remain alongside this status in the
 climate attributes. Automatic policy can still use legacy tariff control while
 its economic model is learning; learning alone does not prove climate is blocked.
@@ -175,9 +176,13 @@ older attempts remain historical evidence. `last_missed_opportunity` retains the
 most recent planned window that expired or was withdrawn without confirmed
 applied preconditioning or an already-satisfied target, including original plan/action IDs, timestamps,
 and its last execution result when available. Missing execution evidence is not
-labelled a device failure. Confirmed existing thermostat ownership also prevents a false missed record after upgrade.
+labelled a device failure. Committed ownership of the preconditioning phase also
+prevents a false missed record after upgrade or a restart between ownership and
+audit writes. Coasting ownership alone does not prove preconditioning ran.
 A later successful retry of that same window clears
-its missed record. Successful other windows do not erase an earlier missed one.
+its missed record. Late outcomes still update a withdrawn window after a newer
+plan is committed; they do not overwrite the newer pending window. Successful
+other windows do not erase an earlier missed one.
 
 The pending window and last missed window survive restart and normal audit
 rotation. Only these two records are retained; this is not a complete event log.
