@@ -436,3 +436,108 @@ def test_retained_window_uses_revised_preconditioning_end():
     assert "last_missed" not in result
     assert result["pending"]["end"] == (NOW + timedelta(minutes=20)).isoformat()
     assert history["pending"]["end"] == (NOW + timedelta(minutes=15)).isoformat()
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_late_outcome_updates_withdrawn_window_without_touching_replacement(replacement):
+    history = record_plan({}, to_jsonable(plan()))
+    newer = plan([])
+    if replacement:
+        newer = plan()
+        newer.actions[0].desired_state["period_end"] += timedelta(hours=1)
+    history = record_plan(history, to_jsonable(newer))
+    rejected = record_outcome(history, to_jsonable(outcome()))
+    assert rejected["last_missed"]["last_outcome"]["reason"] == "production_gate_not_armed"
+    resolved = record_outcome(rejected, to_jsonable(outcome(OutcomeResult.APPLIED)))
+    assert "last_missed" not in resolved
+    assert resolved.get("pending") == history.get("pending")
+
+
+def test_persisted_success_reconciles_existing_pending_record_after_interrupted_audit():
+    history = record_plan({}, to_jsonable(plan()))
+    control = {**to_jsonable(action().desired_state), "main_state_committed": True}
+    # Ownership is saved before async_add_outcome; a restart may occur between them.
+    reconciled = record_plan(history, to_jsonable(plan([])), control)
+    assert "last_missed" not in reconciled
+    withdrawn = record_plan(history, to_jsonable(plan([])))
+    assert "last_missed" in withdrawn
+    assert record_plan(withdrawn, to_jsonable(plan([])), control) == {}
+
+
+def test_coasting_ownership_alone_does_not_prove_preconditioning_ran():
+    control = {**to_jsonable(action().desired_state), "main_state_committed": True, "phase": "peak_coast"}
+    history = record_plan({}, to_jsonable(plan()), control)
+    assert not history["pending"]["fulfilled"]
+
+
+def test_current_status_honours_final_validation_mode_before_first_attempt():
+    generated = DryRunPlanner(OPTIONS).create_plan(context())
+    assert generated.device_plans["climate"]["preconditioning"]["status"] == "scheduled"
+    generated.mode = PlannerMode.ACTIVE_DEGRADED
+    generated.input_issues.append("grid_import_limit_exceeded")
+    actual = current_status({"production": {"armed": True}}, generated)
+    assert actual["status"] == "blocked"
+    assert actual["reason"] == "planner_not_active"
+
+
+def test_final_rollback_gate_does_not_claim_legacy_schedule_selected():
+    ctx = context()
+    ctx.input_issues = ["main_climate_target_unavailable"]
+    generated = DryRunPlanner({**OPTIONS, "minimum_climate_confidence": 0}).create_plan(ctx)
+    assert not any(a.desired_state.get("phase") == "preconditioning" for a in generated.actions)
+    status = generated.device_plans["climate"]["preconditioning"]
+    assert status["status"] == "blocked"
+    assert status["reason"] == "rollback_target_unavailable"
+    assert "restor" in status["summary"].lower()
+    assert status["next_start"] is None
+
+
+def test_store_restart_between_ownership_and_outcome_writes_recovers_confirmation(monkeypatch):
+    persisted = {}
+
+    class Disk:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_load(self):
+            return deepcopy(persisted)
+
+        async def async_save(self, data):
+            persisted.clear()
+            persisted.update(deepcopy(data))
+
+    monkeypatch.setattr(storage, "Store", Disk)
+
+    async def scenario():
+        first = storage.PlannerStore(object())
+        await first.async_save_plan(plan())
+        original_pending = first.data["preconditioning_history"]["pending"]
+        await first.async_save_ownership(
+            {
+                "hvac_control": {
+                    **to_jsonable(action().desired_state),
+                    "main_state_committed": True,
+                }
+            }
+        )
+        # Execution stops before the separate audit write. Reload only durable evidence.
+        reloaded = storage.PlannerStore(object())
+        await reloaded.async_load()
+        await reloaded.async_save_plan(plan([]))
+        assert reloaded.data["preconditioning_history"] == {}
+        assert persisted["preconditioning_history"] == {}
+        assert not original_pending["fulfilled"]
+        # A delayed failed result for a withdrawn window is also retained through reload.
+        await reloaded.async_save_ownership({})
+        await reloaded.async_save_plan(plan())
+        await reloaded.async_save_plan(plan([]))
+        await reloaded.async_add_outcome(outcome(OutcomeResult.FAILED, reason="service_timeout"))
+        after_result = storage.PlannerStore(object())
+        await after_result.async_load()
+        assert (
+            after_result.data["preconditioning_history"]["last_missed"]["last_outcome"]["reason"] == "service_timeout"
+        )
+        await after_result.async_add_outcome(outcome(OutcomeResult.APPLIED))
+        assert persisted["preconditioning_history"] == {}
+
+    asyncio.run(scenario())

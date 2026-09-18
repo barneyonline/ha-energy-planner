@@ -7,7 +7,7 @@ from typing import Any
 
 from .climate_inputs import instant
 from .models import ActionAsset, DecisionContext, OccupancyState, PlanAction, PlannerMode, to_jsonable
-from .planner_confidence import _confidence_rejection_reason
+from .planner_confidence import _confidence_rejection_reason, _hvac_rollback_capability_unavailable
 from .safety import strict_bool
 
 
@@ -65,6 +65,12 @@ def planning_status(
             "schedule_selected",
             "Preconditioning is scheduled; execution gates still apply.",
         )
+    if _hvac_rollback_capability_unavailable(context):
+        status, code, reason = (
+            "blocked",
+            "rollback_target_unavailable",
+            "A required thermostat or zone restoration target is unavailable; takeover is withheld.",
+        )
     if not strict_bool(options.get("climate_control_enabled"), default=False):
         status, code, reason = "blocked", "climate_control_disabled", "The Climate control switch is off."
     if mode != PlannerMode.ACTIVE_HEALTHY:
@@ -102,6 +108,9 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
     """Retain one pending window and the last unexecuted expired/withdrawn window."""
     history = dict(history)
     control = control if isinstance(control, dict) else {}
+    missed = history.get("last_missed", {})
+    if missed and _confirmed_window(control, missed["window"]):
+        history.pop("last_missed")
     now = instant(plan["created_at"])
     candidates = [
         a
@@ -111,6 +120,11 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
     upcoming = min(candidates, key=lambda a: a["execute_not_before"], default=None)
     pending = history.get("pending", {})
     if pending:
+        pending = {
+            **pending,
+            "fulfilled": bool(pending.get("fulfilled") or _confirmed_window(control, pending["window"])),
+        }
+        history["pending"] = pending
         changed = upcoming is None or window_key(upcoming["desired_state"]) != pending["window"]
         if upcoming is not None and not changed:
             pending = {**pending, "end": upcoming["desired_state"].get("precondition_end", pending["end"])}
@@ -141,36 +155,36 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
                 "planned_at": plan["created_at"],
                 "start": upcoming["execute_not_before"],
                 "end": end.isoformat(),
-                "fulfilled": bool(control.get("main_state_committed") and window_key(control) == window_key(desired)),
+                "fulfilled": _confirmed_window(control, window_key(desired)),
             }
     return history
 
 
 def record_outcome(history: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
     """Correlate actual execution evidence before the bounded general audit truncates it."""
-    pending = history.get("pending", {})
     desired = outcome.get("desired_state") or {}
     if (
-        not pending
-        or outcome.get("asset") != "daikin"
+        outcome.get("asset") != "daikin"
         or outcome.get("kind") != "set_hvac"
         or desired.get("phase") != "preconditioning"
-        or window_key(desired) != pending["window"]
     ):
         return history
     history = dict(history)
-    if _fulfilled(outcome) and history.get("last_missed", {}).get("window") == pending["window"]:
-        history.pop("last_missed")
-    return {
-        **history,
-        "pending": {
-            **pending,
-            "fulfilled": bool(pending.get("fulfilled") or _fulfilled(outcome)),
-            "last_outcome": {
-                key: outcome.get(key) for key in ("attempted_at", "plan_id", "action_id", "result", "reason")
-            },
-        },
-    }
+    for key in ("pending", "last_missed"):
+        record = history.get(key, {})
+        if not record or window_key(desired) != record["window"]:
+            continue
+        if key == "last_missed" and _fulfilled(outcome):
+            history.pop(key)
+        else:
+            history[key] = {
+                **record,
+                "fulfilled": bool(record.get("fulfilled") or _fulfilled(outcome)),
+                "last_outcome": {
+                    field: outcome.get(field) for field in ("attempted_at", "plan_id", "action_id", "result", "reason")
+                },
+            }
+    return history
 
 
 def current_status(store: dict[str, Any], plan: Any) -> dict[str, Any]:
@@ -211,6 +225,13 @@ def current_status(store: dict[str, Any], plan: Any) -> dict[str, Any]:
             summary="The scheduled preconditioning command did not run.",
             next_step="Resolve the execution blocker shown in reason; eligibility is checked again on refresh.",
         )
+    elif result.get("status") == "scheduled" and getattr(plan, "mode", None) != PlannerMode.ACTIVE_HEALTHY:
+        result.update(
+            status="blocked",
+            reason="planner_not_active",
+            summary="Automatic execution is disabled, in review, or awaiting healthy inputs.",
+            next_step="Review the current plan health and validation issues before enabling control.",
+        )
     elif result.get("status") == "scheduled" and store.get("production", {}).get("armed") is False:
         result.update(
             status="blocked",
@@ -226,4 +247,13 @@ def _fulfilled(outcome: dict[str, Any]) -> bool:
     """An idempotent confirmed target is fulfilled without claiming a service call."""
     return outcome.get("result") == "applied" or (
         outcome.get("result") == "skipped" and outcome.get("reason") == "already_in_desired_hvac_state"
+    )
+
+
+def _confirmed_window(control: dict[str, Any], window: list[Any]) -> bool:
+    """Use committed preconditioning ownership, never a later coasting-only acquisition."""
+    return bool(
+        control.get("main_state_committed")
+        and control.get("phase") == "preconditioning"
+        and window_key(control) == window
     )
