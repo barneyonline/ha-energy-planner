@@ -12,11 +12,11 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Explain manual, occupancy, and observation-policy climate blockers accurately instead of describing them as uneconomic opportunities.
 
 ### 🔧 Improvements
 
-- None
+- Add a clear preconditioning status, next step and scheduled start to Decision summary and diagnostics, with legacy candidate measurements and a restart-safe record of the last missed planned window and its execution outcome.
 
 ### 🔄 Other changes
 
