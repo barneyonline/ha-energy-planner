@@ -3334,8 +3334,10 @@ def test_off_zone_stays_untouched_when_main_command_fails() -> None:
     assert all(call[2]["entity_id"] != "climate.empty" for call in hass.services.calls)
 
 
-@pytest.mark.parametrize("actuator", ["climate.daikin", "switch.living"])
-def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -> None:
+@pytest.mark.parametrize("actuator, requested_mode", [
+    ("climate.daikin", "heat"), ("climate.daikin", "cool"), ("switch.living", "heat"),
+])
+def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str, requested_mode: str) -> None:
     from custom_components.ha_energy_planner.executor import Executor
 
     zone = "climate.living_temperature"
@@ -3350,7 +3352,10 @@ def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -
     })
     adapter = DaikinHVACAdapter(hass, entry_data)
     assert zone not in adapter.takeover_snapshot()[1]
-    pending = {"enable_zones": True, "configured_zones_only": True, "target_temperature": 23, "hvac_mode": "heat"}
+    pending = {
+        "enable_zones": True, "configured_zones_only": True,
+        "target_temperature": 23, "hvac_mode": requested_mode,
+    }
     Executor._configure_pending_hvac_adapter(Executor.__new__(Executor), adapter, pending)
     assert pending["deferred_zone_entities"] == [zone]
     feedback = []
@@ -3388,14 +3393,29 @@ def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -
             assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) is None
             feedback.append(event)
             hass.states.values[zone] = FakeState("heat", {"temperature": 18})
+        if domain == "climate" and service == "set_hvac_mode" and requested_mode == "cool":
+            event = SimpleNamespace(context=Context(), data={
+                "entity_id": zone,
+                "old_state": hass.states.get(zone),
+                "new_state": FakeState("cool", {"temperature": 18}),
+            })
+            assert _is_planner_owned_control_feedback(
+                entry_data, {}, event, datetime.now(UTC), pending_hvac_desired_state=pending,
+            )
+            assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) is None
+            hass.states.values[zone] = event.data["new_state"]
         await original_call(domain, service, data, blocking, context)
+        if domain == "climate" and service == "turn_on":
+            # Daikin restores heating before the requested cooling command.
+            hass.states.values["climate.daikin"] = FakeState("heat", {"temperature": 20})
 
     hass.services.async_call = publish_recovery
     result = asyncio.run(adapter.async_execute(_action({
-        "hvac_mode": "heat", "target_temperature": 23,
+        "hvac_mode": requested_mode, "target_temperature": 23,
         "enable_zones": True, "configured_zones_only": True,
     })))
     assert result.applied
+    assert hass.states.get("climate.daikin").state == requested_mode
     assert len(feedback) == 1
     assert pending["coupled_zone_feedback_expected"] is None
     # The same event outside the turn-on phase must retain manual protection.
@@ -3407,8 +3427,8 @@ def test_deferred_zone_target_recovery_is_scoped_to_our_command(actuator: str) -
 
 @pytest.mark.parametrize("change", [
     "user", "parent", "missing_context", "other_zone", "not_deferred",
-    "outside_startup", "wrong_mode", "active_target_change", "fan_change",
-    "missing_target", "invalid_target", "wrong_actuator",
+    "outside_startup", "inactive_mode", "active_target_change", "fan_change",
+    "missing_target", "invalid_target", "wrong_actuator", "switch_wrong_mode",
 ])
 def test_unlinked_main_startup_feedback_rejects_unexpected_changes(change: str) -> None:
     zone = "climate.daikin_main_temperature"
@@ -3442,8 +3462,8 @@ def test_unlinked_main_startup_feedback_rejects_unexpected_changes(change: str) 
         pending["deferred_zone_entities"] = []
     elif change == "outside_startup":
         pending["turn_on_feedback_expected"] = False
-    elif change == "wrong_mode":
-        event.data["new_state"].state = "cool"
+    elif change == "inactive_mode":
+        event.data["new_state"].state = "unavailable"
     elif change == "active_target_change":
         event.data["old_state"] = FakeState("heat", {"temperature": 19})
     elif change == "fan_change":
@@ -3452,6 +3472,10 @@ def test_unlinked_main_startup_feedback_rejects_unexpected_changes(change: str) 
         event.data["new_state"].attributes["temperature"] = None
     elif change == "invalid_target":
         event.data["new_state"].attributes["temperature"] = float("nan")
+    elif change == "switch_wrong_mode":
+        entry_data[CONF_CLIMATE_ZONES].append("switch.daikin_main")
+        pending["coupled_zone_feedback_expected"]["actuator_entity_id"] = "switch.daikin_main"
+        event.data["new_state"].state = "cool"
     elif change == "wrong_actuator":
         pending["coupled_zone_feedback_expected"]["actuator_entity_id"] = "climate.other"
     assert not _is_planner_owned_control_feedback(
@@ -3459,6 +3483,74 @@ def test_unlinked_main_startup_feedback_rejects_unexpected_changes(change: str) 
     )
     if change != "other_zone":
         assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) == zone
+
+
+@pytest.mark.parametrize("change", [
+    "none", "target", "linked", "user", "parent", "context", "command_context",
+    "actuator", "requested_mode", "not_deferred", "not_configured", "old_missing",
+    "new_missing", "old_off", "unchanged_mode", "wrong_mode", "fan", "invalid_target",
+    "outside_command",
+])
+def test_deferred_zone_requested_mode_feedback_is_command_scoped(change: str) -> None:
+    zone = "climate.daikin_main_temperature"
+    entry_data = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: [zone]}
+    pending = {
+        "hvac_mode": "cool", "configured_zones_only": True,
+        "deferred_zone_entities": [zone],
+        "coupled_zone_feedback_expected": {
+            "actuator_entity_id": "climate.daikin", "state": "cool", "context_id": "mode-command",
+        },
+    }
+    event = SimpleNamespace(context=Context(), data={
+        "entity_id": zone,
+        "old_state": FakeState("heat", {"temperature": 20}),
+        "new_state": FakeState("cool", {"temperature": 20}),
+    })
+    if change == "target":
+        event.data["new_state"].attributes["temperature"] = 19
+    elif change == "linked":
+        event.context = Context(parent_id="mode-command")
+    elif change == "user":
+        event.context = Context(user_id="manual-user")
+    elif change == "parent":
+        event.context = Context(parent_id="unrelated-command")
+    elif change == "context":
+        event.context = None
+    elif change == "command_context":
+        pending["coupled_zone_feedback_expected"]["context_id"] = None
+    elif change == "actuator":
+        pending["coupled_zone_feedback_expected"]["actuator_entity_id"] = "climate.other"
+    elif change == "requested_mode":
+        pending["hvac_mode"] = "heat"
+    elif change == "not_deferred":
+        pending["deferred_zone_entities"] = []
+    elif change == "not_configured":
+        entry_data[CONF_CLIMATE_ZONES] = []
+    elif change == "old_missing":
+        event.data["old_state"] = None
+    elif change == "new_missing":
+        event.data["new_state"] = None
+    elif change == "old_off":
+        event.data["old_state"].state = "off"
+    elif change == "unchanged_mode":
+        event.data["old_state"].state = "cool"
+        event.data["new_state"].attributes["temperature"] = 21
+    elif change == "wrong_mode":
+        event.data["new_state"].state = "fan_only"
+    elif change == "fan":
+        event.data["new_state"].attributes["fan_mode"] = "high"
+    elif change == "invalid_target":
+        event.data["new_state"].attributes["temperature"] = float("nan")
+    elif change == "outside_command":
+        pending["coupled_zone_feedback_expected"] = None
+    accepted = change in {"none", "target", "linked"}
+    assert _is_planner_owned_control_feedback(
+        entry_data, {}, event, datetime.now(UTC), pending_hvac_desired_state=pending,
+    ) is accepted
+    if change not in {"not_configured", "old_missing", "new_missing"}:
+        assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) == (
+            None if accepted else zone
+        )
 
 
 @pytest.mark.parametrize("attributes", [
