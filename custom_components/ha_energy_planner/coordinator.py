@@ -3054,6 +3054,35 @@ def _matches_pending_coupled_zone_hvac_feedback(
         return False
     expected_state = expected.get("state")
     expected_context_id = expected.get("context_id")
+    if expected_state in _ACTIVE_HVAC_MODES:
+        # The explicit main mode call can also update subordinate climates.
+        # Keep this exception limited to deferred zones and unattributed or
+        # command-linked feedback during that call/confirmation window.
+        event_context = getattr(event, "context", None)
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if (
+            not expected_context_id
+            or expected.get("actuator_entity_id") != entry_data.get(CONF_DAIKIN_CLIMATE)
+            or expected_state != pending.get("hvac_mode")
+            or event.data.get("entity_id") not in pending.get("deferred_zone_entities", [])
+            or event.data.get("entity_id") not in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+            or event_context is None
+            or getattr(event_context, "user_id", None) is not None
+            or getattr(event_context, "parent_id", None) not in {None, expected_context_id}
+            or old_state is None
+            or new_state is None
+            or old_state.state not in _ACTIVE_HVAC_MODES
+            or old_state.state == new_state.state
+            or new_state.state != expected_state
+        ):
+            return False
+        old_attributes = getattr(old_state, "attributes", {}) or {}
+        new_attributes = getattr(new_state, "attributes", {}) or {}
+        changed = {key for key in _HVAC_CONTROL_ATTRIBUTE_KEYS if old_attributes.get(key) != new_attributes.get(key)}
+        return changed <= {"temperature", "target_temp_low", "target_temp_high"} and all(
+            _matching_hvac_target(new_attributes.get(key), new_attributes.get(key)) for key in changed
+        )
     if expected_state not in {"on", "off"} or not expected_context_id:
         return False
     event_context = getattr(event, "context", None)
@@ -3104,13 +3133,19 @@ def _matches_pending_coupled_zone_hvac_feedback(
         if old_attributes.get(attribute) != new_attributes.get(attribute)
     }
     if (
-        (context_matches or (unlinked_feedback and new_mode == pending.get("hvac_mode")))
+        (
+            context_matches
+            or (unlinked_feedback and (main_startup_matches or new_mode == pending.get("hvac_mode")))
+        )
         and expected_state == "on"
         and event.data.get("entity_id") in pending.get("deferred_zone_entities", [])
         and zone_temperature_sync_deferred(old_state)
         and bool(changed_attributes)
         and changed_attributes <= {"temperature", "target_temp_low", "target_temp_high"}
     ):
+        # Main turn-on may restore a remembered mode before set_hvac_mode.
+        # Its deferred zones may likewise recover their previous targets.
+        # Accept that bounded off-to-active transition, not later mode changes.
         # A linked off zone may recover its previous target when our command
         # wakes the unit. It was excluded from target writes before persistence.
         return all(

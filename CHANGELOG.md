@@ -22,6 +22,28 @@
 
 - None
 
+## 1.1.4 - 2026-09-19
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Avoid aborting preconditioning when Daikin main-unit startup restores a deferred zone in its remembered mode before applying the requested heating or cooling mode. Accept the subsequent zone transition during the explicit main-unit mode command, while keeping manual protection outside these bounded command windows.
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 1.1.3 - 2026-09-18
 
 ### 🚧 Breaking changes
