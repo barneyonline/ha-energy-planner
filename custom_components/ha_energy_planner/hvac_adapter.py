@@ -1266,26 +1266,38 @@ class DaikinHVACAdapter:
                             )
                     takeover_main_state.update(rollback_state)
                 command_sent = True
-                await async_call_device_service(
-                    self.hass,
-                    "climate",
-                    "set_hvac_mode",
-                    {ATTR_ENTITY_ID: entity_id, "hvac_mode": desired_mode},
-                    blocking=True,
+                service_context = (
+                    Context()
+                    if self._deferred_zone_entities and self._set_coupled_zone_feedback_expected is not None
+                    else None
                 )
-                if respect_manual_override:
-                    self._raise_if_manual_override_requested(
-                        include_zones=respect_zone_manual_override,
+                if service_context is not None and self._set_coupled_zone_feedback_expected is not None:
+                    self._set_coupled_zone_feedback_expected(entity_id, str(desired_mode), service_context.id)
+                try:
+                    await async_call_device_service(
+                        self.hass,
+                        "climate",
+                        "set_hvac_mode",
+                        {ATTR_ENTITY_ID: entity_id, "hvac_mode": desired_mode},
+                        blocking=True,
+                        context=service_context,
                     )
-                if not await self._async_confirm_hvac_state(
-                    entity_id,
-                    {"hvac_mode": desired_mode},
-                ):
-                    raise _HVACStateConfirmationError("climate HVAC mode was not confirmed")
-                if respect_manual_override:
-                    self._raise_if_manual_override_requested(
-                        include_zones=respect_zone_manual_override,
-                    )
+                    if respect_manual_override:
+                        self._raise_if_manual_override_requested(
+                            include_zones=respect_zone_manual_override,
+                        )
+                    if not await self._async_confirm_hvac_state(
+                        entity_id,
+                        {"hvac_mode": desired_mode},
+                    ):
+                        raise _HVACStateConfirmationError("climate HVAC mode was not confirmed")
+                    if respect_manual_override:
+                        self._raise_if_manual_override_requested(
+                            include_zones=respect_zone_manual_override,
+                        )
+                finally:
+                    if service_context is not None and self._set_coupled_zone_feedback_expected is not None:
+                        self._set_coupled_zone_feedback_expected(None, None, None)
 
         observed = self._state(entity_id) or observed
         if desired_temperature is not None and (force or not _temperature_matches(observed, desired_temperature)):
