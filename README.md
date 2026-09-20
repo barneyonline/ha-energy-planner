@@ -122,6 +122,14 @@ Saving mapped inputs may briefly make planner entities unavailable while their l
 
 When **Automatic control** is armed and **EV control** is enabled, Energy Planner immediately stops charging that a charger starts by itself on plug-in. If the stop cannot be confirmed, it retries every 30 seconds—even while charging feedback is temporarily unavailable—until charging is confirmed inactive or control is disabled. Starts actually issued by Energy Planner or its manual EV controls are ownership-tracked and are not mistaken for plug-in auto-starts; the next plan may start charging again when the current slot calls for it.
 
+EV control attempts are limited over a rolling 24-hour window. Configure **Maximum daily EV actions** in the integration settings under **Safety and troubleshooting** (default 10, range 0–48; 0 disables the cap). Existing saved limits are preserved. Starts, stops, failures and recovery actions count toward the allowance; safety stops remain available. Scheduling reserves the eventual stop as well as the start. An **EV action limit reached** notification means an otherwise feasible schedule was blocked by this allowance and includes the configured and remaining counts.
+
+The default **Manual HVAC override duration** is 60 minutes. Genuine manual changes temporarily block planner control; existing saved durations are preserved. Planner-owned feedback should not create a hold.
+
+The default **Maximum daily climate actions** is 12 in the same settings section (range 0–48; 0 disables the cap). Existing saved climate limits are preserved.
+
+Main-unit shutdowns during release or settings recovery can also switch zone climates off and remove their targets. Those expected updates are treated as planner feedback only during the shutdown command and confirmation window; user-attributed changes and conflicting targets still trigger manual protection.
+
 ## Known Limitations
 
 - Tariff and PV forecasts must come from other Home Assistant integrations. Energy Planner does not fetch forecasts directly.
@@ -206,3 +214,17 @@ Manual charging overrides reset before a replacement vehicle’s plan is built. 
 Existing single-vehicle configurations continue unchanged until profiles are added. Configure **every** tracked car before enabling Auto control. Once profiles are enabled, old single-car SOC/target mappings are ignored, including after the last profile is removed. Removing profiles never silently reactivates the old mapping. Use **Configure → Edit vehicle** to edit a profile and **Configure → Remove vehicle** to remove it; `set_ev_ready_by` updates the currently identified or manually selected tracked vehicle. Ready-by changes replan without reloading the integration or restoring other devices. A new installation can save charger connection and charging feedback before adding its first vehicle.
 
 Manual and unidentified charging still reserve the configured charging power in household load and cost projections, conservatively throughout the horizon until feedback confirms charging has stopped or the cable is unplugged. No EV commands are issued in these modes. Confirmed unplug events release the previous session’s grid reservation, including rapid swaps between refreshes, during pending storage writes, or immediately after a charger-state outage. Port-disconnect evidence is saved even while no vehicle is selected, so a reload cannot reinstate a cleared stale-connection block.
+
+### Action allowances and resuming climate planning
+
+Action limits apply over a rolling 24-hour window. Applied and failed device attempts count; no-change outcomes and climate restoration do not. Stopping an automation that is enabled or still running counts, while repeating suppression on an idle, already-disabled automation does not. A compact persisted attempt ledger retains allowance usage even when the presentation audit rotates. Diagnostics expose each asset's limit, used and remaining actions, next expiry, and when allowance becomes available after exhaustion. Zero means unlimited. Existing installations migrate the retained audit evidence on reload.
+
+Changing action limits, the manual climate hold duration, notification policy, or supported EV scheduling policies requests a fresh plan while preserving armed state and owned climate settings. Device mappings and other safety-sensitive changes still use the normal recovery lifecycle. Changing the default hold duration does not shorten an existing hold.
+
+Use **Resume climate planning** on the integration device, or call `ha_energy_planner.resume_climate_planning` with an optional `config_entry_id`, to clear both the manual helper and internal manual climate holds. The action replans and returns current climate status when response data is requested. It retains action limits, control switches, production readiness, and input-health checks. If an action cap blocks climate startup, the climate status explains usage, the next allowance time, and the **Safety and troubleshooting** setting to review. Resuming makes planning eligible again; it does not force a climate command when another gate blocks execution.
+
+Running calendar entries use the charging sensor's confirmed state-change time or the persisted confirmed climate phase start. Their identity and start stay stable across replans while the forecast end can change. Future windows remain planned times. Unknown/unavailable feedback and unconfirmed climate ownership do not claim an actual start; EV energy estimates describe the remaining planned window. A real EV stop/restart or a new climate phase gets a new start.
+
+Uncertain EV delivery contributes no assumed charging progress toward readiness, but a continuing physical command is still costed at its possible power draw, including battery/carbon and emergency-price exposure. A fresh positive power reading takes precedence over an unchanged cumulative energy counter when classifying delivery.
+
+Resume climate planning bypasses refresh debounce and waits for fresh planning and queued plan execution before reporting its result. If refresh fails, it reports an error instead of returning the previous plan status; manual holds remain cleared. An old action-cap rejection is shown as previous evidence once allowance has become available. Confirmed off-state climate coasting retains its phase start in the calendar; legacy ownership without a confirmed timestamp keeps planned timing. EV safety-stop retry protection continues to use its full failure evidence separately from ordinary action allowance counts.

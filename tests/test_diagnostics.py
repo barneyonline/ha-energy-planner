@@ -300,3 +300,34 @@ def test_climate_diagnostics_distinguish_learning_from_failed_execution() -> Non
     assert result["validation"] == {"heat": {"windows": 0}}
     assert result["pending_restore"]["required_evidence_lost"] == "hvac_release_failed"
     assert climate_diagnostics({}, None)["last_release"] is None
+
+
+def test_climate_cap_diagnostics_explain_allowance_and_settings(monkeypatch):
+    from datetime import timedelta
+    from types import SimpleNamespace
+
+    from custom_components.ha_energy_planner import diagnostics
+    now = datetime(2026, 9, 20, tzinfo=UTC)
+    monkeypatch.setattr(diagnostics.dt_util, "utcnow", lambda: now)
+    store = {"action_attempts": [{"asset": "daikin", "kind": "set_hvac", "result": "applied",
+                                 "attempted_at": now.isoformat()}],
+             "preconditioning_history": {"pending": {"last_outcome": {"plan_id": "p", "result": "skipped",
+                                                           "reason": "climate_daily_action_cap_reached"}}}}
+    plan = SimpleNamespace(plan_id="p", device_plans={})
+    status = diagnostics.climate_diagnostics(store, plan, {"max_daily_climate_actions": 1})["preconditioning"]
+    assert status["summary"] == "Climate action limit reached: 1 of 1 used."
+    assert (now + timedelta(hours=24)).isoformat() in status["next_step"]
+    assert "Safety and troubleshooting" in status["next_step"]
+
+
+def test_expired_climate_cap_message_requests_fresh_evaluation():
+    from types import SimpleNamespace
+
+    from custom_components.ha_energy_planner.diagnostics import climate_diagnostics
+    store = {"preconditioning_history": {"pending": {"last_outcome": {
+        "plan_id": "p", "result": "rejected", "reason": "climate_daily_action_cap_reached",
+    }}}}
+    status = climate_diagnostics(store, SimpleNamespace(plan_id="p", device_plans={}),
+                                 {"max_daily_climate_actions": 12})["preconditioning"]
+    assert "now available" in status["summary"]
+    assert "None" not in status["next_step"]

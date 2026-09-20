@@ -7896,6 +7896,7 @@ def _coordinator_for_runtime_services(
     coordinator._refresh_generation = 0
     coordinator._listeners = {}
     coordinator.refresh_requested = 0
+    coordinator.last_update_success = True
     coordinator._debounce_cancel = None
     coordinator._boundary_cancel = None
     coordinator._ev_auto_start_retry_cancel = None
@@ -7907,6 +7908,7 @@ def _coordinator_for_runtime_services(
         coordinator.refresh_requested += 1
 
     coordinator.async_request_refresh = request_refresh
+    coordinator.async_refresh = request_refresh
     return coordinator
 
 
@@ -8421,4 +8423,68 @@ def test_ev_allocation_deadline_is_serialized_and_stale_callbacks_cannot_stop_ne
         coordinator.async_request_refresh.assert_awaited_once()
         coordinator._schedule_ev_allocation_deadline(None)
         assert coordinator._ev_allocation_cancel is None
+    asyncio.run(run())
+
+
+def test_policy_options_preserve_owned_climate_and_armed_state():
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, "max_daily_ev_actions": 4},
+        store_data={"production": {"armed": True}, "ownership": {"hvac_control": {"phase": "preconditioning"}}},
+    )
+    coordinator.entry.options = {**coordinator.entry.options, "max_daily_ev_actions": 10}
+    asyncio.run(coordinator.async_handle_options_update())
+    assert coordinator.store.data["production"]["armed"]
+    assert coordinator.store.data["ownership"]["hvac_control"]["phase"] == "preconditioning"
+    assert not coordinator.executor.hvac_releases
+    assert "dry_run_evidence_fingerprint" not in coordinator.store.data["production"]
+    assert coordinator.refresh_requested == 1
+
+
+@pytest.mark.parametrize("helper_fails", [False, True])
+def test_resume_climate_clears_all_manual_sources_but_keeps_other_overrides(helper_fails):
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.data = None
+    coordinator.overrides = [Override("manual_hvac", "helper", None, "manual"),
+                             Override("manual_hvac", "service", None, "zone_changed"),
+                             Override("ev", "service", None, "unrelated")]
+    async def clear():
+        assert coordinator._command_lock.locked() and coordinator._planner_lock.locked()
+        return not helper_fails
+    async def flush():
+        pass
+    coordinator._async_clear_expired_manual_hvac_state = clear
+    coordinator.store.async_flush = flush
+    if helper_fails:
+        with pytest.raises(HomeAssistantError):
+            asyncio.run(coordinator.async_resume_climate_planning())
+        assert len(coordinator.overrides) == 3
+    else:
+        result = asyncio.run(coordinator.async_resume_climate_planning())
+        assert [o.kind for o in coordinator.overrides] == ["ev"]
+        assert coordinator.refresh_requested == 1
+        assert "action_budget" in result
+
+
+def test_resume_waits_for_deferred_execution_before_reporting_blocker():
+    async def run():
+        coordinator = _coordinator_for_runtime_services()
+        coordinator.data = SimpleNamespace(plan_id="resume", device_plans={})
+        async def clear():
+            return True
+        async def flush():
+            pass
+        async def execute():
+            await asyncio.sleep(0)
+            coordinator.store.data["preconditioning_history"] = {"pending": {"last_outcome": {
+                "plan_id": "resume", "result": "rejected", "reason": "device_control_paused",
+            }}}
+        async def refresh():
+            coordinator._plan_execution_task = asyncio.create_task(execute())
+        coordinator._async_clear_expired_manual_hvac_state = clear
+        coordinator.store.async_flush = flush
+        coordinator.async_refresh = refresh
+        result = await coordinator.async_resume_climate_planning()
+        await coordinator._plan_execution_task
+        assert result["status"] == "blocked"
+        assert result["reason"] == "device_control_paused"
     asyncio.run(run())

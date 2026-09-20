@@ -161,6 +161,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         coordinator = await _require_coordinator(call)
         await coordinator.async_request_replan()
 
+    async def handle_resume_climate(call: ServiceCall) -> dict[str, Any]:
+        coordinator = await _require_coordinator(call)
+        return await coordinator.async_resume_climate_planning()
+
     async def handle_restore(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
         coordinator = await _require_coordinator(call)
@@ -255,6 +259,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time),
             }
         ),
+    )
+    hass.services.async_register(
+        DOMAIN, "resume_climate_planning", handle_resume_climate,
+        schema=vol.Schema(_config_entry_field()), supports_response=SupportsResponse.OPTIONAL,
     )
     hass.services.async_register(
         DOMAIN,

@@ -234,6 +234,10 @@ class DaikinHVACAdapter:
         self._persisted_zone_supersessions.clear()
         pre_state = self._snapshot()
         saved_automation_states = self._automation_states()
+        automation_work = any(
+            state == "on" or bool(getattr(self._state(entity_id), "attributes", {}).get("current", 0))
+            for entity_id, state in saved_automation_states.items()
+        )
         restorable_automation_states = {
             entity_id: state for entity_id, state in saved_automation_states.items() if state == "on"
         }
@@ -377,7 +381,7 @@ class DaikinHVACAdapter:
                     unresolved_states,
                     rollback_succeeded,
                 )
-            command_sent = bool(saved_automation_states)
+            command_sent = automation_work
             return HVACCommandResult(
                 True,
                 "hvac_automations_suppressed" if command_sent else "already_in_desired_hvac_state",
@@ -440,7 +444,7 @@ class DaikinHVACAdapter:
                 unresolved_main_state,
             )
         command_sent = bool(
-            saved_automation_states or any(entity_id.split(".", 1)[0] != "climate" for entity_id in changed_zones)
+            automation_work or any(entity_id.split(".", 1)[0] != "climate" for entity_id in changed_zones)
         )
 
         try:
@@ -1113,6 +1117,10 @@ class DaikinHVACAdapter:
 
     async def _async_confirm_state(self, entity_id: str, expected_state: str) -> bool:
         """Wait briefly for Home Assistant to publish a requested actuator state."""
+        # Older HA releases queue state listeners even when the state machine
+        # already reflects a service result. Deliver those events while the
+        # command context and manual-supersession markers are still active.
+        await asyncio.sleep(0)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
         while True:
@@ -1126,6 +1134,10 @@ class DaikinHVACAdapter:
 
     async def _async_confirm_hvac_state(self, entity_id: str, desired_state: dict[str, Any]) -> bool:
         """Wait briefly for Home Assistant to publish the requested thermostat state."""
+        # Older HA releases queue state listeners even when the state machine
+        # already reflects a service result. Deliver those events while the
+        # command context and manual-supersession markers are still active.
+        await asyncio.sleep(0)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
         while True:
@@ -1160,6 +1172,10 @@ class DaikinHVACAdapter:
 
     async def _async_confirm_hvac_on(self, entity_id: str) -> bool:
         """Wait for the thermostat to leave its off state."""
+        # Older HA releases queue state listeners even when the state machine
+        # already reflects a service result. Deliver those events while the
+        # command context and manual-supersession markers are still active.
+        await asyncio.sleep(0)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
         while True:
@@ -1199,17 +1215,31 @@ class DaikinHVACAdapter:
         if desired_mode == "off":
             if force or observed.state != "off":
                 command_sent = True
-                await async_call_device_service(
-                    self.hass,
-                    "climate",
-                    SERVICE_TURN_OFF,
-                    {ATTR_ENTITY_ID: entity_id},
-                    blocking=True,
-                )
-                if respect_manual_override:
-                    self._raise_if_manual_override_requested(
-                        include_zones=respect_zone_manual_override,
+                service_context = Context() if self._set_coupled_zone_feedback_expected is not None else None
+                if service_context is not None and self._set_coupled_zone_feedback_expected is not None:
+                    self._set_coupled_zone_feedback_expected(entity_id, "off", service_context.id)
+                try:
+                    await async_call_device_service(
+                        self.hass,
+                        "climate",
+                        SERVICE_TURN_OFF,
+                        {ATTR_ENTITY_ID: entity_id},
+                        blocking=True,
+                        context=service_context,
                     )
+                    if respect_manual_override:
+                        self._raise_if_manual_override_requested(
+                            include_zones=respect_zone_manual_override,
+                        )
+                    if not await self._async_confirm_hvac_state(entity_id, {"hvac_mode": "off"}):
+                        raise _HVACStateConfirmationError("climate turn-off was not confirmed")
+                    if respect_manual_override:
+                        self._raise_if_manual_override_requested(
+                            include_zones=respect_zone_manual_override,
+                        )
+                finally:
+                    if service_context is not None and self._set_coupled_zone_feedback_expected is not None:
+                        self._set_coupled_zone_feedback_expected(None, None, None)
             return command_sent
 
         if desired_mode:

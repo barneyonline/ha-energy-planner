@@ -12,6 +12,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .action_limits import action_budget, budget_history
 from .adapter_helpers import profile_control_service as _profile_control_service_for_target
 from .climate_runtime import command_rejection
 from .command_models import ControlAction, ManualControlAction
@@ -1750,7 +1751,7 @@ class Executor:
             cap_reason = _daily_action_cap_reason(
                 action.asset,
                 self.options,
-                self.store.data.get("execution_audit"),
+                budget_history(self.store.data),
                 now,
             )
             if cap_reason is not None:
@@ -2023,12 +2024,22 @@ class Executor:
         """Create a persistent notification for infeasible EV ready-by plans."""
         if action.asset != ActionAsset.EV or not action.desired_state.get("infeasible"):
             return
+        evidence = action.desired_state.get("optimization", {})
+        action_limited = evidence.get("search_status") == "ev_daily_action_cap_reached"
+        summary = (
+            "A charging schedule could reach the target, but the rolling 24-hour EV action limit blocks it. "
+            f"Remaining actions: {evidence.get('remaining_actions')}; "
+            f"configured limit: {evidence.get('action_limit')}. "
+            "Adjust Maximum daily EV actions in Energy Planner settings under Safety and troubleshooting. "
+            if action_limited
+            else "The EV cannot reach the requested ready-by target with the current schedule. "
+        )
         await self._async_create_plan_fallback_notification(
-            title=self._notification_title("EV target infeasible"),
+            title=self._notification_title("EV action limit reached" if action_limited else "EV target infeasible"),
             message=(
-                "The EV cannot reach the requested ready-by target with the current "
-                f"schedule. Planned target: {action.desired_state.get('target_soc_percent')}%. "
-                f"Ready by: {action.desired_state.get('ready_by', 'not configured')}."
+                summary
+                + f"Planned target: {action.desired_state.get('target_soc_percent')}%. "
+                + f"Ready by: {action.desired_state.get('ready_by', 'not configured')}."
             ),
             notification_id=self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID),
         )
@@ -2888,24 +2899,9 @@ def _daily_action_cap_reason(asset: ActionAsset, options: dict[str, Any], audit:
         return None
     if not isinstance(audit, list):
         return None
-    cutoff = now - timedelta(hours=24)
-    count = 0
-    for item in audit:
-        if not isinstance(item, dict) or item.get("asset") != str(asset):
-            continue
-        item_kind = item.get("kind")
-        if asset == ActionAsset.DAIKIN and item_kind is not None and item_kind != str(ActionKind.SET_HVAC):
-            # Releases restore previously owned state and must remain
-            # available regardless of the command budget. In particular, a
-            # no-ownership comfort handoff must never consume the allowance
-            # needed for a later preconditioning start.
-            continue
-        attempted_at = _parse_datetime_or_none(item.get("attempted_at"))
-        if attempted_at is None or attempted_at < cutoff:
-            continue
-        if item.get("result") in {str(OutcomeResult.APPLIED), str(OutcomeResult.FAILED), str(OutcomeResult.RESTORED)}:
-            count += 1
-    return reason if count >= cap else None
+    budget = action_budget(audit, options, now, str(asset))
+    return reason if budget["used"] >= cap else None
+
 
 
 def _restore_notification_message(reason: str) -> str:

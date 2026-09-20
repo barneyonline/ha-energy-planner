@@ -27,6 +27,8 @@ class EVDecisionEvidence(TypedDict):
     search_status: str
     candidate_evaluations: int
     search_limit: int
+    action_limit: int
+    remaining_actions: int
     capacity_excluded_slots: int
     forecast_complete_to_ready_by: bool
     expected_completion: str | None
@@ -304,15 +306,17 @@ def optimise_ev(
     evaluations = 0
     results: list[Simulation] = []
     cached: dict[tuple[tuple[int, float], ...], Simulation | None] = {}
-    configured_actions = int(options.get("max_daily_ev_actions", 4))
+    configured_actions = int(options.get("max_daily_ev_actions", 10))
     action_limit = (
         max(int(context.ev_evidence.get("remaining_actions", configured_actions)), 0)
         if configured_actions > 0
         else 10000
     )
 
+    action_limited_feasible = False
+
     def simulate(requested: Mapping[int, float]) -> Simulation | None:
-        nonlocal evaluations
+        nonlocal evaluations, action_limited_feasible
         signature = tuple(sorted((i, round(p, 6)) for i, p in requested.items() if p > 0))
         if evaluations >= MAX_EVALUATIONS:
             return None
@@ -382,9 +386,19 @@ def optimise_ev(
             )
             if expected_completion is None and expected_after >= target - 1e-6:
                 expected_completion = item.start + timedelta(hours=expected_hours)
+            # Missing delivery evidence cannot credit readiness, but a live
+            # charge command can still draw its full limit throughout the slot.
+            # Price, carbon, battery and emergency budgets must include that exposure.
+            if prediction_power == 0:
+                expected_energy, expected_hours = power * item.hours, item.hours
             source = context.slots[index]
             effective, solar, grid = _charge_cost_components(source, energy / duration_hours if duration_hours else 0)
-            increment = grid * duration_hours * max(item.import_price - normal_limit, 0)
+            exposure_energy = expected_energy if prediction_power == 0 else energy
+            exposure_hours = expected_hours if prediction_power == 0 else duration_hours
+            _, _, exposure_grid = _charge_cost_components(
+                source, exposure_energy / exposure_hours if exposure_hours else 0,
+            )
+            increment = exposure_grid * exposure_hours * max(item.import_price - normal_limit, 0)
             if extra + increment > budget + 1e-8:
                 return None
             extra += increment
@@ -424,6 +438,7 @@ def optimise_ev(
         if previous_active:
             transitions += 1  # Reserve the eventual stop, including an empty stop schedule.
         if transitions > action_limit and powers:
+            action_limited_feasible |= soc >= target - 1e-6
             return None
         if battery_reason == "observed_profile_simulation":
             total, _, _ = _battery_cost(context, options, energies, interval)
@@ -652,7 +667,9 @@ def optimise_ev(
     status = "valid_schedule"
     if best.schedule.infeasible:
         status = (
-            "forecast_coverage_insufficient"
+            "ev_daily_action_cap_reached"
+            if action_limited_feasible
+            else "forecast_coverage_insufficient"
             if forecast_missing
             else "capacity_or_price_shortfall"
             if capacity_soc < target - 1e-6
@@ -675,6 +692,8 @@ def optimise_ev(
         "search_status": status,
         "candidate_evaluations": evaluations,
         "search_limit": MAX_EVALUATIONS,
+        "action_limit": configured_actions,
+        "remaining_actions": action_limit,
         "capacity_excluded_slots": excluded_capacity,
         "forecast_complete_to_ready_by": not forecast_missing,
         "expected_completion": best.expected_completion.isoformat() if best.expected_completion else None,
