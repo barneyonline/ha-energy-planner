@@ -55,6 +55,9 @@
       },
       "resume_control": {
         "default": "mdi:play-circle-outline"
+      },
+      "resume_climate_planning": {
+        "default": "mdi:play-circle-outline"
       }
     },
     "switch": {

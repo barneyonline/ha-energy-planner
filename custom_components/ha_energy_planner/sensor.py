@@ -230,7 +230,7 @@ def _decision_summary_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         "rejected_actions": bounded_json([item for item in rejected if isinstance(item, dict)][:12]),
         "climate": {
             key: bounded_json(value)
-            for key, value in climate_diagnostics(coordinator.store.data, plan).items()
+            for key, value in climate_diagnostics(coordinator.store.data, plan, coordinator.options).items()
         },
         "ev_optimization": bounded_json(next((
             action.desired_state.get("optimization", {}) for action in plan.actions if action.asset == ActionAsset.EV

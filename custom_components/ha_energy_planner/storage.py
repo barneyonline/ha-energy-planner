@@ -9,6 +9,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
+from .action_limits import budget_history, recent_attempts
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
@@ -119,6 +120,9 @@ class PlannerStore:
 
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""
+        self.data["action_attempts"] = recent_attempts(
+            [*budget_history(self.data), to_jsonable(outcome)], datetime.now(UTC)
+        )
         audit = list(self.data.get("execution_audit", []))
         self.data["preconditioning_history"] = record_outcome(
             self.data.get("preconditioning_history", {}), to_jsonable(outcome)
@@ -341,6 +345,7 @@ def _default_data() -> dict[str, Any]:
         "active_plan": None,
         "execution_audit": [],
         "audit_history_version": 1,
+        "action_attempts": [],
         "ownership": {},
         "overrides": [],
         "forecast_snapshots": [],
@@ -370,6 +375,10 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     data.pop("haeo_runs", None)
     data.pop("trip_history", None)
     data["execution_audit"] = [_audit_entry(record) for record in audit_records(loaded)][-100:]
+    data["action_attempts"] = recent_attempts(
+        loaded["action_attempts"] if isinstance(loaded.get("action_attempts"), list) else audit_records(loaded),
+        datetime.now(UTC),
+    )
     data["audit_history_version"] = 1
     data.pop("outcomes", None)
     for key in _LIST_FIELDS:

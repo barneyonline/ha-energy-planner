@@ -442,7 +442,7 @@ def test_active_stall_does_not_credit_configured_power_in_current_slot():
     ctx.ev_charging = True
     ctx.ev_evidence["delivery_status"] = "stalled"
     schedule, evidence = solve(ctx)
-    assert schedule.allocations[0].added_soc_percent == 0
+    assert all(a.added_soc_percent == 0 for a in schedule.allocations if a.valid_at == NOW)
     assert evidence["conservative_completion"] == (NOW + timedelta(minutes=10)).isoformat()
 
 
@@ -671,3 +671,51 @@ def test_retained_night_window_cannot_override_selected_daylight_preference():
     schedule, evidence = solve(ctx, ev_charging_strategy="split", ev_daylight_lowest_cost_charging_enabled=True)
     assert schedule.allocations[0].valid_at == NOW + timedelta(minutes=5)
     assert evidence["schedule_change_reason"] != "saving_below_schedule_change_threshold"
+
+
+@pytest.mark.parametrize("remaining", [0, 1])
+def test_action_cap_identifies_otherwise_feasible_schedule_and_recovers(remaining):
+    ctx = context()
+    ctx.ev_evidence["remaining_actions"] = remaining
+    schedule, evidence = solve(ctx, max_daily_ev_actions=4)
+    assert schedule.infeasible
+    assert not schedule.allocations
+    assert evidence["search_status"] == "ev_daily_action_cap_reached"
+    assert evidence["remaining_actions"] == remaining
+    assert evidence["action_limit"] == 4
+    assert evidence["maximum_recoverable_soc"] >= ctx.ev_target_soc_percent
+    ctx.ev_evidence["remaining_actions"] = remaining + 6
+    schedule, evidence = solve(ctx, max_daily_ev_actions=10)
+    assert not schedule.infeasible
+    assert evidence["search_status"] == "valid_schedule"
+
+
+def test_action_cap_does_not_mislabel_physical_shortfall():
+    ctx = context((0.1,))
+    ctx.ev_target_soc_percent = 100
+    ctx.ev_evidence["remaining_actions"] = 0
+    schedule, evidence = solve(ctx)
+    assert schedule.infeasible
+    assert evidence["search_status"] == "capacity_or_price_shortfall"
+
+
+def test_default_ev_action_limit_is_ten():
+    assert DEFAULT_OPTIONS["max_daily_ev_actions"] == 10
+
+
+@pytest.mark.parametrize("status", ["stalled", "unavailable"])
+def test_uncertain_delivery_cannot_make_expensive_continuation_free(status):
+    ctx = context((0.24, 0.10, 0.10, 0.10))
+    ctx.ev_charging = True
+    ctx.ev_evidence["delivery_status"] = status
+    schedule, evidence = solve(ctx, ev_charging_strategy="adaptive", ev_schedule_min_saving=0,
+                               ev_schedule_min_saving_percent=0, ev_min_dwell_minutes=0)
+    assert all(a.valid_at > NOW for a in schedule.allocations)
+    assert NOW.isoformat() not in evidence["physical_power_by_time"]
+    assert evidence["modelled_incremental_cost"] == pytest.approx(0.05)
+
+
+def test_positive_power_overrides_unchanged_energy_meter_for_delivery_status():
+    record = update_ev_telemetry({}, sample(power_kw=6, energy_kwh=10), reserved_kw=6)
+    record = update_ev_telemetry(record, sample(NOW + timedelta(minutes=1), power_kw=6, energy_kwh=10), reserved_kw=6)
+    assert record["delivery_status"] == "observed"
