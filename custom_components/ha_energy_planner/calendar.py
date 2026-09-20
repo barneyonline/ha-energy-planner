@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from math import isfinite
 from typing import Any
@@ -13,7 +14,9 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
 )
 from .coordinator import EnergyPlannerCoordinator
@@ -22,6 +25,7 @@ from .entity import (
     recorder_safe_identifier,
     recorder_safe_text,
 )
+from .ev import ev_charging_state
 from .models import ActionAsset, ActionKind, PlanAction
 from .plan_presentation import (
     action_load_forecast_attrs,
@@ -84,11 +88,63 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
     for action in plan.actions:
         if not _calendar_control_enabled(coordinator, action.asset):
             continue
-        if action.kind == ActionKind.EV_SCHEDULE:
-            events.extend(_ev_charging_events(action, plan.interval_minutes))
-        else:
-            events.append(_calendar_event(action, coordinator))
+        candidates = (
+            _ev_charging_events(action, plan.interval_minutes)
+            if action.kind == ActionKind.EV_SCHEDULE else [_calendar_event(action, coordinator)]
+        )
+        now = dt_util.utcnow()
+        actual_start = _actual_start(coordinator, action, now)
+        for event in candidates:
+            if actual_start is not None and event.start <= now < event.end:
+                description = event.description or ""
+                if action.asset == ActionAsset.EV:
+                    description = description.replace(
+                        "Planned EV charging window.",
+                        "Charging in progress. Estimates cover remaining planned charging.",
+                    ).replace("Start charging:", "Remaining plan starts:")
+                event = replace(
+                    event, start=actual_start,
+                    description=recorder_safe_text(
+                        f"Actual start: {_local_datetime_text(actual_start)}\n{description}", max_bytes=4_096,
+                    ),
+                    uid=recorder_safe_identifier(
+                        f"{coordinator.entry.entry_id}-{action.asset}-{actual_start.isoformat()}", max_bytes=255,
+                    ),
+                )
+            events.append(event)
     return sorted(events, key=lambda event: event.start)
+
+
+def _actual_start(coordinator: EnergyPlannerCoordinator, action: PlanAction, now: datetime) -> datetime | None:
+    """Use confirmed live delivery or committed phase ownership, never a plan timestamp."""
+    mapping = getattr(coordinator, "entry_data", {})
+    states = getattr(coordinator.hass, "states", None)
+    if states is None:
+        return None
+    if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_SCHEDULE, ActionKind.EV_START}:
+        entity_id = mapping.get(CONF_EV_CHARGING)
+        state = states.get(entity_id) if entity_id else None
+        if state is None or ev_charging_state(state.state) is not True:
+            return None
+        start = getattr(state, "last_changed", None)
+    elif action.asset == ActionAsset.DAIKIN and action.kind == ActionKind.SET_HVAC:
+        control = coordinator.store.data.get("ownership", {}).get("hvac_control", {})
+        if not isinstance(control, dict):
+            return None
+        entity_id = mapping.get(CONF_DAIKIN_CLIMATE)
+        state = states.get(entity_id) if entity_id else None
+        if (not control.get("main_state_committed") or control.get("required_evidence_lost")
+                or state is None or state.state not in {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"}
+                or (state.state == "off" and action.desired_state.get("hvac_mode") != "off")
+                or (action.desired_state.get("hvac_mode") is not None
+                    and state.state != action.desired_state["hvac_mode"])
+                or not action.desired_state.get("phase")
+                or control.get("phase") != action.desired_state["phase"]):
+            return None
+        start = dt_util.parse_datetime(str(control.get("phase_started_at", "")))
+    else:
+        return None
+    return start if isinstance(start, datetime) and start.tzinfo is not None and start <= now else None
 
 
 def _calendar_control_enabled(

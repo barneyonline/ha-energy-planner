@@ -918,9 +918,9 @@ def test_hvac_suppression_stops_actions_when_automation_is_already_off() -> None
     )
     result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
     assert result.applied is True
-    assert result.reason == "hvac_automations_suppressed"
+    assert result.reason == "already_in_desired_hvac_state"
     assert result.saved_automation_states == {}
-    assert result.command_sent is True
+    assert result.command_sent is False
     assert hass.services.calls == [
         ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
     ]
@@ -3703,3 +3703,84 @@ def test_interrupted_zone_supersession_still_shuts_down_main(monkeypatch, rollba
             asyncio.run(adapter.async_restore({}, zones, main))
     assert hass.states.get("climate.daikin").state == "off"
     assert ("climate", "turn_off", {"entity_id": "climate.daikin"}) in hass.services.calls
+
+
+@pytest.mark.parametrize("failure", [None, "service", "confirmation"])
+def test_main_shutdown_zone_feedback_does_not_create_manual_override(failure: str | None) -> None:
+    from custom_components.ha_energy_planner.executor import Executor
+
+    zone = "climate.living_temperature"
+    entry_data = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: [zone]}
+    hass = FakeHass({
+        "climate.daikin": FakeState("cool", {"temperature": 19}),
+        zone: FakeState("cool", {"temperature": 19}),
+    })
+    adapter = DaikinHVACAdapter(hass, entry_data)
+    pending = {"restore_main": {"hvac_mode": "off"}, "restore_zones": {}}
+    Executor._configure_pending_hvac_adapter(Executor.__new__(Executor), adapter, pending)
+    original_call = hass.services.async_call
+    feedback = []
+
+    async def publish_shutdown(domain, service, data, blocking=False, context=None):
+        if service == "turn_off" and data["entity_id"] == "climate.daikin":
+            assert context is not None
+            for event_context, mode, attributes, entity, expected in [
+                (context, "off", {"temperature": None}, zone, True),
+                (Context(parent_id=context.id), "off", {"temperature": None}, zone, True),
+                (Context(), "off", {"temperature": None}, zone, True),
+                (Context(), "off", {"temperature": 19}, zone, True),
+                (Context(user_id="manual"), "off", {"temperature": None}, zone, False),
+                (Context(parent_id="other"), "off", {"temperature": None}, zone, False),
+                (Context(), "off", {"temperature": 25}, zone, False),
+                (Context(), "off", {"temperature": None, "fan_mode": "high"}, zone, False),
+                (Context(), "heat", {"temperature": 19}, zone, False),
+                (Context(), "off", {"temperature": None}, "climate.other", False),
+            ]:
+                event = SimpleNamespace(context=event_context, data={
+                    "entity_id": entity,
+                    "old_state": FakeState("cool", {"temperature": 19}),
+                    "new_state": FakeState(mode, attributes),
+                })
+                assert _is_planner_owned_control_feedback(
+                    entry_data, {}, event, datetime.now(UTC), pending_hvac_desired_state=pending,
+                ) is expected
+                if entity == zone:
+                    assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) == (
+                        None if expected else zone
+                    )
+                if expected:
+                    feedback.append(event)
+            if failure == "service":
+                raise RuntimeError("service failed")
+        await original_call(domain, service, data, blocking, context)
+
+    hass.services.async_call = publish_shutdown
+    original_confirm = adapter._async_confirm_hvac_state
+
+    async def confirm_shutdown(entity_id, desired):
+        if desired.get("hvac_mode") == "off" and pending.get("coupled_zone_feedback_expected") is not None:
+            assert pending["coupled_zone_feedback_expected"]["state"] == "off"
+            assert _is_planner_owned_control_feedback(
+                entry_data, {}, feedback[0], datetime.now(UTC), pending_hvac_desired_state=pending,
+            )
+            if failure == "confirmation":
+                return False
+        return await original_confirm(entity_id, desired)
+
+    adapter._async_confirm_hvac_state = confirm_shutdown
+    result = asyncio.run(adapter.async_restore({}, {}, {"hvac_mode": "off"}))
+    assert result.applied is (failure is None)
+    assert feedback
+    assert pending["coupled_zone_feedback_expected"] is None
+    assert not _is_planner_owned_control_feedback(
+        entry_data, {}, feedback[0], datetime.now(UTC), pending_hvac_desired_state=pending,
+    )
+
+
+def test_suppression_counts_stopping_a_running_disabled_automation():
+    hass = FakeHass({"climate.daikin": "heat", "automation.climate": FakeState("off", {"current": 1})})
+    adapter = DaikinHVACAdapter(hass, {CONF_DAIKIN_CLIMATE: "climate.daikin",
+                                    CONF_CLIMATE_AUTOMATIONS: "automation.climate"})
+    result = asyncio.run(adapter.async_execute(_action({"suppress_automations": True})))
+    assert result.command_sent is True
+    assert result.reason == "hvac_automations_suppressed"

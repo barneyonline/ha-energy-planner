@@ -1069,3 +1069,26 @@ def test_ai_attempt_is_durable_before_dispatch_inside_refresh_batch(monkeypatch:
 def test_malformed_optional_ev_telemetry_is_normalized_without_rewriting_legacy_store() -> None:
     assert "ev_telemetry" not in storage_module._normalize_loaded_data({})
     assert storage_module._normalize_loaded_data({"ev_telemetry": []})["ev_telemetry"]["budget_uncertain"] is True
+
+
+def test_action_ledger_survives_audit_rotation_and_reload(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    store = PlannerStore(object())
+    now = datetime.now(UTC)
+
+    async def run():
+        await store.async_add_outcome(ActionOutcome(
+            action_id="start", attempted_at=now, result=OutcomeResult.APPLIED,
+            reason="hvac_action_applied", asset="daikin", kind="set_hvac", pre_state={}, post_state={}, plan_id="test",
+        ))
+        for i in range(105):
+            await store.async_add_outcome(ActionOutcome(
+                action_id=str(i), attempted_at=now, result=OutcomeResult.SKIPPED,
+                reason=f"no_change_{i}", asset="daikin", kind="set_hvac", pre_state={}, post_state={}, plan_id="test",
+            ))
+        assert len(store.data["execution_audit"]) == 100
+        assert len(store.data["action_attempts"]) == 1
+        reloaded = storage_module._normalize_loaded_data(store.data)
+        assert reloaded["action_attempts"] == store.data["action_attempts"]
+    asyncio.run(run())

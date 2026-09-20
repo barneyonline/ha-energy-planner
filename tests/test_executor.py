@@ -7575,3 +7575,53 @@ def test_hvac_rollback_enrichment_preserves_original_cycle_baseline() -> None:
     }))
     assert store.data["ownership"]["hvac_control"]["main_state"] == expected
     assert store.flush_count == 2
+
+
+def test_ev_action_limit_notification_explains_configuration():
+    now = datetime.now(UTC)
+    action = PlanAction(
+        action_id="ev", plan_id="plan", execute_not_before=now,
+        execute_not_after=now + timedelta(minutes=5), asset=ActionAsset.EV,
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={"infeasible": True, "target_soc_percent": 100, "ready_by": "08:00",
+                       "optimization": {"search_status": "ev_daily_action_cap_reached",
+                                        "remaining_actions": 1, "action_limit": 10}},
+        hard_constraints=[], reason_codes=[], expected_cost_delta=None, confidence=1.0,
+    )
+    hass = FakeHass()
+    executor = Executor(FakeStore(), hass=hass, entry_data={}, options=DEFAULT_OPTIONS)
+    asyncio.run(executor._async_notify_ev_infeasible(action))
+    notification = hass.services.calls[-1][2]
+    assert notification["title"] == "Energy Planner EV action limit reached"
+    assert "Remaining actions: 1; configured limit: 10" in notification["message"]
+    assert "Maximum daily EV actions" in notification["message"]
+    assert "could reach the target" in notification["message"]
+
+
+def test_confirmed_climate_phase_start_is_stable_until_phase_changes():
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+    start = datetime.now(UTC)
+    result = HVACCommandResult(True, "hvac_action_applied", {}, {}, {})
+    saved = {"hvac_control": {"main_state": {"hvac_mode": "off"}}}
+    for offset, phase in ((0, "preconditioning"), (5, "preconditioning"), (10, "peak_coast"), (15, "peak_coast")):
+        at = start + timedelta(minutes=offset)
+        transaction = HVACOwnershipTransaction(saved, at)
+        provisional = transaction.prepare({"phase": phase}, {}, {}, {})
+        saved = transaction.complete(result, provisional, {"phase": phase}, main_state_superseded=False,
+                                     superseded_zone_entity_ids=set())
+        assert saved["hvac_control"]["phase_started_at"] == start + timedelta(minutes=10 if offset >= 10 else 0)
+
+
+def test_compact_action_ledger_does_not_bypass_safety_stop_retry_cap():
+    now = datetime.now(UTC)
+    store = FakeStore()
+    failed = {"asset": "ev", "kind": "ev_stop", "result": "failed",
+              "attempted_at": (now - timedelta(hours=1)).isoformat(),
+              "desired_state": {"ev_safety_stop": True}}
+    store.data["execution_audit"] = [failed] * 3
+    store.data["action_attempts"] = [{k: v for k, v in failed.items() if k != "desired_state"}] * 3
+    executor = Executor(store)
+    action = SimpleNamespace(asset=ActionAsset.EV, kind=ActionKind.EV_STOP,
+                             desired_state={"ev_safety_stop": True, "owned_ev_safety_stop": True})
+    assert executor._control_rejection_reason(action, now) == "ev_safety_stop_retry_limit_reached"

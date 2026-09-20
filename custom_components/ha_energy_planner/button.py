@@ -40,6 +40,12 @@ async def _replan(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_request_replan()
 
 
+async def _resume_climate(coordinator: EnergyPlannerCoordinator) -> None:
+    status = await coordinator.async_resume_climate_planning()
+    if status.get("status") == "blocked":
+        raise HomeAssistantError(str(status.get("summary", "Climate planning remains blocked.")))
+
+
 async def _restore(coordinator: EnergyPlannerCoordinator) -> None:
     outcome = await coordinator.async_restore_safe_state("button_pressed")
     if outcome.result == OutcomeResult.FAILED:
@@ -121,6 +127,10 @@ async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 BUTTONS: tuple[PlannerButtonDescription, ...] = (
+    PlannerButtonDescription(
+        key="resume_climate_planning", translation_key="resume_climate_planning",
+        press_fn=_resume_climate,
+    ),
     PlannerButtonDescription(
         key="replan",
         translation_key="replan",

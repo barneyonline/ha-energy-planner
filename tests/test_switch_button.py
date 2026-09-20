@@ -453,3 +453,16 @@ def test_production_control_buttons_call_coordinator() -> None:
     assert coordinator.arm_calls == ["button_pressed"]
     assert coordinator.disarm_calls == ["button_pressed"]
     assert coordinator.resume_calls == ["button_pressed"]
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_resume_climate_button_explains_remaining_blocker(blocked):
+    from custom_components.ha_energy_planner.button import _resume_climate
+    async def resume():
+        return {"status": "blocked" if blocked else "running", "summary": "Climate action limit reached"}
+    coordinator = SimpleNamespace(async_resume_climate_planning=resume)
+    if blocked:
+        with pytest.raises(HomeAssistantError, match="Climate action limit reached"):
+            asyncio.run(_resume_climate(coordinator))
+    else:
+        asyncio.run(_resume_climate(coordinator))

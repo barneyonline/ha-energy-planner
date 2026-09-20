@@ -805,3 +805,187 @@ def test_vehicle_policy_release_closes_old_spending_and_resets_only_on_unplug(tm
         finally:
             await hass.async_stop()
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("climate_limit", [1, 12])
+def test_climate_policy_update_and_resume_preserve_real_runtime_safety(tmp_path, monkeypatch, climate_limit):
+    """Real HA events, commands and durable ownership across policy saves and resume."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.options["command_rate_limit_seconds"] = 0
+        configured.options["max_daily_climate_actions"] = climate_limit
+        configured.entry_data["climate_manual_override_entity"] = "input_boolean.manual"
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Climate lifecycle", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        plan, context = _command("hvac")
+        plan.actions[0].desired_state.update({
+            "phase": "preconditioning", "precondition_end": (dt_util.utcnow() + timedelta(minutes=5)).isoformat(),
+        })
+        plan.device_plans["climate"] = {"preconditioning": {"status": "scheduled"}}
+        await store.async_save_plan(plan)
+        coordinator.async_set_updated_data(plan)
+        async def replan():
+            coordinator.async_set_updated_data(plan)
+            await store.async_save_plan(plan)
+            await coordinator.executor.async_evaluate(plan, context)
+        monkeypatch.setattr(coordinator, "async_request_replan", replan)
+        monkeypatch.setattr(coordinator, "async_refresh", replan)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *a, **kw: None)
+        async def helper_off(call):
+            hass.states.async_set("input_boolean.manual", "on" if call.service == "turn_on" else "off",
+                                  context=call.context)
+        hass.services.async_register("input_boolean", "turn_off", helper_off)
+        hass.services.async_register("input_boolean", "turn_on", helper_off)
+        hass.states.async_set("input_boolean.manual", "off")
+        # Seed device states before subscribing, as in an already-running HA instance.
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            await replan()
+            await hass.async_block_till_done()
+            assert hass.states.get("climate.home").attributes["temperature"] == 23
+            assert len(store.data["action_attempts"]) == 1
+            ownership = dict(store.data["ownership"])
+            before = len(calls)
+            object.__setattr__(entry, "options", MappingProxyType({**entry.options, "max_daily_ev_actions": 20}))
+            await coordinator.async_handle_options_update()
+            await hass.async_block_till_done()
+            assert store.data["production"]["armed"]
+            assert store.data["ownership"]["hvac_control"] == ownership["hvac_control"]
+            assert store.data["ownership"]["climate_automations"] == ownership["climate_automations"]
+            assert all(domain == "automation" and service == "turn_off" for domain, service, _ in calls[before:])
+            assert not coordinator.overrides
+            assert len(store.data["action_attempts"]) == 1
+            await coordinator.async_set_manual_hvac_override(60, "runtime_manual")
+            await hass.async_block_till_done()
+            assert coordinator.overrides
+            result = await coordinator.async_resume_climate_planning()
+            await hass.async_block_till_done()
+            assert not coordinator.overrides
+            assert hass.states.get("input_boolean.manual").state == "off"
+            if climate_limit == 1:
+                assert result["status"] == "blocked"
+                assert result["reason"] == "climate_daily_action_cap_reached"
+                assert "1 of 1" in result["summary"]
+                assert hass.states.get("climate.home").attributes["temperature"] == 20
+                assert len(store.data["action_attempts"]) == 1
+            else:
+                assert result["status"] == "running"
+                assert hass.states.get("climate.home").attributes["temperature"] == 23
+                assert len(store.data["action_attempts"]) == 2
+            fresh = PlannerStore(hass, "runtime")
+            await fresh.async_load()
+            assert fresh.data["action_attempts"] == store.data["action_attempts"]
+            assert fresh.data["overrides"] == []
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+def test_delayed_main_shutdown_feedback_does_not_leave_runtime_manual_hold(tmp_path, monkeypatch):
+    """Publish Daikin's fresh-context zone shutdown through actual HA listeners."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("climate.home", "off", {"temperature": 20})
+        hass.states.async_set("climate.room", "cool", {"temperature": 19})
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data[CONF_CLIMATE_ZONES] = ["climate.room"]
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Delayed climate feedback", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        async def no_replan():
+            pass
+        monkeypatch.setattr(coordinator, "async_request_replan", no_replan)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *a, **kw: None)
+        async def shutdown(call):
+            await asyncio.sleep(0.01)
+            hass.states.async_set("climate.room", "off", {"temperature": None})
+            await asyncio.sleep(0)
+            hass.states.async_set("climate.home", "off", {"temperature": 20}, context=call.context)
+        async def startup(call):
+            previous = hass.states.get(call.data["entity_id"])
+            hass.states.async_set(call.data["entity_id"], "heat", dict(previous.attributes), context=call.context)
+        hass.services.async_register("climate", "turn_on", startup)
+        hass.services.async_register("climate", "turn_off", shutdown)
+        # Seed device states before subscribing, as in an already-running HA instance.
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            await coordinator.executor.async_evaluate(*_command("hvac"))
+            await hass.async_block_till_done()
+            assert store.data["ownership"].get("hvac_control"), store.data["execution_audit"]
+            async with coordinator._command_lock:
+                result = await coordinator.executor.async_restore_device_control("daikin", "runtime_release")
+            await hass.async_block_till_done()
+            assert result.result == OutcomeResult.RESTORED
+            assert hass.states.get("climate.home").state == "off"
+            assert hass.states.get("climate.room").attributes["temperature"] is None
+            assert not coordinator.overrides
+            assert not store.data["ownership"].get("manual_hvac_override_expires_at")
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("refresh_fails", [False, True])
+def test_resume_refreshes_during_home_assistant_debounce_cooldown(tmp_path, monkeypatch, refresh_fails):
+    """Resume must publish fresh gate evidence even after a recent refresh."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        store = PlannerStore(hass, "runtime")
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Resume debounce", data={}, options=DEFAULT_OPTIONS,
+            source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        plan, _ = _command("hvac")
+        refreshes = 0
+
+        async def refresh():
+            nonlocal refreshes
+            refreshes += 1
+            if refresh_fails and refreshes == 2:
+                raise TimeoutError("planner input timeout")
+            store.data["preconditioning_history"] = {"pending": {"last_outcome": {
+                "plan_id": plan.plan_id, "result": "rejected",
+                "reason": "manual_hvac_override" if refreshes == 1 else "device_control_paused",
+            }}}
+            return plan
+
+        async def clear():
+            return True
+
+        monkeypatch.setattr(coordinator, "_async_update_data", refresh)
+        monkeypatch.setattr(coordinator, "_async_clear_expired_manual_hvac_state", clear)
+        try:
+            await coordinator.async_request_refresh()
+            assert refreshes == 1
+            if refresh_fails:
+                with pytest.raises(HomeAssistantError, match="Could not refresh climate planning"):
+                    await coordinator.async_resume_climate_planning()
+                assert not coordinator.last_update_success
+            else:
+                result = await coordinator.async_resume_climate_planning()
+                assert result["reason"] == "device_control_paused"
+            assert refreshes == 2
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+    asyncio.run(run())

@@ -211,8 +211,8 @@ def update_ev_telemetry(
         if sample.get("charging") is True
         and (
             sample.get("power_kw") == 0
-            or (same_identity and 0 < elapsed <= 1 / 6 and before_meter is not None and after_meter == before_meter
-                and meter_covers_exposure)
+            or (sample.get("power_kw") is None and same_identity and 0 < elapsed <= 1 / 6
+                and before_meter is not None and after_meter == before_meter and meter_covers_exposure)
         )
         else "unavailable"
         if (

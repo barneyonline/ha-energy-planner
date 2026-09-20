@@ -22,6 +22,40 @@
 
 - None
 
+## 1.1.5 - 2026-09-20
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- Add a Resume climate planning button and action that clear helper and internal manual holds, then report remaining execution blockers.
+
+### 🐛 Bug fixes
+
+- Report failed Resume climate refreshes explicitly instead of returning stale plan status.
+- Preserve the EV safety-stop retry gate when compact action accounting is present.
+- Report Resume climate planning results after an immediate refresh and deferred execution, including during refresh debounce cooldown, and distinguish expired action-cap evidence from a currently exhausted allowance.
+- Anchor climate phase starts to the pre-command state and support confirmed off-state coasting and legacy ownership in the calendar.
+- Keep confirmed running calendar starts stable across replans, with a separate start for each climate phase and EV stop/restart.
+- Cost continued EV charging conservatively when delivery is uncertain, rather than treating an active command as free; positive power readings now prevent false stall detection from an unchanged energy counter.
+- Deliver queued Home Assistant climate feedback before finishing command confirmation, preventing false manual holds on older supported releases.
+- Keep main-unit shutdown feedback from creating a false manual climate override when configured zone targets disappear.
+- Explain when the EV action cap blocks an otherwise feasible charging schedule, including the configured limit and remaining actions.
+
+### 🔧 Improvements
+
+- Preserve active device ownership when changing action limits, manual-hold duration, or supported EV scheduling policies.
+- Keep rolling action allowances independently of the compact audit history and expose usage, remaining actions, and expiry in diagnostics.
+- Exclude redundant climate automation suppression from action counts and explain climate cap blockers with the next allowance time.
+- Reduce the default manual HVAC override duration from 120 to 60 minutes; existing saved durations are preserved.
+- Increase the default configurable rolling 24-hour EV action limit from 4 to 10 and climate action limit from 8 to 12; existing saved limits are preserved.
+
+### 🔄 Other changes
+
+- None
+
 ## 1.1.4 - 2026-09-19
 
 ### 🚧 Breaking changes

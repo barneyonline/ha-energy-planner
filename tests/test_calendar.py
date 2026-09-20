@@ -8,6 +8,8 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from custom_components.ha_energy_planner import calendar as calendar_module
 from custom_components.ha_energy_planner.calendar import EnergyPlannerCalendar
 from custom_components.ha_energy_planner.const import (
@@ -467,3 +469,116 @@ def test_partial_ev_slot_calendar_uses_actual_duration_and_energy():
     assert "0.15 kWh" in event.description
     item["energy_kwh"] = "invalid"
     assert "0.25 kWh" in calendar_module._ev_charging_events(action, 5)[0].description
+
+
+def _running_coordinator(now, *, climate=False):
+    start = now - timedelta(minutes=20)
+    action = _action("current", now, now + timedelta(minutes=15))
+    if climate:
+        action.asset, action.kind = ActionAsset.DAIKIN, ActionKind.SET_HVAC
+        action.desired_state = {"phase": "preconditioning", "hvac_mode": "cool", "target_temperature": 19}
+    else:
+        action.kind = ActionKind.EV_SCHEDULE
+        action.desired_state = {"allocated_slots": [
+            {"valid_at": now.isoformat(), "charge_kw": 7},
+            {"valid_at": (now + timedelta(hours=2)).isoformat(), "charge_kw": 7},
+        ]}
+    coordinator = _coordinator(_plan([action]))
+    state = SimpleNamespace(state="cool" if climate else "CHARGING", last_changed=start)
+    coordinator.hass.states = SimpleNamespace(get=lambda entity_id: state)
+    coordinator.entry_data = {"ev_charging_entity": "sensor.charging", "daikin_climate_entity": "climate.main"}
+    coordinator.store.data["ownership"] = {"hvac_control": {
+        "main_state_committed": True, "phase": "preconditioning", "phase_started_at": start.isoformat(),
+    }}
+    return coordinator, action, state, start
+
+
+@pytest.mark.parametrize("climate", [False, True])
+def test_running_calendar_start_and_uid_survive_replans_and_reload(monkeypatch, climate):
+    now = datetime.now(UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    coordinator, action, state, start = _running_coordinator(now, climate=climate)
+    events = calendar_module._calendar_events(coordinator)
+    assert events[0].start == start
+    assert "Actual start:" in events[0].description
+    uid = events[0].uid
+    now += timedelta(minutes=1)
+    action.action_id = "different-plan"
+    action.execute_not_before = now
+    action.execute_not_after = now + timedelta(minutes=15)
+    if not climate:
+        action.desired_state["allocated_slots"][0]["valid_at"] = now.isoformat()
+    # No calendar cache: a fresh coordinator wrapper has the same identity.
+    coordinator = SimpleNamespace(**vars(coordinator))
+    replanned = calendar_module._calendar_events(coordinator)
+    assert replanned[0].start == start and replanned[0].uid == uid
+    assert replanned[0].end > events[0].end
+    if not climate:
+        assert replanned[1].start == events[1].start
+        assert "Estimates cover remaining" in replanned[0].description
+        state.state = "SUSPENDED_EVSE"
+        assert calendar_module._calendar_events(coordinator)[0].start == now
+        state.state, state.last_changed = "CHARGING", now
+        restarted = calendar_module._calendar_events(coordinator)[0]
+        assert restarted.start == now and restarted.uid != uid
+
+
+@pytest.mark.parametrize("change", ["missing_mapping", "missing_state", "unknown", "naive", "future",
+                                   "uncommitted", "lost", "wrong_phase", "no_phase", "no_stamp", "off", "wrong_mode"])
+def test_calendar_never_invents_confirmed_start(monkeypatch, change):
+    now = datetime.now(UTC)
+    coordinator, action, state, start = _running_coordinator(now, climate=True)
+    control = coordinator.store.data["ownership"]["hvac_control"]
+    if change == "missing_mapping":
+        coordinator.entry_data = {}
+    elif change == "missing_state":
+        coordinator.hass.states.get = lambda entity_id: None
+    elif change == "unknown":
+        state.state = "unavailable"
+    elif change == "naive":
+        control["phase_started_at"] = now.replace(tzinfo=None).isoformat()
+    elif change == "future":
+        control["phase_started_at"] = (now + timedelta(minutes=1)).isoformat()
+    elif change == "uncommitted":
+        control["main_state_committed"] = False
+    elif change == "lost":
+        control["required_evidence_lost"] = "outage"
+    elif change == "wrong_phase":
+        control["phase"] = "peak_coast"
+    elif change == "no_phase":
+        action.desired_state = {}
+    elif change == "no_stamp":
+        control.pop("phase_started_at")
+    elif change == "off":
+        state.state = "off"
+    elif change == "wrong_mode":
+        state.state = "heat"
+    assert calendar_module._actual_start(coordinator, action, now) is None
+    action.asset = ActionAsset.ENPHASE
+    assert calendar_module._actual_start(coordinator, action, now) is None
+
+
+def test_ev_start_requires_live_charging_mapping_and_aware_time():
+    now = datetime.now(UTC)
+    coordinator, action, state, _ = _running_coordinator(now)
+    for stamp in (None, now.replace(tzinfo=None), now + timedelta(minutes=1)):
+        state.last_changed = stamp
+        assert calendar_module._actual_start(coordinator, action, now) is None
+    coordinator.entry_data = {}
+    assert calendar_module._actual_start(coordinator, action, now) is None
+
+
+def test_calendar_handles_legacy_non_mapping_climate_ownership():
+    now = datetime.now(UTC)
+    coordinator, action, _, _ = _running_coordinator(now, climate=True)
+    coordinator.store.data["ownership"]["hvac_control"] = "legacy"
+    assert calendar_module._actual_start(coordinator, action, now) is None
+
+
+def test_committed_off_coasting_phase_keeps_actual_start():
+    now = datetime.now(UTC)
+    coordinator, action, state, start = _running_coordinator(now, climate=True)
+    action.desired_state.update(phase="peak_coast", hvac_mode="off")
+    coordinator.store.data["ownership"]["hvac_control"]["phase"] = "peak_coast"
+    state.state = "off"
+    assert calendar_module._actual_start(coordinator, action, now) == start

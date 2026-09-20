@@ -22,6 +22,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import advice_runtime, startup_recovery, task_lifecycle
+from .action_limits import budget_history
 from .adapter_helpers import async_call_device_service, zone_temperature_sync_deferred
 from .advice_runtime import (
     _AI_ADVICE_NOTIFICATION_ID as _AI_ADVICE_NOTIFICATION_ID,
@@ -1065,7 +1066,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             context.ev_evidence["power_capability"] = None
             context.input_issues.append("ev_power_feedback_unavailable")
         context.ev_evidence.update(audit_evidence(
-            self.store.data.get("execution_audit", []), options, context.created_at))
+            budget_history(self.store.data), options, context.created_at))
         previous_plan = self.store.data.get("active_plan", {})
         for previous_action in previous_plan.get("actions", []) if isinstance(previous_plan, dict) else []:
             if previous_action.get("asset") == "ev":
@@ -1408,6 +1409,29 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 CONF_CLIMATE_CONTROL_ENABLED,
                 CONF_ENPHASE_CONTROL_ENABLED,
             }
+            # Policy changes need a fresh plan, not a release of unrelated assets.
+            # Physical capabilities, entity mappings and safety thresholds retain
+            # the full disarm/recovery path below.
+            hot_policy_keys = {
+                "max_daily_ev_actions", "max_daily_climate_actions", "max_daily_enphase_actions",
+                "manual_hvac_override_minutes", "plan_fallback_notifications_enabled",
+                "ev_charging_strategy", "ev_readiness_buffer_minutes", "ev_schedule_min_saving",
+                "ev_schedule_min_saving_percent", "ev_min_dwell_minutes",
+            }
+            if previous_options is not None and changed_option_keys <= hot_policy_keys:
+                async with self._command_lock:
+                    self.executor.options = current_options
+                    policy_production = dict(parse_production_state(self.store.data.get("production")).raw)
+                    if policy_production.get("dry_run_evidence_fingerprint") == production_evidence_fingerprint(
+                        self.entry_data, previous_options,
+                    ):
+                        policy_production["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+                            self.entry_data, current_options,
+                        )
+                    await self._async_save_production(policy_production)
+                    self._last_handled_options = option_state
+                await self.async_request_replan()
+                return
             store_data = getattr(getattr(self, "store", None), "data", {})
             production = parse_production_state(
                 store_data.get("production") if isinstance(store_data, dict) else None
@@ -1667,6 +1691,32 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if callable(update_entry):
             update_entry(self.entry, options=options)
         await self.async_handle_options_update()
+
+    async def async_resume_climate_planning(self) -> dict[str, Any]:
+        """Clear manual climate holds without bypassing execution safety gates."""
+        async with self._command_lock:
+            async with self._planner_lock:
+                if not await self._async_clear_expired_manual_hvac_state():
+                    raise HomeAssistantError("Could not clear the manual climate override helper.")
+                self.overrides = [override for override in self.overrides if override.kind != "manual_hvac"]
+                await self.store.async_save_overrides(self.overrides)
+                await self.store.async_flush()
+        self._mark_forced_refresh("resume_climate_planning")
+        # A debounced request can return before refreshing during cooldown.
+        # This explicit recovery action must await fresh plan evidence.
+        await self.async_refresh()
+        if not self.last_update_success:
+            raise HomeAssistantError(
+                "Could not refresh climate planning. Manual holds were cleared; retry when planner inputs recover."
+            )
+        # Refresh publishes the plan before its serialized device execution.
+        # Report the resulting execution gates, not just the scheduled intent.
+        execution = getattr(self, "_plan_execution_task", None)
+        if execution is not None:
+            await asyncio.shield(execution)
+        from .diagnostics import climate_diagnostics
+
+        return dict(climate_diagnostics(self.store.data, self.data, self.options)["preconditioning"])
 
     async def async_set_manual_hvac_override(
         self,
@@ -3090,6 +3140,29 @@ def _matches_pending_coupled_zone_hvac_feedback(
         getattr(event_context, "id", None),
         getattr(event_context, "parent_id", None),
     }
+    if expected_state == "off" and expected.get("actuator_entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE):
+        # The main shutdown also switches configured zone climates off and can
+        # remove their targets. Accept only that transition during the command,
+        # including fresh unattributed Daikin feedback; preserve manual changes.
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if (
+            event.data.get("entity_id") not in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+            or event_context is None
+            or getattr(event_context, "user_id", None) is not None
+            or getattr(event_context, "parent_id", None) not in {None, expected_context_id}
+            or old_state is None
+            or new_state is None
+            or old_state.state not in _ACTIVE_HVAC_MODES
+            or new_state.state != "off"
+        ):
+            return False
+        old_attributes = getattr(old_state, "attributes", {}) or {}
+        new_attributes = getattr(new_state, "attributes", {}) or {}
+        changed = {key for key in _HVAC_CONTROL_ATTRIBUTE_KEYS if old_attributes.get(key) != new_attributes.get(key)}
+        return changed <= {"temperature", "target_temp_low", "target_temp_high"} and all(
+            new_attributes.get(key) is None for key in changed
+        )
     entity_pair_matches = _unambiguous_coupled_zone_entity_ids_match(
         entry_data,
         expected.get("actuator_entity_id"),

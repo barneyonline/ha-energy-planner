@@ -9,6 +9,10 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Main thermostat shutdown feedback is scoped through service dispatch and confirmation. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events after the command remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
+
+- EV and climate action limits remain configurable (defaults 10 and 12 respectively, with a 60-minute manual HVAC override; existing values preserved). The optimizer distinguishes physically feasible candidates rejected by the rolling action allowance from capacity/price shortfalls, and notifications expose the limit and remaining allowance. Regression tests cover exhausted/one-action allowances, recovery after raising the cap, physical shortfalls, and actionable notifications (`tests/test_ev_optimization.py`, `tests/test_executor.py`). Safety-stop accounting remains conservative.
+
 - Active legacy HVAC cycles resample fresh timestamped import prices on their persisted tariff grid, avoiding false cancellation when refresh times move. Genuine price changes and source gaps still reject the cycle (`tests/test_inputs.py`). Successful acquisition retains the original main baseline separately from unresolved recovery; subsequent coast commands and a new executor preserve that baseline. Release restores main/zone target dependencies before damper closure or main shutdown, including dynamic Daikin bounds and mandatory off cleanup after persistence failures or cancellation (`tests/test_executor.py`, `tests/test_hvac_adapter.py`). Climate diagnostics distinguish model learning, legacy rejection, execution, and pending restoration with readable bounded blocker/target attributes and legacy non-mapping ownership compatibility (`tests/test_diagnostics.py`, `tests/test_planner.py`, `tests/test_sensor.py`).
 
 - Preconditioning acquisition survives the next planning cycle when heating from at or below the lower comfort boundary or cooling from at or above the upper boundary. Opposite-boundary handoffs remain active, and scheduled coasting boundaries override stale persisted phases. Home/away, mirrored heating/cooling, manual override, missing evidence, and unsafe-input regressions are covered in `tests/test_planner.py`.
@@ -994,3 +998,23 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - Review regressions reproduce concurrent replan/late-outcome correlation, restart between committed ownership and audit writes, coasting-only false positives, post-planning validation downgrade, and the final restoration-target gate. Storage-level tests verify durable readback and immutable prior generations.
 
 - Simultaneous-blocker regressions verify that legacy confidence, manual override, and occupancy reason codes stay aligned with their explanations and move to the remaining blocker when confidence recovers.
+
+### Climate recovery and action allowance lifecycle
+
+- `action_limits.py` and the persistent `action_attempts` ledger account for real/uncertain attempts independently of audit rotation; no-op climate suppression is excluded. Boundary, legacy migration and restart evidence: `tests/test_action_limits.py`, `tests/test_storage.py`, `tests/test_control_runtime.py`.
+- Policy-only options updates preserve active ownership and armed state; the existing recovery path remains for safety-sensitive changes. Evidence: `tests/test_coordinator.py` and real Home Assistant service/event/storage lifecycle tests in `tests/test_control_runtime.py`.
+- The Resume climate planning service and button clear manual helper/internal holds under execution/planner locks, replan, and expose remaining gates. Evidence: `tests/test_services.py`, `tests/test_switch_button.py`, `tests/test_coordinator.py`, `tests/test_control_runtime.py`.
+- Climate diagnostics expose allowance usage and the next usable allowance after a cap rejection. Evidence: `tests/test_diagnostics.py`.
+
+- Climate confirmation yields to queued HA state listeners while command attribution remains active; the compatibility suite exercises policy updates, real manual recovery and delayed main shutdown feedback on each supported HA release.
+
+### Confirmed calendar starts and uncertain EV delivery
+
+- `calendar.py` combines current plans with confirmed charging-state timestamps and committed climate phase ownership. `hvac_control.py` persists phase starts. `tests/test_calendar.py` covers replans, fresh wrappers, future windows, stop/restart and missing evidence; `tests/test_executor.py` covers climate phase transitions.
+- `ev_optimization.py` retains conservative readiness while accounting for the possible cost/carbon/battery/emergency-budget exposure of continued commands under stalled/unavailable delivery. `ev_telemetry.py` accepts positive measured power over an unchanged cumulative meter for delivery classification. Reproduction and regression evidence: `tests/test_ev_optimization.py`.
+
+### Review regressions for recovery and calendar changes
+
+- `tests/test_executor.py` exercises the retry gate with both compact and full audit records, and climate phase transitions through the real prepare/complete ownership sequence.
+- `tests/test_coordinator.py` verifies that Resume waits for deferred execution evidence before reporting blockers. `tests/test_control_runtime.py` uses the real Home Assistant refresh debounce to verify an immediate fresh result during cooldown and an explicit service error when refreshing fails.
+- `tests/test_calendar.py` covers confirmed off-state coasting and legacy non-mapping ownership. `tests/test_diagnostics.py` verifies that expired action-cap evidence does not present an exhausted allowance or a nonexistent expiry.

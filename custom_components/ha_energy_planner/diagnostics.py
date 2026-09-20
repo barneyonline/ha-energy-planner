@@ -7,6 +7,8 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .action_limits import action_budget, budget_history
+from .const import DEFAULT_OPTIONS
 from .entry_data import combined_entry_data
 from .models import to_jsonable
 from .plan_presentation import built_in_load_forecast_attrs
@@ -90,7 +92,9 @@ async def async_get_config_entry_diagnostics(
         "weather_forecast": _redact(
             dict(getattr(coordinator, "weather_forecast_diagnostics", {}) or {})
         ),
-        "climate": _redact(climate_diagnostics(store_data, plan)),
+        "climate": _redact(climate_diagnostics(store_data, plan, {**DEFAULT_OPTIONS, **entry.options})),
+        "action_budgets": {asset: action_budget(budget_history(store_data), {**DEFAULT_OPTIONS, **entry.options},
+                                                dt_util.utcnow(), asset) for asset in ("ev", "daikin", "enphase")},
         "automatic_control": {
             "requested": automatic_control_requested,
             "running": automatic_control_running,
@@ -108,7 +112,7 @@ async def async_get_config_entry_diagnostics(
     return data
 
 
-def climate_diagnostics(store_data: dict[str, Any], plan: Any) -> dict[str, Any]:
+def climate_diagnostics(store_data: dict[str, Any], plan: Any, options: dict[str, Any] | None = None) -> dict[str, Any]:
     """Separate model readiness from the last actual climate control outcome."""
     engine = store_data.get("climate_engine", {})
     model = engine.get("model", {})
@@ -116,8 +120,23 @@ def climate_diagnostics(store_data: dict[str, Any], plan: Any) -> dict[str, Any]
     normal = [row for row in observations if row.get("provenance") == "normal"]
     outcomes = [item for item in audit_records(store_data) if item.get("asset") == "daikin"]
     control = store_data.get("ownership", {}).get("hvac_control", {})
+    status = current_status(store_data, plan)
+    budget = action_budget(
+        budget_history(store_data), {**DEFAULT_OPTIONS, **(options or {})}, dt_util.utcnow(), "daikin",
+    )
+    status["action_budget"] = budget
+    if status.get("reason") == "climate_daily_action_cap_reached":
+        if budget["allowance_available_at"] is not None:
+            status["summary"] = f"Climate action limit reached: {budget['used']} of {budget['limit']} used."
+            status["next_step"] = (
+                f"Allowance becomes available at {budget['allowance_available_at']}. "
+                "Review Maximum daily climate actions in Safety and troubleshooting."
+            )
+        else:
+            status["summary"] = "The previous plan hit the climate action limit; allowance is now available."
+            status["next_step"] = "Replan to reassess the remaining execution gates before climate control resumes."
     return {
-        "preconditioning": current_status(store_data, plan),
+        "preconditioning": status,
         "economic_status": engine.get("status", "learning"),
         "ever_active": bool(engine.get("ever_active")),
         "readiness": engine.get("modes", {}),
