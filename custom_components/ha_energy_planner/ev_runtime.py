@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
+from .action_limits import action_budget
 from .ev_policy import finite
 
 
@@ -26,11 +27,13 @@ def audit_evidence(audit: list[Any], options: dict[str, Any], now: datetime) -> 
         and (at := timestamp(row.get("attempted_at"))) is not None
         and now - timedelta(hours=24) <= at <= now
     ]
-    limit = int(options.get("max_daily_ev_actions", 4))
+    limit = int(options.get("max_daily_ev_actions", 10))
     changed = [row for row in rows if row.get("reason") != "already_in_desired_state"]
     latest = max((at for row in changed if (at := timestamp(row.get("attempted_at"))) is not None), default=None)
     return {
-        "remaining_actions": max(limit - len(rows), 0) if limit > 0 else 10000,
+        "remaining_actions": (
+            action_budget(audit, {"max_daily_ev_actions": limit}, now, "ev")["remaining"] if limit > 0 else 10000
+        ),
         "last_transition_at": latest.isoformat() if latest else None,
     }
 

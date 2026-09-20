@@ -160,3 +160,13 @@ resume_control:
       required: false
       selector:
         text:
+
+resume_climate_planning:
+  name: Resume climate planning
+  description: Clear internal manual climate holds and the override helper, then replan with all safety gates enabled. Returns the current climate status and any remaining blocker.
+  fields:
+    config_entry_id:
+      required: false
+      selector:
+        config_entry:
+          integration: ha_energy_planner

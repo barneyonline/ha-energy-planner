@@ -159,6 +159,12 @@ class HVACOwnershipTransaction:
                 hvac_control.pop("main_state_committed", None)
             if hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY):
                 hvac_control["main_state_committed"] = True
+            # prepare() has already copied the requested phase into current.
+            # Compare with the pre-command baseline to detect a real transition.
+            if (desired.get("phase") is not None
+                    and desired["phase"] != self.previous.get("hvac_control", {}).get("phase")):
+                hvac_control["phase_started_at"] = self.now
+            hvac_control.setdefault("phase_started_at", self.now)
             for key in HVAC_LIFECYCLE_FIELDS:
                 if desired.get(key) is not None:
                     hvac_control[key] = desired[key]

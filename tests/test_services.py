@@ -1099,3 +1099,14 @@ def _run_preflight(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     asyncio.run(async_setup(hass, {}))
     handler = hass.services.handlers[(DOMAIN, SERVICE_RUN_PREFLIGHT)]
     return asyncio.run(handler(FakeCall({})))
+
+
+def test_resume_climate_service_returns_remaining_blocker():
+    coordinator = _coordinator()
+    async def resume():
+        return {"status": "blocked", "reason": "climate_daily_action_cap_reached"}
+    coordinator.async_resume_climate_planning = resume
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+    result = asyncio.run(hass.services.handlers[(DOMAIN, "resume_climate_planning")](FakeCall({})))
+    assert result["reason"] == "climate_daily_action_cap_reached"

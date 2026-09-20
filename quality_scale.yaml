@@ -1,3 +1,6 @@
+# Configurable defaults: EV 10 actions, climate 12 actions, manual HVAC override 60 minutes; existing saved values are preserved.
+# Shutdown feedback evidence: tests/test_hvac_adapter.py covers scoped main-off zone feedback, manual-change exclusions and failed-command cleanup.
+# EV action-cap evidence: tests/test_ev_optimization.py and tests/test_executor.py cover cap-specific diagnosis, configurable allowance recovery, physical shortfalls, and notifications; see docs/requirements-audit.md.
 # Deferred-zone startup evidence: tests/test_hvac_adapter.py covers fresh-context target recovery during main/switch turn-on, including remembered heating during a cooling startup and the subsequent command-scoped heat-to-cool zone transition, and rejection of attributed, out-of-phase, unrelated, invalid, and auxiliary-setting feedback; see docs/requirements-audit.md.
 # Climate lifecycle evidence: tests/test_inputs.py covers persisted-grid tariff revalidation; tests/test_executor.py and tests/test_hvac_adapter.py cover baseline retention, dependent target restoration and interrupted off cleanup; tests/test_diagnostics.py, tests/test_sensor.py and tests/test_planner.py distinguish learning from execution with readable bounded evidence. See docs/requirements-audit.md.
 # Settings ownership evidence: tests/test_vehicles.py verifies hub/profile field separation, hidden-value preservation, optional power inheritance, advanced calibration and shared charger power limits.
@@ -603,3 +606,17 @@ rules:
         - .github/workflows/quality-scale.yml
       tests:
         - tests/scripts/test_validate_quality_scale.py
+
+# Climate recovery and allowance lifecycle: action_limits.py maintains rolling
+# accounting independently of audit rotation; test_action_limits.py and
+# test_control_runtime.py verify expiry, persistence, policy saves and resume.
+# Resume climate planning service/button and actionable cap diagnostics are
+# documented in README.md and docs/requirements-audit.md.
+
+# Confirmed calendar starts: tests/test_calendar.py and tests/test_executor.py.
+# Uncertain EV delivery cost and positive-power stall classification:
+# tests/test_ev_optimization.py; operator behavior documented in README.md.
+
+# Review regressions: full safety-stop evidence, prepare/complete phase timing,
+# deferred Resume outcomes, refresh failure reporting and real HA debounce cooldown, off-state/legacy calendar handling and expired caps
+# are covered in test_executor/coordinator/calendar/diagnostics.py.

@@ -627,6 +627,9 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
+      },
+      "resume_climate_planning": {
+        "name": "Resume climate planning"
       }
     },
     "select": {
