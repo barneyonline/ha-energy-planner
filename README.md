@@ -251,11 +251,26 @@ expires using an execution timer; an earlier load-fallback deadline still wins. 
 recovery retains the existing conservative ownership and reservation handling.
 
 After the grace expires, automatic charging pauses: the forecast does not authorize
-indefinite operation without live consumption. Recovery requires two distinct fresh
-readings at least 60 seconds apart; repeated reads of the same sample and brief
-unavailable/numeric flapping cannot reset the original outage timer. The samples must
-be no more than ten minutes old; source `sampled_at_utc` is preferred to Home Assistant
-report timestamps. Recovery does not re-enable an EV control switch you turned off.
+indefinite operation without live consumption. Full recovery requires two advancing source samples at least 60 seconds apart.
+The first sample can be retained for a 30-minute pairing window; only the newest must
+meet **Consumption recovery sample age**, configurable from 1–30 minutes under
+**Planner settings → Energy, battery, grid, and data** (default 15 for cloud sources;
+use 10 for faster sources).
+
+One fresh sample observed without another failure for 90 seconds establishes limited
+recovery. It retains the model's upper-load margin and original outage deadline. Existing
+eligible outage continuations retain their allowance while the return stabilizes; a new
+Charge now request during stabilization waits for the 90-second check. Repeated reports
+of the same sample never establish full recovery. Missing/invalid/future samples, flapping
+and expired budgets cannot authorize a new automatic session or renew the allowance.
+If the outage start is unknown or the model is ineligible, one sample cannot grant
+forecast-only capacity authority. Full sample recovery is still available in that case.
+
+A committed healthy plan after full sensor recovery wakes startup validation immediately.
+Failed or superseded refreshes retain this handoff until a healthy plan commits.
+One complete fresh safety validation replaces the extra three timed checks, followed by
+normal restoration, preflight and activation verification. Disabled controls stay disabled;
+climate and battery actions retain their own capability and confidence gates.
 
 The **EV charging status** sensor shows degraded operation, recovery, and any Charge now
 expiry. Load-forecast attributes expose `uncertainty_margin_kw`, `recovery_pending` and

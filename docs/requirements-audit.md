@@ -536,7 +536,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   timestamps. A mismatch restores safe state and explicitly disarms production
   control. When startup finds the mismatch on a previously armed installation
   whose automatic-control intent is still active, it persists a restart-safe
-  handoff and requires three fresh non-commanding validation plans plus final
+  handoff and requires one fresh non-commanding safety validation plan plus final
   active-plan verification before re-arming; otherwise new dry-run review cycles
   remain required. Explicit operator arming also
   requires current preflight and matching evidence rather than merely setting
@@ -709,7 +709,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   retains automatic intent, shows **Recovery** in Mode after Home Assistant has
   started, notifies once, and persists `waiting_for_safe`.
   Recovery then runs non-debounced checks every 30 seconds indefinitely and
-  requires three consecutive healthy committed plans before safe-state
+  requires one fresh safe committed plan before safe-state
   reconciliation, evidence refresh, re-arm, active refresh, and final readiness
   verification. Whole-system shutdown preserves control state; runtime unload,
   operator disable, explicit safety-gate arm or disarm, pause, and configuration
@@ -1037,3 +1037,21 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
   real Home Assistant coverage: `test_charge_now_requires_fresh_evidence_during_debounce_cooldown`
   in `tests/test_control_runtime.py`. Confirmed manual/automatic resumes clear interruption
   alerts and reset recurrence deduplication; executor tests cover both paths.
+
+
+## Staged load-source recovery
+
+- `ev_resilience.py` retains a first sample for 30 minutes and checks freshness on the
+  newest sample using the Data health sample-age option (15-minute default, 1–30 range).
+  Single-sample observation uses 90 seconds; repeats never establish normal recovery.
+- Original outage age, capacity ceilings, model quality and grace expiry remain
+  authoritative. Stabilization grants no new automatic sessions; explicit starts wait
+  for stable observation. Unknown outage age remains ineligible for bounded fallback.
+- `startup_recovery.py` wakes on a committed healthy full recovery and runs one complete
+  validation with existing restore and final activation checks. Tests in
+  `test_ev_resilience.py`, `test_inputs.py`, `test_coordinator.py` and `test_config_flow.py`
+  cover ageing pairs, invalid timestamps, flapping, budget expiry, option bounds and
+  event-driven validation without premature arming.
+- A pending recovery handoff survives failed refreshes and discarded plans until a
+  healthy plan commits. A renewed outage cancels it; coordinator regression tests
+  verify retries bypass an otherwise unchanged-input cache.
