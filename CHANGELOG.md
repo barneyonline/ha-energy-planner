@@ -22,6 +22,35 @@
 
 - None
 
+## 1.1.6 - 2026-09-22
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- Add timed Charge now and Stop charge now controls, with a configurable 1–240 minute override that bypasses economic scheduling while retaining capacity, connection, target SOC and charger checks.
+- Add an EV charging status sensor showing consumption outages, stable recovery and timed charging intent.
+
+### 🐛 Bug fixes
+
+- Require a successful immediate input refresh before Charge now can start charging, including during Home Assistant refresh cooldown.
+- Preserve the original consumption-outage age and charging-power ceiling across replans, flapping readings and reloads.
+- Prevent delayed unsolicited-start compensation from reversing an active planner-owned Charge now request.
+- Clear interruption alerts after confirmed charging resumes so later interruptions can notify again.
+
+### 🔧 Improvements
+
+- Continue existing EV sessions through eligible consumption outages using the load model's upper estimate plus a 1 kW uncertainty allowance, without increasing charging power or starting new automatic sessions.
+- Increase the default bounded load-outage grace to 30 minutes while preserving existing explicit settings, and enforce the earlier outage or Charge now deadline with an execution timer.
+- Require two fresh consumption readings at least 60 seconds apart before leaving recovery, without re-enabling disabled controls.
+- Separate degraded cost estimates from valid EV evidence and explain safety interruptions through status attributes and deduplicated notifications.
+
+### 🔄 Other changes
+
+- None
+
 ## 1.1.5 - 2026-09-20
 
 ### 🚧 Breaking changes

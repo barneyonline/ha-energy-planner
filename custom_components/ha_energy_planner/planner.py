@@ -405,7 +405,9 @@ class DryRunPlanner:
             )
             preconditioning_required_now = False
             if manual_ev is not None:
-                charging_required_now = manual_ev.reason == "manual_start"
+                charging_required_now = manual_ev.reason in {"manual_start", "charge_now"}
+                if manual_ev.reason == "charge_now" and context.current_ev_soc_percent >= target_soc:
+                    charging_required_now = False
                 charging_reason = "ev_manual_start_override" if charging_required_now else "ev_manual_stop_override"
             elif keep_on_after_target:
                 charging_required_now = True
@@ -424,6 +426,15 @@ class DryRunPlanner:
             if charging_required_now and current_slot is not None:
                 current_slot.projected_ev_load_kw = optimization_evidence["physical_power_by_time"].get(
                     current_slot.valid_at.isoformat(), charge_rate_kw)
+            from .ev_resilience import fallback_charging_decision
+
+            fallback = fallback_charging_decision(context, self.options, manual_ev)
+            if fallback is not None:
+                charging_required_now, fallback_power, charging_reason = fallback
+                if current_slot is not None:
+                    current_slot.projected_ev_load_kw = fallback_power
+                    optimization_evidence["physical_power_by_time"][current_slot.valid_at.isoformat()] = fallback_power
+                optimization_evidence["cost_estimates_degraded"] = True
             projected_load_kw_now = (
                 max(float(current_slot.projected_ev_load_kw), 0.0)
                 if charging_required_now and current_slot is not None
@@ -439,7 +450,15 @@ class DryRunPlanner:
                     kind=ActionKind.EV_SCHEDULE,
                     desired_state={
                         "charging_required_now": charging_required_now,
+                        **({"charge_now_until": manual_ev.expires_at.isoformat()}
+                           if manual_ev is not None and manual_ev.reason == "charge_now"
+                           and manual_ev.expires_at is not None else {}),
                         "optimization": optimization_evidence,
+                        **({"load_fallback_until": (
+                            context.created_at + timedelta(seconds=float(
+                                context.ev_evidence["load_fallback"]["fallback_remaining_seconds"]
+                            ))).isoformat()}
+                           if context.ev_evidence.get("load_fallback", {}).get("fallback_applied") else {}),
                         **self._ev_power_command(context, optimization_evidence, charging_required_now),
                         "charging_observed": context.ev_charging,
                         "charging_reason": charging_reason,

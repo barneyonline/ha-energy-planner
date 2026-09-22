@@ -679,6 +679,8 @@ class InputManager:
             if current_load is not None
             else None
         )
+        if self.load_source_outage.get("recovering"):
+            clean_current_load = None
         result = load_forecast_from_model(
             self.load_forecast_model,
             now=now,
@@ -689,6 +691,8 @@ class InputManager:
             current_load_kw=clean_current_load if recent_load_is_clean else None,
             current_ev_charging=current_ev_charging,
         )
+        if self.load_source_outage.get("recovering"):
+            source_issue = f"{CONF_HOUSEHOLD_LOAD}_unavailable"
         fallback_active, outage_seconds, fallback_reason = self._load_model_fallback_status(
             state,
             now=now,
@@ -699,14 +703,27 @@ class InputManager:
         )
         if fallback_active:
             source_issue = "household_load_model_fallback_active"
-        grace_seconds = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)), 0) * 60
+        from .ev_resilience import LOAD_UNCERTAINTY_KW
+
+        conservative_load = [
+            value + LOAD_UNCERTAINTY_KW if fallback_active and value is not None else value
+            for value in result.upper_kw
+        ]
+        grace_seconds = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)), 0) * 60
         fallback_details = {
             "fallback_status": "active" if fallback_active else "unavailable" if source_issue else "not_needed",
             "fallback_reason": fallback_reason,
             "fallback_remaining_seconds": (
                 None if outage_seconds is None else round(max(grace_seconds - outage_seconds, 0), 3)
             ),
-            "fallback_summary": _LOAD_FALLBACK_SUMMARIES[fallback_reason],
+            "fallback_summary": (
+                "Consumption is recovering; waiting for two fresh readings at least one minute apart."
+                if self.load_source_outage.get("recovering")
+                else _LOAD_FALLBACK_SUMMARIES[fallback_reason]
+            ),
+            "recovery_pending": bool(self.load_source_outage.get("recovering")),
+            "uncertainty_margin_kw": LOAD_UNCERTAINTY_KW if fallback_active else 0.0,
+            "cost_estimates_degraded": fallback_active,
         }
         self.load_forecast_details = {
             **result.details,
@@ -720,9 +737,10 @@ class InputManager:
                 else "available"
             ),
             "live_source_outage_seconds": outage_seconds,
-            "outage_grace_minutes": int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)),
+            "outage_grace_minutes": int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)),
             "current_correction_applied": (
                 current_load is not None and recent_load_is_clean and current_ev_charging is not True
+                and not self.load_source_outage.get("recovering")
             ),
             "fallback_applied": fallback_active,
         }
@@ -741,12 +759,13 @@ class InputManager:
             ),
             "live_source_outage_seconds": outage_seconds,
             "outage_grace_minutes": int(
-                self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)
+                self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)
             ),
             "current_correction_applied": (
                 current_load is not None
                 and recent_load_is_clean
                 and current_ev_charging is not True
+                and not self.load_source_outage.get("recovering")
             ),
             "fallback_applied": fallback_active,
             "covered_hours": round(
@@ -766,7 +785,7 @@ class InputManager:
             details=coverage_details,
         )
         self._raw_forecast_series["baseline_load_forecast_kw"] = list(result.expected_kw)
-        self._conservative_forecast_series["baseline_load_forecast_kw"] = list(result.upper_kw)
+        self._conservative_forecast_series["baseline_load_forecast_kw"] = conservative_load
         trained_at = dt_util.parse_datetime(str(result.details.get("trained_at") or ""))
         if trained_at is not None:
             self._forecast_source_issued_at["baseline_load_forecast_kw"] = dt_util.as_utc(trained_at)
@@ -815,7 +834,8 @@ class InputManager:
             return False, None, "live_source_available"
         if source_issue != f"{CONF_HOUSEHOLD_LOAD}_unavailable":
             return False, None, "source_non_numeric"
-        if str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}:
+        if (not self.load_source_outage.get("recovering")
+                and str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}):
             return False, None, "source_non_numeric"
         entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
         changed_at: Any = None
@@ -836,7 +856,7 @@ class InputManager:
         outage_seconds = (dt_util.as_utc(now) - dt_util.as_utc(changed_at)).total_seconds()
         if outage_seconds < 0:
             return False, None, "outage_start_in_future"
-        grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 10)), 0)
+        grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)), 0)
         elapsed_seconds = outage_seconds
         outage_seconds = round(outage_seconds, 3)
         if grace_minutes == 0:
