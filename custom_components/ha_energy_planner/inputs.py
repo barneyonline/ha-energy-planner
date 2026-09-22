@@ -717,11 +717,19 @@ class InputManager:
                 None if outage_seconds is None else round(max(grace_seconds - outage_seconds, 0), 3)
             ),
             "fallback_summary": (
-                "Consumption is recovering; waiting for two fresh readings at least one minute apart."
+                "Limited recovery; conservative limits and the original outage deadline still apply."
+                if self.load_source_outage.get("recovery_degraded_ready") and fallback_active
+                else "Consumption is recovering; waiting for advancing source samples."
                 if self.load_source_outage.get("recovering")
                 else _LOAD_FALLBACK_SUMMARIES[fallback_reason]
             ),
             "recovery_pending": bool(self.load_source_outage.get("recovering")),
+            "recovery_stage": (
+                "waiting_for_capacity" if self.load_source_outage.get("recovery_degraded_ready") and not fallback_active
+                else self.load_source_outage.get("recovery_stage", "normal")
+            ),
+            "recovery_degraded_ready": bool(self.load_source_outage.get("recovery_degraded_ready")),
+            "sample_max_age_seconds": self.load_source_outage.get("sample_max_age_seconds"),
             "uncertainty_margin_kw": LOAD_UNCERTAINTY_KW if fallback_active else 0.0,
             "cost_estimates_degraded": fallback_active,
         }

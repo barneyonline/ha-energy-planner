@@ -405,6 +405,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._startup_auto_recovery_task: asyncio.Task[None] | None = None
         self._startup_auto_recovery_start_unsub: Callable[[], None] | None = None
         self._startup_auto_recovery_wakeup = asyncio.Event()
+        self._load_recovery_ready = asyncio.Event()
+        self._load_recovery_pending = False
         self._startup_auto_recovery_validation_active = False
         self._last_startup_auto_recovery_validation: dict[str, Any] | None = None
         self.last_refresh_metadata: dict[str, Any] = {}
@@ -993,7 +995,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entry_data,
             self.store.data.get("load_source_outage"),
             now=now,
+            options=options,
         )
+        load_recovery_completed = bool(self.store.data.get("load_source_outage")) and not load_source_outage
+        if load_source_outage:
+            self._load_recovery_pending = False
+        elif load_recovery_completed:
+            self._load_recovery_pending = True
         await self._async_save_load_source_outage(load_source_outage)
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
@@ -1006,6 +1014,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if (
             not force_refresh
             and not load_source_outage
+            and not getattr(self, "_load_recovery_pending", False)
             and decision_fingerprint == getattr(self, "_last_decision_fingerprint", None)
             and getattr(self, "data", None) is not None
         ):
@@ -1045,6 +1054,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        context.ev_evidence["load_recovery_completed"] = getattr(self, "_load_recovery_pending", False)
         ev_sample = sample_ev(self.hass, entry_data, options, context)
         reservation = self.store.data.get("ev_grid_reservation", {})
         telemetry = update_ev_telemetry(
@@ -2445,6 +2455,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return self.data or plan
         self._last_decision_context = context
         await self.store.async_save_plan(plan)
+        if (getattr(context, "ev_evidence", {}).get("load_recovery_completed")
+                and plan.health == InputHealth.HEALTHY
+                and (event := getattr(self, "_load_recovery_ready", None)) is not None):
+            event.set()
+            self._load_recovery_pending = False
         if getattr(self, "_startup_auto_recovery_validation_active", False):
             validation = getattr(self, "_last_startup_auto_recovery_validation", None)
             if isinstance(validation, dict) and validation.get("plan_id") == plan.plan_id:
@@ -2602,6 +2617,7 @@ def _updated_load_source_outage(
     previous: Any,
     *,
     now: datetime,
+    options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Retain one start timestamp until household load becomes numeric again."""
     entity_id = str(entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
@@ -2613,7 +2629,7 @@ def _updated_load_source_outage(
     if state is not None and normalize_power_kw(getattr(state, "state", None), unit) is not None:
         from .ev_resilience import recovering_load_source
 
-        return recovering_load_source(state, previous, entity_id, now)
+        return recovering_load_source(state, previous, entity_id, now, options)
     observed_state = "missing" if state is None else str(state.state)
     sentinel_state = observed_state.lower() in {"unknown", "unavailable"}
 
