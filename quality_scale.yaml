@@ -1,3 +1,5 @@
+# Charge now freshness and interruption recurrence: tests/test_control_runtime.py and tests/test_executor.py.
+# EV outage resilience: ev_resilience.py; tests/test_ev_resilience.py; docs/ev-scheduling.md.
 # Configurable defaults: EV 10 actions, climate 12 actions, manual HVAC override 60 minutes; existing saved values are preserved.
 # Shutdown feedback evidence: tests/test_hvac_adapter.py covers scoped main-off zone feedback, manual-change exclusions and failed-command cleanup.
 # EV action-cap evidence: tests/test_ev_optimization.py and tests/test_executor.py cover cap-specific diagnosis, configurable allowance recovery, physical shortfalls, and notifications; see docs/requirements-audit.md.

@@ -466,3 +466,23 @@ def test_resume_climate_button_explains_remaining_blocker(blocked):
             asyncio.run(_resume_climate(coordinator))
     else:
         asyncio.run(_resume_climate(coordinator))
+
+
+def test_charge_now_buttons_report_blocked_starts_and_unconfirmed_stops() -> None:
+    from unittest.mock import AsyncMock
+
+    import pytest
+    from homeassistant.exceptions import HomeAssistantError
+
+    from custom_components.ha_energy_planner.button import _cancel_charge_now, _charge_now
+
+    coordinator = SimpleNamespace(async_charge_now=AsyncMock(return_value=SimpleNamespace(applied=True)),
+                                  async_cancel_charge_now=AsyncMock(return_value=SimpleNamespace(applied=True)))
+    asyncio.run(_charge_now(coordinator))
+    asyncio.run(_cancel_charge_now(coordinator))
+    coordinator.async_charge_now.return_value = SimpleNamespace(applied=False, reason="capacity")
+    with pytest.raises(HomeAssistantError, match="blocked"):
+        asyncio.run(_charge_now(coordinator))
+    coordinator.async_cancel_charge_now.return_value = SimpleNamespace(applied=False, reason="not_confirmed")
+    with pytest.raises(HomeAssistantError, match="confirmed stopped"):
+        asyncio.run(_cancel_charge_now(coordinator))

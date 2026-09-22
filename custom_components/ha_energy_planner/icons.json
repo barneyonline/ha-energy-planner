@@ -27,6 +27,9 @@
       },
       "active_ev_vehicle": {
         "default": "mdi:car-connected"
+      },
+      "ev_charging_status": {
+        "default": "mdi:ev-station"
       }
     },
     "binary_sensor": {
@@ -58,6 +61,12 @@
       },
       "resume_climate_planning": {
         "default": "mdi:play-circle-outline"
+      },
+      "charge_now": {
+        "default": "mdi:ev-station"
+      },
+      "cancel_charge_now": {
+        "default": "mdi:stop-circle-outline"
       }
     },
     "switch": {

@@ -132,3 +132,24 @@ With shared-charger vehicle profiles, number commands use the same captured
 vehicle-session guard as start/stop commands. Measured calibration identity
 includes the resolved vehicle. A confirmed unplug resets session spending and
 discards incomplete measured intervals; uncertain handoff preserves spending.
+
+## Bounded operation during household-consumption outages
+
+Known outages use the quality-approved load forecast for the configured grace (default
+30 minutes), with an additional 1 kW upper-load uncertainty allowance. Existing charging
+can continue at no more than the current setpoint; automatic new starts wait for recovery.
+Normal import-limit and shared-reservation checks still apply. Variable-power commands
+use confirmed current-limit handling; if safe reduction cannot be established, pause.
+Forecast-only authority expires at an execution deadline and is never renewed by replans.
+
+`ha_energy_planner.charge_now` authorizes 1–240 minutes (default 60) of charging outside
+normal economic windows/price ceilings. It does not bypass capacity, connected-vehicle,
+SOC, recovery or charger checks. Its expiry and the earlier outage deadline are enforced
+by the actuator timer. `ha_energy_planner.cancel_charge_now` stops and applies the normal
+one-hour manual-stop hold. Vehicle swaps/unplug continue to invalidate session overrides.
+
+Recovery needs two distinct fresh samples at least one minute apart and within a
+10-minute freshness window; source sample timestamps take precedence. Flapping preserves
+the original outage age. No control is re-enabled solely because the sensor recovered.
+The EV charging status sensor and load-forecast evidence distinguish degraded estimates,
+capacity pauses, pending recovery and timed operator intent.

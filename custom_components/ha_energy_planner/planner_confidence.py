@@ -93,7 +93,7 @@ def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -
             issue_text,
             ("daikin_", "climate_", "weather_"),
         ),
-        "ev": _subsystem_confidence(health, issue_text, ("ev_",)),
+        "ev": _subsystem_confidence(1.0 if _only_load_fallback(context) else health, issue_text, ("ev_",)),
         "enphase": _subsystem_confidence(health, issue_text, ("enphase_", "battery_soc")),
     }
     assets_with_actions = {str(action.asset) for action in actions}
@@ -108,6 +108,8 @@ def _confidence_breakdown(context: DecisionContext, actions: list[PlanAction]) -
 def _forecast_source_confidence(context: DecisionContext, *config_keys: str) -> float:
     """Return health-capped confidence for relevant configured forecast sources."""
     health = confidence_from_health(context.input_health)
+    if CONF_HOUSEHOLD_LOAD not in config_keys and _only_load_fallback(context):
+        health = 1.0
     by_source = context.forecast_confidence_by_source
     if not by_source:
         return round(min(health, context.forecast_confidence), 4)
@@ -236,3 +238,11 @@ def _confidence_rejection_reason(
         if actual < threshold:
             failures.append(f"{key} {round(actual * 100, 1)}% (requires {round(threshold * 100, 1)}%)")
     return "Skipped because confidence is below the configured threshold: " + ", ".join(failures) + "."
+
+
+def _only_load_fallback(context: DecisionContext) -> bool:
+    """Economic uncertainty alone must not invalidate fresh EV/tariff/solar evidence."""
+    material = {i for i in context.input_issues if not i.startswith("advisory_")}
+    return (context.input_health == InputHealth.DEGRADED
+            and material == {"household_load_model_fallback_active"}
+            and context.ev_evidence.get("load_fallback", {}).get("fallback_applied") is True)

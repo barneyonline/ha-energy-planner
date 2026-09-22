@@ -170,3 +170,28 @@ resume_climate_planning:
       selector:
         config_entry:
           integration: ha_energy_planner
+
+charge_now:
+  name: Charge now
+  description: Charge for a bounded interval regardless of economic scheduling. Capacity, connection, target SOC and charger safety checks remain active.
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: ha_energy_planner
+    duration_minutes:
+      default: 60
+      selector:
+        number:
+          min: 1
+          max: 240
+          step: 1
+          mode: box
+cancel_charge_now:
+  name: Stop charge now
+  description: Stop charging and hold it off for one hour using the normal confirmed-stop path.
+  fields:
+    config_entry_id:
+      selector:
+        config_entry:
+          integration: ha_energy_planner
