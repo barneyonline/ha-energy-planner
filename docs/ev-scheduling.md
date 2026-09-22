@@ -148,8 +148,18 @@ SOC, recovery or charger checks. Its expiry and the earlier outage deadline are 
 by the actuator timer. `ha_energy_planner.cancel_charge_now` stops and applies the normal
 one-hour manual-stop hold. Vehicle swaps/unplug continue to invalidate session overrides.
 
-Recovery needs two distinct fresh samples at least one minute apart and within a
-10-minute freshness window; source sample timestamps take precedence. Flapping preserves
-the original outage age. No control is re-enabled solely because the sensor recovered.
-The EV charging status sensor and load-forecast evidence distinguish degraded estimates,
-capacity pauses, pending recovery and timed operator intent.
+Full recovery needs two advancing samples at least 60 seconds apart. Retain the first
+sample for up to 30 minutes; require only the newest to meet the configurable 1–30 minute
+sample-age limit (default 15). Source timestamps take precedence over HA report times.
+A single fresh sample stable for 90 seconds permits bounded degraded operation when the
+original outage budget and model are eligible. Existing eligible model continuations
+retain their original allowance during stabilization; new explicit starts wait for that
+stability check. Stopped EVs do not gain new automatic start authority. All limits and
+price ceilings remain enforced, and repeated samples cannot grant full recovery.
+Flapping resets observation but preserves outage age and power ceilings. Budget expiry
+pauses charging even if a single sample remains numeric. Unknown outage age fails closed.
+
+Committed full sample recovery wakes startup recovery immediately. One fresh safety
+validation, safe-state restoration, final preflight and activation verification are still
+required. This never re-enables disabled device controls. Recovery stages and sample-age
+limits are exposed alongside the existing remaining-budget and uncertainty attributes.

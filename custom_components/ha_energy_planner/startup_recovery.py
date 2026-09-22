@@ -37,7 +37,7 @@ STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
 
 STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 
-STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 3
+STARTUP_AUTO_RECOVERY_REQUIRED_RUNS = 1
 
 STARTUP_AUTO_RECOVERY_ACTIVE_STATUSES = frozenset(
     {
@@ -213,15 +213,28 @@ async def _async_run_startup_auto_recovery(self: EnergyPlannerCoordinator) -> No
             )
 
 
+async def _wait_for_load_recovery(self: EnergyPlannerCoordinator, delay: float) -> None:
+    """A committed full load recovery wakes validation without granting authority."""
+    event = getattr(self, "_load_recovery_ready", None)
+    if event is None:
+        await asyncio.sleep(delay)
+        return
+    try:
+        await asyncio.wait_for(event.wait(), timeout=delay)
+    except TimeoutError:
+        pass
+    event.clear()
+
+
 async def _async_complete_startup_grace(self: EnergyPlannerCoordinator) -> tuple[bool, str]:
-    """Wait for the full grace period and evaluate one fresh committed plan."""
+    """Wait for grace or confirmed load recovery, then validate a fresh plan."""
     deadline = self._startup_auto_recovery_deadline
     if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
         deadline = monotonic() + STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS
         self._startup_auto_recovery_deadline = deadline
     remaining = max(deadline - monotonic(), 0.0)
     if remaining:
-        await asyncio.sleep(remaining)
+        await _wait_for_load_recovery(self, remaining)
     if not self._startup_auto_recovery_authorized:
         return False, "startup_recovery_cancelled"
     # Keep ordinary transient fallback notifications suppressed while the
@@ -276,10 +289,10 @@ async def _async_enter_startup_safe_recovery(self: EnergyPlannerCoordinator, rea
 
 
 async def _async_retry_startup_safe_recovery(self: EnergyPlannerCoordinator) -> None:
-    """Retry indefinitely until three fresh healthy plans can reactivate control."""
+    """Retry until one complete fresh safety validation can reactivate control."""
     successful_runs = 0
     while self._startup_auto_recovery_authorized and self.automatic_control_requested:
-        await asyncio.sleep(STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS)
+        await _wait_for_load_recovery(self, STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS)
         if not self._startup_auto_recovery_authorized or not self.automatic_control_requested:
             return
         await self._async_update_startup_auto_recovery(
@@ -303,19 +316,18 @@ async def _async_retry_startup_safe_recovery(self: EnergyPlannerCoordinator) -> 
                 successful_runs=successful_runs,
                 reason="validation_succeeded",
             )
-            if successful_runs >= STARTUP_AUTO_RECOVERY_REQUIRED_RUNS:
-                recovered, reason = await self._async_reactivate_after_startup_recovery(
-                    successful_runs
-                )
-                if recovered:
-                    return
-                successful_runs = 0
-                await self._async_update_startup_auto_recovery(
-                    "waiting_for_safe",
-                    successful_runs=0,
-                    reason=reason,
-                )
-                await self.executor.async_notify_startup_recovery_unsafe(reason)
+            recovered, reason = await self._async_reactivate_after_startup_recovery(
+                successful_runs
+            )
+            if recovered:
+                return
+            successful_runs = 0
+            await self._async_update_startup_auto_recovery(
+                "waiting_for_safe",
+                successful_runs=0,
+                reason=reason,
+            )
+            await self.executor.async_notify_startup_recovery_unsafe(reason)
 
 
 async def _async_reactivate_after_startup_recovery(

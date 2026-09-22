@@ -47,13 +47,16 @@ def test_recovery_requires_distinct_fresh_samples_and_retains_original_outage():
     assert first["started_at"] == prior["started_at"]
     assert first["recovering"]
     same = recovering_load_source(state(NOW), first, "sensor.load", NOW+timedelta(minutes=2))
-    assert same == first  # Re-reading the same sample does not establish recovery.
+    assert same["recovering"]  # Re-reading permits bounded operation, never full recovery.
+    assert same["recovery_stage"] == "bounded_degraded"
+    assert same["recovery_first_sample"] == first["recovery_first_sample"]
     assert recovering_load_source(state(NOW+timedelta(seconds=60)), first, "sensor.load",
                                   NOW+timedelta(seconds=60)) == {}
-    stale = recovering_load_source(state(NOW-timedelta(minutes=11)), first, "sensor.load", NOW)
-    assert "recovery_first_sample" not in stale
+    stale = recovering_load_source(state(NOW-timedelta(minutes=16)), first, "sensor.load", NOW)
+    assert stale["recovery_first_sample"] == first["recovery_first_sample"]
+    assert "recovery_observed_since" not in stale
     future = recovering_load_source(state(NOW+timedelta(seconds=1)), first, "sensor.load", NOW)
-    assert "recovery_first_sample" not in future
+    assert future["recovery_first_sample"] == first["recovery_first_sample"]
     assert recovering_load_source(state(NOW), {}, "sensor.load", NOW) == {}
 
 
@@ -147,7 +150,7 @@ def test_recovery_rejects_sample_before_outage_and_resets_old_recovery_pair():
     rejected = recovering_load_source(state(NOW-timedelta(seconds=1)), prior, "sensor.load", NOW)
     assert "recovery_first_sample" not in rejected
     first = recovering_load_source(state(NOW), prior, "sensor.load", NOW)
-    later = NOW+timedelta(minutes=11)
+    later = NOW+timedelta(minutes=31)
     restarted = recovering_load_source(state(later), first, "sensor.load", later)
     assert restarted["recovery_first_sample"] == later.isoformat()
     assert restarted["started_at"] == prior["started_at"]
@@ -181,3 +184,56 @@ def test_cost_uncertainty_does_not_block_valid_ev_evidence_but_real_faults_do():
     assert asset_meets_confidence_threshold(ActionAsset.EV, ctx, options)
     ctx.input_issues.append("ev_soc_entity_unavailable")
     assert not asset_meets_confidence_threshold(ActionAsset.EV, ctx, options)
+
+
+def test_recovery_pairs_older_sample_with_fresh_newest_without_resetting_outage():
+    prior = {"entity_id": "sensor.load", "started_at": (NOW-timedelta(minutes=5)).isoformat()}
+    first = recovering_load_source(state(NOW), prior, "sensor.load", NOW)
+    # The first sample has aged out of the freshness window, but remains valid
+    # evidence for pairing. Only the newest source sample needs to be fresh.
+    later = NOW+timedelta(minutes=20)
+    assert recovering_load_source(state(later-timedelta(minutes=5)), first, "sensor.load", later) == {}
+    assert recovering_load_source(state(NOW), first, "sensor.load", later)["recovering"]
+
+
+def test_configured_cloud_freshness_and_single_sample_observation_are_independent():
+    prior = {"entity_id": "sensor.load", "started_at": (NOW-timedelta(minutes=20)).isoformat()}
+    sample = state(NOW-timedelta(minutes=11))
+    strict = recovering_load_source(sample, prior, "sensor.load", NOW, {"load_recovery_max_age_minutes": 10})
+    assert strict["recovery_stage"] == "waiting_for_sample"
+    first = recovering_load_source(sample, prior, "sensor.load", NOW)
+    assert first["recovery_stage"] == "stabilizing"
+    assert recovering_load_source(sample, first, "sensor.load", NOW+timedelta(seconds=89))["recovery_stage"] == (
+        "stabilizing")
+    stable = recovering_load_source(sample, first, "sensor.load", NOW+timedelta(seconds=90))
+    assert stable["recovery_degraded_ready"]
+    assert stable["started_at"] == prior["started_at"]
+    expired = recovering_load_source(sample, stable, "sensor.load", NOW+timedelta(minutes=5))
+    assert not expired["recovery_degraded_ready"]
+    assert "recovery_observed_since" not in expired
+
+
+def test_stabilizing_return_cannot_start_charge_now_or_extend_original_deadline():
+    ctx = context()
+    fallback = ctx.ev_evidence["load_fallback"]
+    fallback.update(recovery_pending=True, recovery_degraded_ready=False)
+    action = SimpleNamespace(desired_state={})
+    assert cap_manual_fallback(action, ctx, OPTIONS) == "ev_load_recovery_stabilizing"
+    fallback.update(recovery_degraded_ready=True, recovery_stage="bounded_degraded")
+    assert cap_manual_fallback(action, ctx, OPTIONS) is None
+    assert action.desired_state["load_fallback_until"] == (NOW+timedelta(minutes=15)).isoformat()
+    assert "Limited recovery" in charging_status(ctx, [], NOW)["summary"]
+    ctx.ev_charging = False
+    assert not fallback_charging_decision(ctx, OPTIONS, None)[0]
+
+
+def test_recovery_timestamp_rollback_restarts_observation_without_renewing_budget():
+    prior = {"entity_id": "sensor.load", "started_at": (NOW-timedelta(minutes=10)).isoformat()}
+    first = recovering_load_source(state(NOW), prior, "sensor.load", NOW)
+    rolled = recovering_load_source(state(NOW-timedelta(seconds=30)), first, "sensor.load",
+                                   NOW+timedelta(seconds=90))
+    assert not rolled["recovery_degraded_ready"]
+    assert rolled["started_at"] == prior["started_at"]
+    future_observation = {**first, "recovery_observed_since": (NOW+timedelta(minutes=1)).isoformat()}
+    assert recovering_load_source(state(NOW), future_observation, "sensor.load", NOW)["recovery_observed_since"] == (
+        NOW.isoformat())

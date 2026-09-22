@@ -115,6 +115,7 @@ from .const import (
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_HVAC_ZONE_MAPPINGS,
     CONF_INSTANCE_NAME,
+    CONF_LOAD_RECOVERY_MAX_AGE_MINUTES,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
@@ -460,6 +461,7 @@ _POLICY_SECTION_FIELDS = {
         CONF_PRICE_FRESHNESS_MINUTES,
         CONF_FORECAST_FRESHNESS_MINUTES,
         CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
+        CONF_LOAD_RECOVERY_MAX_AGE_MINUTES,
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
         CONF_MIN_TARIFF_CONFIDENCE,
         CONF_MIN_SOLAR_CONFIDENCE,
@@ -677,6 +679,9 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_FORECAST_FRESHNESS_MINUTES: NumberSelector(
             NumberSelectorConfig(min=1, max=1440, step=5, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_LOAD_RECOVERY_MAX_AGE_MINUTES: NumberSelector(
+            NumberSelectorConfig(min=1, max=30, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: NumberSelector(
             NumberSelectorConfig(min=0, max=30, step=1, mode=NumberSelectorMode.BOX)
@@ -1186,6 +1191,9 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
         load_grace = -1
     if not 0 <= load_grace <= 30:
         errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] = "invalid_load_outage_grace"
+    recovery_age = finite(user_input.get(CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, 15))
+    if recovery_age is None or not 1 <= recovery_age <= 30:
+        errors[CONF_LOAD_RECOVERY_MAX_AGE_MINUTES] = "invalid_load_recovery_age"
     for key, default in EV_DEFAULTS.items():
         if isinstance(default, (int, float)) and key in user_input:
             value = finite(user_input[key])

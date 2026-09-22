@@ -2282,3 +2282,31 @@ def test_numeric_sample_does_not_end_fallback_before_stable_recovery() -> None:
     assert issue == "household_load_model_fallback_active"
     assert manager.load_forecast_details["recovery_pending"]
     assert manager.load_forecast_details["current_correction_applied"] is False
+
+
+def test_single_sample_recovery_keeps_original_capacity_deadline_and_expiry():
+    from custom_components.ha_energy_planner.ev_resilience import recovering_load_source
+
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    state = FakeState("1", attributes={"unit_of_measurement": "kW", "sampled_at_utc": now.isoformat()})
+    prior = {"entity_id": "sensor.house", "started_at": (now-timedelta(minutes=20)).isoformat(),
+             "fallback_eligible": True, "ev_power_ceiling_kw": 4.6}
+    first = recovering_load_source(state, prior, "sensor.house", now)
+    later = now+timedelta(seconds=90)
+    stable = recovering_load_source(state, first, "sensor.house", later)
+    manager = _RawInputManager(FakeHass({"sensor.house": state}), {CONF_HOUSEHOLD_LOAD: "sensor.house"},
+                              dict(DEFAULT_OPTIONS), load_forecast_model=_constant_load_model("sensor.house", 1, now),
+                              load_source_outage=stable)
+    _, issue = manager._built_in_load_series(later, 1, 15)
+    assert issue == "household_load_model_fallback_active"
+    details = manager.load_forecast_details
+    assert details["recovery_stage"] == "bounded_degraded"
+    assert details["fallback_remaining_seconds"] == 510
+    assert details["uncertainty_margin_kw"] == 1
+    assert details["current_correction_applied"] is False
+    assert details["cost_estimates_degraded"] is True
+    _, issue = manager._built_in_load_series(now+timedelta(minutes=10), 1, 15)
+    assert issue == "household_load_entity_unavailable"
+    assert manager.load_forecast_details["fallback_reason"] == "grace_expired"
+    assert manager.load_forecast_details["recovery_stage"] == "waiting_for_capacity"
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 0
