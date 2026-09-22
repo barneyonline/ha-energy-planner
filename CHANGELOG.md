@@ -8,15 +8,17 @@
 
 ### ✨ New features
 
-- None
+- Add configurable consumption recovery sample age and staged single-sample recovery diagnostics.
 
 ### 🐛 Bug fixes
 
-- None
+- Retain an older first recovery sample for pairing with a fresh newer reading, avoiding repeated resets on delayed cloud sensors.
+- Retain the recovery wake-up across failed or superseded plan refreshes until a healthy plan commits.
 
 ### 🔧 Improvements
 
-- None
+- Allow bounded degraded recovery after 90 seconds of stable single-sample observation, retaining original outage limits.
+- Wake automatic recovery on a healthy full sensor recovery and require one complete safety validation instead of three timed checks.
 
 ### 🔄 Other changes
 

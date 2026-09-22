@@ -102,7 +102,8 @@
               "ev_limit_min": "Minimum nonzero charger limit",
               "ev_limit_max": "Maximum charger limit",
               "ev_voltage": "Conservative phase voltage (V)",
-              "ev_phases": "Charging phases"
+              "ev_phases": "Charging phases",
+              "load_recovery_max_age_minutes": "Consumption recovery sample age"
             },
             "data_description": {
               "amber_import_price_entity": "Sensor that exposes current and forecast grid import prices in $/kWh, AUD/kWh, or c/kWh.",
@@ -154,7 +155,8 @@
               "ev_limit_min": "Minimum nonzero charger limit",
               "ev_limit_max": "Maximum charger limit",
               "ev_voltage": "Conservative phase voltage (V)",
-              "ev_phases": "Charging phases"
+              "ev_phases": "Charging phases",
+              "load_recovery_max_age_minutes": "Maximum age in minutes of the newest consumption recovery sample. Use 15 for delayed cloud sources or 10 for faster sources. Older paired samples may be retained for 30 minutes."
             }
           },
           "climate_inputs": {
@@ -494,7 +496,8 @@
       "entity_not_found": "Choose an existing entity of the supported type.",
       "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
       "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
-      "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure."
+      "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure.",
+      "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",

@@ -1,3 +1,5 @@
+# Staged load recovery: ev_resilience.py, startup_recovery.py; recovery/input/coordinator/config-flow tests.
+# Recovery handoff retries and renewed-outage invalidation: tests/test_coordinator.py.
 # Charge now freshness and interruption recurrence: tests/test_control_runtime.py and tests/test_executor.py.
 # EV outage resilience: ev_resilience.py; tests/test_ev_resilience.py; docs/ev-scheduling.md.
 # Configurable defaults: EV 10 actions, climate 12 actions, manual HVAC override 60 minutes; existing saved values are preserved.

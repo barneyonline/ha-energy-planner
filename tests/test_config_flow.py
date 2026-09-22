@@ -1910,3 +1910,14 @@ def test_ev_power_mapping_accepts_valid_capability_and_feedback():
 def test_review_watt_limit_settings_accept_typical_ev_charging_power():
     assert config_flow_module._option_selector("ev_limit_max")(7400) == 7400
     assert config_flow_module._option_selector("ev_limit_min")(1400) == 1400
+
+
+@pytest.mark.parametrize("value", [None, -1, 0, 31, float("nan"), "bad"])
+def test_load_recovery_max_age_rejects_invalid_values(value):
+    errors = _validate_options({**DEFAULT_OPTIONS, "load_recovery_max_age_minutes": value})
+    assert errors["load_recovery_max_age_minutes"] == "invalid_load_recovery_age"
+
+
+@pytest.mark.parametrize("minutes", [1, 10, 15, 30])
+def test_load_recovery_max_age_accepts_supported_sources(minutes):
+    assert _validate_options({**DEFAULT_OPTIONS, "load_recovery_max_age_minutes": minutes}) == {}

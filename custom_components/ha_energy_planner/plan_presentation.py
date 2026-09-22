@@ -374,6 +374,8 @@ def built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[
         "fallback_summary",
         "fallback_remaining_seconds",
         "recovery_pending",
+        "recovery_stage",
+        "sample_max_age_seconds",
         "uncertainty_margin_kw",
         "cost_estimates_degraded",
     )

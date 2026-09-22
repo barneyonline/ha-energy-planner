@@ -2543,12 +2543,14 @@ def test_obsolete_planner_result_does_not_save_or_execute() -> None:
     previous = _plan("previous")
     stale = _plan("stale")
     coordinator = _coordinator_for_commit(previous, current_generation=2)
+    coordinator._load_recovery_pending = True
+    coordinator._load_recovery_ready = asyncio.Event()
 
     result = asyncio.run(
         coordinator._async_commit_plan_if_current(
             1,
             stale,
-            object(),
+            SimpleNamespace(ev_evidence={"load_recovery_completed": True}),
             {"planner_enabled": True},
         )
     )
@@ -2556,6 +2558,8 @@ def test_obsolete_planner_result_does_not_save_or_execute() -> None:
     assert result is previous
     assert coordinator.store.saved_plans == []
     assert coordinator.executor.evaluated == []
+    assert coordinator._load_recovery_pending
+    assert not coordinator._load_recovery_ready.is_set()
 
 
 def test_obsolete_planner_result_schedules_refresh_when_hass_present() -> None:
@@ -4547,8 +4551,10 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: 
     assert "required_evidence_missing" in caplog.text
 
 
+@pytest.mark.parametrize("recovered", [False, True])
 def test_active_load_outage_bypasses_unchanged_fingerprint(
     monkeypatch: pytest.MonkeyPatch,
+    recovered: bool,
 ) -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={
@@ -4563,6 +4569,16 @@ def test_active_load_outage_bypasses_unchanged_fingerprint(
         ),
     )
     coordinator.data = _plan("existing-outage")
+    coordinator._load_recovery_pending = not recovered
+    if recovered:
+        now = coordinator.data.created_at
+        coordinator.hass.states.values["sensor.house"] = FakeState(
+            "1.0", {"sampled_at_utc": now.isoformat(), "unit_of_measurement": "kW"},
+        )
+        coordinator.store.data["load_source_outage"] = {
+            "entity_id": "sensor.house", "started_at": (now - timedelta(minutes=5)).isoformat(),
+            "recovery_first_sample": (now - timedelta(minutes=2)).isoformat(),
+        }
     coordinator._last_decision_fingerprint = _decision_input_fingerprint(
         coordinator.hass,
         coordinator.entry_data,
@@ -4580,10 +4596,23 @@ def test_active_load_outage_bypasses_unchanged_fingerprint(
     try:
         with pytest.raises(RuntimeError, match="outage_was_replanned"):
             asyncio.run(coordinator._async_update_data_locked())
+        if recovered:
+            # The first refresh consumed the persisted outage, but failed to
+            # build a plan. Retrying identical inputs must still replan and
+            # retain the recovery wake-up until a healthy plan commits.
+            assert coordinator.store.data["load_source_outage"] == {}
+            assert coordinator._load_recovery_pending
+            with pytest.raises(RuntimeError, match="outage_was_replanned"):
+                asyncio.run(coordinator._async_update_data_locked())
+            assert coordinator._load_recovery_pending
     finally:
         coordinator_module.dt_util.utcnow = original
 
-    assert coordinator.store.data["load_source_outage"]["entity_id"] == "sensor.house"
+    if recovered:
+        assert coordinator.store.data["load_source_outage"] == {}
+    else:
+        assert coordinator.store.data["load_source_outage"]["entity_id"] == "sensor.house"
+        assert not coordinator._load_recovery_pending
 
 
 def test_explicit_replan_marks_next_refresh_as_forced() -> None:
@@ -6965,7 +6994,7 @@ def test_interrupted_unsafe_transition_resumes_disarmed_recovery_after_restart()
     assert coordinator._startup_auto_recovery_authorized is True
 
 
-def test_startup_safe_recovery_rearms_after_three_awaited_healthy_checks(
+def test_startup_safe_recovery_rearms_after_one_awaited_safe_check(
     monkeypatch: object,
 ) -> None:
     coordinator = _startup_recovery_test_coordinator()
@@ -6990,25 +7019,22 @@ def test_startup_safe_recovery_rearms_after_three_awaited_healthy_checks(
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
     production = coordinator.store.data["production"]
-    assert validations.await_count == 3
+    assert validations.await_count == 1
     coordinator.async_refresh.assert_awaited_once_with()
     assert production["armed"] is True
     assert production["armed_reason"] == "startup_auto_recovered"
     assert production["startup_auto_recovery"]["status"] == "recovered"
-    assert production["startup_auto_recovery"]["successful_runs"] == 3
+    assert production["startup_auto_recovery"]["successful_runs"] == 1
     assert coordinator.executor.startup_recovery_dismissals == 1
 
 
-def test_startup_safe_recovery_resets_consecutive_checks_on_unsafe(
+def test_startup_safe_recovery_retries_unsafe_before_rearming(
     monkeypatch: object,
 ) -> None:
     coordinator = _startup_recovery_test_coordinator()
     results = iter(
         (
-            (True, "validation_succeeded"),
             (False, "validation_plan_unsafe"),
-            (True, "validation_succeeded"),
-            (True, "validation_succeeded"),
             (True, "validation_succeeded"),
         )
     )
@@ -7032,11 +7058,11 @@ def test_startup_safe_recovery_resets_consecutive_checks_on_unsafe(
 
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
-    assert validations.await_count == 5
+    assert validations.await_count == 2
     assert coordinator.executor.startup_recovery_notifications == [
         "validation_plan_unsafe"
     ]
-    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 3
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["successful_runs"] == 1
     assert coordinator.store.data["production"]["armed"] is True
 
 
@@ -7069,7 +7095,7 @@ def test_reactivation_failure_stays_disarmed_then_retries_automatically(
 
     asyncio.run(coordinator._async_retry_startup_safe_recovery())
 
-    assert coordinator._async_run_startup_auto_recovery_validation.await_count == 6
+    assert coordinator._async_run_startup_auto_recovery_validation.await_count == 2
     assert coordinator.executor.startup_recovery_notifications == ["restore_failed"]
     assert coordinator.store.data["production"]["armed"] is True
     assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "recovered"
@@ -8565,3 +8591,65 @@ def test_recovery_flap_retains_outage_age_and_power_ceiling() -> None:
     assert flapped["ev_power_ceiling_kw"] == 4.6
     assert "recovery_first_sample" not in flapped
     assert "recovering" not in flapped
+
+
+def test_committed_full_load_recovery_wakes_validation_but_degraded_plan_does_not():
+    async def run():
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._load_recovery_ready = asyncio.Event()
+        coordinator._load_recovery_pending = True
+        coordinator.store.async_save_plan = AsyncMock()
+        context = SimpleNamespace(ev_evidence={"load_recovery_completed": True})
+        plan = _plan("recovering")
+        plan.health = InputHealth.DEGRADED
+        await coordinator._async_commit_plan_if_current(0, plan, context, {}, execute=False)
+        assert not coordinator._load_recovery_ready.is_set()
+        assert coordinator._load_recovery_pending
+        waiter = asyncio.create_task(startup_recovery_module._wait_for_load_recovery(coordinator, 60))
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        plan.health = InputHealth.HEALTHY
+        await coordinator._async_commit_plan_if_current(0, plan, context, {}, execute=False)
+        await asyncio.wait_for(waiter, 1)
+        assert not coordinator._load_recovery_ready.is_set()
+        assert not coordinator._load_recovery_pending
+        # A wake-up never arms or dispatches a device; the existing full
+        # validation and restore/preflight boundaries still decide authority.
+        assert not coordinator.store.data.get("production", {}).get("armed")
+        assert coordinator._deferred_plan_execution[1] is plan
+        await startup_recovery_module._wait_for_load_recovery(coordinator, 0.001)
+        assert not coordinator._load_recovery_ready.is_set()
+    asyncio.run(run())
+
+
+def test_full_sample_recovery_interrupts_startup_grace_without_bypassing_validation():
+    async def run():
+        coordinator = _startup_recovery_test_coordinator()
+        coordinator._load_recovery_ready = asyncio.Event()
+        coordinator._startup_auto_recovery_deadline = coordinator_module.monotonic()+600
+        coordinator._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(False, "still_unsafe"))
+        task = asyncio.create_task(coordinator._async_complete_startup_grace())
+        await asyncio.sleep(0)
+        coordinator._load_recovery_ready.set()
+        assert await asyncio.wait_for(task, 1) == (False, "still_unsafe")
+        coordinator._async_run_startup_auto_recovery_validation.assert_awaited_once()
+        assert coordinator.store.data["production"]["armed"] is False
+    asyncio.run(run())
+
+
+def test_recovery_flap_resets_observation_but_retains_capacity_budget():
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    states = {"sensor.load": SimpleNamespace(state="unavailable", attributes={}, last_changed=now)}
+    hass = SimpleNamespace(states=SimpleNamespace(get=states.get))
+    data = {CONF_HOUSEHOLD_LOAD: "sensor.load"}
+    prior = _updated_load_source_outage(hass, data, {}, now=now)
+    states["sensor.load"] = SimpleNamespace(state="1", attributes={"unit_of_measurement": "kW",
+                                            "sampled_at_utc": (now+timedelta(minutes=1)).isoformat()})
+    first = _updated_load_source_outage(hass, data, prior, now=now+timedelta(minutes=1))
+    stable = _updated_load_source_outage(hass, data, first, now=now+timedelta(minutes=3))
+    assert stable["recovery_degraded_ready"]
+    states["sensor.load"] = SimpleNamespace(state="unavailable", attributes={}, last_changed=now+timedelta(minutes=4))
+    flapped = _updated_load_source_outage(hass, data, stable, now=now+timedelta(minutes=4))
+    assert flapped["started_at"] == prior["started_at"]
+    assert "recovery_observed_since" not in flapped
+    assert "recovery_first_sample" not in flapped

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any
 
+from .const import CONF_LOAD_RECOVERY_MAX_AGE_MINUTES
 from .ev_policy import finite
 from .ev_runtime import timestamp
 
@@ -12,11 +13,15 @@ from .ev_runtime import timestamp
 # uncertainty allowance, never a replacement for electrical protection.
 LOAD_UNCERTAINTY_KW = 1.0
 RECOVERY_STABLE_SECONDS = 60
-RECOVERY_SAMPLE_MAX_AGE_SECONDS = 600
+RECOVERY_SAMPLE_MAX_AGE_SECONDS = 900
+RECOVERY_PAIR_WINDOW_SECONDS = 1800
+RECOVERY_OBSERVATION_SECONDS = 90
 
 
-def recovering_load_source(state: Any, previous: Any, entity_id: str, now: datetime) -> dict[str, Any]:
-    """Keep outage age through flapping; repeated reads of one sample cannot recover."""
+def recovering_load_source(
+    state: Any, previous: Any, entity_id: str, now: datetime, options: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Separate a fresh source sample from bounded observation and full recovery."""
     if not isinstance(previous, dict) or previous.get("entity_id") != entity_id:
         return {}
     prior = dict(previous)
@@ -26,20 +31,32 @@ def recovering_load_source(state: Any, previous: Any, entity_id: str, now: datet
         getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
         or getattr(state, "last_changed", None)
     )
-    prior["recovering"] = True
-    if sample is None or not 0 <= (now - sample).total_seconds() <= RECOVERY_SAMPLE_MAX_AGE_SECONDS:
-        prior.pop("recovery_first_sample", None)
+    max_age = float((options or {}).get(
+        CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, RECOVERY_SAMPLE_MAX_AGE_SECONDS / 60,
+    )) * 60
+    prior.update(recovering=True, recovery_stage="waiting_for_sample", recovery_degraded_ready=False)
+    prior["sample_max_age_seconds"] = max_age
+    if sample is None or not 0 <= (now - sample).total_seconds() <= max_age:
+        prior.pop("recovery_observed_since", None)
         return prior
     outage_start = timestamp(prior.get("started_at"))
     if outage_start is not None and sample < outage_start:
-        prior.pop("recovery_first_sample", None)
+        prior.pop("recovery_observed_since", None)
         return prior
     first = timestamp(prior.get("recovery_first_sample"))
-    if first is None or sample < first or (now - first).total_seconds() > RECOVERY_SAMPLE_MAX_AGE_SECONDS:
+    if first is None or sample < first or (now - first).total_seconds() > RECOVERY_PAIR_WINDOW_SECONDS:
         prior["recovery_first_sample"] = sample.isoformat()
-        return prior
-    if (sample - first).total_seconds() >= RECOVERY_STABLE_SECONDS:
+        if first is not None and sample < first:
+            prior.pop("recovery_observed_since", None)
+    elif (sample - first).total_seconds() >= RECOVERY_STABLE_SECONDS:
         return {}
+    observed = timestamp(prior.get("recovery_observed_since"))
+    if observed is None or observed > now:
+        observed = now
+        prior["recovery_observed_since"] = now.isoformat()
+    ready = (now - observed).total_seconds() >= RECOVERY_OBSERVATION_SECONDS
+    prior.update(recovery_stage="bounded_degraded" if ready else "stabilizing",
+                 recovery_degraded_ready=ready)
     return prior
 
 
@@ -88,6 +105,9 @@ def cap_manual_fallback(action: Any, context: Any, options: Mapping[str, Any]) -
     """Apply identical capacity evidence to explicit starts during the bounded fallback."""
     if not context.ev_evidence.get("load_fallback", {}).get("fallback_applied"):
         return None
+    fallback = context.ev_evidence["load_fallback"]
+    if fallback.get("recovery_pending") and not fallback.get("recovery_degraded_ready"):
+        return "ev_load_recovery_stabilizing"
     power = fallback_power(context, options)
     if power <= 0:
         return "ev_load_fallback_capacity_pause"
@@ -114,7 +134,9 @@ def charging_status(context: Any, overrides: list[Any], now: datetime) -> dict[s
     fallback = context.ev_evidence.get("load_fallback", {})
     override = next((o for o in overrides if o.kind == "manual_ev_charging"
                      and o.reason == "charge_now" and o.expires_at is not None and o.expires_at > now), None)
-    if fallback.get("recovery_pending"):
+    if fallback.get("recovery_stage") == "bounded_degraded" and fallback.get("fallback_applied"):
+        summary = "Limited recovery; conservative charging limits remain active"
+    elif fallback.get("recovery_pending"):
         summary = "Consumption recovering; waiting for stable readings"
     elif fallback.get("fallback_applied"):
         summary = ("Consumption unavailable; charging with conservative forecast limits"
@@ -132,6 +154,7 @@ def charging_status(context: Any, overrides: list[Any], now: datetime) -> dict[s
             "cost_estimates_degraded": bool(fallback.get("cost_estimates_degraded")),
             "fallback_remaining_seconds": fallback.get("fallback_remaining_seconds"),
             "recovery_pending": bool(fallback.get("recovery_pending")),
+            "recovery_stage": fallback.get("recovery_stage", "normal"),
             "uncertainty_margin_kw": fallback.get("uncertainty_margin_kw", 0)}
 
 
