@@ -150,7 +150,7 @@ from .entry_data import combined_entry_data
 from .ev_policy import EV_DEFAULTS, finite, power_capability, strategy
 from .subentry_migration import async_migrate_subentries_to_entry_data
 from .type_defs import EnergyPlannerConfigEntry
-from .vehicles import AUTO, HOME, MANUAL, PORT, VEHICLE, VEHICLES
+from .vehicles import AUTO, HOME, MANUAL, PORT, VEHICLES
 
 SUBENTRY_ENERGY = "energy"
 SUBENTRY_CLIMATE = "climate"
@@ -742,25 +742,34 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None,
     ) -> config_entries.ConfigFlowResult:
         """Repair an older entry's missing vehicle target without replacing it."""
-        entry = self._get_reconfigure_entry()
+        from .migration_recovery import (
+            async_create_migration_issue,
+            async_save_vehicle_target,
+            supports_migration_retry,
+        )
+
+        entry = self.hass.config_entries.async_get_entry(self.context.get("entry_id", ""))
+        if entry is None or entry.domain != DOMAIN:
+            return self.async_abort(reason="entry_removed")
+        if entry.version > self.VERSION:
+            return self.async_abort(reason="unsupported_version")
+        if not hasattr(self, "_repairing_migration"):
+            self._repairing_migration = entry.version < 4
+        if self._repairing_migration and entry.version >= 4:
+            return self.async_abort(reason="already_repaired")
+        if entry.disabled_by:
+            return self.async_abort(reason="entry_disabled")
         errors: dict[str, str] = {}
         if user_input is not None:
-            errors = _validate_config(self.hass, user_input)
+            if entry.version < 4 and entry.state is not config_entries.ConfigEntryState.MIGRATION_ERROR:
+                errors["base"] = "retry_not_ready"
+            else:
+                errors = async_save_vehicle_target(self.hass, entry, user_input)
             if not errors:
-                data = {**entry.data, **user_input}
-                # Legacy subentries are merged during setup and must not
-                # overwrite the repaired target with an obsolete value.
-                for subentry in entry.subentries.values():
-                    if (
-                        getattr(subentry, "subentry_type", None) != VEHICLE
-                        and CONF_EV_SMART_CHARGING_TARGET_SOC in subentry.data
-                    ):
-                        self.hass.config_entries.async_update_subentry(
-                            entry, subentry, data={**subentry.data, **user_input}
-                        )
-                self.hass.config_entries.async_update_entry(entry, data=data)
-                # Loaded entries use their options/data listener for reload;
-                # failed migrations have no listener and need an explicit retry.
+                if entry.state is config_entries.ConfigEntryState.MIGRATION_ERROR or entry.version < 4:
+                    retry_supported = supports_migration_retry(self.hass)
+                    async_create_migration_issue(self.hass, entry, restart_required=not retry_supported)
+                    return self.async_abort(reason="repair_required" if retry_supported else "restart_required")
                 if not entry.update_listeners:
                     self.hass.config_entries.async_schedule_reload(entry.entry_id)
                 return self.async_abort(reason="reconfigure_successful")

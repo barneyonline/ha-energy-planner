@@ -37,6 +37,8 @@ def test_package_is_repeatable_complete_and_version_checked(tmp_path):
 def test_support_matrix_uses_the_public_minimum_and_pinned_baseline():
     policy = module("support_policy").support_policy(ROOT)
     minimum = json.loads((ROOT / "hacs.json").read_text())["homeassistant"]
+    assert minimum == "2026.9.0"
+    assert policy["matrix"] == ["2026.9.0", "stable"]
     assert policy["matrix"][0] == minimum
     assert policy["baseline"] in policy["matrix"]
     assert policy["matrix"][-1] == "stable"

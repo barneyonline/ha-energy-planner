@@ -6,7 +6,7 @@ dependencies = []
 
 [tool.energy-planner.support]
 baseline = "2026.9.0"
-previous = ["2026.8.2"]
+previous = []
 mypy = "1.19.1"
 
 [tool.pytest.ini_options]
