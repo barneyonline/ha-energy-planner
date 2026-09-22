@@ -39,6 +39,14 @@ from custom_components.ha_energy_planner.const import (
 from custom_components.ha_energy_planner.models import OutcomeResult
 
 
+@pytest.fixture(autouse=True)
+def stub_migration_issue_creation(monkeypatch):
+    """Unit fakes omit HA's registry; real issue lifecycle is covered in test_repairs."""
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.async_create_migration_issue", lambda *args, **kwargs: None,
+    )
+
+
 class FakeConfigEntries:
     """Minimal config-entry manager."""
 

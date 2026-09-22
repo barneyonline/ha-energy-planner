@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Require Home Assistant 2026.9.0 or newer.
 
 ### ✨ New features
 
@@ -12,6 +12,7 @@
 
 ### 🐛 Bug fixes
 
+- Recover blocked legacy vehicle-target migrations through Repairs, with restart guidance on Home Assistant 2026.9 and immediate migration retry on supported newer versions. Reject edits during migration and protect configurations from newer integration versions.
 - Retain an older first recovery sample for pairing with a fresh newer reading, avoiding repeated resets on delayed cloud sensors.
 - Retain the recovery wake-up across failed or superseded plan refreshes until a healthy plan commits.
 
@@ -19,6 +20,7 @@
 
 - Allow bounded degraded recovery after 90 seconds of stable single-sample observation, retaining original outage limits.
 - Wake automatic recovery on a healthy full sensor recovery and require one complete safety validation instead of three timed checks.
+- Use current device ownership properties in compatibility tests and retire pre-2026.9 validation workarounds.
 
 ### 🔄 Other changes
 

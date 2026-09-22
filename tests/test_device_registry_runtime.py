@@ -21,7 +21,9 @@ from custom_components.ha_energy_planner.vehicles import VEHICLE, VEHICLES
 
 
 @pytest.mark.parametrize("existing_planner", [False, True])
-def test_real_registry_migrates_only_this_entries_retired_devices(tmp_path: Path, existing_planner: bool) -> None:
+def test_real_registry_migrates_only_this_entries_retired_devices(
+    tmp_path: Path, existing_planner: bool, caplog: pytest.LogCaptureFixture,
+) -> None:
     """Exercise supported registry APIs, including the minimum supported HA."""
     async def run() -> None:
         hass = HomeAssistant(str(tmp_path))
@@ -103,9 +105,10 @@ def test_real_registry_migrates_only_this_entries_retired_devices(tmp_path: Path
             )
             assert vehicle.name == "MINI Aceman"
             assert vehicle.entry_type is None and vehicle.via_device_id is None
-            assert vehicle.config_entries == {entry.entry_id}
-            assert vehicle.config_entries_subentries == {entry.entry_id: {None}}
-            assert devices.async_get(planner.id).config_entries_subentries == {entry.entry_id: {None}}
+            assert vehicle.config_entry_id == entry.entry_id
+            assert vehicle.config_subentry_id is None
+            assert devices.async_get(planner.id).config_entry_id == entry.entry_id
+            assert devices.async_get(planner.id).config_subentry_id is None
             devices.async_update_device(vehicle.id, name_by_user="My MINI")
             hass.config_entries.async_update_entry(entry, data={**entry.data, VEHICLES: [
                 {**entry.data[VEHICLES][0], "name": "MINI renamed"},
@@ -128,3 +131,8 @@ def test_real_registry_migrates_only_this_entries_retired_devices(tmp_path: Path
             await hass.async_stop(force=True)
 
     asyncio.run(run())
+    assert not [
+        record for record in caplog.records
+        if "deprecat" in record.getMessage().lower()
+        and any(name in record.getMessage() for name in ("config_entries", "config_entries_subentries"))
+    ]

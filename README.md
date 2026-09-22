@@ -86,7 +86,7 @@ blocks when automating planner behavior.
 
 ## Requirements
 
-- Home Assistant `2026.6.0` or newer; the pinned release-validation baseline is `2026.9.0`.
+- Home Assistant `2026.9.0` or newer; the pinned release-validation baseline is `2026.9.0`.
 - Import and export tariff forecast sensors, commonly supplied by Amber Electric.
 - An external PV forecast, commonly Solcast Forecast Today and optionally Forecast Tomorrow.
 - A measured whole-home instantaneous consumption sensor in W, kW, or MW.
@@ -194,7 +194,7 @@ Removing Energy Planner stops future plans and commands. It does not remove sour
 - [Releases](https://github.com/barneyonline/ha-energy-planner/releases)
 - [Issue tracker](https://github.com/barneyonline/ha-energy-planner/issues)
 - [Release notes](CHANGELOG.md)
-- [Requirements and implementation evidence](docs/requirements-audit.md) — `scripts/docker-validate.sh` runs the full suite and compatibility checks; the 2026.6.0 compatibility modules use separate interpreters and retain all failure exit codes.
+- [Requirements and implementation evidence](docs/requirements-audit.md) — `scripts/docker-validate.sh` runs the full suite and compatibility checks; the HA 2026.9.0 baseline and stable compatibility jobs retain all failure exit codes.
 - [Architecture review and implementation evidence](docs/architecture-review-2026-09-05.md)
 - [Quality-scale evidence](quality_scale.yaml)
 - [Home Assistant Integration Quality Scale](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
@@ -277,3 +277,7 @@ expiry. Load-forecast attributes expose `uncertainty_margin_kw`, `recovery_pendi
 `cost_estimates_degraded`. Actual safety/unsolicited-start stops produce a deduplicated
 notification directing you to these diagnostics and the explicit Charge now control.
 A confirmed charging restart clears the alert so a later interruption can notify again.
+
+### Legacy vehicle-target migration repair
+
+If an older configuration cannot migrate because its vehicle target-SOC entity is missing, open **Settings > System > Repairs** and select the target entity. Existing settings and recovery data are preserved. Home Assistant 2026.9 requires a restart after saving; versions with the migration-retry API retry immediately. Reconfigure also accepts the corrected target and directs you to Repairs or restart instructions. Enable disabled entries before repairing them.
