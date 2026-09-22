@@ -36,6 +36,22 @@ class PlannerButtonDescription(ButtonEntityDescription):
     available_fn: Callable[[EnergyPlannerCoordinator], bool] = lambda coordinator: True
 
 
+async def _charge_now(coordinator: EnergyPlannerCoordinator) -> None:
+    result = await coordinator.async_charge_now()
+    if not result.applied:
+        raise HomeAssistantError(
+            f"Charge now is blocked: {result.reason}. Capacity and charger safety checks remain active.",
+            translation_domain=DOMAIN, translation_key="ev_charge_now_blocked",
+            translation_placeholders={"reason": result.reason},
+        )
+
+
+async def _cancel_charge_now(coordinator: EnergyPlannerCoordinator) -> None:
+    result = await coordinator.async_cancel_charge_now()
+    if not result.applied:
+        raise HomeAssistantError(f"Charging could not be confirmed stopped: {result.reason}")
+
+
 async def _replan(coordinator: EnergyPlannerCoordinator) -> None:
     await coordinator.async_request_replan()
 
@@ -127,6 +143,8 @@ async def _resume(coordinator: EnergyPlannerCoordinator) -> None:
 
 
 BUTTONS: tuple[PlannerButtonDescription, ...] = (
+    PlannerButtonDescription(key="charge_now", translation_key="charge_now", press_fn=_charge_now),
+    PlannerButtonDescription(key="cancel_charge_now", translation_key="cancel_charge_now", press_fn=_cancel_charge_now),
     PlannerButtonDescription(
         key="resume_climate_planning", translation_key="resume_climate_planning",
         press_fn=_resume_climate,

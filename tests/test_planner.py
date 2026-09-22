@@ -3885,3 +3885,50 @@ def test_learning_message_does_not_hide_legacy_rejection_or_manual_override() ->
     assert planner_module._rejected_climate_decision(context, DEFAULT_OPTIONS)["reason"] == (
         "Waiting for supported evidence."
     )
+
+
+def test_outage_preserves_current_session_caps_power_and_attaches_hard_deadline() -> None:
+    context = _context(InputHealth.DEGRADED)
+    context.ev_charging = True
+    context.input_issues = ["household_load_model_fallback_active"]
+    context.ev_evidence = {"commanded_kw": 7.0, "load_fallback": {
+        "fallback_applied": True, "fallback_remaining_seconds": 780,
+    }}
+    for slot in context.slots:
+        slot.baseline_load_forecast_upper_kw = 2
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+               "grid_import_limit_kw": 20, "ev_charge_rate_kw": 7}
+    plan = DryRunPlanner(options).create_plan(context)
+    action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is True
+    assert action.desired_state["projected_load_kw_now"] <= 7
+    assert action.desired_state["optimization"]["cost_estimates_degraded"] is True
+    assert datetime.fromisoformat(action.desired_state["load_fallback_until"]) == (
+        context.created_at + timedelta(seconds=780))
+
+
+def test_charge_now_bypasses_economic_window_but_stops_at_vehicle_target() -> None:
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+               "ev_price_limit_enabled": True, "ev_max_import_price": 0.0}
+    for soc, wanted in [(40, True), (80, False)]:
+        context = _context()
+        context.current_ev_soc_percent = soc
+        context.ev_target_soc_percent = 80
+        expiry = context.created_at + timedelta(minutes=30)
+        context.active_overrides = [Override("manual_ev_charging", "charge_now", expiry, "charge_now")]
+        action = next(a for a in DryRunPlanner(options).create_plan(context).actions if a.asset == ActionAsset.EV)
+        assert action.desired_state["charging_required_now"] is wanted
+        assert action.desired_state["charge_now_until"] == expiry.isoformat()
+
+
+def test_outage_without_capacity_slots_never_claims_charging_authority() -> None:
+    context = _context(InputHealth.DEGRADED)
+    context.slots = []
+    context.ev_charging = True
+    context.ev_evidence = {"commanded_kw": 7, "load_fallback": {
+        "fallback_applied": True, "fallback_remaining_seconds": 60,
+    }}
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False}).create_plan(context)
+    action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["charging_reason"] == "ev_load_fallback_capacity_pause"

@@ -36,7 +36,11 @@ def ev_decision_explanation(desired: dict[str, Any]) -> str:
     margin = evidence.get("readiness_margin_minutes")
     readiness = (f" Conservative readiness margin: {margin:g} minutes."
                  if isinstance(margin, int | float) else " Completion before departure is not established.")
-    return f" {status}." + readiness + " Savings and completion are modelled estimates."
+    degraded = (
+        " Consumption is unavailable; cost estimates are degraded and charging is limited using the forecast."
+        if evidence.get("cost_estimates_degraded") else ""
+    )
+    return f" {status}." + readiness + " Savings and completion are modelled estimates." + degraded
 
 
 def plain_state_details(state: dict[str, Any]) -> dict[str, Any]:
@@ -369,6 +373,9 @@ def built_in_load_forecast_attrs(coordinator: EnergyPlannerCoordinator) -> dict[
         "fallback_reason",
         "fallback_summary",
         "fallback_remaining_seconds",
+        "recovery_pending",
+        "uncertainty_margin_kw",
+        "cost_estimates_degraded",
     )
     return {key: bounded_json(value.get(key)) for key in keys if value.get(key) is not None}
 
@@ -513,6 +520,9 @@ def plain_reason(value: Any) -> str:
     """Return a plain-English explanation for an internal reason or issue code."""
     text = str(value or "").strip()
     labels = {
+        "ev_load_fallback_continue": "Consumption unavailable; continuing with conservative forecast limits.",
+        "ev_load_fallback_waiting": "Consumption unavailable; waiting for stable readings before starting.",
+        "ev_load_fallback_capacity_pause": "Charging paused: conservative household capacity is insufficient.",
         "away_hvac_policy": "Nobody is home, so climate control can be reduced.",
         "occupied_comfort_within_bounds": "The home is occupied and temperature is already within the comfort range.",
         "manual_hvac_override_inactive": "No manual climate override is active.",

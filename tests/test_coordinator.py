@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import dt as dt_util
 
 from custom_components.ha_energy_planner import advice_runtime as advice_runtime_module
 from custom_components.ha_energy_planner import coordinator as coordinator_module
@@ -178,11 +179,14 @@ def test_load_source_outage_retains_start_until_numeric_recovery() -> None:
     assert still_retained["started_at"] == first["started_at"]
     assert still_retained["fallback_eligible"] is False
     assert still_ineligible["fallback_eligible"] is False
+    recovering = _updated_load_source_outage(
+        hass, entry_data, still_retained, now=now + timedelta(minutes=7),
+    )
+    assert recovering["recovering"] is True
+    assert recovering["started_at"] == first["started_at"]
+    states["sensor.house"].last_changed = now + timedelta(minutes=8)
     assert _updated_load_source_outage(
-        hass,
-        entry_data,
-        still_retained,
-        now=now + timedelta(minutes=7),
+        hass, entry_data, recovering, now=now + timedelta(minutes=8),
     ) == {}
 
 
@@ -8488,3 +8492,76 @@ def test_resume_waits_for_deferred_execution_before_reporting_blocker():
         assert result["status"] == "blocked"
         assert result["reason"] == "device_control_paused"
     asyncio.run(run())
+
+
+def test_charge_now_persists_bounded_intent_and_clears_delayed_compensation() -> None:
+    from unittest.mock import AsyncMock
+
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._last_decision_context = SimpleNamespace(plan_id="fresh")
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    coordinator.executor.async_manual_ev_charging = AsyncMock(return_value=SimpleNamespace(applied=True))
+    coordinator.store.async_save_overrides = AsyncMock()
+    before = dt_util.utcnow()
+    result = asyncio.run(coordinator.async_charge_now(30))
+    assert result.applied
+    assert coordinator.overrides[0].reason == "charge_now"
+    assert before+timedelta(minutes=30) <= coordinator.overrides[0].expires_at <= dt_util.utcnow()+timedelta(minutes=30)
+    assert coordinator.executor.async_manual_ev_charging.call_args.kwargs["charge_now_until"] == (
+        coordinator.overrides[0].expires_at)
+    assert coordinator.refresh_requested == 2
+    assert not coordinator._ev_auto_start_compensation_pending
+    coordinator.executor.async_manual_ev_charging.return_value = SimpleNamespace(applied=False)
+    asyncio.run(coordinator.async_charge_now(15))
+    assert len(coordinator.overrides) == 1
+    assert coordinator.store.async_save_overrides.await_count == 1
+    with pytest.raises(ValueError):
+        asyncio.run(coordinator.async_charge_now(241))
+    coordinator.async_manual_ev_charging = AsyncMock(return_value=SimpleNamespace(applied=True))
+    assert asyncio.run(coordinator.async_cancel_charge_now()).applied
+    coordinator.async_manual_ev_charging.assert_awaited_once_with(False)
+
+
+def test_charge_now_does_not_allow_queued_auto_start_compensation_to_reverse_intent() -> None:
+    from unittest.mock import AsyncMock
+
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_EV_CHARGING: "sensor.ev_charging"},
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        hass=FakeHass({"sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}},
+    )
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    coordinator.overrides = [Override("manual_ev_charging", "charge_now", dt_util.utcnow()+timedelta(minutes=30),
+                                      "charge_now")]
+    coordinator.store.data["ownership"] = {"ev_smart_charging_state": {"ev_charger_entity": "off"}}
+    coordinator.executor.async_compensate_ev_auto_start = AsyncMock(return_value=SimpleNamespace(applied=True))
+    assert asyncio.run(coordinator._async_compensate_ev_auto_start(require_unowned=False)) is None
+    coordinator.executor.async_compensate_ev_auto_start.assert_not_called()
+
+
+    # A safety stop revokes ownership. A still-live economic override must not
+    # authorise an external restart after the safe state was restored.
+    coordinator.store.data["ownership"] = {}
+    coordinator.async_update_listeners = lambda: None
+    assert asyncio.run(coordinator._async_compensate_ev_auto_start(require_unowned=False)).applied
+    coordinator.executor.async_compensate_ev_auto_start.assert_awaited_once()
+
+
+def test_recovery_flap_retains_outage_age_and_power_ceiling() -> None:
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    states = {"sensor.load": SimpleNamespace(state="unavailable", attributes={}, last_changed=now)}
+    hass = SimpleNamespace(states=SimpleNamespace(get=states.get))
+    data = {CONF_HOUSEHOLD_LOAD: "sensor.load"}
+    outage = _updated_load_source_outage(hass, data, {}, now=now)
+    outage["ev_power_ceiling_kw"] = 4.6
+    states["sensor.load"] = SimpleNamespace(state="1000", attributes={"unit_of_measurement": "W",
+                                            "sampled_at_utc": (now+timedelta(minutes=10)).isoformat()})
+    recovering = _updated_load_source_outage(hass, data, outage, now=now+timedelta(minutes=10))
+    assert recovering["recovering"]
+    states["sensor.load"] = SimpleNamespace(state="unavailable", attributes={}, last_changed=now+timedelta(minutes=11))
+    flapped = _updated_load_source_outage(hass, data, recovering, now=now+timedelta(minutes=11))
+    assert flapped["started_at"] == outage["started_at"]
+    assert flapped["ev_power_ceiling_kw"] == 4.6
+    assert "recovery_first_sample" not in flapped
+    assert "recovering" not in flapped

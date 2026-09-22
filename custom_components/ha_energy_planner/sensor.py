@@ -15,6 +15,7 @@ from homeassistant.components.sensor import (
 from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.util import dt as dt_util
 
 from .ai_advisor import ai_rejection_detail, ai_target_detail
 from .const import (
@@ -82,6 +83,11 @@ class PlannerSensorDescription(SensorEntityDescription):
 
 
 SENSORS: tuple[PlannerSensorDescription, ...] = (
+    PlannerSensorDescription(
+        key="ev_charging_status", translation_key="ev_charging_status",
+        value_fn=lambda coordinator: _ev_charging_status(coordinator)["summary"],
+        attrs_fn=lambda coordinator: _ev_charging_status(coordinator),
+    ),
     PlannerSensorDescription(
         key="mode",
         translation_key="mode",
@@ -196,6 +202,15 @@ class PlannerSensor(EnergyPlannerEntity, SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return state attributes."""
         return recorder_safe_attributes(self.entity_description.attrs_fn(self.coordinator))
+
+
+def _ev_charging_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    from .ev_resilience import charging_status
+
+    return charging_status(
+        getattr(coordinator, "_last_decision_context", None),
+        getattr(coordinator, "overrides", []), dt_util.utcnow(),
+    )
 
 
 def _decision_summary_state(coordinator: EnergyPlannerCoordinator) -> str:
