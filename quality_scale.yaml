@@ -354,7 +354,7 @@ rules:
         - custom_components/ha_energy_planner/manifest.json
   test-coverage:
     status: done
-    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, deferred-zone command-context recovery, PV unit-contract calibration migration, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent; branch evidence is published and per-module regressions are rejected. The 2026.6.0 compatibility modules run in separate interpreters with crash diagnostics and preserved failure statuses; newer images and the coverage job retain combined execution. Runtime smoke installs a deterministic release package and upgrade tests preserve previous-release recovery evidence.
+    comment: Dockerized pytest, explicit three-day EV and bounded-gap household-history boundaries, bounded/chunked EV Recorder import, coordinator execution-lock and newest-plan coalescing coverage, hourly weather response/cache/DST coverage, short household-load outage grace boundaries, climate rollback-target race rejection, deferred-zone command-context recovery, PV unit-contract calibration migration, refresh-storm thermal maturation, effective AI/pause diagnostics, bucketed forecast persistence, consolidated settings and EV option placement, startup source-appearance retry coverage, EV opportunistic-charging, complete daylight-window preference and ready-by fallback, earliest-start, and delayed command-feedback tests, external forecast coverage/stitching fixtures, deterministic Recorder-backed load-model cleaning/quality/DST/age/resampling, day-block conservative calibration, explicit combined-bypass isolation and score visibility, and contract-transition tests, conservative grid-bound and action-time evidence tests, replay fixtures, dependency-free core live-schema and Recorder-history profiles, rolling-origin persistence and conservative-coverage gates, Home Assistant check_config, and the completion-driven Energy Planner Docker smoke path are enforced by scripts/docker-validate.sh. Pull requests select affected expensive jobs with a fail-safe changed-path classifier; behavioral changes, pushes and manual runs include minimum-version, pinned-baseline and stable runtime and smoke checks. Statement coverage remains exactly 100 percent; branch evidence is published and per-module regressions are rejected. The supported HA 2026.9.0 baseline and stable compatibility runs use combined execution with preserved failure statuses. Runtime smoke installs a deterministic release package and upgrade tests preserve previous-release recovery evidence.
     references:
       tests:
         - tests/test_climate_engine.py
@@ -555,7 +555,7 @@ rules:
         - tests/scripts/test_validate_quality_scale.py
   reconfiguration-flow:
     status: done
-    comment: Configure edits all input and policy sections with topology rebuilds; concurrent data/options callbacks serialize reload preparation and recheck the replacement runtime so duplicate reloads cannot cancel automatic recovery. Later topology changes remain effective. Reconfigure repairs missing legacy vehicle targets and retries migration without replacing the entry.
+    comment: Configure edits all input and policy sections with topology rebuilds; concurrent data/options callbacks serialize reload preparation and recheck the replacement runtime so duplicate reloads cannot cancel automatic recovery. Later topology changes remain effective. Reconfigure and Repairs preserve missing-target configurations; HA 2026.9 requests a restart and newer HA can retry migration through the public API.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
@@ -565,14 +565,14 @@ rules:
         - tests/test_lifecycle.py
         - tests/test_upgrade_runtime.py
   repair-issues:
-    status: exempt
-    comment: Legacy target migration has an explicit Reconfigure recovery path. Runtime and storage failures use translated service errors, preflight evidence, and safe-state restoration; no separate Repairs flow is needed.
+    status: done
+    comment: Missing legacy vehicle targets create entry-specific translated Repairs issues. Shared validation preserves configuration; HA 2026.9 requires restart, while newer HA retries migration via its public API. Issues clear after migration, setup or entry removal.
     references:
       code:
-        - custom_components/ha_energy_planner/executor.py
+        - custom_components/ha_energy_planner/repairs.py
+        - custom_components/ha_energy_planner/migration_recovery.py
       tests:
-        - tests/test_executor.py
-        - scripts/docker-ha-smoke.sh
+        - tests/test_repairs.py
   stale-devices:
     status: done
     comment: Setup removes only stale vehicle profile devices belonging to this entry; the planner device, remaining profiles, and devices from other entries are retained.

@@ -801,6 +801,7 @@ def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.Mo
     monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda hass, entry: None)
     updates: list[dict[str, Any]] = []
     hass = SimpleNamespace(
+        data={},
         config_entries=SimpleNamespace(
             async_update_entry=lambda entry, **kwargs: updates.append(kwargs),
             async_entries=lambda domain: [entry],
