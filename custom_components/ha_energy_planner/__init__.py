@@ -47,6 +47,11 @@ from .const import (
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
 from .entry_data import combined_entry_data
+from .migration_recovery import (
+    async_clear_migration_issue,
+    async_create_migration_issue,
+    supports_migration_retry,
+)
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import VEHICLE, VEHICLES
 
@@ -84,12 +89,18 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
         options[CONF_EV_SOC_PER_KWH] = DEFAULT_OPTIONS[CONF_EV_SOC_PER_KWH]
     if version < 4:
         if _legacy_ev_configuration_requires_target(entry):
+            from homeassistant.exceptions import ConfigEntryError
+
+            async_create_migration_issue(hass, entry)
+            if supports_migration_retry(hass):
+                raise ConfigEntryError(translation_domain=DOMAIN, translation_key="legacy_vehicle_target")
             return False
         options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
     if version < 5:
         options.pop(CONF_EV_MAX_SOC_PERCENT, None)
         options.pop(CONF_EV_MIN_SOC_PERCENT, None)
     hass.config_entries.async_update_entry(entry, data=data, options=options, version=5)
+    async_clear_migration_issue(hass, entry.entry_id)
     return True
 
 
@@ -422,6 +433,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
                 continue
         cleanup.result()
         raise
+    async_clear_migration_issue(hass, entry.entry_id)
     return True
 
 
@@ -534,6 +546,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
     """Remove resolved per-entry history; retain uncertain recovery evidence."""
     from .storage import PlannerStore
 
+    async_clear_migration_issue(hass, entry.entry_id)
     if not await PlannerStore(hass, entry.entry_id).async_remove_if_safe():
         _LOGGER.warning("Energy Planner retained recovery storage for removed entry %s", entry.entry_id)
 
@@ -741,8 +754,7 @@ def _async_sync_planner_device(hass: HomeAssistant, entry: EnergyPlannerConfigEn
         (DOMAIN, f"{entry.entry_id}_{suffix}")
         for suffix in ("system", "energy", "climate", "presence", "enphase", "ai", "ev", "controls")
     }
-    # This entry-scoped API is supported throughout our HA version range;
-    # async_get_device_by_identifier was only introduced after HA 2026.6.
+    # Scope cleanup to this entry so another planner's devices cannot be removed.
     for old_device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
         stale_vehicle = any(domain == DOMAIN and identifier.startswith(vehicle_prefix)
                             for domain, identifier in old_device.identifiers) and not (
