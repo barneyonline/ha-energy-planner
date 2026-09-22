@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import sqrt
 from statistics import median
-from typing import Any, TypedDict
+from typing import Any, NotRequired, TypedDict
 
 from .ev import EVChargeAllocation, EVChargeSchedule, _charge_cost_components
 from .ev_policy import finite, strategy
@@ -23,6 +23,7 @@ MAX_EVALUATIONS = 2000
 class EVDecisionEvidence(TypedDict):
     """Version-independent factual evidence shared by actions and presentation."""
 
+    cost_estimates_degraded: NotRequired[bool]
     strategy: str
     search_status: str
     candidate_evaluations: int

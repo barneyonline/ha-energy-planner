@@ -1054,6 +1054,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if (any(entry_data.get(key) for key in ("ev_power_entity", "ev_energy_entity", "ev_power_limit_entity"))
                 or options.get("ev_price_limit_enabled") or self.store.data.get("ev_telemetry")):
             await self.store.async_save_ev_telemetry(telemetry)
+        context.ev_evidence["load_fallback"] = dict(getattr(manager, "load_forecast_details", {}))
+        from .ev_resilience import retain_outage_power_ceiling
+
+        context.ev_evidence["commanded_kw"] = retain_outage_power_ceiling(
+            load_source_outage, ev_sample["commanded_kw"],
+        )
+        if load_source_outage:
+            await self._async_save_load_source_outage(load_source_outage)
         context.ev_evidence.update({
             "performance": telemetry.get("performance", {}),
             "emergency_spend": telemetry.get("emergency_spend", 0),
@@ -1673,6 +1681,41 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         await self.async_request_refresh()
         return result
 
+    async def async_charge_now(self, duration_minutes: int = 60) -> EVCommandResult:
+        """Charge for a bounded interval, bypassing economics but never capacity checks."""
+        if not 1 <= duration_minutes <= 240:
+            raise ValueError("Charge now duration must be between 1 and 240 minutes")
+        # Obtain current evidence before taking the actuator lock. Generation and
+        # vehicle guards still serialize the actual command with other controls.
+        self._mark_forced_refresh("charge_now")
+        await self.async_refresh()
+        if not self.last_update_success:
+            raise HomeAssistantError(
+                "Could not refresh charging evidence. Charge now was not started; retry when inputs recover."
+            )
+        async with self._command_lock:
+            await self._async_reconcile_vehicle_ownership()
+            self.executor.options = self.options
+            self.executor.entry_data = self.entry_data
+            expires = dt_util.utcnow() + timedelta(minutes=duration_minutes)
+            result = await self.executor.async_manual_ev_charging(
+                True, getattr(self, "_last_decision_context", None), charge_now_until=expires,
+            )
+            if result.applied:
+                self.overrides = [o for o in self.overrides if o.kind != "manual_ev_charging"]
+                self.overrides.append(Override(
+                    kind="manual_ev_charging", source="charge_now", expires_at=expires, reason="charge_now",
+                ))
+                await self.store.async_save_overrides(self.overrides)
+                self._clear_ev_auto_start_compensation()
+        self._mark_forced_refresh("charge_now_result")
+        await self.async_request_refresh()
+        return result
+
+    async def async_cancel_charge_now(self) -> EVCommandResult:
+        """Stop the explicit session through the normal confirmed-stop path."""
+        return await self.async_manual_ev_charging(False)
+
     async def async_set_ev_keep_charger_on(self, enabled: bool) -> None:
         """Validate and persist the preconditioning keep-on policy."""
         entry_data = self.entry_data
@@ -2132,6 +2175,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ):
                 self._clear_ev_auto_start_compensation()
                 return None
+            if self.store.data.get("ownership", {}).get("ev_smart_charging_state") and any(
+                o.kind == "manual_ev_charging" and o.reason == "charge_now"
+                and o.expires_at is not None and dt_util.utcnow() < o.expires_at
+                for o in self.overrides
+            ):
+                self._clear_ev_auto_start_compensation()
+                return None
             self._ev_auto_start_compensation_pending = True
             try:
                 result = await self.executor.async_compensate_ev_auto_start(
@@ -2561,7 +2611,9 @@ def _updated_load_source_outage(
     attributes = getattr(state, "attributes", {}) or {}
     unit = str(attributes.get("unit_of_measurement") or attributes.get("unit") or "")
     if state is not None and normalize_power_kw(getattr(state, "state", None), unit) is not None:
-        return {}
+        from .ev_resilience import recovering_load_source
+
+        return recovering_load_source(state, previous, entity_id, now)
     observed_state = "missing" if state is None else str(state.state)
     sentinel_state = observed_state.lower() in {"unknown", "unavailable"}
 
@@ -2590,6 +2642,7 @@ def _updated_load_source_outage(
                 else "household_load_non_numeric"
             )
         result = {
+            **({"ev_power_ceiling_kw": prior["ev_power_ceiling_kw"]} if "ev_power_ceiling_kw" in prior else {}),
             "entity_id": entity_id,
             "started_at": prior_started_at.isoformat(),
             "last_observed_state": observed_state,

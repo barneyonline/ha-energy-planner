@@ -989,3 +989,51 @@ def test_resume_refreshes_during_home_assistant_debounce_cooldown(tmp_path, monk
             await coordinator.async_shutdown()
             await hass.async_stop(force=True)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("refresh_fails", [False, True])
+def test_charge_now_requires_fresh_evidence_during_debounce_cooldown(tmp_path, monkeypatch, refresh_fails):
+    """A real HA debouncer must not let stale capacity evidence authorize a start."""
+    from unittest.mock import AsyncMock
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        store = PlannerStore(hass, "runtime")
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Charge now freshness", data={}, options=DEFAULT_OPTIONS,
+            source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        plan, context = _command("ev")
+        refreshes = 0
+
+        async def refresh():
+            nonlocal refreshes
+            refreshes += 1
+            if refresh_fails and refreshes == 2:
+                raise TimeoutError("planner input timeout")
+            coordinator._last_decision_context = context if refreshes == 1 else None
+            return plan
+
+        start = AsyncMock(return_value=SimpleNamespace(applied=False, reason="ev_grid_projection_unavailable"))
+        monkeypatch.setattr(coordinator, "_async_update_data", refresh)
+        monkeypatch.setattr(coordinator.executor, "async_manual_ev_charging", start)
+        try:
+            await coordinator.async_request_refresh()
+            assert coordinator._last_decision_context is context
+            if refresh_fails:
+                with pytest.raises(HomeAssistantError, match="Could not refresh charging evidence"):
+                    await coordinator.async_charge_now()
+                start.assert_not_awaited()
+                assert coordinator._last_decision_context is context
+            else:
+                result = await coordinator.async_charge_now()
+                assert not result.applied
+                assert start.call_args.args == (True, None)
+            assert refreshes == (2 if refresh_fails else 3)
+            assert coordinator.overrides == []
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+    asyncio.run(run())

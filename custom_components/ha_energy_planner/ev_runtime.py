@@ -58,10 +58,20 @@ def allocation_deadline(
     action: Any, options: dict[str, Any], record: dict[str, Any], now: datetime, price: float | None
 ) -> tuple[datetime | None, float, str | None]:
     """A premium command gets a bounded lease; never infer authorisation from missing prices."""
+    fallback_until = timestamp(action.desired_state.get("load_fallback_until"))
+    if fallback_until is not None and fallback_until <= now:
+        return None, 0.0, "ev_load_fallback_expired"
+    charge_now_until = timestamp(action.desired_state.get("charge_now_until"))
+    if charge_now_until is not None:
+        if charge_now_until <= now:
+            return None, 0.0, "ev_charge_now_expired"
+        return min(charge_now_until, fallback_until or charge_now_until), 0.0, None
     evidence = action.desired_state.get("optimization", {})
     completion = timestamp(evidence.get("conservative_completion"))
     end = action.execute_not_after
     deadline = completion if completion is not None and now < completion < end else None
+    if fallback_until is not None:
+        deadline = min(deadline or fallback_until, fallback_until)
     if not options.get("ev_price_limit_enabled"):
         return deadline, 0.0, None
     ceiling = float(options.get("ev_max_import_price", 1))

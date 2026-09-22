@@ -182,6 +182,23 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         coordinator = await _require_coordinator(call)
         await coordinator.async_set_ready_by(ready_by)
 
+    async def handle_charge_now(call: ServiceCall) -> dict[str, Any]:
+        coordinator = await _require_coordinator(call)
+        result = await coordinator.async_charge_now(int(call.data[ATTR_DURATION_MINUTES]))
+        if not result.applied:
+            raise HomeAssistantError(
+                f"Charge now is blocked: {result.reason}. Capacity and charger safety checks remain active.",
+                translation_domain=DOMAIN, translation_key="ev_charge_now_blocked",
+                translation_placeholders={"reason": result.reason},
+            )
+        return {"status": "charging", "duration_minutes": call.data[ATTR_DURATION_MINUTES]}
+
+    async def handle_cancel_charge_now(call: ServiceCall) -> None:
+        coordinator = await _require_coordinator(call)
+        result = await coordinator.async_cancel_charge_now()
+        if not result.applied:
+            raise HomeAssistantError(f"Charging could not be confirmed stopped: {result.reason}")
+
     async def handle_manual_override(call: ServiceCall) -> None:
         duration = int(call.data[ATTR_DURATION_MINUTES])
         reason = str(call.data.get(ATTR_REASON, "manual_service_call"))
@@ -259,6 +276,17 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
                 vol.Required(ATTR_READY_BY): vol.All(cv.string, _validate_ready_by_time),
             }
         ),
+    )
+    hass.services.async_register(
+        DOMAIN, "charge_now", handle_charge_now,
+        schema=vol.Schema({**_config_entry_field(),
+                           vol.Optional(ATTR_DURATION_MINUTES, default=60):
+                           vol.All(vol.Coerce(int), vol.Range(min=1, max=240))}),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN, "cancel_charge_now", handle_cancel_charge_now,
+        schema=vol.Schema(_config_entry_field()),
     )
     hass.services.async_register(
         DOMAIN, "resume_climate_planning", handle_resume_climate,

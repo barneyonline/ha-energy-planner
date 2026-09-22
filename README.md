@@ -151,7 +151,7 @@ Main-unit shutdowns during release or settings recovery can also switch zone cli
 ## Troubleshooting
 
 - **Load model stays in learning:** verify Recorder history, the sensor unit, and that the source represents gross household demand rather than solar, energy totals, forecasts, or signed net grid flow.
-- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default 10-minute grace requires a current, quality-approved model with complete coverage; missing or invalid readings and expired grace still fail closed.
+- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default 30-minute grace requires a current, quality-approved model with complete coverage; missing or invalid readings and expired grace still fail closed.
 - **Input availability warnings:** warnings identify the issue code and configured entities. During Home Assistant startup, missing-input warnings have a bounded ten-minute grace period; safety gates still apply immediately. The grace applies only to inputs missing on the first refresh. Inputs that remain missing after the grace period warn once; new outages and repeat outages after an input recovers warn immediately, even while other inputs are still starting. Each warned input logs once on loss and once on recovery, including its full observed outage duration. Reason changes are logged at info level and preserve the outage start; recovery requires every issue for that input to clear. Unrecognised issue text is omitted from logs.
 - **Solar forecasts near midnight:** configure both today and tomorrow forecasts. Freshness follows the forecast intervals used by planning, including the final interval through its end and validated tomorrow coverage after rollover. Missing or expired coverage still blocks unsafe plans. Untimestamped values remain subject to the entity freshness timeout even when mixed with malformed dated records.
 - **Automatic control is on but Armed is off:** check Current state, Next actions, active pauses, and the output of Run safety check or `ha_energy_planner.run_preflight`.
@@ -228,3 +228,37 @@ Running calendar entries use the charging sensor's confirmed state-change time o
 Uncertain EV delivery contributes no assumed charging progress toward readiness, but a continuing physical command is still costed at its possible power draw, including battery/carbon and emergency-price exposure. A fresh positive power reading takes precedence over an unchanged cumulative energy counter when classifying delivery.
 
 Resume climate planning bypasses refresh debounce and waits for fresh planning and queued plan execution before reporting its result. If refresh fails, it reports an error instead of returning the previous plan status; manual holds remain cleared. An old action-cap rejection is shown as previous evidence once allowance has become available. Confirmed off-state climate coasting retains its phase start in the calendar; legacy ownership without a confirmed timestamp keeps planned timing. EV safety-stop retry protection continues to use its full failure evidence separately from ordinary action allowance counts.
+
+### EV charging during consumption outages
+
+A quality-approved load model can bridge a known household-consumption outage for the
+configured grace period (30 minutes by default; existing explicit settings are preserved).
+During that period, the planner adds **1 kW** to the model's conservative upper household
+load estimate. An existing EV session may continue despite economic scheduling changes,
+but its charging power cannot increase above the observed current-limit setting (or the
+configured fixed rate). Insufficient conservative capacity causes a reduction where the
+normal confirmed-current path permits it, or a safety pause. Other EV reservations,
+vehicle identity, target SOC, charger capability, user price ceilings and safety checks
+remain enforced. Forecast headroom is an estimate, not electrical overload protection.
+
+No new automatic charging session starts during fallback. **Charge now (1 hour)** provides
+an explicit alternative; `ha_energy_planner.charge_now` accepts `duration_minutes` from 1
+through 240. It bypasses economic timing and price ceilings, but retains capacity,
+connection, target SOC and charger checks. Each request waits for a fresh input assessment; a failed refresh prevents the start.
+Failed requests explain the blocking reason.
+**Stop charge now** confirms a stop and holds charging off for one hour. The override
+expires using an execution timer; an earlier load-fallback deadline still wins. Reload
+recovery retains the existing conservative ownership and reservation handling.
+
+After the grace expires, automatic charging pauses: the forecast does not authorize
+indefinite operation without live consumption. Recovery requires two distinct fresh
+readings at least 60 seconds apart; repeated reads of the same sample and brief
+unavailable/numeric flapping cannot reset the original outage timer. The samples must
+be no more than ten minutes old; source `sampled_at_utc` is preferred to Home Assistant
+report timestamps. Recovery does not re-enable an EV control switch you turned off.
+
+The **EV charging status** sensor shows degraded operation, recovery, and any Charge now
+expiry. Load-forecast attributes expose `uncertainty_margin_kw`, `recovery_pending` and
+`cost_estimates_degraded`. Actual safety/unsolicited-start stops produce a deduplicated
+notification directing you to these diagnostics and the explicit Charge now control.
+A confirmed charging restart clears the alert so a later interruption can notify again.

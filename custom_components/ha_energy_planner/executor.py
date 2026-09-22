@@ -82,6 +82,7 @@ from .vehicles import connection, state_value
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
 _RETIRED_FALLBACK_NOTIFICATION_ID = "ha_energy_planner_haeo_fallback"
+_EV_INTERRUPTED_NOTIFICATION_ID = "ha_energy_planner_ev_interrupted"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
 _HVAC_CAPABILITY_NOTIFICATION_ID = "ha_energy_planner_hvac_capability"
 _STARTUP_RECOVERY_NOTIFICATION_ID = "ha_energy_planner_startup_recovery"
@@ -205,6 +206,8 @@ class Executor:
         self,
         enabled: bool,
         context: DecisionContext | None,
+        *,
+        charge_now_until: datetime | None = None,
     ) -> EVCommandResult:
         """Apply an explicit EV command with shared capacity and recovery tracking."""
         return await self._async_set_ev_charging(
@@ -212,6 +215,7 @@ class Executor:
             context,
             action_id="manual_ev_start" if enabled else "manual_ev_stop",
             charging_reason="manual_start" if enabled else "manual_stop",
+            charge_now_until=charge_now_until,
         )
 
     async def async_compensate_ev_auto_start(
@@ -233,6 +237,7 @@ class Executor:
         *,
         action_id: str,
         charging_reason: str,
+        charge_now_until: datetime | None = None,
     ) -> EVCommandResult:
         """Apply one EV command with shared capacity and recovery tracking."""
         command_guard = self.ev_command_guard()
@@ -251,6 +256,8 @@ class Executor:
                 ),
             },
         )
+        if charge_now_until is not None:
+            action.desired_state["charge_now_until"] = charge_now_until.isoformat()
         plan_id = getattr(context, "plan_id", "manual") if context is not None else "manual"
         if self.hass is None:
             result = EVCommandResult(False, "home_assistant_unavailable", {}, {})
@@ -263,6 +270,14 @@ class Executor:
             )
             return result
         if enabled:
+            if charge_now_until is not None and (
+                context is None or context.ev_connected is not True
+                or context.current_ev_soc_percent is None or context.ev_target_soc_percent is None
+                or context.current_ev_soc_percent >= context.ev_target_soc_percent
+            ):
+                result = EVCommandResult(False, "ev_charge_now_connection_or_target", {}, {})
+                await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id, rejected=True)
+                return result
             gate_reason = _pause_rejection_reason(
                 self.store.data.get("control_pause"),
                 action,
@@ -334,6 +349,14 @@ class Executor:
                 "unit": capability.unit, "physical_power_kw": power,
             }
             action.desired_state["projected_load_kw_now"] = power
+        if enabled and context is not None:
+            from .ev_resilience import cap_manual_fallback
+
+            fallback_reason = cap_manual_fallback(action, context, self.options)
+            if fallback_reason:
+                result = EVCommandResult(False, fallback_reason, {}, {})
+                await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id, rejected=True)
+                return result
         manual_lease = None
         manual_cost_rate = 0.0
         manual_telemetry = settle_spending(self.store.data.get("ev_telemetry", {}), now)
@@ -445,6 +468,10 @@ class Executor:
             await self.store.async_save_ownership(ownership)
         elif enabled and provisional_ownership and not self._has_ev_grid_reservation():
             await self._async_clear_provisional_ev_ownership()
+        if enabled and result.applied:
+            await self._async_dismiss_plan_fallback_notification(self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID))
+        if action_id == "ev_auto_start_compensation" and result.applied:
+            await self._async_notify_ev_interrupted("ev_auto_start_compensation")
         await self._async_record_manual_ev_outcome(
             action,
             result,
@@ -800,6 +827,14 @@ class Executor:
                 )
             )
             action_applied = safe_stop_confirmed if planner_owned_stop else ev_result.applied
+            if action_applied and _ev_action_wants_power(action):
+                await self._async_dismiss_plan_fallback_notification(
+                    self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID)
+                )
+            if action_applied and (owned_safety_stop or
+                    action.desired_state.get("charging_reason") == "ev_load_fallback_capacity_pause"
+            ) and action.desired_state.get("charging_reason") != "ev_charge_now_target_reached":
+                await self._async_notify_ev_interrupted(str(action.desired_state.get("charging_reason")))
             result_reason = (
                 "ev_stop_not_confirmed"
                 if planner_owned_stop and ev_result.applied and not safe_stop_confirmed
@@ -1044,7 +1079,7 @@ class Executor:
         manual_start_override = bool(
             context is not None
             and any(
-                override.kind == "manual_ev_charging" and override.reason == "manual_start"
+                override.kind == "manual_ev_charging" and override.reason in {"manual_start", "charge_now"}
                 for override in context.active_overrides
             )
         )
@@ -1089,7 +1124,17 @@ class Executor:
                 str(issue).startswith("ev_") for issue in context.input_issues if not str(issue).startswith("advisory_")
             )
         )
-        if context is not None:
+        charge_now = bool(context is not None and any(
+            override.kind == "manual_ev_charging" and override.reason == "charge_now"
+            and override.expires_at is not None and context.created_at < override.expires_at
+            for override in context.active_overrides
+        ))
+        charge_now_target_reached = bool(
+            charge_now and context is not None and context.current_ev_soc_percent is not None
+            and context.ev_target_soc_percent is not None
+            and context.current_ev_soc_percent >= context.ev_target_soc_percent
+        )
+        if context is not None and not charge_now:
             ev_input_issue = ev_input_issue or price_stop_required(
                 self.options, settle_spending(self.store.data.get("ev_telemetry", {}), dt_util.utcnow()),
                 context.slots[0].import_price if context.slots else None)
@@ -1122,6 +1167,7 @@ class Executor:
         )
         if not (
             disconnected
+            or charge_now_target_reached
             or unhealthy_inputs
             or recovered_reservation
             or ev_control_disabled
@@ -1131,6 +1177,8 @@ class Executor:
             return None
         if disconnected:
             charging_reason = "ev_disconnected_safety_stop"
+        elif charge_now_target_reached:
+            charging_reason = "ev_charge_now_target_reached"
         elif unhealthy_inputs:
             charging_reason = "ev_input_health_safety_stop"
         elif recovered_reservation:
@@ -1887,6 +1935,20 @@ class Executor:
                 return "external_ev_charging_conflict"
         return None
 
+    async def _async_notify_ev_interrupted(self, reason: str) -> None:
+        if not self.options.get(CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED, True):
+            return
+        await self._async_create_plan_fallback_notification(
+            title=self._notification_title("EV charging paused"),
+            message=(
+                "Energy Planner stopped charging because the current control or capacity checks do not permit it. "
+                f"Reason: {reason.replace('_', ' ')}. "
+                "Check EV charging status and Plan health. Use Charge now for an explicit timed override; "
+                "it bypasses economic scheduling but still requires valid capacity and charger evidence."
+            ),
+            notification_id=self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID),
+        )
+
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         """Create persistent notifications for major plan fallback classes."""
         if not strict_bool(
@@ -1894,7 +1956,9 @@ class Executor:
             default=True,
         ):
             self._plan_fallback_notification_signatures.clear()
-            await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
+            await self._async_dismiss_notifications((
+                *self._plan_fallback_notification_ids(), self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID),
+            ))
             return
         clean_violations = _clean_reason_codes(violations)
         grid_violations = [

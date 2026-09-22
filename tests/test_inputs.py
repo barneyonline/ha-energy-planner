@@ -2250,3 +2250,35 @@ def test_retained_climate_tariff_evidence_fails_closed() -> None:
     manager = _RawInputManager(hass, {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"}, DEFAULT_OPTIONS)
     slots = manager.retained_hvac_tariff_slots(context)
     assert slots and slots[0].import_price == 0.1
+
+
+def test_default_outage_covers_eighteen_minutes_with_added_capacity_margin_and_expires() -> None:
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("unavailable", last_changed=now-timedelta(minutes=18))}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"}, dict(DEFAULT_OPTIONS),
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+    )
+    _, issue = manager._built_in_load_series(now, 1, 15)
+    assert issue == "household_load_model_fallback_active"
+    assert manager.load_forecast_details["uncertainty_margin_kw"] == 1.0
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 720
+    assert min(manager._conservative_forecast_series["baseline_load_forecast_kw"]) >= 2.0
+    _, issue = manager._built_in_load_series(now+timedelta(minutes=12), 1, 15)
+    assert issue == "household_load_entity_unavailable"
+    assert manager.load_forecast_details["fallback_reason"] == "grace_expired"
+
+
+def test_numeric_sample_does_not_end_fallback_before_stable_recovery() -> None:
+    now = datetime(2026, 9, 22, tzinfo=UTC)
+    manager = _RawInputManager(
+        FakeHass({"sensor.house": FakeState("1", attributes={"unit_of_measurement": "kW"})}),
+        {CONF_HOUSEHOLD_LOAD: "sensor.house"}, dict(DEFAULT_OPTIONS),
+        load_forecast_model=_constant_load_model("sensor.house", 1.0, now),
+        load_source_outage={"entity_id": "sensor.house", "started_at": (now-timedelta(minutes=18)).isoformat(),
+                            "fallback_eligible": True, "recovering": True},
+    )
+    _, issue = manager._built_in_load_series(now, 1, 15)
+    assert issue == "household_load_model_fallback_active"
+    assert manager.load_forecast_details["recovery_pending"]
+    assert manager.load_forecast_details["current_correction_applied"] is False

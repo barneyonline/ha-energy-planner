@@ -1110,3 +1110,33 @@ def test_resume_climate_service_returns_remaining_blocker():
     asyncio.run(async_setup(hass, {}))
     result = asyncio.run(hass.services.handlers[(DOMAIN, "resume_climate_planning")](FakeCall({})))
     assert result["reason"] == "climate_daily_action_cap_reached"
+
+
+def test_charge_now_services_validate_duration_and_surface_rejections() -> None:
+    from unittest.mock import AsyncMock
+
+    import pytest
+    import voluptuous as vol
+    from homeassistant.exceptions import HomeAssistantError
+
+    coordinator = _coordinator()
+    coordinator.async_charge_now = AsyncMock(return_value=SimpleNamespace(applied=True))
+    coordinator.async_cancel_charge_now = AsyncMock(return_value=SimpleNamespace(applied=True))
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+    schema = hass.services.schemas[(DOMAIN, "charge_now")]
+    handler = hass.services.handlers[(DOMAIN, "charge_now")]
+    assert schema({})[ATTR_DURATION_MINUTES] == 60
+    for minutes in [0, 241]:
+        with pytest.raises(vol.Invalid):
+            schema({ATTR_DURATION_MINUTES: minutes})
+    assert asyncio.run(handler(FakeCall(schema({ATTR_DURATION_MINUTES: 30})))) == {
+        "status": "charging", "duration_minutes": 30}
+    coordinator.async_charge_now.return_value = SimpleNamespace(applied=False, reason="ev_grid_projection_unsafe")
+    with pytest.raises(HomeAssistantError, match="blocked"):
+        asyncio.run(handler(FakeCall(schema({}))))
+    cancel = hass.services.handlers[(DOMAIN, "cancel_charge_now")]
+    asyncio.run(cancel(FakeCall({})))
+    coordinator.async_cancel_charge_now.return_value = SimpleNamespace(applied=False, reason="ev_stop_not_confirmed")
+    with pytest.raises(HomeAssistantError, match="confirmed stopped"):
+        asyncio.run(cancel(FakeCall({})))

@@ -616,6 +616,9 @@
     },
     "ai_advice_not_ready": {
       "message": "AI troubleshooting is not ready: {reason}"
+    },
+    "ev_charge_now_blocked": {
+      "message": "Charge now is blocked: {reason}. Capacity and charger safety checks remain active."
     }
   },
   "entity": {
@@ -656,6 +659,9 @@
       },
       "active_ev_vehicle": {
         "name": "Active EV vehicle"
+      },
+      "ev_charging_status": {
+        "name": "EV charging status"
       }
     },
     "binary_sensor": {
@@ -706,11 +712,43 @@
       },
       "resume_climate_planning": {
         "name": "Resume climate planning"
+      },
+      "charge_now": {
+        "name": "Charge now (1 hour)"
+      },
+      "cancel_charge_now": {
+        "name": "Stop charge now"
       }
     },
     "select": {
       "ev_vehicle": {
         "name": "EV vehicle"
+      }
+    }
+  },
+  "services": {
+    "charge_now": {
+      "name": "Charge now",
+      "description": "Charge for a bounded interval, bypassing economic scheduling while retaining safety checks.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Configuration",
+          "description": "Energy Planner configuration."
+        },
+        "duration_minutes": {
+          "name": "Duration",
+          "description": "Charging override duration in minutes (1–240)."
+        }
+      }
+    },
+    "cancel_charge_now": {
+      "name": "Stop charge now",
+      "description": "Stop charging and hold it off for one hour.",
+      "fields": {
+        "config_entry_id": {
+          "name": "Configuration",
+          "description": "Energy Planner configuration."
+        }
       }
     }
   }

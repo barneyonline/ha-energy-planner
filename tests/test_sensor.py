@@ -34,6 +34,7 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
     attrs = {description.key: description.attrs_fn(coordinator) for description in SENSORS}
 
     assert values == {
+        "ev_charging_status": "Waiting for charging evidence",
         "mode": "review",
         "current_state": "No controls configured",
         "next_actions": "Unknown",

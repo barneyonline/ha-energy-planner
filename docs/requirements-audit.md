@@ -1018,3 +1018,22 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - `tests/test_executor.py` exercises the retry gate with both compact and full audit records, and climate phase transitions through the real prepare/complete ownership sequence.
 - `tests/test_coordinator.py` verifies that Resume waits for deferred execution evidence before reporting blockers. `tests/test_control_runtime.py` uses the real Home Assistant refresh debounce to verify an immediate fresh result during cooldown and an explicit service error when refreshing fails.
 - `tests/test_calendar.py` covers confirmed off-state coasting and legacy non-mapping ownership. `tests/test_diagnostics.py` verifies that expired action-cap evidence does not present an exhausted allowance or a nonexistent expiry.
+
+## EV consumption-outage resilience and explicit charging
+
+- Known load outages have bounded model authority, a conservative upper-load margin,
+  no automatic starts and no setpoint increases. Shared reservations remain authoritative;
+  unsafe/uncertain reductions stop safely. Evidence: `ev_resilience.py`, `inputs.py`,
+  `planner.py`, `executor.py`, `ev_runtime.py`; regressions in `test_ev_resilience.py`,
+  `test_inputs.py`, `test_planner.py`, `test_executor.py`.
+- Charge now is an explicit expiring economic override with connection, target and
+  capacity gates, confirmed command handling and an execution timer. Evidence:
+  `coordinator.py`, `button.py`, `__init__.py`, `services.yaml`; service/coordinator tests.
+- Persisted outage age survives flapping; two fresh samples establish stable recovery.
+  Status and deduplicated interruption notifications explain degraded/blocked charging.
+  Evidence: `ev_resilience.py`, `sensor.py`, `plan_presentation.py`, coordinator tests.
+
+- Charge now bypasses refresh debounce and rejects failed refreshes before issuing commands;
+  real Home Assistant coverage: `test_charge_now_requires_fresh_evidence_during_debounce_cooldown`
+  in `tests/test_control_runtime.py`. Confirmed manual/automatic resumes clear interruption
+  alerts and reset recurrence deduplication; executor tests cover both paths.
