@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Require Home Assistant 2026.9.0 or newer.
 
 ### ✨ New features
 
@@ -12,11 +12,11 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Recover blocked legacy vehicle-target migrations through Repairs, with restart guidance on Home Assistant 2026.9 and immediate migration retry on supported newer versions. Reject edits during migration and protect configurations from newer integration versions.
 
 ### 🔧 Improvements
 
-- None
+- Use current device ownership properties in compatibility tests and retire pre-2026.9 validation workarounds.
 
 ### 🔄 Other changes
 

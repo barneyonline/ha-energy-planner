@@ -89,7 +89,7 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
                 own_devices = dr.async_entries_for_config_entry(dr.async_get(hass), current.entry_id)
                 assert len(own_devices) == 2
                 assert {d.name for d in own_devices} == {"Upgrade fixture", "MINI Aceman"}
-                assert all(d.config_entries_subentries == {current.entry_id: {None}} for d in own_devices)
+                assert all(d.config_entry_id == current.entry_id and d.config_subentry_id is None for d in own_devices)
                 if restart:
                     assert {d.id for d in own_devices} == device_ids
                 device_ids.update(d.id for d in own_devices)
@@ -181,7 +181,7 @@ def test_separate_data_and_options_writes_preserve_reload_recovery(tmp_path: Pat
     asyncio.run(run())
 
 
-def test_legacy_target_reconfigure_retries_migration_without_replacing_entry(tmp_path: Path) -> None:
+def test_legacy_target_reconfigure_directs_recovery_without_replacing_entry(tmp_path: Path) -> None:
     async def run():
         hass = HomeAssistant(str(tmp_path))
         hass.config_entries = ConfigEntries(hass, {})
@@ -191,15 +191,24 @@ def test_legacy_target_reconfigure_retries_migration_without_replacing_entry(tmp
         flow.hass = hass
         flow.context = {"source": "reconfigure", "entry_id": entry.entry_id}
         try:
-            assert not await async_migrate_entry(hass, entry)
+            from homeassistant.exceptions import ConfigEntryError
+
+            from custom_components.ha_energy_planner.migration_recovery import supports_migration_retry
+
+            if supports_migration_retry(hass):
+                with pytest.raises(ConfigEntryError):
+                    await async_migrate_entry(hass, entry)
+            else:
+                assert not await async_migrate_entry(hass, entry)
+            entry._async_set_state(hass, ConfigEntryState.MIGRATION_ERROR, None)
             assert (await flow.async_step_reconfigure())["type"] == "form"
             invalid = await flow.async_step_reconfigure({CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.missing"})
             assert invalid["errors"]
             hass.states.async_set("sensor.vehicle_target", "80", {"unit_of_measurement": "%"})
             with patch.object(ConfigEntries, "async_schedule_reload") as reload:
                 result = await flow.async_step_reconfigure({CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target"})
-                assert result["reason"] == "reconfigure_successful"
-                reload.assert_called_once_with(entry.entry_id)
+                assert result["reason"] == ("repair_required" if supports_migration_retry(hass) else "restart_required")
+                reload.assert_not_called()
             assert await async_migrate_entry(hass, entry)
             assert entry.version == 5
             assert entry.data["ev_soc_entity"] == "sensor.car_soc"

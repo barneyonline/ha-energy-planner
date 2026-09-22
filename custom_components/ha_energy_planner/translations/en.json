@@ -36,11 +36,18 @@
       "climate_scheduler_guard_pair_required": "Configure both the Scheduler Change Helper and Scheduler Guard Timer, or leave both empty.",
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones.",
       "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
-      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget."
+      "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget.",
+      "retry_not_ready": "Migration is already running or is not ready for repair. Wait for setup to finish, then try again."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
-      "reconfigure_successful": "Reconfigure Successful"
+      "reconfigure_successful": "Reconfigure Successful",
+      "entry_removed": "This Energy Planner configuration was removed.",
+      "already_repaired": "This configuration has already been repaired.",
+      "entry_disabled": "Enable this Energy Planner configuration, then open Repairs again.",
+      "restart_required": "The vehicle target was saved. Restart Home Assistant to finish migrating this configuration.",
+      "repair_required": "The vehicle target was saved. Open Settings > System > Repairs to finish migrating this configuration.",
+      "unsupported_version": "This configuration was created by a newer Energy Planner version. Update Energy Planner before changing it."
     }
   },
   "options": {
@@ -543,6 +550,9 @@
     },
     "ev_charge_now_blocked": {
       "message": "Charge now is blocked: {reason}. Capacity and charger safety checks remain active."
+    },
+    "legacy_vehicle_target": {
+      "message": "A vehicle target-SOC entity is required to migrate this configuration. Open Settings > System > Repairs."
     }
   },
   "entity": {
@@ -674,6 +684,42 @@
           "description": "Energy Planner configuration."
         }
       }
+    }
+  },
+  "issues": {
+    "legacy_vehicle_target": {
+      "title": "Repair vehicle target for {title}",
+      "fix_flow": {
+        "step": {
+          "target": {
+            "title": "Repair vehicle target",
+            "description": "Select the vehicle target-SOC entity. Home Assistant 2026.9 requires a restart after saving; newer versions can retry immediately.",
+            "data": {
+              "ev_smart_charging_target_soc_entity": "Vehicle target SOC"
+            }
+          }
+        },
+        "error": {
+          "entity_not_found": "Entity was not found in Home Assistant.",
+          "invalid_entity_id": "Entity ID is invalid.",
+          "invalid_entity_domain": "Entity domain is not supported for this field.",
+          "invalid_unit": "Entity unit is not compatible with this field.",
+          "ev_planning_sensor_required": "EV SOC, charging state, and vehicle target SOC entities are required for EV planning.",
+          "retry_not_ready": "Migration is not ready to retry. Wait for setup to finish, then open Repairs again.",
+          "retry_failed": "The target was saved, but Energy Planner has not loaded. Check the integration error and try again."
+        },
+        "abort": {
+          "entry_removed": "This Energy Planner configuration was removed.",
+          "already_repaired": "This configuration has already been repaired.",
+          "entry_disabled": "Enable this Energy Planner configuration, then open Repairs again.",
+          "restart_required": "The vehicle target was saved. Restart Home Assistant to finish migrating this configuration.",
+          "unsupported_version": "This configuration was created by a newer Energy Planner version. Update Energy Planner before changing it."
+        }
+      }
+    },
+    "migration_restart_required": {
+      "title": "Restart to finish repairing {title}",
+      "description": "The vehicle target was saved. This Home Assistant version requires a restart to retry the migration. Restart Home Assistant; the configuration and recovery data will be preserved."
     }
   }
 }
