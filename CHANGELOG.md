@@ -4,9 +4,13 @@
 
 ### 🚧 Breaking changes
 
+- Remove the Charge now (1 hour), Stop charge now, and Resume climate planning button entities; the corresponding integration actions remain available.
+
 - Require Home Assistant 2026.9.0 or newer.
 
 ### ✨ New features
+
+- Add a Recovery sensor explaining consumption timestamp blockers, sample ages and limits, and automatic startup recovery progress.
 
 - Add configurable consumption recovery sample age and staged single-sample recovery diagnostics.
 

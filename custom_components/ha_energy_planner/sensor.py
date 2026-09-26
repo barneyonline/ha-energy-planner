@@ -63,6 +63,7 @@ from .plan_presentation import (
     plain_action,
     plain_reason,
 )
+from .recovery_presentation import recovery_details
 from .safety import (
     parse_production_state,
     strict_bool,
@@ -83,6 +84,11 @@ class PlannerSensorDescription(SensorEntityDescription):
 
 
 SENSORS: tuple[PlannerSensorDescription, ...] = (
+    PlannerSensorDescription(
+        key="recovery", translation_key="recovery",
+        value_fn=lambda coordinator: recovery_details(coordinator, dt_util.utcnow())["summary"],
+        attrs_fn=lambda coordinator: recovery_details(coordinator, dt_util.utcnow()),
+    ),
     PlannerSensorDescription(
         key="ev_charging_status", translation_key="ev_charging_status",
         value_fn=lambda coordinator: _ev_charging_status(coordinator)["summary"],
