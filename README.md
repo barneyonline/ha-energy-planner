@@ -222,7 +222,7 @@ Action limits apply over a rolling 24-hour window. Applied and failed device att
 
 Changing action limits, the manual climate hold duration, notification policy, or supported EV scheduling policies requests a fresh plan while preserving armed state and owned climate settings. Device mappings and other safety-sensitive changes still use the normal recovery lifecycle. Changing the default hold duration does not shorten an existing hold.
 
-Use **Resume climate planning** on the integration device, or call `ha_energy_planner.resume_climate_planning` with an optional `config_entry_id`, to clear both the manual helper and internal manual climate holds. The action replans and returns current climate status when response data is requested. It retains action limits, control switches, production readiness, and input-health checks. If an action cap blocks climate startup, the climate status explains usage, the next allowance time, and the **Safety and troubleshooting** setting to review. Resuming makes planning eligible again; it does not force a climate command when another gate blocks execution.
+Call `ha_energy_planner.resume_climate_planning` with an optional `config_entry_id` to clear both the manual helper and internal manual climate holds. The action replans and returns current climate status when response data is requested. It retains action limits, control switches, production readiness, and input-health checks. If an action cap blocks climate startup, the climate status explains usage, the next allowance time, and the **Safety and troubleshooting** setting to review. Resuming makes planning eligible again; it does not force a climate command when another gate blocks execution.
 
 Running calendar entries use the charging sensor's confirmed state-change time or the persisted confirmed climate phase start. Their identity and start stay stable across replans while the forecast end can change. Future windows remain planned times. Unknown/unavailable feedback and unconfirmed climate ownership do not claim an actual start; EV energy estimates describe the remaining planned window. A real EV stop/restart or a new climate phase gets a new start.
 
@@ -242,12 +242,12 @@ normal confirmed-current path permits it, or a safety pause. Other EV reservatio
 vehicle identity, target SOC, charger capability, user price ceilings and safety checks
 remain enforced. Forecast headroom is an estimate, not electrical overload protection.
 
-No new automatic charging session starts during fallback. **Charge now (1 hour)** provides
-an explicit alternative; `ha_energy_planner.charge_now` accepts `duration_minutes` from 1
+No new automatic charging session starts during fallback. The
+`ha_energy_planner.charge_now` action accepts `duration_minutes` from 1
 through 240. It bypasses economic timing and price ceilings, but retains capacity,
 connection, target SOC and charger checks. Each request waits for a fresh input assessment; a failed refresh prevents the start.
 Failed requests explain the blocking reason.
-**Stop charge now** confirms a stop and holds charging off for one hour. The override
+The `ha_energy_planner.cancel_charge_now` action confirms a stop and holds charging off for one hour. The override
 expires using an execution timer; an earlier load-fallback deadline still wins. Reload
 recovery retains the existing conservative ownership and reservation handling.
 
@@ -282,3 +282,22 @@ A confirmed charging restart clears the alert so a later interruption can notify
 ### Legacy vehicle-target migration repair
 
 If an older configuration cannot migrate because its vehicle target-SOC entity is missing, open **Settings > System > Repairs** and select the target entity. Existing settings and recovery data are preserved. Home Assistant 2026.9 requires a restart after saving; versions with the migration-retry API retry immediately. Reconfigure also accepts the corrected target and directs you to Repairs or restart instructions. Enable disabled entries before repairing them.
+
+### Recovery diagnostics
+
+The **Recovery** sensor explains whether recovery is waiting for a valid consumption
+reading, a newer sample, a second advancing sample, a healthy plan, or startup safety
+validation. Attributes include the source entity and displayed reading, source sample
+timestamp and age, configured maximum sample age, first sample timestamp and age,
+required sample advance and pairing window, outage start, plan issues, and startup
+check progress and retry interval. The 30-second retry interval is reported only during
+active validation/recovery; startup grace uses its displayed deadline. Once the source
+samples have been accepted, remaining plan blockers are reported without treating
+the accepted pair as a new consumption outage. Ages are evaluated on coordinator updates. A visible
+numeric consumption reading does not by itself prove recovery, and a completed startup
+recovery does not guarantee that all later inputs remain healthy.
+
+The **Charge now (1 hour)**, **Stop charge now**, and **Resume climate planning**
+buttons are removed, including existing entity-registry entries on upgrade. Their
+`charge_now`, `cancel_charge_now`, and `resume_climate_planning` integration actions
+remain available for automations and Developer Tools.

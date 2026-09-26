@@ -35,6 +35,7 @@ def test_sensors_expose_safe_empty_values_without_plan() -> None:
 
     assert values == {
         "ev_charging_status": "Waiting for charging evidence",
+        "recovery": "No recovery pending",
         "mode": "review",
         "current_state": "No controls configured",
         "next_actions": "Unknown",
