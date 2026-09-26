@@ -4,6 +4,28 @@
 
 ### 🚧 Breaking changes
 
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.2.0 - 2026-09-26
+
+### 🚧 Breaking changes
+
 - Remove the Charge now (1 hour), Stop charge now, and Resume climate planning button entities; the corresponding integration actions remain available.
 
 - Require Home Assistant 2026.9.0 or newer.
