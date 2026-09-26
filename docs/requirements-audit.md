@@ -1005,7 +1005,7 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 
 - `action_limits.py` and the persistent `action_attempts` ledger account for real/uncertain attempts independently of audit rotation; no-op climate suppression is excluded. Boundary, legacy migration and restart evidence: `tests/test_action_limits.py`, `tests/test_storage.py`, `tests/test_control_runtime.py`.
 - Policy-only options updates preserve active ownership and armed state; the existing recovery path remains for safety-sensitive changes. Evidence: `tests/test_coordinator.py` and real Home Assistant service/event/storage lifecycle tests in `tests/test_control_runtime.py`.
-- The Resume climate planning service and button clear manual helper/internal holds under execution/planner locks, replan, and expose remaining gates. Evidence: `tests/test_services.py`, `tests/test_switch_button.py`, `tests/test_coordinator.py`, `tests/test_control_runtime.py`.
+- The Resume climate planning service clears manual helper/internal holds under execution/planner locks, replans, and exposes remaining gates. Evidence: `tests/test_services.py`, `tests/test_switch_button.py`, `tests/test_coordinator.py`, `tests/test_control_runtime.py`.
 - Climate diagnostics expose allowance usage and the next usable allowance after a cap rejection. Evidence: `tests/test_diagnostics.py`.
 
 - Climate confirmation yields to queued HA state listeners while command attribution remains active; the compatibility suite exercises policy updates, real manual recovery and delayed main shutdown feedback on each supported HA release.
@@ -1057,3 +1057,18 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - A pending recovery handoff survives failed refreshes and discarded plans until a
   healthy plan commits. A renewed outage cancels it; coordinator regression tests
   verify retries bypass an otherwise unchanged-input cache.
+
+## Recovery visibility and retired device controls
+
+- `recovery_presentation.py` and the **Recovery** sensor in `sensor.py` explain source
+  availability, timestamp validity, source age, advancing-sample pairing, pending plan
+  commit, and startup safety progress without changing command authority.
+- Source timestamps and age limits, first-sample age, sample advance, plan input issues,
+  retry cadence and successful/required checks are exposed as bounded attributes.
+  Startup grace does not claim a 30-second validation cadence, and an accepted source
+  pair waiting for a healthy plan is not incorrectly reclassified as a stale-source blocker.
+- `entity_registry_migration.py` removes only this entry's retired Charge now, Stop charge
+  now and Resume climate planning buttons, including renamed entities. Corresponding
+  services remain supported.
+- Evidence: `tests/test_recovery_presentation.py`, `tests/test_sensor.py`,
+  `tests/test_switch_button.py`, `tests/test_ev_control_entities.py`; full Docker gate.
