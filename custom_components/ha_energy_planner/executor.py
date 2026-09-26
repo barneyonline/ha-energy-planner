@@ -42,6 +42,7 @@ from .const import (
     DOMAIN,
     EV_RESERVATION_EXTERNAL_BASELINE,
     EV_RESERVATION_RETAIN_WHEN_UNLOADED,
+    STARTUP_WARMUP_SECONDS,
     STATE_UNKNOWN_VALUES,
 )
 from .constraints import ConstraintValidator, _projected_grid_flows_kw
@@ -98,7 +99,7 @@ _PLAN_FALLBACK_NOTIFICATION_IDS = (
     _EV_INFEASIBLE_NOTIFICATION_ID,
     _HVAC_CAPABILITY_NOTIFICATION_ID,
 )
-PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(minutes=5)
+PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE = timedelta(seconds=STARTUP_WARMUP_SECONDS)
 ACTION_BACKOFF_DURATION = timedelta(minutes=10)
 EV_SAFETY_STOP_RETRY_WINDOW = timedelta(hours=24)
 MAX_EV_SAFETY_STOP_ATTEMPTS_PER_24H = 3
@@ -2056,7 +2057,7 @@ class Executor:
                 "Automatic control remains requested, but command authority was disarmed because "
                 f"the startup safety check was not healthy ({reason}). Energy Planner restored its "
                 "owned devices toward safe state and will retry automatically every 30 seconds. "
-                "It will re-arm after three consecutive healthy checks."
+                "It will re-arm after a fresh healthy plan passes the recovery safety checks."
             ),
             notification_id=self._notification_id(_STARTUP_RECOVERY_NOTIFICATION_ID),
         )

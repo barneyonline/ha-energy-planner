@@ -312,6 +312,7 @@ def test_hourly_weather_forecast_fetch_caches_and_manual_force_refreshes() -> No
     coordinator = SimpleNamespace(
         hass=SimpleNamespace(
             services=services,
+            states=SimpleNamespace(get=lambda _entity_id: SimpleNamespace(state="sunny")),
             config=SimpleNamespace(time_zone="Australia/Sydney"),
         ),
         _weather_forecast_cache={},
@@ -377,6 +378,7 @@ def test_hourly_weather_cache_hit_respects_shorter_forecast_freshness() -> None:
     coordinator = SimpleNamespace(
         hass=SimpleNamespace(
             services=services,
+            states=SimpleNamespace(get=lambda _entity_id: SimpleNamespace(state="sunny")),
             config=SimpleNamespace(time_zone="UTC"),
         ),
         _weather_forecast_cache={},
@@ -427,6 +429,7 @@ def test_hourly_weather_forecast_failure_uses_fresh_cache_then_legacy_fallback()
     coordinator = SimpleNamespace(
         hass=SimpleNamespace(
             services=services,
+            states=SimpleNamespace(get=lambda _entity_id: SimpleNamespace(state="sunny")),
             config=SimpleNamespace(time_zone="UTC"),
         ),
         _weather_forecast_cache={
@@ -5450,7 +5453,8 @@ def test_ev_auto_start_compensation_preserves_expected_start_feedback() -> None:
 
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
     coordinator.overrides = [
         SimpleNamespace(kind="manual_hvac", reason="old"),
@@ -5485,7 +5489,8 @@ def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -
 
 def test_manual_hvac_override_releases_control_when_helper_service_fails() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
 
     async def fail_helper(*args: object, **kwargs: object) -> None:
@@ -5544,7 +5549,8 @@ def test_manual_override_helper_uses_configured_timeout_and_can_be_cleared() -> 
 
 def test_manual_override_helper_off_preserves_timed_override() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
     expires_at = datetime.now(UTC) + timedelta(minutes=30)
     coordinator.overrides = [
@@ -5568,7 +5574,8 @@ def test_manual_override_helper_off_preserves_timed_override() -> None:
 
 def test_detected_manual_override_does_not_replace_authoritative_helper() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
     helper_override = Override(
         kind="manual_hvac",
@@ -5623,7 +5630,8 @@ def test_hvac_control_from_ownership_normalizes_legacy_records() -> None:
 
 def test_expired_manual_hvac_helper_cleanup_retries_after_service_failure() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
     coordinator.store.data["ownership"] = {
         "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
@@ -5653,7 +5661,8 @@ def test_expired_manual_hvac_state_removes_persisted_expiry() -> None:
 
 def test_expired_manual_hvac_cleanup_preserves_ownership_added_during_helper_call() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"}
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
     coordinator.store.data["ownership"] = {
         "manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00",
@@ -8027,7 +8036,10 @@ def test_weather_deadline_respects_elapsed_cache_age_and_cancellation(monkeypatc
         now = datetime(2026, 9, 5, tzinfo=UTC)
         async def hung(*args: Any, **kwargs: Any) -> None:
             await asyncio.Event().wait()
-        hass = SimpleNamespace(services=SimpleNamespace(async_call=hung))
+        hass = SimpleNamespace(
+            services=SimpleNamespace(async_call=hung),
+            states=SimpleNamespace(get=lambda _entity_id: SimpleNamespace(state="sunny")),
+        )
         cache = {
             "entity_id": "weather.home", "fetched_at": now - timedelta(seconds=59),
             "forecast": [{"datetime": now.isoformat(), "temperature": 20}],
@@ -8653,3 +8665,88 @@ def test_recovery_flap_resets_observation_but_retains_capacity_budget():
     assert flapped["started_at"] == prior["started_at"]
     assert "recovery_observed_since" not in flapped
     assert "recovery_first_sample" not in flapped
+
+
+@pytest.mark.parametrize("weather_state", [None, "unavailable"])
+@pytest.mark.parametrize("cache_age_minutes", [None, 10, 121])
+def test_weather_waits_for_available_entity_and_preserves_cache_freshness(
+    weather_state: str | None, cache_age_minutes: int | None,
+) -> None:
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    forecast = [{"datetime": now.isoformat(), "temperature": 12}]
+    service = AsyncMock(return_value={"weather.home": {"forecast": forecast}})
+    state = None if weather_state is None else SimpleNamespace(state=weather_state)
+    owner = SimpleNamespace(
+        hass=SimpleNamespace(
+            services=SimpleNamespace(async_call=service),
+            states=SimpleNamespace(get=lambda _entity_id: state),
+        ),
+        _weather_forecast_cache={} if cache_age_minutes is None else {
+            "entity_id": "weather.home",
+            "fetched_at": now - timedelta(minutes=cache_age_minutes),
+            "forecast": forecast,
+        },
+    )
+    async def fetch() -> Any:
+        return await EnergyPlannerCoordinator._async_weather_forecast(
+            owner, {"weather_entity": "weather.home"}, {}, now=now, force=True,
+        )
+    result, details = asyncio.run(fetch())
+    service.assert_not_awaited()
+    assert details["failure_reason"] == "ValueError:weather_entity_unavailable"
+    assert result == ({"forecast": forecast} if cache_age_minutes == 10 else {})
+    state = SimpleNamespace(state="sunny")
+    result, details = asyncio.run(fetch())
+    service.assert_awaited_once()
+    assert result == {"forecast": forecast}
+    assert details["fetch_status"] == "fetched"
+
+
+def test_startup_warmup_waits_thirty_minutes_before_validation(monkeypatch: Any) -> None:
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.store.data["production"]["armed"] = True
+    coordinator._startup_auto_recovery_deadline = None
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(True, "healthy"))
+    monkeypatch.setattr(startup_recovery_module, "monotonic", lambda: 100.0)
+    wait = AsyncMock()
+    monkeypatch.setattr(startup_recovery_module, "_wait_for_load_recovery", wait)
+    assert asyncio.run(coordinator._async_complete_startup_grace()) == (True, "startup_grace_completed_healthy")
+    wait.assert_awaited_once_with(coordinator, 1800.0)
+    coordinator._async_run_startup_auto_recovery_validation.assert_awaited_once()
+    assert coordinator.executor.startup_recovery_notifications == []
+
+
+@pytest.mark.parametrize("state", [None, "unknown", "unavailable"])
+def test_expired_helper_waits_silently_and_retains_cleanup_until_available(state: str | None, caplog: Any) -> None:
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
+        hass=FakeHass({} if state is None else {"input_boolean.manual_override": state}),
+        store_data={"ownership": {"manual_hvac_override_expires_at": "2000-01-01T00:00:00+00:00"}},
+    )
+    assert asyncio.run(coordinator._async_clear_expired_manual_hvac_state()) is False
+    assert not coordinator.hass.services.calls
+    assert "manual_hvac_override_expires_at" in coordinator.store.data["ownership"]
+    assert not caplog.records
+    coordinator.hass.states.values["input_boolean.manual_override"] = "on"
+    assert asyncio.run(coordinator._async_clear_expired_manual_hvac_state()) is True
+    assert "manual_hvac_override_expires_at" not in coordinator.store.data["ownership"]
+    assert len(coordinator.hass.services.calls) == 1
+
+
+def test_available_weather_with_unknown_conditions_still_fetches_forecasts() -> None:
+    now = datetime(2026, 9, 26, tzinfo=UTC)
+    forecast = [{"datetime": now.isoformat(), "temperature": 12}]
+    service = AsyncMock(return_value={"weather.home": {"forecast": forecast}})
+    owner = SimpleNamespace(
+        hass=SimpleNamespace(
+            states=SimpleNamespace(get=lambda _: SimpleNamespace(state="unknown")),
+            services=SimpleNamespace(async_call=service),
+        ),
+        _weather_forecast_cache={},
+    )
+    result, details = asyncio.run(EnergyPlannerCoordinator._async_weather_forecast(
+        owner, {"weather_entity": "weather.home"}, {}, now=now, force=True,
+    ))
+    assert result == {"forecast": forecast}
+    assert details["fetch_status"] == "fetched"
+    service.assert_awaited_once()

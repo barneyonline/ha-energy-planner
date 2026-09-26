@@ -23,7 +23,7 @@ from homeassistant.util import dt as dt_util
 
 from . import advice_runtime, startup_recovery, task_lifecycle
 from .action_limits import budget_history
-from .adapter_helpers import async_call_device_service, zone_temperature_sync_deferred
+from .adapter_helpers import async_call_device_service, service_entity_available, zone_temperature_sync_deferred
 from .advice_runtime import (
     _AI_ADVICE_NOTIFICATION_ID as _AI_ADVICE_NOTIFICATION_ID,
 )
@@ -2374,6 +2374,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Clear planner-managed manual HVAC exposure after its timeout."""
         manual_override_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
         if manual_override_entity:
+            if not service_entity_available(self.hass, manual_override_entity):
+                # Retain expiry and retry after the helper integration recovers.
+                self._manual_override_helper_guard = None
+                return False
             try:
                 self._manual_override_helper_guard = ("off", dt_util.utcnow() + timedelta(minutes=2))
                 await async_call_device_service(

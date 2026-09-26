@@ -40,7 +40,7 @@ class EnphaseControlTransaction:
                     self.previous.profile or result.saved_profile,
                     self.now,
                 ).apply_to(ownership)
-        elif result.rollback_succeeded is True:
+        elif not result.command_sent or result.rollback_succeeded is True:
             self.previous.apply_to(ownership)
         elif result.command_sent and result.saved_profile is not None:
             EnphaseOwnership(self.previous.profile or result.saved_profile, self.now).apply_to(ownership)

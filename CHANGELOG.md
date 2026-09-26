@@ -12,6 +12,10 @@
 
 ### 🐛 Bug fixes
 
+- Reuse validated battery forecast inputs within each EV search, avoiding repeated work across candidate schedules while retaining the five-second performance gate.
+
+- Allow 30 minutes for startup dependencies before fallback notifications and startup recovery warnings, and avoid weather and device service calls targeting missing or unavailable entities. Runtime safety checks remain immediate.
+
 - Recover blocked legacy vehicle-target migrations through Repairs, with restart guidance on Home Assistant 2026.9 and immediate migration retry on supported newer versions. Reject edits during migration and protect configurations from newer integration versions.
 - Retain an older first recovery sample for pairing with a fresh newer reading, avoiding repeated resets on delayed cloud sensors.
 - Retain the recovery wake-up across failed or superseded plan refreshes until a healthy plan commits.

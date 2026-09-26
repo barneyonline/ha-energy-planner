@@ -10,7 +10,7 @@ from typing import Any
 from homeassistant.const import ATTR_ENTITY_ID
 from homeassistant.core import HomeAssistant, State
 
-from .adapter_helpers import async_call_device_service, available_state
+from .adapter_helpers import DeviceTargetUnavailable, async_call_device_service, available_state
 from .adapter_helpers import profile_control_service as _profile_control_service
 from .const import (
     CONF_ENPHASE_AI_PROFILE,
@@ -104,6 +104,15 @@ class EnphaseProfileAdapter:
             await self.before_dispatch(current_profile)
         try:
             await async_call_device_service(self.hass, domain, service, service_data, blocking=True)
+        except DeviceTargetUnavailable:
+            return EnphaseCommandResult(
+                applied=False,
+                reason="enphase_profile_entity_unavailable",
+                pre_state=pre_state,
+                post_state=self._snapshot(),
+                saved_profile=current_profile,
+                changed_profile_at=False,
+            )
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
             rollback_succeeded = await self._async_rollback_profile(
                 profile_entity,
