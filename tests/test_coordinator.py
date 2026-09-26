@@ -9,7 +9,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from homeassistant.core import CoreState
@@ -5451,11 +5451,13 @@ def test_ev_auto_start_compensation_preserves_expected_start_feedback() -> None:
     assert coordinator.refresh_requested == 0
 
 
-def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper() -> None:
+@pytest.mark.parametrize("running", [False, True])
+def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper(running: bool) -> None:
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.manual_override"},
         hass=FakeHass({"input_boolean.manual_override": "on"}),
     )
+    coordinator.hass.is_running = running
     coordinator.overrides = [
         SimpleNamespace(kind="manual_hvac", reason="old"),
         SimpleNamespace(kind="other", reason="kept"),
@@ -8750,3 +8752,143 @@ def test_available_weather_with_unknown_conditions_still_fetches_forecasts() -> 
     assert result == {"forecast": forecast}
     assert details["fetch_status"] == "fetched"
     service.assert_awaited_once()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("guard", ["off", "on"])
+@pytest.mark.parametrize("attribution", [None, "parent", "event", "state"])
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone", "switch.zone"])
+def test_startup_hvac_manual_detection(
+    monkeypatch: object, pending: bool, guard: str, attribution: str | None, entity: str,
+) -> None:
+    callbacks = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda *args: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"],
+            CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.guard",
+        },
+        hass=FakeHass({"input_boolean.guard": guard, "input_boolean.override": "off"}),
+        store_data={"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+    )
+    coordinator.hass.is_running = False
+    coordinator.executor.pending_hvac_desired_state = {"target_temperature": 20} if pending else None
+    coordinator._async_handle_manual_hvac_change = AsyncMock()
+    coordinator._schedule_debounced_refresh = Mock()
+    coordinator.async_start_listeners()
+    event = FakeEvent(
+        entity, "on" if entity.startswith("switch.") else "heat", "off",
+        old_attributes={"temperature": 24}, new_attributes={"temperature": 20},
+        context_user_id="user" if attribution == "event" else None,
+        parent_context_id="parent" if attribution == "parent" else None,
+    )
+    if attribution == "state":
+        event.data["new_state"] = SimpleNamespace(
+            state="off", attributes={"temperature": 20}, context=SimpleNamespace(user_id="user"),
+        )
+    callbacks[0](event)
+    explicit = attribution in {"event", "state"}
+    if explicit:
+        coordinator._async_handle_manual_hvac_change.assert_called_once_with(
+            "daikin_state_changed" if entity == "climate.daikin" else "climate_zone_changed",
+            preserve_main_state=entity == "climate.daikin",
+            preserve_zone_entity_id=None if entity == "climate.daikin" else entity,
+        )
+    else:
+        coordinator._async_handle_manual_hvac_change.assert_not_called()
+        coordinator._schedule_debounced_refresh.assert_called_once_with("state_change")
+        assert coordinator.overrides == []
+        assert coordinator.hass.services.calls == []
+        assert coordinator.executor.hvac_releases == []
+    assert coordinator.executor.pending_hvac_manual_overrides == int(
+        explicit and pending and entity == "climate.daikin"
+    )
+    assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+        [entity] if explicit and pending and entity != "climate.daikin" else []
+    )
+
+
+def test_startup_hvac_sequence_and_running_transition(monkeypatch: object) -> None:
+    callbacks = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda *args: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]},
+        store_data={"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+    )
+    coordinator.hass.is_running = False
+    existing = SimpleNamespace(kind="manual_hvac", source="service", reason="existing")
+    coordinator.overrides = [existing]
+    coordinator.executor.pending_hvac_desired_state = {"target_temperature": 20}
+    coordinator._async_handle_manual_hvac_change = AsyncMock()
+    coordinator._schedule_debounced_refresh = Mock()
+    coordinator.async_start_listeners()
+    events = [
+        FakeEvent("climate.zone", "off", "off", old_attributes={"temperature": 24}, new_attributes={"temperature": 20}),
+        FakeEvent("climate.zone", "off", "off", old_attributes={"temperature": 20}),
+        FakeEvent("climate.daikin", "heat", "off"),
+        FakeEvent("climate.daikin", "heat", "heat", context_user_id="user"),
+    ]
+    missing = FakeEvent("climate.zone", "off", "off", context_user_id="user")
+    missing.data["old_state"] = None
+    events.append(missing)
+    for event in events:
+        callbacks[0](event)
+    coordinator._async_handle_manual_hvac_change.assert_not_called()
+    assert coordinator.overrides == [existing]
+    assert coordinator.hass.services.calls == []
+    assert coordinator.executor.hvac_releases == []
+    assert coordinator.executor.pending_hvac_manual_overrides == 0
+    assert coordinator.executor.pending_hvac_manual_zone_overrides == []
+    coordinator.hass.is_running = True
+    coordinator.executor.pending_hvac_desired_state = None
+    callbacks[0](events[1])
+    coordinator._async_handle_manual_hvac_change.assert_called_once_with(
+        "climate_zone_changed", preserve_zone_entity_id="climate.zone",
+    )
+    coordinator._async_handle_manual_hvac_change.reset_mock()
+    coordinator.async_start_listeners()  # Reloading listeners adds no startup window.
+    callbacks[-1](events[1])
+    coordinator._async_handle_manual_hvac_change.assert_called_once()
+
+
+def test_startup_hvac_helper_remains_authoritative(monkeypatch: object) -> None:
+    callbacks = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entity_ids, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_call_later",
+        lambda *args: lambda: None,
+    )
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+        hass=FakeHass({"input_boolean.override": "off"}),
+    )
+    coordinator.hass.is_running = False
+    coordinator.async_start_listeners()
+    tasks = []
+    coordinator._async_create_listener_task = tasks.append
+    callbacks[0](FakeEvent("input_boolean.override", "off", "on"))
+    assert len(tasks) == 1
+    asyncio.run(tasks[0])
+    assert len(coordinator.overrides) == 1
+    assert coordinator.overrides[0].source == "helper"
+    assert coordinator.store.data["overrides"] == coordinator.overrides
+    assert coordinator.executor.hvac_releases == ["manual_override_helper_on"]
