@@ -7754,3 +7754,17 @@ def test_interruption_alert_clears_on_confirmed_resume_and_alerts_on_recurrence(
     alerts = [call for call in hass.services.calls if call[0] == "persistent_notification"
               and call[2].get("notification_id") == "ha_energy_planner_ev_interrupted"]
     assert [call[1] for call in alerts] == ["create", "dismiss", "create"]
+
+
+@pytest.mark.parametrize("elapsed_minutes, expected", [(10, True), (29, True), (30, False)])
+def test_fallback_notifications_share_thirty_minute_warmup(
+    monkeypatch: Any, elapsed_minutes: int, expected: bool,
+) -> None:
+    from custom_components.ha_energy_planner import executor as executor_module
+    now = datetime.now(UTC)
+    executor = Executor(
+        FakeStore(), hass=FakeHass(),
+        notification_grace_until=now + executor_module.PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE,
+    )
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now + timedelta(minutes=elapsed_minutes))
+    assert executor._in_notification_grace_period() is expected

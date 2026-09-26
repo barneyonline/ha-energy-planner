@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
+from .adapter_helpers import service_entity_available
 from .const import CONF_FORECAST_FRESHNESS_MINUTES, CONF_PLANNING_INTERVAL_MINUTES, CONF_WEATHER
 
 WEATHER_FORECAST_TIMEOUT_SECONDS = 10.0
@@ -119,6 +120,9 @@ async def async_weather_forecast(
     fetch_started = monotonic()
     failure_reason: str | None = None
     try:
+        # Unknown current conditions do not make a forecast provider unavailable.
+        if not service_entity_available(self.hass, entity_id, allow_unknown=True):
+            raise ValueError("weather_entity_unavailable")
         async with asyncio.timeout(WEATHER_FORECAST_TIMEOUT_SECONDS):
             response = await self.hass.services.async_call(
                 "weather",
@@ -269,7 +273,9 @@ def _weather_forecast_details(
 
 def _bounded_reason(error: Exception) -> str:
     """Return a bounded service failure reason without leaking payloads."""
-    local_reasons = {"weather_forecast_response_empty", "weather_forecast_response_invalid"}
+    local_reasons = {
+        "weather_forecast_response_empty", "weather_forecast_response_invalid", "weather_entity_unavailable",
+    }
     reason = error.args[0] if type(error) is ValueError and error.args else None
     if isinstance(reason, str) and reason in local_reasons:
         return f"ValueError:{reason}"
