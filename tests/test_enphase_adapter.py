@@ -490,3 +490,56 @@ def test_enphase_dispatch_and_compensation_are_bounded(monkeypatch: Any) -> None
         assert store.data["ownership"]["enphase_profile"] == "Custom Baseline"
 
     asyncio.run(run())
+
+
+def test_profile_disappears_before_dispatch_without_attempting_rollback() -> None:
+    hass = FakeHass({"select.profile": "Self-Consumption"})
+    adapter = EnphaseProfileAdapter(hass, {"enphase_profile_entity": "select.profile"})
+
+    async def disappears(_profile: str) -> None:
+        hass.states.values["select.profile"] = "unavailable"
+
+    adapter.before_dispatch = disappears
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"})))
+    assert not result.applied
+    assert result.rollback_succeeded is None
+    assert not result.command_sent
+    assert result.saved_profile == "Self-Consumption"
+    assert hass.services.calls == []
+    hass.states.values["select.profile"] = "Full Backup"
+    assert asyncio.run(adapter._async_rollback_profile(
+        "select.profile", "select.select_option", result.saved_profile,
+    )) is True
+    assert len(hass.services.calls) == 1
+
+
+def test_enphase_predispatch_rejection_restores_previous_ownership_without_commands() -> None:
+    from copy import deepcopy
+
+    from custom_components.ha_energy_planner.enphase_control import EnphaseControlTransaction
+
+    async def run() -> None:
+        prior_cases = [{}, {"enphase_profile": "Original",
+                            "enphase_profile_changed_at": datetime(2026, 9, 1, tzinfo=UTC)}]
+        for prior in prior_cases:
+            store = TransactionStore()
+            store.data["ownership"].update(prior)
+            previous = deepcopy(store.data["ownership"])
+            hass = FakeHass({"select.enphase_profile": "Custom Baseline"})
+            original_flush = store.async_flush
+
+            async def disappear(original_flush: Any = original_flush, hass: Any = hass) -> None:
+                await original_flush()
+                hass.states.values["select.enphase_profile"] = "unavailable"
+
+            store.async_flush = disappear
+            result = await EnphaseControlTransaction(
+                store, EnphaseProfileAdapter(hass, _entry_data()), datetime.now(UTC),
+            ).async_execute(_action(ActionKind.SET_PROFILE, {"profile": "Full Backup"}))
+            assert not result.applied
+            assert not result.command_sent
+            assert result.reason == "enphase_profile_entity_unavailable"
+            assert not hass.services.calls
+            assert store.data["ownership"] == previous
+
+    asyncio.run(run())
