@@ -7,6 +7,9 @@ from custom_components.ha_energy_planner.const import DOMAIN, PLATFORMS
 
 
 def test_retired_registry_migration_preserves_unrelated_entities(monkeypatch: object) -> None:
+    assert {"charge_now", "cancel_charge_now", "resume_climate_planning"}.issubset(
+        migration.RETIRED_ENTITY_KEYS["button"]
+    )
     original = {
         (platform, DOMAIN, f"entry-1_{key}"): f"{platform}.renamed_{key}"
         for platform, keys in migration.RETIRED_ENTITY_KEYS.items()
@@ -15,6 +18,8 @@ def test_retired_registry_migration_preserves_unrelated_entities(monkeypatch: ob
     original.update(
         {
             ("sensor", DOMAIN, "entry-1_mode"): "sensor.my_mode",
+            ("button", DOMAIN, "entry-2_charge_now"): "button.other_charge",
+            ("button", "another_integration", "entry-1_charge_now"): "button.unrelated",
             ("number", DOMAIN, "entry-2_ev_target_soc"): "number.other_entry",
             ("time", "another_integration", "entry-1_ev_ready_by"): "time.unrelated",
         }
@@ -32,7 +37,9 @@ def test_retired_registry_migration_preserves_unrelated_entities(monkeypatch: ob
 
     monkeypatch.setattr(migration.er, "async_get", lambda hass: Registry())
     migration.async_migrate_entity_registry(None, SimpleNamespace(entry_id="entry-1"))
-    assert set(entities.values()) == {"sensor.my_mode", "number.other_entry", "time.unrelated"}
+    assert set(entities.values()) == {
+        "sensor.my_mode", "number.other_entry", "time.unrelated", "button.other_charge", "button.unrelated",
+    }
     migration.async_migrate_entity_registry(None, SimpleNamespace(entry_id="entry-1"))
-    assert len(entities) == 3
+    assert len(entities) == 5
     assert {"number", "time"}.isdisjoint(PLATFORMS)

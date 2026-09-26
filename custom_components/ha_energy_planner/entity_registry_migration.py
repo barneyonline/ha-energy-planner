@@ -57,6 +57,9 @@ RETIRED_ENTITY_KEYS: dict[str, tuple[str, ...]] = {
         "ev_keep_charger_on",
     ),
     "button": (
+        "charge_now",
+        "cancel_charge_now",
+        "resume_climate_planning",
         "ev_start_charging",
         "ev_stop_charging",
         "pause_control_1h",

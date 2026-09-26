@@ -675,6 +675,9 @@
       },
       "ev_charging_status": {
         "name": "EV charging status"
+      },
+      "recovery": {
+        "name": "Recovery"
       }
     },
     "binary_sensor": {
@@ -722,15 +725,6 @@
       },
       "resume_control": {
         "name": "Advanced: Resume control"
-      },
-      "resume_climate_planning": {
-        "name": "Resume climate planning"
-      },
-      "charge_now": {
-        "name": "Charge now (1 hour)"
-      },
-      "cancel_charge_now": {
-        "name": "Stop charge now"
       }
     },
     "select": {

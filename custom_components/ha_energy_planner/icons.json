@@ -30,6 +30,9 @@
       },
       "ev_charging_status": {
         "default": "mdi:ev-station"
+      },
+      "recovery": {
+        "default": "mdi:restore"
       }
     },
     "binary_sensor": {
@@ -58,15 +61,6 @@
       },
       "resume_control": {
         "default": "mdi:play-circle-outline"
-      },
-      "resume_climate_planning": {
-        "default": "mdi:play-circle-outline"
-      },
-      "charge_now": {
-        "default": "mdi:ev-station"
-      },
-      "cancel_charge_now": {
-        "default": "mdi:stop-circle-outline"
       }
     },
     "switch": {
