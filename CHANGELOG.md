@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Prevent Home Assistant startup climate feedback from enabling manual override; explicit user changes and override controls remain effective during startup.
 
 ### 🔧 Improvements
 

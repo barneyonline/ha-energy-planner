@@ -280,6 +280,13 @@ use throughout; the Docker and pull-request gates enforce that result.
   and is marked consumed after the entry-scoped store exists. Stable persistent
   notification IDs are suffixed with the config-entry ID so one planner cannot
   overwrite or dismiss another planner's alert.
+- Startup manual-change classification in `coordinator.py` suppresses unattributed
+  main/zone feedback before pending-command detection until HA is running.
+  Explicit user attribution on the event or new state still interrupts pending
+  commands and preserves the adjusted device, even with the scheduler guard on.
+  Helper/service overrides and persisted holds remain effective. Regression
+  evidence: startup HVAC tests in `tests/test_coordinator.py`, including target
+  disappearance, parent-only contexts, and immediate post-startup detection.
 - Manual Daikin or planner-owned zone changes create a temporary override,
   persist across restart, and release only HVAC ownership. An externally
   enabled manual-override helper uses the same configured timeout; legacy
