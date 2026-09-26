@@ -5,7 +5,7 @@ No Home Assistant I/O, speculative battery dispatch, or shared-EV scheduling.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from math import sqrt
@@ -153,14 +153,13 @@ def _charge_interval(
     return soc, energy, duration
 
 
-def _battery_cost(
+def _battery_simulator(
     context: DecisionContext,
     options: Mapping[str, Any],
-    energy: Mapping[int, float],
     interval: timedelta,
     scenario: str | None = None,
-) -> tuple[float, float, str]:
-    """Simulate observed self-consumption/backup; never invent AI dispatch."""
+) -> Callable[[Mapping[int, float]], tuple[float, float, str]]:
+    """Prepare invariant forecast data once for one synchronous search."""
     capacity = finite(options.get("battery_usable_capacity_kwh")) or 0.0
     charge_limit = finite(options.get("battery_max_charge_kw")) or 0.0
     discharge_limit = finite(options.get("battery_max_discharge_kw")) or 0.0
@@ -171,7 +170,7 @@ def _battery_cost(
     )
     backup = bool(scenario == "backup" or observed and observed == context.enphase_full_backup_profile)
     if capacity <= 0 or soc is None or not (self_consumption or backup):
-        return 0.0, 0.0, "battery_profile_or_model_unavailable"
+        return lambda _energy: (0.0, 0.0, "battery_profile_or_model_unavailable")
     efficiency = sqrt(min(max(float(options.get("battery_round_trip_efficiency_percent", 90)) / 100, 0.01), 1))
     floor = capacity * max(float(options.get("battery_min_soc_percent", 0)), 0) / 100
     stored = capacity * soc / 100
@@ -180,30 +179,51 @@ def _battery_cost(
         any(finite(v) is None for v in (s.import_price, s.export_price, s.pv_forecast_kw, s.baseline_load_forecast_kw))
         for s in valid
     ):
-        return 0.0, 0.0, "battery_forecast_incomplete"
+        return lambda _energy: (0.0, 0.0, "battery_forecast_incomplete")
     final_start = valid[-1].valid_at + interval - timedelta(hours=3)
     prices = [
         float(s.import_price or 0) for s in valid if s.valid_at >= final_start and float(s.import_price or 0) >= 0
     ]
     terminal_value = median(prices) * efficiency if prices else 0.0
-    cost = 0.0
+    rows = []
     for index, slot in enumerate(context.slots):
         hours = max((slot.valid_at + interval - max(slot.valid_at, context.created_at)).total_seconds() / 3600, 0)
         if hours <= 0:
             continue
         net = (
             float(slot.baseline_load_forecast_kw or 0) + slot.projected_hvac_load_kw - float(slot.pv_forecast_kw or 0)
-        ) * hours + energy.get(index, 0.0)
-        if net < 0:
-            charged = min(-net, charge_limit * hours, max(capacity - stored, 0) / efficiency)
-            stored += charged * efficiency
-            net += charged
-        elif self_consumption:
-            discharged = min(net, discharge_limit * hours, max(stored - floor, 0) * efficiency)
-            stored -= discharged / efficiency
-            net -= discharged
-        cost += net * float((slot.import_price if net >= 0 else slot.export_price) or 0)
-    return cost - max(stored - floor, 0) * terminal_value, terminal_value, "observed_profile_simulation"
+        ) * hours
+        rows.append((index, net, charge_limit * hours, discharge_limit * hours,
+                     float(slot.import_price or 0), float(slot.export_price or 0)))
+
+    def simulate(energy: Mapping[int, float]) -> tuple[float, float, str]:
+        current_stored = stored
+        cost = 0.0
+        for index, base_net, charge_cap, discharge_cap, import_price, export_price in rows:
+            net = base_net + energy.get(index, 0.0)
+            if net < 0:
+                charged = min(-net, charge_cap, max(capacity - current_stored, 0) / efficiency)
+                current_stored += charged * efficiency
+                net += charged
+            elif self_consumption:
+                discharged = min(net, discharge_cap, max(current_stored - floor, 0) * efficiency)
+                current_stored -= discharged / efficiency
+                net -= discharged
+            cost += net * (import_price if net >= 0 else export_price)
+        return cost - max(current_stored - floor, 0) * terminal_value, terminal_value, "observed_profile_simulation"
+
+    return simulate
+
+
+def _battery_cost(
+    context: DecisionContext,
+    options: Mapping[str, Any],
+    energy: Mapping[int, float],
+    interval: timedelta,
+    scenario: str | None = None,
+) -> tuple[float, float, str]:
+    """Simulate observed self-consumption/backup; never invent AI dispatch."""
+    return _battery_simulator(context, options, interval, scenario)(energy)
 
 
 def optimise_ev(
@@ -288,17 +308,19 @@ def optimise_ev(
             slots.append(ChargeSlot(index, start, end, power, price, price <= normal_limit, daylight))
     forecast_missing |= covered_until < ready_by
     by_index = {slot.index: slot for slot in slots}
-    baseline, terminal_value, battery_reason = _battery_cost(context, options, {}, interval)
-    scenarios: list[tuple[str, float]] = []
+    battery_simulate = _battery_simulator(context, options, interval)
+    baseline, terminal_value, battery_reason = battery_simulate({})
+    scenarios: list[tuple[Callable[[Mapping[int, float]], tuple[float, float, str]], float]] = []
     if (
         battery_reason == "battery_profile_or_model_unavailable"
         and context.current_enphase_profile
         and (context.enphase_self_consumption_profile or context.enphase_full_backup_profile)
     ):
         for mode in ("self_consumption", "backup"):
-            scenario_baseline, scenario_terminal, reason = _battery_cost(context, options, {}, interval, mode)
+            scenario_simulate = _battery_simulator(context, options, interval, mode)
+            scenario_baseline, scenario_terminal, reason = scenario_simulate({})
             if reason == "observed_profile_simulation":
-                scenarios.append((mode, scenario_baseline))
+                scenarios.append((scenario_simulate, scenario_baseline))
                 terminal_value = scenario_terminal
         if scenarios:
             battery_reason = "uncertain_profile_conservative_scenarios"
@@ -442,14 +464,14 @@ def optimise_ev(
             action_limited_feasible |= soc >= target - 1e-6
             return None
         if battery_reason == "observed_profile_simulation":
-            total, _, _ = _battery_cost(context, options, energies, interval)
+            total, _, _ = battery_simulate(energies)
             cost = total - baseline
         elif scenarios:
             cost = max(
                 cost,
                 *(
-                    _battery_cost(context, options, energies, interval, mode)[0] - scenario_baseline
-                    for mode, scenario_baseline in scenarios
+                    scenario_simulate(energies)[0] - scenario_baseline
+                    for scenario_simulate, scenario_baseline in scenarios
                 ),
             )
 
