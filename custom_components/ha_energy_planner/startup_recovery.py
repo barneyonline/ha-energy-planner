@@ -14,6 +14,7 @@ from homeassistant.util import dt as dt_util
 from .const import (
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
+    STARTUP_WARMUP_SECONDS,
 )
 from .models import (
     EnergyPlan,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = 10 * 60
+STARTUP_AUTO_RECOVERY_TIMEOUT_SECONDS = STARTUP_WARMUP_SECONDS
 
 STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS = 30
 

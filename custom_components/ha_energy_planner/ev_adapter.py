@@ -12,7 +12,7 @@ from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_O
 from homeassistant.core import HomeAssistant, State
 from homeassistant.util import dt as dt_util
 
-from .adapter_helpers import async_call_device_service, available_state
+from .adapter_helpers import async_call_device_service, available_state, service_entity_available
 from .const import (
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -804,8 +804,7 @@ class EVChargerAdapter:
     ) -> EVCommandResult:
         if not self.command_guard():
             return EVCommandResult(False, "ev_vehicle_session_changed", self._snapshot(), self._snapshot())
-        raw_state = self.hass.states.get(entity_id)
-        if raw_state is None:
+        if not service_entity_available(self.hass, entity_id):
             return EVCommandResult(False, "ev_control_unavailable", self._snapshot(), self._snapshot())
         domain = entity_id.split(".", 1)[0]
         if domain in {"button", "input_button"} and (turn_on or press_button):

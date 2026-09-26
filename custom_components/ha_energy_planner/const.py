@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .ev_policy import EV_DEFAULTS
 
+STARTUP_WARMUP_SECONDS = 30 * 60
+
 DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"
 LEGACY_INTEGRATION_NAME = f"HA {INTEGRATION_NAME}"

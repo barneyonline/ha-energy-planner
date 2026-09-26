@@ -719,3 +719,27 @@ def test_positive_power_overrides_unchanged_energy_meter_for_delivery_status():
     record = update_ev_telemetry({}, sample(power_kw=6, energy_kwh=10), reserved_kw=6)
     record = update_ev_telemetry(record, sample(NOW + timedelta(minutes=1), power_kw=6, energy_kwh=10), reserved_kw=6)
     assert record["delivery_status"] == "observed"
+
+
+@pytest.mark.parametrize("mode, expected", [
+    ("self_consumption", [0.14966666666666667, 0.3925, 0.0825000000000001]),
+    ("backup", [0.149, 0.39249999999999996, 0.08250000000000006]),
+])
+def test_prepared_battery_candidates_match_reference_and_reset_storage(mode, expected):
+    from custom_components.ha_energy_planner.ev_optimization import _battery_simulator
+
+    ctx = context((0.1, -0.2, 0.5, 0.3, 0.1), pv=2)
+    ctx.created_at += timedelta(minutes=7)
+    ctx.current_battery_soc_percent = 10
+    ctx.slots[2].pv_forecast_kw = 20
+    ctx.slots[3].baseline_load_forecast_kw = 15
+    ctx.slots[4].projected_hvac_load_kw = 2
+    simulate = _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5), mode)
+    energies = [{}, {0: 10, 1: 0.2, 2: 0.4, 3: 0.8}, {1: 0.7, 4: 0.5}]
+    # Reference values captured from the original per-candidate simulator.
+    # Include elapsed/partial slots, negative prices, reserve, solar and HVAC.
+    for index in (0, 1, 2, 1, 0):
+        cost, terminal, reason = simulate(energies[index])
+        assert cost == pytest.approx(expected[index], abs=1e-12)
+        assert terminal == pytest.approx(0.2846049894151541, abs=1e-12)
+        assert reason == "observed_profile_simulation"

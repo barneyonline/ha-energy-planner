@@ -17,7 +17,10 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Preconditioning acquisition survives the next planning cycle when heating from at or below the lower comfort boundary or cooling from at or above the upper boundary. Opposite-boundary handoffs remain active, and scheduled coasting boundaries override stale persisted phases. Home/away, mirrored heating/cooling, manual override, missing evidence, and unsafe-input regressions are covered in `tests/test_planner.py`.
 
-- Startup input warnings have a bounded ten-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
+- EV battery economics prepares forecast validation, terminal value and slot inputs once per synchronous search; each candidate starts from the observed battery storage independently. Self-consumption and backup reference cases cover partial/elapsed slots, reserve, negative prices, solar and HVAC; the full-horizon five-second performance gate remains unchanged (`tests/test_ev_optimization.py`).
+- Device service calls reject unavailable targets before dispatch, including during compensation; pending restoration is retained for retry. An Enphase pre-dispatch rejection consumes no command attempt and restores prior ownership without sending compensation. Never-pressed buttons remain usable, and expired manual-helper cleanup waits silently for availability (`tests/test_adapter_helpers.py`, `tests/test_ev_adapter.py`, `tests/test_enphase_adapter.py`, `tests/test_coordinator.py`).
+- Weather service calls wait until the configured entity is present and available; unknown current weather conditions still allow fetching forecasts; unavailable entities use only freshness-bounded cached forecasts and recover on the next fetch (`tests/test_coordinator.py`).
+- Startup input warnings have a bounded 30-minute grace without bypassing input safety. Persistent outages warn after the deadline and preserve their original duration; new or repeated outages warn immediately even while other inputs are starting (`tests/test_coordinator.py`).
 - Zone restoration retains incompatible targets without repeated device or scheduler-guard commands, releases other eligible states, and retries the original target after recovery, and accepts an already-observed baseline despite changed command bounds (`tests/test_hvac_adapter.py`). Plan health exposes unresolved durable HVAC restoration as degraded independently of input quality and handles legacy non-mapping HVAC ownership (`tests/test_sensor.py`).
 
 - Actuator recovery metadata uses atomic Home Assistant Store writes with an
@@ -700,7 +703,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   interval rather than assuming a fixed slot duration.
 - A previously requested-active and armed installation preserves production
   arming, device ownership, and EV reservation on startup. Home Assistant's
-  `async_at_started` boundary begins a fresh ten-minute grace at Core `RUNNING`;
+  `async_at_started` boundary begins a fresh 30-minute grace at Core `RUNNING`;
   no startup-only gate suppresses ordinary planning or execution, while all
   normal runtime safety gates remain authoritative. The deadline uses one
   awaited `async_refresh()` and a complete preflight. A healthy result remains

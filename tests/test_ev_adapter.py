@@ -1944,3 +1944,19 @@ def test_ev_dispatch_timeout_accepts_observed_feedback_without_retry(monkeypatch
     assert result.applied and result.command_sent
     assert result.reason == "ev_charging_confirmed_after_service_error"
     assert calls == ["button.start"]
+
+
+@pytest.mark.parametrize("domain", ["button", "input_button"])
+def test_unavailable_ev_button_never_dispatches_or_claims_command_sent(domain: str) -> None:
+    entity_id = f"{domain}.start"
+    hass = FakeHass({entity_id: "unavailable"})
+    adapter = EVSmartChargingAdapter(hass, {})
+    result = asyncio.run(adapter._async_call_control(entity_id, turn_on=True))
+    assert not result.applied
+    assert not result.command_sent
+    assert result.reason == "ev_control_unavailable"
+    assert hass.services.calls == []
+    hass.states.values[entity_id] = "unknown"
+    recovered = asyncio.run(adapter._async_call_control(entity_id, turn_on=True))
+    assert recovered.applied
+    assert hass.services.calls == [(domain, "press", {"entity_id": entity_id})]
