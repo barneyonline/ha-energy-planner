@@ -644,6 +644,38 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "pending_hvac_desired_state",
                 None,
             )
+            entity_id = str(event.data.get("entity_id") or "")
+            is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
+            if not getattr(self.hass, "is_running", True) and (
+                is_main_climate
+                or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+            ):
+                # Startup restoration is not evidence of manual intent. Check
+                # before pending-command detection, which deliberately bypasses
+                # the scheduler guard to protect user changes during commands.
+                if _is_explicit_startup_hvac_change(event):
+                    if pending_hvac_desired_state is not None:
+                        if is_main_climate:
+                            self.executor.mark_pending_hvac_manual_override()
+                        else:
+                            self.executor.mark_pending_hvac_zone_manual_override(entity_id)
+                    self._async_create_listener_task(
+                        self._async_handle_manual_hvac_change(
+                            "daikin_state_changed" if is_main_climate else "climate_zone_changed",
+                            preserve_main_state=is_main_climate,
+                            preserve_zone_entity_id=None if is_main_climate else entity_id,
+                        )
+                    )
+                    return
+                if not _is_planner_owned_control_feedback(
+                    entry_data,
+                    self.store.data,
+                    event,
+                    now,
+                    pending_hvac_desired_state=pending_hvac_desired_state,
+                ) and _is_material_state_change(event, self.options):
+                    self._schedule_debounced_refresh("state_change")
+                return
             if _is_planner_owned_control_feedback(
                 entry_data,
                 self.store.data,
@@ -2832,6 +2864,25 @@ def _split_entity_values(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if "." in str(item)]
     return []
+
+
+def _is_explicit_startup_hvac_change(event: Any) -> bool:
+    """Require user attribution and a material control change during HA startup."""
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    if old_state is None or new_state is None:
+        return False
+    if not any(
+        getattr(context, "user_id", None)
+        for context in (getattr(event, "context", None), getattr(new_state, "context", None))
+    ):
+        return False
+    old_attributes = getattr(old_state, "attributes", {}) or {}
+    new_attributes = getattr(new_state, "attributes", {}) or {}
+    return old_state.state != new_state.state or (
+        str(event.data.get("entity_id", "")).startswith("climate.")
+        and any(old_attributes.get(key) != new_attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS)
+    )
 
 
 def _is_manual_hvac_change(
