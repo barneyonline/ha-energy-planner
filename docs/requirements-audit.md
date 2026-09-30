@@ -77,7 +77,36 @@ use throughout; the Docker and pull-request gates enforce that result.
   windows with explicit start and stop times instead of showing the planner's
   short recheck interval, groups event evidence into readable bulleted sections,
   renders embedded timestamps in Home Assistant's local timezone, and omits
-  actions for device-control areas whose selector is off.
+  future actions for device-control areas whose selector is off. Only confirmed
+  activity persists per entry alongside the committed plan, without automatic
+  expiry, and remains queryable after replan, reload, restart, or disabling control.
+  EV windows require physical charging feedback; climate phases require committed
+  ownership and matching live mode. Discrete profile/stop/release actions require
+  a successful adapter outcome. Service acceptance alone never confirms a charging
+  or climate window. State callbacks record feedback synchronously, including queued
+  start/stop events. Delayed EV starts can confirm one elapsed allocation, with an
+  active allocation taking precedence. Each device transaction captures committed
+  phase ownership before later actions; stop feedback records valid old-state
+  evidence before closure, including ownership/outcome persistence waits. Capture
+  observes committed phase ownership
+  even when the plan generation changes, a later action raises, or execution
+  completes after the command deadline. Exact-deadline phase starts retain a
+  positive estimated interval; future phases and later independent acquisitions
+  cannot confirm an expired action. Recovered elapsed phase evidence coalesces
+  with the same confirmed start; stale execution snapshots cannot shorten the
+  newest running phase estimate. Feedback preserves
+  the latest pending plan and uses its runtime snapshot during the publication
+  interval, including initial publication; successful discrete outcomes survive plan replacement
+  and elapsed presentation deadlines. Presentation resolves vehicle transitions on
+  the live coordinator and rechecks its generation before committing the plan.
+  Current calendar state and date-range queries use the same reconciled events.
+  Unconfirmed elapsed plans are discarded; estimated ends are labelled explicitly.
+  Confirmed phase starts remain distinct across real restarts. `calendar_history.py`,
+  `tests/test_calendar_history.py`, `tests/test_calendar.py`, and
+  `tests/test_storage.py` cover reconciliation, bounded metadata, malformed
+  records, range boundaries, deduplication, and storage reload;
+  `tests/test_coordinator.py` and `tests/test_calendar.py` cover superseded
+  confirmations and vehicle-swap generation safety.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
