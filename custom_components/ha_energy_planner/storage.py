@@ -10,6 +10,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .action_limits import budget_history, recent_attempts
+from .calendar_history import confirm_calendar_action, update_calendar_history
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
@@ -24,6 +25,7 @@ _LIST_FIELDS = {
 }
 
 _DICT_FIELDS = {
+    "calendar_history",
     "ai_last_attempt",
     "command_rate_limits",
     "discovery",
@@ -73,6 +75,7 @@ class PlannerStore:
             else None
         )
         self.data: dict[str, Any] = _default_data()
+        self.calendar_plan: EnergyPlan | None = None
         self._save_delay_depth = 0
         self._mutation_generation = 0
         self._saved_generation = 0
@@ -95,7 +98,9 @@ class PlannerStore:
             if self.data != loaded:
                 await self._store.async_save(self.data)
 
-    async def async_save_plan(self, plan: EnergyPlan) -> None:
+    async def async_save_plan(
+        self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None = None,
+    ) -> None:
         """Persist the compact active plan."""
         serialized = to_jsonable(plan)
         self.data["preconditioning_history"] = record_plan(
@@ -103,6 +108,14 @@ class PlannerStore:
             self.data.get("ownership", {}).get("hvac_control"),
         )
         self.data["active_plan"] = serialized
+        if calendar_events is not None:
+            self.data["calendar_history"] = update_calendar_history(
+                self.data.get("calendar_history"), calendar_events, datetime.now(UTC),
+            )
+            # Feedback can arrive during the final disk flush, before the
+            # coordinator publishes this plan. Keep its runtime presentation
+            # source aligned with the in-memory calendar snapshot.
+            self.calendar_plan = plan
         await self._async_save()
 
     async def async_remove_if_safe(self) -> bool:
@@ -118,6 +131,24 @@ class PlannerStore:
         await self._store.async_remove()
         return True
 
+    async def async_save_calendar_events(
+        self, events: list[dict[str, str]], *, now: datetime | None = None,
+    ) -> None:
+        """Persist observed activity even when no new plan is computed."""
+        self.record_calendar_events(events, now=now)
+        await self._async_flush()
+
+    def record_calendar_events(
+        self, events: list[dict[str, str]], *, now: datetime | None = None, location: str | None = None,
+    ) -> None:
+        """Record state feedback synchronously before later events or replans."""
+        history = update_calendar_history(
+            self.data.get("calendar_history"), events, now or datetime.now(UTC), replace_plan=False, location=location,
+        )
+        if self.data.get("calendar_history") != history:
+            self.data["calendar_history"] = history
+            self._mutation_generation += 1
+
     async def async_add_outcome(self, outcome: ActionOutcome) -> None:
         """Append an execution outcome."""
         self.data["action_attempts"] = recent_attempts(
@@ -128,6 +159,7 @@ class PlannerStore:
             self.data.get("preconditioning_history", {}), to_jsonable(outcome)
         )
         entry = _audit_entry(outcome)
+        self.data["calendar_history"] = confirm_calendar_action(self.data.get("calendar_history"), entry)
         if audit and _deduplicable_outcome(entry) and _same_audit_outcome(audit[-1], entry):
             previous = dict(audit[-1])
             previous["occurrence_count"] = int(previous.get("occurrence_count", 1)) + 1
@@ -343,6 +375,7 @@ class PlannerStore:
 def _default_data() -> dict[str, Any]:
     return {
         "active_plan": None,
+        "calendar_history": {},
         "execution_audit": [],
         "audit_history_version": 1,
         "action_attempts": [],

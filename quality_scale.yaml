@@ -621,6 +621,18 @@ rules:
 # documented in README.md and docs/requirements-audit.md.
 
 # Confirmed calendar starts: tests/test_calendar.py and tests/test_executor.py.
+# Persistent calendar history: calendar_history.py and storage.py retain only
+# confirmed activity without expiry; calendar.py/coordinator.py capture live feedback
+# and committed execution. tests/test_calendar_history.py, test_calendar.py,
+# test_coordinator.py and test_storage.py cover skipped/failed/unconfirmed plans,
+# queued start/stop events, superseded discrete confirmations, generation changes,
+# vehicle-swap safety, feedback during initial and replacement plan publication,
+# delayed phase acquisition and exact-deadline starts, later-action delays,
+# elapsed feedback recovery and stale snapshots preserving newer phase estimates,
+# delayed EV feedback, per-action capture and old-state proof during persistence,
+# replans, reload and consistent current/range calendar state.
+# Operator semantics and storage growth are documented in README.md and
+# docs/requirements-audit.md; scripts/docker-validate.sh runs these regressions.
 # Uncertain EV delivery cost and positive-power stall classification:
 # tests/test_ev_optimization.py; operator behavior documented in README.md.
 

@@ -5,13 +5,14 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta
 from math import isfinite
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
+from .calendar_history import update_calendar_history
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DAIKIN_CLIMATE,
@@ -26,7 +27,7 @@ from .entity import (
     recorder_safe_text,
 )
 from .ev import ev_charging_state
-from .models import ActionAsset, ActionKind, PlanAction
+from .models import ActionAsset, ActionKind, EnergyPlan, PlanAction
 from .plan_presentation import (
     action_load_forecast_attrs,
     action_sentence,
@@ -64,7 +65,7 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
     def event(self) -> CalendarEvent | None:
         """Return the current or next controlled action."""
         now = dt_util.utcnow()
-        events = [event for event in _calendar_events(self.coordinator) if event.end > now]
+        events = [event for event in _events_with_history(self.coordinator) if event.end > now]
         return None if not events else events[0]
 
     async def async_get_events(
@@ -75,16 +76,73 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
     ) -> list[CalendarEvent]:
         """Return controlled actions that overlap the requested range."""
         return [
-            event for event in _calendar_events(self.coordinator) if event.end > start_date and event.start < end_date
+            event for event in _events_with_history(self.coordinator)
+            if event.end > start_date and event.start < end_date
         ]
+
+
+def _events_with_history(coordinator: EnergyPlannerCoordinator) -> list[CalendarEvent]:
+    """Combine saved history with live events without changing storage on reads."""
+    state = update_calendar_history(
+        coordinator.store.data.get("calendar_history"),
+        calendar_event_records(coordinator), dt_util.utcnow(),
+    )
+    return sorted(
+        [CalendarEvent(
+            start=datetime.fromisoformat(record["start"]), end=datetime.fromisoformat(record["end"]),
+            summary=record["summary"], uid=record["uid"],
+            description=record.get("description"), location=record.get("location"),
+        ) for record in [*state["history"], *state["pending"]]],
+        key=lambda event: event.start,
+    )
+
+
+class _CalendarPlanView:
+    """Override presentation data while delegating runtime reads to their owner."""
+
+    def __init__(self, coordinator: EnergyPlannerCoordinator, plan: EnergyPlan) -> None:
+        self._coordinator = coordinator
+        self.data = plan
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._coordinator, name)
+
+
+def calendar_event_records(
+    coordinator: EnergyPlannerCoordinator, plan: EnergyPlan | None = None,
+    *, state_overrides: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
+    """Snapshot the same bounded event metadata that the calendar publishes."""
+    if plan is not None:
+        # Runtime properties must execute on the live owner: entry_data can
+        # update vehicle identity, overrides, and the planner safety generation.
+        coordinator = cast(EnergyPlannerCoordinator, _CalendarPlanView(coordinator, plan))
+    records = []
+    for event, confirmed_start in _calendar_windows(coordinator, state_overrides=state_overrides):
+        record = {
+            "start": event.start.isoformat(), "end": event.end.isoformat(),
+            "summary": event.summary, "uid": event.uid or "",
+            "description": event.description or "", "location": event.location or "",
+        }
+        if confirmed_start is not None:
+            record["confirmed_start"] = confirmed_start.isoformat()
+        records.append(record)
+    return records
 
 
 def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEvent]:
     """Return current plan actions as calendar events in time order."""
+    return [event for event, _ in _calendar_windows(coordinator)]
+
+
+def _calendar_windows(
+    coordinator: EnergyPlannerCoordinator, *, state_overrides: dict[str, Any] | None = None,
+) -> list[tuple[CalendarEvent, datetime | None]]:
+    """Pair each displayed window with independently confirmed start evidence."""
     plan = coordinator.data
     if plan is None:
         return []
-    events: list[CalendarEvent] = []
+    events: list[tuple[CalendarEvent, datetime | None]] = []
     for action in plan.actions:
         if not _calendar_control_enabled(coordinator, action.asset):
             continue
@@ -93,9 +151,28 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
             if action.kind == ActionKind.EV_SCHEDULE else [_calendar_event(action, coordinator)]
         )
         now = dt_util.utcnow()
-        actual_start = _actual_start(coordinator, action, now)
+        actual_start = _actual_start(coordinator, action, now, state_overrides=state_overrides)
+        # Delayed feedback can prove that an elapsed allocation actually ran.
+        # Prefer the current window; otherwise confirm one latest past window
+        # covered by the same physical charging start, keeping its identity unique.
+        late_ev_event = None
+        if action.asset == ActionAsset.EV and actual_start is not None and not any(
+            event.start <= now < event.end for event in candidates
+        ):
+            late_ev_event = max(
+                (event for event in candidates if actual_start < event.end <= now),
+                key=lambda event: event.end, default=None,
+            )
         for event in candidates:
-            if actual_start is not None and event.start <= now < event.end:
+            confirmed_start = None
+            late_confirmed_phase = (
+                action.kind == ActionKind.SET_HVAC and actual_start is not None
+                and event.start <= now and actual_start <= event.end
+            )
+            if actual_start is not None and (
+                event.start <= now < event.end or late_confirmed_phase or event is late_ev_event
+            ):
+                confirmed_start = actual_start
                 description = event.description or ""
                 if action.asset == ActionAsset.EV:
                     description = description.replace(
@@ -103,7 +180,11 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
                         "Charging in progress. Estimates cover remaining planned charging.",
                     ).replace("Start charging:", "Remaining plan starts:")
                 event = replace(
+                    # Acquisition or a later action can finish after the allowed
+                    # command window. Retain its confirmed phase, with the same
+                    # estimated boundary and a positive interval at exact expiry.
                     event, start=actual_start,
+                    end=event.end if event.end > actual_start else actual_start + timedelta(seconds=1),
                     description=recorder_safe_text(
                         f"Actual start: {_local_datetime_text(actual_start)}\n{description}", max_bytes=4_096,
                     ),
@@ -111,11 +192,14 @@ def _calendar_events(coordinator: EnergyPlannerCoordinator) -> list[CalendarEven
                         f"{coordinator.entry.entry_id}-{action.asset}-{actual_start.isoformat()}", max_bytes=255,
                     ),
                 )
-            events.append(event)
-    return sorted(events, key=lambda event: event.start)
+            events.append((event, confirmed_start))
+    return sorted(events, key=lambda item: item[0].start)
 
 
-def _actual_start(coordinator: EnergyPlannerCoordinator, action: PlanAction, now: datetime) -> datetime | None:
+def _actual_start(
+    coordinator: EnergyPlannerCoordinator, action: PlanAction, now: datetime,
+    *, state_overrides: dict[str, Any] | None = None,
+) -> datetime | None:
     """Use confirmed live delivery or committed phase ownership, never a plan timestamp."""
     mapping = getattr(coordinator, "entry_data", {})
     states = getattr(coordinator.hass, "states", None)
@@ -123,7 +207,7 @@ def _actual_start(coordinator: EnergyPlannerCoordinator, action: PlanAction, now
         return None
     if action.asset == ActionAsset.EV and action.kind in {ActionKind.EV_SCHEDULE, ActionKind.EV_START}:
         entity_id = mapping.get(CONF_EV_CHARGING)
-        state = states.get(entity_id) if entity_id else None
+        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
         if state is None or ev_charging_state(state.state) is not True:
             return None
         start = getattr(state, "last_changed", None)
@@ -132,7 +216,7 @@ def _actual_start(coordinator: EnergyPlannerCoordinator, action: PlanAction, now
         if not isinstance(control, dict):
             return None
         entity_id = mapping.get(CONF_DAIKIN_CLIMATE)
-        state = states.get(entity_id) if entity_id else None
+        state = (state_overrides or {}).get(entity_id, states.get(entity_id)) if entity_id else None
         if (not control.get("main_state_committed") or control.get("required_evidence_lost")
                 or state is None or state.state not in {"off", "heat", "cool", "heat_cool", "auto", "dry", "fan_only"}
                 or (state.state == "off" and action.desired_state.get("hvac_mode") != "off")
