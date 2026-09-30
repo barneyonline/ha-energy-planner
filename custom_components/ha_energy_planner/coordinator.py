@@ -107,11 +107,13 @@ from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_
 from .inputs import InputManager
 from .load_forecast import normalize_power_kw
 from .models import (
+    ActionAsset,
     ActionOutcome,
     DecisionContext,
     EnergyPlan,
     InputHealth,
     Override,
+    PlanAction,
     PlannerMode,
     to_jsonable,
 )
@@ -620,6 +622,34 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self.async_update_listeners()
             entry_data = self.entry_data
             now = dt_util.utcnow()
+            calendar_plan: EnergyPlan | None = (
+                getattr(self.store, "calendar_plan", None) or getattr(self, "data", None)
+            )
+            if (calendar_plan is not None
+                    and (calendar_plan.actions or self.store.data.get("calendar_history"))
+                    and event.data.get("entity_id") in {
+                        entry_data.get(CONF_EV_CHARGING), entry_data.get(CONF_DAIKIN_CLIMATE),
+                    }):
+                from .calendar import calendar_event_records
+
+                # Capture the event's state now: queued start/stop events can be
+                # delivered after hass.states already exposes a later value.
+                from .plan_presentation import asset_name
+
+                asset = (
+                    ActionAsset.EV
+                    if event.data["entity_id"] == entry_data.get(CONF_EV_CHARGING)
+                    else ActionAsset.DAIKIN
+                )
+                # A phase may become committed during a persistence await and
+                # stop before execution returns. Its old state is independent
+                # positive evidence; record it before closing on the new state.
+                for state in (event.data.get("old_state"), event.data.get("new_state")):
+                    records = calendar_event_records(self, calendar_plan, state_overrides={
+                        str(event.data["entity_id"]): state,
+                    })
+                    self.store.record_calendar_events(records, now=now, location=asset_name(asset))
+                self._async_create_listener_task(self.store.async_flush())
             executor = getattr(self, "executor", None)
             limit_entity = entry_data.get("ev_power_limit_entity")
             if (event.data.get("entity_id") in {limit_entity, entry_data.get("ev_power_entity")}
@@ -2489,8 +2519,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if hasattr(self, "hass"):
                 self._async_create_listener_task(self.async_request_refresh())
             return self.data or plan
+        # Import after coordinator initialization: calendar entities depend on it.
+        from .calendar import calendar_event_records
+
+        calendar_events = calendar_event_records(self, plan)
+        if started_generation != self._refresh_generation:
+            # Resolving live vehicle input during presentation can invalidate
+            # a result whose identity changed while the planner was running.
+            if hasattr(self, "hass"):
+                self._async_create_listener_task(self.async_request_refresh())
+            return self.data or plan
         self._last_decision_context = context
-        await self.store.async_save_plan(plan)
+        await self.store.async_save_plan(plan, calendar_events=calendar_events)
         if (getattr(context, "ev_evidence", {}).get("load_recovery_completed")
                 and plan.health == InputHealth.HEALTHY
                 and (event := getattr(self, "_load_recovery_ready", None)) is not None):
@@ -2588,7 +2628,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.entry_data = self.entry_data
         if started_generation != self._refresh_generation:
             return
-        consumed_action = await self.executor.async_evaluate(plan, context)
+        async def evaluate(action_plan: EnergyPlan) -> PlanAction | None:
+            try:
+                return await self.executor.async_evaluate(action_plan, context)
+            finally:
+                from .calendar import calendar_event_records
+
+                # Capture each completed transaction before later asynchronous
+                # work can end its activity. Also retain confirmation on failure
+                # or generation change without republishing an obsolete plan.
+                await self.store.async_save_calendar_events(calendar_event_records(self, plan))
+
+        consumed_action = await evaluate(plan)
         evaluated_action = consumed_action if consumed_action in plan.actions else plan.next_action
         for action in plan.actions:
             if action is evaluated_action:
@@ -2601,7 +2652,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 break
             if started_generation != self._refresh_generation:
                 _LOGGER.debug(
-                    "Stopping coordinated execution for obsolete plan %s from generation %s; current generation is %s",
+                    "Stopping coordinated execution for obsolete plan %s from generation %s; "
+                    "current generation is %s",
                     plan.plan_id,
                     started_generation,
                     self._refresh_generation,
@@ -2611,7 +2663,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 break
             # The priority score orders presentation and the first command, but
             # every coordinated device action keeps its own execution gate.
-            await self.executor.async_evaluate(replace(plan, actions=[action]), context)
+            await evaluate(replace(plan, actions=[action]))
 
     _async_get_throttled_ai_advice = advice_runtime._async_get_throttled_ai_advice
 
