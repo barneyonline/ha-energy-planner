@@ -792,11 +792,34 @@ class FakeStore:
         self.production_saves: list[dict[str, object]] = []
         self.control_pause_saves: list[dict[str, object]] = []
 
-    async def async_save_plan(self, plan: EnergyPlan) -> None:
+    async def async_save_plan(
+        self, plan: EnergyPlan, *, calendar_events: list[dict[str, str]] | None = None,
+    ) -> None:
         self.saved_plans.append(plan)
+        self.data["saved_calendar_events"] = calendar_events
+        if calendar_events is not None:
+            self.calendar_plan = plan
+            from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+            self.data["calendar_history"] = update_calendar_history(
+                self.data.get("calendar_history"), calendar_events, datetime.now(UTC),
+            )
 
     async def async_save_overrides(self, overrides: list[object]) -> None:
         self.data["overrides"] = overrides
+
+    async def async_save_calendar_events(self, events, *, now=None) -> None:
+        self.record_calendar_events(events, now=now)
+
+    def record_calendar_events(self, events, *, now=None, location=None) -> None:
+        from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+        self.data["calendar_history"] = update_calendar_history(
+            self.data.get("calendar_history"), events, now or datetime.now(UTC), replace_plan=False, location=location,
+        )
+
+    async def async_flush(self) -> None:
+        pass
 
     async def async_save_ownership(self, ownership: dict[str, object]) -> None:
         self.data["ownership"] = ownership
@@ -8892,3 +8915,392 @@ def test_startup_hvac_helper_remains_authoritative(monkeypatch: object) -> None:
     assert coordinator.overrides[0].source == "helper"
     assert coordinator.store.data["overrides"] == coordinator.overrides
     assert coordinator.executor.hvac_releases == ["manual_override_helper_on"]
+
+
+def test_current_commit_snapshots_calendar_but_obsolete_commit_does_not(monkeypatch):
+    from custom_components.ha_energy_planner import calendar as calendar_module
+
+    previous = _plan("previous")
+    coordinator = _coordinator_for_commit(previous, current_generation=2)
+    new = _plan("new")
+    record = {"uid": "new-window", "summary": "EV: Charge"}
+    snapshots = []
+
+    def snapshot(target, plan):
+        assert target is coordinator
+        snapshots.append(plan.plan_id)
+        return [record]
+
+    monkeypatch.setattr(calendar_module, "calendar_event_records", snapshot)
+    asyncio.run(coordinator._async_commit_plan_if_current(1, _plan("stale"), object(), {}, execute=False))
+    assert snapshots == []
+    asyncio.run(coordinator._async_commit_plan_if_current(2, new, object(), {}, execute=False))
+    assert snapshots == ["new"]
+    assert coordinator.store.data["saved_calendar_events"] == [record]
+    assert coordinator.data is previous
+
+
+def test_calendar_observation_captures_queued_start_and_stop_without_replanning(monkeypatch):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    clock = [datetime(2026, 9, 30, 12, tzinfo=UTC)]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+
+    def initialize(self, hass, **kwargs):
+        self.data = None
+
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__", initialize)
+
+    async def run():
+        hass = FakeHass({"sensor.charging": "off"})
+        tasks = []
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+        hass.async_create_task = create_task
+        entry = FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {CONF_EV_CONTROL_ENABLED: True})
+        coordinator = EnergyPlannerCoordinator(hass, entry, FakeStore())
+        coordinator.executor = FakeExecutor()
+        plan = _plan("observed")
+        plan.created_at = clock[0] - timedelta(minutes=1)
+        plan.actions = [_coordinated_action(plan, "charging-window", ActionAsset.EV, ActionKind.EV_START)]
+        coordinator.data = plan
+        coordinator.async_start_listeners()
+        start = FakeEvent("sensor.charging", "off", "on")
+        start.data["new_state"] = SimpleNamespace(state="on", last_changed=clock[0], attributes={})
+        callbacks[0](start)
+        clock[0] += timedelta(seconds=10)
+        stop = FakeEvent("sensor.charging", "on", "off")
+        stop.data["new_state"] = SimpleNamespace(state="off", last_changed=clock[0], attributes={})
+        callbacks[0](stop)
+        # Both callbacks were delivered with hass.states already reporting off.
+        await asyncio.gather(*tasks)
+        history = coordinator.store.data["calendar_history"]["history"]
+        assert len(history) == 1
+        assert history[0]["confirmed_start"] == (clock[0] - timedelta(seconds=10)).isoformat()
+        assert history[0]["end"] == clock[0].isoformat()
+        assert "End time is estimated" in history[0]["description"]
+
+    asyncio.run(run())
+
+
+def test_calendar_confirmation_is_saved_after_adapter_execution(monkeypatch):
+    now = datetime.now(UTC)
+    coordinator = _coordinator_for_commit(None, current_generation=1)
+    coordinator.entry = FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {CONF_EV_CONTROL_ENABLED: True})
+    state = SimpleNamespace(state="off", last_changed=now, attributes={})
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity_id: state))
+    plan = _plan("execution")
+    plan.created_at = now - timedelta(seconds=1)
+    plan.actions = [_coordinated_action(plan, "window", ActionAsset.EV, ActionKind.EV_START)]
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+
+    async def evaluate(plan, context):
+        state.state = "on"
+        return None
+
+    coordinator.executor.async_evaluate = evaluate
+    asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    pending = coordinator.store.data["calendar_history"]["pending"]
+    assert len(pending) == 1
+    assert pending[0]["confirmed_start"] == now.isoformat()
+
+
+def test_commit_drops_result_invalidated_during_calendar_vehicle_resolution():
+    from test_vehicles import make_coordinator, setup
+
+    hass, data = setup()
+    coordinator = make_coordinator(hass, data)
+    coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = True
+    coordinator._update_vehicle_session()
+    previous = _plan("previous-vehicle")
+    coordinator.data = previous
+    old_context = coordinator._last_decision_context = object()
+    coordinator.store.async_save_plan = AsyncMock()
+    coordinator._async_create_listener_task = lambda coroutine: coroutine.close()
+    started_generation = coordinator._refresh_generation
+    hass.states.values.update({"sensor.a_port": "DISCONNECTED", "sensor.b_port": "CONNECTED"})
+    new = _plan("obsolete-vehicle")
+    new.actions = [_coordinated_action(new, "ev-next", ActionAsset.EV, ActionKind.EV_START)]
+    result = asyncio.run(
+        coordinator._async_commit_plan_if_current(started_generation, new, object(), {}, execute=False)
+    )
+    assert result is previous
+    assert coordinator._refresh_generation > started_generation
+    assert coordinator._last_decision_context is old_context
+    coordinator.store.async_save_plan.assert_not_awaited()
+
+
+@pytest.mark.parametrize("raise_after_confirmation", [False, True])
+def test_committed_activity_survives_generation_change_and_execution_exception(raise_after_confirmation):
+    now = datetime.now(UTC)
+    coordinator = _coordinator_for_commit(None, current_generation=1)
+    coordinator.entry = FakeEntry({CONF_DAIKIN_CLIMATE: "climate.main"}, {CONF_CLIMATE_CONTROL_ENABLED: True})
+    state = SimpleNamespace(state="cool", attributes={})
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity_id: state))
+    plan = _plan("confirmed-phase")
+    plan.created_at = now - timedelta(seconds=1)
+    action = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+    action.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+    plan.actions = [action]
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+
+    async def evaluate(plan, context):
+        # New acquisition feedback cannot confirm while ownership is provisional.
+        coordinator.store.data["ownership"] = {"hvac_control": {
+            "main_state_committed": True, "phase": "preconditioning", "phase_started_at": now.isoformat(),
+        }}
+        coordinator._refresh_generation += 1
+        if raise_after_confirmation:
+            raise RuntimeError("later execution failure")
+        return None
+
+    coordinator.executor.async_evaluate = evaluate
+    if raise_after_confirmation:
+        with pytest.raises(RuntimeError, match="later execution failure"):
+            asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    else:
+        asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    pending = coordinator.store.data["calendar_history"]["pending"]
+    assert len(pending) == 1
+    assert pending[0]["confirmed_start"] == now.isoformat()
+
+
+@pytest.mark.parametrize("old_ev_schedule", [False, True])
+def test_old_plan_completion_preserves_newer_confirmed_activity_absent_from_old_windows(old_ev_schedule):
+    now = datetime.now(UTC)
+    coordinator = _coordinator_for_commit(None, current_generation=1)
+    coordinator.entry = FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {
+        CONF_ENPHASE_CONTROL_ENABLED: True, CONF_EV_CONTROL_ENABLED: True,
+    })
+    state = SimpleNamespace(state="on", last_changed=now - timedelta(minutes=1), attributes={})
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity_id: state))
+    plan = _plan("old-profile")
+    plan.actions = [_coordinated_action(plan, "profile", ActionAsset.ENPHASE, ActionKind.SET_PROFILE)]
+    if old_ev_schedule:
+        expired = _coordinated_action(plan, "old-ev", ActionAsset.EV, ActionKind.EV_SCHEDULE)
+        expired.desired_state = {"allocated_slots": [{
+            "valid_at": (now - timedelta(minutes=20)).isoformat(), "charge_kw": 7,
+        }]}
+        plan.actions.append(expired)
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    coordinator._async_create_listener_task = lambda coroutine: coroutine.close()
+    newer = {
+        "uid": "newer-confirmed-ev", "summary": "EV: Charging window", "location": "EV",
+        "start": (now - timedelta(minutes=1)).isoformat(),
+        "confirmed_start": (now - timedelta(minutes=1)).isoformat(),
+        "end": (now + timedelta(minutes=10)).isoformat(), "description": "Charging in progress.",
+    }
+
+    async def evaluate(plan, context):
+        # A newer EV plan committed while the older Enphase service was awaiting.
+        coordinator.store.data["calendar_history"] = {"history": [], "pending": [newer]}
+        coordinator._refresh_generation += 1
+        return None
+
+    coordinator.executor.async_evaluate = evaluate
+    asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    assert coordinator.store.data["calendar_history"] == {"history": [], "pending": [newer]}
+
+
+@pytest.mark.parametrize("already_charging", [False, True])
+@pytest.mark.parametrize("first_plan", [False, True])
+def test_calendar_feedback_uses_newest_plan_while_commit_flush_is_pending(monkeypatch, already_charging, first_plan):
+    from custom_components.ha_energy_planner.calendar import calendar_event_records
+
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    clock = [datetime(2026, 9, 30, 12, tzinfo=UTC)]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                        lambda self, hass, **kwargs: setattr(self, "data", None))
+
+    async def run():
+        hass = FakeHass({"sensor.charging": "off"})
+        tasks = []
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+        hass.async_create_task = create_task
+        coordinator = EnergyPlannerCoordinator(hass, FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {
+            CONF_EV_CONTROL_ENABLED: True,
+        }), FakeStore())
+        coordinator.executor = FakeExecutor()
+        previous = _plan("previous-without-ev-window")
+        previous.actions = []
+        coordinator.data = None if first_plan else previous
+        coordinator.async_start_listeners()
+        newer = _plan("newer-ev-window")
+        newer.created_at = clock[0] - timedelta(minutes=1)
+        action = _coordinated_action(newer, "newer-window", ActionAsset.EV, ActionKind.EV_SCHEDULE)
+        action.desired_state = {"allocated_slots": [{"valid_at": clock[0].isoformat(), "charge_kw": 7}]}
+        newer.actions = [action]
+        # Simulate the atomic in-memory publication before the Store's disk flush returns.
+        overrides = {"sensor.charging": SimpleNamespace(
+            state="on", last_changed=clock[0] - timedelta(seconds=5), attributes={},
+        )} if already_charging else None
+        records = calendar_event_records(coordinator, newer, state_overrides=overrides)
+        await coordinator.store.async_save_plan(newer, calendar_events=records)
+        assert coordinator.store.calendar_plan is newer
+        start = FakeEvent("sensor.charging", "on" if already_charging else "off", "on")
+        start.data["new_state"] = SimpleNamespace(
+            state="on", last_changed=clock[0] - timedelta(seconds=5) if already_charging else clock[0], attributes={},
+        )
+        callbacks[0](start)
+        pending = coordinator.store.data["calendar_history"]["pending"]
+        assert any("confirmed_start" in event for event in pending)
+        clock[0] += timedelta(seconds=10)
+        stop = FakeEvent("sensor.charging", "on", "off")
+        callbacks[0](stop)
+        await asyncio.gather(*tasks)
+        history = coordinator.store.data["calendar_history"]["history"]
+        assert len(history) == 1
+        assert history[0]["end"] == clock[0].isoformat()
+        assert coordinator.data is (None if first_plan else previous)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("start_at_deadline", [False, True])
+@pytest.mark.parametrize("later_action_delays_capture", [False, True])
+def test_confirmed_phase_survives_capture_after_execution_deadline(
+    monkeypatch, start_at_deadline, later_action_delays_capture,
+):
+    deadline = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    started = deadline if start_at_deadline else deadline - timedelta(seconds=1)
+    clock = [started]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+    coordinator = _coordinator_for_commit(None, current_generation=1)
+    coordinator.entry = FakeEntry({CONF_DAIKIN_CLIMATE: "climate.main"}, {
+        CONF_CLIMATE_CONTROL_ENABLED: True, CONF_ENPHASE_CONTROL_ENABLED: True,
+    })
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(
+        get=lambda entity_id: SimpleNamespace(state="cool", attributes={}),
+    ))
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    plan = _plan("late-confirmed-phase")
+    phase = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+    phase.execute_not_before = deadline - timedelta(minutes=1)
+    phase.execute_not_after = deadline
+    phase.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+    plan.actions = [phase]
+    if later_action_delays_capture:
+        plan.actions.append(_coordinated_action(plan, "profile", ActionAsset.ENPHASE, ActionKind.SET_PROFILE))
+
+    async def evaluate(target, context):
+        if target.next_action.kind == ActionKind.SET_HVAC:
+            coordinator.store.data["ownership"] = {"hvac_control": {
+                "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
+            }}
+            if not later_action_delays_capture:
+                clock[0] = deadline + timedelta(seconds=2)
+            return phase
+        clock[0] = deadline + timedelta(seconds=2)
+        return None
+
+    coordinator.executor.async_evaluate = evaluate
+    asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    state = coordinator.store.data["calendar_history"]
+    assert len(state["history"]) == 1
+    assert state["history"][0]["confirmed_start"] == started.isoformat()
+    assert "End time is estimated" in state["history"][0]["description"]
+    assert datetime.fromisoformat(state["history"][0]["end"]) > started
+
+
+@pytest.mark.parametrize("committed,old_mode,expected", [
+    (True, "cool", 1), (False, "cool", 0), (True, "unavailable", 0),
+])
+def test_stop_feedback_captures_old_state_only_with_committed_phase_proof(monkeypatch, committed, old_mode, expected):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    started = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    now = started + timedelta(seconds=30)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    monkeypatch.setattr(coordinator_module.DataUpdateCoordinator, "__init__",
+                        lambda self, hass, **kwargs: setattr(self, "data", None))
+
+    async def run():
+        hass = FakeHass({"climate.main": "off"})
+        tasks = []
+        def create_task(coroutine):
+            task = asyncio.create_task(coroutine)
+            tasks.append(task)
+            return task
+        hass.async_create_task = create_task
+        coordinator = EnergyPlannerCoordinator(hass, FakeEntry({CONF_DAIKIN_CLIMATE: "climate.main"}, {
+            CONF_CLIMATE_CONTROL_ENABLED: True,
+        }), FakeStore())
+        coordinator.executor = FakeExecutor()
+        coordinator.async_request_refresh = AsyncMock()
+        plan = _plan("phase-in-ownership-flush")
+        plan.created_at = started
+        action = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+        action.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+        plan.actions = [action]
+        coordinator.data = plan
+        coordinator.async_start_listeners()
+        # The ownership mutation is installed, but executor persistence has not returned.
+        coordinator.store.data["ownership"] = {"hvac_control": {
+            "main_state_committed": committed, "phase": "preconditioning", "phase_started_at": started.isoformat(),
+        }}
+        callbacks[0](FakeEvent("climate.main", old_mode, "off"))
+        await asyncio.gather(*tasks)
+        history = coordinator.store.data["calendar_history"]["history"]
+        assert len(history) == expected
+        if expected:
+            assert history[0]["confirmed_start"] == started.isoformat()
+            assert history[0]["end"] == now.isoformat()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("later_action_fails", [False, True])
+def test_committed_phase_is_recorded_before_a_later_device_action_stops_it(monkeypatch, later_action_fails):
+    started = datetime.now(UTC)
+    clock = [started]
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: clock[0])
+    coordinator = _coordinator_for_commit(None, current_generation=1)
+    coordinator.entry = FakeEntry({CONF_DAIKIN_CLIMATE: "climate.main"}, {
+        CONF_CLIMATE_CONTROL_ENABLED: True, CONF_ENPHASE_CONTROL_ENABLED: True,
+    })
+    state = SimpleNamespace(state="cool", attributes={})
+    coordinator.hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity_id: state))
+    coordinator._async_reconcile_vehicle_ownership = AsyncMock()
+    plan = _plan("phase-before-other-action")
+    plan.created_at = started
+    phase = _coordinated_action(plan, "phase", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+    phase.desired_state = {"phase": "preconditioning", "hvac_mode": "cool"}
+    plan.actions = [phase, _coordinated_action(plan, "profile", ActionAsset.ENPHASE, ActionKind.SET_PROFILE)]
+
+    async def evaluate(target, context):
+        if target.next_action.kind == ActionKind.SET_HVAC:
+            coordinator.store.data["ownership"] = {"hvac_control": {
+                "main_state_committed": True, "phase": "preconditioning", "phase_started_at": started.isoformat(),
+            }}
+            return phase
+        # Confirmation must already be retained before the second adapter awaits.
+        assert coordinator.store.data["calendar_history"]["pending"][0]["confirmed_start"] == started.isoformat()
+        clock[0] += timedelta(seconds=30)
+        state.state = "off"
+        coordinator.store.record_calendar_events([], now=clock[0], location="Climate")
+        if later_action_fails:
+            raise RuntimeError("other device failed")
+        return None
+
+    coordinator.executor.async_evaluate = evaluate
+    if later_action_fails:
+        with pytest.raises(RuntimeError, match="other device failed"):
+            asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    else:
+        asyncio.run(coordinator._async_execute_plan_if_current(1, plan, object(), {}))
+    history = coordinator.store.data["calendar_history"]["history"]
+    assert len(history) == 1
+    assert history[0]["end"] == clock[0].isoformat()

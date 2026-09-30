@@ -1092,3 +1092,89 @@ def test_action_ledger_survives_audit_rotation_and_reload(monkeypatch):
         reloaded = storage_module._normalize_loaded_data(store.data)
         assert reloaded["action_attempts"] == store.data["action_attempts"]
     asyncio.run(run())
+
+
+def test_calendar_history_persists_with_plan_and_survives_reload(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    FakeStore.loaded_by_key = None
+    now = datetime.now(UTC)
+    event = {
+        "start": (now - timedelta(hours=2)).isoformat(),
+        "end": (now - timedelta(hours=1)).isoformat(),
+        "uid": "past", "summary": "EV: Charge", "description": "Charging was observed.",
+        "confirmed_start": (now - timedelta(hours=2)).isoformat(),
+    }
+    plan = EnergyPlan(
+        plan_id="history", created_at=now, horizon_hours=24, interval_minutes=5,
+        status="current", health=InputHealth.HEALTHY, mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test", confidence=0.9, estimated_daily_cost=2.0, actions=[], preview=[],
+    )
+
+    async def run():
+        store = PlannerStore(object(), "history-entry")
+        await store.async_save_plan(plan, calendar_events=[event])
+        assert FakeStore.saved["active_plan"]["plan_id"] == "history"
+        FakeStore.loaded = deepcopy(FakeStore.saved)
+        restored = PlannerStore(object(), "history-entry")
+        await restored.async_load()
+        await restored.async_save_plan(plan, calendar_events=[])
+        assert restored.data["calendar_history"] == update_calendar_history({}, [event], now)
+
+    asyncio.run(run())
+
+
+def test_store_records_discrete_confirmation_and_filters_unconfirmed_history(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    now = datetime.now(UTC)
+    item = {
+        "uid": "profile", "summary": "Enphase: Set profile", "start": (now - timedelta(seconds=1)).isoformat(),
+        "end": (now + timedelta(minutes=5)).isoformat(), "description": "Planned profile change.",
+    }
+
+    async def run():
+        store = PlannerStore(object(), "confirmed-action")
+        from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+        store.data["calendar_history"] = update_calendar_history({}, [item], now)
+        await store.async_add_outcome(ActionOutcome(
+            action_id="profile", attempted_at=now, result=OutcomeResult.APPLIED, reason="enphase_profile_applied",
+            pre_state={}, post_state={}, asset="enphase", kind="set_profile", plan_id="plan",
+        ))
+        await store.async_save_calendar_events([item], now=now + timedelta(seconds=2))
+        history = store.data["calendar_history"]
+        assert history["pending"] == []
+        assert len(history["history"]) == 1
+        assert history["history"][0]["confirmed_action"] == "true"
+        assert FakeStore.saved["calendar_history"] == history
+
+    asyncio.run(run())
+
+
+def test_calendar_plan_source_is_available_before_persistence_finishes(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    now = datetime.now(UTC)
+    plan = EnergyPlan(
+        plan_id="publishing", created_at=now, horizon_hours=24, interval_minutes=5,
+        status="current", health=InputHealth.HEALTHY, mode=PlannerMode.ACTIVE_HEALTHY,
+        summary="test", confidence=0.9, estimated_daily_cost=2.0, actions=[], preview=[],
+    )
+
+    async def run():
+        store = PlannerStore(object(), "publishing")
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def persist(snapshot):
+            entered.set()
+            await release.wait()
+        store._store.async_save = persist
+        task = asyncio.create_task(store.async_save_plan(plan, calendar_events=[]))
+        await entered.wait()
+        assert store.data["active_plan"]["plan_id"] == plan.plan_id
+        assert store.calendar_plan is plan
+        assert not task.done()
+        release.set()
+        await task
+
+    asyncio.run(run())

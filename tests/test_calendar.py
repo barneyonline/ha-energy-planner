@@ -14,6 +14,7 @@ from custom_components.ha_energy_planner import calendar as calendar_module
 from custom_components.ha_energy_planner.calendar import EnergyPlannerCalendar
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
 )
@@ -582,3 +583,200 @@ def test_committed_off_coasting_phase_keeps_actual_start():
     coordinator.store.data["ownership"]["hvac_control"]["phase"] = "peak_coast"
     state.state = "off"
     assert calendar_module._actual_start(coordinator, action, now) == start
+
+
+def test_calendar_returns_persistent_history_after_replan_and_without_live_plan(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+    now = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    old = _action("past", now - timedelta(hours=2), now - timedelta(hours=1))
+    coordinator = _coordinator(_plan([old]))
+    observed = calendar_module.calendar_event_records(coordinator)
+    observed[0]["confirmed_start"] = observed[0]["start"]
+    coordinator.store.data["calendar_history"] = update_calendar_history({}, observed, now)
+    # History remains visible even when that control area is disabled or no plan exists.
+    coordinator.options[CONF_EV_CONTROL_ENABLED] = False
+    coordinator.data = None
+    entity = EnergyPlannerCalendar(coordinator)
+    assert entity.event is None
+    events = asyncio.run(entity.async_get_events(coordinator.hass, now - timedelta(days=1), now))
+    assert len(events) == 1 and events[0].uid == "past"
+    assert "Start EV charging" in events[0].summary
+    assert asyncio.run(entity.async_get_events(coordinator.hass, old.execute_not_after, now)) == []
+    assert asyncio.run(entity.async_get_events(coordinator.hass, now - timedelta(days=1), old.execute_not_before)) == []
+
+
+def test_calendar_history_and_live_plan_have_no_duplicate_elapsed_event(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+    now = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    action = _action("past", now - timedelta(hours=2), now - timedelta(hours=1))
+    coordinator = _coordinator(_plan([action]))
+    observed = calendar_module.calendar_event_records(coordinator)
+    observed[0]["confirmed_start"] = observed[0]["start"]
+    coordinator.store.data["calendar_history"] = update_calendar_history({}, observed, now)
+    entity = EnergyPlannerCalendar(coordinator)
+    assert len(asyncio.run(entity.async_get_events(coordinator.hass, now - timedelta(days=1), now))) == 1
+
+
+def test_committed_calendar_snapshot_uses_new_plan_evidence_without_mutating_coordinator():
+    now = datetime.now(UTC)
+    coordinator = _coordinator(None)
+    new = _plan([_action("new", now, now + timedelta(minutes=5))])
+    new.confidence = 0.0
+    new.health = InputHealth.UNSAFE
+    records = calendar_module.calendar_event_records(coordinator, new)
+    assert "Inputs are not safe enough" in records[0]["description"]
+    assert coordinator.data is None
+
+
+def test_current_event_and_range_agree_after_discrete_execution(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import confirm_calendar_action, update_calendar_history
+
+    now = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    action = replace(_action("profile", now - timedelta(minutes=1), now + timedelta(minutes=4)),
+                     asset=ActionAsset.ENPHASE, kind=ActionKind.SET_PROFILE, desired_state={"profile": "Full Backup"})
+    future = _action("future", now + timedelta(hours=1), now + timedelta(hours=2))
+    coordinator = _coordinator(_plan([action, future]))
+    state = update_calendar_history({}, calendar_module.calendar_event_records(coordinator), now)
+    coordinator.store.data["calendar_history"] = confirm_calendar_action(state, {
+        "result": "applied", "kind": "set_profile", "action_id": "profile",
+        "attempted_at": (now - timedelta(seconds=5)).isoformat(),
+    })
+    entity = EnergyPlannerCalendar(coordinator)
+    assert entity.event.uid == "future"
+    events = asyncio.run(entity.async_get_events(coordinator.hass, now - timedelta(days=1), now + timedelta(days=1)))
+    assert [event.uid for event in events] == ["profile", "future"]
+    assert events[0].end < now
+    assert events[1] == entity.event
+
+
+def test_snapshot_vehicle_transition_updates_live_generation_and_override():
+    from test_vehicles import make_coordinator, setup
+
+    from custom_components.ha_energy_planner.models import Override
+
+    hass, data = setup()
+    coordinator = make_coordinator(hass, data)
+    coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = True
+    coordinator._update_vehicle_session()
+    generation = coordinator._refresh_generation
+    coordinator.overrides = [Override("manual_ev_charging", "service", None, "manual_request")]
+    hass.states.values.update({"sensor.a_port": "DISCONNECTED", "sensor.b_port": "CONNECTED"})
+    now = datetime.now(UTC)
+    plan = _plan([_action("next", now, now + timedelta(minutes=5))])
+    calendar_module.calendar_event_records(coordinator, plan)
+    assert coordinator.vehicle_session.profile["id"] == "B"
+    assert coordinator._refresh_generation > generation
+    assert coordinator.overrides == []
+
+
+@pytest.mark.parametrize("start_offset,end_offset,phase_start_offset,confirmed", [
+    (-10, -5, -6, True), (-10, -5, -5, True), (-10, -5, -4, False), (5, 10, -6, False),
+])
+def test_late_phase_confirmation_preserves_elapsed_activity_without_confirming_new_or_future_phases(
+    monkeypatch, start_offset, end_offset, phase_start_offset, confirmed,
+):
+    now = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    phase_start = now + timedelta(minutes=phase_start_offset)
+    action = replace(_action("phase", now + timedelta(minutes=start_offset), now + timedelta(minutes=end_offset)),
+                     asset=ActionAsset.DAIKIN, kind=ActionKind.SET_HVAC,
+                     desired_state={"phase": "preconditioning", "hvac_mode": "cool"})
+    coordinator = _coordinator(_plan([action]))
+    coordinator.entry_data = {CONF_DAIKIN_CLIMATE: "climate.main"}
+    coordinator.hass.states = SimpleNamespace(get=lambda entity_id: SimpleNamespace(state="cool"))
+    coordinator.store.data["ownership"] = {"hvac_control": {
+        "main_state_committed": True, "phase": "preconditioning", "phase_started_at": phase_start.isoformat(),
+    }}
+    record = calendar_module.calendar_event_records(coordinator)[0]
+    assert ("confirmed_start" in record) is confirmed
+    if confirmed:
+        assert record["confirmed_start"] == phase_start.isoformat()
+        assert datetime.fromisoformat(record["end"]) > phase_start
+    else:
+        assert record["start"] == action.execute_not_before.isoformat()
+
+
+def test_phase_feedback_recovery_after_deadline_keeps_one_history_event(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+    start = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    clock = [start]
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: clock[0])
+    action = replace(_action("phase", start - timedelta(minutes=1), start + timedelta(minutes=5)),
+                     asset=ActionAsset.DAIKIN, kind=ActionKind.SET_HVAC,
+                     desired_state={"phase": "preconditioning", "hvac_mode": "cool"})
+    coordinator = _coordinator(_plan([action]))
+    coordinator.entry_data = {CONF_DAIKIN_CLIMATE: "climate.main"}
+    state = SimpleNamespace(state="cool")
+    coordinator.hass.states = SimpleNamespace(get=lambda entity_id: state)
+    coordinator.store.data["ownership"] = {"hvac_control": {
+        "main_state_committed": True, "phase": "preconditioning", "phase_started_at": start.isoformat(),
+    }}
+    saved = update_calendar_history({}, calendar_module.calendar_event_records(coordinator), clock[0])
+    clock[0] += timedelta(minutes=2)
+    state.state = "unavailable"
+    saved = update_calendar_history(saved, calendar_module.calendar_event_records(coordinator), clock[0],
+                                    replace_plan=False, location="Climate")
+    assert len(saved["history"]) == 1
+    clock[0] += timedelta(minutes=4)
+    state.state = "cool"
+    saved = update_calendar_history(saved, calendar_module.calendar_event_records(coordinator), clock[0],
+                                    replace_plan=False, location="Climate")
+    assert len(saved["history"]) == 1
+    assert saved["history"][0]["end"] == action.execute_not_after.isoformat()
+    coordinator.store.data["calendar_history"] = saved
+    events = asyncio.run(EnergyPlannerCalendar(coordinator).async_get_events(
+        coordinator.hass, start - timedelta(days=1), start + timedelta(days=1),
+    ))
+    assert len(events) == 1
+
+
+@pytest.mark.parametrize("in_next_window", [False, True])
+def test_queued_ev_start_is_retained_after_expiry_without_duplicate_active_window(monkeypatch, in_next_window):
+    from custom_components.ha_energy_planner.calendar_history import update_calendar_history
+
+    boundary = datetime(2026, 9, 30, 12, 5, tzinfo=UTC)
+    now = boundary + (timedelta(minutes=5, seconds=1) if in_next_window else timedelta(seconds=1))
+    actual = boundary - timedelta(seconds=1)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    action = _action("schedule", boundary - timedelta(minutes=5), boundary)
+    action.kind = ActionKind.EV_SCHEDULE
+    action.desired_state = {"allocated_slots": [
+        {"valid_at": (boundary - timedelta(minutes=5)).isoformat(), "charge_kw": 7},
+        {"valid_at": (boundary + timedelta(minutes=5)).isoformat(), "charge_kw": 7},
+    ]}
+    coordinator = _coordinator(_plan([action]))
+    coordinator.entry_data = {"ev_charging_entity": "sensor.charging"}
+    # The callback delivers earlier on-state evidence after the slot boundary.
+    coordinator.hass.states = SimpleNamespace(get=lambda entity_id: SimpleNamespace(state="off"))
+    records = calendar_module.calendar_event_records(coordinator, state_overrides={
+        "sensor.charging": SimpleNamespace(state="on", last_changed=actual),
+    })
+    confirmed = [record for record in records if "confirmed_start" in record]
+    assert len(confirmed) == 1
+    assert confirmed[0]["confirmed_start"] == actual.isoformat()
+    state = update_calendar_history({}, records, now)
+    actual_events = [record for record in [*state["history"], *state["pending"]] if "confirmed_start" in record]
+    assert len(actual_events) == 1
+
+
+@pytest.mark.parametrize("slot_offset", [-10, 5])
+def test_late_ev_feedback_does_not_confirm_future_or_preceding_allocations(monkeypatch, slot_offset):
+    now = datetime(2026, 9, 30, 12, tzinfo=UTC)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    action = _action("schedule", now - timedelta(minutes=1), now + timedelta(minutes=5))
+    action.kind = ActionKind.EV_SCHEDULE
+    action.desired_state = {"allocated_slots": [{
+        "valid_at": (now + timedelta(minutes=slot_offset)).isoformat(), "charge_kw": 7,
+    }]}
+    coordinator = _coordinator(_plan([action]))
+    coordinator.entry_data = {"ev_charging_entity": "sensor.charging"}
+    coordinator.hass.states = SimpleNamespace(get=lambda entity_id: SimpleNamespace(
+        state="on", last_changed=now - timedelta(minutes=1),
+    ))
+    assert all("confirmed_start" not in record for record in calendar_module.calendar_event_records(coordinator))

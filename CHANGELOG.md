@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Preserve confirmed Plan calendar activity across replans and Home Assistant restarts, including short activity between replans. History excludes skipped, failed, and unconfirmed plans, has no automatic expiry, and labels estimated end times.
 
 ### 🐛 Bug fixes
 
