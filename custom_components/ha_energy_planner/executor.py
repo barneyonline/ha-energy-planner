@@ -504,7 +504,7 @@ class Executor:
         no_change = result.reason == "already_in_desired_state"
         outcome_result = (
             OutcomeResult.REJECTED
-            if rejected
+            if rejected or (not result.applied and not result.command_sent)
             else OutcomeResult.SKIPPED
             if no_change
             else OutcomeResult.APPLIED
@@ -869,7 +869,7 @@ class Executor:
                 if planner_owned_stop and safe_stop_confirmed and not ev_result.applied
                 else ev_result.reason
             )
-            if not no_change:
+            if ev_result.command_sent:
                 await self._async_record_command_attempt(action, now)
             if not action_applied:
                 pause_duration = ACTION_BACKOFF_DURATION
@@ -943,6 +943,8 @@ class Executor:
                         if no_change
                         else OutcomeResult.APPLIED
                         if action_applied
+                        else OutcomeResult.REJECTED
+                        if not ev_result.command_sent
                         else OutcomeResult.FAILED
                     ),
                     reason=result_reason,

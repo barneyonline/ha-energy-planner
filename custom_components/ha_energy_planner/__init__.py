@@ -395,6 +395,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
 async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> bool:
     """Set up Energy Planner from a config entry."""
     from .coordinator import EnergyPlannerCoordinator
+    from .enphase_ev_migration import async_migrate_retired_enphase_buttons, without_retired_enphase_buttons
     from .storage import PlannerStore
     from .subentry_migration import async_migrate_subentries_to_entry_data
 
@@ -403,6 +404,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
     if getattr(entry, "title", None) == LEGACY_INTEGRATION_NAME:
         hass.config_entries.async_update_entry(entry, title=INTEGRATION_NAME)
     async_migrate_subentries_to_entry_data(hass, entry)
+    async_migrate_retired_enphase_buttons(hass, entry)
     domain_entries = hass.config_entries.async_entries(DOMAIN)
     legacy_store_entry_id = _legacy_store_owner_entry_id(domain_entries)
     store = PlannerStore(
@@ -411,6 +413,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         legacy_fallback=entry.entry_id == legacy_store_entry_id,
     )
     await store.async_load()
+    ownership = dict(store.data.get("ownership", {}))
+    topology = ownership.get("ev_smart_charging_control_topology")
+    if isinstance(topology, dict):
+        migrated_topology = without_retired_enphase_buttons(hass, topology)
+        if migrated_topology != topology:
+            await store.async_save_ownership({**ownership, "ev_smart_charging_control_topology": migrated_topology})
     _rehydrate_ev_grid_reservation(hass, entry, getattr(store, "data", {}))
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
     coordinator.entry_topology_signature = _entry_topology_signature(entry)

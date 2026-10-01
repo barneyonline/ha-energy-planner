@@ -765,7 +765,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
 def test_setup_entry_adds_default_options_for_empty_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     class Store:
         def __init__(self, hass: Any, entry_id: str, *, legacy_fallback: bool = False) -> None:
-            pass
+            self.data: dict[str, Any] = {"ownership": {}}
 
         async def async_load(self) -> None:
             pass

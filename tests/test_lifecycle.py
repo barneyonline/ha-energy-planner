@@ -1146,3 +1146,46 @@ def test_reload_drains_and_suppresses_queued_manual_listener_jobs(helper_off: bo
         assert rejected.cr_frame is None
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("retired", [True, False])
+def test_setup_repairs_retired_enphase_config_and_owned_recovery_before_refresh(monkeypatch, retired):
+    from custom_components.ha_energy_planner import enphase_ev_migration
+    from custom_components.ha_energy_planner.const import CONF_EV_CHARGER, CONF_EV_CHARGER_START, CONF_EV_CHARGER_STOP
+
+    switch = "switch.renamed_charger"
+    controls = {CONF_EV_CHARGER: switch}
+    if retired:
+        controls.update({CONF_EV_CHARGER_START: "button.iq_ev_charger_1234_start_charging",
+                         CONF_EV_CHARGER_STOP: "button.iq_ev_charger_1234_stop_charging"})
+    snapshot = {CONF_EV_CHARGER: "off", CONF_EV_CHARGER_START: None, CONF_EV_CHARGER_STOP: None}
+    saved = {"ev_smart_charging_state": snapshot, "ev_smart_charging_control_topology": controls,
+             "ev_smart_charging_command_entity_id": "button.iq_ev_charger_1234_start_charging"}
+
+    class OwnedStore(FakeStore):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.data = {"ownership": dict(saved)}
+
+        async def async_save_ownership(self, value):
+            self.data["ownership"] = value
+
+    class ReadyCoordinator(FakeCoordinator):
+        def __init__(self, hass, entry, store):
+            assert entry.data == {CONF_EV_CHARGER: switch}
+            assert store.data["ownership"]["ev_smart_charging_control_topology"] == {CONF_EV_CHARGER: switch}
+            assert store.data["ownership"]["ev_smart_charging_state"] == snapshot
+            assert (store.data["ownership"]["ev_smart_charging_command_entity_id"]
+                    == saved["ev_smart_charging_command_entity_id"])
+            super().__init__(hass, entry, store)
+
+    registered = SimpleNamespace(platform="enphase_ev", disabled_by=None,
+                                 unique_id="enphase_ev_TEST1234_charging_switch")
+    monkeypatch.setattr(enphase_ev_migration.er, "async_get",
+                        lambda _: SimpleNamespace(async_get=lambda entity: registered if entity == switch else None))
+    monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", OwnedStore)
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", ReadyCoordinator)
+    monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda *_: None)
+    entry = FakeEntry(data=controls, subentries={})
+    hass = SimpleNamespace(data={}, config_entries=FakeConfigEntries(), states=SimpleNamespace(get=lambda _: None))
+    assert asyncio.run(async_setup_entry(hass, entry))

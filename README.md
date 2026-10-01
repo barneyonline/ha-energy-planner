@@ -118,11 +118,13 @@ For a safe initial rollout:
 
 **Automatic control** records the operator's request for active control. **Armed** is the actual command-authority gate; unsafe or incomplete evidence keeps it off even when automatic-control intent is retained.
 
+On reload, missing default Start/Stop Charging buttons retired by Enphase EV Charger 5.0 automatically use the already-mapped charger switch when its entity-registry identity confirms the same charger. Saved recovery controls are repaired too. Existing, unavailable, custom-named, or mismatched controls remain unchanged; reconfigure custom-named retired buttons manually.
+
 Saving mapped inputs may briefly make planner entities unavailable while their listeners are rebuilt. Concurrent updates from one settings save share that reload and preserve automatic recovery; after the required safety checks pass, Armed returns on. Policy-only changes apply without rebuilding the integration.
 
 When **Automatic control** is armed and **EV control** is enabled, Energy Planner immediately stops charging that a charger starts by itself on plug-in. If the stop cannot be confirmed, it retries every 30 seconds—even while charging feedback is temporarily unavailable—until charging is confirmed inactive or control is disabled. Starts actually issued by Energy Planner or its manual EV controls are ownership-tracked and are not mistaken for plug-in auto-starts; the next plan may start charging again when the current slot calls for it.
 
-EV control attempts are limited over a rolling 24-hour window. Configure **Maximum daily EV actions** in the integration settings under **Safety and troubleshooting** (default 10, range 0–48; 0 disables the cap). Existing saved limits are preserved. Starts, stops, failures and recovery actions count toward the allowance; safety stops remain available. Scheduling reserves the eventual stop as well as the start. An **EV action limit reached** notification means an otherwise feasible schedule was blocked by this allowance and includes the configured and remaining counts.
+EV control attempts are limited over a rolling 24-hour window. Configure **Maximum daily EV actions** in the integration settings under **Safety and troubleshooting** (default 10, range 0–48; 0 disables the cap). Existing saved limits are preserved. Starts, stops, dispatched failures and recovery actions count toward the allowance; local rejections before dispatch do not count, and older missing-control retry counts are removed on reload; safety stops remain available. Scheduling reserves the eventual stop as well as the start. An **EV action limit reached** notification means an otherwise feasible schedule was blocked by this allowance and includes the configured and remaining counts.
 
 The default **Manual HVAC override duration** is 60 minutes. Genuine manual changes temporarily block planner control; existing saved durations are preserved. Planner-owned feedback should not create a hold.
 
@@ -219,7 +221,7 @@ Manual and unidentified charging still reserve the configured charging power in 
 
 ### Action allowances and resuming climate planning
 
-Action limits apply over a rolling 24-hour window. Applied and failed device attempts count; no-change outcomes and climate restoration do not. Stopping an automation that is enabled or still running counts, while repeating suppression on an idle, already-disabled automation does not. A compact persisted attempt ledger retains allowance usage even when the presentation audit rotates. Diagnostics expose each asset's limit, used and remaining actions, next expiry, and when allowance becomes available after exhaustion. Zero means unlimited. Existing installations migrate the retained audit evidence on reload.
+Action limits apply over a rolling 24-hour window. Applied and dispatched failed device attempts count; locally rejected EV commands do not count; no-change outcomes and climate restoration do not. Stopping an automation that is enabled or still running counts, while repeating suppression on an idle, already-disabled automation does not. A compact persisted attempt ledger retains allowance usage even when the presentation audit rotates. Diagnostics expose each asset's limit, used and remaining actions, next expiry, and when allowance becomes available after exhaustion. Zero means unlimited. Existing installations migrate the retained audit evidence on reload.
 
 Changing action limits, the manual climate hold duration, notification policy, or supported EV scheduling policies requests a fresh plan while preserving armed state and owned climate settings. Device mappings and other safety-sensitive changes still use the normal recovery lifecycle. Changing the default hold duration does not shorten an existing hold.
 

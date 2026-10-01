@@ -13,6 +13,9 @@ def counted_attempt(row: Any) -> bool:
              if row.get("asset") == "enphase_export_limit"
              else row.get("result") in {"applied", "failed", "restored"})
         and row.get("reason") not in {"already_in_desired_state", "already_in_desired_hvac_state"}
+        # Older EV safety-stop retries recorded missing local targets as failed
+        # commands even though the adapter never dispatched a service call.
+        and not (row.get("asset") == "ev" and row.get("reason") == "ev_control_unavailable")
         and (row.get("asset") != "daikin" or row.get("kind") in {None, "set_hvac"})
     )
 
