@@ -25,6 +25,9 @@ CONF_PV_OBSERVED = "pv_observed_entity"
 CONF_BASELINE_LOAD_OBSERVED = "baseline_load_observed_entity"
 CONF_HOUSEHOLD_LOAD = "household_load_entity"
 CONF_BATTERY_SOC = "battery_soc_entity"
+CONF_ENPHASE_EXPORT_LIMIT_ENTITY = "enphase_export_limit_entity"
+CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED = "enphase_export_limit_control_enabled"
+CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS = "max_daily_export_limit_actions"
 CONF_ENPHASE_PROFILE = "enphase_profile_entity"
 CONF_ENPHASE_PROFILE_CONTROL_SERVICE = "enphase_profile_control_service"
 CONF_ENPHASE_AI_PROFILE = "enphase_ai_profile"
@@ -179,6 +182,8 @@ DEFAULT_OPTIONS = {
     CONF_EV_CONTROL_ENABLED: False,
     CONF_CLIMATE_CONTROL_ENABLED: False,
     CONF_ENPHASE_CONTROL_ENABLED: False,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: False,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: 0,
     CONF_AI_TIMEOUT_SECONDS: 20,
     CONF_PRICE_FRESHNESS_MINUTES: 30,
     CONF_FORECAST_FRESHNESS_MINUTES: 120,

@@ -1,0 +1,31 @@
+{
+  "name": "enphase_export_limit_zero_export",
+  "kind": "enphase_export_limit",
+  "source": "sanitized public Enphase Export Limit sensor contract",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "zero_export",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "confirmed_watts": 0,
+      "slew_rate": 100.0,
+      "pending": false,
+      "requested_watts": null,
+      "requested_action": null,
+      "pending_requested_at": null,
+      "request_status": "confirmed",
+      "last_successful_readback": 1790813400.0
+    }
+  },
+  "expected": {
+    "watts": 0,
+    "slew_rate": 100.0,
+    "state": "zero_export",
+    "pending": false,
+    "requested_watts": null,
+    "requested_action": null,
+    "requested_at": null,
+    "request_status": "confirmed",
+    "last_readback": 1790813400.0
+  }
+}

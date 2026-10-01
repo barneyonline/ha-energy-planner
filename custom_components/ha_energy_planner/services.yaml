@@ -142,6 +142,7 @@ pause_control:
             - ev
             - daikin
             - enphase
+            - enphase_export_limit
     reason:
       required: false
       selector:
@@ -156,6 +157,16 @@ resume_control:
       selector:
         config_entry:
           integration: ha_energy_planner
+    asset:
+      required: false
+      selector:
+        select:
+          options:
+            - all
+            - ev
+            - daikin
+            - enphase
+            - enphase_export_limit
     reason:
       required: false
       selector:

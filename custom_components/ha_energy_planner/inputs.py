@@ -373,7 +373,13 @@ class InputManager:
             if bool(self.options.get(CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED, False))
             else []
         )
+        from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
+        from .enphase_export_limit import evidence
+
+        export_limit = (evidence(self.hass, dict(self.entry_data), dict(self.options), now)
+                        if self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True else {})
         return DecisionContext(
+            export_limit=export_limit,
             created_at=now,
             plan_id=uuid4().hex,
             slots=slots,

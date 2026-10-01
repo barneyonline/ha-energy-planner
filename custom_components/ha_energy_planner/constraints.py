@@ -11,6 +11,7 @@ from typing import Any
 from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_DRY_RUN,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_ENPHASE_PROFILE_MIN_HOLD_MINUTES,
     CONF_GRID_EXPORT_LIMIT_KW,
@@ -20,6 +21,7 @@ from .const import (
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PLANNER_ENABLED,
 )
+from .export_limit_policy import area_safe
 from .models import (
     ActionAsset,
     ActionKind,
@@ -131,6 +133,12 @@ class ConstraintValidator:
             violations.append(_action_violation(action, "planner_disabled", "Planner execution is disabled."))
         if strict_bool(self.options.get(CONF_DRY_RUN), default=True):
             violations.append(_action_violation(action, "dry_run_enabled", "Dry run is enabled."))
+        if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+            if not self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) or not area_safe(plan):
+                violations.append(_action_violation(action, "export_limit_not_ready", "Export Limit is not ready."))
+            if not action.execute_not_before <= now < action.execute_not_after:
+                violations.append(_action_violation(action, "action_outside_execution_window", "Tariff block expired."))
+            return violations
         if context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
             violations.append(_action_violation(action, "input_health_not_healthy", "Required inputs are unsafe."))
         if not _action_window_contains(action, now):

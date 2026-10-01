@@ -116,7 +116,8 @@
       "zone_only_preconditioning_requires_climate_zone": "Synchronise configured zone temperatures requires at least one climate entity under Climate Zones.",
       "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
       "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget.",
-      "retry_not_ready": "Migration is already running or is not ready for repair. Wait for setup to finish, then try again."
+      "retry_not_ready": "Migration is already running or is not ready for repair. Wait for setup to finish, then try again.",
+      "invalid_export_limit_entity": "Select an Export Limit sensor supplied by the Enphase integration."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -313,14 +314,15 @@
           },
           "enphase_inputs": {
             "name": "Enphase",
-            "description": "Configure Enphase profile monitoring, control, and policy.",
+            "description": "Configure independent Enphase profile and Export Limit controls.",
             "data": {
               "enphase_profile_entity": "Enphase Profile",
               "enphase_ai_profile": "Enphase Restore Profile",
               "enphase_self_consumption_profile": "Enphase Consume Battery Profile",
               "enphase_full_backup_profile": "Enphase Charge Battery Profile",
               "enphase_profile_min_hold_minutes": "Enphase profile minimum hold",
-              "enphase_minimum_savings": "Minimum Enphase savings"
+              "enphase_minimum_savings": "Minimum Enphase savings",
+              "enphase_export_limit_entity": "Enphase Export Limit sensor"
             },
             "data_description": {
               "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
@@ -328,7 +330,8 @@
               "enphase_self_consumption_profile": "Profile name used when the planner wants the battery to serve local load or export, normally Self-Consumption.",
               "enphase_full_backup_profile": "Profile name used when the planner wants to charge or preserve the battery, normally Full Backup.",
               "enphase_profile_min_hold_minutes": "Minimum time to keep an Enphase profile before changing it again.",
-              "enphase_minimum_savings": "Minimum estimated daily savings required before the planner takes Enphase profile ownership."
+              "enphase_minimum_savings": "Minimum estimated daily savings required before the planner takes Enphase profile ownership.",
+              "enphase_export_limit_entity": "Select the Enphase Export Limit sensor. Automatic control selects 0 W for negative export prices and Disabled otherwise, replacing any existing nonzero limit. Enable Export Limit controls and installer access in Enphase first."
             }
           },
           "ai_inputs": {
@@ -341,12 +344,14 @@
               "plan_fallback_notifications_enabled": "Enable plan fallback notifications",
               "ev_control_enabled": "Enable EV control",
               "climate_control_enabled": "Enable climate control",
-              "enphase_control_enabled": "Enable Enphase control",
+              "enphase_control_enabled": "Enable Enphase Profile control",
               "ai_timeout_seconds": "AI troubleshooting timeout",
               "command_rate_limit_seconds": "Device command cooldown",
               "max_daily_ev_actions": "Maximum daily EV actions",
               "max_daily_climate_actions": "Maximum daily climate actions",
-              "max_daily_enphase_actions": "Maximum daily Enphase actions"
+              "max_daily_enphase_actions": "Maximum daily Enphase actions",
+              "enphase_export_limit_control_enabled": "Enable Enphase Export Limit control",
+              "max_daily_export_limit_actions": "Maximum daily Export Limit actions"
             },
             "data_description": {
               "ai_task_entity": "Select an AI Task entity for on-demand plan explanation and troubleshooting. Energy Planner accepts only complete actions tied to current planner evidence.",
@@ -360,7 +365,9 @@
               "command_rate_limit_seconds": "Cooldown between repeated commands to the same device target.",
               "max_daily_ev_actions": "Maximum EV control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
               "max_daily_climate_actions": "Maximum climate control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
-              "max_daily_enphase_actions": "Maximum Enphase profile control attempts allowed in a rolling 24-hour window. Set to 0 for no cap."
+              "max_daily_enphase_actions": "Maximum Enphase profile control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
+              "enphase_export_limit_control_enabled": "Allows independent tariff-based Export Limit changes after Automatic control is armed.",
+              "max_daily_export_limit_actions": "Maximum Export Limit actions in a rolling 24-hour window. Set to 0 for no cap."
             }
           },
           "ev_inputs": {
@@ -583,7 +590,8 @@
       "vehicle_entity_in_use": "This SOC or port sensor already belongs to another vehicle.",
       "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
       "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure.",
-      "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes."
+      "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes.",
+      "invalid_export_limit_entity": "Select an Export Limit sensor supplied by the Enphase integration."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",
@@ -613,7 +621,7 @@
       "message": "Automatic control is not ready: {reason}"
     },
     "active_control_no_device_selected": {
-      "message": "Turn on at least one Climate control, EV control, or Enphase control switch before enabling Automatic control."
+      "message": "Turn on at least one Climate control, EV control, Enphase Profile control, or Enphase Export Limit control switch before enabling Automatic control."
     },
     "device_control_not_configured": {
       "message": "Configure this device area before turning on its control switch."
@@ -701,7 +709,10 @@
         "name": "EV control"
       },
       "enphase_control": {
-        "name": "Enphase control"
+        "name": "Enphase Profile control"
+      },
+      "enphase_export_limit_control": {
+        "name": "Enphase Export Limit control"
       }
     },
     "button": {

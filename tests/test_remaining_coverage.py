@@ -562,7 +562,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         CapabilityEvidence(True),
     )
     assert report.for_asset("bad") == CapabilityEvidence(False, ["unknown_asset"])
-    assert set(report.as_dict()) == {"ev", "hvac", "enphase", "ai"}
+    assert set(report.as_dict()) == {"ev", "hvac", "enphase", "enphase_export_limit", "ai"}
     assert discovery_split_entities(["sensor.a", " bad "]) == ["sensor.a", "bad"]
     assert discovery_split_entities(123) == []
     registered: list[Any] = []

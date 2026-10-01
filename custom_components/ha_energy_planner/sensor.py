@@ -26,6 +26,8 @@ from .const import (
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -418,6 +420,8 @@ def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         "health": "Unknown" if plan is None else display_state(plan.health),
         "controlled_assets": _controlled_state_groups(coordinator),
     }
+    if coordinator.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+        attrs["export_limit"] = {} if plan is None else plan.device_plans.get("enphase_export_limit", {})
     if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
         attrs["climate_capability"] = _climate_capability_attrs(coordinator)
     if coordinator.entry_data.get(CONF_WEATHER):
@@ -457,6 +461,7 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
             ],
         ),
         (ActionAsset.ENPHASE, [("profile", entry_data.get(CONF_ENPHASE_PROFILE))]),
+        (ActionAsset.ENPHASE_EXPORT_LIMIT, [("export limit", entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY))]),
     )
     for asset, configured_entities in configured:
         if not _asset_control_enabled(coordinator, asset):
@@ -466,7 +471,7 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
             for role, value in configured_entities
             for entity_id in _entity_id_values(value)
         ]
-        actuator_roles = {"climate", "charger", "start command", "stop command", "profile"}
+        actuator_roles = {"climate", "charger", "start command", "stop command", "profile", "export limit"}
         if not any(row["role"] in actuator_roles for row in entity_rows):
             continue
         if asset == ActionAsset.EV:
@@ -493,6 +498,7 @@ def _asset_control_enabled(
         ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
         ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
         ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+        ActionAsset.ENPHASE_EXPORT_LIMIT: CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     }
     return strict_bool(coordinator.options.get(option_by_asset[asset]), default=False)
 
@@ -548,6 +554,8 @@ def _asset_owned(store_data: dict[str, Any], asset: ActionAsset) -> bool:
         return bool(
             ownership.get("ev_smart_charging_state") or (isinstance(reservation, dict) and reservation.get("active"))
         )
+    if asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+        return bool(ownership.get("enphase_export_limit", {}).get("baseline"))
     return bool(ownership.get("enphase_profile") or ownership.get("enphase_profile_changed_at"))
 
 
@@ -609,6 +617,8 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "actions": actions,
         "ai_explanation": _ai_advice_attrs(coordinator),
     }
+    if coordinator.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+        result["export_limit"] = {} if plan is None else plan.device_plans.get("enphase_export_limit", {})
     if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
         result["climate_capability"] = _climate_capability_attrs(coordinator)
     if coordinator.entry_data.get(CONF_WEATHER):
@@ -998,6 +1008,7 @@ def _device_plan_for_asset(plan: EnergyPlan, asset: ActionAsset) -> dict[str, An
     key_by_asset = {
         ActionAsset.DAIKIN: "climate",
         ActionAsset.ENPHASE: "enphase",
+        ActionAsset.ENPHASE_EXPORT_LIMIT: "enphase_export_limit",
         ActionAsset.EV: "ev",
     }
     device_plan = plan.device_plans.get(key_by_asset[asset], {})

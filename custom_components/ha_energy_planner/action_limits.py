@@ -8,8 +8,10 @@ def counted_attempt(row: Any) -> bool:
     """Count applied/uncertain attempts, excluding no-ops and climate releases."""
     return (
         isinstance(row, dict)
-        and row.get("asset") in {"ev", "daikin", "enphase"}
-        and row.get("result") in {"applied", "failed", "restored"}
+        and row.get("asset") in {"ev", "daikin", "enphase", "enphase_export_limit"}
+        and ((row.get("result") == "pending" or str(row.get("reason", "")).startswith("export_limit_service_rejected"))
+             if row.get("asset") == "enphase_export_limit"
+             else row.get("result") in {"applied", "failed", "restored"})
         and row.get("reason") not in {"already_in_desired_state", "already_in_desired_hvac_state"}
         and (row.get("asset") != "daikin" or row.get("kind") in {None, "set_hvac"})
     )
@@ -35,7 +37,7 @@ def recent_attempts(rows: Any, now: datetime) -> list[dict[str, Any]]:
 
 def action_budget(rows: Any, options: dict[str, Any], now: datetime, asset: str) -> dict[str, Any]:
     """Describe allowance and its next expiry without granting command authority."""
-    key = {"ev": "ev", "daikin": "climate", "enphase": "enphase"}[asset]
+    key = {"ev": "ev", "daikin": "climate", "enphase": "enphase", "enphase_export_limit": "export_limit"}[asset]
     limit = int(options.get(f"max_daily_{key}_actions", 0) or 0)
     times = sorted(at for row in recent_attempts(rows, now) if row["asset"] == asset
                    and (at := attempt_time(row)) is not None)

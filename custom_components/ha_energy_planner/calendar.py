@@ -17,6 +17,7 @@ from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_EV_CHARGING,
     CONF_EV_CONTROL_ENABLED,
 )
@@ -27,6 +28,7 @@ from .entity import (
     recorder_safe_text,
 )
 from .ev import ev_charging_state
+from .export_limit_policy import EXPORT_ASSET, block_time
 from .models import ActionAsset, ActionKind, EnergyPlan, PlanAction
 from .plan_presentation import (
     action_load_forecast_attrs,
@@ -144,6 +146,8 @@ def _calendar_windows(
         return []
     events: list[tuple[CalendarEvent, datetime | None]] = []
     for action in plan.actions:
+        if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+            continue  # Its tariff windows remain visible without redundant commands.
         if not _calendar_control_enabled(coordinator, action.asset):
             continue
         candidates = (
@@ -193,6 +197,26 @@ def _calendar_windows(
                     ),
                 )
             events.append((event, confirmed_start))
+    if _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
+        export = plan.device_plans.get(EXPORT_ASSET, {})
+        for block in export.get("blocks", []):
+            desired = "Enabled — 0 W" if block["watts"] == 0 else "Disabled"
+            ownership = export.get("ownership", {})
+            description = (
+                f"Planned Export Limit setting: {desired}.\nExport price: {block['price'] * 100:g} c/kWh.\n"
+                f"Confirmed setting: {export.get('confirmed_setting', 'Unknown')}.\n"
+                f"Request/status: {export.get('current_state_label', 'Unknown')}.\n"
+                f"Last readback: {export.get('feedback', {}).get('last_readback')}.\n"
+                f"Ownership baseline: {ownership.get('baseline')}.\nPause: {ownership.get('pause')}.\n"
+                f"Restoration outstanding: {bool(ownership.get('restoring'))}."
+            )
+            events.append((CalendarEvent(
+                start=block_time(block["start"]), end=block_time(block["end"]),
+                summary=f"Enphase Export Limit: {desired}",
+                description=recorder_safe_text(description, max_bytes=4_096), location="Enphase Export Limit",
+                uid=recorder_safe_identifier(
+                    f"{coordinator.entry.entry_id}-export-limit-{block['start']}", max_bytes=255),
+            ), None))
     return sorted(events, key=lambda item: item[0].start)
 
 
@@ -240,6 +264,7 @@ def _calendar_control_enabled(
         ActionAsset.EV: CONF_EV_CONTROL_ENABLED,
         ActionAsset.DAIKIN: CONF_CLIMATE_CONTROL_ENABLED,
         ActionAsset.ENPHASE: CONF_ENPHASE_CONTROL_ENABLED,
+        ActionAsset.ENPHASE_EXPORT_LIMIT: CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     }
     return strict_bool(coordinator.options.get(option_by_asset[asset]), default=False)
 

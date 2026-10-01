@@ -1,3 +1,6 @@
+# Export Limit evidence: export_limit_policy.py, enphase_export_limit.py; tests/test_export_limit.py; tests/fixtures/live_schema/enphase_export_limit_*.json and export_tariff_half_hour.json; tests/fixtures/replay/export_limit_*.json; scripts/docker-ha-smoke.sh; README.md and docs/requirements-audit.md.
+# Export Limit recovery evidence: tests/test_export_limit.py and tests/test_lifecycle.py cover retained Unconfirmed requests, independent startup/toggle gates, persistence rollback, external slew changes, pending unload and off-selector restoration visibility.
+# Export Limit isolation and confidence evidence: tests/test_export_limit.py covers selective resume with absent/inactive/expired and legacy pauses, all supported confidence aliases/encodings, invalid confidence and dispatch-time threshold revalidation.
 # HA startup manual override evidence: coordinator.py; startup HVAC regressions in tests/test_coordinator.py; docs/requirements-audit.md.
 # Staged load recovery: ev_resilience.py, startup_recovery.py; recovery/input/coordinator/config-flow tests.
 # Recovery handoff retries and renewed-outage invalidation: tests/test_coordinator.py.
