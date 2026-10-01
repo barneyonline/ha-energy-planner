@@ -9,7 +9,9 @@ from typing import Any
 
 DRY_RUN_READY_CYCLES_REQUIRED = 3
 _MAX_REASONABLE_LEGACY_READY_CYCLES = 10_000
-_CONTROL_AREA_ASSETS = {"ev": "ev", "hvac": "daikin", "enphase": "enphase"}
+_CONTROL_AREA_ASSETS = {
+    "ev": "ev", "hvac": "daikin", "enphase": "enphase", "enphase_export_limit": "enphase_export_limit",
+}
 
 
 @dataclass(frozen=True, slots=True)

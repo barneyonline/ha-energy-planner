@@ -29,7 +29,7 @@ def _fixtures() -> list[dict[str, Any]]:
 
 def test_representative_live_schema_fixtures_parse_successfully() -> None:
     for fixture in _fixtures():
-        if fixture["kind"] == "ev_power_control":
+        if fixture["kind"] in {"ev_power_control", "enphase_export_limit", "export_tariff"}:
             _load_validator()._validate_fixture(fixture)
         elif fixture["kind"] == "forecast_state":
             _assert_forecast_fixture(fixture)

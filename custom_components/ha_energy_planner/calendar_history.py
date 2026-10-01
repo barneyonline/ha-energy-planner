@@ -174,7 +174,7 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
         outcome.get("kind") == "release_hvac" and outcome.get("result") == "restored"
     )
     if not confirmed or outcome.get("kind") not in {
-        "set_profile", "restore_ai", "ev_stop", "release_hvac",
+        "set_profile", "restore_ai", "ev_stop", "release_hvac", "set_export_limit", "disable_export_limit",
     }:
         return state
     start = _timestamp(outcome.get("attempted_at"))
@@ -207,6 +207,8 @@ def _outcome_record(outcome: dict[str, Any], start: datetime) -> dict[str, str] 
     if not isinstance(plan_id, str) or plan_id in {"", "manual"} or not isinstance(action_id, str) or not action_id:
         return None
     labels = {
+        ("enphase_export_limit", "set_export_limit"): ("Enphase Export Limit", "Enabled — 0 W"),
+        ("enphase_export_limit", "disable_export_limit"): ("Enphase Export Limit", "Disabled"),
         ("enphase", "set_profile"): ("Enphase", "Set Enphase profile"),
         ("enphase", "restore_ai"): ("Enphase", "Restore Enphase AI profile"),
         ("ev", "ev_stop"): ("EV", "Stop EV charging"),

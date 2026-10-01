@@ -94,7 +94,8 @@ async def async_get_config_entry_diagnostics(
         ),
         "climate": _redact(climate_diagnostics(store_data, plan, {**DEFAULT_OPTIONS, **entry.options})),
         "action_budgets": {asset: action_budget(budget_history(store_data), {**DEFAULT_OPTIONS, **entry.options},
-                                                dt_util.utcnow(), asset) for asset in ("ev", "daikin", "enphase")},
+                                                dt_util.utcnow(), asset)
+                           for asset in ("ev", "daikin", "enphase", "enphase_export_limit")},
         "automatic_control": {
             "requested": automatic_control_requested,
             "running": automatic_control_running,

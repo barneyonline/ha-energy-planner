@@ -795,6 +795,7 @@ def test_run_preflight_rejects_truthy_string_safety_options() -> None:
         "ev": False,
         "climate": False,
         "enphase": False,
+        "enphase_export_limit": False,
     }
 
 

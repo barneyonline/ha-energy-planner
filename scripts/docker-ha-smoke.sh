@@ -268,6 +268,61 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         assert hass.states.get("input_boolean.ev_power_smoke_charger").state == "off"
         Path(hass.config.config_dir, ".ev_power_smoke_complete").touch()
 
+    async def assert_export_limit_control(call: ServiceCall) -> None:
+        """Exercise public Enphase services, durable ownership and sign transitions in HA."""
+        from homeassistant.helpers import entity_registry as er
+        from custom_components.ha_energy_planner.enphase_export_limit import ExportLimitControl, evidence
+        from custom_components.ha_energy_planner.export_limit_policy import build_actions, EXPORT_ASSET
+        from custom_components.ha_energy_planner.models import DecisionContext, InputHealth, OccupancyState
+        from custom_components.ha_energy_planner.storage import PlannerStore
+        from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
+
+        entry = next(iter(hass.config_entries.async_entries("ha_energy_planner")))
+        registered = er.async_get(hass).async_get_or_create("sensor", "enphase_ev",
+            "smoke_enphase_export_limit", config_entry=entry, suggested_object_id="smoke_export_limit")
+        entity = registered.entity_id
+        mapping = {"enphase_export_limit_entity": entity, "amber_export_price_entity": "sensor.smoke_export_tariff"}
+        store = PlannerStore(hass, "smoke_export_limit")
+        calls = []
+        slew = 77
+
+        def readback(watts):
+            hass.states.async_set(entity, "disabled" if watts is None else "zero_export" if watts == 0 else "limited",
+                {"confirmed_watts": watts, "slew_rate": slew, "pending": False,
+                 "last_successful_readback": dt_util.utcnow().timestamp(), "request_status": "confirmed"})
+
+        async def command(request: ServiceCall):
+            assert request.data["entity_id"] == entity
+            calls.append(dict(request.data))
+            watts = request.data.get("limit_watts")
+            readback(watts)
+
+        hass.services.async_register("enphase_ev", "set_export_limit", command)
+        hass.services.async_register("enphase_ev", "disable_export_limit", command)
+        readback(3000)
+        options = {**DEFAULT_OPTIONS, "enphase_export_limit_control_enabled": True}
+        for price in (-10, 0, 20):
+            now = dt_util.utcnow()
+            start = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
+            hass.states.async_set("sensor.smoke_export_tariff", price, {"unit_of_measurement": "c/kWh", "issued_at": now.isoformat(),
+                "forecasts": [{"start_time": start.isoformat(), "end_time": (start+timedelta(minutes=30)).isoformat(),
+                               "per_kwh": price}]})
+            ctx = DecisionContext(now, "export-smoke", [], None, None, OccupancyState.UNKNOWN, InputHealth.UNSAFE,
+                                  export_limit=evidence(hass, mapping, options, now))
+            for action in build_actions(ctx):
+                await ExportLimitControl(hass, store, mapping).execute(action, now)
+            assert hass.states.get(entity).attributes["confirmed_watts"] == (0 if price < 0 else None)
+        assert len(calls) == 2  # Positive follows zero without a redundant write.
+        await store.async_flush()
+        recovered = PlannerStore(hass, "smoke_export_limit")
+        await recovered.async_load()
+        assert recovered.data["ownership"][EXPORT_ASSET]["baseline"] == {"watts": 3000, "slew_rate": slew}
+        await ExportLimitControl(hass, recovered, mapping).restore(dt_util.utcnow())
+        assert hass.states.get(entity).attributes["confirmed_watts"] == 3000
+        assert calls[-1]["slew_rate"] == slew
+        assert EXPORT_ASSET not in recovered.data["ownership"]
+        Path(hass.config.config_dir, ".export_limit_smoke_complete").touch()
+
     async def mark_smoke_complete(call: ServiceCall) -> None:
         """Write a completion marker before Home Assistant shuts down."""
         Path(hass.config.config_dir, ".ha_energy_planner_smoke_complete").touch()
@@ -327,6 +382,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "wait_for_hvac_away_off", wait_for_hvac_away_off)
     hass.services.async_register(DOMAIN, "mark_smoke_complete", mark_smoke_complete)
     hass.services.async_register(DOMAIN, "assert_ev_power_control", assert_ev_power_control)
+    hass.services.async_register(DOMAIN, "assert_export_limit_control", assert_export_limit_control)
     hass.services.async_register("persistent_notification", "create", capture_persistent_notification)
     return True
 PY
@@ -589,6 +645,7 @@ automation:
         continue_on_timeout: false
       # Explicit arming must not turn a persisted request into apparent command
       # authority before the current plan and reviewed evidence are healthy.
+      - action: fake_planner_test.assert_export_limit_control
       - action: fake_planner_test.assert_ev_power_control
       - action: fake_planner_test.assert_unsafe_arm_rejected
       - condition: state
@@ -910,7 +967,7 @@ automation:
           entity_id:
             - switch.energy_planner_climate_control
             - switch.energy_planner_ev_control
-            - switch.energy_planner_enphase_control
+            - switch.energy_planner_enphase_profile_control
       - action: input_text.set_value
         data:
           entity_id: input_text.planner_climate_control_off_seen
@@ -922,13 +979,13 @@ automation:
       - action: input_text.set_value
         data:
           entity_id: input_text.planner_enphase_control_off_seen
-          value: "{{ states('switch.energy_planner_enphase_control') }}"
+          value: "{{ states('switch.energy_planner_enphase_profile_control') }}"
       - action: switch.turn_on
         target:
           entity_id:
             - switch.energy_planner_climate_control
             - switch.energy_planner_ev_control
-            - switch.energy_planner_enphase_control
+            - switch.energy_planner_enphase_profile_control
       - action: ha_energy_planner.resume_control
         data:
           reason: docker_smoke_automatic_control
@@ -1282,7 +1339,7 @@ expected_entities = {
     "switch.energy_planner_automatic_control",
     "switch.energy_planner_climate_control",
     "switch.energy_planner_ev_control",
-    "switch.energy_planner_enphase_control",
+    "switch.energy_planner_enphase_profile_control",
     "button.energy_planner_explain",
     "button.energy_planner_restore_safe_state",
 }
@@ -1680,6 +1737,11 @@ PY
 
 if [[ ! -f "$TMP_DIR/.ev_power_smoke_complete" ]]; then
   echo "EV number-control smoke did not complete" >&2
+  exit 1
+fi
+
+if [[ ! -f "$TMP_DIR/.export_limit_smoke_complete" ]]; then
+  echo "Enphase Export Limit smoke did not complete" >&2
   exit 1
 fi
 

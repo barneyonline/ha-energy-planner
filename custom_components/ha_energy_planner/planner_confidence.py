@@ -159,6 +159,9 @@ def plan_asset_meets_confidence_threshold(
     options: Mapping[str, Any],
 ) -> bool:
     """Return whether a current plan proves confidence eligibility for an asset."""
+    if asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+        from .export_limit_policy import area_safe
+        return area_safe(plan)
     breakdown = getattr(plan, "confidence_breakdown", None)
     if not isinstance(breakdown, Mapping):
         return False
@@ -175,6 +178,7 @@ def confidence_eligible_control_areas(
         "ev": ActionAsset.EV,
         "hvac": ActionAsset.DAIKIN,
         "enphase": ActionAsset.ENPHASE,
+        "enphase_export_limit": ActionAsset.ENPHASE_EXPORT_LIMIT,
     }
     return [
         area

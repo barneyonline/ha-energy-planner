@@ -1,0 +1,45 @@
+{
+  "name": "export_tariff_negative_zero_positive",
+  "kind": "export_tariff",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "-10",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "unit_of_measurement": "c/kWh",
+      "forecasts": [
+        {
+          "start_time": "2026-10-01T00:00:00+00:00",
+          "end_time": "2026-10-01T00:30:00+00:00",
+          "per_kwh": -10.0
+        },
+        {
+          "start_time": "2026-10-01T00:30:00+00:00",
+          "end_time": "2026-10-01T01:00:00+00:00",
+          "per_kwh": 0
+        },
+        {
+          "start_time": "2026-10-01T01:00:00+00:00",
+          "end_time": "2026-10-01T01:30:00+00:00",
+          "per_kwh": 20
+        }
+      ]
+    }
+  },
+  "expected": [
+    {
+      "start": "2026-10-01T00:00:00+00:00",
+      "end": "2026-10-01T00:30:00+00:00",
+      "price": -0.1,
+      "watts": 0,
+      "confidence": 1.0
+    },
+    {
+      "start": "2026-10-01T00:30:00+00:00",
+      "end": "2026-10-01T01:00:00+00:00",
+      "price": 0,
+      "watts": null,
+      "confidence": 1.0
+    }
+  ]
+}

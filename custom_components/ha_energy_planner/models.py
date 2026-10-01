@@ -39,6 +39,7 @@ class ActionAsset(StrEnum):
     """Controllable asset classes."""
 
     ENPHASE = "enphase"
+    ENPHASE_EXPORT_LIMIT = "enphase_export_limit"
     DAIKIN = "daikin"
     EV = "ev"
 
@@ -46,6 +47,9 @@ class ActionAsset(StrEnum):
 class ActionKind(StrEnum):
     """Supported plan action kinds."""
 
+    SET_EXPORT_LIMIT = "set_export_limit"
+    DISABLE_EXPORT_LIMIT = "disable_export_limit"
+    RESTORE_EXPORT_LIMIT = "restore_export_limit"
     SET_PROFILE = "set_profile"
     RESTORE_AI = "restore_ai"
     SET_HVAC = "set_hvac"
@@ -58,6 +62,7 @@ class ActionKind(StrEnum):
 class OutcomeResult(StrEnum):
     """Execution result values."""
 
+    PENDING = "pending"
     APPLIED = "applied"
     SKIPPED = "skipped"
     REJECTED = "rejected"
@@ -157,6 +162,7 @@ class DecisionContext:
     climate_decision: dict[str, Any] = field(default_factory=dict)
     climate_legacy_decision: dict[str, Any] = field(default_factory=dict)
     ev_evidence: dict[str, Any] = field(default_factory=dict)
+    export_limit: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -227,6 +233,7 @@ class EnergyPlan:
     timeline_card: list[dict[str, Any]] = field(default_factory=list)
     confidence_breakdown: dict[str, Any] = field(default_factory=dict)
     estimated_cost_horizon_hours: float | None = None
+    control_area_health: dict[str, Any] = field(default_factory=dict)
 
     @property
     def next_action(self) -> PlanAction | None:
