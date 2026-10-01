@@ -7768,3 +7768,63 @@ def test_fallback_notifications_share_thirty_minute_warmup(
     )
     monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now + timedelta(minutes=elapsed_minutes))
     assert executor._in_notification_grace_period() is expected
+
+
+def test_missing_auto_start_stop_target_is_rejected_without_command_or_allowance():
+    from custom_components.ha_energy_planner.action_limits import action_budget
+    from custom_components.ha_energy_planner.models import to_jsonable
+
+    hass = FakeHass({"switch.ev_charger": "on", "sensor.ev_charging": "CHARGING"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={
+        CONF_EV_CHARGER: "switch.ev_charger",
+        CONF_EV_CHARGER_STOP: "button.iq_ev_charger_1234_stop_charging",
+        CONF_EV_CHARGING: "sensor.ev_charging",
+    })
+    for _ in range(12):
+        result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+        assert result.reason == "ev_control_unavailable"
+        assert not result.command_sent
+    assert hass.services.calls == []
+    assert "command_rate_limits" not in store.data
+    assert all(row.result == OutcomeResult.REJECTED for row in store.data["outcomes"])
+    rows = [to_jsonable(row) for row in store.data["outcomes"]]
+    assert action_budget(rows, {"max_daily_ev_actions": 10}, datetime.now(UTC), "ev")["remaining"] == 10
+
+
+def test_retired_enphase_button_repair_allows_switch_start_stop_and_owned_recovery(monkeypatch):
+    from custom_components.ha_energy_planner import enphase_ev_migration
+    from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
+
+    switch = "switch.renamed_charger"
+    old = {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: switch,
+           CONF_EV_CHARGER_START: "button.iq_ev_charger_1234_start_charging",
+           CONF_EV_CHARGER_STOP: "button.iq_ev_charger_1234_stop_charging"}
+    hass = FakeHass({switch: "off"})
+    registered = SimpleNamespace(platform="enphase_ev", disabled_by=None,
+                                 unique_id="enphase_ev_TEST1234_charging_switch")
+    monkeypatch.setattr(enphase_ev_migration.er, "async_get",
+                        lambda _: SimpleNamespace(async_get=lambda entity: registered if entity == switch else None))
+    assert CapabilityDiscovery(hass, old).inspect().ev.issues == [
+        "ev_start_control_unavailable", "ev_stop_control_unavailable",
+    ]
+    repaired = enphase_ev_migration.without_retired_enphase_buttons(hass, old)
+    assert CapabilityDiscovery(hass, repaired).inspect().ev.supported
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data=repaired)
+    assert asyncio.run(executor.async_manual_ev_charging(True, _context(datetime.now(UTC)))).applied
+    assert asyncio.run(executor.async_compensate_ev_auto_start(None)).applied
+    assert [(domain, service, data) for domain, service, data in hass.services.calls if domain == "switch"] == [
+        ("switch", "turn_on", {"entity_id": switch}), ("switch", "turn_off", {"entity_id": switch}),
+    ]
+    # Keep the old command identity and snapshot: restoration safely stops the
+    # verified charger rather than trying to replay the retired start button.
+    hass.states.values[switch] = "on"
+    store.data["ownership"] = {"ev_smart_charging_control_topology": repaired,
+                               "ev_smart_charging_command_entity_id": old[CONF_EV_CHARGER_START],
+                               "ev_smart_charging_state": {CONF_EV_CHARGER: "off", CONF_EV_CHARGER_START: None}}
+    result = asyncio.run(executor.async_restore_device_control("ev", "test_upgrade"))
+    assert result.result == OutcomeResult.RESTORED
+    assert hass.states.values[switch] == "off"
+    assert hass.services.calls[-2][0:2] == ("switch", "turn_off")
+    assert not store.data["ownership"]

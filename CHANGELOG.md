@@ -14,6 +14,8 @@
 
 ### 🐛 Bug fixes
 
+- Recover missing default Enphase Start/Stop Charging button mappings using the existing charger switch after verifying its registry identity, including saved recovery controls. Exclude EV checks that never dispatched a command from the rolling action allowance and remove older missing-control retry counts on reload.
+
 - Prevent Home Assistant startup climate feedback from enabling manual override; explicit user changes and override controls remain effective during startup.
 
 ### 🔧 Improvements
