@@ -18,12 +18,12 @@ from .models import ActionAsset, ActionKind, ActionOutcome, OutcomeResult, PlanA
 
 
 def target_identity(hass: HomeAssistant, entity: str) -> dict[str, str] | None:
-    """Require the upstream sensor's registry identity, never a default site."""
+    """Require the upstream Export Limit identity, never a default site."""
     registered = er.async_get(hass).async_get(entity)
     if (
         registered is None
         or registered.platform != "enphase_ev"
-        or registered.domain != "sensor"
+        or registered.domain not in {"select", "sensor"}
         or not registered.config_entry_id
         or not registered.unique_id.endswith("_export_limit")
     ):
@@ -36,6 +36,25 @@ def target_identity(hass: HomeAssistant, entity: str) -> dict[str, str] | None:
     }
 
 
+def feedback_entity_id(hass: HomeAssistant, entity: str | None) -> str | None:
+    """Resolve a Select's readback sensor by registry identity, never its name."""
+    if not entity:
+        return None
+    if entity.startswith("sensor."):
+        return entity
+    identity = target_identity(hass, entity)
+    if identity is None:
+        return None
+    registry = er.async_get(hass)
+    sensor = registry.async_get_entity_id("sensor", "enphase_ev", identity["unique_id"])
+    sensor_identity = target_identity(hass, sensor) if sensor else None
+    if sensor_identity is None or any(
+        sensor_identity[key] != identity[key] for key in ("config_entry_id", "unique_id", "device_id")
+    ):
+        return None
+    return sensor
+
+
 def feedback(hass: HomeAssistant, entity: str | None, now: datetime) -> tuple[dict[str, Any], str | None]:
     """Read confirmed/requested state separately; freshness comes from readback."""
     state = hass.states.get(entity) if entity else None
@@ -44,7 +63,8 @@ def feedback(hass: HomeAssistant, entity: str | None, now: datetime) -> tuple[di
     identity = target_identity(hass, str(entity))
     if identity is None:
         return {}, "export_limit_target_invalid"
-    observed, issue = confirmed_feedback(state, now)
+    sensor = feedback_entity_id(hass, entity)
+    observed, issue = confirmed_feedback(hass.states.get(sensor) if sensor else None, now)
     observed["identity"] = identity
     return observed, issue
 
