@@ -80,6 +80,11 @@ blocks when automating planner behavior.
 
 ### Manual
 
+Published releases include a component ZIP and SHA-256 checksum after version
+validation and a packaged runtime smoke test. Maintainers can rebuild missing
+assets for an existing tag using the Release Assets workflow; see the
+[release checklist](docs/release-checklist.md).
+
 1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
 2. Restart Home Assistant.
 3. Go to **Settings -> Devices & services -> Add integration -> Energy Planner**.

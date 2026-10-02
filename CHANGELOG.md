@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Build release ZIP/checksum assets without requiring an operating-evidence attachment; retain version checks and packaged runtime smoke validation, and allow rebuilding assets for an existing release tag.
 
 ### 🔧 Improvements
 

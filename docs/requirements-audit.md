@@ -956,9 +956,12 @@ use throughout; the Docker and pull-request gates enforce that result.
   smoke installs the unpacked artifact. Exact image/tool metadata is retained.
 - Current configuration, public contracts, upgrade/rollback and data-retention
   policy are in `docs/stable-release.md`; the old specification is archived.
-- `docs/release-checklist.md` and the observation validator require real operating
-  evidence before a stable 1.x release. That observation is pending; synthetic
-  validation does not claim household acceptance.
+- `docs/release-checklist.md` retains real operating evidence as a manual stable
+  release acceptance check. Synthetic validation does not claim household acceptance.
+  Release asset packaging independently checks version agreement and packaged
+  runtime behavior without requiring an observation attachment. The Release Assets
+  workflow supports manual repair using an existing tag and attaches assets to
+  that same release without moving the tag.
   `tests/scripts/test_release_tools.py` verifies that every scenario rejects
   missing, blank, and non-string evidence references.
 

@@ -55,12 +55,19 @@ numbers, collections, and blank text are rejected.
 4. Review all required GitHub checks for the exact release revision and retain
    artifacts. Metadata-only release changes still require the full release gate.
 5. Run `python3 scripts/validate-release-evidence.py --evidence PATH --commit SHA`
-   on the completed observation record. Stable releases from 1.0 onward require it.
-   Keep that record outside Git (it references the final commit). Upload it as
-   `release-evidence.json` to the draft release before publishing; publication
-   downloads and validates the asset against the tag commit.
+   on the completed observation record as a manual stable-release acceptance check.
+   Keep that record outside Git (it references the final commit). It may be attached
+   as `release-evidence.json` for traceability. Release packaging does not require
+   that asset or claim that household observation has passed.
 6. Publish the reviewed version/commit and verify metadata, ZIP and SHA-256.
    Publication repeats package validation; it does not replace prepublication review.
+
+The Release Assets workflow checks tag/manifest/project version agreement, builds
+the ZIP/checksum and runs the packaged runtime smoke test before uploading. To
+repair missing assets on an existing release, run this workflow manually from
+`main` with its `release_tag` input (for example `v1.3.0`). It checks out that exact
+tag and attaches assets to the same release. Rerunning an older failed run uses
+the old workflow definition; use a new manual run after the workflow fix is merged.
 
 ## Quality and maintenance
 
