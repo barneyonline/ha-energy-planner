@@ -163,3 +163,10 @@ Committed full sample recovery wakes startup recovery immediately. One fresh saf
 validation, safe-state restoration, final preflight and activation verification are still
 required. This never re-enables disabled device controls. Recovery stages and sample-age
 limits are exposed alongside the existing remaining-budget and uncertainty attributes.
+
+EV start and stop commands share one mapped charger switch (or `input_boolean`
+helper). Separate command buttons are retired. Upgrades retain an existing
+charger switch and remove old start/stop mappings; entries with only separate
+controls require a stateful control before EV operation can resume. Saved
+command identity remains recovery evidence, and a confirmed switch-off is
+required to release charging owned through an old command endpoint.

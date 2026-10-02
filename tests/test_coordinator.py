@@ -1193,7 +1193,7 @@ def test_options_update_surfaces_restore_error_after_safe_option_is_applied() ->
 def test_keep_on_option_rejects_nonpersistent_control_before_persisting() -> None:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.entry = FakeEntry(
-        {"ev_charger_start_entity": "button.ev_start"},
+        {"ev_charger_entity": "button.ev_start"},
         {CONF_EV_KEEP_CHARGER_ON: False},
     )
 
@@ -6597,7 +6597,7 @@ def test_asset_safe_degraded_plan_records_production_evidence() -> None:
 
 def test_production_evidence_resets_when_control_contract_changes() -> None:
     coordinator = _coordinator_for_runtime_services(
-        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        entry_data={"ev_charger_entity": "button.ev_start"},
         options={"ev_control_enabled": True},
     )
     dry_run = _plan("dry-run")
@@ -7776,7 +7776,7 @@ def test_production_evidence_rejects_malformed_counters_and_saturates() -> None:
 def test_runtime_ready_by_does_not_change_production_evidence_contract() -> None:
     coordinator = _coordinator_for_runtime_services(
         options={CONF_DEFAULT_READY_BY: "07:00", "ev_control_enabled": True},
-        entry_data={"ev_smart_charging_start_entity": "button.ev_start"},
+        entry_data={"ev_charger_entity": "button.ev_start"},
     )
     dry_run = _plan("dry-run")
     dry_run.mode = PlannerMode.DRY_RUN

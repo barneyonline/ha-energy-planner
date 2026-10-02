@@ -15,17 +15,13 @@ from homeassistant.util import dt as dt_util
 from .adapter_helpers import async_call_device_service, available_state, service_entity_available
 from .const import (
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
 )
-from .ev import ev_charging_state, ev_charging_state_proves_safe
+from .ev import ev_charging_state
 from .ev_policy import finite, power_capability
 from .ev_runtime import timestamp
 from .ev_telemetry import measured
@@ -47,11 +43,7 @@ class EVCommandResult:
 
 _CONTROL_KEYS = {
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
 }
 
 
@@ -270,7 +262,6 @@ class EVChargerAdapter:
             return await self._async_control_with_confirmation(
                 keep_on_entity,
                 enabled=True,
-                press_button=False,
                 confirmation_entity=keep_on_entity,
                 confirmation_reason="ev_charger_enabled_for_preconditioning",
             )
@@ -282,75 +273,40 @@ class EVChargerAdapter:
     async def _async_stop(self) -> EVCommandResult:
         initial_pre_state = self._snapshot()
         if await self._async_existing_state_proves_safe():
-            return await self._async_finalize_stop(
-                EVCommandResult(
-                    True,
-                    "already_in_desired_state",
-                    initial_pre_state,
-                    self._snapshot(),
-                    command_sent=False,
-                    safe_state_confirmed=True,
-                ),
-                self._keep_on_entity() or "",
+            return EVCommandResult(
+                True,
+                "already_in_desired_state",
+                initial_pre_state,
+                self._snapshot(),
+                command_sent=False,
+                safe_state_confirmed=True,
             )
-        stop_entity = self._stop_entity(separate_only=True)
-        if stop_entity:
-            result = await self._async_control_with_confirmation(
-                stop_entity,
-                enabled=False,
-                press_button=True,
-                force=True,
-                # A separate stop entity is a command endpoint, not an
-                # authoritative persistent charger-state control. Its neutral
-                # state cannot prove that charging will remain disabled.
-                safe_control_entity=None,
-            )
-            return await self._async_finalize_stop(result, stop_entity)
         stop_entity = self._stop_entity()
         if not stop_entity:
             return EVCommandResult(False, "ev_stop_control_not_configured", self._snapshot(), self._snapshot())
         result = await self._async_control_with_confirmation(
             stop_entity,
             enabled=False,
-            press_button=False,
-            safe_control_entity=stop_entity,
         )
-        return await self._async_finalize_stop(result, stop_entity)
+        return result
 
     async def _async_control_with_confirmation(
         self,
         entity_id: str,
         *,
         enabled: bool,
-        press_button: bool = True,
         confirmation_entity: str | None = None,
         confirmation_reason: str | None = None,
         force: bool = False,
-        safe_control_entity: str | None = None,
     ) -> EVCommandResult:
         """Issue a command and confirm the mapped charging feedback state."""
         charging_entity = confirmation_entity or self.entry_data.get(CONF_EV_CHARGING)
         initial_pre_state = self._snapshot()
-        command_domain = entity_id.split(".", 1)[0]
-        if press_button and command_domain in {"button", "input_button"} and charging_entity:
-            charging_state = self._state(charging_entity)
-            already_confirmed = charging_state is not None and _charging_state_matches(charging_state, enabled) is True
-            feedback_proves_safe = not enabled and self._charging_feedback_proves_safe(charging_entity)
-            if already_confirmed and (enabled or feedback_proves_safe):
-                return EVCommandResult(
-                    True,
-                    "already_in_desired_state",
-                    initial_pre_state,
-                    self._snapshot(),
-                    command_sent=False,
-                    safe_state_confirmed=(feedback_proves_safe if not enabled else None),
-                )
         command_sent = False
         for _attempt in range(self.confirmation_retries + 1):
             result = await self._async_call_control(
                 entity_id,
                 turn_on=enabled,
-                press_button=press_button,
                 force=force,
             )
             command_sent = (
@@ -368,10 +324,7 @@ class EVChargerAdapter:
                     if confirmation == "confirmed":
                         safe_state_confirmed = None
                         if not enabled:
-                            if safe_control_entity:
-                                safe_state_confirmed = await self._async_control_proves_safe(safe_control_entity)
-                            else:
-                                safe_state_confirmed = self._charging_feedback_proves_safe(charging_entity)
+                            safe_state_confirmed = await self._async_control_proves_safe(entity_id)
                         return EVCommandResult(
                             True,
                             confirmation_reason
@@ -395,7 +348,7 @@ class EVChargerAdapter:
             if not charging_entity:
                 safe_state_confirmed = None
                 if not enabled:
-                    safe_state_confirmed = await self._async_control_proves_safe(safe_control_entity)
+                    safe_state_confirmed = await self._async_control_proves_safe(entity_id)
                 return EVCommandResult(
                     result.applied,
                     result.reason,
@@ -412,10 +365,7 @@ class EVChargerAdapter:
             if confirmation == "confirmed":
                 safe_state_confirmed = None
                 if not enabled:
-                    if safe_control_entity:
-                        safe_state_confirmed = await self._async_control_proves_safe(safe_control_entity)
-                    else:
-                        safe_state_confirmed = self._charging_feedback_proves_safe(charging_entity)
+                    safe_state_confirmed = await self._async_control_proves_safe(entity_id)
                 return EVCommandResult(
                     True,
                     (
@@ -484,13 +434,6 @@ class EVChargerAdapter:
         charging_entity = self.entry_data.get(CONF_EV_CHARGING)
         charging_state = self._state(charging_entity) if charging_entity else None
         return charging_state is not None and ev_charging_state(charging_state.state) is False
-
-    def _charging_feedback_proves_safe(self, entity_id: str) -> bool:
-        """Return whether charging feedback proves more than disconnection."""
-        state = self._state(entity_id)
-        if state is None:
-            return False
-        return ev_charging_state_proves_safe(state.state)
 
     async def _async_confirm_state(self, entity_id: str, enabled: bool, *, control_state: bool = False) -> str:
         """Wait for charging feedback or a stateful control to match the request."""
@@ -566,7 +509,6 @@ class EVChargerAdapter:
             result = await self._async_call_control(
                 entity_id,
                 turn_on=state == "on",
-                press_button=False,
                 force=True,
             )
             confirmed = result.applied and (
@@ -581,40 +523,13 @@ class EVChargerAdapter:
         return attempted, attempted and restored
 
     async def _async_issue_safe_stop(self) -> tuple[bool, bool]:
-        """Issue one unconfirmed stop command when a momentary start cannot be rolled back."""
-        stop_entity = self._stop_entity(separate_only=True)
-        separate_stop = bool(stop_entity)
-        press_button = separate_stop
-        if not stop_entity:
-            stop_entity = self._stop_entity()
-            press_button = False
+        """Confirm the charger switch is off after an uncertain command."""
+        stop_entity = self._stop_entity()
         if not stop_entity:
             return False, False
-        result = await self._async_call_control(
-            stop_entity,
-            turn_on=False,
-            press_button=press_button,
-            force=separate_stop or not press_button,
-        )
-        if not result.applied:
-            return True, False
-        confirmation_entity = self.entry_data.get(CONF_EV_CHARGING) if press_button else stop_entity
-        if not confirmation_entity:
-            stopped = await self._async_control_proves_safe(None if press_button else stop_entity)
-        else:
-            confirmed = (
-                await self._async_confirm_state(
-                    confirmation_entity,
-                    False,
-                    control_state=not press_button,
-                )
-                == "confirmed"
-            )
-            stopped = confirmed and (not press_button or self._charging_feedback_proves_safe(confirmation_entity))
-        if not stopped:
-            return True, False
-        reset_attempted, reset_succeeded = await self._async_reset_start_command(stopped_entity=stop_entity)
-        return True, not reset_attempted or reset_succeeded
+        result = await self._async_call_control(stop_entity, turn_on=False, force=True)
+        return (result.command_sent or result.applied,
+                result.applied and await self._async_control_proves_safe(stop_entity))
 
     async def _async_write_number(self, entity_id: str, value: float) -> bool:
         if not self.command_guard():
@@ -708,89 +623,22 @@ class EVChargerAdapter:
         return await self._async_start(action)
 
     def _start_entity(self) -> str | None:
-        return (
-            self.entry_data.get(CONF_EV_CHARGER_START)
-            or self.entry_data.get(CONF_EV_CHARGER)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING)
-        )
+        return self._keep_on_entity()
 
     def _start_command_requires_safe_stop(self, entity_id: str) -> bool:
-        """Return whether a start control cannot prove a restored safe state."""
-        if entity_id.split(".", 1)[0] in {"button", "input_button"}:
-            return True
-        return entity_id in {
-            self.entry_data.get(CONF_EV_CHARGER_START),
-            self.entry_data.get(CONF_EV_SMART_CHARGING_START),
-        }
-
-    async def _async_finalize_stop(
-        self,
-        result: EVCommandResult,
-        stop_entity: str,
-    ) -> EVCommandResult:
-        """Neutralize a separate start command after charging is stopped."""
-        if not result.applied:
-            return result
-        reset_attempted, reset_succeeded = await self._async_reset_start_command(stopped_entity=stop_entity)
-        if not reset_attempted:
-            return result
-        return EVCommandResult(
-            reset_succeeded,
-            ("ev_charging_stopped_and_start_reset" if reset_succeeded else "ev_start_command_reset_failed"),
-            result.pre_state,
-            self._snapshot(),
-            command_sent=True,
-            rollback_succeeded=(result.rollback_succeeded if reset_succeeded else False),
-            safe_state_confirmed=(result.safe_state_confirmed is True and reset_succeeded),
-        )
-
-    async def _async_reset_start_command(
-        self,
-        *,
-        stopped_entity: str,
-    ) -> tuple[bool, bool]:
-        """Reset a switch-based separate start command to its neutral state."""
-        start_entity = self.entry_data.get(CONF_EV_CHARGER_START) or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
-        if (
-            not start_entity
-            or start_entity == stopped_entity
-            or start_entity.split(".", 1)[0] not in {"switch", "input_boolean"}
-        ):
-            return False, True
-        start_state = self._state(start_entity)
-        if start_state is not None and not _truthy_state(start_state):
-            return False, True
-        result = await self._async_call_control(
-            start_entity,
-            turn_on=False,
-            press_button=False,
-            force=True,
-        )
-        if not result.applied:
-            return True, False
-        confirmed = await self._async_confirm_state(
-            start_entity,
-            False,
-            control_state=True,
-        )
-        return True, confirmed == "confirmed"
+        """Old command endpoints are recovery evidence, never replay targets."""
+        return entity_id != self._keep_on_entity() or entity_id.split(".", 1)[0] not in {"switch", "input_boolean"}
 
     def _keep_on_entity(self) -> str | None:
-        """Return the persistent charger-enable control used for preconditioning."""
+        """Return the single stateful charger control."""
         return self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(CONF_EV_SMART_CHARGING)
 
-    def _stop_entity(self, *, separate_only: bool = False) -> str | None:
-        separate = self.entry_data.get(CONF_EV_CHARGER_STOP) or self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
-        if separate or separate_only:
-            return separate
-        return self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(CONF_EV_SMART_CHARGING)
+    def _stop_entity(self) -> str | None:
+        return self._keep_on_entity()
 
     def _configured_entity(self, key: str) -> str | None:
         aliases = {
             CONF_EV_SMART_CHARGING: CONF_EV_CHARGER,
-            CONF_EV_SMART_CHARGING_START: CONF_EV_CHARGER_START,
-            CONF_EV_SMART_CHARGING_STOP: CONF_EV_CHARGER_STOP,
         }
         return self.entry_data.get(key) or self.entry_data.get(aliases.get(key, ""))
 
@@ -799,7 +647,6 @@ class EVChargerAdapter:
         entity_id: str,
         *,
         turn_on: bool,
-        press_button: bool = True,
         force: bool = False,
     ) -> EVCommandResult:
         if not self.command_guard():
@@ -807,19 +654,6 @@ class EVChargerAdapter:
         if not service_entity_available(self.hass, entity_id):
             return EVCommandResult(False, "ev_control_unavailable", self._snapshot(), self._snapshot())
         domain = entity_id.split(".", 1)[0]
-        if domain in {"button", "input_button"} and (turn_on or press_button):
-            try:
-                await async_call_device_service(self.hass, domain, "press", {ATTR_ENTITY_ID: entity_id}, blocking=True)
-            except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
-                return EVCommandResult(
-                    False,
-                    "ev_control_service_failed",
-                    self._snapshot(),
-                    self._snapshot(),
-                    command_sent=True,
-                )
-            return EVCommandResult(True, f"{domain}_press_called", self._snapshot(), self._snapshot())
-
         state = self._state(entity_id)
         if state is None:
             return EVCommandResult(False, "ev_control_unavailable", self._snapshot(), self._snapshot())
@@ -939,11 +773,7 @@ class EVChargerAdapter:
                 CONF_EV_CHARGING,
                 CONF_EV_CONNECTED,
                 CONF_EV_CHARGER,
-                CONF_EV_CHARGER_START,
-                CONF_EV_CHARGER_STOP,
                 CONF_EV_SMART_CHARGING,
-                CONF_EV_SMART_CHARGING_START,
-                CONF_EV_SMART_CHARGING_STOP,
                 CONF_EV_SMART_CHARGING_TARGET_SOC,
                 CONF_EV_SMART_CHARGING_READY_BY,
             }

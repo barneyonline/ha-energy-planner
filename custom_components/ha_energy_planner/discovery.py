@@ -24,12 +24,8 @@ from .const import (
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     DEFAULT_OPTIONS,
@@ -107,34 +103,14 @@ class CapabilityDiscovery:
     def _inspect_ev(self) -> CapabilityEvidence:
         issues: list[str] = []
         details: dict[str, Any] = {}
-        control = (
-            self.entry_data.get(CONF_EV_CHARGER_START)
-            or self.entry_data.get(CONF_EV_CHARGER)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING_START)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING)
-        )
-        separate_stop = (
-            self.entry_data.get(CONF_EV_CHARGER_STOP)
-            or self.entry_data.get(CONF_EV_SMART_CHARGING_STOP)
-        )
-        shared_stop = self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(
-            CONF_EV_SMART_CHARGING
-        )
-        persistent_control = shared_stop
-        stop = separate_stop or shared_stop
+        control = self.entry_data.get(CONF_EV_CHARGER) or self.entry_data.get(CONF_EV_SMART_CHARGING)
+        persistent_control = stop = control
         if not control:
-            issues.append("ev_start_control_not_configured")
+            issues.extend(["ev_start_control_not_configured", "ev_stop_control_not_configured"])
+        elif str(control).split(".", 1)[0] not in {"switch", "input_boolean"}:
+            issues.extend(["ev_start_control_unsupported", "ev_stop_control_unsupported"])
         elif _state_missing(self.hass, control):
-            issues.append("ev_start_control_unavailable")
-        if not stop:
-            issues.append("ev_stop_control_not_configured")
-        elif (
-            not separate_stop
-            and str(stop).split(".", 1)[0] in {"button", "input_button"}
-        ):
-            issues.append("ev_stop_control_unsupported")
-        elif _state_missing(self.hass, stop):
-            issues.append("ev_stop_control_unavailable")
+            issues.extend(["ev_start_control_unavailable", "ev_stop_control_unavailable"])
         details["start_control"] = control
         details["stop_control"] = stop
         details["persistent_control"] = {

@@ -643,8 +643,8 @@ rules:
 # deferred Resume outcomes, refresh failure reporting and real HA debounce cooldown, off-state/legacy calendar handling and expired caps
 # are covered in test_executor/coordinator/calendar/diagnostics.py.
 
-# Retired Enphase EV default button migration: enphase_ev_migration.py verifies
-# charger registry identity and absence before using the existing mapped switch.
-# test_enphase_ev_migration.py and test_lifecycle.py cover config and ownership;
-# test_executor.py, test_action_limits.py and test_storage.py cover local
-# rejection accounting and cleanup of legacy missing-target retries.
+# One stateful EV charger control: entry_data.py removes separate start/stop
+# mappings, and __init__.py cleans saved recovery topology while preserving
+# command identity and snapshots. test_config_flow.py and test_lifecycle.py
+# cover configuration and upgrade behavior; test_ev_adapter.py, test_executor.py,
+# test_action_limits.py and test_storage.py cover safe recovery and accounting.

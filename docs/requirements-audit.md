@@ -199,16 +199,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   confirmation failures. Subsequent starts honour that pause and the command
   cooldown, while manual and scheduled stops bypass failure backoff, command
   cooldowns, and daily caps for recovery. Safe-state ownership records the
-  actual commanded entity and its complete EV actuator topology so momentary
-  takeovers cannot be mistaken for a restorable unrelated persistent control.
+  actual commanded entity and its complete EV actuator topology so legacy
+  command takeovers cannot restore an unrelated charger control.
   Restore, automated safety-stop, and manual-stop paths use that persisted
   topology after EV mapping changes rather than clearing ownership through a
   replacement actuator. Command
   acceptance is tracked separately from proven-safe stop confirmation. A
-  separate stop command helper cannot release safety ownership by itself;
-  meaningful inactive charging feedback together with a confirmed-off
-  persistent charger control, a stateful control, or rollback must prove the
-  safe state. Failed automatic safety stops back off for ten minutes and stop
+  confirmed-off charger switch or confirmed rollback must prove the safe state;
+  retired command helpers are never replayed during recovery. Failed automatic safety stops back off for ten minutes and stop
   after three attempts per rolling day. Dedicated command metadata preserves
   the backoff and retry block independently of shared pause updates and bounded
   audit retention. A compensating stop
@@ -252,7 +250,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   within configured SOC policy bounds, preventing an external vehicle target
   from bypassing the hard planner maximum.
 - EV safety stops use direction-specific validation: unrelated unhealthy plan
-  inputs and unavailable start controls cannot block an available stop path.
+  inputs cannot block an available charger switch from stopping.
   When unhealthy inputs, an observed disconnect, disabled EV control, or a hard
   grid-import violation leave EV power planner-owned or reserved, execution
   prioritizes one audited safety-stop attempt for that plan, retains its
@@ -620,9 +618,9 @@ use throughout; the Docker and pull-request gates enforce that result.
   planning uses the conservative bootstrap rate while retraining.
   Configured charging feedback also accepts connector-status sensors;
   `SUSPENDED_EV` and `SUSPENDED_EVSE` are normalized as connected but not
-  actively charging, so momentary stop controls are not called after a vehicle
-  has already suspended power delivery. Disconnection remains insufficient
-  evidence for a safe momentary stop.
+  actively charging. Stopping still requires the charger switch to be confirmed
+  off; suspended or disconnected feedback alone does not prove safe ownership
+  release.
   Persisted Recorder calibration timestamps tolerate malformed or timezone-naive
   older values without raising through planner refresh. Docker smoke coverage
   validates the compact calibration lifecycle, and real-history replay fixtures
@@ -1116,3 +1114,20 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
   services remain supported.
 - Evidence: `tests/test_recovery_presentation.py`, `tests/test_sensor.py`,
   `tests/test_switch_button.py`, `tests/test_ev_control_entities.py`; full Docker gate.
+
+## Single EV charger control
+
+- Config flow exposes one switch or `input_boolean` charger control. Discovery,
+  preflight, execution and actuator presentation use that same control for both
+  directions; no EV button presses or separate command endpoints remain.
+- `entry_data.py` removes both current and legacy separate start/stop keys from
+  entry and subentry data. Setup persists the cleanup and removes retired fields
+  from saved recovery topology while retaining snapshots and command identity.
+  An old command identity triggers a safe stop through the retained charger
+  switch; missing or unconfirmed controls retain ownership for retry. Entries
+  without a retained switch require reconfiguration and cannot start charging.
+- Rejections without dispatch do not consume the rolling EV action allowance;
+  legacy missing-control failures are excluded when restoring the attempt ledger.
+- Evidence: `test_config_flow.py`, `test_lifecycle.py`, `test_ev_adapter.py`,
+  `test_executor.py`, `test_action_limits.py`, `test_storage.py`, and the real
+  Home Assistant single-control smoke fixture in `scripts/docker-ha-smoke.sh`.

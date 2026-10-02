@@ -48,8 +48,8 @@ CONF_EV_SOC = "ev_soc_entity"
 CONF_EV_CHARGING = "ev_charging_entity"
 CONF_EV_CONNECTED = "ev_connected_entity"
 CONF_EV_KEEP_CHARGER_ON = "ev_keep_charger_on"
-# Native charger controls. The EV Smart Charging keys below remain readable
-# for upgrades, but are no longer exposed by the config flow.
+# One stateful charger control; the legacy single-control alias remains readable.
+# Separate start/stop constants identify retired mappings for upgrade cleanup.
 CONF_EV_CHARGER = "ev_charger_entity"
 CONF_EV_CHARGER_START = "ev_charger_start_entity"
 CONF_EV_CHARGER_STOP = "ev_charger_stop_entity"

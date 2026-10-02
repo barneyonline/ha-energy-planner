@@ -26,20 +26,16 @@ from .const import (
     CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_HOUSEHOLD_LOAD,
     CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
 )
 from .discovery import CapabilityDiscovery
-from .entry_data import combined_entry_data
+from .entry_data import combined_entry_data, remove_retired_config_keys
 from .ev_policy import EV_DEFAULTS
 from .export_limit_policy import EXPORT_ASSET, area_safe
 from .load_forecast import FORECAST_CONTRACT_VERSION
@@ -590,7 +586,7 @@ def _production_report(
 
 def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[str, Any]) -> str:
     """Bind dry-run evidence to the currently configured control contract."""
-    entry_data = dict(entry_data.get("_ev_configuration", entry_data))
+    entry_data = remove_retired_config_keys(entry_data.get("_ev_configuration", entry_data))
     options = options.get("_ev_shared_options", options)
     if "ev_vehicles" in entry_data:
         entry_data["ev_vehicles"] = [
@@ -599,8 +595,6 @@ def production_evidence_fingerprint(entry_data: dict[str, Any], options: dict[st
         ]
     aliases = {
         CONF_EV_CHARGER: CONF_EV_SMART_CHARGING,
-        CONF_EV_CHARGER_START: CONF_EV_SMART_CHARGING_START,
-        CONF_EV_CHARGER_STOP: CONF_EV_SMART_CHARGING_STOP,
     }
     for current_key, legacy_key in aliases.items():
         if not entry_data.get(current_key) and entry_data.get(legacy_key):
@@ -643,11 +637,7 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
             bool(str(entry_data.get(key, "") or "").strip())
             for key in (
                 CONF_EV_CHARGER,
-                CONF_EV_CHARGER_START,
-                CONF_EV_CHARGER_STOP,
                 CONF_EV_SMART_CHARGING,
-                CONF_EV_SMART_CHARGING_START,
-                CONF_EV_SMART_CHARGING_STOP,
             )
         ),
         "hvac": bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
