@@ -34,8 +34,6 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
@@ -432,7 +430,7 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
     executor = Executor(
         store,
         hass=hass,
-        entry_data={"ev_smart_charging_start_entity": "switch.ev_start"},
+        entry_data={"ev_charger_entity": "switch.ev_start"},
         options={
             **DEFAULT_OPTIONS,
             "planner_enabled": True,
@@ -443,7 +441,7 @@ def test_executor_rejects_ev_action_when_discovery_fails() -> None:
     _arm_store(store, executor)
     asyncio.run(executor.async_evaluate(plan, _context(now)))
     assert store.data["outcomes"][0].result == "rejected"
-    assert store.data["outcomes"][0].reason == "ev_start_control_unavailable,ev_stop_control_not_configured"
+    assert store.data["outcomes"][0].reason == "ev_start_control_unavailable,ev_stop_control_unavailable"
     assert hass.services.calls == []
 
 
@@ -490,7 +488,6 @@ def test_executor_keep_on_ignores_unavailable_separate_start_control() -> None:
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
             CONF_EV_CHARGER: "switch.ev_control",
-            CONF_EV_CHARGER_START: "button.ev_start",
         },
         options={
             **DEFAULT_OPTIONS,
@@ -544,29 +541,26 @@ def test_executor_keep_on_rejects_invalid_persistent_controls() -> None:
         (
             {
                 CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-                CONF_EV_CHARGER_START: "input_boolean.ev_start",
-                CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+                "ev_charger_start_entity": "input_boolean.ev_start",
             },
             {
                 "binary_sensor.ev_connected": "on",
                 "input_boolean.ev_start": "off",
                 "input_boolean.ev_stop": "on",
             },
-            "ev_keep_on_requires_stateful_control",
+            "ev_stop_control_not_configured,ev_keep_on_requires_stateful_control",
         ),
         (
             {
                 CONF_EV_CONNECTED: "binary_sensor.ev_connected",
                 CONF_EV_CHARGER: "switch.missing_control",
-                CONF_EV_CHARGER_START: "input_boolean.ev_start",
-                CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
             },
             {
                 "binary_sensor.ev_connected": "on",
                 "input_boolean.ev_start": "off",
                 "input_boolean.ev_stop": "on",
             },
-            "ev_keep_on_control_unavailable",
+            "ev_stop_control_unavailable,ev_keep_on_control_unavailable",
         ),
     ]
 
@@ -843,7 +837,7 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
     executor = Executor(
         store,
         hass=hass,
-        entry_data={"ev_smart_charging_start_entity": "switch.ev_start"},
+        entry_data={"ev_charger_entity": "switch.ev_start"},
         options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
     )
 
@@ -1339,8 +1333,7 @@ def test_executor_preserves_first_ev_pre_takeover_state() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
         options={
             **DEFAULT_OPTIONS,
@@ -1354,7 +1347,7 @@ def test_executor_preserves_first_ev_pre_takeover_state() -> None:
     asyncio.run(executor.async_evaluate(plan, _context(now)))
     asyncio.run(executor.async_evaluate(plan, _context(now)))
 
-    assert store.data["ownership"]["ev_smart_charging_state"][CONF_EV_SMART_CHARGING_START] == "off"
+    assert store.data["ownership"]["ev_smart_charging_state"][CONF_EV_CHARGER] == "off"
     assert hass.states.values["input_boolean.ev_start"] == "on"
 
 
@@ -1401,8 +1394,7 @@ def test_executor_rate_limits_repeated_device_command() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
         options={
             **DEFAULT_OPTIONS,
@@ -1452,7 +1444,7 @@ def test_executor_detects_recent_ev_external_conflict_and_pauses_control() -> No
     executor = Executor(
         store,
         hass=FakeHass({"input_boolean.ev_start": "off"}),
-        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+        entry_data={CONF_EV_CHARGER: "input_boolean.ev_start"},
     )
 
     assert executor._observed_conflict_reason(action, now) == "external_ev_charging_conflict"
@@ -1510,7 +1502,7 @@ def test_executor_ev_conflict_uses_actual_command_and_feedback_entities() -> Non
     )
     keep_on_entry_data = {
         CONF_EV_CHARGER: "switch.ev_control",
-        CONF_EV_CHARGER_START: "button.ev_start",
+
         CONF_EV_CHARGING: "binary_sensor.ev_charging",
     }
     keep_on_store = FakeStore()
@@ -1584,7 +1576,7 @@ def test_executor_ev_conflict_uses_actual_command_and_feedback_entities() -> Non
         button_store,
         hass=button_hass,
         entry_data={
-            CONF_EV_CHARGER_START: "button.ev_start",
+            CONF_EV_CHARGER: "button.ev_start",
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
         },
     )
@@ -1732,7 +1724,7 @@ def test_executor_conflict_helpers_cover_defensive_branches() -> None:
     no_state = Executor(
         FakeStore(),
         hass=FakeHass({}),
-        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+        entry_data={CONF_EV_CHARGER: "input_boolean.ev_start"},
     )
     no_state.store.data["execution_audit"] = [
         {"attempted_at": now.isoformat(), "asset": "ev", "result": "applied", "post_state": {}}
@@ -1741,7 +1733,7 @@ def test_executor_conflict_helpers_cover_defensive_branches() -> None:
     no_conflict = Executor(
         FakeStore(),
         hass=FakeHass({"input_boolean.ev_start": "on"}),
-        entry_data={CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start"},
+        entry_data={CONF_EV_CHARGER: "input_boolean.ev_start"},
     )
     no_conflict.store.data["execution_audit"] = [
         {"attempted_at": now.isoformat(), "asset": "ev", "result": "applied", "post_state": {}}
@@ -1795,8 +1787,7 @@ def test_executor_rejects_and_pauses_on_observed_conflict() -> None:
         store,
         hass=hass,
         entry_data={
-            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
     )
 
@@ -1818,8 +1809,8 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
             return SimpleNamespace(
                 applied=False,
                 reason="ev_failed",
-                pre_state={"ev_smart_charging_start_entity": "off"},
-                post_state={"ev_smart_charging_start_entity": "on"},
+                pre_state={"ev_charger_entity": "off"},
+                post_state={"ev_charger_entity": "on"},
                 command_sent=True,
                 rollback_succeeded=False,
             )
@@ -1889,8 +1880,7 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 1.0,
             ),
             {
-                "ev_smart_charging_start_entity": "input_boolean.ev_start",
-                "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+                "ev_charger_entity": "input_boolean.ev_start",
             },
             {"input_boolean.ev_start": "off", "input_boolean.ev_stop": "on"},
             "ev_failed",
@@ -1972,7 +1962,7 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
         assert store.data["control_pause"]["reason"] == reason
         assert store.data["outcomes"][0].result == "failed"
         if action.asset == ActionAsset.EV:
-            assert store.data["ownership"]["ev_smart_charging_state"] == {"ev_smart_charging_start_entity": "off"}
+            assert store.data["ownership"]["ev_smart_charging_state"] == {"ev_charger_entity": "off"}
 
 
 def test_executor_rejects_active_command_when_production_gate_not_armed() -> None:
@@ -2158,7 +2148,7 @@ def test_executor_blocks_armed_control_when_entity_or_policy_contract_changes() 
         expected_cost_delta=None,
         confidence=1.0,
     )
-    entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_start"}
+    entry_data = {CONF_EV_CHARGER: "button.ev_start"}
     options = {**DEFAULT_OPTIONS, CONF_EV_CONTROL_ENABLED: True}
     store = FakeStore()
     store.data["production"] = {
@@ -2171,7 +2161,7 @@ def test_executor_blocks_armed_control_when_entity_or_policy_contract_changes() 
     assert executor._control_rejection_reason(action, now) is None
     executor.options = {**options, CONF_DEFAULT_READY_BY: "23:45"}
     assert executor._control_rejection_reason(action, now) is None
-    executor.entry_data = {CONF_EV_SMART_CHARGING_START: "button.ev_replaced"}
+    executor.entry_data = {CONF_EV_CHARGER: "button.ev_replaced"}
     assert executor._control_rejection_reason(action, now) == "production_evidence_contract_changed"
     executor.entry_data = entry_data
     executor.options = {**options, "command_rate_limit_seconds": 999}
@@ -2221,8 +2211,7 @@ def test_executor_ignores_malformed_command_rate_limit_timestamp() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
         options={
             **DEFAULT_OPTIONS,
@@ -2277,7 +2266,7 @@ def test_executor_restore_ai_releases_enphase_ownership() -> None:
     store.data["ownership"] = {
         "enphase_profile": "AI Optimisation",
         "enphase_profile_changed_at": (now - timedelta(hours=1)).isoformat(),
-        "ev_smart_charging_state": {CONF_EV_SMART_CHARGING_START: "off"},
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
     }
     hass = FakeHass({"input_select.enphase_profile": "Savings"})
     executor = Executor(
@@ -2303,7 +2292,7 @@ def test_executor_restore_ai_releases_enphase_ownership() -> None:
     assert "enphase_profile" not in store.data["ownership"]
     assert "enphase_profile_changed_at" not in store.data["ownership"]
     assert store.data["ownership"]["ev_smart_charging_state"] == {
-        CONF_EV_SMART_CHARGING_START: "off",
+        CONF_EV_CHARGER: "off",
     }
     assert store.data["outcomes"][0].result == "applied"
 
@@ -4423,7 +4412,7 @@ def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None
         "ev_smart_charging_command_entity_id": "button.old_start",
         "ev_smart_charging_control_topology": {
             CONF_EV_CHARGING: "binary_sensor.old_charging",
-            CONF_EV_CHARGER_STOP: "button.old_stop",
+            CONF_EV_CHARGER: "button.old_stop",
         },
     }
     executor = Executor(
@@ -4439,12 +4428,8 @@ def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None
     outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
 
     assert outcome.result == OutcomeResult.FAILED
-    assert outcome.reason == ("entry_unload:ev_stop_not_confirmed:enphase_ai_profile_not_configured")
-    assert hass.services.calls[0] == (
-        "button",
-        "press",
-        {"entity_id": "button.old_stop"},
-    )
+    assert outcome.reason == ("entry_unload:ev_control_unavailable:enphase_ai_profile_not_configured")
+    assert all(call[0] != "button" for call in hass.services.calls)
     assert all(call[2].get("entity_id") != "switch.new_charger" for call in hass.services.calls)
     retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
     assert retained["retain_when_unloaded"] is True
@@ -4453,7 +4438,7 @@ def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None
         "ev_smart_charging_command_entity_id": "button.old_start",
         "ev_smart_charging_control_topology": {
             CONF_EV_CHARGING: "binary_sensor.old_charging",
-            CONF_EV_CHARGER_STOP: "button.old_stop",
+            CONF_EV_CHARGER: "button.old_stop",
         },
     }
 
@@ -4471,22 +4456,19 @@ def test_executor_restore_uses_owned_ev_control_topology_after_reconfigure() -> 
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {
-            CONF_EV_CHARGER_START: "unknown",
-            CONF_EV_CHARGER_STOP: "on",
+            CONF_EV_CHARGER: "unknown",
         },
         "ev_smart_charging_command_entity_id": "button.old_start",
         "ev_smart_charging_control_topology": {
             CONF_EV_CHARGING: "binary_sensor.old_charging",
-            CONF_EV_CHARGER_START: "button.old_start",
-            CONF_EV_CHARGER_STOP: "input_boolean.old_stop",
+            CONF_EV_CHARGER: "input_boolean.old_stop",
         },
     }
     executor = Executor(
         store,
         hass=hass,
         entry_data={
-            CONF_EV_CHARGER_START: "button.new_start",
-            CONF_EV_CHARGER_STOP: "input_boolean.new_stop",
+            CONF_EV_CHARGER: "input_boolean.new_stop",
         },
     )
 
@@ -4726,7 +4708,7 @@ def test_executor_message_and_service_target_helpers_cover_edge_cases() -> None:
         "enphase", "plan-1", now, now, ActionAsset.ENPHASE, ActionKind.SET_PROFILE, {}, [], [], None, 1.0
     )
 
-    assert _service_target_for_action(ev_stop, {CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop"}) == "switch.ev_stop"
+    assert _service_target_for_action(ev_stop, {CONF_EV_CHARGER: "switch.ev_stop"}) == "switch.ev_stop"
     assert _service_target_for_action(hvac, {"daikin_climate_entity": "climate.daikin"}) == "climate.daikin"
     assert (
         _service_target_for_action(enphase, {CONF_ENPHASE_PROFILE: "select.enphase"})
@@ -5285,7 +5267,7 @@ def test_unconfirmed_owned_manual_ev_stop_fails_closed() -> None:
     }
     hass = FakeHass(
         {
-            "input_boolean.ev_start": "off",
+            "input_boolean.ev_start": "on",
             "input_boolean.ev_stop": "on",
         }
     )
@@ -5294,12 +5276,14 @@ def test_unconfirmed_owned_manual_ev_stop_fails_closed() -> None:
             "ev_grid_reservations": {"ev-a": reservation},
         }
     }
+    async def ignore_stop(domain, service, data, blocking=False):
+        hass.services.calls.append((domain, service, data))
+    hass.services.async_call = ignore_stop
     ownership = {
-        "ev_smart_charging_state": {CONF_EV_CHARGER_START: "off"},
+        "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
         "ev_smart_charging_command_entity_id": "input_boolean.ev_start",
         "ev_smart_charging_control_topology": {
-            CONF_EV_CHARGER_START: "input_boolean.ev_start",
-            CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
     }
     store = FakeStore()
@@ -5308,11 +5292,11 @@ def test_unconfirmed_owned_manual_ev_stop_fails_closed() -> None:
         store,
         hass=hass,
         entry_data={
-            CONF_EV_CHARGER_START: "input_boolean.ev_start",
-            CONF_EV_CHARGER_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
         options={
             CONF_EV_CHARGE_RATE_KW: 7.0,
+            CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0,
             CONF_GRID_IMPORT_LIMIT_KW: 10.0,
         },
         entry_id="ev-a",
@@ -5409,7 +5393,7 @@ def test_manual_ev_start_rejects_control_without_safe_stop_path() -> None:
     result = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
 
     assert result.applied is False
-    assert result.reason == "ev_stop_control_unsupported"
+    assert result.reason == "ev_start_control_unsupported,ev_stop_control_unsupported"
     assert executor.ev_start_feedback_expected_until is None
     assert hass.services.calls == []
     assert (
@@ -5559,8 +5543,8 @@ def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
     result = SimpleNamespace(
         applied=False,
         reason="ev_charging_confirmation_timeout",
-        pre_state={CONF_EV_SMART_CHARGING_START: "off"},
-        post_state={CONF_EV_SMART_CHARGING_START: "on"},
+        pre_state={CONF_EV_CHARGER: "off"},
+        post_state={CONF_EV_CHARGER: "on"},
         command_sent=True,
         rollback_succeeded=False,
     )
@@ -5588,7 +5572,7 @@ def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
     now = datetime.now(UTC)
     hass = FakeHass(
         {
-            "button.ev_start": "unknown",
+            "switch.ev_start": "off",
             "button.ev_stop": "unknown",
         }
     )
@@ -5601,8 +5585,7 @@ def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
         store,
         hass=hass,
         entry_data={
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
+            CONF_EV_CHARGER: "switch.ev_start",
         },
         options={
             CONF_EV_CHARGE_RATE_KW: 7.0,
@@ -5878,7 +5861,7 @@ def test_manual_ev_start_honors_backoff_while_stop_remains_available() -> None:
     hass = FakeHass(
         {
             "binary_sensor.ev_connected": "on",
-            "input_boolean.ev_start": "off",
+            "input_boolean.ev_start": "on",
             "input_boolean.ev_stop": "on",
         }
     )
@@ -5895,8 +5878,7 @@ def test_manual_ev_start_honors_backoff_while_stop_remains_available() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SMART_CHARGING_START: "input_boolean.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_start",
         },
         options={
             CONF_EV_CHARGE_RATE_KW: 7.0,
@@ -5919,7 +5901,7 @@ def test_manual_ev_start_honors_backoff_while_stop_remains_available() -> None:
     assert rate_limited_start.reason == "device_command_rate_limited"
     assert store.data["outcomes"][1].result == OutcomeResult.REJECTED
     assert stop.applied is True
-    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_start"})]
 
 
 def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> None:
@@ -5949,8 +5931,7 @@ def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> 
         hass=hass,
         entry_data={
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_stop",
         },
         options=options,
         entry_id="ev-a",
@@ -6209,7 +6190,7 @@ def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {
-            CONF_EV_SMART_CHARGING_START: "off",
+            CONF_EV_CHARGER: "off",
         },
         "ev_smart_charging_command_entity_id": "button.ev_start",
     }
@@ -6224,8 +6205,7 @@ def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_stop",
         },
         options=options,
         entry_id="ev-a",
@@ -6347,7 +6327,7 @@ def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {
-            CONF_EV_SMART_CHARGING_START: "unknown",
+            CONF_EV_CHARGER: "unknown",
         },
         "ev_smart_charging_command_entity_id": "button.ev_start",
     }
@@ -6362,8 +6342,7 @@ def test_grid_degraded_plan_replaces_owned_ev_start_with_safety_stop() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_stop",
         },
         options=options,
         entry_id="ev-a",
@@ -6438,7 +6417,7 @@ def test_disabled_ev_control_safely_reconciles_interrupted_restore() -> None:
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {
-            CONF_EV_SMART_CHARGING_START: "unknown",
+            CONF_EV_CHARGER: "unknown",
         },
         "ev_smart_charging_command_entity_id": "button.ev_start",
     }
@@ -6453,8 +6432,7 @@ def test_disabled_ev_control_safely_reconciles_interrupted_restore() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "input_boolean.ev_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_stop",
         },
         options=enabled_options,
         entry_id="ev-a",
@@ -6561,7 +6539,7 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
     store = FakeStore()
     ownership = {
         "ev_smart_charging_state": {
-            CONF_EV_SMART_CHARGING_START: "off",
+            CONF_EV_CHARGER: "off",
         },
         "ev_smart_charging_command_entity_id": "button.ev_start",
     }
@@ -6635,79 +6613,6 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
     assert hass.data["ha_energy_planner"]["ev_grid_shedding_entry_id"] == "ev-b"
 
 
-def test_disconnected_ev_retains_capacity_when_button_stop_is_unconfirmed() -> None:
-    now = datetime.now(UTC)
-    reservation = {
-        "load_kw": 7.0,
-        "limit_kw": 10.0,
-        "reserved_at": now.isoformat(),
-    }
-    hass = FakeHass(
-        {
-            "binary_sensor.ev_charging": "disconnected",
-            "button.ev_start": "unknown",
-            "button.ev_stop": "unknown",
-        }
-    )
-    hass.data = {
-        "ha_energy_planner": {
-            "ev_grid_reservations": {"ev-a": reservation},
-        }
-    }
-    hass.config_entries = SimpleNamespace(
-        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
-    )
-    store = FakeStore()
-    ownership = {
-        "ev_smart_charging_state": {
-            CONF_EV_CHARGER_START: "unknown",
-        },
-        "ev_smart_charging_command_entity_id": "button.ev_start",
-    }
-    store.data["ownership"] = ownership
-    options = {
-        **DEFAULT_OPTIONS,
-        "planner_enabled": True,
-        "dry_run": False,
-        CONF_EV_CONTROL_ENABLED: True,
-        CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0,
-    }
-    executor = Executor(
-        store,
-        hass=hass,
-        entry_data={
-            CONF_EV_CHARGING: "binary_sensor.ev_charging",
-            CONF_EV_CHARGER_START: "button.ev_start",
-            CONF_EV_CHARGER_STOP: "button.ev_stop",
-        },
-        options=options,
-        entry_id="ev-a",
-    )
-    _arm_store(store, executor)
-    plan = EnergyPlan(
-        plan_id="disconnected-button-stop",
-        created_at=now,
-        horizon_hours=24,
-        interval_minutes=5,
-        status="current",
-        health=InputHealth.HEALTHY,
-        mode=PlannerMode.ACTIVE_HEALTHY,
-        summary="disconnected",
-        confidence=1.0,
-        estimated_daily_cost=None,
-        actions=[],
-        preview=[],
-    )
-    context = _context(now)
-    context.ev_connected = False
-
-    asyncio.run(executor.async_evaluate(plan, context))
-
-    retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
-    assert retained["retain_when_unloaded"] is True
-    assert store.data["ownership"] == ownership
-    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
-    assert store.data["outcomes"][-1].reason == "ev_stop_not_confirmed"
 
 
 def test_compensated_owned_safety_stop_clears_ownership_and_capacity() -> None:
@@ -6972,7 +6877,7 @@ def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
     store = FakeStore()
     store.data["ownership"] = {
         "ev_smart_charging_state": {
-            CONF_EV_CHARGER_START: "unknown",
+            CONF_EV_CHARGER: "unknown",
         },
         "ev_smart_charging_command_entity_id": "button.ev_a_start",
     }
@@ -6989,8 +6894,7 @@ def test_existing_multi_ev_limit_conflict_sheds_owned_reservation() -> None:
         hass=hass,
         entry_data={
             CONF_EV_CHARGING: "binary_sensor.ev_a_charging",
-            CONF_EV_CHARGER_START: "button.ev_a_start",
-            CONF_EV_CHARGER_STOP: "input_boolean.ev_a_stop",
+            CONF_EV_CHARGER: "input_boolean.ev_a_stop",
         },
         options=options,
         entry_id="ev-a",
@@ -7430,10 +7334,9 @@ def test_ev_grid_reservation_defensive_branches() -> None:
     action.desired_state["charging_required_now"] = False
     assert executor_module._ev_action_wants_power(action) is False
     legacy_controls = {
-        CONF_EV_SMART_CHARGING_START: "switch.ev_start",
-        CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop",
+        CONF_EV_CHARGER: "switch.ev_start",
     }
-    assert _service_target_for_action(action, legacy_controls) == "switch.ev_stop"
+    assert _service_target_for_action(action, legacy_controls) == "switch.ev_start"
     action.desired_state.pop("charging_required_now")
     assert executor_module._ev_action_wants_power(action) is True
     assert _service_target_for_action(action, legacy_controls) == "switch.ev_start"
@@ -7770,15 +7673,15 @@ def test_fallback_notifications_share_thirty_minute_warmup(
     assert executor._in_notification_grace_period() is expected
 
 
-def test_missing_auto_start_stop_target_is_rejected_without_command_or_allowance():
+def test_missing_charger_switch_is_rejected_without_command_or_allowance():
     from custom_components.ha_energy_planner.action_limits import action_budget
     from custom_components.ha_energy_planner.models import to_jsonable
 
-    hass = FakeHass({"switch.ev_charger": "on", "sensor.ev_charging": "CHARGING"})
+    hass = FakeHass({"sensor.ev_charging": "CHARGING"})
     store = FakeStore()
     executor = Executor(store, hass=hass, entry_data={
         CONF_EV_CHARGER: "switch.ev_charger",
-        CONF_EV_CHARGER_STOP: "button.iq_ev_charger_1234_stop_charging",
+
         CONF_EV_CHARGING: "sensor.ev_charging",
     })
     for _ in range(12):
@@ -7792,23 +7695,17 @@ def test_missing_auto_start_stop_target_is_rejected_without_command_or_allowance
     assert action_budget(rows, {"max_daily_ev_actions": 10}, datetime.now(UTC), "ev")["remaining"] == 10
 
 
-def test_retired_enphase_button_repair_allows_switch_start_stop_and_owned_recovery(monkeypatch):
-    from custom_components.ha_energy_planner import enphase_ev_migration
+def test_retired_controls_are_ignored_and_switch_recovers_owned_charging(monkeypatch):
     from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
+    from custom_components.ha_energy_planner.entry_data import remove_retired_config_keys
 
     switch = "switch.renamed_charger"
     old = {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: switch,
            CONF_EV_CHARGER_START: "button.iq_ev_charger_1234_start_charging",
            CONF_EV_CHARGER_STOP: "button.iq_ev_charger_1234_stop_charging"}
     hass = FakeHass({switch: "off"})
-    registered = SimpleNamespace(platform="enphase_ev", disabled_by=None,
-                                 unique_id="enphase_ev_TEST1234_charging_switch")
-    monkeypatch.setattr(enphase_ev_migration.er, "async_get",
-                        lambda _: SimpleNamespace(async_get=lambda entity: registered if entity == switch else None))
-    assert CapabilityDiscovery(hass, old).inspect().ev.issues == [
-        "ev_start_control_unavailable", "ev_stop_control_unavailable",
-    ]
-    repaired = enphase_ev_migration.without_retired_enphase_buttons(hass, old)
+    assert CapabilityDiscovery(hass, old).inspect().ev.supported
+    repaired = remove_retired_config_keys(old)
     assert CapabilityDiscovery(hass, repaired).inspect().ev.supported
     store = FakeStore()
     executor = Executor(store, hass=hass, entry_data=repaired)
@@ -7828,3 +7725,24 @@ def test_retired_enphase_button_repair_allows_switch_start_stop_and_owned_recove
     assert hass.states.values[switch] == "off"
     assert hass.services.calls[-2][0:2] == ("switch", "turn_off")
     assert not store.data["ownership"]
+
+
+def test_empty_owned_topology_never_stops_a_replacement_charger() -> None:
+    hass = FakeHass({"switch.replacement": "on"})
+    store = FakeStore()
+    ownership = {
+        "ev_smart_charging_control_topology": {},
+        "ev_smart_charging_command_entity_id": "button.retired_start",
+        "ev_smart_charging_state": {"ev_charger_start_entity": None},
+    }
+    store.data["ownership"] = ownership
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.replacement"})
+    outcome = asyncio.run(executor.async_restore_device_control("ev", "upgrade"))
+    assert outcome.result == OutcomeResult.FAILED
+    assert store.data["ownership"] == ownership
+    assert hass.states.values["switch.replacement"] == "on"
+    assert not any(call[2].get("entity_id") == "switch.replacement" for call in hass.services.calls)
+
+
+def test_unknown_asset_has_no_service_target() -> None:
+    assert _service_target_for_action(SimpleNamespace(asset="unknown"), {CONF_EV_CHARGER: "switch.charger"}) is None

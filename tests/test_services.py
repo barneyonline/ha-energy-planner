@@ -270,7 +270,7 @@ def test_run_preflight_returns_active_mode_readiness_without_scheduling_work() -
 
 def test_run_preflight_reports_missing_entities() -> None:
     coordinator = _coordinator()
-    coordinator.entry.data["ev_smart_charging_stop_entity"] = "input_boolean.missing_stop"
+    coordinator.entry.data["ev_charger_entity"] = "input_boolean.missing_stop"
     coordinator.entry.options["planner_enabled"] = True
     hass = FakeHass(coordinator)
     asyncio.run(async_setup(hass, {}))
@@ -286,7 +286,7 @@ def test_run_preflight_reports_missing_entities() -> None:
     assert checks["configured_services_available"]["ok"] is True
 
 
-def test_run_preflight_accepts_unknown_stateless_ev_buttons() -> None:
+def test_run_preflight_ignores_retired_buttons_when_switch_is_configured() -> None:
     coordinator = _coordinator()
     coordinator.entry.data["ev_smart_charging_start_entity"] = "button.ev_start"
     coordinator.entry.data["ev_smart_charging_stop_entity"] = "button.ev_stop"
@@ -328,8 +328,7 @@ def test_run_preflight_reports_production_gate_reasons() -> None:
 def test_run_preflight_supports_ev_only_control() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
         },
         ev_control_enabled=True,
     )
@@ -345,8 +344,7 @@ def test_run_preflight_supports_ev_only_control() -> None:
 def test_run_preflight_blocks_keep_on_without_persistent_control() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_start_entity": "input_boolean.ev_start",
         },
         ev_control_enabled=True,
         **{CONF_EV_KEEP_CHARGER_ON: True},
@@ -378,8 +376,6 @@ def test_run_preflight_blocks_keep_on_with_unavailable_persistent_control() -> N
     coordinator = _partial_coordinator(
         {
             "ev_charger_entity": "switch.missing_charger",
-            "ev_charger_start_entity": "input_boolean.ev_start",
-            "ev_charger_stop_entity": "input_boolean.ev_stop",
         },
         ev_control_enabled=True,
         **{CONF_EV_KEEP_CHARGER_ON: True},
@@ -403,8 +399,8 @@ def test_run_preflight_blocks_keep_on_with_unavailable_persistent_control() -> N
 def test_run_preflight_keeps_unavailable_ai_configuration_advisory() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
+
             "ai_task_entity": "ai_task.missing",
             "ai_advisor_service": "ai_task.generate_data",
         },
@@ -424,8 +420,8 @@ def test_run_preflight_keeps_unavailable_ai_configuration_advisory() -> None:
 def test_run_preflight_blocks_control_when_vehicle_target_is_unavailable() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
+
             CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
         },
         ev_control_enabled=True,
@@ -442,7 +438,7 @@ def test_run_preflight_blocks_control_when_vehicle_target_is_unavailable() -> No
     assert checks["configured_entities_available"]["ok"] is False
     assert response["entities"]["unavailable"] == ["sensor.ev_target"]
     assert response["entities"]["advisory_unavailable"] == []
-    assert response["entities"]["available_count"] == 4
+    assert response["entities"]["available_count"] == 3
     assert response["discovery"]["ev"]["supported"] is True
 
 
@@ -485,8 +481,8 @@ def test_run_preflight_blocks_enabled_but_unconfigured_control() -> None:
 def test_run_preflight_ignores_entities_for_disabled_control_areas() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
+
             "daikin_climate_entity": "climate.missing",
         },
         ev_control_enabled=True,
@@ -522,8 +518,8 @@ def test_run_preflight_no_control_dry_run_treats_discovery_as_advisory() -> None
 def test_run_preflight_isolates_a_mixed_unsupported_enabled_area() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
+
             "daikin_climate_entity": "climate.missing",
         },
         ev_control_enabled=True,
@@ -588,8 +584,7 @@ def test_run_preflight_accepts_degraded_plan_for_asset_specific_execution() -> N
 def test_run_preflight_requires_a_confidence_eligible_ready_area() -> None:
     coordinator = _partial_coordinator(
         {
-            "ev_smart_charging_start_entity": "input_boolean.ev_start",
-            "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+            "ev_charger_entity": "input_boolean.ev_start",
         },
         ev_control_enabled=True,
     )
@@ -801,7 +796,7 @@ def test_run_preflight_rejects_truthy_string_safety_options() -> None:
 
 def test_production_evidence_survives_mode_and_advisory_toggles_only() -> None:
     entry_data = {
-        "ev_smart_charging_start_entity": "button.ev_start",
+        "ev_charger_entity": "button.ev_start",
         "haeo_optimize_service": "retired.value",
         "ai_task_entity": "ai_task.local",
     }
@@ -960,8 +955,8 @@ def _coordinator(entry_id: str = "entry-1") -> EnergyPlannerCoordinator:
                 "climate_target_low_entity": "input_number.climate_low",
                 "climate_target_high_entity": "input_number.climate_high",
                 "person_entities": "person.home",
-                "ev_smart_charging_start_entity": "input_boolean.ev_start",
-                "ev_smart_charging_stop_entity": "input_boolean.ev_stop",
+                "ev_charger_entity": "input_boolean.ev_start",
+
                 CONF_EV_SOC: "sensor.ev_soc",
                 CONF_EV_CHARGING: "binary_sensor.ev_charging",
                 CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
@@ -1141,3 +1136,13 @@ def test_charge_now_services_validate_duration_and_surface_rejections() -> None:
     coordinator.async_cancel_charge_now.return_value = SimpleNamespace(applied=False, reason="ev_stop_not_confirmed")
     with pytest.raises(HomeAssistantError, match="confirmed stopped"):
         asyncio.run(cancel(FakeCall({})))
+
+
+def test_control_fingerprint_normalizes_legacy_switch_and_ignores_retired_endpoints() -> None:
+    from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+    canonical = {"ev_charger_entity": "switch.charger"}
+    legacy = {"ev_smart_charging_entity": "switch.charger",
+              "ev_charger_start_entity": "button.retired", "ev_smart_charging_stop_entity": "button.retired"}
+    # Legacy primary names remain compatible; retired command mappings have no authority.
+    assert production_evidence_fingerprint(legacy, {}) == production_evidence_fingerprint(
+        {**canonical, "ev_smart_charging_entity": "switch.charger"}, {})

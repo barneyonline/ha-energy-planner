@@ -1149,8 +1149,7 @@ def test_reload_drains_and_suppresses_queued_manual_listener_jobs(helper_off: bo
 
 
 @pytest.mark.parametrize("retired", [True, False])
-def test_setup_repairs_retired_enphase_config_and_owned_recovery_before_refresh(monkeypatch, retired):
-    from custom_components.ha_energy_planner import enphase_ev_migration
+def test_setup_removes_separate_ev_controls_and_preserves_owned_recovery_before_refresh(monkeypatch, retired):
     from custom_components.ha_energy_planner.const import CONF_EV_CHARGER, CONF_EV_CHARGER_START, CONF_EV_CHARGER_STOP
 
     switch = "switch.renamed_charger"
@@ -1179,10 +1178,6 @@ def test_setup_repairs_retired_enphase_config_and_owned_recovery_before_refresh(
                     == saved["ev_smart_charging_command_entity_id"])
             super().__init__(hass, entry, store)
 
-    registered = SimpleNamespace(platform="enphase_ev", disabled_by=None,
-                                 unique_id="enphase_ev_TEST1234_charging_switch")
-    monkeypatch.setattr(enphase_ev_migration.er, "async_get",
-                        lambda _: SimpleNamespace(async_get=lambda entity: registered if entity == switch else None))
     monkeypatch.setattr("custom_components.ha_energy_planner.storage.PlannerStore", OwnedStore)
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.EnergyPlannerCoordinator", ReadyCoordinator)
     monkeypatch.setattr("custom_components.ha_energy_planner._async_sync_planner_device", lambda *_: None)

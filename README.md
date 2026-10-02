@@ -118,7 +118,7 @@ For a safe initial rollout:
 
 **Automatic control** records the operator's request for active control. **Armed** is the actual command-authority gate; unsafe or incomplete evidence keeps it off even when automatic-control intent is retained.
 
-On reload, missing default Start/Stop Charging buttons retired by Enphase EV Charger 5.0 automatically use the already-mapped charger switch when its entity-registry identity confirms the same charger. Saved recovery controls are repaired too. Existing, unavailable, custom-named, or mismatched controls remain unchanged; reconfigure custom-named retired buttons manually.
+EV charging uses one **Charger control** switch (or an `input_boolean` helper) for both on and off commands. Separate start/stop controls and button commands are no longer supported. Reloading removes those old mappings while preserving the mapped charger switch and recovery evidence. If only separate controls were configured, select a stateful charger control in **Configure → Planner settings** before enabling EV control. Saved ownership remains pending when its original charger control is missing or cannot be confirmed off.
 
 Saving mapped inputs may briefly make planner entities unavailable while their listeners are rebuilt. Concurrent updates from one settings save share that reload and preserve automatic recovery; after the required safety checks pass, Armed returns on. Policy-only changes apply without rebuilding the integration.
 
@@ -205,7 +205,7 @@ Removing Energy Planner stops future plans and commands. It does not remove sour
 
 ### Multiple cars sharing one charger
 
-Configure the shared charger's Plugged In sensor, charging feedback and start/stop controls in **Configure → Planner settings**. Then use **Configure → Add vehicle** for each car. Each profile requires its own charging-port sensor, home-presence entity, SOC sensor and target-SOC sensor, plus a ready-by time. Vehicle charging power is optional; leave it blank to inherit the shared charger power. BMW CarData `CONNECTED` / `DISCONNECTED` and location `home` are supported. A home binary sensor may report `on` / `off`. Target SOC is read only: there is no configured target or target fallback.
+Configure the shared charger's Plugged In sensor, charging feedback and charger control switch in **Configure → Planner settings**. Then use **Configure → Add vehicle** for each car. Each profile requires its own charging-port sensor, home-presence entity, SOC sensor and target-SOC sensor, plus a ready-by time. Vehicle charging power is optional; leave it blank to inherit the shared charger power. BMW CarData `CONNECTED` / `DISCONNECTED` and location `home` are supported. A home binary sensor may report `on` / `off`. Target SOC is read only: there is no configured target or target fallback.
 
 The **EV vehicle** selector offers **Auto**, each vehicle name, and **Manual — no tracked charging**. Auto requires the home charger to be plugged in and exactly one vehicle to be connected at home; another vehicle with missing evidence must be ruled out before identification. **Active EV vehicle** shows the result, with the detection reason in its attributes. Manual vehicle selection overrides identity detection but still requires a plugged-in charger and valid SOC/target readings.
 

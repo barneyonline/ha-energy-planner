@@ -71,8 +71,6 @@ from .const import (
     CONF_ENPHASE_SELF_CONSUMPTION_PROFILE,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONFIRMATION_RETRIES,
     CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
@@ -90,8 +88,6 @@ from .const import (
     CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_EV_SOC_PER_KWH,
@@ -312,8 +308,6 @@ EV_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_EV_CONNECTED): _entity_selector(["binary_sensor", "sensor"]),
         vol.Optional(CONF_EV_SMART_CHARGING_TARGET_SOC): _entity_selector(entity_filter=_EV_TARGET_SOC_FILTER),
         vol.Optional(CONF_EV_CHARGER): _entity_selector(["switch", "input_boolean"]),
-        vol.Optional(CONF_EV_CHARGER_START): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
-        vol.Optional(CONF_EV_CHARGER_STOP): _entity_selector(["switch", "button", "input_boolean", "input_button"]),
     }
 )
 
@@ -353,11 +347,7 @@ _HOUSEHOLD_ACTUATOR_KEYS = (
 _EV_ACTUATOR_KEYS = (
     "ev_power_limit_entity",
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
 )
 _ACTUATOR_KEYS = (*_HOUSEHOLD_ACTUATOR_KEYS, *_EV_ACTUATOR_KEYS)
 _SUBENTRY_ACTUATOR_KEYS = {
@@ -1441,11 +1431,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_EV_CHARGING: {"binary_sensor", "sensor", "switch"},
     CONF_EV_CONNECTED: {"binary_sensor", "sensor"},
     CONF_EV_CHARGER: {"switch", "input_boolean"},
-    CONF_EV_CHARGER_START: {"switch", "button", "input_boolean", "input_button"},
-    CONF_EV_CHARGER_STOP: {"switch", "button", "input_boolean", "input_button"},
-    CONF_EV_SMART_CHARGING: {"switch", "button", "input_boolean", "input_button"},
-    CONF_EV_SMART_CHARGING_START: {"switch", "button", "input_boolean", "input_button"},
-    CONF_EV_SMART_CHARGING_STOP: {"switch", "button", "input_boolean", "input_button"},
+    CONF_EV_SMART_CHARGING: {"switch", "input_boolean"},
     CONF_EV_SMART_CHARGING_TARGET_SOC: {"number", "input_number", "sensor", "select", "input_select"},
     CONF_EV_SMART_CHARGING_READY_BY: {"time", "input_datetime", "input_text", "select", "input_select"},
     CONF_AI_TASK_ENTITY: {"ai_task"},

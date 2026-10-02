@@ -22,8 +22,8 @@ _DISCOVERY_KEYS = {
     "climate_scheduler_guard_unavailable": (
         "climate_change_from_scheduler_entity", "climate_scheduler_guard_timer_entity",
     ),
-    "ev_start_control_unavailable": ("ev_charger_start_entity", "ev_charger_entity"),
-    "ev_stop_control_unavailable": ("ev_charger_stop_entity", "ev_charger_entity"),
+    "ev_start_control_unavailable": ("ev_charger_entity",),
+    "ev_stop_control_unavailable": ("ev_charger_entity",),
 }
 
 type AvailabilityIdentity = tuple[tuple[str, ...], tuple[str, ...]]
