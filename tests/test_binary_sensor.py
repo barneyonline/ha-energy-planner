@@ -352,8 +352,7 @@ def test_armed_sensor_ignores_unrelated_optional_entity_availability() -> None:
 
 def test_armed_sensor_applies_keep_on_persistent_control_capability() -> None:
     entry_data = {
-        "ev_smart_charging_start_entity": "button.ev_start",
-        "ev_smart_charging_stop_entity": "button.ev_stop",
+        "ev_charger_entity": "button.ev_start",
     }
     options = {
         "ev_control_enabled": True,

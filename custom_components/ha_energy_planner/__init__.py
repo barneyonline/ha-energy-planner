@@ -46,7 +46,7 @@ from .const import (
     SERVICE_SET_EV_READY_BY,
     SERVICE_SET_MANUAL_HVAC_OVERRIDE,
 )
-from .entry_data import combined_entry_data
+from .entry_data import combined_entry_data, remove_retired_config_keys
 from .migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
@@ -411,6 +411,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry
         legacy_fallback=entry.entry_id == legacy_store_entry_id,
     )
     await store.async_load()
+    ownership = dict(store.data.get("ownership", {}))
+    topology = ownership.get("ev_smart_charging_control_topology")
+    if isinstance(topology, dict):
+        migrated_topology = remove_retired_config_keys(topology)
+        if migrated_topology != topology:
+            await store.async_save_ownership({**ownership, "ev_smart_charging_control_topology": migrated_topology})
     _rehydrate_ev_grid_reservation(hass, entry, getattr(store, "data", {}))
     coordinator = EnergyPlannerCoordinator(hass, entry, store)
     coordinator.entry_topology_signature = _entry_topology_signature(entry)

@@ -1178,3 +1178,41 @@ def test_calendar_plan_source_is_available_before_persistence_finishes(monkeypat
         await task
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("ledger", [True, False])
+def test_reload_cleans_missing_control_attempts_but_preserves_uncertain_commands(monkeypatch, ledger):
+    from custom_components.ha_energy_planner.action_limits import action_budget
+
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    now = datetime.now(UTC)
+    missing = dict(asset="ev", kind="ev_stop", result="failed", reason="ev_control_unavailable",
+                   attempted_at=now.isoformat())
+    attempted = {**missing, "reason": "ev_control_service_failed"}
+    rows = [missing] * 68 + [attempted]
+    loaded = {"execution_audit": rows, **({"action_attempts": rows} if ledger else {})}
+    monkeypatch.setattr(FakeStore, "loaded", loaded)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    store = PlannerStore(object())
+    asyncio.run(store.async_load())
+    assert store.data["action_attempts"] == [attempted]
+    assert len(store.data["execution_audit"]) == 69
+    assert action_budget(store.data["action_attempts"], {"max_daily_ev_actions": 10}, now, "ev")["remaining"] == 9
+    assert FakeStore.saved["action_attempts"] == [attempted]
+
+
+@pytest.mark.parametrize("ledger", [False, True])
+def test_reload_retains_dispatched_target_loss_and_prunes_legacy_local_rejections(monkeypatch, ledger):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    now = datetime.now(UTC)
+    missing = dict(asset="ev", kind="ev_start", result="failed", reason="ev_control_unavailable",
+                   attempted_at=now.isoformat())
+    dispatched = {**missing, "command_sent": True}
+    rows = [missing, dispatched]
+    monkeypatch.setattr(FakeStore, "loaded", {"execution_audit": rows, **({"action_attempts": rows} if ledger else {})})
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    store = PlannerStore(object())
+    asyncio.run(store.async_load())
+    assert store.data["action_attempts"] == [dispatched]
+    assert store.data["execution_audit"][-1]["command_sent"] is True
+    assert "command_sent" not in store.data["execution_audit"][0]

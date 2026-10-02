@@ -17,10 +17,9 @@ from custom_components.ha_energy_planner.const import (
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_PROFILE,
     CONF_ENPHASE_PROFILE_CONTROL_SERVICE,
+    CONF_EV_CHARGER,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
 )
@@ -91,8 +90,8 @@ def test_discovery_reports_supported_controls() -> None:
         hass,
         {
             CONF_AI_TASK_ENTITY: "ai_task.extended_openai",
-            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "switch.ev_stop",
+            CONF_EV_CHARGER: "switch.ev_start",
+
             CONF_DAIKIN_CLIMATE: "climate.daikin",
             CONF_CLIMATE_AUTOMATIONS: "automation.climate",
             CONF_ENPHASE_PROFILE: "select.enphase_profile",
@@ -153,7 +152,7 @@ def test_climate_target_discovery_is_options_aware_and_reports_entities() -> Non
     assert recovered.supported is True
 
 
-def test_discovery_treats_unknown_button_controls_as_available() -> None:
+def test_discovery_rejects_button_charger_controls() -> None:
     hass = FakeHass(
         {
             "button.ev_start": "unknown",
@@ -165,13 +164,12 @@ def test_discovery_treats_unknown_button_controls_as_available() -> None:
     report = CapabilityDiscovery(
         hass,
         {
-            CONF_EV_SMART_CHARGING_START: "button.ev_start",
-            CONF_EV_SMART_CHARGING_STOP: "button.ev_stop",
+            CONF_EV_CHARGER: "button.ev_start",
         },
     ).inspect()
 
-    assert report.ev.supported is True
-    assert report.ev.issues == []
+    assert report.ev.supported is False
+    assert report.ev.issues == ["ev_start_control_unsupported", "ev_stop_control_unsupported"]
 
 
 def test_discovery_treats_unknown_ai_task_as_available() -> None:
@@ -221,7 +219,7 @@ def test_discovery_rejects_legacy_single_button_without_stop_control() -> None:
     ).inspect()
 
     assert report.ev.supported is False
-    assert report.ev.issues == ["ev_stop_control_unsupported"]
+    assert report.ev.issues == ["ev_start_control_unsupported", "ev_stop_control_unsupported"]
     assert report.ev.details["start_control"] == "button.ev_control"
     assert report.ev.details["stop_control"] == "button.ev_control"
     assert report.ev.details["persistent_control"] == {
@@ -368,7 +366,7 @@ def test_discovery_reports_missing_and_invalid_surfaces() -> None:
     report = CapabilityDiscovery(
         hass,
         {
-            CONF_EV_SMART_CHARGING_START: "switch.ev_start",
+            CONF_EV_CHARGER: "switch.ev_start",
             CONF_EV_SMART_CHARGING_TARGET_SOC: "input_number.target",
             CONF_EV_SMART_CHARGING_READY_BY: "input_text.ready_by",
             CONF_DAIKIN_CLIMATE: "climate.missing",
@@ -379,7 +377,7 @@ def test_discovery_reports_missing_and_invalid_surfaces() -> None:
 
     assert report.ev.supported is False
     assert "ev_start_control_unavailable" in report.ev.issues
-    assert "ev_stop_control_not_configured" in report.ev.issues
+    assert "ev_stop_control_unavailable" in report.ev.issues
     assert report.ev.details[CONF_EV_SMART_CHARGING_TARGET_SOC]["available"] is True
     assert report.ev.details[CONF_EV_SMART_CHARGING_READY_BY]["available"] is False
     assert report.hvac.issues == ["daikin_climate_unavailable"]

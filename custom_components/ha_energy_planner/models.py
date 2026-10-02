@@ -197,6 +197,7 @@ class ActionOutcome:
     kind: str | None = None
     service_target: str | None = None
     desired_state: dict[str, Any] | None = None
+    command_sent: bool | None = None
 
 
 @dataclass(slots=True)

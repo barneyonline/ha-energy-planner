@@ -15,6 +15,8 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Selective Export Limit resume retains only effectively active pauses, preserving legacy string asset selectors without creating or reviving unrelated pauses. Export tariff confidence accepts the existing input layer's four confidence aliases and fraction/percentage encodings, rejects invalid or below-threshold evidence, and is rechecked before execution. Reproduced resume and low-confidence dispatch defects are covered in `tests/test_export_limit.py` (`coordinator.py`, `export_limit_policy.py`, `executor.py`).
 
+- Upgrades remove current and legacy separate EV start/stop mappings, retaining the configured charger switch and saved recovery snapshots and command identity. Missing original controls retain ownership. Explicit dispatch evidence is preserved in audit and rolling-attempt storage, so partial commands followed by target loss still consume allowance while local rejections do not. Regression coverage is in `tests/test_config_flow.py`, `tests/test_lifecycle.py`, `tests/test_executor.py`, `tests/test_action_limits.py`, and `tests/test_storage.py`.
+
 - Main thermostat shutdown feedback is scoped through service dispatch and confirmation. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events after the command remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
 
 - EV and climate action limits remain configurable (defaults 10 and 12 respectively, with a 60-minute manual HVAC override; existing values preserved). The optimizer distinguishes physically feasible candidates rejected by the rolling action allowance from capacity/price shortfalls, and notifications expose the limit and remaining allowance. Regression tests cover exhausted/one-action allowances, recovery after raising the cap, physical shortfalls, and actionable notifications (`tests/test_ev_optimization.py`, `tests/test_executor.py`). Safety-stop accounting remains conservative.
@@ -197,16 +199,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   confirmation failures. Subsequent starts honour that pause and the command
   cooldown, while manual and scheduled stops bypass failure backoff, command
   cooldowns, and daily caps for recovery. Safe-state ownership records the
-  actual commanded entity and its complete EV actuator topology so momentary
-  takeovers cannot be mistaken for a restorable unrelated persistent control.
+  actual commanded entity and its complete EV actuator topology so legacy
+  command takeovers cannot restore an unrelated charger control.
   Restore, automated safety-stop, and manual-stop paths use that persisted
   topology after EV mapping changes rather than clearing ownership through a
   replacement actuator. Command
   acceptance is tracked separately from proven-safe stop confirmation. A
-  separate stop command helper cannot release safety ownership by itself;
-  meaningful inactive charging feedback together with a confirmed-off
-  persistent charger control, a stateful control, or rollback must prove the
-  safe state. Failed automatic safety stops back off for ten minutes and stop
+  confirmed-off charger switch or confirmed rollback must prove the safe state;
+  retired command helpers are never replayed during recovery. Failed automatic safety stops back off for ten minutes and stop
   after three attempts per rolling day. Dedicated command metadata preserves
   the backoff and retry block independently of shared pause updates and bounded
   audit retention. A compensating stop
@@ -250,7 +250,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   within configured SOC policy bounds, preventing an external vehicle target
   from bypassing the hard planner maximum.
 - EV safety stops use direction-specific validation: unrelated unhealthy plan
-  inputs and unavailable start controls cannot block an available stop path.
+  inputs cannot block an available charger switch from stopping.
   When unhealthy inputs, an observed disconnect, disabled EV control, or a hard
   grid-import violation leave EV power planner-owned or reserved, execution
   prioritizes one audited safety-stop attempt for that plan, retains its
@@ -618,9 +618,9 @@ use throughout; the Docker and pull-request gates enforce that result.
   planning uses the conservative bootstrap rate while retraining.
   Configured charging feedback also accepts connector-status sensors;
   `SUSPENDED_EV` and `SUSPENDED_EVSE` are normalized as connected but not
-  actively charging, so momentary stop controls are not called after a vehicle
-  has already suspended power delivery. Disconnection remains insufficient
-  evidence for a safe momentary stop.
+  actively charging. Stopping still requires the charger switch to be confirmed
+  off; suspended or disconnected feedback alone does not prove safe ownership
+  release.
   Persisted Recorder calibration timestamps tolerate malformed or timezone-naive
   older values without raising through planner refresh. Docker smoke coverage
   validates the compact calibration lifecycle, and real-history replay fixtures
@@ -1114,3 +1114,20 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
   services remain supported.
 - Evidence: `tests/test_recovery_presentation.py`, `tests/test_sensor.py`,
   `tests/test_switch_button.py`, `tests/test_ev_control_entities.py`; full Docker gate.
+
+## Single EV charger control
+
+- Config flow exposes one switch or `input_boolean` charger control. Discovery,
+  preflight, execution and actuator presentation use that same control for both
+  directions; no EV button presses or separate command endpoints remain.
+- `entry_data.py` removes both current and legacy separate start/stop keys from
+  entry and subentry data. Setup persists the cleanup and removes retired fields
+  from saved recovery topology while retaining snapshots and command identity.
+  An old command identity triggers a safe stop through the retained charger
+  switch; missing or unconfirmed controls retain ownership for retry. Entries
+  without a retained switch require reconfiguration and cannot start charging.
+- Rejections without dispatch do not consume the rolling EV action allowance;
+  legacy missing-control failures are excluded when restoring the attempt ledger.
+- Evidence: `test_config_flow.py`, `test_lifecycle.py`, `test_ev_adapter.py`,
+  `test_executor.py`, `test_action_limits.py`, `test_storage.py`, and the real
+  Home Assistant single-control smoke fixture in `scripts/docker-ha-smoke.sh`.

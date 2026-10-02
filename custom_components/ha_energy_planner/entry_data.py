@@ -24,12 +24,16 @@ _RETIRED_CONFIG_KEYS = frozenset(
         "haeo_config_entry_id",
         "haeo_entry_id",
         "haeo_optimize_service",
+        CONF_EV_CHARGER_START,
+        CONF_EV_CHARGER_STOP,
+        CONF_EV_SMART_CHARGING_START,
+        CONF_EV_SMART_CHARGING_STOP,
     }
 )
 
 
 def remove_retired_config_keys(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Return config data without keys used by retired integrations."""
+    """Return config data without retired integration or control mappings."""
     return {key: value for key, value in data.items() if key not in _RETIRED_CONFIG_KEYS}
 
 
@@ -54,8 +58,6 @@ def combined_entry_data(entry: EnergyPlannerConfigEntry) -> dict[str, Any]:
     # This keeps existing entries safe until the EV subentry is reconfigured.
     aliases = {
         CONF_EV_CHARGER: CONF_EV_SMART_CHARGING,
-        CONF_EV_CHARGER_START: CONF_EV_SMART_CHARGING_START,
-        CONF_EV_CHARGER_STOP: CONF_EV_SMART_CHARGING_STOP,
     }
     for current_key, legacy_key in aliases.items():
         if not data.get(current_key) and data.get(legacy_key):

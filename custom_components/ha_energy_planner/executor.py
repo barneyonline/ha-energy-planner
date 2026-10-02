@@ -26,16 +26,12 @@ from .const import (
     CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONFIRMATION_RETRIES,
     CONF_EV_CONFIRMATION_TIMEOUT_SECONDS,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
@@ -126,11 +122,7 @@ _EV_CONTROL_TOPOLOGY_KEYS = (
     "ev_power_entity",
     "ev_energy_entity",
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_CHARGING,
 )
 _EV_SAFETY_PLAN_ISSUES = frozenset(
@@ -504,7 +496,7 @@ class Executor:
         no_change = result.reason == "already_in_desired_state"
         outcome_result = (
             OutcomeResult.REJECTED
-            if rejected
+            if rejected or (not result.applied and not result.command_sent)
             else OutcomeResult.SKIPPED
             if no_change
             else OutcomeResult.APPLIED
@@ -521,6 +513,7 @@ class Executor:
                 post_state=result.post_state,
                 plan_id=plan_id,
                 ev_entry_data=ev_entry_data,
+                command_sent=result.command_sent,
             )
         )
 
@@ -869,7 +862,7 @@ class Executor:
                 if planner_owned_stop and safe_stop_confirmed and not ev_result.applied
                 else ev_result.reason
             )
-            if not no_change:
+            if ev_result.command_sent:
                 await self._async_record_command_attempt(action, now)
             if not action_applied:
                 pause_duration = ACTION_BACKOFF_DURATION
@@ -943,6 +936,8 @@ class Executor:
                         if no_change
                         else OutcomeResult.APPLIED
                         if action_applied
+                        else OutcomeResult.REJECTED
+                        if not ev_result.command_sent
                         else OutcomeResult.FAILED
                     ),
                     reason=result_reason,
@@ -950,6 +945,7 @@ class Executor:
                     post_state=ev_result.post_state,
                     plan_id=plan.plan_id,
                     ev_entry_data=ev_entry_data,
+                    command_sent=ev_result.command_sent,
                 )
             )
             return None
@@ -1496,7 +1492,7 @@ class Executor:
                         self.hass,
                         (
                             dict(ev_control_topology)
-                            if isinstance(ev_control_topology, dict) and ev_control_topology
+                            if isinstance(ev_control_topology, dict)
                             else self.entry_data
                         ),
                         command_guard=command_guard,
@@ -1749,6 +1745,7 @@ class Executor:
         post_state: dict[str, Any],
         plan_id: str,
         ev_entry_data: dict[str, Any] | None = None,
+        command_sent: bool | None = None,
     ) -> ActionOutcome:
         """Return an outcome enriched for the execution audit trail."""
         service_target = (
@@ -1771,6 +1768,7 @@ class Executor:
             kind=str(action.kind),
             service_target=service_target,
             desired_state=dict(action.desired_state),
+            command_sent=command_sent,
         )
 
     def _export_limit_rejection_reason(self, action: PlanAction, now: datetime) -> str | None:
@@ -2461,7 +2459,7 @@ class Executor:
         if not isinstance(ownership, dict):
             return None
         topology = ownership.get(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY)
-        return dict(topology) if isinstance(topology, dict) and topology else None
+        return dict(topology) if isinstance(topology, dict) else None
 
     def _has_ev_grid_reservation(self) -> bool:
         """Return whether this entry has planner-controlled EV grid capacity."""
@@ -2819,35 +2817,11 @@ def _service_target_for_action(action: ControlAction, entry_data: dict[str, Any]
         CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_PROFILE,
         CONF_EV_CHARGER,
-        CONF_EV_CHARGER_START,
-        CONF_EV_CHARGER_STOP,
         CONF_EV_SMART_CHARGING,
-        CONF_EV_SMART_CHARGING_START,
-        CONF_EV_SMART_CHARGING_STOP,
     )
 
     if action.asset == ActionAsset.EV:
-        if action.kind in {ActionKind.EV_START, ActionKind.EV_SCHEDULE}:
-            if not _ev_action_wants_power(action):
-                return (
-                    entry_data.get(CONF_EV_CHARGER_STOP)
-                    or entry_data.get(CONF_EV_CHARGER)
-                    or entry_data.get(CONF_EV_SMART_CHARGING_STOP)
-                    or entry_data.get(CONF_EV_SMART_CHARGING)
-                )
-            return (
-                entry_data.get(CONF_EV_CHARGER_START)
-                or entry_data.get(CONF_EV_CHARGER)
-                or entry_data.get(CONF_EV_SMART_CHARGING_START)
-                or entry_data.get(CONF_EV_SMART_CHARGING)
-            )
-        if action.kind == ActionKind.EV_STOP:
-            return (
-                entry_data.get(CONF_EV_CHARGER_STOP)
-                or entry_data.get(CONF_EV_CHARGER)
-                or entry_data.get(CONF_EV_SMART_CHARGING_STOP)
-                or entry_data.get(CONF_EV_SMART_CHARGING)
-            )
+        return entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)
     if action.asset == ActionAsset.DAIKIN:
         return entry_data.get(CONF_DAIKIN_CLIMATE)
     if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
