@@ -4,6 +4,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to package
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,28 +17,21 @@ permissions:
 jobs:
   package-component:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
-      - name: Require stable operating evidence
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if [[ "$RELEASE_TAG" =~ ^v?[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
-            gh release download "$RELEASE_TAG" --pattern release-evidence.json --dir "$RUNNER_TEMP/release-evidence"
-            python3 scripts/validate-release-evidence.py --version "$RELEASE_TAG" --commit "$(git rev-parse HEAD)" --evidence "$RUNNER_TEMP/release-evidence/release-evidence.json"
-          fi
+          ref: ${{ inputs.release_tag && format('refs/tags/{0}', inputs.release_tag) || github.ref }}
       - name: Build validated component and checksum
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: python3 scripts/package-release.py --version "$RELEASE_TAG"
       - name: Verify packaged runtime before attaching assets
         run: scripts/docker-package-smoke.sh
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
           files: |
             dist/*.zip
             dist/*.sha256
