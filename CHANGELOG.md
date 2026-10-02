@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.3.0 - 2026-10-02
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add independent, opt-in Enphase Export Limit automation: negative half-hour export prices request 0 W, zero or positive prices disable the limit, with gateway confirmation, durable baseline restoration and export-only activation. Existing Enphase profile settings remain unchanged.
 
 - Preserve confirmed Plan calendar activity across replans and Home Assistant restarts, including short activity between replans. History excludes skipped, failed, and unconfirmed plans, has no automatic expiry, and labels estimated end times.
