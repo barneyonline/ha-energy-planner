@@ -431,11 +431,11 @@ def test_subentry_validation_rejects_ev_controls_owned_under_another_key() -> No
     errors = _validate_subentry_config(
         hass,
         current_entry,
-        {CONF_EV_CHARGER_START: "switch.shared_charger"},
+        {CONF_EV_CHARGER: "switch.shared_charger"},
         subentry_type=SUBENTRY_EV,
     )
 
-    assert errors[CONF_EV_CHARGER_START] == "household_actuator_in_use"
+    assert errors[CONF_EV_CHARGER] == "household_actuator_in_use"
 
 
 def test_subentry_validation_rejects_cross_role_actuator_collisions() -> None:
@@ -636,26 +636,12 @@ def test_enphase_profile_defaults_match_planner_roles() -> None:
     assert defaults[CONF_ENPHASE_FULL_BACKUP_PROFILE] == "Full Backup"
 
 
-def test_ev_charger_controls_accept_switches_buttons_and_input_buttons() -> None:
+def test_ev_charger_uses_one_stateful_control() -> None:
     ev_schema = PLANNER_SUBENTRY_SCHEMAS["ev"]
-    schema_fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
-
-    assert schema_fields[CONF_EV_CHARGER].serialize()["selector"]["entity"]["domain"] == [
-        "switch",
-        "input_boolean",
-    ]
-    assert schema_fields[CONF_EV_CHARGER_START].serialize()["selector"]["entity"]["domain"] == [
-        "switch",
-        "button",
-        "input_boolean",
-        "input_button",
-    ]
-    assert schema_fields[CONF_EV_CHARGER_STOP].serialize()["selector"]["entity"]["domain"] == [
-        "switch",
-        "button",
-        "input_boolean",
-        "input_button",
-    ]
+    fields = {getattr(key, "schema", key): selector for key, selector in ev_schema.schema.items()}
+    assert fields[CONF_EV_CHARGER].serialize()["selector"]["entity"]["domain"] == ["switch", "input_boolean"]
+    assert not {CONF_EV_CHARGER_START, CONF_EV_CHARGER_STOP, CONF_EV_SMART_CHARGING_START,
+                CONF_EV_SMART_CHARGING_STOP}.intersection(fields)
 
 
 def test_ev_target_soc_can_follow_vehicle_and_ready_by_remains_native() -> None:
@@ -666,7 +652,7 @@ def test_ev_target_soc_can_follow_vehicle_and_ready_by_remains_native() -> None:
     assert CONF_EV_SMART_CHARGING_READY_BY not in schema_fields
 
 
-def test_validate_config_accepts_input_button_ev_controls() -> None:
+def test_validate_config_ignores_retired_button_mappings() -> None:
     hass = FakeHass(
         {"input_button.ev_start", "input_button.ev_stop"},
         {("select", "select_option")},
@@ -1843,10 +1829,9 @@ def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on
         CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.ev_target",
     }
     switch = {CONF_EV_CHARGER: "switch.shared_charger"}
-    buttons = {CONF_EV_CHARGER_START: "button.ev_start", CONF_EV_CHARGER_STOP: "button.ev_stop"}
     entry = SimpleNamespace(
         entry_id="entry-current",
-        data={**sensors, **(buttons if enable_keep_on else switch)},
+        data={**sensors, **switch},
         options={CONF_EV_KEEP_CHARGER_ON: not enable_keep_on},
         subentries={},
     )
@@ -1857,7 +1842,7 @@ def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on
     flow.hass.config_entries = manager
     submission = _settings_submission(
         flow,
-        input_sections={INPUT_STEP_EV: {**sensors, **(switch if enable_keep_on else buttons)}},
+        input_sections={INPUT_STEP_EV: {**sensors, **switch}},
         policy_overrides={POLICY_STEP_EV_BATTERY_GRID: {CONF_EV_KEEP_CHARGER_ON: enable_keep_on}},
     )
     result = asyncio.run(flow.async_step_settings(submission))
@@ -1865,7 +1850,7 @@ def test_options_flow_validates_ev_mapping_with_submitted_keep_on(enable_keep_on
     assert result["data"][CONF_EV_KEEP_CHARGER_ON] is enable_keep_on
     saved = manager.async_update_entry.call_args.kwargs["data"]
     assert {key: value for key, value in saved.items() if key.startswith("ev_")} == {
-        **sensors, **(switch if enable_keep_on else buttons)
+        **sensors, **switch
     }
 
 
@@ -1921,3 +1906,29 @@ def test_load_recovery_max_age_rejects_invalid_values(value):
 @pytest.mark.parametrize("minutes", [1, 10, 15, 30])
 def test_load_recovery_max_age_accepts_supported_sources(minutes):
     assert _validate_options({**DEFAULT_OPTIONS, "load_recovery_max_age_minutes": minutes}) == {}
+
+
+@pytest.mark.parametrize("primary_key", [CONF_EV_CHARGER, CONF_EV_SMART_CHARGING, None])
+def test_combined_data_retires_all_separate_controls_without_promoting_them(primary_key) -> None:
+    controls = {
+        CONF_EV_CHARGER_START: "switch.old_start",
+        CONF_EV_CHARGER_STOP: "switch.old_stop",
+        CONF_EV_SMART_CHARGING_START: "button.old_start",
+        CONF_EV_SMART_CHARGING_STOP: "button.old_stop",
+    }
+    data = {**controls, CONF_INSTANCE_NAME: "Charger"}
+    if primary_key:
+        data[primary_key] = "switch.charger"
+    entry = SimpleNamespace(data=data, subentries={"ev": SimpleNamespace(data=controls)})
+    combined = combined_entry_data(entry)
+    assert not set(controls).intersection(combined)
+    assert combined.get(CONF_EV_CHARGER) == ("switch.charger" if primary_key else None)
+    assert entry.data == data  # Pure reads leave the persisted migration to setup.
+
+
+@pytest.mark.parametrize("domain", ["button", "input_button"])
+def test_validate_config_rejects_momentary_primary_charger_control(domain) -> None:
+    hass = _valid_hass()
+    entity = f"{domain}.charger"
+    hass.states.entity_ids.add(entity)
+    assert _validate_config(hass, {CONF_EV_CHARGER: entity})[CONF_EV_CHARGER] == "invalid_entity_domain"

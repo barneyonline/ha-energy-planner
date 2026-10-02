@@ -485,12 +485,9 @@ input_boolean:
   ev_charging:
     name: EV charging feedback
     initial: false
-  ev_smart_charging_start:
-    name: EV charger start
+  ev_charger:
+    name: EV charger
     initial: false
-  ev_smart_charging_stop:
-    name: EV charger stop
-    initial: true
 
 timer:
   climate_scheduler_guard:
@@ -603,26 +600,24 @@ automation:
     mode: restart
     triggers:
       - trigger: state
-        entity_id: input_boolean.ev_smart_charging_start
+        entity_id: input_boolean.ev_charger
         to: "on"
     actions:
       - action: input_boolean.turn_on
         data:
           entity_id:
-            - input_boolean.ev_smart_charging_stop
             - input_boolean.ev_charging
   - alias: Fake EV charger stop feedback
     id: fake_ev_charger_stop_feedback
     mode: restart
     triggers:
       - trigger: state
-        entity_id: input_boolean.ev_smart_charging_stop
+        entity_id: input_boolean.ev_charger
         to: "off"
     actions:
       - action: input_boolean.turn_off
         data:
           entity_id:
-            - input_boolean.ev_smart_charging_start
             - input_boolean.ev_charging
   - alias: Fake climate conflict
     id: fake_climate_conflict
@@ -849,11 +844,8 @@ automation:
       - action: input_boolean.turn_off
         data:
           entity_id:
-            - input_boolean.ev_smart_charging_start
+            - input_boolean.ev_charger
             - input_boolean.ev_charging
-      - action: input_boolean.turn_on
-        data:
-          entity_id: input_boolean.ev_smart_charging_stop
       - action: ha_energy_planner.resume_control
         data:
           reason: docker_smoke_ev_restore_setup
@@ -1181,8 +1173,9 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "ev_charging_entity": "input_boolean.ev_charging",
               "ev_connected_entity": "input_boolean.ev_connected",
               "ev_smart_charging_target_soc_entity": "input_number.ev_target_soc",
-              "ev_charger_start_entity": "input_boolean.ev_smart_charging_start",
-              "ev_charger_stop_entity": "input_boolean.ev_smart_charging_stop"
+              "ev_charger_entity": "input_boolean.ev_charger",
+              "ev_charger_start_entity": "button.retired_start",
+              "ev_charger_stop_entity": "button.retired_stop"
             },
             "subentry_id": "haep_ev",
             "subentry_type": "ev",

@@ -43,3 +43,28 @@ def test_invalid_audit_and_other_assets():
     rows = [{"asset": "enphase", "result": "failed", "attempted_at": NOW.isoformat()}]
     assert action_budget(rows, {"max_daily_enphase_actions": 2}, NOW, "enphase")["remaining"] == 1
     assert action_budget(rows, {}, NOW, "ev")["used"] == 0
+
+
+def test_missing_ev_controls_do_not_consume_or_poison_rolling_allowance():
+    missing = dict(asset="ev", kind="ev_stop", result="failed", reason="ev_control_unavailable",
+                   attempted_at=(NOW - timedelta(minutes=5)).isoformat())
+    attempted = {**missing, "reason": "ev_control_service_failed"}
+    rows = [missing] * 68 + [attempted]
+    compact = recent_attempts(rows, NOW)
+    assert compact == [attempted]
+    assert action_budget(rows, {"max_daily_ev_actions": 10}, NOW, "ev")["remaining"] == 9
+    # Other adapters' uncertain attempts and EV confirmation failures still count.
+    assert counted_attempt({**missing, "asset": "enphase"})
+    assert counted_attempt({**missing, "reason": "ev_state_confirmation_failed"})
+
+
+def test_target_loss_preserves_explicit_dispatch_evidence_in_compact_ledger():
+    row = dict(asset="ev", kind="ev_start", result="failed", reason="ev_control_unavailable",
+               attempted_at=NOW.isoformat())
+    for marker in (True, False, None):
+        recorded = {**row, "command_sent": marker}
+        assert counted_attempt(recorded) is (marker is True)
+    dispatched = {**row, "command_sent": True}
+    assert recent_attempts([dispatched], NOW) == [dispatched]
+    assert recent_attempts(recent_attempts([dispatched], NOW), NOW) == [dispatched]
+    assert action_budget([dispatched], {"max_daily_ev_actions": 1}, NOW, "ev")["remaining"] == 0

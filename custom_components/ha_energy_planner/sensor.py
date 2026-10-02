@@ -30,14 +30,10 @@ from .const import (
     CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
-    CONF_EV_CHARGER_START,
-    CONF_EV_CHARGER_STOP,
     CONF_EV_CHARGING,
     CONF_EV_CONNECTED,
     CONF_EV_CONTROL_ENABLED,
     CONF_EV_SMART_CHARGING,
-    CONF_EV_SMART_CHARGING_START,
-    CONF_EV_SMART_CHARGING_STOP,
     CONF_EV_SOC,
     CONF_WEATHER,
 )
@@ -450,11 +446,6 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
             ActionAsset.EV,
             [
                 ("charger", entry_data.get(CONF_EV_CHARGER) or entry_data.get(CONF_EV_SMART_CHARGING)),
-                (
-                    "start command",
-                    entry_data.get(CONF_EV_CHARGER_START) or entry_data.get(CONF_EV_SMART_CHARGING_START),
-                ),
-                ("stop command", entry_data.get(CONF_EV_CHARGER_STOP) or entry_data.get(CONF_EV_SMART_CHARGING_STOP)),
                 ("charging feedback", entry_data.get(CONF_EV_CHARGING)),
                 ("connection feedback", entry_data.get(CONF_EV_CONNECTED)),
                 ("state of charge", entry_data.get(CONF_EV_SOC)),
