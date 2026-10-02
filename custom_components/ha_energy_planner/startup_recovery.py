@@ -16,6 +16,7 @@ from .const import (
     DOMAIN,
     STARTUP_WARMUP_SECONDS,
 )
+from .export_limit_policy import area_safe
 from .models import (
     EnergyPlan,
     InputHealth,
@@ -446,9 +447,9 @@ def _record_startup_auto_recovery_validation_candidate(
     self._last_startup_auto_recovery_validation = {
         "plan_id": plan.plan_id,
         "healthy": plan.health == InputHealth.HEALTHY and plan.status != "unsafe",
-        "safe": plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
-        and plan.status == "current",
-        "violations": list(violations),
+        "safe": (plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
+        and plan.status == "current") or area_safe(plan),
+        "violations": [] if area_safe(plan) else list(violations),
         "committed": False,
     }
 
@@ -528,7 +529,9 @@ def _startup_auto_recovery_prerequisites(
         return False, "control_paused"
     if not control_areas.get("confidence_eligible"):
         return False, "no_confidence_eligible_control_area"
-    if entry_data.get(CONF_HOUSEHOLD_LOAD) and not bool(dict(report.get("recorder", {})).get("available")):
+    if (entry_data.get(CONF_HOUSEHOLD_LOAD)
+            and not bool(dict(report.get("recorder", {})).get("available"))
+            and not bool(dict(report.get("current_plan", {})).get("export_limit_safe"))):
         return False, "recorder_unavailable"
     return True, "startup_dependencies_ready"
 

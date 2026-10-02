@@ -170,11 +170,17 @@ def test_automatic_control_switch_retains_requested_intent_while_disarmed() -> N
     assert PlannerSwitch.is_on.fget(switch) is True
 
 
-def test_switches_expose_one_master_and_three_device_controls() -> None:
+def test_switches_expose_one_master_and_four_device_controls() -> None:
     descriptions = {description.key: description for description in SWITCHES}
     keys = set(descriptions)
 
-    assert keys == {"active_control", "climate_control", "ev_control", "enphase_control"}
+    assert keys == {
+        "active_control",
+        "climate_control",
+        "ev_control",
+        "enphase_control",
+        "enphase_export_limit_control",
+    }
     assert all(
         descriptions[key].entity_category is None
         for key in ("active_control", "climate_control", "ev_control", "enphase_control")

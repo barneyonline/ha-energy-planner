@@ -112,6 +112,8 @@ def plain_allocation_source(value: Any) -> str:
 def action_sentence(action: PlanAction) -> str:
     """Return a one-sentence explanation of a planned action."""
     desired = action.desired_state
+    if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+        return "Enable Export Limit at 0 W" if action.desired_state.get("watts") == 0 else "Disable Export Limit"
     if action.kind == ActionKind.SET_PROFILE:
         return f"Switch Enphase profile to {desired.get('profile', 'the selected profile')}."
     if action.kind == ActionKind.RESTORE_AI:
@@ -137,6 +139,9 @@ def action_label(action: PlanAction) -> str:
     """Return a short user-facing action label."""
     labels = {
         ActionKind.SET_PROFILE: "Switch Enphase profile",
+        ActionKind.SET_EXPORT_LIMIT: "Enable zero export",
+        ActionKind.DISABLE_EXPORT_LIMIT: "Disable Export Limit",
+        ActionKind.RESTORE_EXPORT_LIMIT: "Restore Export Limit",
         ActionKind.RESTORE_AI: "Restore AI profile",
         ActionKind.SET_HVAC: "Change climate state",
         ActionKind.RELEASE_HVAC: "Release climate control",
@@ -502,7 +507,7 @@ def asset_name(asset: ActionAsset) -> str:
     """Return a readable asset name."""
     names = {
         ActionAsset.DAIKIN: "Climate",
-        ActionAsset.ENPHASE: "Enphase",
+        ActionAsset.ENPHASE: "Enphase", ActionAsset.ENPHASE_EXPORT_LIMIT: "Enphase Export Limit",
         ActionAsset.EV: "EV",
     }
     return names.get(asset, display_state(asset))

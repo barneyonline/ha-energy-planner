@@ -258,7 +258,11 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_resume_control(call: ServiceCall) -> None:
         reason = str(call.data.get(ATTR_REASON, "user_requested"))
         coordinator = await _require_coordinator(call)
-        await coordinator.async_resume_control(reason)
+        asset = str(call.data.get(ATTR_ASSET, "all"))
+        if asset == "all":
+            await coordinator.async_resume_control(reason)
+        else:
+            await coordinator.async_resume_control(reason, asset=asset)
 
     hass.services.async_register(
         DOMAIN,
@@ -366,7 +370,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             {
                 **_config_entry_field(),
                 vol.Required(ATTR_DURATION_MINUTES): vol.All(vol.Coerce(int), vol.Range(min=1, max=10080)),
-                vol.Optional(ATTR_ASSET, default="all"): vol.In(["all", "ev", "daikin", "enphase"]),
+                vol.Optional(ATTR_ASSET, default="all"): vol.In(
+                    ["all", "ev", "daikin", "enphase", "enphase_export_limit"]),
                 vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code),
             }
         ),
@@ -378,6 +383,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         schema=vol.Schema(
             {
                 **_config_entry_field(),
+                vol.Optional(ATTR_ASSET, default="all"): vol.In(
+                    ["all", "ev", "daikin", "enphase", "enphase_export_limit"]),
                 vol.Optional(ATTR_REASON, default="user_requested"): vol.All(cv.string, _validate_reason_code),
             }
         ),
@@ -525,7 +532,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
             isinstance(ev_reservation, Mapping) and ev_reservation.get("active") is True
         )
         if (
-            getattr(getattr(restore_outcome, "result", None), "value", None) == "failed"
+            getattr(getattr(restore_outcome, "result", None), "value", None) in {"failed", "pending"}
             and unresolved_restore
         ):
             await coordinator.async_disarm_production_control("entry_unload_restore_failed")

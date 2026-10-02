@@ -55,6 +55,7 @@ class DiscoveryReport:
     hvac: CapabilityEvidence
     enphase: CapabilityEvidence
     ai: CapabilityEvidence
+    enphase_export_limit: CapabilityEvidence = field(default_factory=lambda: CapabilityEvidence(False))
 
     def for_asset(self, asset: ActionAsset) -> CapabilityEvidence:
         """Return capability evidence for a controllable asset."""
@@ -64,6 +65,8 @@ class DiscoveryReport:
             return self.hvac
         if asset == ActionAsset.ENPHASE:
             return self.enphase
+        if asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+            return self.enphase_export_limit
         return CapabilityEvidence(False, ["unknown_asset"])
 
     def as_dict(self) -> dict[str, Any]:
@@ -73,6 +76,7 @@ class DiscoveryReport:
             "hvac": _evidence_dict(self.hvac),
             "enphase": _evidence_dict(self.enphase),
             "ai": _evidence_dict(self.ai),
+            "enphase_export_limit": _evidence_dict(self.enphase_export_limit),
         }
 
 
@@ -97,6 +101,7 @@ class CapabilityDiscovery:
             hvac=self._inspect_hvac(),
             enphase=self._inspect_enphase(),
             ai=self._inspect_ai(),
+            enphase_export_limit=self._inspect_export_limit(),
         )
 
     def _inspect_ev(self) -> CapabilityEvidence:
@@ -261,6 +266,20 @@ class CapabilityDiscovery:
                 "full_backup_profile_configured": bool(full_backup_profile),
             },
         )
+
+    def _inspect_export_limit(self) -> CapabilityEvidence:
+        from homeassistant.util import dt as dt_util
+
+        from .const import CONF_ENPHASE_EXPORT_LIMIT_ENTITY
+        from .enphase_export_limit import feedback
+
+        if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+            return CapabilityEvidence(False, ["export_limit_not_configured"])
+        observed, issue = feedback(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), dt_util.utcnow())
+        issues = [issue] if issue else []
+        for service in ("set_export_limit", "disable_export_limit"):
+            issues.extend(_service_evidence(self.hass, f"enphase_ev.{service}", "export_limit_service").issues)
+        return CapabilityEvidence(not issues, issues, observed)
 
     def _inspect_ai(self) -> CapabilityEvidence:
         task_entity = str(self.entry_data.get(CONF_AI_TASK_ENTITY, "") or "").strip()

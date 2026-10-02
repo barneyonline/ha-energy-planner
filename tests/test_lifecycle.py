@@ -435,10 +435,14 @@ def test_failed_configuration_reload_handoff_restarts_safe_recovery() -> None:
     assert entry.runtime_data is coordinator
 
 
-def test_unload_stops_when_safe_state_restore_fails() -> None:
+@pytest.mark.parametrize("result", [OutcomeResult.FAILED, OutcomeResult.PENDING])
+def test_unload_stops_when_safe_state_restore_fails(result) -> None:
     coordinator = FakeCoordinator(None, FakeEntry(), FakeStore(None))
-    coordinator.restore_outcome = SimpleNamespace(result=OutcomeResult.FAILED)
-    coordinator.store.data["ownership"] = {"ev_smart_charging_state": {"switch.ev": "on"}}
+    coordinator.restore_outcome = SimpleNamespace(result=result)
+    coordinator.store.data["ownership"] = (
+        {"enphase_export_limit": {"baseline": {"watts": None, "slew_rate": 100}, "restoring": True}}
+        if result == OutcomeResult.PENDING else {"ev_smart_charging_state": {"switch.ev": "on"}}
+    )
     entry = FakeEntry(runtime_data=coordinator)
     hass = FakeHass(FakeConfigEntries())
 
