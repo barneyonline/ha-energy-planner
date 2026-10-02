@@ -15,7 +15,7 @@
 ### 🐛 Bug fixes
 
 - Use one stateful charger switch for both EV start and stop commands; remove separate start/stop fields and button dispatch. Upgrades remove retired mappings while preserving the configured switch and saved recovery evidence. Installations with only separate controls must configure a switch (or `input_boolean` helper).
-- Exclude EV checks that never dispatched a command from the rolling action allowance and remove older missing-control retry counts on reload.
+- Exclude EV checks that never dispatched a command from the rolling action allowance and remove older missing-control retry counts on reload. Preserve explicit dispatch evidence so partial commands followed by charger target loss still consume allowance after reload.
 
 - Prevent Home Assistant startup climate feedback from enabling manual override; explicit user changes and override controls remain effective during startup.
 

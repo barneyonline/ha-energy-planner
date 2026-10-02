@@ -56,3 +56,15 @@ def test_missing_ev_controls_do_not_consume_or_poison_rolling_allowance():
     # Other adapters' uncertain attempts and EV confirmation failures still count.
     assert counted_attempt({**missing, "asset": "enphase"})
     assert counted_attempt({**missing, "reason": "ev_state_confirmation_failed"})
+
+
+def test_target_loss_preserves_explicit_dispatch_evidence_in_compact_ledger():
+    row = dict(asset="ev", kind="ev_start", result="failed", reason="ev_control_unavailable",
+               attempted_at=NOW.isoformat())
+    for marker in (True, False, None):
+        recorded = {**row, "command_sent": marker}
+        assert counted_attempt(recorded) is (marker is True)
+    dispatched = {**row, "command_sent": True}
+    assert recent_attempts([dispatched], NOW) == [dispatched]
+    assert recent_attempts(recent_attempts([dispatched], NOW), NOW) == [dispatched]
+    assert action_budget([dispatched], {"max_daily_ev_actions": 1}, NOW, "ev")["remaining"] == 0

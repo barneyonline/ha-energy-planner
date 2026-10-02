@@ -7746,3 +7746,80 @@ def test_empty_owned_topology_never_stops_a_replacement_charger() -> None:
 
 def test_unknown_asset_has_no_service_target() -> None:
     assert _service_target_for_action(SimpleNamespace(asset="unknown"), {CONF_EV_CHARGER: "switch.charger"}) is None
+
+
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("failure", ["power_limit", "confirmation_retry"])
+def test_ev_dispatched_target_loss_counts_toward_allowance_after_reload(monkeypatch, manual, failure) -> None:
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+
+    from homeassistant.core import State
+
+    from custom_components.ha_energy_planner import storage as storage_module
+    from custom_components.ha_energy_planner.action_limits import action_budget
+    from custom_components.ha_energy_planner.storage import PlannerStore
+
+    backend = SimpleNamespace(async_save=AsyncMock(), async_load=AsyncMock())
+    monkeypatch.setattr(storage_module, "Store", lambda *args, **kwargs: backend)
+    now = datetime.now(UTC)
+    hass = FakeHass()
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda _: [SimpleNamespace(entry_id="ev-a", runtime_data=object())]
+    )
+    hass.states.values = {
+        "switch.charger": State("switch.charger", "off"),
+        "binary_sensor.connected": State("binary_sensor.connected", "on"),
+        "binary_sensor.charging": State("binary_sensor.charging", "off"),
+        "number.limit": State("number.limit", "3", {"unit_of_measurement": "kW", "min": 1, "max": 7, "step": 1}),
+        "sensor.power": State("sensor.power", "0", {"unit_of_measurement": "kW"}),
+    }
+    hass.states.get = hass.states.values.get
+
+    async def lose_charger(domain, service, data, blocking=False):
+        hass.services.calls.append((domain, service, data))
+        if domain == "number":
+            original = hass.states.values[data["entity_id"]]
+            hass.states.values[data["entity_id"]] = State(
+                data["entity_id"], str(data["value"]), dict(original.attributes)
+            )
+        hass.states.values["switch.charger"] = State("switch.charger", "unavailable")
+
+    hass.services.async_call = lose_charger
+    data = {CONF_EV_CHARGER: "switch.charger", CONF_EV_CONNECTED: "binary_sensor.connected",
+            CONF_EV_CHARGING: "binary_sensor.charging"}
+    limit = {"entity_id": "number.limit", "value": 7, "unit": "kW", "physical_power_kw": 7}
+    if failure == "power_limit":
+        data.update({"ev_power_limit_entity": "number.limit", "ev_power_entity": "sensor.power"})
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, CONF_EV_CONTROL_ENABLED: True,
+               CONF_EV_CHARGE_RATE_KW: 7, CONF_GRID_IMPORT_LIMIT_KW: 10, CONF_MAX_DAILY_EV_ACTIONS: 1,
+               CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0, CONF_EV_CONFIRMATION_RETRIES: 1,
+               "ev_limit_min": 1, "ev_limit_max": 7}
+    store = PlannerStore(hass, "ev-a")
+    executor = Executor(store, hass=hass, entry_data=data, options=options, entry_id="ev-a")
+    context = _context(now)
+    if manual:
+        result = asyncio.run(executor.async_manual_ev_charging(True, context))
+        assert result.reason == "ev_control_unavailable" and result.command_sent
+    else:
+        _arm_store(store, executor)
+        action = PlanAction("loss", "plan-1", now, now + timedelta(minutes=5), ActionAsset.EV, ActionKind.EV_START,
+                            {"charging_required_now": True,
+                             **({"power_limit": limit} if failure == "power_limit" else {})},
+                            [], [], 0, 1)
+        plan = EnergyPlan("plan-1", now, 12, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                          "loss", 1, None, actions=[action], preview=[])
+        asyncio.run(executor.async_evaluate(plan, context))
+    assert len(hass.services.calls) == 1
+    expected_service = ("number", "set_value") if failure == "power_limit" else ("switch", "turn_on")
+    assert hass.services.calls[0][:2] == expected_service
+    assert store.data["execution_audit"][-1]["reason"] == "ev_control_unavailable"
+    assert store.data["execution_audit"][-1]["result"] == "failed"
+    assert action_budget(store.data["action_attempts"], options, datetime.now(UTC), "ev")["used"] == 1
+    assert store.data["action_attempts"][0]["command_sent"] is True
+    backend.async_load.return_value = deepcopy(store.data)
+    restored = PlannerStore(hass, "ev-a")
+    asyncio.run(restored.async_load())
+    assert action_budget(restored.data["action_attempts"], options, datetime.now(UTC), "ev")["remaining"] == 0
+    assert restored.data["execution_audit"][-1]["command_sent"] is True

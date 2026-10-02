@@ -467,6 +467,8 @@ def _audit_entry(outcome: ActionOutcome | dict[str, Any]) -> dict[str, Any]:
         "pre_state": _bounded_mapping(entry.get("pre_state")),
         "post_state": _bounded_mapping(entry.get("post_state")),
     }
+    if isinstance(entry.get("command_sent"), bool):
+        audit["command_sent"] = entry["command_sent"]
     if isinstance(entry.get("desired_state"), dict):
         audit["desired_state"] = _bounded_mapping(entry["desired_state"])
     if "occurrence_count" in entry:

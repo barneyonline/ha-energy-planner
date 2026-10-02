@@ -513,6 +513,7 @@ class Executor:
                 post_state=result.post_state,
                 plan_id=plan_id,
                 ev_entry_data=ev_entry_data,
+                command_sent=result.command_sent,
             )
         )
 
@@ -944,6 +945,7 @@ class Executor:
                     post_state=ev_result.post_state,
                     plan_id=plan.plan_id,
                     ev_entry_data=ev_entry_data,
+                    command_sent=ev_result.command_sent,
                 )
             )
             return None
@@ -1743,6 +1745,7 @@ class Executor:
         post_state: dict[str, Any],
         plan_id: str,
         ev_entry_data: dict[str, Any] | None = None,
+        command_sent: bool | None = None,
     ) -> ActionOutcome:
         """Return an outcome enriched for the execution audit trail."""
         service_target = (
@@ -1765,6 +1768,7 @@ class Executor:
             kind=str(action.kind),
             service_target=service_target,
             desired_state=dict(action.desired_state),
+            command_sent=command_sent,
         )
 
     def _export_limit_rejection_reason(self, action: PlanAction, now: datetime) -> str | None:

@@ -648,3 +648,6 @@ rules:
 # command identity and snapshots. test_config_flow.py and test_lifecycle.py
 # cover configuration and upgrade behavior; test_ev_adapter.py, test_executor.py,
 # test_action_limits.py and test_storage.py cover safe recovery and accounting.
+# Review regressions preserve explicit dispatch evidence in audit and rolling
+# allowance storage after partial power-limit commands or confirmation retries
+# lose the charger target; test_executor.py and test_storage.py cover reloads.
