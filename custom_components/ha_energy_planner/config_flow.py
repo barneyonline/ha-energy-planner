@@ -62,6 +62,8 @@ from .const import (
     CONF_DRY_RUN,
     CONF_ENPHASE_AI_PROFILE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_FULL_BACKUP_PROFILE,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_ENPHASE_PROFILE,
@@ -121,6 +123,7 @@ from .const import (
     CONF_MAX_DAILY_CLIMATE_ACTIONS,
     CONF_MAX_DAILY_ENPHASE_ACTIONS,
     CONF_MAX_DAILY_EV_ACTIONS,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     CONF_MIN_CLIMATE_CONFIDENCE,
     CONF_MIN_ENPHASE_CONFIDENCE,
     CONF_MIN_EV_CONFIDENCE,
@@ -233,23 +236,26 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 
 ENERGY_DATA_SCHEMA = vol.Schema(
     {
-        vol.Required(CONF_AMBER_IMPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
+        vol.Optional(CONF_AMBER_IMPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
         vol.Required(CONF_AMBER_EXPORT_PRICE): _entity_selector(entity_filter=_sensor_filter(_PRICE_SENSOR_UNITS)),
-        vol.Required(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
+        vol.Optional(CONF_PV_FORECAST): _entity_selector(entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)),
         vol.Optional(CONF_PV_FORECAST_SECONDARY): _entity_selector(
             entity_filter=_sensor_filter(_FORECAST_SENSOR_UNITS)
         ),
-        vol.Required(CONF_HOUSEHOLD_LOAD): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
+        vol.Optional(CONF_HOUSEHOLD_LOAD): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_CARBON_INTENSITY_FORECAST): _entity_selector(
             entity_filter=_sensor_filter(_CARBON_INTENSITY_SENSOR_UNITS)
         ),
         vol.Optional(CONF_PV_OBSERVED): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
-        vol.Required(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
+        vol.Optional(CONF_BATTERY_SOC): _entity_selector(entity_filter=_sensor_filter(_PERCENT_SENSOR_UNITS)),
     }
 )
 
 ENPHASE_DATA_SCHEMA = vol.Schema(
     {
+        vol.Optional(CONF_ENPHASE_EXPORT_LIMIT_ENTITY): _entity_selector(
+            entity_filter={"domain": "sensor", "integration": "enphase_ev"}
+        ),
         vol.Optional(CONF_ENPHASE_PROFILE): _entity_selector(["select", "input_select"]),
         vol.Optional(CONF_ENPHASE_AI_PROFILE, default=DEFAULT_ENPHASE_AI_PROFILE): TextSelector(),
         vol.Optional(
@@ -342,6 +348,7 @@ _HOUSEHOLD_ACTUATOR_KEYS = (
     CONF_CLIMATE_ZONES,
     CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_ENPHASE_PROFILE,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
 )
 _EV_ACTUATOR_KEYS = (
     "ev_power_limit_entity",
@@ -362,7 +369,7 @@ _SUBENTRY_ACTUATOR_KEYS = {
             CONF_CLIMATE_MANUAL_OVERRIDE,
         }
     ),
-    SUBENTRY_ENPHASE: frozenset({CONF_ENPHASE_PROFILE}),
+    SUBENTRY_ENPHASE: frozenset({CONF_ENPHASE_PROFILE, CONF_ENPHASE_EXPORT_LIMIT_ENTITY}),
     SUBENTRY_EV: frozenset(_EV_ACTUATOR_KEYS),
 }
 
@@ -396,6 +403,7 @@ _ENTITY_MANAGED_OPTION_FIELDS = frozenset(
         CONF_EV_CONTROL_ENABLED,
         CONF_CLIMATE_CONTROL_ENABLED,
         CONF_ENPHASE_CONTROL_ENABLED,
+        CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     }
 )
 
@@ -450,11 +458,13 @@ _POLICY_SECTION_FIELDS = {
         CONF_EV_CONTROL_ENABLED,
         CONF_CLIMATE_CONTROL_ENABLED,
         CONF_ENPHASE_CONTROL_ENABLED,
+        CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
         CONF_AI_TIMEOUT_SECONDS,
         CONF_COMMAND_RATE_LIMIT_SECONDS,
         CONF_MAX_DAILY_EV_ACTIONS,
         CONF_MAX_DAILY_CLIMATE_ACTIONS,
         CONF_MAX_DAILY_ENPHASE_ACTIONS,
+        CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     ),
     POLICY_STEP_DATA_HEALTH: (
         CONF_BYPASS_SAFETY_GATES,
@@ -719,6 +729,10 @@ def _option_selector(field: str) -> Any:
         CONF_MAX_DAILY_CLIMATE_ACTIONS: NumberSelector(
             NumberSelectorConfig(min=0, max=48, step=1, mode=NumberSelectorMode.BOX)
         ),
+        CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS: NumberSelector(
+            NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
+        ),
+        CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: BooleanSelector(),
         CONF_MAX_DAILY_ENPHASE_ACTIONS: NumberSelector(
             NumberSelectorConfig(min=0, max=48, step=1, mode=NumberSelectorMode.BOX)
         ),
@@ -1254,6 +1268,12 @@ def _validate_config(hass: HomeAssistant, user_input: dict[str, Any]) -> dict[st
             if unit_error:
                 errors[key] = unit_error
                 break
+    entity = user_input.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+    if entity and CONF_ENPHASE_EXPORT_LIMIT_ENTITY not in errors:
+        from .enphase_export_limit import target_identity
+
+        if target_identity(hass, str(entity)) is None:
+            errors[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "invalid_export_limit_entity"
     return errors
 
 
@@ -1406,6 +1426,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_PV_OBSERVED: {"sensor"},
     CONF_BATTERY_SOC: {"sensor"},
     CONF_ENPHASE_PROFILE: {"select", "input_select"},
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY: {"sensor"},
     CONF_DAIKIN_CLIMATE: {"climate"},
     CONF_DAIKIN_POWER: {"sensor"},
     CONF_CLIMATE_AUTOMATIONS: {"automation"},

@@ -75,6 +75,9 @@
       },
       "enphase_control": {
         "default": "mdi:home-battery-outline"
+      },
+      "enphase_export_limit_control": {
+        "default": "mdi:transmission-tower-export"
       }
     },
     "calendar": {

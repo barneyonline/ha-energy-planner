@@ -11,6 +11,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
 )
 from .coordinator import EnergyPlannerCoordinator
@@ -31,6 +32,10 @@ class PlannerSwitchDescription(SwitchEntityDescription):
 
 
 SWITCHES: tuple[PlannerSwitchDescription, ...] = (
+    PlannerSwitchDescription(
+        key="enphase_export_limit_control", translation_key="enphase_export_limit_control",
+        option_key=CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, default=False,
+    ),
     PlannerSwitchDescription(
         key="active_control",
         translation_key="active_control",
@@ -120,6 +125,7 @@ class PlannerSwitch(EnergyPlannerEntity, SwitchEntity):
             CONF_CLIMATE_CONTROL_ENABLED,
             CONF_EV_CONTROL_ENABLED,
             CONF_ENPHASE_CONTROL_ENABLED,
+            CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
         }
         await self.coordinator.async_set_device_control(option_key, value)
         self.async_write_ha_state()

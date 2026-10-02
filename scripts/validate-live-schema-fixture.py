@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 
 from custom_components.ha_energy_planner.climate_inputs import read_climate_inputs  # noqa: E402
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS  # noqa: E402
+from custom_components.ha_energy_planner.export_limit_policy import confirmed_feedback, tariff_blocks  # noqa: E402
 from custom_components.ha_energy_planner.forecasts import forecast_series_from_state  # noqa: E402
 
 V1_REAL_PROFILE_REQUIREMENTS = {
@@ -84,6 +85,15 @@ def main() -> int:
 
 def _validate_fixture(fixture: dict[str, Any]) -> dict[str, Any]:
     kind = fixture.get("kind")
+    if kind in {"enphase_export_limit", "export_tariff"}:
+        now = datetime.fromisoformat(fixture["now"])
+        state = SimpleNamespace(**fixture["state"])
+        state.last_updated = datetime.fromisoformat(fixture["state"]["last_updated"])
+        value, issue = (confirmed_feedback(state, now) if kind == "enphase_export_limit"
+                        else tariff_blocks(state, now, {**DEFAULT_OPTIONS, **fixture.get("options", {})}))
+        if issue != fixture.get("expected_issue") or value != fixture["expected"]:
+            raise ValueError(f"Export fixture mismatch: {value}, {issue}")
+        return {"kind": kind, "name": fixture["name"]}
     if kind == "climate_inputs":
         now = datetime.fromisoformat(fixture["now"])
         states = {entity: SimpleNamespace(state=value["state"], attributes=value.get("attributes", {}),

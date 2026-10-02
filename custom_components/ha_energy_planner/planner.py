@@ -13,6 +13,7 @@ from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_ENPHASE_MIN_SAVINGS,
     CONF_EV_CHARGE_RATE_KW,
     CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED,
@@ -33,6 +34,7 @@ from .const import (
 from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
 from .ev_optimization import optimise_ev
 from .ev_policy import strategy
+from .export_limit_policy import EXPORT_ASSET, assumed_zero_export, build_actions, curtailment_preview
 from .models import (
     ActionAsset,
     ActionKind,
@@ -101,10 +103,28 @@ class DryRunPlanner:
         mode = self._mode(context)
         confidence = self._confidence(context)
         actions = self._actions(context, mode)
+        if mode != PlannerMode.DISABLED and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+            actions.extend(build_actions(context))
         preview = self._preview(context)
         estimated_cost = self._estimate_cost(context)
         estimated_cost_horizon = self._estimated_cost_horizon_hours(context)
         device_plans = build_device_plans(context, actions, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        if context.export_limit:
+            observed = context.export_limit.get("feedback", {})
+            ownership = context.export_limit.get("ownership", {})
+            confirmed_label = ("Unknown" if "watts" not in observed else "Disabled" if observed["watts"] is None
+                               else f"Enabled — {observed['watts']} W")
+            current_label = ("Unconfirmed" if ownership.get("pause") == "export_limit_unconfirmed"
+                             or observed.get("state") == "unconfirmed" else "Pending"
+                             if observed.get("pending") or ownership.get("pending") else confirmed_label)
+            blocks = context.export_limit.get("blocks", [])
+            device_plans[EXPORT_ASSET] = {**context.export_limit,
+                "current_state_label": current_label, "confirmed_setting": confirmed_label,
+                "next_planned_state_label": ("Enabled — 0 W" if blocks[-1]["watts"] == 0 else "Disabled")
+                if blocks else "Hold confirmed setting", "timeline": [
+                {**block, "state": "Enabled — 0 W" if block["watts"] == 0 else "Disabled",
+                 "reason": "Negative export price" if block["watts"] == 0 else "Nonnegative export price"}
+                for block in context.export_limit.get("blocks", [])]}
         if context.climate_decision:
             device_plans.setdefault("climate", {}).update({"economics": context.climate_decision})
         confidence_breakdown = _confidence_breakdown(context, actions)
@@ -143,12 +163,15 @@ class DryRunPlanner:
             timeline_card=timeline_card,
             confidence_breakdown=confidence_breakdown,
             estimated_cost_horizon_hours=estimated_cost_horizon,
+            control_area_health={EXPORT_ASSET: dict(context.export_limit)} if context.export_limit else {},
         )
 
     def _mode(self, context: DecisionContext) -> PlannerMode:
         planner_enabled = strict_bool(self.options.get(CONF_PLANNER_ENABLED), default=False)
         dry_run = strict_bool(self.options.get(CONF_DRY_RUN), default=True)
         if context.input_health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
+            if planner_enabled and dry_run and context.export_limit:
+                return PlannerMode.DRY_RUN
             return PlannerMode.ACTIVE_DEGRADED if planner_enabled else PlannerMode.DISABLED
         if not planner_enabled:
             return PlannerMode.DISABLED
@@ -171,6 +194,7 @@ class DryRunPlanner:
                 "carbon_intensity_g_per_kwh": slot.carbon_intensity_g_per_kwh,
                 "outdoor_temperature_forecast_c": slot.outdoor_temperature_forecast_c,
                 "battery_floor_percent": battery_floor,
+                **(curtailment_preview(context, slot) if context.export_limit else {}),
                 "occupied": context.occupancy_state,
             }
             for slot in slots
@@ -668,6 +692,11 @@ class DryRunPlanner:
         }}
 
     def _estimate_cost(self, context: DecisionContext) -> float | None:
+        if context.export_limit and any(
+            slot.import_price is None or slot.export_price is None
+            or slot.pv_forecast_kw is None or slot.baseline_load_forecast_kw is None for slot in context.slots
+        ):
+            return None
         total = 0.0
         has_data = False
         interval_hours = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES])).total_seconds() / 3600
@@ -678,7 +707,7 @@ class DryRunPlanner:
             net_kw = load_kw - (slot.pv_forecast_kw or 0.0)
             if net_kw >= 0:
                 total += net_kw * interval_hours * slot.import_price
-            elif slot.export_price is not None:
+            elif slot.export_price is not None and not assumed_zero_export(context, slot.valid_at):
                 total += net_kw * interval_hours * slot.export_price
             has_data = True
         return round(total, 4) if has_data else None

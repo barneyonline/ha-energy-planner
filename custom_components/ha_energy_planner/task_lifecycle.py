@@ -47,6 +47,10 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if self._boundary_cancel is not None:
         self._boundary_cancel()
         self._boundary_cancel = None
+    export_cancel = getattr(self, "_export_boundary_cancel", None)
+    if export_cancel is not None:
+        export_cancel()
+        self._export_boundary_cancel = None
     ai_task = getattr(self, "_ai_advice_task", None)
     if ai_task is not None and not ai_task.done():
         ai_task.cancel()

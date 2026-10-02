@@ -1,0 +1,42 @@
+{
+  "name": "export_limit_1_zero",
+  "options": {
+    "planner_enabled": true,
+    "dry_run": false,
+    "enphase_export_limit_control_enabled": true
+  },
+  "now": "2026-10-01T01:00:00+00:00",
+  "context": {
+    "created_at": "2026-10-01T01:00:00+00:00",
+    "plan_id": "export-1",
+    "slots": [],
+    "input_health": "unsafe",
+    "occupancy_state": "unknown"
+  },
+  "plan": {
+    "mode": "ACTIVE_DEGRADED",
+    "health": "unsafe",
+    "actions": [
+      {
+        "action_id": "export-1",
+        "asset": "enphase_export_limit",
+        "kind": "disable_export_limit",
+        "execute_not_before": "2026-10-01T01:00:00+00:00",
+        "execute_not_after": "2026-10-01T01:30:00+00:00",
+        "desired_state": {
+          "watts": null
+        },
+        "confidence": 1
+      }
+    ],
+    "control_area_health": {
+      "enphase_export_limit": {
+        "ready": true
+      }
+    }
+  },
+  "expected_plan_violations": [
+    "input_health_unsafe"
+  ],
+  "expected_rejected_action_count": 0
+}

@@ -69,6 +69,8 @@ from .const import (
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CHARGING,
@@ -83,6 +85,7 @@ from .const import (
     CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
@@ -97,12 +100,16 @@ from .const import (
 )
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
+from .enphase_export_limit import ExportLimitControl
+from .enphase_export_limit import evidence as export_limit_evidence
+from .enphase_export_limit import feedback as export_limit_feedback
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
 from .ev_runtime import audit_evidence
 from .ev_telemetry import sample_ev, update_ev_telemetry
 from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
+from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .inputs import InputManager
 from .load_forecast import normalize_power_kw
@@ -274,6 +281,7 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
         CONF_CARBON_INTENSITY_FORECAST,
         CONF_BATTERY_SOC,
         CONF_ENPHASE_PROFILE,
+        CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
         CONF_DAIKIN_CLIMATE,
         CONF_CLIMATE_MANUAL_OVERRIDE,
         CONF_CLIMATE_ZONES,
@@ -368,6 +376,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
+        self._export_boundary_cancel: Callable[[], None] | None = None
         self._ev_auto_start_retry_cancel: Callable[[], None] | None = None
         self._ev_auto_start_compensation_pending = False
         self._ev_auto_start_compensation_generation = 0
@@ -675,6 +684,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 None,
             )
             entity_id = str(event.data.get("entity_id") or "")
+            if entity_id == entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+                self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
+                return
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
             if not getattr(self.hass, "is_running", True) and (
                 is_main_climate
@@ -948,6 +960,25 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass, max((deadline-dt_util.utcnow()).total_seconds(), 0), due)
 
     @callback
+    def _schedule_export_boundary(self, evidence: dict[str, Any]) -> None:
+        if self._export_boundary_cancel is not None:
+            self._export_boundary_cancel()
+            self._export_boundary_cancel = None
+        blocks = evidence.get("blocks", [])
+        if not blocks:
+            return
+        deadline = block_time(blocks[0]["end"])
+
+        @callback
+        def due(_now: Any) -> None:
+            self._export_boundary_cancel = None
+            self._mark_forced_refresh("export_tariff_boundary")
+            self._async_create_listener_task(self.async_request_refresh())
+
+        self._export_boundary_cancel = async_call_later(
+            self.hass, max((deadline - dt_util.utcnow()).total_seconds(), 0), due)
+
+    @callback
     def _schedule_next_boundary_refresh(self) -> None:
         """Schedule the next planning-interval boundary refresh."""
         if self._boundary_cancel is not None:
@@ -1044,6 +1075,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 await self.store.async_save_vehicle_calibration(profile["id"], updated_model)
                 self._force_next_refresh = True
         self.executor.options = options
+        if entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+            async with self._command_lock:
+                export_control = ExportLimitControl(self.hass, self.store, entry_data)
+                await export_control.reconcile(now)
+                if (export_control.state.get("restoring")
+                        and not getattr(self, "_startup_auto_recovery_validation_active", False)):
+                    await export_control.restore(now)
+                elif self.active_control and options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+                    observed, export_issue = export_limit_feedback(
+                        self.hass, entry_data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY], now)
+                    if not export_control.state and export_issue == "export_limit_unsupported":
+                        await export_control.save({"identity": observed["identity"], "pause": export_issue})
+                    if not export_control.state and not export_issue and not observed["pending"]:
+                        await export_control.save({"identity": observed["identity"], "expected": {
+                            "watts": observed["watts"], "slew_rate": observed["slew_rate"]}})
         force_refresh = bool(getattr(self, "_force_next_refresh", False))
         self._force_next_refresh = False
         weather_forecast, weather_forecast_details = await self._async_weather_forecast(
@@ -1116,6 +1162,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        runtime = dict(self.store.data.get("ownership", {}).get(EXPORT_ASSET, {}))
+        if runtime and not getattr(context, "export_limit", None):
+            # Keep outstanding restoration visible after its selector is off.
+            context.export_limit = export_limit_evidence(self.hass, entry_data, options, now)
+        if getattr(context, "export_limit", None):
+            context.export_limit["ownership"] = runtime
+            if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True:
+                context.export_limit.update(ready=False, reason="export_limit_control_disabled")
+            if runtime.get("pause") or runtime.get("pending") or runtime.get("restoring"):
+                context.export_limit.update(ready=False, reason=runtime.get("pause") or "export_limit_pending")
+            self._schedule_export_boundary(context.export_limit
+                if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True else {})
+        elif getattr(self, "_export_boundary_cancel", None) is not None:
+            self._schedule_export_boundary({})
         context.ev_evidence["load_recovery_completed"] = getattr(self, "_load_recovery_pending", False)
         ev_sample = sample_ev(self.hass, entry_data, options, context)
         reservation = self.store.data.get("ev_grid_reservation", {})
@@ -1364,7 +1424,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
-        if self.active_control and pause_blocks_all_control:
+        if self.active_control and pause_blocks_all_control and required_control_areas != [EXPORT_ASSET]:
             # A temporary pause remains authoritative, but it must not erase a
             # previously armed installation's automatic-control lifecycle.
             # Persist the restart-resumable handoff before disarming so a
@@ -1488,12 +1548,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 CONF_EV_CONTROL_ENABLED,
                 CONF_CLIMATE_CONTROL_ENABLED,
                 CONF_ENPHASE_CONTROL_ENABLED,
+                CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
             }
             # Policy changes need a fresh plan, not a release of unrelated assets.
             # Physical capabilities, entity mappings and safety thresholds retain
             # the full disarm/recovery path below.
             hot_policy_keys = {
                 "max_daily_ev_actions", "max_daily_climate_actions", "max_daily_enphase_actions",
+                CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
                 "manual_hvac_override_minutes", "plan_fallback_notifications_enabled",
                 "ev_charging_strategy", "ev_readiness_buffer_minutes", "ev_schedule_min_saving",
                 "ev_schedule_min_saving_percent", "ev_min_dwell_minutes",
@@ -1536,7 +1598,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 and production.armed
             )
             automatic_lifecycle_was_active = was_running or recovery_was_pending
-            await self.async_cancel_startup_auto_recovery("options_changed")
+            await self.async_cancel_startup_auto_recovery(
+                "options_changed", restore_owned_state=not device_control_only_change)
             automatic_control_still_requested = bool(
                 strict_bool(current_options.get(CONF_PLANNER_ENABLED), default=False)
                 and not strict_bool(current_options.get(CONF_DRY_RUN), default=True)
@@ -1568,6 +1631,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     (CONF_EV_CONTROL_ENABLED, "ev", "ev"),
                     (CONF_CLIMATE_CONTROL_ENABLED, "hvac", "daikin"),
                     (CONF_ENPHASE_CONTROL_ENABLED, "enphase", "enphase"),
+                    (CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, EXPORT_ASSET, EXPORT_ASSET),
                 )
                 if previous_options is not None
                 and strict_bool(previous_options.get(option_key), default=False)
@@ -2086,6 +2150,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 CONF_EV_CONTROL_ENABLED,
                 CONF_CLIMATE_CONTROL_ENABLED,
                 CONF_ENPHASE_CONTROL_ENABLED,
+                CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
             )
         )
         if not device_control_selected:
@@ -2123,6 +2188,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             CONF_EV_CONTROL_ENABLED: "ev",
             CONF_CLIMATE_CONTROL_ENABLED: "hvac",
             CONF_ENPHASE_CONTROL_ENABLED: "enphase",
+            CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: EXPORT_ASSET,
         }
         if option_key not in control_areas:
             raise ValueError(f"Unsupported device control option: {option_key}")
@@ -2140,7 +2206,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
 
         if self.active_control and enabled:
-            report = build_preflight_report(self.hass, self, options_override=proposed_options)
+            if option_key == CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED:
+                report = build_preflight_report(self.hass, self, options_override=proposed_options,
+                    export_limit_override=export_limit_evidence(
+                        self.hass, self.entry_data, proposed_options, dt_util.utcnow()))
+            else:
+                report = build_preflight_report(self.hass, self, options_override=proposed_options)
             raw_area_state = report.get("control_areas")
             proposed_area_state = raw_area_state if isinstance(raw_area_state, dict) else {}
             area_ready = area in proposed_area_state.get("ready", [])
@@ -2189,6 +2260,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self.async_update_listeners()
             return
 
+        if option_key == CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED:
+            async with self._command_lock:
+                await ExportLimitControl(self.hass, self.store, self.entry_data).resume()
         self.hass.config_entries.async_update_entry(self.entry, options=proposed_options)
         await self.async_handle_options_update()
         if option_key == CONF_EV_CONTROL_ENABLED:
@@ -2360,10 +2434,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
         finally:
             await self.async_disarm_production_control(reason)
+            if self.store.data.get("ownership", {}).get(EXPORT_ASSET, {}).get("baseline"):
+                async with self._command_lock:
+                    await self.executor.async_restore_device_control(EXPORT_ASSET, "production_control_disarmed")
 
     async def async_pause_control(self, duration_minutes: int, reason: str, asset: str = "all") -> None:
         """Pause planner-owned active control for all devices or one asset."""
-        normalized_asset = asset if asset in {"all", "ev", "daikin", "enphase"} else "all"
+        normalized_asset = asset if asset in {"all", "ev", "daikin", "enphase", EXPORT_ASSET} else "all"
         pause = {
             "active": True,
             "assets": ["all"] if normalized_asset == "all" else [normalized_asset],
@@ -2374,15 +2451,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._mark_forced_refresh("control_paused")
         await self.async_request_refresh()
 
-    async def async_resume_control(self, reason: str = "user_requested") -> None:
-        """Resume planner-owned active control."""
-        await self._async_save_control_pause(
-            {
-                "active": False,
-                "resumed_at": dt_util.utcnow(),
-                "reason": reason,
-            }
-        )
+    async def async_resume_control(self, reason: str = "user_requested", *, asset: str = "all") -> None:
+        """Resume the selected area without clearing other areas' pauses."""
+        now = dt_util.utcnow()
+        saved_pause = self.store.data.get("control_pause")
+        pause = dict(saved_pause) if isinstance(saved_pause, dict) else {}
+        _, paused = partition_control_areas_by_pause(saved_pause, now, ["ev", "hvac", "enphase", EXPORT_ASSET])
+        areas = ["daikin" if area == "hvac" else area for area in paused]
+        remaining = [] if asset == "all" else [area for area in areas if area != asset]
+        await self._async_save_control_pause({**pause, "active": bool(remaining), "assets": remaining,
+            "resumed_at": now, "reason": reason})
+        if asset in {"all", EXPORT_ASSET}:
+            async with self._command_lock:
+                await ExportLimitControl(self.hass, self.store, self.entry_data).resume()
         self._mark_forced_refresh("control_resumed")
         await self.async_request_refresh()
 
@@ -2398,7 +2479,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             pause=self.store.data.get("control_pause"),
             now=plan.created_at,
         )
+        export_review_safe = area_safe(plan) and EXPORT_ASSET in control_areas.get("confidence_eligible", [])
         review_safe = bool(
+            (plan.mode == PlannerMode.DRY_RUN and export_review_safe) or
             plan.mode == PlannerMode.DRY_RUN
             and plan.health in {InputHealth.HEALTHY, InputHealth.DEGRADED}
             and plan.status == "current"

@@ -131,6 +131,7 @@ def _context_from_fixture(data: dict[str, Any]) -> DecisionContext:
         climate_engine=dict(data.get("climate_engine", {})),
         climate_decision=dict(data.get("climate_decision", {})),
         climate_zone_entities=list(data.get("climate_zone_entities", [])),
+        export_limit=dict(data.get("export_limit", {})),
         input_issues=list(data.get("input_issues", [])),
         local_timezone=str(data.get("local_timezone", "UTC")),
         daylight_windows=[
@@ -145,6 +146,7 @@ def _context_from_fixture(data: dict[str, Any]) -> DecisionContext:
 
 def _plan_from_fixture(data: dict[str, Any], context: DecisionContext) -> EnergyPlan:
     return EnergyPlan(
+        control_area_health=dict(data.get("control_area_health", {})),
         plan_id=str(data.get("plan_id", context.plan_id)),
         created_at=_parse_datetime(data.get("created_at", context.created_at.isoformat())),
         horizon_hours=int(data.get("horizon_hours", 24)),

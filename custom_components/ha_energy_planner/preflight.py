@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Collection
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -21,6 +22,8 @@ from .const import (
     CONF_DEFAULT_READY_BY,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
     CONF_ENPHASE_PROFILE,
     CONF_EV_CHARGER,
     CONF_EV_CHARGER_START,
@@ -31,12 +34,14 @@ from .const import (
     CONF_EV_SMART_CHARGING_START,
     CONF_EV_SMART_CHARGING_STOP,
     CONF_HOUSEHOLD_LOAD,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
     CONF_PERSON_ENTITIES,
     CONF_PLANNER_ENABLED,
 )
 from .discovery import CapabilityDiscovery
 from .entry_data import combined_entry_data
 from .ev_policy import EV_DEFAULTS
+from .export_limit_policy import EXPORT_ASSET, area_safe
 from .load_forecast import FORECAST_CONTRACT_VERSION
 from .planner import confidence_eligible_control_areas
 from .safety import (
@@ -60,6 +65,8 @@ _EVIDENCE_OPTION_EXCLUSIONS = {
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_ENPHASE_CONTROL_ENABLED,
     "ev_connected_helper",
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS,
 }
 _EVIDENCE_ENTRY_EXCLUSIONS = {
     CONF_AI_ADVISOR_SERVICE,
@@ -75,24 +82,28 @@ def build_preflight_report(
     coordinator: Any,
     *,
     options_override: dict[str, Any] | None = None,
+    export_limit_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a redacted readiness report without calling device services."""
     entry_data = combined_entry_data(coordinator.entry)
     options = coordinator.options if options_override is None else {**coordinator.options, **options_override}
     bypass_safety_gates = strict_bool(options.get(CONF_BYPASS_SAFETY_GATES), default=False)
     now = dt_util.utcnow()
+    plan = getattr(coordinator, "data", None)
+    if plan is not None and export_limit_override is not None:
+        plan = replace(plan, control_area_health={**plan.control_area_health, EXPORT_ASSET: export_limit_override})
     control_areas, discovery = _runtime_control_area_report(
         hass,
         entry_data,
         options,
-        plan=getattr(coordinator, "data", None),
+        plan=plan,
         pause=coordinator.store.data.get("control_pause"),
         now=now,
     )
     entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
     recorder = _recorder_report(hass)
-    recorder_required = bool(entry_data.get(CONF_HOUSEHOLD_LOAD))
+    recorder_required = bool(entry_data.get(CONF_HOUSEHOLD_LOAD)) and control_areas["required"] != [EXPORT_ASSET]
     safety = _safety_report(options)
     evidence_fingerprint = production_evidence_fingerprint(entry_data, options)
     production = _production_report(
@@ -103,10 +114,19 @@ def build_preflight_report(
         now=now,
     )
     current_plan = _current_plan_report(
-        getattr(coordinator, "data", None),
+        plan,
         now=now,
         last_refresh_metadata=getattr(coordinator, "last_refresh_metadata", None),
     )
+    export_safe = (EXPORT_ASSET in control_areas["confidence_eligible"]
+                   and area_safe(plan)
+                   and current_plan["fresh"] and current_plan["last_refresh_succeeded"])
+    recorder_required = recorder_required and not export_safe
+    current_plan["legacy_safe"] = current_plan["safe"]
+    current_plan["export_limit_safe"] = bool(export_safe)
+    if export_safe:
+        current_plan["safe"] = True
+        current_plan["message"] = "Export Limit has fresh tariff and gateway readback evidence."
     audit = _audit_report(coordinator.store.data)
 
     ready_control_areas = list(control_areas.get("ready", []))
@@ -492,6 +512,8 @@ def _configured_services(entry_data: dict[str, Any], *, required_areas: list[str
             for key in _SERVICE_KEYS
             if entry_data.get(key)
         )
+    if required_areas and EXPORT_ASSET in required_areas:
+        configured.extend(["enphase_ev.set_export_limit", "enphase_ev.disable_export_limit"])
     return configured
 
 
@@ -532,6 +554,7 @@ def _production_report(
         "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
         "climate": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
         "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
+        EXPORT_ASSET: strict_bool(options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED), default=False),
     }
     required_control_areas = list(control_areas.get("required", []))
     dry_run_ready_cycles = production_state.dry_run_ready_cycles
@@ -629,13 +652,15 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
         ),
         "hvac": bool(str(entry_data.get(CONF_DAIKIN_CLIMATE, "") or "").strip()),
         "enphase": bool(str(entry_data.get(CONF_ENPHASE_PROFILE, "") or "").strip()),
+        EXPORT_ASSET: bool(entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)),
     }
     enabled = {
         "ev": strict_bool(options.get(CONF_EV_CONTROL_ENABLED), default=False),
         "hvac": strict_bool(options.get(CONF_CLIMATE_CONTROL_ENABLED), default=False),
         "enphase": strict_bool(options.get(CONF_ENPHASE_CONTROL_ENABLED), default=False),
+        EXPORT_ASSET: strict_bool(options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED), default=False),
     }
-    required = [area for area in ("ev", "hvac", "enphase") if enabled[area]]
+    required = [area for area in ("ev", "hvac", "enphase", EXPORT_ASSET) if enabled[area]]
     return {
         "configured": [area for area, value in configured.items() if value],
         "enabled": [area for area, value in enabled.items() if value],
@@ -646,7 +671,7 @@ def _control_area_report(entry_data: dict[str, Any], options: dict[str, Any]) ->
                 "enabled": enabled[area],
                 "required": area in required,
             }
-            for area in ("ev", "hvac", "enphase")
+            for area in ("ev", "hvac", "enphase", EXPORT_ASSET)
         },
     }
 
@@ -668,6 +693,9 @@ def _runtime_control_area_report(
     ready = list(control_areas.get("ready", []))
     available, paused = partition_control_areas_by_pause(pause, now, ready)
     confidence_eligible = confidence_eligible_control_areas(plan, available, options)
+    if area_safe(plan) and (str(getattr(plan, "health", "")) not in {"healthy", "degraded"}
+                           or str(getattr(plan, "status", "")) != "current"):
+        confidence_eligible = [area for area in confidence_eligible if area == EXPORT_ASSET]
     control_areas.update(
         {
             "available": available,
@@ -774,6 +802,8 @@ def _entity_control_area(config_key: str) -> str | None:
         return "ev"
     if config_key.startswith(("daikin_", "climate_", "weather_")):
         return "hvac"
+    if config_key == CONF_ENPHASE_EXPORT_LIMIT_ENTITY:
+        return EXPORT_ASSET
     if config_key.startswith("enphase_"):
         return "enphase"
     return None

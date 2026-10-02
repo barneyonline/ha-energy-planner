@@ -13,7 +13,7 @@
 [![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
 ![Development Status](https://img.shields.io/badge/development-active-success?style=flat-square)
 
-Energy Planner is a local-first Home Assistant custom integration that coordinates tariffs, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles in one guarded plan.
+Energy Planner is a local-first Home Assistant custom integration that coordinates tariffs, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles and Export Limit in one guarded plan.
 
 The Platinum quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
 
@@ -32,7 +32,7 @@ Planning and control include:
 - A plan calendar, current state, next actions, input health, forecast confidence, production readiness, and redacted support data.
 - Diagnostic sensors for Decision summary, Plan health, Current load forecast, Planning duration, and load-forecast coverage.
 - Clear `review`, `recovery`, and `active` mode states so startup recovery is distinguishable from normal review mode.
-- Independent switches for climate, EV, and Enphase control, plus a guarded Automatic control switch.
+- Independent switches for climate, EV, Enphase Profile control and Enphase Export Limit control, plus a guarded Automatic control switch.
 - Optional AI Task explanations that remain advisory and cannot call services or bypass constraints.
 
 EV planning includes capacity-aware slots, a soft readiness buffer, optional measured charging performance and number-entity power limits, battery opportunity-cost estimates, and guarded departure-priority spending. See [EV charging decisions](docs/ev-scheduling.md) for configuration, compatibility, and diagnostic evidence.
@@ -304,3 +304,19 @@ The **Charge now (1 hour)**, **Stop charge now**, and **Resume climate planning*
 buttons are removed, including existing entity-registry entries on upgrade. Their
 `charge_now`, `cancel_charge_now`, and `resume_climate_planning` integration actions
 remain available for automations and Developer Tools.
+
+## Enphase Export Limit control
+
+Map the Enphase integration's **Export Limit sensor** in Planner settings. Enable Export Limit controls in the upstream Enphase integration and obtain its required installer access first. Energy Planner checks sensor identity, supported confirmed configuration and registered `enphase_ev.set_export_limit` / `enphase_ev.disable_export_limit` actions; no upstream version is hard-coded. The sensor provides feedback and is not a writable switch. Multi-site installations always target the mapped sensor explicitly.
+
+**Enphase Export Limit control** defaults off and operates independently of **Enphase Profile control**. Existing profile entities, saved options and IDs are preserved. Export-only installations need the export-price forecast and Export Limit sensor; import prices, solar, household consumption and battery mappings are optional for this control. Other control areas retain their input and safety gates. Enable the Export Limit selector in review mode, obtain three qualifying dry-run cycles, then enable **Automatic control** through the usual production arming process.
+
+Each timestamped 30-minute tariff block selects **Enabled — 0 W** when the export price is strictly negative, and **Disabled** at zero or a positive price. Negative zero is treated as zero. The planner previews the current and next block, schedules a fresh plan at each tariff boundary, and reconciles immediately when activated or resumed mid-block. Forecast revisions replace future intent. Prices must identify actual half-hour intervals, either explicit ends or unambiguous contiguous half-hour timestamps/cadence metadata. A scalar current price cannot authorize a write. The minimum tariff-confidence threshold applies to the supported `confidence`, `confidence_percent`, `forecast_confidence` and `forecast_confidence_percent` fields, including fraction and percentage values. Stale, invalid, low-confidence or missing forecasts hold the last confirmed setting. Feedback must include a successful gateway readback no older than ten minutes.
+
+Automation may replace an existing nonzero limit. Before its first write, Energy Planner durably records the original Disabled/limit-watts configuration and slew rate. Normal tariff changes preserve the upstream slew rate. Accepted requests appear **Pending** until matching fresh gateway readback confirms them. Pending requests suppress duplicate and opposite writes; when they resolve, the latest tariff intent is reconciled. After ten minutes without confirmation, this area pauses as **Unconfirmed** and continues observing without retransmitting. Resolve the cause and explicitly resume using `ha_energy_planner.resume_control` with `asset: enphase_export_limit`. Profile pauses, minimum holds and action limits do not govern Export Limit. Rejected requests identify disabled upstream controls or unavailable/expired installer access separately. Its separate rolling daily action allowance defaults to `0` (unlimited), and its command cooldown uses the shared configured duration with a separate key.
+
+Turning off Export Limit control restores only its owned baseline; turning off Profile control restores only its profile. Leaving Automatic control, entering dry-run or calling `restore_safe_state` also restores owned Export Limit state. Restoration uses exact saved watts and slew rate and remains outstanding until matching readback. Unavailable or pending targets are retried after feedback recovery; uncertain commands are never resent. Re-enabling control cannot replace an unresolved restoration baseline. A replaced target is rejected. An external configuration change pauses this area and supersedes its ownership baseline without undoing the user's change; explicit resume begins a new session with that configuration as the baseline. Pause/resume selectors support `enphase_export_limit`, existing `enphase` for profiles, and `all` for both.
+
+Outstanding restoration remains visible after the Export Limit selector is turned off. An explicit integration unload is deferred while owned restoration is pending, so readback observation can continue. Enphase retains its pending request when reporting Unconfirmed; the planner keeps the confirmed and requested values separate. External slew-rate changes during confirmation also pause this area without restoring over the external setting. A persistence failure before dispatch discards the unsent request, and conflicting declared tariff cadence cannot authorize a command.
+
+Plan, timeline, preflight and diagnostics expose tariff intervals, price, desired and confirmed setting, pending request, baseline, last readback, pause reason and restoration state. Planned zero export limits grid-export and cost previews while retaining solar production for local loads; it is an assumption until gateway confirmation. Missing energy inputs prevent a monetary estimate. Enphase performs curtailment, so a dispatched boundary command cannot guarantee instantaneous zero physical export.
