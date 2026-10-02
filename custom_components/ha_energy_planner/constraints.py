@@ -417,9 +417,11 @@ def _is_same_hvac_lifecycle(
         and desired.get("hvac_mode") == persisted.get("mode")
     ):
         return False
+    if persisted.get("lifecycle_id") and desired.get("lifecycle_id"):
+        return bool(persisted["lifecycle_id"] == desired["lifecycle_id"])
     return all(
         _lifecycle_datetime(persisted.get(key)) == _lifecycle_datetime(desired.get(key)) is not None
-        for key in ("period_start", "period_end", "precondition_end")
+        for key in ("period_start", "period_end")
     )
 
 

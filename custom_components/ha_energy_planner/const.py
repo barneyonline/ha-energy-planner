@@ -237,3 +237,5 @@ EV_RESERVATION_EXTERNAL_BASELINE = "external_baseline"
 # Optional EV policies preserve legacy booleans and hard ceilings on upgrade.
 
 DEFAULT_OPTIONS.update(EV_DEFAULTS)
+
+CONF_HVAC_POWER_SOURCE_TYPE = "hvac_power_source_type"

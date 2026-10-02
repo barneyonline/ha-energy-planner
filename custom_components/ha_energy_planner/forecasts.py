@@ -51,6 +51,29 @@ def constant_forecast(
     ]
 
 
+def tariff_source_intervals(state: Any, interval_minutes: int) -> list[dict[str, Any]]:
+    """Expose sanitized source boundaries used to identify tariff lifecycles."""
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    keys = ("import_price", "general_price", "per_kwh", "price", "value")
+    parsed = [
+        _parse_item(
+            item, value_keys=keys, value_kind="price", default_unit=str(attributes.get("unit_of_measurement", ""))
+        )
+        for item in _forecast_items(attributes, keys)
+    ]
+    points = sorted(
+        {(_as_aware_utc(at), value) for item in parsed if item is not None for at, value in [item] if at is not None}
+    )
+    explicit_interval = _explicit_interval_minutes(attributes)
+    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+    cadence = _conservative_cadence(
+        points,
+        explicit_cadence or timedelta(minutes=interval_minutes),
+        maximum=explicit_cadence,
+    )
+    return [{"start": at.isoformat(), "end": (at + cadence).isoformat(), "price": price} for at, price in points[:576]]
+
+
 def forecast_series_from_state(
     state: Any,
     *,

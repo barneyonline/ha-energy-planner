@@ -561,3 +561,194 @@ def test_simultaneous_legacy_blockers_keep_code_and_summary_consistent(other_blo
     assert recovered["reason"] == ("manual_hvac_override" if other_blocker == "manual" else "occupancy_away")
     remaining_reason = "manual climate override" if other_blocker == "manual" else "nobody is currently home"
     assert remaining_reason in recovered["summary"]
+
+
+@pytest.mark.parametrize("mode,temperature,target,coast", [("heat", 23, 23, 19), ("cool", 19, 19, 23)])
+def test_live_early_target_enters_coast_and_does_not_reheat(mode, temperature, target, coast):
+    ctx = context()
+    ctx.current_hvac_temperature_c = temperature
+    ctx.hvac_control = {
+        "phase": "preconditioning",
+        "mode": mode,
+        "main_state_committed": True,
+        "period_start": NOW + timedelta(minutes=15),
+        "period_end": NOW + timedelta(hours=1),
+        "precondition_end": NOW + timedelta(minutes=15),
+        "baseline_price": 0.1,
+        "precondition_target": target,
+        "coast_target": coast,
+    }
+    policy = HVACPlanningPolicy({**OPTIONS, "planning_interval_minutes": 5}, {})
+    actions = policy._hvac_lifecycle_actions(ctx, ctx.created_at, ctx.created_at + timedelta(minutes=5))
+    assert actions[0].desired_state["phase"] == "pre_peak_coast"
+    assert actions[0].desired_state["target_temperature"] == coast
+    assert actions[0].desired_state["precondition_end"] == NOW
+    ctx.hvac_control.update(actions[0].desired_state)
+    ctx.created_at += timedelta(minutes=5)
+    ctx.current_hvac_temperature_c = 21
+    assert (
+        policy._hvac_lifecycle_actions(ctx, ctx.created_at, ctx.created_at + timedelta(minutes=5))[0].desired_state[
+            "phase"
+        ]
+        == "pre_peak_coast"
+    )
+
+
+def test_learning_observation_does_not_withhold_legacy_cycle():
+    ctx = context()
+    ctx.climate_inputs = {"identity": "test", "power_source_type": "estimated"}
+    ctx.climate_engine = {
+        "status": "learning",
+        "opportunities": 9,
+        "observation_until": (NOW + timedelta(hours=1)).isoformat(),
+    }
+    legacy = [action()]
+    assert economic_actions(ctx, OPTIONS, legacy) == legacy
+    assert ctx.climate_engine["opportunities"] == 9
+    assert not ctx.climate_decision["observing"]
+
+
+def test_source_tariff_identity_survives_refresh_grid_drift_and_configuration_changes():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planner_hvac import _legacy_lifecycle_id
+
+    tariff = SimpleNamespace(
+        attributes={
+            "unit_of_measurement": "AUD/kWh",
+            "forecast": [{"valid_at": (NOW + timedelta(minutes=i * 30)).isoformat(), "price": i} for i in range(6)],
+        }
+    )
+    intervals = tariff_source_intervals(tariff, 5)
+    assert len(intervals) == 6
+    assert tariff_source_intervals(SimpleNamespace(attributes={}), 5) == []
+    ctx = context()
+    ctx.climate_inputs.update(identity="config", tariff_intervals=intervals)
+    start, end = NOW + timedelta(minutes=30), NOW + timedelta(hours=1)
+    cycle = _legacy_lifecycle_id(ctx, OPTIONS, start, end, "heat")
+    assert (
+        _legacy_lifecycle_id(ctx, OPTIONS, start + timedelta(minutes=14), end + timedelta(minutes=14), "heat") == cycle
+    )
+    assert _legacy_lifecycle_id(ctx, OPTIONS, start, end, "cool") != cycle
+    ctx.climate_inputs["identity"] = "changed"
+    assert _legacy_lifecycle_id(ctx, OPTIONS, start, end, "heat") != cycle
+    planned = plan([action()])
+    planned.actions[0].desired_state["lifecycle_id"] = cycle
+    history = record_plan({}, to_jsonable(planned))
+    planned.created_at += timedelta(minutes=1)
+    planned.actions[0].desired_state["period_start"] += timedelta(seconds=45)
+    history = record_plan(history, to_jsonable(planned))
+    assert "last_missed" not in history
+    control = {
+        **planned.actions[0].desired_state,
+        "phase": "pre_peak_coast",
+        "main_state_committed": True,
+        "preconditioning_confirmed": True,
+    }
+    history = record_plan(history, to_jsonable(plan([])), control)
+    assert "last_missed" not in history
+
+
+def test_early_coast_continuation_bypasses_minimum_cycle_by_lifecycle():
+    from custom_components.ha_energy_planner.constraints import _is_same_hvac_lifecycle
+
+    ctx = context()
+    ctx.hvac_control = {"phase": "preconditioning", "mode": "heat", "lifecycle_id": "same"}
+    transition = action()
+    transition.desired_state.update(phase="pre_peak_coast", hvac_mode="heat", lifecycle_id="same")
+    ownership = SimpleNamespace(planner_takeover_started_at=NOW, hvac_control_phase="preconditioning")
+    assert _is_same_hvac_lifecycle(ctx, transition, ownership)
+    transition.desired_state["lifecycle_id"] = "different"
+    assert not _is_same_hvac_lifecycle(ctx, transition, ownership)
+
+
+def test_confirmed_early_transition_retains_all_original_baselines():
+    import json
+    from pathlib import Path
+
+    from custom_components.ha_energy_planner.constraints import _lifecycle_datetime
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    evidence = json.loads((Path(__file__).parent / "fixtures/climate/preconditioning_sep_oct_2026.json").read_text())[
+        "early_target"
+    ]
+    now = datetime.fromisoformat(evidence["reached_at"]).astimezone(UTC)
+    original = {
+        "climate_automations": {"automation.schedule": "on"},
+        "hvac_control": {
+            "phase": "preconditioning",
+            "lifecycle_id": "october-cycle",
+            "main_state": {"hvac_mode": "off", "target_temperature": evidence["original_main_target"]},
+            "zone_states": {"climate.zone": {"target_temperature": evidence["original_zone_target"]}},
+            "main_state_committed": True,
+        },
+    }
+    desired = {
+        "phase": "pre_peak_coast",
+        "phase_transition_reason": "target_reached",
+        "target_temperature": evidence["coast"],
+        "precondition_end": now,
+    }
+    transaction = HVACOwnershipTransaction(deepcopy(original), now)
+    provisional = transaction.prepare(
+        desired,
+        {"automation.schedule": "off"},
+        {"climate.zone": {"target_temperature": 24}},
+        {"hvac_mode": "heat", "target_temperature": 24},
+    )
+    confirmed = now + timedelta(seconds=3)
+    result = transaction.complete(
+        HVACCommandResult(True, "applied", {}, {}, {}),
+        provisional,
+        desired,
+        main_state_superseded=False,
+        superseded_zone_entity_ids=set(),
+        confirmed_at=confirmed,
+    )
+    assert result["hvac_control"]["main_state"] == original["hvac_control"]["main_state"]
+    assert result["hvac_control"]["zone_states"] == original["hvac_control"]["zone_states"]
+    assert result["climate_automations"] == original["climate_automations"]
+    assert result["hvac_control"]["precondition_end"] == confirmed
+    assert result["hvac_control"]["phase_started_at"] == confirmed
+    assert _lifecycle_datetime(datetime(2026, 10, 1)) == datetime(2026, 10, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("change", ["source", "comfort", "policy"])
+def test_owned_legacy_cycle_releases_after_material_configuration_change(change):
+    ctx = context()
+    ctx.climate_inputs = {"identity": "original"}
+    options = dict(OPTIONS)
+    selected = next(a for a in DryRunPlanner(options).create_plan(ctx).actions if a.kind == ActionKind.SET_HVAC)
+    ctx.hvac_control = dict(selected.desired_state)
+    ctx.created_at += timedelta(seconds=20)
+    if change == "source":
+        ctx.climate_inputs["identity"] = "different-controls"
+    elif change == "comfort":
+        ctx.occupied_temperature_high_c = 22
+    else:
+        options["hvac_precondition_lead_minutes"] += 5
+    actions = DryRunPlanner(options).create_plan(ctx).actions
+    assert actions[0].kind == ActionKind.RELEASE_HVAC
+    assert actions[0].desired_state["release_reason"] == "hvac_configuration_changed"
+
+
+def test_tariff_identity_respects_explicit_intervals_when_forecast_gaps_fill():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planner_hvac import _legacy_lifecycle_id
+
+    ctx = context()
+    tariff = SimpleNamespace(
+        attributes={
+            "interval_minutes": 30,
+            "forecast": [
+                {"valid_at": NOW.isoformat(), "price": 1},
+                {"valid_at": (NOW + timedelta(hours=2)).isoformat(), "price": 0.1},
+            ],
+        }
+    )
+    ctx.climate_inputs["tariff_intervals"] = tariff_source_intervals(tariff, 5)
+    assert ctx.climate_inputs["tariff_intervals"][0]["end"] == (NOW + timedelta(minutes=30)).isoformat()
+    cycle = _legacy_lifecycle_id(ctx, OPTIONS, NOW, NOW + timedelta(minutes=30), "heat")
+    tariff.attributes["forecast"].insert(1, {"valid_at": (NOW + timedelta(minutes=30)).isoformat(), "price": 0.1})
+    ctx.climate_inputs["tariff_intervals"] = tariff_source_intervals(tariff, 5)
+    assert _legacy_lifecycle_id(ctx, OPTIONS, NOW, NOW + timedelta(minutes=30), "heat") == cycle

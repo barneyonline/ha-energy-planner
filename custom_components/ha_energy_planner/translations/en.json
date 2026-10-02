@@ -199,11 +199,12 @@
               "hvac_irradiance_entity": "Measured solar irradiance",
               "hvac_irradiance_forecast_entity": "Solar irradiance forecast",
               "hvac_zone_mappings": "Room measurements",
-              "hvac_cop_table": "Equipment efficiency curve"
+              "hvac_cop_table": "Equipment efficiency curve",
+              "hvac_power_source_type": "HVAC power source type"
             },
             "data_description": {
               "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
-              "daikin_power_entity": "Optional power sensor used for HVAC thermal-model learning.",
+              "daikin_power_entity": "Optional HVAC power source. Fixed Powercalc and other synthetic sources remain estimates and cannot validate measured energy savings.",
               "weather_entity": "Optional weather entity used for outdoor temperature forecasts. For Bureau of Meteorology, select the Hourly weather entity for climate planning because Energy Planner uses near-term temperature forecast points.",
               "climate_automation_entities": "Automation entities to pause during planner HVAC control.",
               "climate_change_from_scheduler_entity": "Optional input_boolean that marks scheduler-owned climate changes.",
@@ -230,7 +231,8 @@
               "hvac_irradiance_entity": "Optional irradiance sensor in W/m² for thermal learning.",
               "hvac_irradiance_forecast_entity": "Optional forecast sensor with issued_at and timestamped valid_at/irradiance points in W/m².",
               "hvac_zone_mappings": "Map configured zone entity IDs to temperature, humidity, presence, low/high helper IDs and optional maximum_humidity.",
-              "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration."
+              "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration.",
+              "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated."
             }
           },
           "enphase_inputs": {
