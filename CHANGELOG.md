@@ -12,6 +12,7 @@
 
 ### 🐛 Bug fixes
 
+- Allow mapping the Enphase Export Limit Select entity, resolve its matching sensor for confirmed readback, and clarify export-only operation with optional Profile mapping and Profile control off. Existing sensor mappings remain supported; sensor/Select aliases cannot assign the same gateway Export Limit control to separate planners.
 - Build release ZIP/checksum assets without requiring an operating-evidence attachment; retain version checks and packaged runtime smoke validation, and allow rebuilding assets for an existing release tag.
 
 ### 🔧 Improvements

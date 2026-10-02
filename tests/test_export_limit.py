@@ -116,7 +116,13 @@ def setup(monkeypatch):
             device_id="gateway-a",
         )
     }
-    monkeypatch.setattr(runtime.er, "async_get", lambda hass: SimpleNamespace(async_get=registry.get))
+    monkeypatch.setattr(runtime.er, "async_get", lambda hass: SimpleNamespace(
+        async_get=registry.get,
+        async_get_entity_id=lambda domain, platform, unique_id: next((
+            entity for entity, entry in registry.items()
+            if (entry.domain, entry.platform, entry.unique_id) == (domain, platform, unique_id)
+        ), None),
+    ))
     calls = []
     mode = {"value": "pending"}
     store = Store()
@@ -295,6 +301,215 @@ def test_sensor_identity_services_and_pending(setup):
     assert runtime.evidence(setup.hass, DATA, OPTIONS, NOW)["reason"] == "export_limit_services_unavailable"
     setup.states.pop(ENTITY)
     assert runtime.feedback(setup.hass, ENTITY, NOW)[1] == "export_limit_entity_unavailable"
+
+
+@pytest.fixture
+def select_setup(setup):
+    """The control has no readback attributes and a differently named sensor."""
+    select = "select.gateway_export_control"
+    sensor = "sensor.renamed_gateway_feedback"
+    setup.states[sensor] = setup.states.pop(ENTITY)
+    setup.registry[sensor] = setup.registry.pop(ENTITY)
+    setup.states[select] = SimpleNamespace(state="disable_limit", attributes={"default_limit_watts": 5000})
+    setup.registry[select] = SimpleNamespace(**{**vars(setup.registry[sensor]), "domain": "select"})
+    # Keep the existing fake service updating the readback at its new name.
+    setup.states[ENTITY] = setup.states[sensor]
+    original_call = setup.hass.services.async_call
+
+    async def call(*args, **kwargs):
+        await original_call(*args, **kwargs)
+        setup.states[sensor] = setup.states[ENTITY]
+
+    setup.hass.services.async_call = call
+    setup.select, setup.sensor = select, sensor
+    setup.mapping = {**DATA, CONF_ENPHASE_EXPORT_LIMIT_ENTITY: select}
+    setup.control = runtime.ExportLimitControl(setup.hass, setup.store, setup.mapping)
+    return setup
+
+
+@pytest.mark.parametrize("failure", [None, "missing", "entry", "device", "stale", "unavailable"])
+def test_select_resolves_only_its_matching_readback(select_setup, failure):
+    setup = select_setup
+    from custom_components.ha_energy_planner.config_flow import ENPHASE_DATA_SCHEMA, _validate_config
+
+    assert ENPHASE_DATA_SCHEMA({CONF_ENPHASE_EXPORT_LIMIT_ENTITY: setup.select})
+    assert _validate_config(setup.hass, setup.mapping) == {}
+    assert runtime.feedback_entity_id(setup.hass, setup.select) == setup.sensor
+    if failure == "missing":
+        setup.registry.pop(setup.sensor)
+    elif failure == "entry":
+        setup.registry[setup.sensor].config_entry_id = "other-site"
+    elif failure == "device":
+        setup.registry[setup.sensor].device_id = "other-gateway"
+    elif failure == "stale":
+        setup.states[setup.sensor].attributes["last_successful_readback"] = NOW.timestamp() - 601
+    elif failure == "unavailable":
+        setup.states[setup.select].state = "unavailable"
+    observed, issue = runtime.feedback(setup.hass, setup.select, NOW)
+    assert (issue is None) is (failure is None)
+    assert runtime.evidence(setup.hass, setup.mapping, OPTIONS, NOW)["ready"] is (failure is None)
+    if failure is None:
+        assert observed["watts"] is None
+        assert observed["identity"]["entity_id"] == setup.select
+    assert runtime.feedback_entity_id(setup.hass, "select.missing") is None
+
+
+@pytest.mark.parametrize("mapped_profile", [False, True])
+def test_select_export_only_execution_never_changes_profile(select_setup, mapped_profile):
+    from custom_components.ha_energy_planner.const import CONF_ENPHASE_CONTROL_ENABLED, CONF_ENPHASE_PROFILE
+    from custom_components.ha_energy_planner.executor import Executor
+    from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
+
+    setup = select_setup
+
+    async def run():
+        mapping = dict(setup.mapping)
+        if mapped_profile:
+            mapping[CONF_ENPHASE_PROFILE] = "select.system_profile"
+            setup.states["select.system_profile"] = SimpleNamespace(state="AI Optimisation", attributes={})
+        opts = {**OPTIONS, CONF_DRY_RUN: False, CONF_ENPHASE_CONTROL_ENABLED: False}
+        setup.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(mapping, opts)
+        executor = Executor(setup.store, hass=setup.hass, entry_data=mapping, options=opts)
+        ctx = context(runtime.evidence(setup.hass, mapping, opts, NOW))
+        plan = DryRunPlanner(opts).create_plan(ctx)
+        plan.actions = plan.actions[:1]
+        await executor.async_evaluate(plan, ctx)
+        assert setup.calls == [("enphase_ev", "set_export_limit", {"entity_id": setup.select, "limit_watts": 0})]
+        assert setup.control.state["pending"]["watts"] == 0
+        # The unchanged Select option is not confirmation, nor is acceptance.
+        assert setup.control.state["baseline"]["watts"] is None
+        setup.states[setup.sensor] = limit_state(0)
+        assert await setup.control.reconcile(NOW) is None
+        assert not setup.control.state.get("pending")
+        setup.mode["value"] = "confirm"
+        assert (await setup.control.restore(NOW))[0] == OutcomeResult.RESTORED
+        assert setup.calls[-1] == ("enphase_ev", "disable_export_limit", {
+            "entity_id": setup.select, "slew_rate": 100.0,
+        })
+        assert all(domain == "enphase_ev" and service in {"set_export_limit", "disable_export_limit"}
+                   for domain, service, _ in setup.calls)
+        if mapped_profile:
+            assert setup.states["select.system_profile"].state == "AI Optimisation"
+
+    asyncio.run(run())
+
+
+def test_select_readback_attributes_trigger_refresh(select_setup, monkeypatch):
+    from test_coordinator import FakeEvent, FakeHass, _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    setup = select_setup
+    callbacks, watched, requests = [], [], []
+    monkeypatch.setattr(module, "async_track_state_change_event", lambda hass, ids, callback: (
+        watched.extend(ids), callbacks.append(callback), lambda: None
+    )[-1])
+    monkeypatch.setattr(module, "async_call_later", lambda *args: lambda: None)
+    owner = _coordinator_for_runtime_services(entry_data=setup.mapping, options=OPTIONS, hass=FakeHass())
+    owner.hass.bus = SimpleNamespace(async_listen=lambda *args: lambda: None)
+    owner._schedule_debounced_refresh = lambda *args, **kwargs: requests.append((args, kwargs))
+    owner.async_start_listeners()
+    assert setup.sensor in watched and setup.select in watched
+    callbacks[0](FakeEvent(setup.sensor, "disabled", "disabled"))
+    assert requests[-1][0] == ("export_limit_feedback",)
+    assert requests[-1][1]["force"]
+
+
+@pytest.mark.parametrize("change", ["rename", "late_registration", "remove", "shared_input"])
+def test_select_readback_listener_follows_registry_changes(select_setup, monkeypatch, change):
+    from test_coordinator import FakeEvent, FakeHass, _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    setup = select_setup
+    registered_sensor = setup.registry[setup.sensor]
+    if change in {"late_registration", "shared_input"}:
+        setup.registry.pop(setup.sensor)
+    if change == "shared_input":
+        setup.mapping["pv_forecast_secondary_entity"] = setup.sensor
+    listeners, registry_callbacks, requests = {}, [], []
+
+    def track(hass, ids, callback):
+        for entity in ids:
+            listeners[entity] = callback
+
+        def remove():
+            for entity in ids:
+                listeners.pop(entity, None)
+
+        return remove
+
+    monkeypatch.setattr(module, "async_track_state_change_event", track)
+    monkeypatch.setattr(module, "async_call_later", lambda *args: lambda: None)
+    hass = FakeHass()
+    hass.bus = SimpleNamespace(async_listen=lambda event, cb: (
+        registry_callbacks.append((event, cb)) or (lambda: registry_callbacks.clear())))
+    owner = _coordinator_for_runtime_services(entry_data=setup.mapping, options=OPTIONS, hass=hass)
+    owner._schedule_debounced_refresh = lambda *args, **kwargs: requests.append((args, kwargs))
+    owner.async_start_listeners()
+    assert registry_callbacks, "Select readback must track registry additions and renames"
+    event_name, registry_changed = registry_callbacks[0]
+    assert event_name == "entity_registry_updated"
+    # Unrelated changes should neither recreate listeners nor trigger a plan.
+    registry_changed(SimpleNamespace(data={"entity_id": "sensor.unrelated", "action": "update"}))
+    assert requests == []
+    old_sensor = setup.sensor
+    if change in {"rename", "remove"}:
+        setup.registry.pop(old_sensor)
+    if change == "rename":
+        setup.sensor = "sensor.new_feedback_name"
+    if change == "remove":
+        registry_changed(SimpleNamespace(data={"entity_id": old_sensor, "action": "remove"}))
+        assert old_sensor not in listeners
+        assert requests[-1][1]["force"]
+        # Recreating the matching sensor restores immediate readback observation.
+    setup.registry[setup.sensor] = registered_sensor
+    registry_changed(SimpleNamespace(data={"entity_id": setup.sensor, "action": "create"}))
+    assert setup.sensor in listeners
+    if change == "rename":
+        assert old_sensor not in listeners
+    listeners[setup.sensor](FakeEvent(setup.sensor, "disabled", "disabled"))
+    assert requests[-1] == (("export_limit_feedback",), {"debounce_seconds": 0, "force": True})
+    # Shutdown removes both subscriptions and a queued registry event stays inert.
+    owner._begin_shutdown()
+    assert not listeners and not registry_callbacks
+    registry_changed(SimpleNamespace(data={"entity_id": setup.sensor, "action": "remove"}))
+    assert not listeners
+
+
+@pytest.mark.parametrize("existing_select", [False, True])
+@pytest.mark.parametrize(
+    "other_target", ["same", "different_entry", "different_unique", "unregistered", "unconfigured"])
+def test_export_limit_aliases_cannot_be_shared_by_planners(select_setup, existing_select, other_target):
+    from custom_components.ha_energy_planner.config_flow import SUBENTRY_ENPHASE, _validate_subentry_config
+
+    setup = select_setup
+    existing_entity, requested_entity = (
+        (setup.select, setup.sensor) if existing_select else (setup.sensor, setup.select)
+    )
+    if other_target == "different_entry":
+        setup.registry[existing_entity].config_entry_id = "site-b"
+    elif other_target == "different_unique":
+        setup.registry[existing_entity].unique_id = "enphase_site-b_export_limit"
+    elif other_target == "unregistered":
+        setup.registry.pop(existing_entity)
+    current_entry = SimpleNamespace(entry_id="planner-a", data={}, options=OPTIONS, subentries={})
+    other_entry = SimpleNamespace(entry_id="planner-b", options=OPTIONS, subentries={}, data={
+        CONF_ENPHASE_EXPORT_LIMIT_ENTITY: existing_entity,
+    })
+    if other_target == "unconfigured":
+        other_entry.data.clear()
+    setup.hass.config_entries = SimpleNamespace(async_entries=lambda domain: [current_entry, other_entry])
+    errors = _validate_subentry_config(setup.hass, current_entry, {
+        CONF_ENPHASE_EXPORT_LIMIT_ENTITY: requested_entity,
+    }, subentry_type=SUBENTRY_ENPHASE)
+    assert errors == ({CONF_ENPHASE_EXPORT_LIMIT_ENTITY: "household_actuator_in_use"} if other_target == "same" else {})
+    # Editing a planner's own alias must remain possible.
+    current_entry.data = other_entry.data
+    setup.hass.config_entries.async_entries = lambda domain: [current_entry]
+    assert _validate_subentry_config(setup.hass, current_entry, {
+        CONF_ENPHASE_EXPORT_LIMIT_ENTITY: requested_entity,
+    }, subentry_type=SUBENTRY_ENPHASE) == {}
 
 
 @pytest.mark.parametrize("baseline", [None, 0, 3000])
@@ -482,31 +697,36 @@ def test_executor_independent_dispatch_and_gates(setup, failure):
     asyncio.run(run())
 
 
-def test_export_only_preflight_discovery_and_dry_run_evidence(setup):
+@pytest.mark.parametrize("mapping_kind", ["sensor", "select"])
+def test_export_only_preflight_discovery_and_dry_run_evidence(setup, request, mapping_kind):
     from test_coordinator import _coordinator_for_runtime_services
 
     from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
     from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
 
+    if mapping_kind == "select":
+        setup = request.getfixturevalue("select_setup")
+    mapping = setup.mapping if mapping_kind == "select" else DATA
+
     async def run():
-        plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
-        coordinator = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, mapping, OPTIONS, NOW)))
+        coordinator = _coordinator_for_runtime_services(entry_data=mapping, options=OPTIONS, hass=setup.hass)
         coordinator.data = plan
         coordinator.last_refresh_metadata = {"succeeded": True, "completed_at": NOW}
-        report = CapabilityDiscovery(setup.hass, DATA, OPTIONS).inspect()
+        report = CapabilityDiscovery(setup.hass, mapping, OPTIONS).inspect()
         assert report.for_asset(EXPORT_ASSET).supported
         for i in range(3):
             await coordinator._async_update_production_evidence(plan, ["input_health_unsafe"])
             assert coordinator.store.data["production"]["dry_run_ready_cycles"] == i + 1
         coordinator.store.data["production"]["dry_run_evidence_fingerprint"] = (
-            production_evidence_fingerprint(DATA, OPTIONS))
+            production_evidence_fingerprint(mapping, OPTIONS))
         report = build_preflight_report(setup.hass, coordinator)
         assert report["safe_to_activate_now"], report
         assert report["current_plan"]["export_limit_safe"]
         assert not report["current_plan"]["legacy_safe"]
         assert report["control_areas"]["confidence_eligible"] == [EXPORT_ASSET]
         setup.hass.services.has_service = lambda *args: False
-        assert not CapabilityDiscovery(setup.hass, DATA, OPTIONS).inspect().for_asset(EXPORT_ASSET).supported
+        assert not CapabilityDiscovery(setup.hass, mapping, OPTIONS).inspect().for_asset(EXPORT_ASSET).supported
 
     asyncio.run(run())
 

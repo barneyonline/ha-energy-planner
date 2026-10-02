@@ -250,7 +250,7 @@ ENERGY_DATA_SCHEMA = vol.Schema(
 ENPHASE_DATA_SCHEMA = vol.Schema(
     {
         vol.Optional(CONF_ENPHASE_EXPORT_LIMIT_ENTITY): _entity_selector(
-            entity_filter={"domain": "sensor", "integration": "enphase_ev"}
+            entity_filter={"domain": ["select", "sensor"], "integration": "enphase_ev"}
         ),
         vol.Optional(CONF_ENPHASE_PROFILE): _entity_selector(["select", "input_select"]),
         vol.Optional(CONF_ENPHASE_AI_PROFILE, default=DEFAULT_ENPHASE_AI_PROFILE): TextSelector(),
@@ -1328,6 +1328,10 @@ def _duplicate_household_actuator_errors(
     subentry_type: str | None = None,
 ) -> dict[str, str]:
     """Reject actuators assigned to more than one planner control."""
+    from .enphase_export_limit import target_identity
+
+    export_entity = user_input.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+    export_identity = target_identity(hass, str(export_entity)) if export_entity else None
     requested = {
         key: set(_entity_values(user_input.get(key)))
         for key in _ACTUATOR_KEYS
@@ -1369,6 +1373,13 @@ def _duplicate_household_actuator_errors(
         for key, requested_entities in requested.items():
             if requested_entities.intersection(other_actuator_entities):
                 errors[key] = "household_actuator_in_use"
+        if export_identity and not (is_current_entry and CONF_ENPHASE_EXPORT_LIMIT_ENTITY in current_subentry_keys):
+            other_export = other_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+            other_identity = target_identity(hass, str(other_export)) if other_export else None
+            if other_identity and all(
+                export_identity[key] == other_identity[key] for key in ("config_entry_id", "unique_id")
+            ):
+                errors[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "household_actuator_in_use"
     return errors
 
 
@@ -1416,7 +1427,7 @@ _ENTITY_DOMAIN_RULES = {
     CONF_PV_OBSERVED: {"sensor"},
     CONF_BATTERY_SOC: {"sensor"},
     CONF_ENPHASE_PROFILE: {"select", "input_select"},
-    CONF_ENPHASE_EXPORT_LIMIT_ENTITY: {"sensor"},
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY: {"select", "sensor"},
     CONF_DAIKIN_CLIMATE: {"climate"},
     CONF_DAIKIN_POWER: {"sensor"},
     CONF_CLIMATE_AUTOMATIONS: {"automation"},
