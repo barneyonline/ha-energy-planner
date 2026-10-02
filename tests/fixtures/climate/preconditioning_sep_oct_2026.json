@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "source": "Sanitized retained Home Assistant state and execution history; timestamps are Melbourne local time.",
+  "uncertainties": ["The source of the 30 September 24-to-22 zone change is unknown.", "The exact 1 October restoration exception was not retained."],
+  "recovery": {"failed_at": "2026-09-29T18:00:20+10:00", "restored_at": "2026-09-30T06:55:41+10:00", "main_mode": "off", "zone_mode": "off", "zone_target": null, "saved_zone_target": 20},
+  "override": {"acquired_at": "2026-09-30T15:15:00+10:00", "changed_at": "2026-09-30T15:17:11.102+10:00", "old_target": 24, "new_target": 22, "source": "unattributed"},
+  "early_target": {"started_at": "2026-10-01T15:00:15+10:00", "reached_at": "2026-10-01T15:25:27+10:00", "peak_start": "2026-10-01T16:00:00+10:00", "peak_end": "2026-10-01T21:00:00+10:00", "start_temperature": 19, "target": 24, "coast": 19, "original_main_target": 19, "original_zone_target": 20},
+  "power": {"integration": "powercalc", "calculation_mode": "fixed", "unit_of_measurement": "W", "state_class": "measurement"}
+}

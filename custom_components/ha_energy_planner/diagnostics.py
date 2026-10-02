@@ -8,13 +8,23 @@ from homeassistant.core import HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .action_limits import action_budget, budget_history
+from .climate_models import (
+    MAX_ENERGY_ERROR,
+    MAX_TEMPERATURE_MAE,
+    MAX_TEMPERATURE_P90,
+    MIN_ACTIVE_EPISODES,
+    MIN_ACTIVE_RECALL,
+    MIN_HISTORY_DAYS,
+    MIN_STATE_ACCURACY,
+    MIN_VALIDATION_WINDOWS,
+)
 from .const import DEFAULT_OPTIONS
 from .entry_data import combined_entry_data
 from .models import to_jsonable
 from .plan_presentation import built_in_load_forecast_attrs
 from .preconditioning import current_status
 from .safety import control_pause_status
-from .storage import audit_records
+from .storage import audit_records, climate_audit_records
 from .type_defs import EnergyPlannerConfigEntry
 
 REDACT_KEYS = {
@@ -115,12 +125,19 @@ async def async_get_config_entry_diagnostics(
 
 def climate_diagnostics(store_data: dict[str, Any], plan: Any, options: dict[str, Any] | None = None) -> dict[str, Any]:
     """Separate model readiness from the last actual climate control outcome."""
+    climate_audit = climate_audit_records(store_data, dt_util.utcnow())
     engine = store_data.get("climate_engine", {})
     model = engine.get("model", {})
     observations = engine.get("observations", [])
     normal = [row for row in observations if row.get("provenance") == "normal"]
-    outcomes = [item for item in audit_records(store_data) if item.get("asset") == "daikin"]
+    canonical = {item.get("action_id"): item for item in audit_records(store_data) if item.get("asset") == "daikin"}
+    outcomes = [
+        canonical.get(item.get("transaction_id"), item.get("outcome", item))
+        for item in climate_audit
+        if item.get("stage") == "outcome"
+    ] or [item for item in audit_records(store_data) if item.get("asset") == "daikin"]
     control = store_data.get("ownership", {}).get("hvac_control", {})
+    control = control if isinstance(control, dict) else {}
     status = current_status(store_data, plan)
     budget = action_budget(
         budget_history(store_data), {**DEFAULT_OPTIONS, **(options or {})}, dt_util.utcnow(), "daikin",
@@ -138,6 +155,58 @@ def climate_diagnostics(store_data: dict[str, Any], plan: Any, options: dict[str
             status["next_step"] = "Replan to reassess the remaining execution gates before climate control resumes."
     return {
         "preconditioning": status,
+        "lifecycle_id": control.get("lifecycle_id"),
+        "phase_transition_reason": control.get("phase_transition_reason"),
+        "demand_explanation": (
+            "Lower thermostat demand while keeping schedules suppressed and preserving original restoration settings. "
+            "Compressor activity may continue."
+        )
+        if control.get("phase") in {"pre_peak_coast", "peak_coast"}
+        else "Heating or cooling toward the preconditioning target."
+        if control.get("phase") == "preconditioning"
+        else "Normal climate controls or restoration retain authority.",
+        "restoration_stage": "pending" if control.get("required_evidence_lost") else "owned" if control else "released",
+        "unresolved_settings": {
+            key: control.get(key)
+            for key in ("main_state", "zone_states")
+            if control.get("required_evidence_lost") and control.get(key)
+        },
+        "unresolved_automations": store_data.get("ownership", {}).get("climate_automations", {})
+        if control.get("required_evidence_lost")
+        else {},
+        "climate_audit": climate_audit[-100:],
+        "last_failure_category": next(
+            (item["failure_category"] for item in reversed(climate_audit) if item.get("failure_category")),
+            None,
+        ),
+        "last_failure_stage": next(
+            (item.get("stage") for item in reversed(climate_audit) if item.get("failure_category")),
+            None,
+        ),
+        "last_override_attribution": next(
+            (item for item in reversed(climate_audit) if item.get("override_source")), None
+        ),
+        "power_source_type": engine.get("power_source_type", "unknown"),
+        "power_source_reason": engine.get("power_source_reason"),
+        "power_source_conflict": engine.get("power_source_conflict", False),
+        "economic_eligibility_reason": "measured_power_required"
+        if engine.get("power_source_type") != "measured"
+        else "mode_validation_required"
+        if engine.get("status") not in {"active", "ready_observing"}
+        else "eligible",
+        "validation_requirements": {
+            "days": MIN_HISTORY_DAYS,
+            "windows": MIN_VALIDATION_WINDOWS,
+            "active_episodes": MIN_ACTIVE_EPISODES,
+            "temperature_mae": MAX_TEMPERATURE_MAE,
+            "temperature_p90": MAX_TEMPERATURE_P90,
+            "energy_error": MAX_ENERGY_ERROR,
+            "state_accuracy": MIN_STATE_ACCURACY,
+            "active_recall": MIN_ACTIVE_RECALL,
+            "daily_passes": 2,
+        },
+        "observation_deadline": engine.get("observation_until"),
+        "observation_invalid_reason": engine.get("observation_invalid_reason"),
         "economic_status": engine.get("status", "learning"),
         "ever_active": bool(engine.get("ever_active")),
         "readiness": engine.get("modes", {}),

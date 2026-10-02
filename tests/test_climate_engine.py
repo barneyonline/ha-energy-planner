@@ -67,6 +67,7 @@ def context(count=6):
         occupied_temperature_high_c=24,
         climate_inputs={
             "identity": "id",
+            "power_source_type": "measured",
             "target": 21.0,
             "load_excludes_hvac": True,
             "currency": "AUD",
@@ -87,6 +88,7 @@ def row(at=NOW, **values):
         "high": 24.0,
         "target": 21.0,
         "provenance": "normal",
+        "power_source_type": "measured",
         **values,
     }
 
@@ -117,6 +119,7 @@ def physical_rows(mode="heat", days=2):
 def ready_model():
     return {
         "identity": "id",
+        "power_source_type": "measured",
         "baseline_version": 1,
         "validation_version": 1,
         "physical": {"version": 1},
@@ -597,6 +600,7 @@ def test_observation_period_is_persisted_and_not_counted_per_refresh():
         "model": simulation_model(),
         "modes": {"heat": {"ready": True}},
         "opportunities": 9,
+        "observation_cadence_version": 1,
     }
     options = {**DEFAULT_OPTIONS, "hvac_minimum_saving": 0.01}
     assert economic_actions(ctx, options, []) == []
@@ -631,7 +635,20 @@ def test_command_time_authority_cannot_be_forged_by_a_saving():
     )
     assert command_rejection(None, {}, options, engine, desired, NOW) is None
     hass = SimpleNamespace(states=SimpleNamespace(get=lambda key: None))
-    assert command_rejection(hass, {}, options, engine, desired, NOW) is None
+    assert command_rejection(hass, {}, options, engine, desired, NOW) == "economic_climate_power_not_measured"
+    measured_data = {"hvac_power_source_type": "measured"}
+    measured_identity = climate_identity(measured_data, options)
+    assert (
+        command_rejection(
+            hass,
+            measured_data,
+            options,
+            {**engine, "identity": measured_identity},
+            {**desired, "configuration_identity": measured_identity},
+            NOW,
+        )
+        is None
+    )
     assert (
         command_rejection(hass, {}, options, engine, {**desired, "period_end": NOW}, NOW)
         == "economic_climate_window_ended"
@@ -789,6 +806,8 @@ def test_observation_closure_distinguishes_actual_from_predicted_energy():
         "observation_started_at": NOW.isoformat(),
         "observation_until": (NOW + timedelta(minutes=10)).isoformat(),
         "observation_prediction": {
+            "qualified": True,
+            "power_source_type": "measured",
             "baseline_powers_kw": [1, 1],
             "baseline_slots": [NOW.isoformat(), (NOW + timedelta(minutes=5)).isoformat()],
         },
@@ -855,8 +874,9 @@ def test_runtime_revalidates_coasting_and_handles_policy_transitions():
     actions = economic_actions(ctx, options, [])
     ctx.hvac_control = deepcopy(actions[0].desired_state)
     ctx.climate_engine["observation_until"] = (NOW + timedelta(hours=1)).isoformat()
-    assert economic_actions(ctx, options, [])[0].kind == ActionKind.RELEASE_HVAC
-    ctx.climate_engine.pop("observation_until")
+    assert economic_actions(ctx, options, [])[0].kind == ActionKind.SET_HVAC
+    assert ctx.climate_engine["observation_invalid_reason"] == "unqualified_or_intervened"
+    ctx.climate_engine.pop("observation_until", None)
     ctx.climate_engine["scheduled"]["identity"] = "changed"
     assert economic_actions(ctx, options, [])[0].kind == ActionKind.RELEASE_HVAC
     ctx.hvac_control = {}
@@ -1026,12 +1046,12 @@ def test_conservative_savings_allow_lower_normal_consumption():
     "mode,phase,temperature,handoff",
     [
         ("heat", "peak_coast", 20, True),
-        ("heat", "peak_coast", 24, True),
-        ("cool", "peak_coast", 20, True),
+        ("heat", "peak_coast", 24, False),
+        ("cool", "peak_coast", 20, False),
         ("cool", "peak_coast", 24, True),
         ("heat", "preconditioning", 20, False),
-        ("heat", "preconditioning", 24, True),
-        ("cool", "preconditioning", 20, True),
+        ("heat", "preconditioning", 24, False),
+        ("cool", "preconditioning", 20, False),
         ("cool", "preconditioning", 24, False),
     ],
 )
@@ -1170,6 +1190,8 @@ def test_observation_energy_uses_forecast_timestamps(interval):
         "observation_started_at": NOW.isoformat(),
         "observation_until": end.isoformat(),
         "observation_prediction": {
+            "qualified": True,
+            "power_source_type": "measured",
             "baseline_slots": [(NOW + timedelta(minutes=i)).isoformat() for i in range(0, 30, interval)],
             "baseline_powers_kw": [2] * (30 // interval),
             "interval_minutes": interval,
@@ -1378,6 +1400,8 @@ def test_observation_ignores_forecast_points_after_its_period():
         "observation_started_at": NOW.isoformat(),
         "observation_until": end.isoformat(),
         "observation_prediction": {
+            "qualified": True,
+            "power_source_type": "measured",
             "baseline_powers_kw": [1, 100],
             "baseline_slots": [NOW.isoformat(), end.isoformat()],
         },
@@ -1514,7 +1538,7 @@ def test_command_accepts_arrival_after_planned_early_release():
     }
     state = {"identity": identity, "status": "active", "scheduled": {"lifecycle_id": "one"}}
     hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity: sensor if entity == "sensor.arrival" else None))
-    assert command_rejection(hass, data, DEFAULT_OPTIONS, state, desired, NOW) is None
+    assert command_rejection(hass, data, DEFAULT_OPTIONS, state, desired, NOW) == "economic_climate_power_not_measured"
 
 
 def test_default_horizon_search_covers_starts_and_targets_within_budget():
@@ -1661,3 +1685,171 @@ def test_economic_recovery_failures_release_before_any_new_command(ownership):
     assert len(actions) == 1 and actions[0].kind == ActionKind.RELEASE_HVAC
     assert actions[0].desired_state["release_reason"] == "hvac_required_evidence_lost"
     assert "scheduled" not in ctx.climate_engine
+
+
+@pytest.mark.parametrize(
+    "declared,synthetic,effective,conflict",
+    [
+        ("auto", False, "unknown", False),
+        ("measured", False, "measured", False),
+        ("estimated", False, "estimated", False),
+        ("auto", True, "estimated", False),
+        ("measured", True, "estimated", True),
+        ("estimated", True, "estimated", False),
+    ],
+)
+def test_power_provenance_never_promotes_synthetic_watts(declared, synthetic, effective, conflict):
+    from custom_components.ha_energy_planner.climate_inputs import power_provenance
+
+    attrs = {"unit_of_measurement": "W", "state_class": "measurement"}
+    if synthetic:
+        attrs.update(integration="powercalc", calculation_mode="fixed")
+    hass = SimpleNamespace(states=SimpleNamespace(get=lambda entity: SimpleNamespace(attributes=attrs)))
+    result = power_provenance(hass, {"daikin_power_entity": "sensor.power", "hvac_power_source_type": declared})
+    assert result["power_source_type"] == effective
+    assert result["power_source_conflict"] is conflict
+    hass.data = {"entity_registry": SimpleNamespace(async_get=lambda entity: SimpleNamespace(platform="powercalc"))}
+    assert power_provenance(hass, {"daikin_power_entity": "sensor.power"})["power_source_type"] == "estimated"
+
+
+def test_estimated_power_blocks_validation_without_suppressing_legacy():
+    ctx = context()
+    ctx.climate_inputs["power_source_type"] = "estimated"
+    state = update_readiness({}, ready_model(), ctx, DEFAULT_OPTIONS)
+    assert state["status"] == "learning"
+    assert state["modes"]["heat"]["passes"] == 0
+    assert "power_provenance_not_measured" in state["modes"]["heat"]["blockers"]
+    assert "validation_not_qualified" in state["modes"]["heat"]["blockers"]
+    assert "validation_expired" not in state["modes"]["heat"]["blockers"]
+    rows = [row(NOW - timedelta(days=i), power_source_type="estimated") for i in range(20)]
+    result = validate(rows, "heat", "UTC", 30)
+    assert result.windows == 0 and result.rejected_windows["invalid_power_provenance"] == 20
+    legacy = [SimpleNamespace(desired_state={"phase": "preconditioning", "period_end": NOW + timedelta(hours=1)})]
+    ctx.climate_engine = {
+        "status": "active",
+        "ever_active": True,
+        "opportunities": 9,
+        "model": simulation_model(),
+        "modes": {"heat": {"ready": True}},
+    }
+    assert economic_actions(ctx, DEFAULT_OPTIONS, legacy) == legacy
+    assert ctx.climate_engine["opportunities"] == 9
+    assert not ctx.climate_decision["observation_eligible"]
+
+
+def test_power_change_invalidates_models_without_rewriting_old_observations_or_ownership():
+    ctx = context()
+    state = observe({}, ctx, 20)
+    ownership = {"phase": "peak_coast", "main_state": {"hvac_mode": "off", "target_temperature": 19}}
+    ctx.hvac_control = deepcopy(ownership)
+    ctx.created_at += timedelta(minutes=5)
+    ctx.climate_inputs["power_source_type"] = "estimated"
+    state.update(model=ready_model(), modes={"heat": {"ready": True}}, scheduled={"lifecycle_id": "old"})
+    result = observe(state, ctx, 20)
+    assert not result.get("model") and not result.get("modes") and not result.get("scheduled")
+    assert result["observations"][0]["power_source_type"] == "measured"
+    assert result["observations"][-1]["power_source_type"] == "estimated"
+    assert ctx.hvac_control == ownership
+    # Returning to measured must not revive evidence invalidated by the change.
+    ctx.climate_inputs["power_source_type"] = "measured"
+    ctx.created_at += timedelta(minutes=5)
+    measured_again = observe(result, ctx, 20)
+    retrained = train_climate(measured_again, "UTC", 30, ctx.created_at)
+    assert retrained["normal"] == []
+    assert retrained["validation"]["heat"]["windows"] == 0
+    assert measured_again["observations"][0]["power_source_type"] == "measured"
+    old = row()
+    old.pop("power_source_type")
+    assert validate([old], "heat", "UTC", 30).windows == 0
+    assert validate_climate_config({"hvac_power_source_type": "inferred_watts"})
+
+
+def test_economic_early_target_revalidates_real_coast_timestamp(monkeypatch):
+    from custom_components.ha_energy_planner import climate_runtime as runtime
+
+    ctx = context(12)
+    ctx.current_hvac_temperature_c = 24
+    ctx.hvac_control = {
+        "economic_policy_version": 1,
+        "main_state_committed": True,
+        "phase": "preconditioning",
+        "mode": "heat",
+        "precondition_target": 24,
+        "precondition_end": NOW + timedelta(minutes=15),
+        "period_start": NOW + timedelta(minutes=15),
+        "period_end": NOW + timedelta(minutes=45),
+    }
+    ctx.climate_engine = {
+        "status": "active",
+        "model": ready_model(),
+        "modes": {"heat": {"ready": True}},
+        "scheduled": {
+            "mode": "heat",
+            "start": (NOW - timedelta(minutes=25)).isoformat(),
+            "stop": (NOW + timedelta(minutes=15)).isoformat(),
+            "release": (NOW + timedelta(minutes=45)).isoformat(),
+        },
+    }
+    stops = []
+
+    def rejected_trajectory(context, options, model, scheduled):
+        stops.append(scheduled["stop"])
+        return None
+
+    monkeypatch.setattr(runtime, "revalidate_schedule", rejected_trajectory)
+    result = economic_actions(ctx, DEFAULT_OPTIONS, [])
+    assert stops == [NOW.isoformat()]
+    assert result[0].kind == ActionKind.RELEASE_HVAC
+    assert result[0].desired_state["release_reason"] == "economic_revalidation_failed"
+
+
+@pytest.mark.parametrize("source", ["estimated", "unknown", "expired_measured"])
+def test_synthetic_or_retired_power_cannot_fit_economic_electrical_response(source):
+    rows = physical_rows()
+    for item in rows:
+        item["zones"] = {"climate.room": {"temperature": item["temperature"], "humidity": 50}}
+        item["power_source_type"] = "measured" if source == "expired_measured" else source
+    state = {"identity": "id", "power_source_type": "measured", "observations": rows}
+    if source == "expired_measured":
+        state["power_evidence_after"] = NOW.isoformat()
+    trained = train_climate(state, "UTC", 30, NOW)
+    assert "heat" not in trained["physical"]
+    assert "heat" not in trained["rooms"]["climate.room"]["physical"]
+    assert trained["normal"] == []
+    assert trained["validation"]["heat"]["windows"] == 0
+    assert trained["humidity"]["ready"]  # Unrelated humidity history is retained.
+
+
+def test_power_declaration_changes_retire_energy_evidence_without_erasing_unrelated_history():
+    ctx = context()
+    data = {"hvac_power_source_type": "auto"}
+    ctx.climate_inputs.update(identity=climate_identity(data, DEFAULT_OPTIONS), power_source_type="unknown")
+    state = observe({}, ctx, 20)
+    state["observations"][0]["humidity"] = 50
+    data["hvac_power_source_type"] = "measured"
+    ctx.created_at += timedelta(minutes=5)
+    ctx.climate_inputs.update(identity=climate_identity(data, DEFAULT_OPTIONS), power_source_type="measured")
+    result = observe(state, ctx, 20)
+    assert len(result["observations"]) == 2
+    assert result["observations"][0]["humidity"] == 50
+    assert result["observations"][0]["power_source_type"] == "unknown"
+    assert result["power_evidence_after"] == ctx.created_at.isoformat()
+
+
+def test_learning_era_counter_does_not_withhold_first_validated_opportunity():
+    ctx = context(6)
+    ctx.slots[0].import_price = 0
+    for slot in ctx.slots[1:]:
+        slot.import_price = 5
+    ctx.climate_engine = {
+        "status": "active",
+        "ever_active": True,
+        "model": simulation_model(),
+        "modes": {"heat": {"ready": True}},
+        "opportunities": 9,
+        "observation_date": NOW.date().isoformat(),
+    }
+    actions = economic_actions(ctx, {**DEFAULT_OPTIONS, "hvac_minimum_saving": 0.01}, [])
+    assert actions and not ctx.climate_decision["observing"]
+    assert ctx.climate_engine["opportunities"] == 1
+    assert ctx.climate_engine["observation_cadence_version"] == 1

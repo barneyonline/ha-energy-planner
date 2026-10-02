@@ -2557,7 +2557,7 @@ def test_manual_override_and_zone_change_helpers_cover_invalid_events() -> None:
         **climate_entry_data,
         CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
     }
-    assert not _is_manual_hvac_zone_change(
+    assert _is_manual_hvac_zone_change(
         FakeHass({"input_boolean.scheduler_change": "on"}),
         guarded_climate_entry_data,
         {"ownership": {"hvac_control": {"phase": "peak_coast"}}},
@@ -8452,6 +8452,11 @@ def test_climate_training_publication_and_nested_input_listeners() -> None:
         mismatched = TrainingResult({}, {}, False, False, 'unchanged', 'unchanged', {'identity': 'other'})
         await coordinator._async_publish_training(0, request, mismatched)
         assert coordinator.store.data['climate_engine']['model'] == {'identity': identity}
+        for changed in ({"power_source_type": "measured"}, {"power_evidence_after": "new-source-epoch"}):
+            obsolete = TrainingResult({}, {}, False, False, "unchanged", "unchanged", {"identity": identity, **changed})
+            await coordinator._async_publish_training(0, request, obsolete)
+            assert coordinator.store.data["climate_engine"]["model"] == {"identity": identity}
+
     asyncio.run(run())
     values = coordinator_module._configured_entity_ids({'hvac_zone_mappings': {
         'climate.room': {'temperature': 'sensor.room', 'maximum_humidity': 60}, 'invalid': None}})
@@ -9304,3 +9309,125 @@ def test_committed_phase_is_recorded_before_a_later_device_action_stops_it(monke
     history = coordinator.store.data["calendar_history"]["history"]
     assert len(history) == 1
     assert history[0]["end"] == clock[0].isoformat()
+
+
+@pytest.mark.parametrize("source", ["user", "parent", "unattributed"])
+def test_owned_climate_conflict_records_attribution_even_when_scheduler_guard_is_on(monkeypatch, source):
+    callbacks = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.async_call_later", lambda *args: lambda: None)
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={
+            CONF_DAIKIN_CLIMATE: "climate.daikin",
+            CONF_CLIMATE_ZONES: ["climate.zone"],
+            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.guard",
+        },
+        hass=FakeHass({"input_boolean.guard": "on"}),
+        store_data={"ownership": {"hvac_control": {"phase": "peak_coast", "lifecycle_id": "cycle"}}},
+    )
+    records = []
+    coordinator.store.record_climate_event = lambda record, **kwargs: records.append(record)
+    coordinator._async_handle_manual_hvac_change = AsyncMock()
+    coordinator.executor.hvac_feedback_commands = [
+        {
+            "context_id": "our-command",
+            "issued_at": datetime.now(UTC),
+            "deadline": datetime.now(UTC) + timedelta(minutes=2),
+            "entity_id": "climate.zone",
+            "service": "set_temperature",
+            "requested": {"temperature": 24},
+        }
+    ]
+    coordinator.async_start_listeners()
+    event = FakeEvent(
+        "climate.zone",
+        "heat",
+        "heat",
+        old_attributes={"temperature": 24},
+        new_attributes={"temperature": 22},
+        context_id="observed-context",
+        context_user_id="user" if source == "user" else None,
+        parent_context_id="other-command" if source == "parent" else None,
+    )
+    callbacks[0](event)
+    assert (
+        records[0]["override_source"]
+        == {"user": "user", "parent": "context_linked_external", "unattributed": "unattributed"}[source]
+    )
+    assert records[0]["supporting_command_context"] == "our-command"
+    assert records[0]["lifecycle_id"] == "cycle"
+    assert records[0]["observed"]["temperature"] == 22
+    coordinator._async_handle_manual_hvac_change.assert_called_once_with(
+        "climate_zone_changed", preserve_zone_entity_id="climate.zone"
+    )
+
+
+def test_missing_scheduler_guard_does_not_hide_unowned_manual_changes():
+    assert _is_manual_hvac_change(
+        FakeHass(),
+        {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.absent"},
+        {"ownership": {}},
+        FakeEvent("climate.daikin", "heat", "off"),
+        datetime.now(UTC),
+    )
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone"])
+def test_manual_change_during_settling_retires_completed_command_expectations(monkeypatch, entity):
+    callbacks = []
+    monkeypatch.setattr(
+        "custom_components.ha_energy_planner.coordinator.async_track_state_change_event",
+        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.async_call_later", lambda *args: lambda: None)
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]},
+        store_data={"ownership": {"hvac_control": {"phase": "peak_coast"}}},
+    )
+    coordinator._async_handle_manual_hvac_change = AsyncMock()
+    now = datetime.now(UTC)
+    coordinator.executor.hvac_feedback_commands = [
+        {
+            "entity_id": entity,
+            "service": "set_temperature",
+            "context_id": "completed",
+            "issued_at": now,
+            "deadline": now + timedelta(minutes=2),
+            "requested": {"temperature": 22},
+        }
+    ]
+    coordinator.store.data["execution_audit"] = [
+        {
+            "asset": "daikin",
+            "result": "applied",
+            "attempted_at": now.isoformat(),
+            "desired_state": {"hvac_mode": "heat", "target_temperature": 22, "configured_zones_only": True},
+        }
+    ]
+    coordinator.async_start_listeners()
+    callbacks[0](
+        FakeEvent(
+            entity,
+            "heat",
+            "heat",
+            old_attributes={"temperature": 22},
+            new_attributes={"temperature": 24},
+            context_user_id="human",
+        )
+    )
+    assert coordinator.executor.hvac_feedback_commands == []
+    callbacks[0](
+        FakeEvent(entity, "heat", "heat", old_attributes={"temperature": 24}, new_attributes={"temperature": 22})
+    )
+    assert coordinator._async_handle_manual_hvac_change.call_count == 2
+
+
+def test_explicit_manual_override_retires_completed_command_expectations():
+    coordinator = _coordinator_for_runtime_services()
+    coordinator.executor.hvac_feedback_commands = [{"context_id": "completed-command"}]
+    asyncio.run(coordinator.async_set_manual_hvac_override(45, "operator_request"))
+    assert coordinator.executor.hvac_feedback_commands == []
+    assert coordinator.executor.hvac_releases == ["operator_request"]

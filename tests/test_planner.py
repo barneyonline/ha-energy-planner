@@ -1867,8 +1867,8 @@ def test_disabled_climate_control_only_releases_persisted_ownership() -> None:
 
     assert owned_plan.actions[0].kind == ActionKind.RELEASE_HVAC
     assert owned_plan.actions[0].desired_state == {
-        "release_reason": "hvac_comfort_handoff",
-        "released_until": period_end,
+        "release_reason": "hvac_expensive_period_ended",
+        "released_until": None,
     }
 
 
@@ -3749,6 +3749,10 @@ def test_preconditioning_continues_toward_comfort_after_acquisition(
     # The observed failure occurred ten seconds after acquiring control.
     context.created_at += timedelta(seconds=10)
     continued = next(a for a in planner.create_plan(context).actions if a.asset == ActionAsset.DAIKIN)
+    if not 19 <= temperature <= 24:
+        assert continued.kind == ActionKind.RELEASE_HVAC
+        assert continued.desired_state["release_reason"] == "hvac_comfort_handoff"
+        return
     assert continued.kind == ActionKind.SET_HVAC
     assert continued.desired_state["phase"] == "preconditioning"
     assert continued.desired_state["target_temperature"] == target
@@ -3756,8 +3760,8 @@ def test_preconditioning_continues_toward_comfort_after_acquisition(
 
 
 @pytest.mark.parametrize(("mode", "temperature"), [("heat", 24.0), ("heat", 25.0), ("cool", 19.0), ("cool", 18.0)])
-def test_preconditioning_hands_off_at_opposite_comfort_boundary(mode: str, temperature: float) -> None:
-    context = _boundary_preconditioning_context(mode, temperature)
+def test_preconditioning_hands_off_outside_opposite_comfort_boundary(mode: str, temperature: float) -> None:
+    context = _boundary_preconditioning_context(mode, temperature + (0.1 if mode == "heat" else -0.1))
     period_end = context.created_at + timedelta(hours=2)
     context.hvac_control = {
         "phase": "preconditioning", "mode": mode, "baseline_price": 0.10,

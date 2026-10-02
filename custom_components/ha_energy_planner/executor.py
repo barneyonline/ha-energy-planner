@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.util import dt as dt_util
 
 from .action_limits import action_budget, budget_history
@@ -155,6 +155,7 @@ class Executor:
         self.entry_id = entry_id
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
+        self.hvac_feedback_commands: list[dict[str, Any]] = []
         self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
         self.ev_restore_guard: Callable[[], bool] = lambda: True
         self.ev_start_feedback_expected_until: datetime | None = None
@@ -164,6 +165,7 @@ class Executor:
 
     def mark_pending_hvac_manual_override(self) -> bool:
         """Synchronously mark an in-flight HVAC command as user-superseded."""
+        getattr(self, "hvac_feedback_commands", []).clear()
         pending = self.pending_hvac_desired_state
         if pending is None:
             return False
@@ -172,6 +174,8 @@ class Executor:
 
     def mark_pending_hvac_zone_manual_override(self, entity_id: str) -> bool:
         """Synchronously mark an in-flight zone command as user-superseded."""
+        if entity_id:
+            getattr(self, "hvac_feedback_commands", []).clear()
         pending = self.pending_hvac_desired_state
         if pending is None or not entity_id:
             return False
@@ -1030,6 +1034,7 @@ class Executor:
                 action.desired_state,
                 main_state_superseded=main_state_superseded,
                 superseded_zone_entity_ids=superseded_zone_entity_ids,
+                confirmed_at=dt_util.utcnow(),
             )
             if completed_ownership is not None:
                 await self.store.async_save_ownership(completed_ownership)
@@ -2589,6 +2594,62 @@ class Executor:
     def _configure_pending_hvac_adapter(self, adapter: DaikinHVACAdapter, pending: dict[str, Any]) -> None:
         """Wire one adapter to the shared pending-transaction protocol."""
         pending["deferred_zone_entities"] = adapter.deferred_zone_entities
+        pending.setdefault("transaction_id", Context().id)
+        baseline = getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {})
+        if isinstance(baseline, dict):
+            pending.setdefault("lifecycle_id", baseline.get("lifecycle_id"))
+            abort_callback = getattr(adapter, "set_abort_main_state", None)
+            if callable(abort_callback):
+                abort_callback(dict(baseline.get("main_state", {})))
+        self.hvac_feedback_commands = [
+            item for item in getattr(self, "hvac_feedback_commands", []) if item["deadline"] > dt_util.utcnow()
+        ]
+
+        def record_command(record: dict[str, Any]) -> None:
+            now = dt_util.utcnow()
+            record = {
+                **record,
+                "requested_hvac_mode": pending.get("hvac_mode") or pending.get("restore_main", {}).get("hvac_mode"),
+            }
+            evidence = {
+                **record,
+                "transaction_id": pending.setdefault("transaction_id", record["context_id"]),
+                "lifecycle_id": pending.get("lifecycle_id"),
+                "phase": pending.get("phase") or "restoration",
+            }
+            store = getattr(self, "store", None)
+            audit = getattr(store, "record_climate_event", None)
+            if callable(audit):
+                audit(evidence, now=now)
+            if record["stage"] == "issued":
+                effect = "target" if record["service"] == "set_temperature" else "mode"
+                self.hvac_feedback_commands[:] = [
+                    item
+                    for item in self.hvac_feedback_commands
+                    if item["deadline"] > now
+                    and not (
+                        item["entity_id"] == record["entity_id"]
+                        and ("target" if item["service"] == "set_temperature" else "mode") == effect
+                    )
+                ]
+                zone_targets = pending.get("restore_zones") or getattr(store, "data", {}).get("ownership", {}).get(
+                    "hvac_control", {}
+                ).get("zone_states", {})
+                self.hvac_feedback_commands.append(
+                    {**record, "zone_targets": zone_targets, "issued_at": now, "deadline": now + timedelta(minutes=2)}
+                )
+                del self.hvac_feedback_commands[:-30]
+                pending["feedback_commands"] = self.hvac_feedback_commands
+            elif record.get("failure_category") == "CancelledError":
+                self.hvac_feedback_commands.clear()
+            elif record["stage"].endswith("failed"):
+                self.hvac_feedback_commands[:] = [
+                    item for item in self.hvac_feedback_commands if item["context_id"] != record["context_id"]
+                ]
+
+        command_callback = getattr(adapter, "set_command_callback", None)
+        if callable(command_callback):
+            command_callback(record_command)
         adapter.set_manual_override_check(lambda: pending.get(_PENDING_HVAC_MANUAL_OVERRIDE_KEY) is True)
         adapter.set_manual_override_persistence_callback(self._async_persist_provisional_hvac_manual_supersession)
         adapter.set_zone_manual_override_check(

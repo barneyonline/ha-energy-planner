@@ -1216,3 +1216,149 @@ def test_reload_retains_dispatched_target_loss_and_prunes_legacy_local_rejection
     assert store.data["action_attempts"] == [dispatched]
     assert store.data["execution_audit"][-1]["command_sent"] is True
     assert "command_sent" not in store.data["execution_audit"][0]
+
+
+def test_climate_audit_is_durable_bounded_deduplicated_and_isolated(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    store = PlannerStore(object(), "climate-audit")
+    now = datetime.now(UTC) - timedelta(minutes=2)
+    store.data["climate_audit"] = [None, {"last_at": "invalid"}, {"last_at": (now - timedelta(days=31)).isoformat()}]
+    evidence = {
+        "stage": "service_failed",
+        "phase": "restoration",
+        "entity_id": "climate.zone",
+        "failure_category": "ValueError",
+        "requested": {"temperature": 20, "api_key": "secret"},
+        "raw_payload": "secret",
+        "context_id": "first",
+    }
+    store.record_climate_event(evidence, now=now)
+    store.record_climate_event({**evidence, "context_id": "second"}, now=now + timedelta(seconds=1))
+    assert len(store.data["climate_audit"]) == 1
+    record = store.data["climate_audit"][0]
+    assert record["occurrence_count"] == 2 and record["first_at"] == now.isoformat()
+    assert "secret" not in repr(record)
+    for i in range(110):
+        store.record_climate_event(
+            {"stage": "issued", "entity_id": f"climate.zone_{i}"}, now=now + timedelta(seconds=i + 2)
+        )
+    assert len(store.data["climate_audit"]) == 100
+    retained = deepcopy(store.data["climate_audit"])
+    for i in range(105):
+        asyncio.run(
+            store.async_add_outcome(
+                ActionOutcome(
+                    str(i),
+                    now,
+                    OutcomeResult.SKIPPED,
+                    "already_selected",
+                    {},
+                    {},
+                    "plan",
+                    asset="enphase",
+                    kind="set_profile",
+                )
+            )
+        )
+    assert store.data["climate_audit"] == retained
+    FakeStore.loaded = deepcopy(FakeStore.saved)
+    restarted = PlannerStore(object(), "climate-audit")
+    asyncio.run(restarted.async_load())
+    assert restarted.data["climate_audit"] == retained
+
+
+def test_climate_audit_rejects_expired_future_and_unsupported_records_on_read():
+    """Retention applies even when the climate has been inactive for weeks."""
+    from custom_components.ha_energy_planner.storage import climate_audit_records
+
+    now = datetime.now(UTC)
+    assert climate_audit_records({"climate_audit": {}}, now) == []
+    valid = {"version": 1, "last_at": now.isoformat(), "stage": "issued"}
+    stale = {"last_at": (now - timedelta(days=31)).isoformat()}
+    future = {"last_at": (now + timedelta(days=1)).isoformat()}
+    unsupported = {**valid, "version": 2}
+    data = {"climate_audit": [stale, future, unsupported, valid]}
+    assert climate_audit_records(data, now) == [valid]
+    assert storage_module._normalize_loaded_data(data)["climate_audit"] == [valid]
+
+
+def test_climate_outcome_start_timestamp_cannot_discard_later_command_evidence(monkeypatch):
+    """An outcome is attempted before dispatch; audit retention uses completion time."""
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object(), "chronological-climate")
+    start = datetime.now(UTC) - timedelta(seconds=1)
+    store.record_climate_event({"stage": "issued", "entity_id": "switch.zone", "service": "turn_on"})
+    store.record_climate_event({"stage": "confirmed", "entity_id": "switch.zone", "observed": {"mode": "on"}})
+    asyncio.run(
+        store.async_add_outcome(
+            ActionOutcome(
+                "action",
+                start,
+                OutcomeResult.APPLIED,
+                "hvac_action_applied",
+                {},
+                {},
+                "plan",
+                asset="daikin",
+                kind="set_hvac",
+            )
+        )
+    )
+    assert [r["stage"] for r in store.data["climate_audit"]] == ["issued", "confirmed", "outcome"]
+
+
+def test_climate_outcome_diagnostics_keep_existing_shape_and_readback_after_general_audit_rotation(monkeypatch):
+    from custom_components.ha_energy_planner.diagnostics import climate_diagnostics
+
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object(), "climate-outcomes")
+    outcome = ActionOutcome(
+        "release",
+        datetime.now(UTC),
+        OutcomeResult.RESTORED,
+        "hvac_restored",
+        {"daikin_climate_entity": "heat", "climate.zone": "heat"},
+        {"daikin_climate_entity": "off", "climate.zone": "off"},
+        "plan",
+        asset="daikin",
+        kind="release_hvac",
+        service_target="climate.main",
+        desired_state={"target_temperature": 19},
+    )
+    asyncio.run(store.async_add_outcome(outcome))
+    canonical = store.data["execution_audit"][-1]
+    assert climate_diagnostics(store.data, None)["last_outcome"] == canonical
+    store.data["execution_audit"] = [{"asset": "enphase"}] * 100
+    result = climate_diagnostics(store.data, None)
+    assert result["last_outcome"] == result["last_release"] == canonical
+    assert result["climate_audit"][-1]["observed"] == outcome.post_state
+
+
+def test_climate_outcome_retry_deduplication_preserves_redacted_last_readback(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    store = PlannerStore(object(), "retry-audit")
+    now = datetime.now(UTC)
+    for index in range(2):
+        asyncio.run(
+            store.async_add_outcome(
+                ActionOutcome(
+                    f"attempt-{index}",
+                    now + timedelta(seconds=index),
+                    OutcomeResult.FAILED,
+                    "hvac_release_failed",
+                    {},
+                    {"climate.zone": "off", "api_key": "secret", "raw_payload": {"vendor": "secret"}},
+                    f"plan-{index}",
+                    asset="daikin",
+                    kind="release_hvac",
+                    command_sent=True,
+                )
+            )
+        )
+    audit = store.data["climate_audit"]
+    assert len(audit) == 1 and audit[0]["occurrence_count"] == 2
+    assert audit[0]["outcome"]["action_id"] == "attempt-1"
+    assert audit[0]["outcome"]["post_state"] == {"climate.zone": "off"}
+    assert audit[0]["outcome"]["command_sent"] is True
+    assert "secret" not in repr(audit)

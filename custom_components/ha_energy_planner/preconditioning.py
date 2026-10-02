@@ -101,7 +101,11 @@ def planning_status(
 
 def window_key(desired: dict[str, Any]) -> list[Any]:
     """Match a climate window across regenerated plan/action IDs."""
-    return [to_jsonable(desired.get(key)) for key in ("period_start", "period_end", "mode")]
+    return (
+        ["lifecycle", desired["lifecycle_id"]]
+        if desired.get("lifecycle_id")
+        else [to_jsonable(desired.get(key)) for key in ("period_start", "period_end", "mode")]
+    )
 
 
 def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = None) -> dict[str, Any]:
@@ -254,6 +258,6 @@ def _confirmed_window(control: dict[str, Any], window: list[Any]) -> bool:
     """Use committed preconditioning ownership, never a later coasting-only acquisition."""
     return bool(
         control.get("main_state_committed")
-        and control.get("phase") == "preconditioning"
+        and (control.get("phase") == "preconditioning" or control.get("preconditioning_confirmed") is True)
         and window_key(control) == window
     )
