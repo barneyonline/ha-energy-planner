@@ -278,16 +278,19 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 
         entry = next(iter(hass.config_entries.async_entries("ha_energy_planner")))
-        registered = er.async_get(hass).async_get_or_create("sensor", "enphase_ev",
+        registered = er.async_get(hass).async_get_or_create("select", "enphase_ev",
             "smoke_enphase_export_limit", config_entry=entry, suggested_object_id="smoke_export_limit")
         entity = registered.entity_id
+        sensor = er.async_get(hass).async_get_or_create("sensor", "enphase_ev",
+            "smoke_enphase_export_limit", config_entry=entry, suggested_object_id="smoke_export_feedback").entity_id
+        hass.states.async_set(entity, "enable_limit", {"default_limit_watts": 5000})
         mapping = {"enphase_export_limit_entity": entity, "amber_export_price_entity": "sensor.smoke_export_tariff"}
         store = PlannerStore(hass, "smoke_export_limit")
         calls = []
         slew = 77
 
         def readback(watts):
-            hass.states.async_set(entity, "disabled" if watts is None else "zero_export" if watts == 0 else "limited",
+            hass.states.async_set(sensor, "disabled" if watts is None else "zero_export" if watts == 0 else "limited",
                 {"confirmed_watts": watts, "slew_rate": slew, "pending": False,
                  "last_successful_readback": dt_util.utcnow().timestamp(), "request_status": "confirmed"})
 
@@ -311,14 +314,14 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
                                   export_limit=evidence(hass, mapping, options, now))
             for action in build_actions(ctx):
                 await ExportLimitControl(hass, store, mapping).execute(action, now)
-            assert hass.states.get(entity).attributes["confirmed_watts"] == (0 if price < 0 else None)
+            assert hass.states.get(sensor).attributes["confirmed_watts"] == (0 if price < 0 else None)
         assert len(calls) == 2  # Positive follows zero without a redundant write.
         await store.async_flush()
         recovered = PlannerStore(hass, "smoke_export_limit")
         await recovered.async_load()
         assert recovered.data["ownership"][EXPORT_ASSET]["baseline"] == {"watts": 3000, "slew_rate": slew}
         await ExportLimitControl(hass, recovered, mapping).restore(dt_util.utcnow())
-        assert hass.states.get(entity).attributes["confirmed_watts"] == 3000
+        assert hass.states.get(sensor).attributes["confirmed_watts"] == 3000
         assert calls[-1]["slew_rate"] == slew
         assert EXPORT_ASSET not in recovered.data["ownership"]
         Path(hass.config.config_dir, ".export_limit_smoke_complete").touch()

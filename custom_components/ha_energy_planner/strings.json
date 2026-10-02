@@ -38,7 +38,7 @@
       "invalid_climate_configuration": "Check the climate mappings, humidity range and ordered positive COP values.",
       "invalid_ev_policy": "Enter valid EV limits; departure priority requires an emergency ceiling above the normal ceiling and a positive extra-spending budget.",
       "retry_not_ready": "Migration is already running or is not ready for repair. Wait for setup to finish, then try again.",
-      "invalid_export_limit_entity": "Select an Export Limit sensor supplied by the Enphase integration."
+      "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported."
     },
     "abort": {
       "already_configured": "Energy Planner is already configured.",
@@ -243,16 +243,16 @@
               "enphase_full_backup_profile": "Enphase Charge Battery Profile",
               "enphase_profile_min_hold_minutes": "Enphase profile minimum hold",
               "enphase_minimum_savings": "Minimum Enphase savings",
-              "enphase_export_limit_entity": "Enphase Export Limit sensor"
+              "enphase_export_limit_entity": "Enphase Export Limit control entity"
             },
             "data_description": {
-              "enphase_profile_entity": "Select entity used to read and change the current Enphase system profile.",
+              "enphase_profile_entity": "Optional Select entity used to read and change the Enphase system profile. Leave unmapped for export-only operation, or keep Enphase Profile control off to preserve the current profile.",
               "enphase_ai_profile": "Profile name to restore when planner ownership ends, normally AI Optimisation.",
               "enphase_self_consumption_profile": "Profile name used when the planner wants the battery to serve local load or export, normally Self-Consumption.",
               "enphase_full_backup_profile": "Profile name used when the planner wants to charge or preserve the battery, normally Full Backup.",
               "enphase_profile_min_hold_minutes": "Minimum time to keep an Enphase profile before changing it again.",
               "enphase_minimum_savings": "Minimum estimated daily savings required before the planner takes Enphase profile ownership.",
-              "enphase_export_limit_entity": "Select the Enphase Export Limit sensor. Automatic control selects 0 W for negative export prices and Disabled otherwise, replacing any existing nonzero limit. Enable Export Limit controls and installer access in Enphase first."
+              "enphase_export_limit_entity": "Select the Enphase Export Limit Select entity. Automatic control requests 0 W for negative export prices and Disabled otherwise, replacing any existing nonzero limit. Enable Export Limit controls and installer access in Enphase first. For export-only operation, leave Enphase Profile control off."
             }
           },
           "ai_inputs": {
@@ -281,7 +281,7 @@
               "plan_fallback_notifications_enabled": "Shows persistent notifications only for problems that normally require user action, such as broken required mappings or a configured grid hard limit. Routine changes and successful recovery do not notify.",
               "ev_control_enabled": "Allows active-mode EV start, stop, and schedule commands after production is armed.",
               "climate_control_enabled": "Allows active-mode climate commands after production is armed.",
-              "enphase_control_enabled": "Allows active-mode Enphase profile changes after production is armed.",
+              "enphase_control_enabled": "Allows active-mode Enphase profile changes after production is armed. Leave off to preserve the current profile when using Export Limit control only.",
               "ai_timeout_seconds": "Maximum time to wait after pressing Explain.",
               "command_rate_limit_seconds": "Cooldown between repeated commands to the same device target.",
               "max_daily_ev_actions": "Maximum EV control attempts allowed in a rolling 24-hour window. Set to 0 for no cap.",
@@ -508,7 +508,7 @@
       "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
       "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure.",
       "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes.",
-      "invalid_export_limit_entity": "Select an Export Limit sensor supplied by the Enphase integration."
+      "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",

@@ -17,6 +17,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity_registry import EVENT_ENTITY_REGISTRY_UPDATED
 from homeassistant.helpers.event import async_call_later, async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -103,6 +104,7 @@ from .discovery import CapabilityDiscovery
 from .enphase_export_limit import ExportLimitControl
 from .enphase_export_limit import evidence as export_limit_evidence
 from .enphase_export_limit import feedback as export_limit_feedback
+from .enphase_export_limit import feedback_entity_id as export_limit_feedback_entity_id
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
@@ -591,6 +593,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         entry_data = self.entry_data
         self._start_load_forecast_source_listener(entry_data)
         entity_ids = _configured_entity_ids(entry_data)
+        export_feedback_entity = export_limit_feedback_entity_id(
+            self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        )
+        if export_feedback_entity and export_feedback_entity not in entity_ids:
+            entity_ids.append(export_feedback_entity)
         if not entity_ids:
             return
 
@@ -684,7 +691,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 None,
             )
             entity_id = str(event.data.get("entity_id") or "")
-            if entity_id == entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+            if entity_id in {entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_feedback_entity}:
                 self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
                 return
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
@@ -814,7 +821,34 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return
             self._schedule_debounced_refresh("state_change")
 
-        self._unsub_listeners.append(async_track_state_change_event(self.hass, entity_ids, _handle_state_change))
+        unsubscribe_states = async_track_state_change_event(self.hass, entity_ids, _handle_state_change)
+
+        @callback
+        def _unsubscribe_states() -> None:
+            unsubscribe_states()
+
+        self._unsub_listeners.append(_unsubscribe_states)
+        export_entity = entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        if export_entity and export_entity.startswith("select."):
+            @callback
+            def _handle_export_registry_change(_event: Any) -> None:
+                nonlocal export_feedback_entity, unsubscribe_states
+                if self._tearing_down:
+                    return
+                sensor = export_limit_feedback_entity_id(self.hass, export_entity)
+                if sensor == export_feedback_entity:
+                    return
+                export_feedback_entity = sensor
+                watched_entities = _configured_entity_ids(entry_data)
+                if sensor and sensor not in watched_entities:
+                    watched_entities.append(sensor)
+                unsubscribe_states()
+                unsubscribe_states = async_track_state_change_event(self.hass, watched_entities, _handle_state_change)
+                self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
+
+            self._unsub_listeners.append(self.hass.bus.async_listen(
+                EVENT_ENTITY_REGISTRY_UPDATED, _handle_export_registry_change,
+            ))
         charging_entity = entry_data.get(CONF_EV_CHARGING)
         charging_state = self.hass.states.get(charging_entity) if charging_entity else None
         if (
