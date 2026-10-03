@@ -299,7 +299,7 @@ rules:
         - tests/test_lifecycle.py
   docs-configuration-parameters:
     status: done
-    comment: EV readiness, capacity, optional power controls, measured learning, and emergency spending are documented in docs/ev-scheduling.md. Central settings document the 0–30 minute conservative household-load outage grace, climate away-preconditioning opt-in, catch-up windows, default-off configured-zone synchronisation, discovery and execution-time rollback-target gates, main-first target ordering, disabled-sync target isolation, acquisition rollback and retry of the complete main state including Daikin's remembered active mode, independent off cleanup and blocking of reacquisition while main recovery remains unresolved, exact pending main/zone targets and explicitly phased main turn-on and context-correlated coupled zone-actuator feedback classification, synchronous in-flight abort across acquisition rollback and recovery, crash-safe preservation of superseding manual main changes, and per-zone supersession that removes only the user's zone before remaining rollback actuators run, zone switch/helper restoration and zone-climate target propagation, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards with corrective preconditioning continuation and both-boundary coasting handoffs even for stale persisted phases, and bounded manual-override helper behavior.
+    comment: EV readiness, capacity, optional power controls, measured learning, and emergency spending are documented in docs/ev-scheduling.md. Central settings document the 0–30 minute conservative household-load outage grace, climate away-preconditioning opt-in, catch-up windows, default-off configured-zone synchronisation, discovery and execution-time rollback-target gates, main-first target ordering, disabled-sync target isolation, acquisition rollback and retry of the complete main state including Daikin's remembered active mode, independent off cleanup and blocking of reacquisition while main recovery remains unresolved, exact pending main/zone targets and explicitly phased main turn-on and context-correlated coupled zone-actuator feedback classification, synchronous in-flight abort across acquisition rollback and recovery, crash-safe preservation of superseding manual main changes, and per-zone supersession that removes only the user's zone before remaining rollback actuators run, zone switch/helper restoration and zone-climate target propagation, ownership-aware release and command-cap behavior, source/asset-specific confidence and pause isolation, directional comfort/minimum-cycle safeguards with corrective preconditioning continuation and target-driven early coasting, directional coast comfort handoffs even for stale persisted phases, stable tariff lifecycle identity, measured-power provenance and qualified-only observation cadence, and bounded manual-override helper behavior.
     references:
       docs:
         - README.md
@@ -655,3 +655,22 @@ rules:
 # Review regressions preserve explicit dispatch evidence in audit and rolling
 # allowance storage after partial power-limit commands or confirmation retries
 # lose the charger target; test_executor.py and test_storage.py cover reloads.
+
+# Climate reliability evidence: hvac_adapter.py and coordinator.py retain dependent
+# restoration/command readback; storage.py isolates 100 records for 30 days.
+# climate_inputs.py, climate_learning.py and climate_runtime.py preserve strict
+# measured validation and explain rejected chronological windows. Regressions:
+# tests/test_hvac_adapter.py, tests/test_climate_engine.py,
+# tests/test_preconditioning.py, tests/test_storage.py and the sanitized
+# tests/fixtures/climate/preconditioning_sep_oct_2026.json incident sequence.
+# Review regressions additionally cover mixed pending control recovery without
+# main power cycling, provenance declaration history preservation, qualified
+# cadence migration and compatible redacted outcome readbacks after audit rotation.
+# Additional review evidence: required-only coupled bounds clamps, guard-independent
+# interrupted shutdown, rollback progress retained only for matching unsuperseded
+# baselines, and declared tariff cadence identity when forecast gaps fill are
+# covered by test_hvac_adapter.py, test_executor.py and test_preconditioning.py.
+# Manual supersession retires settling expectations in listeners, executor markers
+# and explicit override requests; completed dependent target recovery avoids main
+# activation while pending main changes retain zone evidence. Regressions are in
+# test_coordinator.py, test_executor.py and test_hvac_adapter.py.

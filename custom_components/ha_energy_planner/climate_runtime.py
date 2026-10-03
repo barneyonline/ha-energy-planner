@@ -43,6 +43,8 @@ def update_readiness(
     )
     live_valid = (
         versions_valid
+        and context.climate_inputs.get("power_source_type") == "measured"
+        and model.get("power_source_type") == "measured"
         and context.current_hvac_power_kw is not None
         and context.climate_inputs.get("configuration_valid", True)
         and not context.input_issues
@@ -53,6 +55,11 @@ def update_readiness(
         item = statuses.setdefault(mode, {})
         evidence = model.get("validation", {}).get(mode, {})
         blockers = list(evidence.get("blockers", ["model_unavailable"]))
+        if (
+            context.climate_inputs.get("power_source_type") != "measured"
+            or model.get("power_source_type") != "measured"
+        ):
+            blockers.append("power_provenance_not_measured")
         for entity in context.climate_inputs.get("zones", {}):
             room = model.get("rooms", {}).get(entity, {})
             if (
@@ -67,7 +74,7 @@ def update_readiness(
             consecutive = (
                 previous is not None and trained is not None and trained.date() - previous.date() == timedelta(days=1)
             )
-            success = not blockers
+            success = not blockers and live_valid
             item["passes"] = (int(item.get("passes", 0)) + 1 if consecutive else 1) if success else 0
             item["failures"] = (int(item.get("failures", 0)) + 1 if consecutive else 1) if not success else 0
             item["validation_date"] = current_date
@@ -85,7 +92,15 @@ def update_readiness(
             ready = True
         item["ready"] = ready
         item["blockers"] = (
-            blockers + ([] if live_valid else ["live_evidence_missing"]) + (["validation_expired"] if stale else [])
+            blockers
+            + ([] if live_valid else ["live_evidence_missing"])
+            + (
+                ["validation_expired"]
+                if stale and last_good is not None
+                else ["validation_not_qualified"]
+                if last_good is None
+                else []
+            )
         )
     state["modes"] = statuses
     any_ready = any(item.get("ready") for item in statuses.values())
@@ -152,18 +167,27 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
             }
             return []
         active = {}
+    early_coast = False
     if owned_economic:
         current = context.current_hvac_temperature_c
         low, high = context.occupied_temperature_low_c, context.occupied_temperature_high_c
         stop = instant(active.get("precondition_end"))
         preconditioning = active.get("phase") == "preconditioning" and stop is not None and now < stop
-        warming = preconditioning and active.get("mode") == "heat"
-        cooling = preconditioning and active.get("mode") == "cool"
         if (
             current is not None
             and low is not None
             and high is not None
-            and ((current <= low and not warming) or (current >= high and not cooling))
+            and (
+                current < low
+                or current > high
+                or (
+                    not preconditioning
+                    and (
+                        (active.get("mode") == "heat" and current <= low)
+                        or (active.get("mode") == "cool" and current >= high)
+                    )
+                )
+            )
         ):
             state.pop("scheduled", None)
             context.climate_engine = state
@@ -200,9 +224,32 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         "solar_exposure": bool(context.climate_inputs.get("irradiance_forecast")),
         "equipment_curve": bool(context.climate_inputs.get("cop_table")),
     }
-    incumbent = state.get("scheduled", {})
+    incumbent = dict(state.get("scheduled", {}))
+    if owned_economic:
+        stop = instant(active.get("precondition_end"))
+        temperature, target = context.current_hvac_temperature_c, active.get("precondition_target")
+        early_coast = (
+            active.get("main_state_committed") is True
+            and active.get("phase") == "preconditioning"
+            and stop is not None
+            and now < stop
+            and temperature is not None
+            and target is not None
+            and (
+                (active.get("mode") == "heat" and temperature >= target)
+                or (active.get("mode") == "cool" and temperature <= target)
+            )
+        )
+        if early_coast:
+            incumbent["stop"] = now.isoformat()
+        elif active.get("phase") in {"pre_peak_coast", "peak_coast"} and stop is not None:
+            incumbent["stop"] = stop.isoformat()
     retained = None
-    if not blocked and state.get("status") in {"active", "ready_observing"}:
+    if (
+        not blocked
+        and context.climate_inputs.get("power_source_type") == "measured"
+        and state.get("status") in {"active", "ready_observing"}
+    ):
         if incumbent and state.get("modes", {}).get(incumbent.get("mode"), {}).get("ready"):
             retained = revalidate_schedule(context, options, eligible_model, incumbent)
         if not owned_economic:
@@ -217,6 +264,44 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
             candidate = retained
             decision.update(candidate_summary(context, retained))
             decision.update({key: incumbent[key] for key in ("lifecycle_id", "start", "stop", "release")})
+    qualified = (
+        candidate is not None
+        and not blocked
+        and not active
+        and state.get("modes", {}).get(candidate.mode, {}).get("ready") is True
+        and context.climate_inputs.get("power_source_type") == "measured"
+        and len(decision.get("baseline_powers_kw", [])) == len(context.slots)
+        and len(decision.get("baseline_temperatures", [])) == len(context.slots)
+    )
+    if qualified and state.get("observation_cadence_version") != 1:
+        # Learning-era counters included unqualified legacy opportunities.
+        # They cannot count toward the first validated comparison cadence.
+        state["observation_cadence_version"] = 1
+        state["opportunities"] = 0
+        state.pop("opportunity", None)
+        state.pop("observation_date", None)
+    persisted_prediction = state.get("observation_prediction", {})
+    if state.get("observation_until") and (
+        persisted_prediction.get("qualified") is not True
+        or persisted_prediction.get("identity") != context.climate_inputs.get("identity")
+        or persisted_prediction.get("power_source_type") != "measured"
+        or not state.get("modes", {}).get(persisted_prediction.get("mode"), {}).get("ready")
+        or blocked
+        or active
+    ):
+        state.pop("observation_until", None)
+        state.pop("observation_started_at", None)
+        state["observation_invalid_reason"] = "unqualified_or_intervened"
+    decision["observation_eligible"] = bool(qualified)
+    decision["observation_suppression_reason"] = None if qualified else "validated_measured_baseline_required"
+    decision["power_source_type"] = context.climate_inputs.get("power_source_type", "unknown")
+    decision["economic_eligibility_reason"] = (
+        "measured_power_required"
+        if decision["power_source_type"] != "measured"
+        else "eligible"
+        if candidate is not None
+        else "mode_validation_required"
+    )
     observation_until = instant(state.get("observation_until"))
     observing = observation_until is not None and now < observation_until
     opportunity = decision.get("release")
@@ -235,7 +320,8 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         opportunity = opportunity_end.isoformat()
     previous_opportunity = instant(state.get("opportunity"))
     if (
-        opportunity
+        qualified
+        and opportunity
         and not active
         and state.get("opportunity") != opportunity
         and (previous_opportunity is None or now >= previous_opportunity)
@@ -254,6 +340,9 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
             observing = True
             state["observation_prediction"] = {
                 **decision,
+                "qualified": True,
+                "power_source_type": "measured",
+                "identity": context.climate_inputs.get("identity"),
                 "baseline_slots": [slot.valid_at.isoformat() for slot in context.slots],
                 "interval_minutes": int(options[CONF_PLANNING_INTERVAL_MINUTES]),
             }
@@ -287,8 +376,9 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
             reason="model_" + state.get("status", "learning"),
             preconditioning_status="blocked" if state.get("status") == "degraded" else "learning",
         )
+    legacy_allowed = not state.get("ever_active") or context.climate_inputs.get("power_source_type") != "measured"
     decision["legacy_fallback"] = bool(
-        not state.get("ever_active") and not observing and candidate is None and policy == "automatic" and not blocked
+        legacy_allowed and not observing and candidate is None and policy == "automatic" and not blocked
     )
     context.climate_decision = decision
     context.climate_engine = state
@@ -297,6 +387,7 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         arrival_changed = active.get("arrival") != context.climate_inputs.get("arrival")
         if (
             blocked
+            or context.climate_inputs.get("power_source_type") != "measured"
             or policy != "automatic"
             or state.get("status") != "active"
             or arrival_changed
@@ -308,11 +399,9 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         if candidate is None or decision.get("mode") != active.get("mode"):
             return [release_action(context, "economic_revalidation_failed", interval)]
     if candidate is None or policy == "observe" or observing or blocked:
-        if owned_economic:
-            return [release_action(context, "economic_control_released", interval)]
-        return legacy if not state.get("ever_active") and not observing else []
+        return legacy if legacy_allowed and not observing else []
     if state.get("status") != "active":
-        return legacy if not state.get("ever_active") else []
+        return legacy if legacy_allowed else []
     # Legacy ownership must complete or restore before a new lifecycle acquires devices.
     if active and not owned_economic:
         return legacy
@@ -332,7 +421,9 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
     coast = device_targets[0] if candidate.mode == "heat" else device_targets[-1]
     actions: list[PlanAction] = []
     incumbent_stop = instant(incumbent.get("stop"))
-    for phase, at, target in (("preconditioning", start, candidate.target), ("peak_coast", stop, coast)):
+    tariff_start = instant(active.get("period_start")) if owned_economic else stop
+    coast_phase = "pre_peak_coast" if tariff_start is not None and max(now, stop) < tariff_start else "peak_coast"
+    for phase, at, target in (("preconditioning", start, candidate.target), (coast_phase, stop, coast)):
         if owned_economic and phase == "preconditioning" and incumbent_stop is not None and incumbent_stop <= now:
             continue
         actions.append(
@@ -349,7 +440,10 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
                     "target_temperature": target,
                     "phase": phase,
                     "mode": candidate.mode,
-                    "period_start": stop,
+                    "period_start": tariff_start or stop,
+                    "phase_transition_reason": "target_reached"
+                    if early_coast
+                    else active.get("phase_transition_reason", "scheduled_boundary"),
                     "period_end": end,
                     "precondition_end": stop,
                     "precondition_target": candidate.target,
@@ -444,4 +538,6 @@ def command_rejection(
             return "economic_climate_arrival_changed"
         if not live.get("configuration_valid") or any(not source["fresh"] for source in live["sources"].values()):
             return "economic_climate_live_evidence_missing"
+        if live.get("power_source_type") != "measured":
+            return "economic_climate_power_not_measured"
     return None

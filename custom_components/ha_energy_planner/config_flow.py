@@ -106,6 +106,7 @@ from .const import (
     CONF_HVAC_MIN_SAVING,
     CONF_HVAC_OBSERVATION_CADENCE,
     CONF_HVAC_POLICY,
+    CONF_HVAC_POWER_SOURCE_TYPE,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
@@ -278,12 +279,13 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_HVAC_ZONE_MAPPINGS): ObjectSelector(),
         vol.Optional(CONF_HVAC_COP_TABLE): ObjectSelector(),
         vol.Required(CONF_DAIKIN_CLIMATE): _entity_selector("climate"),
+        vol.Optional(CONF_HVAC_POWER_SOURCE_TYPE, default="auto"): SelectSelector(
+            SelectSelectorConfig(options=["auto", "measured", "estimated"])
+        ),
         vol.Optional(CONF_DAIKIN_POWER): _entity_selector(entity_filter=_sensor_filter(_POWER_SENSOR_UNITS)),
         vol.Optional(CONF_WEATHER): _entity_selector("weather"),
         vol.Optional(CONF_CLIMATE_AUTOMATIONS): _entity_selector("automation", multiple=True),
-        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(
-            ["switch", "input_boolean", "climate"], multiple=True
-        ),
+        vol.Optional(CONF_CLIMATE_ZONES): _entity_selector(["switch", "input_boolean", "climate"], multiple=True),
         vol.Optional(CONF_CLIMATE_CHANGE_FROM_SCHEDULER): _entity_selector("input_boolean"),
         vol.Optional(CONF_CLIMATE_SCHEDULER_GUARD_TIMER): _entity_selector("timer"),
         vol.Optional(CONF_CLIMATE_MANUAL_OVERRIDE): _entity_selector("input_boolean"),

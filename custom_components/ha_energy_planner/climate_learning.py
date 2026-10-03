@@ -62,6 +62,15 @@ def observe(state: dict[str, Any], context: DecisionContext, rest_minutes: int) 
         state = {"identity": identity, "ever_active": bool(state.get("ever_active"))}
     else:
         state = dict(state)
+    power_type = context.climate_inputs.get("power_source_type", "unknown")
+    if state.get("power_source_type", "unknown") != power_type:
+        state["power_evidence_after"] = context.created_at.isoformat()
+        for key in ("model", "modes", "scheduled", "observation_until", "observation_prediction"):
+            state.pop(key, None)
+    state["power_source_type"] = power_type
+    state["power_source_reason"] = context.climate_inputs.get("power_source_reason")
+    state["power_source_conflict"] = context.climate_inputs.get("power_source_conflict", False)
+    state["record_version"] = 2
     state["comfort_signature"] = comfort_signature
     now = context.created_at
     bucket = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
@@ -105,6 +114,8 @@ def observe(state: dict[str, Any], context: DecisionContext, rest_minutes: int) 
                 "temperature": values[0],
                 "outdoor": values[1],
                 "power_kw": values[2],
+                "power_source_type": power_type,
+                "record_version": 2,
                 "low": values[3],
                 "high": values[4],
                 "mode": context.current_hvac_mode,
@@ -283,7 +294,24 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
     correct = states = active = recalled = episodes = windows = 0
     last_window_at = None
     previous_active_end: datetime | None = None
-    normal = [row for row in rows if row.get("provenance") == "normal"]
+    rejected = {
+        key: 0
+        for key in (
+            "insufficient_preceding_history",
+            "sampling_gaps",
+            "intervention_washout",
+            "insufficient_neighbours",
+            "unsupported_thermal_conditions",
+            "invalid_power_provenance",
+        )
+    }
+    rejected["invalid_power_provenance"] = min(
+        sum(row.get("mode") == mode and row.get("power_source_type") != "measured" for row in rows), MAX_OBSERVATIONS
+    )
+    rejected["intervention_washout"] = min(
+        sum(row.get("mode") == mode and row.get("provenance") != "normal" for row in rows), MAX_OBSERVATIONS
+    )
+    normal = [row for row in rows if row.get("provenance") == "normal" and row.get("power_source_type") == "measured"]
     days = {str(row["at"])[:10] for row in normal}
     cutoff: datetime | None = None
     fit_cache: dict[str, dict[str, Any]] = {}
@@ -294,8 +322,9 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
         if at is None or (cutoff and at < cutoff) or start["mode"] != mode:
             continue
         # Train on preceding complete days, with the latest day held out.
-        train = [row for row in rows if str(row["at"])[:10] < str(start["at"])[:10]]
+        train = [row for row in normal if str(row["at"])[:10] < str(start["at"])[:10]]
         if len({str(row["at"])[:10] for row in train if row.get("provenance") == "normal"}) < 7:
+            rejected["insufficient_preceding_history"] += 1
             continue
         day = str(start["at"])[:10]
         if day not in fit_cache:
@@ -311,6 +340,7 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
             if row_at >= end:
                 break
         if instant(trajectory[-1]["at"]) != end:
+            rejected["sampling_gaps"] += 1
             continue
         temperature = float(start["temperature"])
         predictions: list[tuple[float, float, float]] = []
@@ -319,11 +349,13 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
             sample = {**observed, "temperature": temperature, "mode": mode, "occupied": start["occupied"]}
             predicted = neighbours(train, sample, timezone)
             if predicted is None:
+                rejected["insufficient_neighbours"] += 1
                 break
             sample["power_kw"] = predicted.power_kw
             sample["mode"] = predicted.mode
             next_temperature = temperature_step(model, sample, 5 / 60)
             if next_temperature is None:
+                rejected["unsupported_thermal_conditions"] += 1
                 break
             temperature = next_temperature
             window_errors.append(temperature - float(trajectory[len(predictions) + 1]["temperature"]))
@@ -357,6 +389,7 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
     blockers = tuple(
         name
         for name, failed in (
+            ("power_provenance", not normal),
             ("history_days", len(days) < MIN_HISTORY_DAYS),
             ("validation_windows", windows < MIN_VALIDATION_WINDOWS),
             ("active_episodes", episodes < MIN_ACTIVE_EPISODES),
@@ -381,22 +414,35 @@ def validate(rows: list[dict[str, Any]], mode: str, timezone: str, window_minute
         blockers,
         tuple(errors[-100:]),
         last_window_at,
+        rejected,
     )
 
 
 def train_climate(state: dict[str, Any], timezone: str, window_minutes: int, now: datetime) -> dict[str, Any]:
     """Detached daily training; caller publishes only for its current identity."""
-    rows = state.get("observations", [])
+    cutoff = instant(state.get("power_evidence_after"))
+    # Keep historical provenance immutable while retiring its economic training
+    # authority after a source declaration/classification changes. Thermal fits
+    # can still use these samples; measured baselines and validation cannot.
+    rows = [
+        {**row, "power_source_type": "unknown"}
+        if cutoff is not None and (at := instant(row.get("at"))) is not None and at < cutoff
+        else row
+        for row in state.get("observations", [])
+    ]
     result: dict[str, Any] = {
         "identity": state.get("identity"),
+        "power_source_type": state.get("power_source_type", "unknown"),
+        "record_version": 2,
+        "power_evidence_after": state.get("power_evidence_after"),
         "baseline_version": BASELINE_VERSION,
         "validation_version": VALIDATION_VERSION,
         "trained_at": now.isoformat(),
-        "physical": fit_physical(rows),
+        "physical": fit_physical([r for r in rows if r.get("power_source_type") == "measured"]),
         "humidity": fit_humidity(rows),
         "rooms": fit_rooms(rows, timezone, window_minutes),
         "validation": {},
-        "normal": [r for r in rows if r.get("provenance") == "normal"],
+        "normal": [r for r in rows if r.get("provenance") == "normal" and r.get("power_source_type") == "measured"],
     }
     for mode in ("heat", "cool"):
         result["validation"][mode] = asdict(validate(rows, mode, timezone, window_minutes))
@@ -454,7 +500,7 @@ def fit_rooms(rows: list[dict[str, Any]], timezone: str = "UTC", window_minutes:
             if finite(row.get("zones", {}).get(entity, {}).get("temperature")) is not None
         ]
         result[entity] = {
-            "physical": fit_physical(observations),
+            "physical": fit_physical([r for r in observations if r.get("power_source_type") == "measured"]),
             "humidity": fit_humidity(observations),
             "days": len({str(row["at"])[:10] for row in observations if row.get("provenance") == "normal"}),
             "validation": {
@@ -517,6 +563,9 @@ def finish_observation(state: dict[str, Any], rows: list[dict[str, Any]], now: d
             coverage_end = overlap_end
     valid = bool(
         selected
+        and prediction.get("qualified") is True
+        and prediction.get("power_source_type") == "measured"
+        and all(r.get("power_source_type") == "measured" for r in selected)
         and reference
         and coverage_end == end
         and instant(selected[0]["at"]) == start

@@ -7,8 +7,11 @@ behaviour. A tariff difference alone is not reported as a monetary saving.
 
 ## Policies and activation
 
-- **Automatic** (default): retain legacy behaviour while learning, with occasional
-  observation periods; activate economic decisions only after validation passes.
+- **Automatic** (default): retain legacy behaviour while learning and collect passive history;
+  activate economic decisions only after validation passes. Intentional observation
+  periods require a validated mode, a complete baseline prediction and an eligible
+  economic comparison. Only distinct eligible opportunities advance the configured
+  cadence (default every tenth), with at most one observation per local day.
 - **Observe**: compare without commands from the economic engine. Legacy control
   remains available before the economic engine has ever activated.
 - **Legacy**: use the existing tariff-window policy.
@@ -193,3 +196,104 @@ selected has no missed-window record: use the current reason and candidate
 rejections instead. Historical records from before this feature cannot be
 reconstructed. Pending restoration takes priority in the current status until
 ownership recovery is resolved.
+
+## Completing a tariff cycle and restoration
+
+Reaching the preconditioning target enters coast immediately. Before the original
+peak starts the phase is `pre_peak_coast`; during it the phase is `peak_coast`.
+Heating reduces demand to the lower comfort target; cooling mirrors this at the
+upper target. A refresh or small temperature drift cannot restart preconditioning
+within the same lifecycle. Minimum-cycle rules do not block this demand reduction.
+The configured schedules remain suppressed with `stop_actions: true` until release.
+Coasting lowers thermostat demand and does not promise zero compressor activity.
+Heating hands control back at the lower comfort boundary; cooling at the upper
+boundary. Temperatures outside the comfort band hand back control. Required evidence loss, safety failure and genuine manual intervention
+also release control. Economic cycles revalidate the actual early coast timestamp,
+current conditions and remaining savings before retaining ownership.
+
+Original main mode, remembered active mode, target, zone targets, dampers and
+individual automation states remain the restoration baseline. Restore the main
+mode/target, wait for compatible zone bounds, restore and confirm each zone,
+restore dampers, then return the original main power state. Service acceptance
+never proves restoration. Shutdown cleanup runs even when a dependent zone fails
+or an interrupted acquisition loses its scheduler guard. A genuine manual main
+change still supersedes that cleanup.
+Unresolved zones retain their main recovery context; retries restore unfinished
+settings only. Deferred targets do not repeatedly toggle an already-off head or
+arm guards. A legacy zone-only record cannot energize equipment: it waits until
+normal operation exposes compatible bounds. Unknown recovery versions stay pending.
+When authoritative main and zone targets already match the saved settings, recovery
+confirms completion without waking the head. If the main still needs restoration,
+zone snapshots remain pending until dependent changes and readback are complete.
+
+Each issued command records its context, requested control values and deadline.
+Fixture-supported remembered-mode, dynamic-bound and shutdown feedback can match
+the command during confirmation and a bounded settling period of at most two
+minutes. User attribution, incompatible targets and auxiliary setting changes
+retain manual priority. A scheduler guard alone does not authorize arbitrary
+changes. A head target command permits only a required clamp of a zone target
+outside the new bounds; a compatible zone must retain its own target. Declared
+tariff intervals also bound lifecycle identity, so filling a forecast gap does
+not replace the same tariff opportunity. The retained 30 September 24°C-to-22°C
+change remains an unexplained
+conflict; neither its source nor the exact 1 October service exception is inferred.
+Manual supersession retires the prior transaction's expectations immediately,
+including during settling after command execution has finished. Explicit manual
+override requests also retire prior expectations before releasing owned controls.
+Historical outcomes remain diagnostic evidence and cannot revive retired
+expectations in the live state listener.
+
+## Power provenance and validation diagnostics
+
+**HVAC power source type** accepts `auto` (default), `measured` or `estimated`.
+Auto leaves sources unknown unless physical provenance is established; watts and
+`state_class: measurement` alone do not establish a meter. Known synthetic
+sources such as fixed Powercalc remain estimated even when declared measured,
+and diagnostics report the configuration conflict. An explicit measured declaration
+can qualify an otherwise unknown physical source. No sensor mapping or meter
+purchase is required for legacy preconditioning.
+
+Provenance is attached to every new observation and model. Old observations
+without provenance remain unknown. Source or provenance changes invalidate the
+corresponding economic readiness, predictions and training authority while preserving actuator
+ownership and unrelated history. Estimated/unknown power cannot establish energy
+accuracy, active-power validation or measured savings. Validation thresholds and
+chronological training remain unchanged.
+
+Heating and cooling diagnostics show actual values beside required thresholds,
+consecutive daily passes, never-qualified versus expired evidence, and bounded
+counts of rejected candidate window starts: insufficient preceding history,
+sampling gaps, intervention/washout, insufficient neighbours, unsupported thermal
+conditions and invalid power provenance. Counts describe attempts, not manufactured
+independent validation windows. Manual or incomplete observation comparisons remain
+invalid and cannot create validation success or an additional observation hold.
+
+The versioned climate audit is independent of the general execution audit: it
+retains at most 100 records for 30 days across restart. Identical retries merge
+first/last timestamps and occurrence counts. It contains lifecycle/transaction IDs,
+service stages, expected and observed controls, sanitized exception categories and
+override attribution; credentials, vendor response bodies and location history are
+excluded. Decision summary and diagnostic exports include the lifecycle, transition
+reason, heating/cooling/coasting explanation, unresolved settings and latest failure.
+
+Recovery retries restore available unfinished dampers and automations independently
+when zone targets remain hidden after confirmed main shutdown. Unavailable controls
+retain ownership without restarting the main unit or repeatedly arming the guard.
+Confirmed shutdown during acquisition rollback retains the same completed-step
+marker. Ownership merges recovery progress only for the matching original baseline.
+Outcome diagnostics preserve their existing fields and sanitized actuator readbacks
+even after unrelated execution history rotates. Changing the power declaration
+retires affected energy evidence while retaining unrelated observation history.
+Learning-era opportunity counters are excluded when the first qualified observation
+cadence begins; subsequent refreshes retain the qualified counter.
+
+## Deployment acceptance
+
+Prepare and run `scripts/docker-validate.sh` without skip flags before release.
+Publishing and live deployment are separate actions. Before deployment, back up
+the installed integration and relevant planner configuration/storage. Confirm the
+loaded version and saved/runtime state, then observe a complete naturally eligible
+heating cycle through coasting and restoration. Cooling acceptance uses deterministic
+replay until a natural cooling opportunity occurs. On failure, retain transaction
+evidence, restore through the supported ownership path and roll back if required;
+do not clear ownership or override records to make the UI appear healthy.

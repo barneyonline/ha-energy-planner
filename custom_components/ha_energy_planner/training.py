@@ -46,12 +46,23 @@ class TrainingRequest:
     @property
     def identity(self) -> tuple[Any, ...]:
         return (
-            *(self.entry_data.get(key) for key in (
-                CONF_HOUSEHOLD_LOAD, CONF_EV_CHARGING, CONF_EV_SOC, CONF_DAIKIN_POWER,
-            )),
-            self.charge_rate_kw, self.timezone, self.bypass_safety_gates,
-            self.climate_state.get("identity"), self.climate_window_minutes,
+            *(
+                self.entry_data.get(key)
+                for key in (
+                    CONF_HOUSEHOLD_LOAD,
+                    CONF_EV_CHARGING,
+                    CONF_EV_SOC,
+                    CONF_DAIKIN_POWER,
+                )
+            ),
+            self.charge_rate_kw,
+            self.timezone,
+            self.bypass_safety_gates,
+            self.climate_state.get("identity"),
+            self.climate_window_minutes,
             self.climate_state.get("comfort_signature"),
+            self.climate_state.get("power_source_type", "unknown"),
+            self.climate_state.get("power_evidence_after"),
         )
 
 

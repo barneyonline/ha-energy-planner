@@ -53,6 +53,7 @@ from .advice_runtime import (
     _material_preview as _material_preview,
 )
 from .availability import AvailabilityIdentity, availability_details
+from .climate_inputs import finite
 from .climate_learning import observe
 from .climate_runtime import update_readiness
 from .const import (
@@ -690,6 +691,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "pending_hvac_desired_state",
                 None,
             )
+            feedback_commands = getattr(executor, "hvac_feedback_commands", [])
+            feedback_commands[:] = [
+                command
+                for command in feedback_commands
+                if (deadline := _parse_datetime_or_none(command.get("deadline"))) is not None and now < deadline
+            ]
             entity_id = str(event.data.get("entity_id") or "")
             if entity_id in {entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_feedback_entity}:
                 self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
@@ -703,6 +710,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 # before pending-command detection, which deliberately bypasses
                 # the scheduler guard to protect user changes during commands.
                 if _is_explicit_startup_hvac_change(event):
+                    feedback_commands.clear()
                     if pending_hvac_desired_state is not None:
                         if is_main_climate:
                             self.executor.mark_pending_hvac_manual_override()
@@ -731,8 +739,63 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 event,
                 now,
                 pending_hvac_desired_state=pending_hvac_desired_state,
+                feedback_commands=feedback_commands if hasattr(executor, "hvac_feedback_commands") else None,
             ):
                 return
+            if (is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))) and (
+                getattr(event.data.get("old_state"), "state", None)
+                != getattr(event.data.get("new_state"), "state", None)
+                or any(
+                    (getattr(event.data.get("old_state"), "attributes", {}) or {}).get(key)
+                    != (getattr(event.data.get("new_state"), "attributes", {}) or {}).get(key)
+                    for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+                )
+            ):
+                audit = getattr(self.store, "record_climate_event", None)
+                if callable(audit):
+                    context = getattr(event, "context", None)
+                    old, new = event.data.get("old_state"), event.data.get("new_state")
+                    user = bool(
+                        getattr(context, "user_id", None) or getattr(getattr(new, "context", None), "user_id", None)
+                    )
+                    audit(
+                        {
+                            "stage": "unmatched_feedback",
+                            "transaction_id": (pending_hvac_desired_state or {}).get("transaction_id"),
+                            "lifecycle_id": self.store.data.get("ownership", {})
+                            .get("hvac_control", {})
+                            .get("lifecycle_id")
+                            if isinstance(self.store.data.get("ownership", {}).get("hvac_control"), dict)
+                            else None,
+                            "supporting_command_context": feedback_commands[-1].get("context_id")
+                            if feedback_commands
+                            else None,
+                            "entity_id": entity_id,
+                            "override_source": "user"
+                            if user
+                            else "context_linked_external"
+                            if getattr(context, "parent_id", None)
+                            else "unattributed",
+                            "user_attributed": user,
+                            "context_id": getattr(context, "id", None),
+                            "parent_id": getattr(context, "parent_id", None),
+                            "expected": {
+                                "mode": getattr(old, "state", None),
+                                **{
+                                    key: (getattr(old, "attributes", {}) or {}).get(key)
+                                    for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+                                },
+                            },
+                            "observed": {
+                                "mode": getattr(new, "state", None),
+                                **{
+                                    key: (getattr(new, "attributes", {}) or {}).get(key)
+                                    for key in _HVAC_CONTROL_ATTRIBUTE_KEYS
+                                },
+                            },
+                        },
+                        now=now,
+                    )
             if _event_reports_ev_charging_started(entry_data, event):
                 if self._ev_command_guard()() and self.active_control and strict_bool(
                     self.options.get(CONF_EV_CONTROL_ENABLED),
@@ -802,6 +865,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._async_create_listener_task(self._async_handle_manual_override_helper(helper_state == "on"))
                 return
             if _is_manual_hvac_change(self.hass, entry_data, self.store.data, event, now):
+                feedback_commands.clear()
                 self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "daikin_state_changed",
@@ -810,6 +874,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
                 return
             if _is_manual_hvac_zone_change(self.hass, entry_data, self.store.data, event):
+                feedback_commands.clear()
                 self._async_create_listener_task(
                     self._async_handle_manual_hvac_change(
                         "climate_zone_changed",
@@ -936,6 +1001,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     async def async_shutdown(self) -> None:
         """Stop integration work and release coordinator resources."""
         self._begin_shutdown()
+        executor = getattr(self, "executor", None)
+        if executor is not None:
+            executor.hvac_feedback_commands = []
         await super().async_shutdown()
 
     async_wait_for_plan_execution = task_lifecycle.async_wait_for_plan_execution
@@ -1419,7 +1487,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             async with self.store.async_delay_save():
                 if result.climate_model:
                     state = dict(self.store.data.get("climate_engine", {}))
-                    if state.get("identity") == result.climate_model.get("identity"):
+                    if (
+                        state.get("identity") == result.climate_model.get("identity")
+                        and state.get("power_source_type", "unknown")
+                        == result.climate_model.get("power_source_type", "unknown")
+                        and state.get("power_evidence_after") == result.climate_model.get("power_evidence_after")
+                    ):
                         state["model"] = result.climate_model
                         await self.store.async_save_climate_engine(state)
                 if result.ev_changed:
@@ -1965,6 +2038,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         preserve_main_state: bool = False,
     ) -> ActionOutcome | None:
         """Set a manual HVAC override."""
+        getattr(self.executor, "hvac_feedback_commands", []).clear()
         self._mark_forced_refresh("manual_hvac_override")
         helper_error: Exception | None = None
         release_outcome = None
@@ -3078,7 +3152,7 @@ def _is_manual_hvac_change(
     if not state_changed and not control_attribute_changed:
         return False
     guard_entity = entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
-    if guard_entity:
+    if guard_entity and not store_data.get("ownership", {}).get("hvac_control"):
         guard_state = hass.states.get(guard_entity)
         if guard_state is not None and str(guard_state.state).lower() in {"on", "true", "1"}:
             return False
@@ -3151,12 +3225,105 @@ def _is_manual_hvac_zone_change(
         )
     if not state_changed and not control_attribute_changed:
         return False
-    guard_entity = entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
-    if guard_entity:
-        guard_state = hass.states.get(guard_entity)
-        if guard_state is not None and str(guard_state.state).lower() in {"on", "true", "1"}:
-            return False
     return True
+
+
+def _matches_climate_transaction(
+    entry_data: dict[str, Any], commands: list[dict[str, Any]], event: Any, now: datetime
+) -> bool:
+    """Match only issued commands and fixture-supported coupled transitions."""
+    old, new = event.data.get("old_state"), event.data.get("new_state")
+    contexts = (getattr(event, "context", None), getattr(new, "context", None))
+    if old is None or new is None or any(getattr(context, "user_id", None) for context in contexts):
+        return False
+    old_attributes, new_attributes = old.attributes or {}, new.attributes or {}
+    changed = {key for key in _HVAC_CONTROL_ATTRIBUTE_KEYS if old_attributes.get(key) != new_attributes.get(key)}
+    if changed - {"temperature", "target_temp_low", "target_temp_high"}:
+        return False
+    entity = event.data.get("entity_id")
+    for command in reversed(commands):
+        issued = _parse_datetime_or_none(command.get("issued_at"))
+        deadline = _parse_datetime_or_none(command.get("deadline"))
+        if issued is None or deadline is None or not issued <= now < min(deadline, issued + timedelta(minutes=2)):
+            continue
+        if any(getattr(context, "parent_id", None) not in {None, command["context_id"]} for context in contexts):
+            continue
+        same = entity == command.get("entity_id")
+        coupled = (
+            command.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
+            and entity in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+            and str(entity).startswith("climate.")
+        ) or _unambiguous_coupled_zone_entity_ids_match(entry_data, command.get("entity_id"), entity)
+        if not same and not coupled:
+            continue
+        requested, service = command.get("requested", {}), command.get("service")
+        expected_mode = "off" if service == "turn_off" else requested.get("hvac_mode")
+        if service == "turn_on":
+            mode_matches = old.state == "off" and (
+                new.state in _ACTIVE_HVAC_MODES if entity.startswith("climate.") else new.state == "on"
+            )
+        elif expected_mode is not None:
+            mode_matches = new.state == expected_mode
+        else:
+            mode_matches = old.state == new.state
+        if service == "turn_on" and coupled and command.get("entity_id") != entry_data.get(CONF_DAIKIN_CLIMATE):
+            mode = command.get("main_mode")
+            expected_active_mode = mode if mode in _ACTIVE_HVAC_MODES else command.get("requested_hvac_mode")
+            mode_matches = mode_matches and new.state == expected_active_mode
+        if not mode_matches:
+            continue
+        zone_target = (
+            command.get("zone_targets", {}).get(entity) or command.get("coupled_zones", {}).get(entity, {})
+            if coupled
+            else command.get("observed", {})
+        )
+        targets = {
+            "temperature": requested.get("temperature"),
+            "target_temp_low": requested.get("target_temp_low"),
+            "target_temp_high": requested.get("target_temp_high"),
+        }
+        if service in {"turn_on", "set_hvac_mode"}:
+            source = zone_target if isinstance(zone_target, dict) else command.get("observed", {})
+            targets = {
+                "temperature": source.get("target_temperature"),
+                "target_temp_low": source.get("target_temp_low"),
+                "target_temp_high": source.get("target_temp_high"),
+            }
+        if service == "set_temperature" and coupled:
+            # A head command only authorizes the zone's required bounds clamp.
+            # A compatible zone target does not become the requested head target.
+            targets = {key: old_attributes.get(key) for key in targets}
+            head_target, previous = finite(requested.get("temperature")), finite(old_attributes.get("temperature"))
+            if head_target is not None and previous is not None:
+                clamped = min(max(previous, head_target - 2), head_target + 2)
+                if clamped != previous:
+                    targets["temperature"] = clamped
+        if service == "turn_on" and coupled and old.state == "off":
+            snapshot = command.get("coupled_zones", {}).get(entity, {})
+            center = finite(command.get("main_target"))
+            lower = finite(snapshot.get("min_temp"))
+            upper = finite(snapshot.get("max_temp"))
+            lower = lower if lower is not None else center - 2 if center is not None else None
+            upper = upper if upper is not None else center + 2 if center is not None else None
+            for key in changed:
+                value = finite(new_attributes.get(key))
+                if (
+                    old_attributes.get(key) is None
+                    and value is not None
+                    and lower is not None
+                    and upper is not None
+                    and lower <= value <= upper
+                ):
+                    targets[key] = value
+        if service == "turn_off" and coupled:
+            targets = {key: None for key in changed}
+        if all(
+            (new_attributes.get(key) is None and targets.get(key) is None)
+            or _matching_hvac_target(new_attributes.get(key), targets.get(key))
+            for key in changed
+        ):
+            return True
+    return False
 
 
 def _is_planner_owned_control_feedback(
@@ -3166,6 +3333,7 @@ def _is_planner_owned_control_feedback(
     now: datetime,
     *,
     pending_hvac_desired_state: dict[str, Any] | None = None,
+    feedback_commands: list[dict[str, Any]] | None = None,
 ) -> bool:
     """Return whether a control-state event follows a recent planner command."""
     entity_id = event.data.get("entity_id")
@@ -3183,6 +3351,17 @@ def _is_planner_owned_control_feedback(
     new_state = event.data.get("new_state")
     if new_state is None:
         return False
+    if asset in {"daikin", "daikin_zone"} and any(
+        getattr(context, "user_id", None)
+        for context in (getattr(event, "context", None), getattr(new_state, "context", None))
+    ):
+        return False
+    if asset in {"daikin", "daikin_zone"}:
+        commands = (pending_hvac_desired_state or {}).get("feedback_commands", feedback_commands or [])
+        if feedback_commands is not None or commands or (pending_hvac_desired_state or {}).get("transaction_id"):
+            # A live executor's empty cache is authoritative retirement, not
+            # permission to revive an older outcome's target expectation.
+            return _matches_climate_transaction(entry_data, commands, event, now)
     if asset == "daikin" and pending_hvac_desired_state is not None:
         # A multi-call climate transaction can publish intermediate states (for
         # example turn_on restoring the previous mode before set_hvac_mode).

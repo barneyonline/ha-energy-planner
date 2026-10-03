@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from math import ceil, isfinite
 from typing import Any
 
@@ -141,7 +142,7 @@ class HVACPlanningPolicy:
                 if active
                 else []
             )
-        # Preconditioning moves toward comfort from the cold/hot boundary.
+        # Owned cycles hand back control outside the comfort band.
         # Use the scheduled boundaries as well as the persisted phase so a
         # stale preconditioning record cannot bypass comfort protection in coast.
         active_period_start = _datetime_value(active.get("period_start"))
@@ -152,11 +153,18 @@ class HVACPlanningPolicy:
             and active_precondition_end is not None
             and now < min(active_period_start, active_precondition_end)
         )
-        warming = preconditioning_now and active.get("mode") == "heat"
-        cooling = preconditioning_now and active.get("mode") == "cool"
+        coasting = active.get("phase") in {"pre_peak_coast", "peak_coast"} or (active and not preconditioning_now)
         comfort_boundary_breached = (
-            float(current) <= float(low) and not warming
-        ) or (float(current) >= float(high) and not cooling)
+            float(current) < float(low)
+            or float(current) > float(high)
+            or (
+                coasting
+                and (
+                    (active.get("mode") == "heat" and float(current) <= float(low))
+                    or (active.get("mode") == "cool" and float(current) >= float(high))
+                )
+            )
+        )
         if comfort_boundary_breached and active:
             active_end = _datetime_value(active.get("period_end"))
             return [
@@ -192,6 +200,13 @@ class HVACPlanningPolicy:
             )
             if period_start is None or period_end is None or baseline is None or now >= period_end:
                 return [self._hvac_release_action(context, now, now + interval, "hvac_expensive_period_ended")]
+            configuration = active.get("configuration_identity")
+            if (
+                isinstance(configuration, str)
+                and configuration.startswith("legacy:")
+                and configuration != _legacy_configuration_id(context, self.options)
+            ):
+                return [self._hvac_release_action(context, now, now + interval, "hvac_configuration_changed")]
             if now < period_start and not _persisted_hvac_period_qualifies(
                 context,
                 period_start,
@@ -212,6 +227,11 @@ class HVACPlanningPolicy:
             if not _tariff_evidence_covers_period(context, period_end, interval):
                 return [self._hvac_release_action(context, now, now + interval, "hvac_tariff_evidence_lost")]
             precondition_end = _datetime_value(active.get("precondition_end")) or period_start
+            target_reached = (
+                mode == "heat" and float(current) >= float(active.get("precondition_target") or high)
+            ) or (mode == "cool" and float(current) <= float(active.get("precondition_target") or low))
+            if active.get("phase") in {"pre_peak_coast", "peak_coast"} or target_reached:
+                precondition_end = min(precondition_end, now)
             phase = (
                 "peak_coast"
                 if now >= period_start
@@ -256,6 +276,10 @@ class HVACPlanningPolicy:
                     comfort_boundary=coast_target,
                 )
             common: dict[str, Any] = {
+                "lifecycle_id": active.get("lifecycle_id"),
+                "phase_transition_reason": "target_reached"
+                if target_reached and preconditioning_now
+                else active.get("phase_transition_reason"),
                 "period_start": period_start,
                 "period_end": period_end,
                 "precondition_end": precondition_end,
@@ -668,6 +692,8 @@ class HVACPlanningPolicy:
         precondition_target: float | None = None,
         coast_target: float | None = None,
         projected_precondition_end_temperature: float | None = None,
+        lifecycle_id: str | None = None,
+        phase_transition_reason: str | None = None,
     ) -> PlanAction:
         """Build one lifecycle HVAC control action."""
         thermal_summary = thermal_model_summary(self.thermal_model)
@@ -683,6 +709,10 @@ class HVACPlanningPolicy:
                 "hvac_mode": mode,
                 "target_temperature": float(target),
                 "phase": phase,
+                "lifecycle_id": lifecycle_id
+                or _legacy_lifecycle_id(context, self.options, period_start, period_end, mode),
+                "phase_transition_reason": phase_transition_reason or "scheduled_boundary",
+                "configuration_identity": _legacy_configuration_id(context, self.options),
                 "period_start": period_start,
                 "period_end": period_end,
                 "precondition_end": precondition_end,
@@ -994,3 +1024,35 @@ def _hvac_reject(context: DecisionContext, reason: str, evidence: dict[str, Any]
     rejected[reason] = {"count": previous.get("count", 0) + 1, "evidence": evidence}
     primary = max(rejected, key=list(_LEGACY_REASONS).index)
     decision.update(reason=primary, summary=_LEGACY_REASONS[primary])
+
+
+def _legacy_lifecycle_id(
+    context: DecisionContext, options: Mapping[str, Any], start: datetime, end: datetime, mode: str
+) -> str:
+    """Identify the source tariff opportunity independently of refresh time."""
+    intervals = context.climate_inputs.get("tariff_intervals", [])
+
+    def source_boundary(at: datetime) -> str:
+        for interval in intervals:
+            left, right = _datetime_value(interval.get("start")), _datetime_value(interval.get("end"))
+            if left is not None and right is not None and left <= at < right:
+                return left.isoformat()
+        # Compatibility contexts have no source intervals. Their deterministic
+        # five-minute grids still tolerate refresh seconds without changing ID.
+        return at.replace(minute=at.minute // 5 * 5, second=0, microsecond=0).isoformat()
+
+    return sha256(
+        str((source_boundary(start), source_boundary(end), mode, _legacy_configuration_id(context, options))).encode()
+    ).hexdigest()[:24]
+
+
+def _legacy_configuration_id(context: DecisionContext, options: Mapping[str, Any]) -> str:
+    """Track material tariff policy and comfort changes separately from grid drift."""
+    policy = tuple((key, str(value)) for key, value in sorted(options.items()) if key.startswith("hvac_"))
+    identity = (
+        context.climate_inputs.get("identity", ""),
+        policy,
+        context.occupied_temperature_low_c,
+        context.occupied_temperature_high_c,
+    )
+    return "legacy:" + sha256(str(identity).encode()).hexdigest()[:24]
