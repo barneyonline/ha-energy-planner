@@ -21,6 +21,7 @@ HVAC_LIFECYCLE_FIELDS = (
     "configuration_identity",
     "arrival",
     "phase",
+    "phase_transition_reason",
     "period_start",
     "period_end",
     "precondition_end",
@@ -91,6 +92,7 @@ class HVACOwnershipTransaction:
         *,
         main_state_superseded: bool,
         superseded_zone_entity_ids: set[str],
+        confirmed_at: datetime | None = None,
     ) -> dict[str, Any] | None:
         """Reconcile confirmed success/rollback without undoing manual changes."""
         if not hvac_result.applied:
@@ -132,11 +134,29 @@ class HVACOwnershipTransaction:
                     zone_states.setdefault(entity_id, state)
                 hvac_control["zone_states"] = zone_states
                 unresolved_main_state = dict(hvac_result.saved_main_state)
-                if unresolved_main_state:
+                if unresolved_main_state and not main_state_superseded:
                     hvac_control.setdefault(
                         _HVAC_MAIN_STATE_OWNERSHIP_KEY,
                         unresolved_main_state,
                     )
+                    original_main_state = hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY]
+                    baseline_keys = (
+                        "hvac_mode",
+                        "target_temperature",
+                        "target_temp_low",
+                        "target_temp_high",
+                        "rollback_active_hvac_mode",
+                        "rollback_hvac_mode_changed",
+                    )
+                    if all(original_main_state.get(key) == unresolved_main_state.get(key) for key in baseline_keys):
+                        hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = {
+                            **original_main_state,
+                            **{
+                                key: unresolved_main_state[key]
+                                for key in ("zone_recovery_attempted", "recovery_version")
+                                if key in unresolved_main_state
+                            },
+                        }
                 hvac_control.pop("main_state_committed", None)
                 hvac_control["required_evidence_lost"] = "hvac_acquisition_rollback_failed"
                 ownership_data["hvac_control"] = hvac_control
@@ -148,6 +168,8 @@ class HVACOwnershipTransaction:
                 saved_automations.setdefault(entity_id, state)
             ownership_data["climate_automations"] = saved_automations
             hvac_control = dict(ownership_data.get("hvac_control", {}))
+            if desired.get("phase") == "preconditioning":
+                hvac_control["preconditioning_confirmed"] = True
             saved_zones = dict(hvac_control.get("zone_states", {}))
             for entity_id, state in hvac_result.saved_zone_states.items():
                 saved_zones.setdefault(entity_id, state)
@@ -168,6 +190,13 @@ class HVACOwnershipTransaction:
             for key in HVAC_LIFECYCLE_FIELDS:
                 if desired.get(key) is not None:
                     hvac_control[key] = desired[key]
+            if (
+                desired.get("phase") in {"pre_peak_coast", "peak_coast"}
+                and desired.get("phase_transition_reason") == "target_reached"
+                and self.previous.get("hvac_control", {}).get("phase") == "preconditioning"
+            ):
+                hvac_control["precondition_end"] = confirmed_at or self.now
+                hvac_control["phase_started_at"] = confirmed_at or self.now
             hvac_control.setdefault("started_at", self.now)
             ownership_data["hvac_control"] = hvac_control
             ownership_data.pop("hvac_release_hold_until", None)

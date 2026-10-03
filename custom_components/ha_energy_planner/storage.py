@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant
 
 from .action_limits import budget_history, recent_attempts
 from .calendar_history import confirm_calendar_action, update_calendar_history
+from .climate_inputs import instant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
@@ -19,6 +20,7 @@ from .preconditioning import record_outcome, record_plan
 _LIST_FIELDS = {
     "ai_recommendations",
     "execution_audit",
+    "climate_audit",
     "forecast_snapshots",
     "dry_run_comparisons",
     "overrides",
@@ -159,6 +161,21 @@ class PlannerStore:
             self.data.get("preconditioning_history", {}), to_jsonable(outcome)
         )
         entry = _audit_entry(outcome)
+        if entry.get("asset") == "daikin":
+            self.record_climate_event(
+                {
+                    "stage": "outcome",
+                    "transaction_id": outcome.action_id,
+                    "kind": outcome.kind,
+                    "phase": entry.get("desired_state", {}).get("phase"),
+                    "lifecycle_id": (outcome.desired_state or {}).get("lifecycle_id"),
+                    "reason": entry.get("reason"),
+                    "result": entry.get("result"),
+                    "expected": entry.get("desired_state"),
+                    "observed": entry.get("post_state"),
+                    "outcome": entry,
+                },
+            )
         self.data["calendar_history"] = confirm_calendar_action(self.data.get("calendar_history"), entry)
         if audit and _deduplicable_outcome(entry) and _same_audit_outcome(audit[-1], entry):
             previous = dict(audit[-1])
@@ -169,6 +186,62 @@ class PlannerStore:
             audit.append(entry)
         self.data["execution_audit"] = audit[-100:]
         await self._async_save()
+
+    def record_climate_event(self, event: dict[str, Any], *, now: datetime | None = None) -> None:
+        """Retain bounded, sanitized climate evidence independently of other assets."""
+        now = now or datetime.now(UTC)
+        allowed = {
+            "stage",
+            "kind",
+            "phase",
+            "lifecycle_id",
+            "transaction_id",
+            "entity_id",
+            "domain",
+            "service",
+            "context_id",
+            "requested",
+            "expected",
+            "observed",
+            "failure_category",
+            "reason",
+            "result",
+            "override_source",
+            "user_attributed",
+            "parent_id",
+            "supporting_command_context",
+            "main_mode",
+            "main_target",
+            "requested_hvac_mode",
+            "outcome",
+        }
+        item = {
+            key: _climate_audit_outcome(value)
+            if key == "outcome"
+            else _climate_audit_controls(value)
+            if isinstance(value, dict)
+            else value
+            for key, value in event.items()
+            if key in allowed and value is not None
+        }
+        records = climate_audit_records(self.data, now)
+        signature = _climate_event_signature(item)
+        matching = next(
+            (
+                index
+                for index in range(len(records) - 1, -1, -1)
+                if _climate_event_signature(records[index]) == signature
+            ),
+            None,
+        )
+        if matching is not None:
+            previous = records.pop(matching)
+            item.update(first_at=previous["first_at"], occurrence_count=int(previous.get("occurrence_count", 1)) + 1)
+        else:
+            item.update(first_at=now.isoformat(), occurrence_count=1)
+        records.append({**item, "version": 1, "last_at": now.isoformat()})
+        self.data["climate_audit"] = records[-100:]
+        self._mutation_generation += 1
 
     async def async_save_overrides(self, overrides: list[Override]) -> None:
         """Persist active overrides."""
@@ -377,6 +450,7 @@ def _default_data() -> dict[str, Any]:
         "active_plan": None,
         "calendar_history": {},
         "execution_audit": [],
+        "climate_audit": [],
         "audit_history_version": 1,
         "action_attempts": [],
         "ownership": {},
@@ -412,6 +486,7 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
         loaded["action_attempts"] if isinstance(loaded.get("action_attempts"), list) else audit_records(loaded),
         datetime.now(UTC),
     )
+    data["climate_audit"] = climate_audit_records(data, datetime.now(UTC))
     data["audit_history_version"] = 1
     data.pop("outcomes", None)
     for key in _LIST_FIELDS:
@@ -440,6 +515,104 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
             active_plan["actions"] = normalized_actions
             data["active_plan"] = active_plan
     return data
+
+
+def _climate_event_signature(event: dict[str, Any]) -> dict[str, Any]:
+    """Deduplicate identical retry effects without collapsing distinct readbacks."""
+    signature = {
+        key: value
+        for key, value in event.items()
+        if key not in {"version", "first_at", "last_at", "occurrence_count", "context_id", "transaction_id"}
+    }
+    if isinstance(signature.get("outcome"), dict):
+        signature["outcome"] = {
+            key: value
+            for key, value in signature["outcome"].items()
+            if key not in {"attempted_at", "plan_id", "action_id"}
+        }
+    return signature
+
+
+def _climate_audit_controls(values: dict[str, Any]) -> dict[str, Any]:
+    """Retain only bounded climate control readbacks, including per-entity states."""
+    controls = {
+        "power",
+        "mode",
+        "hvac_mode",
+        "temperature",
+        "target_temperature",
+        "target_temp_low",
+        "target_temp_high",
+        "min_temp",
+        "max_temp",
+        "fan_mode",
+        "swing_mode",
+        "preset_mode",
+        "stop_actions",
+        "phase",
+        "daikin_climate_entity",
+        "lifecycle_id",
+        "configuration_identity",
+        "phase_transition_reason",
+        "period_start",
+        "period_end",
+        "precondition_end",
+        "baseline_price",
+        "precondition_target",
+        "coast_target",
+        "projected_precondition_end_temperature",
+        "economic_policy_version",
+        "released_until",
+        "release_reason",
+        "suppress_automations",
+        "release_automations",
+        "climate_policy",
+    }
+    return {
+        field: setting
+        for field, setting in list(values.items())[:100]
+        if (field in controls or field.startswith(("climate.", "switch.", "input_boolean.", "automation.", "timer.")))
+        and (setting is None or isinstance(setting, str | bool | int | float))
+    }
+
+
+def _climate_audit_outcome(entry: dict[str, Any]) -> dict[str, Any]:
+    """Preserve the public outcome schema without retaining arbitrary payload maps."""
+    outcome = {
+        key: entry.get(key)
+        for key in (
+            "attempted_at",
+            "plan_id",
+            "action_id",
+            "asset",
+            "kind",
+            "result",
+            "reason",
+            "service_target",
+        )
+    }
+    for key in ("pre_state", "post_state"):
+        outcome[key] = _climate_audit_controls(entry.get(key, {}))
+    if isinstance(entry.get("desired_state"), dict):
+        outcome["desired_state"] = _climate_audit_controls(entry["desired_state"])
+    if isinstance(entry.get("command_sent"), bool):
+        outcome["command_sent"] = entry["command_sent"]
+    return outcome
+
+
+def climate_audit_records(data: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+    """Read bounded, supported climate evidence within the thirty-day retention window."""
+    raw = data.get("climate_audit", [])
+    if not isinstance(raw, list):
+        return []
+    return [
+        record
+        for record in raw
+        if isinstance(record, dict)
+        and record.get("version", 1) == 1
+        and (stamp := instant(record.get("last_at"))) is not None
+        and now - timedelta(days=30) <= stamp <= now
+    ][-100:]
 
 
 def audit_records(data: dict[str, Any]) -> list[dict[str, Any]]:

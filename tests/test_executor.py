@@ -7493,6 +7493,40 @@ def test_hvac_rollback_enrichment_preserves_original_cycle_baseline() -> None:
     assert store.flush_count == 2
 
 
+@pytest.mark.parametrize("superseded", [False, True])
+@pytest.mark.parametrize("matching", [False, True])
+def test_failed_acquisition_recovery_progress_only_merges_matching_owned_baselines(superseded, matching):
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    baseline = {"hvac_mode": "off", "target_temperature": 19, "rollback_active_hvac_mode": "heat"}
+    previous = {"hvac_control": {"main_state": baseline, "zone_states": {"climate.zone": {"target_temperature": 20}}}}
+    pending = {**baseline, "zone_recovery_attempted": True, "recovery_version": 1}
+    if not matching:
+        pending["target_temperature"] = 24
+        pending["rollback_active_hvac_mode"] = "cool"
+    failed = HVACCommandResult(
+        False,
+        "hvac_acquisition_rollback_failed",
+        {},
+        {},
+        {},
+        rollback_succeeded=False,
+        saved_zone_states=previous["hvac_control"]["zone_states"],
+        saved_main_state=pending,
+    )
+    result = HVACOwnershipTransaction(previous, datetime.now(UTC)).complete(
+        failed, previous, {}, main_state_superseded=superseded, superseded_zone_entity_ids=set()
+    )
+    restored = result["hvac_control"]
+    assert restored["zone_states"] == previous["hvac_control"]["zone_states"]
+    if superseded:
+        assert "main_state" not in restored
+    else:
+        assert restored["main_state"] == (pending if matching else baseline)
+    assert previous["hvac_control"]["main_state"] == baseline
+
+
 def test_ev_action_limit_notification_explains_configuration():
     now = datetime.now(UTC)
     action = PlanAction(
@@ -7823,3 +7857,29 @@ def test_ev_dispatched_target_loss_counts_toward_allowance_after_reload(monkeypa
     asyncio.run(restored.async_load())
     assert action_budget(restored.data["action_attempts"], options, datetime.now(UTC), "ev")["remaining"] == 0
     assert restored.data["execution_audit"][-1]["command_sent"] is True
+
+
+@pytest.mark.parametrize("legacy_control", [None, {}])
+def test_cancelled_climate_transaction_retires_earlier_feedback(legacy_control):
+    """Cancellation must not leave old target expectations authorizing later changes."""
+    executor = Executor.__new__(Executor)
+    executor.store = SimpleNamespace(data={"ownership": {"hvac_control": legacy_control}})
+    executor.hvac_feedback_commands = [{"deadline": datetime.now(UTC) + timedelta(minutes=1)}]
+    adapter = DaikinHVACAdapter(SimpleNamespace(states=SimpleNamespace(get=lambda entity: None)), {})
+    executor._configure_pending_hvac_adapter(adapter, {})
+    adapter._command_callback(
+        {"stage": "service_failed", "context_id": "cancelled", "failure_category": "CancelledError"}
+    )
+    assert executor.hvac_feedback_commands == []
+
+
+@pytest.mark.parametrize("zone", [False, True])
+def test_manual_supersession_retires_feedback_even_without_an_inflight_transaction(zone):
+    executor = Executor.__new__(Executor)
+    executor.pending_hvac_desired_state = None
+    executor.hvac_feedback_commands = [{"context_id": "completed-command"}]
+    if zone:
+        assert executor.mark_pending_hvac_zone_manual_override("climate.zone") is False
+    else:
+        assert executor.mark_pending_hvac_manual_override() is False
+    assert executor.hvac_feedback_commands == []

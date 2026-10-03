@@ -17,7 +17,7 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Upgrades remove current and legacy separate EV start/stop mappings, retaining the configured charger switch and saved recovery snapshots and command identity. Missing original controls retain ownership. Explicit dispatch evidence is preserved in audit and rolling-attempt storage, so partial commands followed by target loss still consume allowance while local rejections do not. Regression coverage is in `tests/test_config_flow.py`, `tests/test_lifecycle.py`, `tests/test_executor.py`, `tests/test_action_limits.py`, and `tests/test_storage.py`.
 
-- Main thermostat shutdown feedback is scoped through service dispatch and confirmation. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events after the command remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
+- Main thermostat shutdown feedback is scoped through service dispatch, confirmation and a bounded settling period of at most two minutes. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events outside the matching command transition or deadline remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
 
 - EV and climate action limits remain configurable (defaults 10 and 12 respectively, with a 60-minute manual HVAC override; existing values preserved). The optimizer distinguishes physically feasible candidates rejected by the rolling action allowance from capacity/price shortfalls, and notifications expose the limit and remaining allowance. Regression tests cover exhausted/one-action allowances, recovery after raising the cap, physical shortfalls, and actionable notifications (`tests/test_ev_optimization.py`, `tests/test_executor.py`). Safety-stop accounting remains conservative.
 
@@ -651,7 +651,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
   recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
   Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
-  frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution and finite restored targets. Main-unit turn-on may restore the remembered mode before the requested mode is applied; zone-switch feedback must still match the requested mode. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only finite recovered targets. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction, including a cooling request that first restores remembered heating; attributed changes, unrelated zones, inactive modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
+  frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution and compatible restored targets. Main-unit turn-on may restore the remembered mode before the requested mode is applied; zone-switch feedback must match the command-time head mode, or the requested mode when the head is off. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only compatible recovered targets within the bounded command settling period. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction, including a cooling request that first restores remembered heating; attributed changes, unrelated zones, inactive modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping
   releases eligible, and creates one recovery-aware notification.
   Execution repeats the check immediately before adapter construction so the
@@ -682,8 +682,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   the original snapshot across peak transitions. Release
   restores zones, re-enables only automations that were active before takeover,
   retains unresolved ownership for
-  retry. Ordinary lifecycle release never restores the prior climate mode or
-  setpoint; unresolved acquisition recovery restores its persisted main snapshot
+  retry. Ordinary lifecycle release restores the original main mode, target and power
+  state; unresolved acquisition recovery retains its persisted main snapshot
   unless a manual main change supersedes it. An ownership-free
   release is a no-op, and only actual `set_hvac` attempts consume the daily
   climate command allowance. Comfort-boundary
@@ -1134,3 +1134,54 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 - Evidence: `test_config_flow.py`, `test_lifecycle.py`, `test_ev_adapter.py`,
   `test_executor.py`, `test_action_limits.py`, `test_storage.py`, and the real
   Home Assistant single-control smoke fixture in `scripts/docker-ha-smoke.sh`.
+
+## Climate lifecycle reliability and provenance
+
+- Dependent main/zone restoration, compatible-bound waits, mandatory off cleanup,
+  retained recovery context and version rejection: `hvac_adapter.py`,
+  `tests/test_hvac_adapter.py`.
+- Exact issued-command feedback with bounded settling and conflicting/manual
+  attribution: `coordinator.py`, `executor.py`, `tests/test_hvac_adapter.py`.
+- Early-target coasting, stable tariff lifecycle identity, history correlation and
+  cycle continuity: `planner_hvac.py`, `hvac_control.py`, `preconditioning.py`,
+  `constraints.py`, `tests/test_preconditioning.py`.
+- Qualified-only observation cadence and actual early economic revalidation:
+  `climate_runtime.py`, `tests/test_climate_engine.py`.
+- Measured/estimated/unknown power contracts, chronological rejection counts and
+  source-change invalidation: `climate_inputs.py`, `climate_learning.py`,
+  `training.py`, `tests/test_climate_engine.py`.
+- Independent durable 100-record/30-day audit, deduplication and redaction:
+  `storage.py`, `diagnostics.py`, `tests/test_storage.py`.
+- Sanitized retained September–October incidents and explicit attribution/exception
+  uncertainty: `tests/fixtures/climate/preconditioning_sep_oct_2026.json`.
+- Review regressions cover mixed hidden-target/damper restoration without repeated
+  main activation, unavailable automation retention, completed recovery cleanup,
+  declaration changes preserving unrelated learning, migration of unqualified
+  observation counts, and durable compatible/redacted outcome readback after
+  general-audit rotation: `tests/test_hvac_adapter.py`, `tests/test_climate_engine.py`,
+  `tests/test_storage.py`.
+
+- A second review reproduced and covers head-target feedback that must not hide a
+  compatible zone's conflicting change, interrupted-acquisition shutdown despite
+  guard failure, completed rollback markers surviving ownership reconciliation
+  without replacing or resurrecting a baseline, and declared tariff cadence
+  retaining lifecycle identity as forecast gaps fill: `tests/test_hvac_adapter.py`,
+  `tests/test_executor.py`, `tests/test_preconditioning.py`.
+- Manual supersession retires completed-command expectations through the listener,
+  executor markers and explicit override service. Already-restored dependent targets
+  complete recovery without main activation, while a pending main change keeps zone
+  snapshots until fresh readback: `tests/test_coordinator.py`, `tests/test_executor.py`,
+  `tests/test_hvac_adapter.py`.
+
+Full validation remains `scripts/docker-validate.sh`; the exact 100% statement
+coverage and reviewed branch limits are unchanged. Automated replay does not
+establish live Daikin acceptance; deployment requires authoritative readback of a
+naturally eligible complete cycle as documented in `docs/climate-decisions.md`.
+
+Validation on 3 October 2026: `scripts/docker-validate.sh` passed without skip
+flags, including 2,536 tests, strict mypy across 79 source files, 17,629/17,629
+statements covered (100%), 98.15% branch coverage within the unchanged reviewed
+limits, 336 compatibility tests, all replay/schema/history checks, Home Assistant
+configuration validation and the packaged Home Assistant entity/service smoke
+test. All 17 touched Python modules have complete statement coverage. No release
+or live deployment was performed; live cycle acceptance remains outstanding.

@@ -1036,6 +1036,7 @@ def test_options_flow_saves_all_sections_together_and_preserves_options() -> Non
         {
             "data": {
                 CONF_INSTANCE_NAME: "Energy Planner",
+                "hvac_power_source_type": "auto",
                 CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
                 CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
                 CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",
@@ -1323,6 +1324,7 @@ def test_central_energy_settings_updates_main_entry_data() -> None:
                 CONF_INSTANCE_NAME: "Energy Planner",
                 CONF_AI_TASK_ENTITY: "ai_task.old",
                 CONF_AI_ADVISOR_SERVICE: "ai_task.generate_data",
+                "hvac_power_source_type": "auto",
                 CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
                 CONF_ENPHASE_SELF_CONSUMPTION_PROFILE: "Self-Consumption",
                 CONF_ENPHASE_FULL_BACKUP_PROFILE: "Full Backup",

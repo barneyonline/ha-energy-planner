@@ -8,11 +8,16 @@
 
 ### ✨ New features
 
-- None
+- Add HVAC power source provenance, per-mode validation rejection diagnostics and a durable, isolated climate transaction audit.
 
 ### 🐛 Bug fixes
 
 - Allow mapping the Enphase Export Limit Select entity, resolve its matching sensor for confirmed readback, and clarify export-only operation with optional Profile mapping and Profile control off. Existing sensor mappings remain supported; sensor/Select aliases cannot assign the same gateway Export Limit control to separate planners.
+- Coast immediately when a preconditioning target is reached, retain original restoration settings, correlate legacy windows by tariff lifecycle, and restrict intentional observations to qualified measured comparisons.
+- Restore dependent Daikin main/zone targets with authoritative readback, retain recovery context after partial shutdown, and classify issued-command feedback through bounded settling without hiding conflicting manual changes.
+- Keep mixed damper/zone recovery from restarting a restored main unit, preserve unrelated learning when power provenance is declared, migrate learning-era observation counters, and retain compatible outcome readbacks in the climate audit.
+- Limit coupled zone feedback to required bounds clamps, shut down interrupted acquisitions even when the scheduler guard fails, retain completed rollback steps without replacing original baselines, and respect declared tariff intervals when forecast gaps fill.
+- Retire completed-command feedback expectations on manual supersession and confirm already-restored main/zone targets without restarting the unit.
 - Build release ZIP/checksum assets without requiring an operating-evidence attachment; retain version checks and packaged runtime smoke validation, and allow rebuilding assets for an existing release tag.
 
 ### 🔧 Improvements

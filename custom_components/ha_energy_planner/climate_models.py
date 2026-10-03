@@ -132,3 +132,4 @@ class ValidationResult:
     blockers: tuple[str, ...]
     residuals: tuple[float, ...] = ()
     last_window_at: str | None = None
+    rejected_windows: dict[str, int] = field(default_factory=dict)

@@ -24,12 +24,14 @@ from .const import (
     CONF_HVAC_IRRADIANCE,
     CONF_HVAC_IRRADIANCE_FORECAST,
     CONF_HVAC_MAX_HUMIDITY,
+    CONF_HVAC_POWER_SOURCE_TYPE,
     CONF_HVAC_ZONE_MAPPINGS,
     CONF_PERSON_ENTITIES,
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
     CONF_WEATHER,
 )
+from .forecasts import tariff_source_intervals
 
 
 def finite(value: Any) -> float | None:
@@ -64,7 +66,9 @@ def climate_identity(data: dict[str, Any], options: dict[str, Any]) -> str:
         CONF_PERSON_ENTITIES,
     }
     payload = {
-        key: value for key, value in data.items() if key in keys or key.startswith("hvac_") or key.startswith("weather")
+        key: value
+        for key, value in data.items()
+        if key != CONF_HVAC_POWER_SOURCE_TYPE and (key in keys or key.startswith("hvac_") or key.startswith("weather"))
     }
     payload["options"] = {
         key: value
@@ -79,6 +83,8 @@ def climate_identity(data: dict[str, Any], options: dict[str, Any]) -> str:
 def validate_climate_config(data: dict[str, Any]) -> dict[str, str]:
     """Validate structured optional mappings before they reach a model."""
     errors: dict[str, str] = {}
+    if data.get(CONF_HVAC_POWER_SOURCE_TYPE, "auto") not in {"auto", "measured", "estimated"}:
+        errors[CONF_HVAC_POWER_SOURCE_TYPE] = "invalid_climate_configuration"
     maximum = data.get(CONF_HVAC_MAX_HUMIDITY)
     if maximum is not None and (finite(maximum) is None or not 0 < float(maximum) <= 100):
         errors[CONF_HVAC_MAX_HUMIDITY] = "invalid_climate_configuration"
@@ -133,6 +139,41 @@ def validate_climate_config(data: dict[str, Any]) -> dict[str, str]:
                 elif not isinstance(value, str) or value.split(".")[0] not in domains[key]:
                     errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
     return errors
+
+
+def power_provenance(hass: Any, data: dict[str, Any]) -> dict[str, Any]:
+    """Physical watts need provenance; HA measurement metadata alone proves no meter."""
+    entity = data.get(CONF_DAIKIN_POWER)
+    item = hass.states.get(entity) if entity else None
+    attributes = getattr(item, "attributes", {}) or {}
+    declared = data.get(CONF_HVAC_POWER_SOURCE_TYPE, "auto")
+    synthetic = str(attributes.get("integration", "")).lower() == "powercalc" or attributes.get("calculation_mode") in {
+        "fixed",
+        "linear",
+        "lut",
+        "playbook",
+    }
+    registry = (
+        getattr(hass, "data", {}).get("entity_registry") if isinstance(getattr(hass, "data", None), dict) else None
+    )
+    registered = registry.async_get(entity) if registry is not None and entity else None
+    synthetic |= getattr(registered, "platform", None) == "powercalc"
+    effective = (
+        "estimated" if synthetic or declared == "estimated" else "measured" if declared == "measured" else "unknown"
+    )
+    conflict = synthetic and declared == "measured"
+    return {
+        "power_source_type": effective,
+        "power_source_declared": declared,
+        "power_source_conflict": conflict,
+        "power_source_reason": "synthetic_source_conflict"
+        if conflict
+        else "synthetic_source"
+        if synthetic
+        else "explicit_declaration"
+        if declared != "auto"
+        else "physical_provenance_unavailable",
+    }
 
 
 def read_climate_inputs(
@@ -236,6 +277,8 @@ def read_climate_inputs(
         currency = tariff.attributes.get("currency") or getattr(getattr(hass, "config", None), "currency", None)
     return {
         "identity": climate_identity(data, options),
+        **power_provenance(hass, data),
+        "tariff_intervals": tariff_source_intervals(tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5))),
         "target": finite(attrs.get("temperature")),
         "temperature_step": finite(attrs.get("target_temp_step")) or 0.5,
         "minimum_temperature": finite(attrs.get("min_temp")),
