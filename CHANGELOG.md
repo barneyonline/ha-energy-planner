@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.3.1 - 2026-10-03
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add HVAC power source provenance, per-mode validation rejection diagnostics and a durable, isolated climate transaction audit.
 
 ### 🐛 Bug fixes
