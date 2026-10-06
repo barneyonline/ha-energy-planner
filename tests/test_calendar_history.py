@@ -180,6 +180,36 @@ def test_confirmed_discrete_actions_are_retained_without_claiming_running_durati
     assert len(state["history"]) == 1 and state["pending"] == []
 
 
+@pytest.mark.parametrize("kind,label", [
+    ("set_export_limit", "Enabled — 0 W"), ("disable_export_limit", "Disabled"),
+])
+def test_export_confirmation_relabels_saved_history_without_changing_identity_or_duplicating(kind, label):
+    previous = {
+        **record(start=-10, end=-9, actual=True), "confirmed_action": "true",
+        "summary": f"Enphase Export Limit: {label}", "location": "Enphase Export Limit",
+    }
+    previous["end"] = (datetime.fromisoformat(previous["start"]) + timedelta(seconds=1)).isoformat()
+    saved = {"history": [previous]}
+    state = update_calendar_history(saved, [], NOW)
+    expected = {**previous, "summary": f"Enphase Export Limit: {label} (confirmed)"}
+    assert state["history"] == [expected]
+    assert saved["history"] == [previous]  # Reading does not mutate saved records.
+    assert update_calendar_history(state, [], NOW) == state
+    state = confirm_calendar_action(state, {
+        "result": "applied", "kind": kind, "asset": "enphase_export_limit",
+        "plan_id": "old-plan", "action_id": previous["uid"], "attempted_at": previous["start"],
+    })
+    assert len(state["history"]) == 1
+    assert state["history"][0]["uid"] == previous["uid"]
+    assert state["history"][0]["summary"] == expected["summary"]
+
+
+def test_unconfirmed_export_window_does_not_gain_confirmation_label():
+    planned = {**record(), "summary": "Enphase Export Limit: Disabled", "location": "Enphase Export Limit"}
+    assert calendar_records([planned])[0]["summary"] == planned["summary"]
+    assert update_calendar_history({"pending": [planned]}, [], NOW + timedelta(hours=1))["history"] == []
+
+
 @pytest.mark.parametrize("saved,stamp,action_id", [
     (None, NOW.isoformat(), "event"),
     ({"pending": [record()]}, "invalid", "event"),

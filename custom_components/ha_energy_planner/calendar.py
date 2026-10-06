@@ -199,11 +199,24 @@ def _calendar_windows(
             events.append((event, confirmed_start))
     if _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
         export = plan.device_plans.get(EXPORT_ASSET, {})
+        windows: list[list[dict[str, Any]]] = []
         for block in export.get("blocks", []):
-            desired = "Enabled — 0 W" if block["watts"] == 0 else "Disabled"
+            if (windows and windows[-1][-1]["watts"] == block["watts"]
+                    and block_time(windows[-1][-1]["end"]) == block_time(block["start"])):
+                windows[-1].append(block)
+            else:
+                windows.append([block])
+        for blocks in windows:
+            first, last = blocks[0], blocks[-1]
+            desired = "Enabled — 0 W" if first["watts"] == 0 else "Disabled"
             ownership = export.get("ownership", {})
+            prices = "\n".join(
+                f"• {_local_datetime_text(block_time(block['start']))} to "
+                f"{_local_datetime_text(block_time(block['end']))}: {block['price'] * 100:g} c/kWh."
+                for block in blocks
+            )
             description = (
-                f"Planned Export Limit setting: {desired}.\nExport price: {block['price'] * 100:g} c/kWh.\n"
+                f"Planned Export Limit setting: {desired}.\nExport prices:\n{prices}\n"
                 f"Confirmed setting: {export.get('confirmed_setting', 'Unknown')}.\n"
                 f"Request/status: {export.get('current_state_label', 'Unknown')}.\n"
                 f"Last readback: {export.get('feedback', {}).get('last_readback')}.\n"
@@ -211,11 +224,11 @@ def _calendar_windows(
                 f"Restoration outstanding: {bool(ownership.get('restoring'))}."
             )
             events.append((CalendarEvent(
-                start=block_time(block["start"]), end=block_time(block["end"]),
-                summary=f"Enphase Export Limit: {desired}",
+                start=block_time(first["start"]), end=block_time(last["end"]),
+                summary=f"Enphase Export Limit: {desired} (planned)",
                 description=recorder_safe_text(description, max_bytes=4_096), location="Enphase Export Limit",
                 uid=recorder_safe_identifier(
-                    f"{coordinator.entry.entry_id}-export-limit-{block['start']}", max_bytes=255),
+                    f"{coordinator.entry.entry_id}-export-limit-{first['start']}", max_bytes=255),
             ), None))
     return sorted(events, key=lambda item: item[0].start)
 

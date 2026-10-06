@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Merge adjacent Plan calendar Export Limit intervals with the same setting and label planned windows separately from confirmed actions, including saved history. Each interval's tariff price remains available in the event description.
 
 ### 🔧 Improvements
 
