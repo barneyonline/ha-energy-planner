@@ -16,6 +16,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_EV_CONTROL_ENABLED,
 )
 from custom_components.ha_energy_planner.models import (
@@ -652,6 +653,53 @@ def test_current_event_and_range_agree_after_discrete_execution(monkeypatch):
     assert [event.uid for event in events] == ["profile", "future"]
     assert events[0].end < now
     assert events[1] == entity.event
+
+
+def test_export_calendar_combines_planned_windows_and_distinguishes_saved_confirmation(monkeypatch):
+    from copy import deepcopy
+
+    now = datetime(2026, 10, 6, 8, 41, tzinfo=UTC)
+    start = now.replace(minute=30)
+    confirmed_at = now.replace(minute=35, second=1)
+    monkeypatch.setattr(calendar_module.dt_util, "utcnow", lambda: now)
+    monkeypatch.setattr(
+        calendar_module.dt_util, "as_local", lambda stamp: stamp.astimezone(ZoneInfo("Australia/Melbourne")),
+    )
+    plan = _plan([])
+    plan.device_plans["enphase_export_limit"] = {
+        "confirmed_setting": "Disabled", "current_state_label": "Disabled",
+        "blocks": [
+            {"start": start.isoformat(), "end": (start + timedelta(minutes=30)).isoformat(),
+             "watts": None, "price": 0.1015},
+            {"start": (start + timedelta(minutes=30)).isoformat(), "end": (start + timedelta(hours=1)).isoformat(),
+             "watts": None, "price": 0.097},
+        ],
+    }
+    coordinator = _coordinator(plan)
+    coordinator.options[CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED] = True
+    coordinator.store.data["calendar_history"] = {"history": [{
+        "uid": "previous-plan-disable", "summary": "Enphase Export Limit: Disabled",
+        "location": "Enphase Export Limit", "confirmed_action": "true",
+        "start": confirmed_at.isoformat(), "end": (confirmed_at + timedelta(seconds=1)).isoformat(),
+        "confirmed_start": confirmed_at.isoformat(),
+    }]}
+    saved = deepcopy(coordinator.store.data)
+    entity = EnergyPlannerCalendar(coordinator)
+    events = asyncio.run(entity.async_get_events(coordinator.hass, start, start + timedelta(hours=1)))
+    assert [event.summary for event in events] == [
+        "Enphase Export Limit: Disabled (planned)", "Enphase Export Limit: Disabled (confirmed)",
+    ]
+    assert events[0].start == start and events[0].end == start + timedelta(hours=1)
+    assert events[1].start == confirmed_at and events[1].uid == "previous-plan-disable"
+    assert events[0] == entity.event
+    assert "7:30 PM" in events[0].description and "8:30 PM" in events[0].description
+    assert "10.15 c/kWh" in events[0].description and "9.7 c/kWh" in events[0].description
+    # A date-range beginning inside the second tariff interval still finds the combined window.
+    later = asyncio.run(entity.async_get_events(
+        coordinator.hass, start + timedelta(minutes=45), start + timedelta(hours=1),
+    ))
+    assert later == [events[0]]
+    assert coordinator.store.data == saved
 
 
 def test_snapshot_vehicle_transition_updates_live_generation_and_override():

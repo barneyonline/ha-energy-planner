@@ -1273,15 +1273,66 @@ def test_calendar_windows_and_history_use_confirmed_feedback(setup):
     ctx.export_limit["feedback"]["watts"] = 0
     owner.data = DryRunPlanner(OPTIONS).create_plan(ctx)
     assert len(owner.data.actions) == 1
-    assert len(_calendar_events(owner)) == 2  # Every tariff decision is visible even with no transition.
+    assert len(_calendar_events(owner)) == 2  # Different settings remain separate windows.
     a = action(setup)
     outcome = {"plan_id": a.plan_id, "action_id": a.action_id, "asset": EXPORT_ASSET,
                "kind": str(a.kind), "attempted_at": NOW.isoformat(), "result": "pending"}
     assert not confirm_calendar_action({}, outcome).get("history")
     outcome["result"] = "applied"
-    assert confirm_calendar_action({}, outcome)["history"][0]["summary"].endswith("Enabled — 0 W")
+    assert confirm_calendar_action({}, outcome)["history"][0]["summary"].endswith("Enabled — 0 W (confirmed)")
     outcome["kind"] = "disable_export_limit"
-    assert confirm_calendar_action({}, outcome)["history"][0]["summary"].endswith("Disabled")
+    assert confirm_calendar_action({}, outcome)["history"][0]["summary"].endswith("Disabled (confirmed)")
+
+
+@pytest.mark.parametrize("prices,watts,label", [
+    ((0.1015, 0.097), None, "Disabled"),
+    ((-0.1, -0.2), 0, "Enabled — 0 W"),
+    ((-0.0, 0.1), None, "Disabled"),
+])
+def test_calendar_merges_unchanged_export_setting_and_keeps_tariff_evidence(setup, prices, watts, label):
+    from custom_components.ha_energy_planner.calendar import _calendar_events, calendar_event_records
+
+    setup.states["sensor.export_price"] = price_state(prices)
+    setup.states[ENTITY] = limit_state(watts)
+    ctx = context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW))
+    plan = DryRunPlanner(OPTIONS).create_plan(ctx)
+    owner = SimpleNamespace(data=plan, options=OPTIONS, entry=SimpleNamespace(entry_id="export-a"),
+                            entry_data=DATA, hass=setup.hass, store=setup.store)
+    events = _calendar_events(owner)
+    assert len(events) == 1
+    event = events[0]
+    assert event.summary == f"Enphase Export Limit: {label} (planned)"
+    assert event.start == NOW.replace(minute=0)
+    assert event.end == NOW.replace(minute=0) + timedelta(hours=1)
+    assert event.uid == f"export-a-export-limit-{event.start.isoformat()}"
+    for price in prices:
+        assert f"{price * 100:g} c/kWh" in event.description
+    assert "Export prices:\n• " in event.description
+    assert "12:00 AM" in event.description and "12:30 AM" in event.description and "1:00 AM" in event.description
+    assert len(plan.device_plans[EXPORT_ASSET]["blocks"]) == 2
+    assert plan.actions == []
+    assert "confirmed_start" not in calendar_event_records(owner)[0]
+
+
+@pytest.mark.parametrize("separation", ["gap", "overlap", "setting"])
+def test_calendar_keeps_export_gaps_overlaps_and_setting_changes_separate(setup, separation):
+    from custom_components.ha_energy_planner.calendar import _calendar_events
+
+    ctx = context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW))
+    plan = DryRunPlanner(OPTIONS).create_plan(ctx)
+    blocks = plan.device_plans[EXPORT_ASSET]["blocks"]
+    if separation == "setting":
+        assert blocks[0]["watts"] != blocks[1]["watts"]
+    else:
+        blocks[1]["watts"] = blocks[0]["watts"]
+        offset = 5 if separation == "gap" else -5
+        blocks[1]["start"] = (block_time(blocks[1]["start"]) + timedelta(minutes=offset)).isoformat()
+    owner = SimpleNamespace(data=plan, options=OPTIONS, entry=SimpleNamespace(entry_id="export-a"),
+                            entry_data=DATA, hass=setup.hass, store=setup.store)
+    events = _calendar_events(owner)
+    assert len(events) == 2
+    assert events[0].end == block_time(blocks[0]["end"])
+    assert events[1].start == block_time(blocks[1]["start"])
 
 
 def test_healthy_export_area_can_arm_with_unavailable_legacy_inputs(setup):

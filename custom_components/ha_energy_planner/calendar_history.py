@@ -29,8 +29,19 @@ def calendar_records(value: Any) -> list[dict[str, str]]:
             record["confirmed_start"] = confirmed.isoformat()
         if item.get("confirmed_action") == "true" and confirmed is not None and confirmed == start:
             record["confirmed_action"] = "true"
+            record["summary"] = _confirmed_action_summary(record)
         records.append(record)
     return records
+
+
+def _confirmed_action_summary(record: dict[str, str]) -> str:
+    """Distinguish export confirmations, including already saved action history."""
+    summary = record["summary"]
+    if record.get("location") == "Enphase Export Limit" and summary in {
+        "Enphase Export Limit: Enabled — 0 W", "Enphase Export Limit: Disabled",
+    }:
+        return f"{summary} (confirmed)"
+    return summary
 
 
 def update_calendar_history(
@@ -196,6 +207,7 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
                 + record.get("description", "")
             ).encode("utf-8")[:4096].decode("utf-8", errors="ignore"),
         }
+        record["summary"] = _confirmed_action_summary(record)
         _append_unique(history, record)
     state["history"] = history
     return state
