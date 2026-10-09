@@ -1279,6 +1279,7 @@ def test_queued_refresh_skips_work_after_teardown() -> None:
 def test_wait_for_refresh_shutdown_reaches_planner_safe_boundary() -> None:
     async def scenario() -> bool:
         coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+        coordinator._command_lock = asyncio.Lock()
         coordinator._planner_lock = asyncio.Lock()
         release = asyncio.Event()
         started = asyncio.Event()
@@ -7876,9 +7877,11 @@ def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: 
     coordinator._schedule_debounced_refresh()
     debounce_callback = scheduled[-1][1]
     debounce_callback(None)
+    coordinator.async_update_listeners = Mock()
     coordinator._schedule_next_boundary_refresh()
     boundary_callback = scheduled[-1][1]
     boundary_callback(None)
+    coordinator.async_update_listeners.assert_called_once()
     # Boundary scheduling bypasses the 20-second state debounce but still uses
     # the coalescing/minimum-interval callback.
     scheduled[-2][1](None)
@@ -9431,3 +9434,106 @@ def test_explicit_manual_override_retires_completed_command_expectations():
     asyncio.run(coordinator.async_set_manual_hvac_override(45, "operator_request"))
     assert coordinator.executor.hvac_feedback_commands == []
     assert coordinator.executor.hvac_releases == ["operator_request"]
+
+
+@pytest.mark.parametrize("fail_helper", [False, True])
+def test_manual_hvac_override_refresh_and_export_resume_complete_without_command_deadlock(fail_helper):
+    async def run():
+        coordinator = _coordinator_for_runtime_services()
+        plan = _plan("lock-regression")
+        async def refresh():
+            assert not coordinator._command_lock.locked()
+            await coordinator._async_update_data()
+        async def update_locked(*, defer_execution=False):
+            return plan
+        coordinator._async_update_data_locked = update_locked
+        coordinator.async_request_refresh = refresh
+        if fail_helper:
+            coordinator._async_set_manual_hvac_override = AsyncMock(return_value=(None, HomeAssistantError("helper")))
+            with pytest.raises(HomeAssistantError):
+                await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "manual"), 1)
+        else:
+            await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "manual"), 1)
+        await asyncio.wait_for(coordinator.async_resume_control(asset="enphase_export_limit"), 1)
+        assert coordinator.last_refresh_metadata["succeeded"] is True
+    asyncio.run(run())
+
+
+def test_export_reconciliation_does_not_hold_planner_lock_while_waiting_for_command(monkeypatch):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        started = asyncio.Event()
+        async def reconcile(_self, now):
+            assert not coordinator._planner_lock.locked()
+            started.set()
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        # Review mode does not seed active ownership or issue restoration commands.
+        await coordinator._command_lock.acquire()
+        task = asyncio.create_task(coordinator._async_update_data())
+        await asyncio.sleep(0)
+        assert not coordinator._planner_lock.locked()
+        coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
+        await asyncio.wait_for(coordinator._planner_lock.acquire(), .2)
+        coordinator._planner_lock.release()
+        coordinator._command_lock.release()
+        await asyncio.wait_for(task, 1)
+        assert started.is_set()
+    asyncio.run(run())
+
+
+def test_export_reconciliation_rechecks_mapping_after_waiting_for_command(monkeypatch):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.old"})
+        reconcile = AsyncMock()
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        await coordinator._command_lock.acquire()
+        task = asyncio.create_task(coordinator._async_reconcile_export_limit())
+        await asyncio.sleep(0)
+        coordinator.entry.data.clear()
+        coordinator._command_lock.release()
+        await asyncio.wait_for(task, 1)
+        reconcile.assert_not_awaited()
+    asyncio.run(run())
+
+
+
+@pytest.mark.parametrize("stage", ["before", "queued", "inflight"])
+def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, stage):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator.data = _plan("shutdown")
+        reconcile = AsyncMock()
+        restore = AsyncMock()
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "restore", restore)
+        coordinator.store.data["ownership"] = {"enphase_export_limit": {"restoring": True}}
+        if stage == "inflight":
+            started = asyncio.Event()
+            finish = asyncio.Event()
+            async def in_progress(now):
+                started.set()
+                await finish.wait()
+            reconcile.side_effect = in_progress
+            task = asyncio.create_task(coordinator._async_update_data())
+            await started.wait()
+            coordinator._begin_shutdown()
+            shutdown = asyncio.create_task(coordinator.async_wait_for_refresh_shutdown())
+            await asyncio.sleep(0)
+            assert not shutdown.done()
+            finish.set()
+            await asyncio.wait_for(asyncio.gather(task, shutdown), 1)
+            reconcile.assert_awaited_once()
+        elif stage == "queued":
+            await coordinator._command_lock.acquire()
+            task = asyncio.create_task(coordinator._async_reconcile_export_limit())
+            await asyncio.sleep(0)
+            coordinator._begin_shutdown()
+            coordinator._command_lock.release()
+            await asyncio.wait_for(task, 1)
+        else:
+            coordinator._begin_shutdown()
+            await coordinator._async_reconcile_export_limit()
+        if stage != "inflight":
+            reconcile.assert_not_awaited()
+        restore.assert_not_awaited()
+    asyncio.run(run())

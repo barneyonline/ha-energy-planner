@@ -21,7 +21,7 @@ from .climate_models import (
 from .const import DEFAULT_OPTIONS
 from .entry_data import combined_entry_data
 from .models import to_jsonable
-from .plan_presentation import built_in_load_forecast_attrs
+from .plan_presentation import built_in_load_forecast_attrs, export_limit_status, planning_status
 from .preconditioning import current_status
 from .safety import control_pause_status
 from .storage import audit_records, climate_audit_records
@@ -97,6 +97,8 @@ async def async_get_config_entry_diagnostics(
             },
             "issues": plan.input_issues[:20],
         },
+        "planning_status": planning_status(coordinator),
+        "export_limit": _redact(export_limit_status(coordinator)),
         "refresh_performance": _redact(_refresh_performance(coordinator)),
         "load_forecast": _redact(built_in_load_forecast_attrs(coordinator)),
         "weather_forecast": _redact(

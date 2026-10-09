@@ -125,8 +125,25 @@ class ExportLimitControl:
             )
         )
 
+    async def adopt_external_feedback(self, observed: dict[str, Any], now: datetime) -> None:
+        """Retire superseded ownership without clearing unrelated failure pauses."""
+        previous = self.state
+        adopted: dict[str, Any] = {
+            "identity": observed["identity"],
+            "expected": {"watts": observed["watts"], "slew_rate": observed["slew_rate"]},
+            "last_external_change": {
+                "observed_at": now.isoformat(),
+                "previous_expected": previous.get("expected", {}),
+                "watts": observed["watts"],
+                "slew_rate": observed["slew_rate"],
+            },
+        }
+        if previous.get("pause") and previous["pause"] != "external_export_limit_conflict":
+            adopted["pause"] = previous["pause"]
+        await self.save(adopted)
+
     async def reconcile(self, now: datetime) -> str | None:
-        """Resolve durable commands and surrender ownership to external changes."""
+        """Resolve durable commands and reconcile external changes without latching a pause."""
         state = self.state
         if not state:
             return None
@@ -143,6 +160,11 @@ class ExportLimitControl:
         if observed["identity"] != state["identity"]:
             return "export_limit_target_changed"
         pending = state.get("pending")
+        if state.get("pause") == "external_export_limit_conflict" and not pending:
+            if observed["pending"]:
+                return "export_limit_pending"
+            await self.adopt_external_feedback(observed, now)
+            return None
         if pending:
             matches = (
                 not observed["pending"]
@@ -152,9 +174,9 @@ class ExportLimitControl:
             )
             if matches:
                 if not pending["restore"] and observed["slew_rate"] != pending["pre_state"]["slew_rate"]:
-                    await self.audit(pending, OutcomeResult.REJECTED, "external_export_limit_conflict", now, observed)
-                    await self.save({"identity": state["identity"], "pause": "external_export_limit_conflict"})
-                    return "external_export_limit_conflict"
+                    await self.audit(pending, OutcomeResult.REJECTED, "external_export_limit_changed", now, observed)
+                    await self.adopt_external_feedback(observed, now)
+                    return self.state.get("pause")
                 await self.audit(
                     pending,
                     OutcomeResult.RESTORED if pending["restore"] else OutcomeResult.APPLIED,
@@ -173,11 +195,13 @@ class ExportLimitControl:
                 return "export_limit_unconfirmed"
             else:
                 return "export_limit_pending"
-        elif observed["pending"] or (
-            state.get("expected") and any(state["expected"].get(key) != observed[key] for key in ("watts", "slew_rate"))
+        elif observed["pending"]:
+            return "export_limit_pending"
+        elif state.get("expected") and any(
+            state["expected"].get(key) != observed[key] for key in ("watts", "slew_rate")
         ):
-            await self.save({"identity": state["identity"], "pause": "external_export_limit_conflict"})
-            return "external_export_limit_conflict"
+            await self.adopt_external_feedback(observed, now)
+            return self.state.get("pause")
         return self.state.get("pause")
 
     async def unconfirmed(
@@ -253,14 +277,17 @@ class ExportLimitControl:
         if not blocked and latest["pending"]:
             blocked = "export_limit_pending"
         if not blocked and any(latest[key] != observed[key] for key in ("watts", "slew_rate")):
-            blocked = "external_export_limit_conflict"
+            blocked = "external_export_limit_changed"
         if not restore:
             if not action.execute_not_before <= dispatch_now < action.execute_not_after:
                 blocked = "export_tariff_expired"
             if self.before_dispatch:
                 blocked = blocked or self.before_dispatch()
         if blocked:
-            await self.save(previous)
+            if blocked == "external_export_limit_changed":
+                await self.adopt_external_feedback(latest, dispatch_now)
+            else:
+                await self.save(previous)
             if restore:
                 await self.audit(pending, OutcomeResult.REJECTED, blocked, dispatch_now, latest)
             return OutcomeResult.REJECTED, blocked, False
@@ -311,6 +338,8 @@ class ExportLimitControl:
             return OutcomeResult.RESTORED, "export_limit_restored", False
         if issue:
             return OutcomeResult.PENDING, issue, False
+        if not state.get("baseline"):
+            return OutcomeResult.SKIPPED, "export_limit_not_owned", False
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
         if issue:
             return OutcomeResult.PENDING, issue, False
