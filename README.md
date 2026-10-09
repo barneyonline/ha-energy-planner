@@ -100,6 +100,8 @@ assets for an existing tag using the Release Assets workflow; see the
 
 Weather, carbon intensity, measured PV power, and AI explanations are optional. An external solar forecast remains required. The integration has no third-party Python dependencies and does not require separate vendor credentials.
 
+Maintainers validate changes with `scripts/docker-validate.sh`. Docker test runners install the pinned development tools from `tests/requirements.txt` inside each disposable container, so validation works when a Home Assistant image omits pytest. The pinned baseline and separate stable compatibility checks retain their existing coverage and runtime gates.
+
 ## Configuration
 
 Initial setup asks for a planner name. Then open **Configure** to map inputs and manage six areas:

@@ -42,6 +42,7 @@ run env PYTHONPYCACHEPREFIX="$PYCACHE_DIR" python3 -m compileall -q custom_compo
 run docker run --rm -v "$PWD:/work" -w /work ghcr.io/astral-sh/ruff:0.14.1 check custom_components tests scripts
 run scripts/docker-mypy.sh
 run bash -n scripts/docker-package-smoke.sh scripts/validation-environment.sh scripts/docker-compatibility.sh scripts/docker-ha-smoke.sh scripts/docker-mypy.sh scripts/docker-pytest-fast.sh scripts/docker-validate.sh scripts/export-real-live-schema.sh scripts/export-real-history-fixtures.sh scripts/export-real-validation-bundle.sh
+run sh -n scripts/install-test-dependencies.sh
 run scripts/export-real-live-schema.sh --dry-run
 run scripts/export-real-history-fixtures.sh --dry-run
 run scripts/export-real-validation-bundle.sh --dry-run
@@ -53,7 +54,7 @@ fi
 if [[ "${HEP_SKIP_PYTEST:-0}" == "1" ]]; then
   printf '\n==> pytest with coverage (skipped: HEP_SKIP_PYTEST=1)\n'
 else
-  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work "$HA_IMAGE" sh -c 'python3 -m coverage run --branch -m pytest -q --durations=15 && python3 -m coverage json --fail-under=0 -o coverage.json && python3 -m coverage report -m --fail-under=0 && python3 scripts/check_coverage.py coverage.json'
+  run docker run --rm -e PYTHONDONTWRITEBYTECODE=1 -v "$PWD:/work" -w /work "$HA_IMAGE" sh -c 'sh scripts/install-test-dependencies.sh && python3 -m coverage run --branch -m pytest -q --durations=15 && python3 -m coverage json --fail-under=0 -o coverage.json && python3 -m coverage report -m --fail-under=0 && python3 scripts/check_coverage.py coverage.json'
 fi
 run python3 scripts/replay-fixture.py tests/fixtures/replay/*.json
 run python3 scripts/validate-live-schema-fixture.py tests/fixtures/live_schema/*.json

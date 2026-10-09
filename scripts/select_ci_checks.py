@@ -23,6 +23,8 @@ _ALL_CHECKS = {
     ".github/workflows/ci.yml",
     ".github/workflows/tests.yml",
     "pyproject.toml",
+    "scripts/install-test-dependencies.sh",
+    "tests/requirements.txt",
 }
 
 _PYTEST_PATTERNS = (
@@ -46,6 +48,8 @@ _DEDICATED_QUALITY_SCALE_PATTERNS = (
     "scripts/docker-mypy.sh",
     "scripts/docker-validate.sh",
     "pyproject.toml",
+    "scripts/install-test-dependencies.sh",
+    "tests/requirements.txt",
     ".github/workflows/quality-scale.yml",
     ".github/workflows/tests.yml",
 )

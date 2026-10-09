@@ -18,7 +18,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Bootstrap pinned test tools in disposable Docker validation containers, including current stable images that omit pytest.
 
 ### 🔄 Other changes
 
