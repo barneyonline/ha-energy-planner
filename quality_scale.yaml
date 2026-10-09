@@ -675,3 +675,16 @@ rules:
 # and explicit override requests; completed dependent target recovery avoids main
 # activation while pending main changes retain zone evidence. Regressions are in
 # test_coordinator.py, test_executor.py and test_hvac_adapter.py.
+
+# Export conflict recovery and stalled planning: enphase_export_limit.py retires
+# superseded baselines and migrates saved conflict pauses after settled readback.
+# coordinator.py avoids planner/command lock inversion and refresh under command
+# ownership. Boundary callbacks publish clock-dependent status while refresh waits.
+# task_lifecycle.py drains export reconciliation before unload restoration;
+# external feedback adoption preserves failure pauses until explicit resume.
+# Evidence: tests/test_export_limit.py, tests/test_coordinator.py,
+# tests/test_sensor.py and tests/test_diagnostics.py; operator behavior is documented
+# in README.md and docs/requirements-audit.md. Full scripts/docker-validate.sh gate.
+# Docker runners bootstrap pinned development tools from tests/requirements.txt;
+# scripts/install-test-dependencies.sh supports production images without pytest.
+# tests/scripts/test_select_ci_checks.py keeps all dependent CI gates selected.

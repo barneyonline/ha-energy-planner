@@ -12,11 +12,13 @@
 
 ### 🐛 Bug fixes
 
+- Prevent climate overrides, Export Limit feedback and Resume control from deadlocking on planner/command locks. Publish stale planning and export execution blockers in status and diagnostics.
+- Automatically reconcile unexpected Export Limit and slew-rate changes with the current tariff, retire superseded restoration baselines and recover saved external-conflict pauses after fresh, settled readback. Pending and unconfirmed commands remain protected against duplicate writes.
 - Merge adjacent Plan calendar Export Limit intervals with the same setting and label planned windows separately from confirmed actions, including saved history. Each interval's tariff price remains available in the event description.
 
 ### 🔧 Improvements
 
-- None
+- Bootstrap pinned test tools in disposable Docker validation containers, including current stable images that omit pytest.
 
 ### 🔄 Other changes
 

@@ -34,7 +34,7 @@ run_runtime_tests() {
     -e PYTHONDONTWRITEBYTECODE=1 \
     -v "$PWD:/work:ro" -w /work \
     "ghcr.io/home-assistant/home-assistant:$version" \
-    python3 -X faulthandler -m pytest -q -p no:cacheprovider "$@"
+    sh -c 'sh scripts/install-test-dependencies.sh && exec python3 -X faulthandler -m pytest -q -p no:cacheprovider "$@"' sh "$@"
 }
 
 for version in "${versions[@]}"; do
