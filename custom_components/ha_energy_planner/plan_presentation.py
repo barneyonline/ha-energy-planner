@@ -7,10 +7,54 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant.util import dt as dt_util
 
+from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
 from .models import ActionAsset, ActionKind, InputHealth, PlanAction, to_jsonable
+from .preflight import _current_plan_report
+from .safety import control_pause_reason
 
 if TYPE_CHECKING:
     from .coordinator import EnergyPlannerCoordinator
+
+
+def planning_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Expose freshness independently of whether another refresh can complete."""
+    latest = getattr(coordinator, "last_refresh_metadata", None)
+    if coordinator.data is None or not isinstance(latest, dict) or not latest.get("completed_at"):
+        return {}
+    report = _current_plan_report(coordinator.data, last_refresh_metadata=latest)
+    stalled = not report["fresh"] or not report["last_refresh_succeeded"]
+    return {
+        "stalled": stalled,
+        "reason": "planning_refresh_stale" if stalled else None,
+        "plan_age_seconds": report["age_seconds"],
+        "maximum_age_seconds": report["maximum_age_seconds"],
+        "last_completed_at": to_jsonable(latest["completed_at"]),
+        "summary": "Planning is stale; automatic control is waiting for a successful refresh."
+        if stalled else "Planning is current.",
+        "next_step": "Replan; if it continues waiting, restart Home Assistant and inspect planner diagnostics."
+        if stalled else None,
+    }
+
+
+def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Combine planned tariff intent with current durable execution blockers."""
+    plan = coordinator.data
+    status = dict(plan.device_plans.get("enphase_export_limit", {})) if plan is not None else {}
+    ownership = coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {})
+    if isinstance(ownership, dict) and ownership:
+        status["ownership"] = dict(ownership)
+        reason = ownership.get("pause") or (
+            "export_limit_pending" if ownership.get("pending") else
+            "export_limit_restoration_pending" if ownership.get("restoring") else None
+        )
+        if reason:
+            status.update(ready=False, reason=reason)
+    if getattr(coordinator, "options", {}).get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+        pause = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow(),
+                                     asset="enphase_export_limit")
+        if pause:
+            status.update(ready=False, reason=pause)
+    return status
 
 
 def plain_action(action: PlanAction) -> dict[str, Any]:

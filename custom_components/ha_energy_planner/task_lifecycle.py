@@ -92,6 +92,9 @@ async def async_wait_for_plan_execution(self: EnergyPlannerCoordinator) -> None:
 
 
 async def async_wait_for_refresh_shutdown(self: EnergyPlannerCoordinator) -> None:
-    """Wait until any refresh already inside the planner lock has finished."""
-    async with self._planner_lock:
-        return
+    """Drain export reconciliation and planning before final unload restoration."""
+    # Refresh reconciliation runs outside the planner lock. Drain its durable
+    # writes as well, using the same command-then-planner order as operator work.
+    async with self._command_lock:
+        async with self._planner_lock:
+            return

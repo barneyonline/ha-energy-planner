@@ -17,6 +17,8 @@ on:
       - "scripts/validate_quality_scale.py"
       - "scripts/docker-mypy.sh"
       - "scripts/docker-validate.sh"
+      - "scripts/install-test-dependencies.sh"
+      - "tests/requirements.txt"
       - "pyproject.toml"
       - ".github/workflows/quality-scale.yml"
       - ".github/workflows/tests.yml"
@@ -46,6 +48,6 @@ jobs:
           -v "$PWD:/work"
           -w /work
           ghcr.io/home-assistant/home-assistant:stable
-          python3 -m pytest -q
+          sh -c 'sh scripts/install-test-dependencies.sh && python3 -m pytest -q
           tests/scripts/test_validate_quality_scale.py
-          tests/test_manifest.py
+          tests/test_manifest.py'
