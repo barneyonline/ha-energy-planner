@@ -343,7 +343,9 @@ def test_planning_duration_sensor_exposes_bounded_refresh_performance() -> None:
     assert description.native_unit_of_measurement == UnitOfTime.MILLISECONDS
     assert description.entity_category == EntityCategory.DIAGNOSTIC
     assert description.value_fn(coordinator) == 27.25
-    assert description.attrs_fn(coordinator) == {
+    attrs = description.attrs_fn(coordinator)
+    assert attrs.pop("planning_status")["last_completed_at"] == "2026-06-27T00:05:00+00:00"
+    assert attrs == {
         "last_refresh_succeeded": True,
         "last_completed_at": "2026-06-27T00:05:00+00:00",
         "last_trigger": "state_change",
@@ -1569,3 +1571,60 @@ def test_decision_summary_preserves_climate_blockers_and_restore_targets() -> No
     climate = sensor_module._decision_summary_attrs(coordinator)["climate"]
     assert climate["readiness"]["heat"]["blockers"] == ["history_days", "validation_windows"]
     assert climate["pending_restore"]["zone_states"]["climate.zone"]["target_temperature"] == 20
+
+
+def test_clock_dependent_status_exposes_stalled_planning_without_new_plan(monkeypatch):
+    plan = _plan()
+    coordinator = _coordinator(plan, entry_data={"daikin_climate_entity": "climate.main"},
+                               options={"climate_control_enabled": True})
+    coordinator.last_refresh_metadata = {"succeeded": True, "completed_at": plan.created_at}
+    maximum = timedelta(minutes=max(plan.interval_minutes * 2, 15))
+    monkeypatch.setattr(sensor_module.dt_util, "utcnow", lambda: plan.created_at + maximum)
+    assert sensor_module._plan_health_state(coordinator) == "healthy"
+    assert not presentation_module.planning_status(coordinator)["stalled"]
+    monkeypatch.setattr(sensor_module.dt_util, "utcnow", lambda: plan.created_at + maximum + timedelta(seconds=1))
+    assert sensor_module._plan_health_state(coordinator) == "degraded"
+    assert sensor_module._plan_health_attrs(coordinator)["plan_status"] == "stale"
+    assert "planning_refresh_stale" in [x["code"] for x in sensor_module._plan_health_attrs(coordinator)["issues"]]
+    assert sensor_module._controlled_state_summary(coordinator).startswith("Planning stale")
+    assert sensor_module._controlled_state_attrs(coordinator)["planning_status"]["stalled"]
+    assert sensor_module._next_actions_state(coordinator).startswith("Planning stale")
+    assert sensor_module._next_actions_attrs(coordinator)["planning_status"]["stalled"]
+    assert sensor_module._planning_duration_attrs(coordinator)["planning_status"]["stalled"]
+    # Failed refreshes also cannot advertise healthy automatic control.
+    monkeypatch.setattr(sensor_module.dt_util, "utcnow", lambda: plan.created_at)
+    coordinator.last_refresh_metadata["succeeded"] = False
+    assert presentation_module.planning_status(coordinator)["stalled"]
+
+
+def test_export_execution_blocker_is_visible_in_state_actions_and_health():
+    plan = _plan()
+    plan.device_plans["enphase_export_limit"] = {
+        "ready": True, "current_state_label": "Disabled", "next_planned_state_label": "Enabled — 0 W",
+    }
+    coordinator = _coordinator(plan, entry_data={"enphase_export_limit_entity": "select.export"},
+        options={"enphase_export_limit_control_enabled": True},
+        store_data={"ownership": {"enphase_export_limit": {"pause": "export_limit_unconfirmed"}}})
+    assert sensor_module._plan_health_state(coordinator) == "degraded"
+    assert "control blocked" in sensor_module._controlled_state_summary(coordinator)
+    assert "Blocked:" in sensor_module._next_actions_state(coordinator)
+    assert "Enabled — 0 W" not in sensor_module._next_actions_state(coordinator)
+    assert sensor_module._controlled_state_attrs(coordinator)["export_limit"]["reason"] == "export_limit_unconfirmed"
+    assert sensor_module._next_actions_attrs(coordinator)["export_limit"]["ready"] is False
+    attrs = sensor_module._plan_health_attrs(coordinator)
+    assert attrs["issue_count"] == 1
+    assert attrs["issues"][0]["code"] == "export_limit_unconfirmed"
+    coordinator.store.data["ownership"]["enphase_export_limit"] = {"pending": {"watts": 0}}
+    assert presentation_module.export_limit_status(coordinator)["reason"] == "export_limit_pending"
+    coordinator.store.data["ownership"]["enphase_export_limit"] = {"restoring": True}
+    assert presentation_module.export_limit_status(coordinator)["reason"] == "export_limit_restoration_pending"
+
+
+
+def test_explicit_export_pause_is_visible_and_unrelated_pause_does_not_block_export():
+    coordinator = _coordinator(_plan(), options={"enphase_export_limit_control_enabled": True},
+        store_data={"control_pause": {"active": True, "assets": ["enphase_export_limit"]},
+                    "ownership": {"enphase_export_limit": "malformed"}})
+    assert presentation_module.export_limit_status(coordinator)["reason"] == "enphase_export_limit_control_paused"
+    coordinator.store.data["control_pause"]["assets"] = ["daikin"]
+    assert not presentation_module.export_limit_status(coordinator)

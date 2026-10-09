@@ -57,9 +57,11 @@ from .plan_presentation import (
     built_in_load_forecast_attrs,
     decision_data_quality_attrs,
     display_state,
+    export_limit_status,
     latest_forecast_snapshot,
     plain_action,
     plain_reason,
+    planning_status,
 )
 from .recovery_presentation import recovery_details
 from .safety import (
@@ -265,7 +267,11 @@ def _plan_health_state(coordinator: EnergyPlannerCoordinator) -> str | None:
     if plan is None:
         return None
     health = str(plan.health)
-    if health == str(InputHealth.HEALTHY) and _pending_hvac_restore(coordinator):
+    export = export_limit_status(coordinator)
+    export_blocked = coordinator.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True and export.get("reason")
+    if health == str(InputHealth.HEALTHY) and (
+        _pending_hvac_restore(coordinator) or export_blocked or planning_status(coordinator).get("stalled")
+    ):
         return str(InputHealth.DEGRADED)
     return health if health in {str(item) for item in InputHealth} else None
 
@@ -279,14 +285,22 @@ def _plan_health_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     pending_restore = _pending_hvac_restore(coordinator)
     if pending_restore:
         issue_codes.append("hvac_release_failed")
+    runtime = planning_status(coordinator)
+    export = export_limit_status(coordinator)
+    if runtime.get("stalled"):
+        issue_codes.append("planning_refresh_stale")
+    if coordinator.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True and export.get("reason"):
+        issue_codes.append(str(export["reason"]))
     return {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
-        "plan_status": plan.status,
+        "plan_status": "stale" if runtime.get("stalled") else plan.status,
         "mode": str(plan.mode),
         "summary": plan.summary,
         "confidence_percent": round(plan.confidence * 100, 1),
-        "issue_count": len(plan.input_issues) + bool(pending_restore),
+        "issue_count": len(plan.input_issues) + len(issue_codes) - len(plan.input_issues[:20]),
+        "planning_status": runtime,
+        "export_limit": export,
         "input_health": str(plan.health),
         "pending_hvac_restore": pending_restore,
         "issues": [{"code": issue, "description": plain_reason(issue)} for issue in issue_codes],
@@ -380,6 +394,7 @@ def _planning_duration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str,
         "teardown_skipped",
     )
     return {
+        "planning_status": planning_status(coordinator),
         "last_refresh_succeeded": latest.get("succeeded"),
         "last_completed_at": to_jsonable(latest.get("completed_at")),
         "last_trigger": metrics.get("last_trigger", latest.get("trigger")),
@@ -403,7 +418,10 @@ def _controlled_state_summary(coordinator: EnergyPlannerCoordinator) -> str:
     groups = _controlled_state_groups(coordinator)
     if not groups:
         return "No controls configured"
-    return " | ".join(f"{group['asset']}: {group['state']}" for group in groups)[:255]
+    summary = " | ".join(f"{group['asset']}: {group['state']}" for group in groups)
+    if planning_status(coordinator).get("stalled"):
+        summary = "Planning stale | " + summary
+    return summary[:255]
 
 
 def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
@@ -413,11 +431,14 @@ def _controlled_state_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, 
         "plan_id": None if plan is None else plan.plan_id,
         "plan_created_at": None if plan is None else plan.created_at.isoformat(),
         "mode": "Unknown" if plan is None else display_state(plan.mode),
-        "health": "Unknown" if plan is None else display_state(plan.health),
+        "health": "Unknown" if plan is None else display_state(_plan_health_state(coordinator)),
         "controlled_assets": _controlled_state_groups(coordinator),
     }
+    runtime = planning_status(coordinator)
+    if runtime:
+        attrs["planning_status"] = runtime
     if coordinator.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
-        attrs["export_limit"] = {} if plan is None else plan.device_plans.get("enphase_export_limit", {})
+        attrs["export_limit"] = export_limit_status(coordinator)
     if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
         attrs["climate_capability"] = _climate_capability_attrs(coordinator)
     if coordinator.entry_data.get(CONF_WEATHER):
@@ -469,6 +490,10 @@ def _controlled_state_groups(coordinator: EnergyPlannerCoordinator) -> list[dict
             state = _ev_current_charge_state(coordinator)
         else:
             state = _asset_current_state(plan, asset)
+        if asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+            reason = export_limit_status(coordinator).get("reason")
+            if reason:
+                state += f" (control blocked: {plain_reason(reason)})"
         groups.append(
             {
                 "asset": asset_name(asset),
@@ -555,15 +580,26 @@ def _next_actions_state(coordinator: EnergyPlannerCoordinator) -> str:
     plan = coordinator.data
     if plan is None:
         return "Unknown"
+    if planning_status(coordinator).get("stalled"):
+        return "Planning stale; awaiting a successful refresh"
     asset_by_name = {asset_name(asset): asset for asset in ActionAsset}
     summaries = [
-        f"{group['asset']}: {_next_asset_summary(plan, asset_by_name[group['asset']])}"
+        f"{group['asset']}: {_next_control_summary(coordinator, asset_by_name[group['asset']])}"
         for group in _controlled_state_groups(coordinator)
         if group["asset"] in asset_by_name
     ]
     if not summaries:
         return "No controls configured"
     return " | ".join(summaries)[:255]
+
+
+def _next_control_summary(coordinator: EnergyPlannerCoordinator, asset: ActionAsset) -> str:
+    if asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+        reason = export_limit_status(coordinator).get("reason")
+        if reason:
+            return f"Blocked: {plain_reason(reason)}"
+    assert coordinator.data is not None
+    return _next_asset_summary(coordinator.data, asset)
 
 
 def _next_asset_summary(plan: EnergyPlan, asset: ActionAsset) -> str:
@@ -598,7 +634,8 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
         "mode": display_state(plan.mode),
-        "health": display_state(plan.health),
+        "health": display_state(_plan_health_state(coordinator)),
+        "planning_status": planning_status(coordinator),
         "data_quality": decision_data_quality_attrs(coordinator),
         "decision_summary": audit.get("summary"),
         "policy_order": bounded_json(audit.get("policy_order", [])),
@@ -609,7 +646,7 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "ai_explanation": _ai_advice_attrs(coordinator),
     }
     if coordinator.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
-        result["export_limit"] = {} if plan is None else plan.device_plans.get("enphase_export_limit", {})
+        result["export_limit"] = export_limit_status(coordinator)
     if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
         result["climate_capability"] = _climate_capability_attrs(coordinator)
     if coordinator.entry_data.get(CONF_WEATHER):

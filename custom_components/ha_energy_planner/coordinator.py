@@ -1093,6 +1093,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def _refresh(now: Any) -> None:
             self._boundary_cancel = None
+            # Publish clock-dependent health even if a refresh is still waiting.
+            self.async_update_listeners()
             # Preserve wall-clock boundaries; only the minimum-refresh floor
             # may delay this request, not the state-change debounce.
             self._schedule_debounced_refresh("interval_boundary", debounce_seconds=0)
@@ -1109,6 +1111,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         trigger_counts[trigger] = int(trigger_counts.get(trigger, 0)) + 1
         self._refresh_trigger_counts = trigger_counts
         try:
+            if getattr(self, "entry", None) is not None:
+                await self._async_reconcile_export_limit()
             async with self._planner_lock:
                 if getattr(self, "_tearing_down", False):
                     succeeded = True
@@ -1140,6 +1144,37 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "counters": dict(getattr(self, "_refresh_counters", {})),
                 "phases": dict(getattr(self, "_last_phase_durations", {})),
             }
+
+    async def _async_reconcile_export_limit(self) -> None:
+        """Reconcile commands before acquiring the planner lock, never inside it."""
+        if getattr(self, "_tearing_down", False):
+            return
+        entry_data = self.entry_data
+        if entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+            async with self._command_lock:
+                # Configuration and feedback may have changed while waiting.
+                if getattr(self, "_tearing_down", False):
+                    return
+                entry_data = self.entry_data
+                if not entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+                    return
+                options = self.planner_options
+                now = dt_util.utcnow()
+                export_control = ExportLimitControl(self.hass, self.store, entry_data)
+                await export_control.reconcile(now)
+                if getattr(self, "_tearing_down", False):
+                    return
+                if (export_control.state.get("restoring")
+                        and not getattr(self, "_startup_auto_recovery_validation_active", False)):
+                    await export_control.restore(now)
+                elif self.active_control and options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+                    observed, export_issue = export_limit_feedback(
+                        self.hass, entry_data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY], now)
+                    if not export_control.state and export_issue == "export_limit_unsupported":
+                        await export_control.save({"identity": observed["identity"], "pause": export_issue})
+                    if not export_control.state and not export_issue and not observed["pending"]:
+                        await export_control.save({"identity": observed["identity"], "expected": {
+                            "watts": observed["watts"], "slew_rate": observed["slew_rate"]}})
 
     async def _async_update_data_locked(self, *, defer_execution: bool = False) -> EnergyPlan:
         """Refresh planner data while holding the planner lock."""
@@ -1177,21 +1212,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 await self.store.async_save_vehicle_calibration(profile["id"], updated_model)
                 self._force_next_refresh = True
         self.executor.options = options
-        if entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
-            async with self._command_lock:
-                export_control = ExportLimitControl(self.hass, self.store, entry_data)
-                await export_control.reconcile(now)
-                if (export_control.state.get("restoring")
-                        and not getattr(self, "_startup_auto_recovery_validation_active", False)):
-                    await export_control.restore(now)
-                elif self.active_control and options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
-                    observed, export_issue = export_limit_feedback(
-                        self.hass, entry_data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY], now)
-                    if not export_control.state and export_issue == "export_limit_unsupported":
-                        await export_control.save({"identity": observed["identity"], "pause": export_issue})
-                    if not export_control.state and not export_issue and not observed["pending"]:
-                        await export_control.save({"identity": observed["identity"], "expected": {
-                            "watts": observed["watts"], "slew_rate": observed["slew_rate"]}})
         force_refresh = bool(getattr(self, "_force_next_refresh", False))
         self._force_next_refresh = False
         weather_forecast, weather_forecast_details = await self._async_weather_forecast(
@@ -2018,7 +2038,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         async with self._command_lock:
             if getattr(self, "_tearing_down", False):
                 return None
-            return await self._async_set_manual_hvac_override(
+            outcome, helper_error = await self._async_set_manual_hvac_override(
                 duration_minutes,
                 reason,
                 source=source,
@@ -2026,6 +2046,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 preserve_zone_entity_id=preserve_zone_entity_id,
                 preserve_main_state=preserve_main_state,
             )
+
+        await self.async_request_refresh()
+        if helper_error is not None:
+            raise helper_error
+        return outcome
 
     async def _async_set_manual_hvac_override(
         self,
@@ -2036,8 +2061,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         expires: bool = True,
         preserve_zone_entity_id: str | None = None,
         preserve_main_state: bool = False,
-    ) -> ActionOutcome | None:
-        """Set a manual HVAC override."""
+    ) -> tuple[ActionOutcome | None, Exception | None]:
+        """Set a manual HVAC override without refreshing under command ownership."""
         getattr(self.executor, "hvac_feedback_commands", []).clear()
         self._mark_forced_refresh("manual_hvac_override")
         helper_error: Exception | None = None
@@ -2100,10 +2125,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 if preserve_main_state:
                     release_options["preserve_main_state"] = True
                 release_outcome = await release_hvac(reason, **release_options)
-        await self.async_request_refresh()
-        if helper_error is not None:
-            raise helper_error
-        return release_outcome
+        return release_outcome, helper_error
 
     async def _async_reconcile_expired_manual_hvac_state(self, expired: bool) -> None:
         """Retry helper cleanup while retaining a fail-closed override."""

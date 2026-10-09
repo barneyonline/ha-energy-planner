@@ -540,19 +540,20 @@ def test_exact_baseline_restoration(setup, baseline):
     asyncio.run(run())
 
 
-def test_manual_change_surrenders_baseline(setup):
+def test_manual_change_reconciles_automatically_with_new_baseline(setup):
     async def run():
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
         setup.states[ENTITY] = limit_state(5000)
-        assert await setup.control.reconcile(NOW) == "external_export_limit_conflict"
+        assert await setup.control.reconcile(NOW) is None
         assert "baseline" not in setup.control.state
         assert (await setup.control.restore(NOW))[2] is False
         assert len(setup.calls) == 1
-        await setup.control.resume()
-        assert not setup.control.state
+        assert "pause" not in setup.control.state
+        assert setup.control.state["expected"]["watts"] == 5000
         await setup.control.execute(action(setup), NOW)
         assert setup.control.state["baseline"]["watts"] == 5000
+        assert len(setup.calls) == 2
 
     asyncio.run(run())
 
@@ -859,6 +860,7 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             setup.mode["value"] = "pending"
             coordinator.store.async_add_outcome = setup.store.async_add_outcome
             coordinator.store.async_flush = setup.store.async_flush
+        await coordinator._async_reconcile_export_limit()
         result = await coordinator._async_update_data_locked(defer_execution=True)
         if "history_training" in coordinator.__dict__ and coordinator.history_training.task:
             await coordinator.history_training.task
@@ -1400,12 +1402,12 @@ def test_external_slew_change_during_pending_surrenders_ownership(setup):
     async def run():
         await setup.control.execute(action(setup), NOW)
         setup.states[ENTITY] = limit_state(0, slew=77)
-        assert await setup.control.reconcile(NOW) == "external_export_limit_conflict"
+        assert await setup.control.reconcile(NOW) is None
         assert "baseline" not in setup.control.state and "pending" not in setup.control.state
         assert setup.store.data["execution_audit"][-1]["result"] == "rejected"
         assert (await setup.control.restore(NOW))[0] == OutcomeResult.SKIPPED
         assert len(setup.calls) == 1
-        await setup.control.resume()
+        assert "pause" not in setup.control.state
         setup.states["sensor.export_price"] = price_state((0, 1, 1))
         await setup.control.execute(action(setup), NOW)
         assert setup.control.state["baseline"] == {"watts": 0, "slew_rate": 77}
@@ -1564,4 +1566,125 @@ def test_restoration_reports_matching_readback_and_identifies_rejected_action(se
         assert last["kind"] == "restore_export_limit" and last["service_target"] == ENTITY
         assert last["result"] == ("restored" if mode == "confirm" else "failed")
 
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("upstream_pending", [False, True])
+def test_saved_conflict_pause_recovers_only_after_settled_fresh_feedback(setup, upstream_pending):
+    async def run():
+        identity = runtime.target_identity(setup.hass, ENTITY)
+        await setup.control.save({"identity": identity, "pause": "external_export_limit_conflict"})
+        setup.states[ENTITY] = limit_state(None, pending=upstream_pending)
+        issue = await setup.control.reconcile(NOW)
+        if upstream_pending:
+            assert issue == "export_limit_pending"
+            assert not setup.calls
+            setup.states[ENTITY] = limit_state()
+            assert await setup.control.reconcile(NOW) is None
+        else:
+            assert issue is None
+        assert "pause" not in setup.control.state
+        assert setup.control.state["last_external_change"]["watts"] is None
+        await setup.control.execute(action(setup), NOW)
+        assert len(setup.calls) == 1
+    asyncio.run(run())
+
+
+def test_external_request_is_observed_without_conflict_pause_or_duplicate_command(setup):
+    async def run():
+        setup.mode["value"] = "confirm"
+        requested = action(setup)
+        await setup.control.execute(requested, NOW)
+        setup.states[ENTITY] = limit_state(0, pending=True)
+        assert await setup.control.reconcile(NOW) == "export_limit_pending"
+        assert "pause" not in setup.control.state
+        assert (await setup.control.execute(requested, NOW))[2] is False
+        assert len(setup.calls) == 1
+        setup.states[ENTITY] = limit_state()
+        assert await setup.control.reconcile(NOW) is None
+        await setup.control.execute(action(setup), NOW)
+        assert len(setup.calls) == 2
+    asyncio.run(run())
+
+
+def test_external_change_during_restoration_retires_baseline_without_key_error(setup):
+    async def run():
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(action(setup), NOW)
+        setup.states[ENTITY] = limit_state(5000, slew=77)
+        assert await setup.control.restore(NOW) == (OutcomeResult.SKIPPED, "export_limit_not_owned", False)
+        assert "baseline" not in setup.control.state
+        assert "pause" not in setup.control.state
+        assert len(setup.calls) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["rejected", "unsupported", "late_confirmation", "late_slew_change"])
+def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, failure):
+    async def run():
+        requested = action(setup)
+        if failure in {"rejected", "unsupported"}:
+            setup.mode["value"] = "confirm"
+            await setup.control.execute(action(setup), NOW)
+            if failure == "rejected":
+                setup.mode["value"] = "reject"
+                setup.states["sensor.export_price"] = price_state((0, 1, 1))
+                await setup.control.execute(action(setup), NOW)
+                reason = "export_limit_service_rejected"
+            else:
+                setup.states[ENTITY].state = "unsupported"
+                reason = "export_limit_unsupported"
+                assert await setup.control.reconcile(NOW) == reason
+            now = NOW
+            setup.states[ENTITY] = limit_state(5000, slew=77)
+        else:
+            await setup.control.execute(action(setup), NOW)
+            now = NOW + timedelta(minutes=10)
+            reason = "export_limit_unconfirmed"
+            assert await setup.control.reconcile(now) == reason
+            setup.states[ENTITY] = limit_state(0, readback=now.timestamp(),
+                                             slew=77 if failure == "late_slew_change" else 100)
+            assert await setup.control.reconcile(now) == reason
+            if failure == "late_confirmation":
+                setup.states[ENTITY] = limit_state(5000, slew=77, readback=now.timestamp())
+        assert await setup.control.reconcile(now) == reason
+        assert setup.control.state["pause"] == reason
+        assert "baseline" not in setup.control.state
+        assert "pending" not in setup.control.state
+        writes = len(setup.calls)
+        assert await setup.control.execute(requested, now) == (OutcomeResult.REJECTED, reason, False)
+        assert len(setup.calls) == writes
+        await setup.control.resume()
+        assert "pause" not in setup.control.state
+        setup.mode["value"] = "confirm"
+        setup.states["sensor.export_price"] = price_state((-1, 0, 1))
+        setup.states[ENTITY] = limit_state(5000, slew=77)
+        await setup.control.execute(action(setup), NOW)
+        assert len(setup.calls) == writes + 1
+        assert setup.control.state["baseline"] == {"watts": 5000, "slew_rate": 77}
+    asyncio.run(run())
+
+
+
+def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setup):
+    from unittest.mock import AsyncMock
+
+    from test_coordinator import _coordinator_for_runtime_services
+
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data=DATA, options={**OPTIONS, CONF_DRY_RUN: False}, hass=setup.hass,
+        )
+        coordinator.store.data = setup.store.data
+        coordinator.store.data["production"] = {"armed": True}
+        await setup.control.save({"identity": runtime.target_identity(setup.hass, ENTITY),
+                                  "pause": "external_export_limit_conflict"})
+        plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
+        coordinator._async_update_data_locked = AsyncMock(return_value=plan)
+        coordinator.async_request_refresh = coordinator._async_update_data
+        await asyncio.wait_for(coordinator.async_resume_control(asset=EXPORT_ASSET), 1)
+        await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "operator"), 1)
+        assert coordinator.last_refresh_metadata["succeeded"] is True
+        assert "pause" not in coordinator.store.data["ownership"][EXPORT_ASSET]
+        assert not setup.calls
     asyncio.run(run())
