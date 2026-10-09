@@ -104,3 +104,9 @@ def test_tests_workflow_and_unclassified_paths_fail_safe() -> None:
     assert module.select_checks([".github/workflows/ci.yml"]) == fallback_all_checks
     assert module.select_checks(["new-trigger-path.cfg"]) == fallback_all_checks
     assert module.select_checks([], force_all=True) == fallback_all_checks
+
+
+def test_test_tool_bootstrap_changes_run_all_dependent_checks() -> None:
+    module = _module()
+    for path in ("scripts/install-test-dependencies.sh", "tests/requirements.txt"):
+        assert module.select_checks([path]) == module.CheckSelection(True, True, True, True)

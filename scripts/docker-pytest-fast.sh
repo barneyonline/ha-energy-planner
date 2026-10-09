@@ -16,4 +16,4 @@ docker run --rm \
   -v "$PWD:/work" \
   -w /work \
   ghcr.io/home-assistant/home-assistant:stable \
-  python3 -m pytest "${pytest_args[@]}"
+  sh -c 'sh scripts/install-test-dependencies.sh && exec python3 -m pytest "$@"' sh "${pytest_args[@]}"

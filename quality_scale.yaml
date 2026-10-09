@@ -685,3 +685,6 @@ rules:
 # Evidence: tests/test_export_limit.py, tests/test_coordinator.py,
 # tests/test_sensor.py and tests/test_diagnostics.py; operator behavior is documented
 # in README.md and docs/requirements-audit.md. Full scripts/docker-validate.sh gate.
+# Docker runners bootstrap pinned development tools from tests/requirements.txt;
+# scripts/install-test-dependencies.sh supports production images without pytest.
+# tests/scripts/test_select_ci_checks.py keeps all dependent CI gates selected.

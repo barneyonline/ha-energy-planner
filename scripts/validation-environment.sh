@@ -8,8 +8,10 @@ docker image inspect "$HA_IMAGE" --format '{{json .}}' | python3 -c '
 import json, sys
 image=json.load(sys.stdin)
 print(json.dumps({"image_id":image["Id"], "digests":image["RepoDigests"], "labels":image["Config"]["Labels"]}, indent=2))'
-docker run --rm --entrypoint python3 "$HA_IMAGE" -c '
+docker run --rm -i -v "$PWD:/work:ro" -w /work --entrypoint sh "$HA_IMAGE" \
+  -c 'sh scripts/install-test-dependencies.sh && python3 -' <<'PY'
 import json, platform
 from importlib.metadata import version
-print(json.dumps({"python":platform.python_version(), "homeassistant":version("homeassistant"), "pytest":version("pytest"), "coverage":version("coverage")}, indent=2))'
+print(json.dumps({"python":platform.python_version(), "homeassistant":version("homeassistant"), "pytest":version("pytest"), "coverage":version("coverage")}, indent=2))
+PY
 python3 scripts/support_policy.py mypy

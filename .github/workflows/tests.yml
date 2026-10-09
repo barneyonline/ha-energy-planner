@@ -81,7 +81,8 @@ jobs:
           -v "$PWD:/work"
           -w /work
           ghcr.io/home-assistant/home-assistant:stable
-          sh -c 'python3 -m coverage run --branch -m pytest -q
+          sh -c 'sh scripts/install-test-dependencies.sh &&
+          python3 -m coverage run --branch -m pytest -q
           --durations=15
           --junitxml=junit.xml
           -o junit_family=legacy &&
@@ -139,9 +140,9 @@ jobs:
           -v "$PWD:/work"
           -w /work
           ghcr.io/home-assistant/home-assistant:stable
-          python3 -m pytest -q
+          sh -c 'sh scripts/install-test-dependencies.sh && python3 -m pytest -q
           tests/scripts/test_validate_quality_scale.py
-          tests/test_manifest.py
+          tests/test_manifest.py'
 
   validation-extras:
     needs: changes
