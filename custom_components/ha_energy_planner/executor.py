@@ -1661,9 +1661,13 @@ class Executor:
                         retained_hvac_control["required_evidence_lost"] = "hvac_release_failed"
                         remaining_ownership["hvac_control"] = retained_hvac_control
 
-            if restore_enphase and (assets is None or enphase_owned):
-                # Restore a recorded Enphase profile first; a full safe-state
-                # restore retains the existing best-effort configured fallback.
+            if restore_enphase and (
+                enphase_owned
+                or (assets is None and _device_control_disabled_reason(ActionAsset.ENPHASE, self.options) is None)
+            ):
+                # Recorded ownership still needs restoration after control is
+                # disabled. The unowned configured fallback requires profile
+                # control authority, including during startup and reloads.
                 try:
                     enphase_adapter = EnphaseProfileAdapter(self.hass, self.entry_data)
                     saved_enphase_profile = ownership.get("enphase_profile")

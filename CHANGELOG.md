@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Respect disabled Enphase Profile control during startup recovery, configuration changes and safe-state restoration. Unowned profiles remain unchanged and cannot block automatic re-arming; previously owned profile baselines still restore safely.
 
 ### 🔧 Improvements
 
