@@ -5199,6 +5199,17 @@ def test_ev_auto_start_compensation_uses_audited_stop_path() -> None:
     assert outcome.desired_state["charging_reason"] == "ev_auto_start_compensation"
 
 
+def test_auto_start_compensation_noop_does_not_report_charging_interrupted() -> None:
+    hass = FakeHass({"input_boolean.ev_charger": "off"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "input_boolean.ev_charger"})
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+    assert result.applied
+    assert not result.command_sent
+    assert hass.services.calls == []
+    assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+
+
 def test_compensated_manual_ev_stop_is_successful() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(

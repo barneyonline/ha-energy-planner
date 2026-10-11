@@ -233,6 +233,15 @@ use throughout; the Docker and pull-request gates enforce that result.
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while
   rejected or no-op starts cannot mask a later plug-in event.
+  Delayed and recovered feedback beyond that one-shot expectation is recognized
+  under the command lock only for the same owned and enabled charger, a current
+  active healthy/degraded plan charging slot, and no EV pause or plan capacity
+  issue. Ownership alone, an expired/future slot, a scheduled stop, unsafe plan,
+  or changed actuator mapping still permits compensation. Control activation
+  also preserves a just-issued owned start. No-command compensation outcomes
+  do not emit interruption alerts. Regressions in `tests/test_coordinator.py`
+  and `tests/test_executor.py` cover these paths, including repeated feedback
+  recovery without stop/start churn.
 - EV target SOC comes only from the required mapped vehicle sensor. Missing,
   unavailable, nonnumeric, or out-of-range target evidence blocks EV planning
   instead of substituting a planner-derived target. The live vehicle value is
