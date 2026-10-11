@@ -235,13 +235,17 @@ def test_manual_releases_ownership_and_invalidates_inflight_commands() -> None:
             "ev_smart_charging_state": {"switch.charger": "off"},
             "enphase_profile": "AI",
         }
+        failed_stop_limits = {"ev_safety_stop_failed_at": datetime.now(UTC)}
+        coordinator.store.data["command_rate_limits"] = dict(failed_stop_limits)
         guard = coordinator._ev_command_guard()
         await coordinator.async_select_vehicle(MANUAL)
         assert not guard()
         assert coordinator.store.data["ownership"] == {"enphase_profile": "AI"}
+        assert coordinator.store.data["command_rate_limits"] == failed_stop_limits
         assert coordinator.store.data["ev_vehicle_session"]["selection"] == MANUAL
         assert not hass.services.async_call.called
         await coordinator._async_reconcile_vehicle_ownership()
+        assert coordinator.store.data["command_rate_limits"] == failed_stop_limits
         result = await coordinator.executor.async_manual_ev_charging(True, None)
         assert not result.applied and result.reason == "ev_vehicle_policy_withheld"
         with pytest.raises(ValueError, match="Unknown vehicle"):
