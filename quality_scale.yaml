@@ -684,8 +684,9 @@ rules:
 # executor.py suppresses interruption alerts for stops without dispatch and shares
 # persisted ten-minute failure backoff across scheduled stops and auto-start
 # compensation, retaining immediate manual stops and closing backoff only on
-# confirmed safe-stop evidence. Reload and repeated-check regressions cover it.
-# Evidence: tests/test_coordinator.py and tests/test_executor.py.
+# confirmed safe-stop evidence. Vehicle policy release preserves stop backoff;
+# reload, repeated-check, and vehicle selection regressions cover these paths.
+# Evidence: tests/test_coordinator.py, tests/test_executor.py, tests/test_vehicles.py.
 # coordinator.py avoids planner/command lock inversion and refresh under command
 # ownership. Boundary callbacks publish clock-dependent status while refresh waits.
 # task_lifecycle.py drains export reconciliation before unload restoration;
