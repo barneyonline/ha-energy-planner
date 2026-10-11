@@ -681,7 +681,10 @@ rules:
 # EV auto-start feedback: coordinator.py preserves delayed/recovered feedback only
 # for current charging intent on the same owned enabled actuator, retaining pause,
 # capacity, expiry and stop checks. Activation preserves just-issued owned starts;
-# executor.py suppresses interruption alerts for stops without dispatch.
+# executor.py suppresses interruption alerts for stops without dispatch and shares
+# persisted ten-minute failure backoff across scheduled stops and auto-start
+# compensation, retaining immediate manual stops and closing backoff only on
+# confirmed safe-stop evidence. Reload and repeated-check regressions cover it.
 # Evidence: tests/test_coordinator.py and tests/test_executor.py.
 # coordinator.py avoids planner/command lock inversion and refresh under command
 # ownership. Boundary callbacks publish clock-dependent status while refresh waits.

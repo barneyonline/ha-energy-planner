@@ -226,9 +226,16 @@ use throughout; the Docker and pull-request gates enforce that result.
   through the normal confirmed and audited EV command path. The same
   compensation runs when either control is enabled while charging is already
   active, covering chargers that default to immediate charging on plug-in. A
-  failed or unconfirmed compensation remains pending and retries every 30
+  failed or unconfirmed compensation remains pending and is checked every 30
   seconds, including through temporarily unknown or unavailable charging
   feedback, until inactive charging feedback is observed or control is disabled.
+  Dispatched stop failures impose the existing persisted ten-minute EV backoff
+  on both regular schedule stops and auto-start compensation. Repeated checks
+  do not dispatch commands or consume allowance during backoff, even after
+  reload or unrelated asset pause changes. First stops and explicit manual stops
+  remain available. Confirmed safe stops acknowledge historical failures so an
+  old audit row cannot revive backoff for a new episode. Regression evidence is
+  in `tests/test_executor.py`.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while
