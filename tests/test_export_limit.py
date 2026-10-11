@@ -356,7 +356,11 @@ def test_select_resolves_only_its_matching_readback(select_setup, failure):
 
 @pytest.mark.parametrize("mapped_profile", [False, True])
 def test_select_export_only_execution_never_changes_profile(select_setup, mapped_profile):
-    from custom_components.ha_energy_planner.const import CONF_ENPHASE_CONTROL_ENABLED, CONF_ENPHASE_PROFILE
+    from custom_components.ha_energy_planner.const import (
+        CONF_ENPHASE_AI_PROFILE,
+        CONF_ENPHASE_CONTROL_ENABLED,
+        CONF_ENPHASE_PROFILE,
+    )
     from custom_components.ha_energy_planner.executor import Executor
     from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
@@ -366,7 +370,8 @@ def test_select_export_only_execution_never_changes_profile(select_setup, mapped
         mapping = dict(setup.mapping)
         if mapped_profile:
             mapping[CONF_ENPHASE_PROFILE] = "select.system_profile"
-            setup.states["select.system_profile"] = SimpleNamespace(state="AI Optimisation", attributes={})
+            mapping[CONF_ENPHASE_AI_PROFILE] = "AI Optimisation"
+            setup.states["select.system_profile"] = SimpleNamespace(state="Full Backup", attributes={})
         opts = {**OPTIONS, CONF_DRY_RUN: False, CONF_ENPHASE_CONTROL_ENABLED: False}
         setup.store.data["production"]["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(mapping, opts)
         executor = Executor(setup.store, hass=setup.hass, entry_data=mapping, options=opts)
@@ -386,10 +391,17 @@ def test_select_export_only_execution_never_changes_profile(select_setup, mapped
         assert setup.calls[-1] == ("enphase_ev", "disable_export_limit", {
             "entity_id": setup.select, "slew_rate": 100.0,
         })
-        assert all(domain == "enphase_ev" and service in {"set_export_limit", "disable_export_limit"}
-                   for domain, service, _ in setup.calls)
+        for reason in ("configuration_changed", "startup_auto_recovery", "entry_unload"):
+            restored = await executor.async_restore_safe_state(reason)
+            assert restored.result == OutcomeResult.RESTORED
+            assert "enphase_profile" not in restored.reason
+        assert all(
+            (domain == "enphase_ev" and service in {"set_export_limit", "disable_export_limit"})
+            or (domain == "persistent_notification" and service == "dismiss")
+            for domain, service, _ in setup.calls
+        )
         if mapped_profile:
-            assert setup.states["select.system_profile"].state == "AI Optimisation"
+            assert setup.states["select.system_profile"].state == "Full Backup"
 
     asyncio.run(run())
 

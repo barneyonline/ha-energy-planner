@@ -293,15 +293,16 @@ def test_enphase_rejects_missing_profile_and_unsupported_action() -> None:
 
 
 def test_enphase_restore_requires_configured_ai_profile() -> None:
-    adapter = EnphaseProfileAdapter(
-        FakeHass({"select.enphase_profile": "Full Backup"}),
-        {CONF_ENPHASE_PROFILE: "select.enphase_profile"},
-    )
+    for mapping in ({}, {CONF_ENPHASE_PROFILE: "select.enphase_profile"}):
+        hass = FakeHass({"select.enphase_profile": "Full Backup"})
+        adapter = EnphaseProfileAdapter(hass, mapping)
 
-    result = asyncio.run(adapter.async_restore_ai())
+        result = asyncio.run(adapter.async_restore_ai())
 
-    assert result.applied is False
-    assert result.reason == "enphase_ai_profile_not_configured"
+        assert result.applied is False
+        assert result.reason == "enphase_ai_profile_not_configured"
+        assert hass.services.calls == []
+        assert hass.states.values["select.enphase_profile"] == "Full Backup"
 
 
 def test_enphase_profile_requires_available_entity_and_control_service() -> None:
