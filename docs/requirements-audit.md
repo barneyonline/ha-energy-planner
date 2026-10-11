@@ -226,13 +226,31 @@ use throughout; the Docker and pull-request gates enforce that result.
   through the normal confirmed and audited EV command path. The same
   compensation runs when either control is enabled while charging is already
   active, covering chargers that default to immediate charging on plug-in. A
-  failed or unconfirmed compensation remains pending and retries every 30
+  failed or unconfirmed compensation remains pending and is checked every 30
   seconds, including through temporarily unknown or unavailable charging
   feedback, until inactive charging feedback is observed or control is disabled.
+  Dispatched stop failures impose the existing persisted ten-minute EV backoff
+  on both regular schedule stops and auto-start compensation. Repeated checks
+  do not dispatch commands or consume allowance during backoff, even after
+  reload or unrelated asset pause changes. First stops and explicit manual stops
+  remain available. Confirmed safe stops acknowledge historical failures so an
+  old audit row cannot revive backoff for a new episode. Releasing vehicle
+  policy ends planner billing exposure without confirming a stop and therefore
+  preserves failed-stop backoff. Regression evidence is in
+  `tests/test_executor.py` and `tests/test_vehicles.py`.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while
   rejected or no-op starts cannot mask a later plug-in event.
+  Delayed and recovered feedback beyond that one-shot expectation is recognized
+  under the command lock only for the same owned and enabled charger, a current
+  active healthy/degraded plan charging slot, and no EV pause or plan capacity
+  issue. Ownership alone, an expired/future slot, a scheduled stop, unsafe plan,
+  or changed actuator mapping still permits compensation. Control activation
+  also preserves a just-issued owned start. No-command compensation outcomes
+  do not emit interruption alerts. Regressions in `tests/test_coordinator.py`
+  and `tests/test_executor.py` cover these paths, including repeated feedback
+  recovery without stop/start churn.
 - EV target SOC comes only from the required mapped vehicle sensor. Missing,
   unavailable, nonnumeric, or out-of-range target evidence blocks EV planning
   instead of substituting a planner-derived target. The live vehicle value is

@@ -5199,6 +5199,17 @@ def test_ev_auto_start_compensation_uses_audited_stop_path() -> None:
     assert outcome.desired_state["charging_reason"] == "ev_auto_start_compensation"
 
 
+def test_auto_start_compensation_noop_does_not_report_charging_interrupted() -> None:
+    hass = FakeHass({"input_boolean.ev_charger": "off"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "input_boolean.ev_charger"})
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+    assert result.applied
+    assert not result.command_sent
+    assert hass.services.calls == []
+    assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+
+
 def test_compensated_manual_ev_stop_is_successful() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(
@@ -6076,6 +6087,8 @@ def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> 
 def test_regular_planner_owned_stop_requires_confirmed_safe_state(
     monkeypatch: object,
 ) -> None:
+    calls = []
+
     class SupportedDiscovery:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
@@ -6091,6 +6104,7 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
             pass
 
         async def async_execute(self, action: Any) -> Any:
+            calls.append(action)
             return SimpleNamespace(
                 applied=True,
                 reason="ev_stop_command_accepted",
@@ -6172,6 +6186,125 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
     assert store.data["outcomes"][-1].reason == "ev_stop_not_confirmed"
     assert store.data["ownership"] == ownership
     assert hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]["retain_when_unloaded"] is True
+
+    # A fresh schedule must not bypass the failure backoff just because this
+    # stop lacks the synthetic safety-stop flag.
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now + timedelta(seconds=30))
+    retry_action = replace(action, action_id="retry", plan_id="retry")
+    retry_plan = replace(plan, plan_id="retry", created_at=now + timedelta(seconds=30), actions=[retry_action])
+    asyncio.run(executor.async_evaluate(retry_plan, context))
+    assert len(calls) == 1
+    assert store.data["outcomes"][-1].reason == "ev_control_paused"
+
+
+def test_auto_start_stop_backoff_survives_reload_and_does_not_consume_attempts(monkeypatch) -> None:
+    from custom_components.ha_energy_planner.ev_adapter import EVCommandResult
+    from custom_components.ha_energy_planner.models import to_jsonable
+
+    calls = []
+
+    class FailedStopAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_set_charging(self, enabled):
+            calls.append(enabled)
+            return EVCommandResult(False, "ev_charging_confirmation_timeout", {}, {}, command_sent=True)
+
+    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedStopAdapter)
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: clock[0])
+    store = FakeStore()
+    hass = FakeHass({"switch.ev": "on"})
+    kwargs = {"hass": hass, "entry_data": {CONF_EV_CHARGER: "switch.ev"}}
+    executor = Executor(store, **kwargs)
+    assert not asyncio.run(executor.async_compensate_ev_auto_start(None)).applied
+    assert calls == [False]
+    # Restore JSON persistence and overwrite the shared pause with another
+    # asset. The EV-specific failure timestamp remains authoritative.
+    store.data = to_jsonable(store.data)
+    store.data["control_pause"] = {"active": True, "assets": ["daikin"]}
+    executor = Executor(store, **kwargs)
+    for seconds in range(30, 600, 30):
+        clock[0] = now + timedelta(seconds=seconds)
+        result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+        assert result.reason == "ev_control_paused"
+        assert not result.command_sent
+    assert calls == [False]
+    assert len(store.data["outcomes"]) == 1
+    # Explicit operator stops retain immediate authority during automatic backoff.
+    asyncio.run(executor.async_manual_ev_charging(False, None))
+    assert calls == [False, False]
+    clock[0] = now + timedelta(minutes=10)
+    asyncio.run(executor.async_compensate_ev_auto_start(None))
+    assert calls == [False, False, False]
+
+
+@pytest.mark.parametrize("confirmed_age", [-1, 0, 1, 6])
+def test_confirmed_safe_stop_closes_backoff_without_historical_revival(monkeypatch, confirmed_age) -> None:
+    now = datetime.now(UTC)
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now)
+    failure = now - timedelta(minutes=5)
+    audit = [{"asset": "ev", "kind": "ev_stop", "result": "failed", "attempted_at": failure,
+              "desired_state": {"ev_safety_stop": True}}]
+    confirmed = (now - timedelta(minutes=confirmed_age)).replace(tzinfo=None)
+    limits = {"ev_safety_stop_failed_at": failure, "ev_safe_stop_confirmed_at": confirmed}
+    assert _ev_safety_stop_backoff_active(audit, now, limits=limits) is (confirmed_age in {-1, 6})
+    store = FakeStore()
+    store.data["execution_audit"] = audit
+    store.data["command_rate_limits"] = limits
+    executor = Executor(store, hass=FakeHass({"switch.ev": "on"}), entry_data={CONF_EV_CHARGER: "switch.ev"})
+    assert asyncio.run(executor.async_manual_ev_charging(False, None)).applied
+    assert not _ev_safety_stop_backoff_active(audit, now, limits=store.data["command_rate_limits"])
+    assert "ev_safety_stop_failed_at" not in store.data["command_rate_limits"]
+    acknowledged = dict(store.data["command_rate_limits"])
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now + timedelta(minutes=1))
+    asyncio.run(executor._async_end_ev_exposure(safe_stop_confirmed=True))
+    assert store.data["command_rate_limits"] == acknowledged
+
+
+def test_unowned_scheduled_stop_retry_honors_persisted_failure_backoff() -> None:
+    now = datetime.now(UTC)
+    store = FakeStore()
+    store.data["command_rate_limits"] = {"ev_safety_stop_failed_at": now}
+    executor = Executor(store, options={CONF_EV_CONTROL_ENABLED: True})
+    for kind in [ActionKind.EV_STOP, ActionKind.EV_SCHEDULE]:
+        action = SimpleNamespace(asset=ActionAsset.EV, kind=kind, desired_state={"charging_required_now": False})
+        assert executor._control_rejection_reason(action, now) == "ev_control_paused"
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_releasing_ev_policy_preserves_unconfirmed_stop_backoff(monkeypatch, persisted) -> None:
+    class StoreWithTelemetry(FakeStore):
+        async def async_save_ev_telemetry(self, telemetry):
+            self.data["ev_telemetry"] = telemetry
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now)
+    failure = now - timedelta(minutes=1)
+    store = StoreWithTelemetry()
+    store.data["execution_audit"] = [{
+        "asset": "ev", "kind": "ev_stop", "result": "failed", "attempted_at": failure,
+        "desired_state": {"ev_safety_stop": True},
+    }]
+    limits = {"ev_safety_stop_failed_at": failure} if persisted else {}
+    store.data["command_rate_limits"] = dict(limits)
+    store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
+    store.data["ev_telemetry"] = {"command_exposure": {"at": failure.isoformat(), "cost_per_hour": 1}}
+    hass = FakeHass({"switch.ev": "on"})
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev"})
+
+    asyncio.run(executor.async_release_ev_policy())
+
+    assert store.data["ownership"] == {}
+    assert "command_exposure" not in store.data["ev_telemetry"]
+    assert hass.services.calls == []
+    assert store.data["command_rate_limits"] == limits
+    assert _ev_safety_stop_backoff_active(store.data["execution_audit"], now, limits=limits)
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+    assert result.reason == "ev_control_paused"
+    assert not result.command_sent
 
 
 def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:

@@ -109,9 +109,10 @@ from .enphase_export_limit import feedback_entity_id as export_limit_feedback_en
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
+from .ev_control import _ev_action_wants_power
 from .ev_runtime import audit_evidence
 from .ev_telemetry import sample_ev, update_ev_telemetry
-from .executor import PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor
+from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
 from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .inputs import InputManager
@@ -2445,10 +2446,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return None
             if charging_active is not True and not compensation_pending:
                 return None
-            if require_unowned and _ev_start_feedback_is_expected(
-                getattr(self, "executor", None),
-                dt_util.utcnow(),
-            ):
+            now = dt_util.utcnow()
+            owned_state = self.store.data.get("ownership", {}).get("ev_smart_charging_state")
+            if (
+                (require_unowned or bool(owned_state))
+                and _ev_start_feedback_is_expected(getattr(self, "executor", None), now)
+            ) or self._ev_charging_matches_owned_plan(now):
                 self._clear_ev_auto_start_compensation()
                 return None
             if self.store.data.get("ownership", {}).get("ev_smart_charging_state") and any(
@@ -2475,6 +2478,34 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._mark_forced_refresh("ev_auto_start_compensation")
             await self.async_request_refresh()
         return result
+
+    def _ev_charging_matches_owned_plan(self, now: datetime) -> bool:
+        """Recognize delayed/recovered feedback for current owned charging intent."""
+        ownership = self.store.data.get("ownership", {})
+        if not ownership.get("ev_smart_charging_state"):
+            return False
+        if ownership.get("ev_smart_charging_control_topology") != _ev_control_topology(self.entry_data):
+            return False
+        charger_entity = self.entry_data.get(CONF_EV_CHARGER)
+        charger_state = self.hass.states.get(charger_entity) if charger_entity else None
+        if charger_state is None or ev_charging_state(charger_state.state) is not True:
+            return False
+        plan = getattr(self, "data", None)
+        if not isinstance(plan, EnergyPlan) or plan.health not in {InputHealth.HEALTHY, InputHealth.DEGRADED}:
+            return False
+        if plan.mode not in {PlannerMode.ACTIVE_HEALTHY, PlannerMode.ACTIVE_DEGRADED, PlannerMode.MANUAL_HVAC_OVERRIDE}:
+            return False
+        if set(plan.input_issues) & _EV_SAFETY_PLAN_ISSUES:
+            return False
+        if control_pause_reason(self.store.data.get("control_pause"), now, asset="ev") is not None:
+            return False
+        # Ownership alone can survive a disconnect or an unconfirmed stop.
+        # Require the committed slot to still request power from this actuator.
+        return any(
+            action.asset == ActionAsset.EV and _ev_action_wants_power(action)
+            and action.execute_not_before <= now < action.execute_not_after
+            for action in plan.actions
+        )
 
     @callback
     def _schedule_ev_auto_start_compensation_retry(self) -> None:
