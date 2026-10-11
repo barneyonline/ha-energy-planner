@@ -443,7 +443,7 @@ class Executor:
             self._reconcile_ev_start_feedback_expectation(result)
         if not enabled:
             if _ev_result_proves_safe(result):
-                await self._async_end_ev_exposure()
+                await self._async_end_ev_exposure(safe_stop_confirmed=True)
             result = _normalized_ev_stop_result(
                 result,
                 require_safe=owned_manual_stop,
@@ -474,7 +474,7 @@ class Executor:
             )
             await self.store.async_save_ownership(ownership)
         elif not enabled and _ev_result_proves_safe(result) and result.applied:
-            await self._async_end_ev_exposure()
+            await self._async_end_ev_exposure(safe_stop_confirmed=True)
             ownership = dict(self.store.data.get("ownership", {}))
             ownership.pop("ev_smart_charging_state", None)
             ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
@@ -841,7 +841,7 @@ class Executor:
             no_change = ev_result.reason == "already_in_desired_state"
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             if not _ev_action_wants_power(action) and safe_stop_confirmed:
-                await self._async_end_ev_exposure()
+                await self._async_end_ev_exposure(safe_stop_confirmed=True)
 
             stored_ownership = self.store.data.get("ownership")
             planner_owned_stop = bool(
@@ -1538,7 +1538,7 @@ class Executor:
                     results.append(ev_result)
                     reasons.append(ev_result.reason)
                     if _ev_result_proves_safe(ev_result):
-                        await self._async_end_ev_exposure()
+                        await self._async_end_ev_exposure(safe_stop_confirmed=True)
                     if ev_result.applied:
                         remaining_ownership.pop("ev_smart_charging_state", None)
                         remaining_ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
@@ -2314,10 +2314,12 @@ class Executor:
             reservations[self.entry_id]["pending_power_limit"] = pending
         return result
 
-    async def _async_end_ev_exposure(self) -> None:
+    async def _async_end_ev_exposure(self, *, safe_stop_confirmed: bool = False) -> None:
         limits = dict(self.store.data.get("command_rate_limits", {}))
-        if _EV_SAFETY_STOP_FAILED_AT_KEY in limits or _ev_safety_stop_backoff_active(
-            self.store.data.get("execution_audit"), dt_util.utcnow(), limits=limits,
+        if safe_stop_confirmed and (
+            _EV_SAFETY_STOP_FAILED_AT_KEY in limits or _ev_safety_stop_backoff_active(
+                self.store.data.get("execution_audit"), dt_util.utcnow(), limits=limits,
+            )
         ):
             # A proven safe stop closes the failed command episode. Retain an
             # acknowledgement so historical audit failures cannot revive it.

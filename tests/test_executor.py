@@ -6260,7 +6260,7 @@ def test_confirmed_safe_stop_closes_backoff_without_historical_revival(monkeypat
     assert "ev_safety_stop_failed_at" not in store.data["command_rate_limits"]
     acknowledged = dict(store.data["command_rate_limits"])
     monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now + timedelta(minutes=1))
-    asyncio.run(executor._async_end_ev_exposure())
+    asyncio.run(executor._async_end_ev_exposure(safe_stop_confirmed=True))
     assert store.data["command_rate_limits"] == acknowledged
 
 
@@ -6272,6 +6272,39 @@ def test_unowned_scheduled_stop_retry_honors_persisted_failure_backoff() -> None
     for kind in [ActionKind.EV_STOP, ActionKind.EV_SCHEDULE]:
         action = SimpleNamespace(asset=ActionAsset.EV, kind=kind, desired_state={"charging_required_now": False})
         assert executor._control_rejection_reason(action, now) == "ev_control_paused"
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_releasing_ev_policy_preserves_unconfirmed_stop_backoff(monkeypatch, persisted) -> None:
+    class StoreWithTelemetry(FakeStore):
+        async def async_save_ev_telemetry(self, telemetry):
+            self.data["ev_telemetry"] = telemetry
+
+    now = datetime.now(UTC)
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now)
+    failure = now - timedelta(minutes=1)
+    store = StoreWithTelemetry()
+    store.data["execution_audit"] = [{
+        "asset": "ev", "kind": "ev_stop", "result": "failed", "attempted_at": failure,
+        "desired_state": {"ev_safety_stop": True},
+    }]
+    limits = {"ev_safety_stop_failed_at": failure} if persisted else {}
+    store.data["command_rate_limits"] = dict(limits)
+    store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
+    store.data["ev_telemetry"] = {"command_exposure": {"at": failure.isoformat(), "cost_per_hour": 1}}
+    hass = FakeHass({"switch.ev": "on"})
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev"})
+
+    asyncio.run(executor.async_release_ev_policy())
+
+    assert store.data["ownership"] == {}
+    assert "command_exposure" not in store.data["ev_telemetry"]
+    assert hass.services.calls == []
+    assert store.data["command_rate_limits"] == limits
+    assert _ev_safety_stop_backoff_active(store.data["execution_audit"], now, limits=limits)
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+    assert result.reason == "ev_control_paused"
+    assert not result.command_sent
 
 
 def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:

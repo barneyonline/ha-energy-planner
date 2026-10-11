@@ -234,8 +234,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   do not dispatch commands or consume allowance during backoff, even after
   reload or unrelated asset pause changes. First stops and explicit manual stops
   remain available. Confirmed safe stops acknowledge historical failures so an
-  old audit row cannot revive backoff for a new episode. Regression evidence is
-  in `tests/test_executor.py`.
+  old audit row cannot revive backoff for a new episode. Releasing vehicle
+  policy ends planner billing exposure without confirming a stop and therefore
+  preserves failed-stop backoff. Regression evidence is in
+  `tests/test_executor.py` and `tests/test_vehicles.py`.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while
