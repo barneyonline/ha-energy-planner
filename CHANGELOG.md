@@ -12,7 +12,31 @@
 
 ### 🐛 Bug fixes
 
-- Respect disabled Enphase Profile control during startup recovery, configuration changes and safe-state restoration. Unowned profiles remain unchanged and cannot block automatic re-arming; previously owned profile baselines still restore safely.
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.3.3 - 2026-10-11
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Preserve planner-owned EV charging when delayed or recovered charger feedback matches the current active plan. Protect newly issued starts during activation and only report interruptions when a stop command was dispatched. ([#110](https://github.com/barneyonline/ha-energy-planner/pull/110))
+- Apply the persisted ten-minute failed-stop backoff to automatic scheduled EV stops and auto-start compensation, including across refreshes, reloads and vehicle policy changes. Explicit manual stops remain available; checks that dispatch no command consume no action allowance. ([#110](https://github.com/barneyonline/ha-energy-planner/pull/110))
+- Respect disabled Enphase Profile control during startup recovery, configuration changes and safe-state restoration. Unowned profiles remain unchanged and cannot block automatic re-arming; previously owned profile baselines still restore safely. ([#111](https://github.com/barneyonline/ha-energy-planner/pull/111))
 
 ### 🔧 Improvements
 
