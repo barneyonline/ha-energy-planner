@@ -688,7 +688,9 @@ def test_recovered_restore_cancels_deferred_startup_notification(monkeypatch: ob
     assert all(call[1] != "create" for call in hass.services.calls)
 
 
-def test_restore_safe_state_attempts_configured_enphase_without_ownership() -> None:
+@pytest.mark.parametrize("profile_control", [False, True, None])
+@pytest.mark.parametrize("reason", ["manual", "configuration_changed", "startup_auto_recovery", "entry_unload"])
+def test_restore_safe_state_respects_unowned_enphase_control(profile_control: bool | None, reason: str) -> None:
     store = FakeStore()
     hass = FakeHass({"select.enphase": "Self Consumption"})
     executor = Executor(
@@ -698,19 +700,41 @@ def test_restore_safe_state_attempts_configured_enphase_without_ownership() -> N
             CONF_ENPHASE_PROFILE: "select.enphase",
             CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
         },
+        options={} if profile_control is None else {CONF_ENPHASE_CONTROL_ENABLED: profile_control},
     )
 
-    outcome = asyncio.run(executor.async_restore_safe_state("manual"))
+    outcome = asyncio.run(executor.async_restore_safe_state(reason))
 
     assert outcome.result == "restored"
-    assert outcome.reason == "manual:enphase_profile_applied"
+    assert outcome.reason == (f"{reason}:enphase_profile_applied" if profile_control else reason)
     assert outcome.post_state["ownership"] == "cleared"
-    assert hass.states.values["select.enphase"] == "AI Optimisation"
-    assert hass.services.calls[0] == (
-        "select",
-        "select_option",
-        {"entity_id": "select.enphase", "option": "AI Optimisation"},
+    assert hass.states.values["select.enphase"] == ("AI Optimisation" if profile_control else "Self Consumption")
+    profile_calls = [call for call in hass.services.calls if call[0] == "select"]
+    assert profile_calls == ([(
+        "select", "select_option", {"entity_id": "select.enphase", "option": "AI Optimisation"},
+    )] if profile_control else [])
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_disabled_profile_control_still_restores_owned_baseline(available: bool) -> None:
+    store = FakeStore()
+    baseline = {"enphase_profile": "Custom Baseline"}
+    store.data["ownership"] = dict(baseline)
+    hass = FakeHass({"select.enphase": "Full Backup"} if available else {})
+    executor = Executor(
+        store, hass=hass,
+        entry_data={CONF_ENPHASE_PROFILE: "select.enphase", CONF_ENPHASE_AI_PROFILE: "AI Optimisation"},
+        options={CONF_ENPHASE_CONTROL_ENABLED: False},
     )
+
+    outcome = asyncio.run(executor.async_restore_safe_state("startup_auto_recovery"))
+
+    assert outcome.result == (OutcomeResult.RESTORED if available else OutcomeResult.FAILED)
+    assert store.data["ownership"] == ({} if available else baseline)
+    if available:
+        assert hass.states.values["select.enphase"] == "Custom Baseline"
+    else:
+        assert "enphase_profile_entity_unavailable" in outcome.reason
 
 
 @pytest.mark.parametrize(
@@ -725,6 +749,7 @@ def test_restore_safe_state_ignores_unavailable_unowned_enphase_fallback(
     executor = Executor(
         store,
         hass=hass,
+        options={CONF_ENPHASE_CONTROL_ENABLED: True},
         entry_data={
             CONF_ENPHASE_PROFILE: "select.enphase",
             CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
@@ -778,7 +803,8 @@ def test_manual_restore_fails_for_unowned_enphase_fallback_failure(
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FailedEnphaseAdapter)
     hass = FakeHass()
 
-    outcome = asyncio.run(Executor(FakeStore(), hass=hass).async_restore_safe_state("manual_service_call"))
+    executor = Executor(FakeStore(), hass=hass, options={CONF_ENPHASE_CONTROL_ENABLED: True})
+    outcome = asyncio.run(executor.async_restore_safe_state("manual_service_call"))
 
     assert outcome.result == OutcomeResult.FAILED
     assert outcome.reason == "manual_service_call:enphase_profile_service_failed"
@@ -797,7 +823,8 @@ def test_unowned_enphase_fallback_exception_remains_a_restore_failure(
 
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", RaisingEnphaseAdapter)
 
-    outcome = asyncio.run(Executor(FakeStore(), hass=FakeHass()).async_restore_safe_state("manual_service_call"))
+    executor = Executor(FakeStore(), hass=FakeHass(), options={CONF_ENPHASE_CONTROL_ENABLED: True})
+    outcome = asyncio.run(executor.async_restore_safe_state("manual_service_call"))
 
     assert outcome.result == OutcomeResult.FAILED
     assert outcome.reason == "manual_service_call:enphase_restore_exception"
@@ -4428,7 +4455,7 @@ def test_executor_restore_retains_unconfirmed_reservation_only_ev_load() -> None
     outcome = asyncio.run(executor.async_restore_safe_state("entry_unload"))
 
     assert outcome.result == OutcomeResult.FAILED
-    assert outcome.reason == ("entry_unload:ev_control_unavailable:enphase_ai_profile_not_configured")
+    assert outcome.reason == ("entry_unload:ev_control_unavailable")
     assert all(call[0] != "button" for call in hass.services.calls)
     assert all(call[2].get("entity_id") != "switch.new_charger" for call in hass.services.calls)
     retained = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
@@ -4516,7 +4543,7 @@ def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch
     outcome = asyncio.run(Executor(store, hass=FakeHass()).async_restore_safe_state("manual"))
 
     assert outcome.result == "failed"
-    assert outcome.reason == "manual:ev_restore_exception:hvac_restored:enphase_ai_profile_not_configured"
+    assert outcome.reason == "manual:ev_restore_exception:hvac_restored"
     assert outcome.post_state["automation.hvac"] == "on"
     assert outcome.post_state["ownership"] == "partially_cleared"
     assert store.data["ownership"] == {"ev_smart_charging_state": {"switch.ev": "on"}}

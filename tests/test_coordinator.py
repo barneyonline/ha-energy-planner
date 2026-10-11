@@ -7171,6 +7171,46 @@ def test_startup_safe_recovery_rearms_after_one_awaited_safe_check(
     assert coordinator.executor.startup_recovery_dismissals == 1
 
 
+def test_startup_recovery_rearms_with_disabled_unowned_profile(monkeypatch: object) -> None:
+    from test_executor import FakeHass as ExecutorHass
+    from test_executor import FakeStore as ExecutorStore
+
+    from custom_components.ha_energy_planner.const import CONF_ENPHASE_AI_PROFILE
+    from custom_components.ha_energy_planner.executor import Executor
+
+    coordinator = _startup_recovery_test_coordinator()
+    coordinator.options[CONF_ENPHASE_CONTROL_ENABLED] = False
+    coordinator.entry_data.update({
+        CONF_ENPHASE_PROFILE: "select.enphase",
+        CONF_ENPHASE_AI_PROFILE: "AI Optimisation",
+    })
+    # Exercise the real restoration boundary: an unavailable mapped profile
+    # must not prevent an otherwise qualified recovery from re-arming.
+    hass = ExecutorHass()
+    executor = Executor(
+        ExecutorStore(), hass=hass, entry_data=coordinator.entry_data, options=coordinator.options,
+    )
+
+    async def restore(reason: str, **kwargs: object) -> object:
+        return await executor.async_restore_safe_state(reason)
+
+    coordinator.async_restore_safe_state = AsyncMock(side_effect=restore)
+    coordinator._async_run_startup_auto_recovery_validation = AsyncMock(return_value=(True, "validation_succeeded"))
+    coordinator.async_refresh = AsyncMock()
+    for module in (coordinator_module, startup_recovery_module):
+        monkeypatch.setattr(module, "build_preflight_report", lambda hass, item: _startup_recovery_report(item))
+    monkeypatch.setattr(startup_recovery_module, "STARTUP_AUTO_RECOVERY_VALIDATION_INTERVAL_SECONDS", 0)
+
+    asyncio.run(coordinator._async_retry_startup_safe_recovery())
+
+    assert coordinator.store.data["production"]["armed"] is True
+    assert coordinator.store.data["production"]["startup_auto_recovery"]["status"] == "recovered"
+    coordinator.async_restore_safe_state.assert_awaited_once_with("startup_auto_recovery", refresh=False)
+    assert all(
+        domain == "persistent_notification" and service == "dismiss" for domain, service, _ in hass.services.calls
+    )
+
+
 def test_startup_safe_recovery_retries_unsafe_before_rearming(
     monkeypatch: object,
 ) -> None:
