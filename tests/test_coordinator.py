@@ -5475,6 +5475,114 @@ def test_ev_auto_start_compensation_preserves_expected_start_feedback() -> None:
     assert coordinator.refresh_requested == 0
 
 
+def _owned_charging_coordinator(now: datetime) -> EnergyPlannerCoordinator:
+    mapping = {CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.ev_charging"}
+    coordinator = _coordinator_for_runtime_services(
+        entry_data=mapping,
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, CONF_EV_CONTROL_ENABLED: True},
+        hass=FakeHass({"switch.ev": "on", "sensor.ev_charging": "charging"}),
+        store_data={"production": {"armed": True}, "ownership": {
+            "ev_smart_charging_state": {CONF_EV_CHARGER: "off"},
+            "ev_smart_charging_control_topology": dict(mapping),
+        }},
+    )
+    coordinator.data = replace(_plan("owned"), created_at=now, actions=[PlanAction(
+        "charge", "owned", now - timedelta(minutes=4), now + timedelta(minutes=1),
+        ActionAsset.EV, ActionKind.EV_SCHEDULE, {"charging_required_now": True}, [], [], 0, 1,
+    )])
+    coordinator.async_update_listeners = lambda: None
+    return coordinator
+
+
+@pytest.mark.parametrize("require_unowned", [False, True])
+@pytest.mark.parametrize("expected", ["expired", "consumed", "fresh"])
+def test_auto_start_compensation_preserves_current_owned_charging(require_unowned, expected) -> None:
+    now = dt_util.utcnow()
+    coordinator = _owned_charging_coordinator(now)
+    coordinator.executor.ev_start_feedback_expected_until = (
+        None if expected == "consumed" else now + timedelta(minutes=1 if expected == "fresh" else -1)
+    )
+    coordinator._ev_auto_start_compensation_pending = True
+    cancelled = []
+    coordinator._ev_auto_start_retry_cancel = lambda: cancelled.append(True)
+
+    assert asyncio.run(coordinator._async_compensate_ev_auto_start(require_unowned=require_unowned)) is None
+    assert coordinator.executor.ev_auto_start_compensations == []
+    assert not coordinator._ev_auto_start_compensation_pending
+    assert cancelled == [True]
+
+
+@pytest.mark.parametrize("blocked", [
+    "no_ownership", "other_topology", "off", "unknown", "missing_charger", "no_charger_mapping",
+    "no_plan", "unsafe", "disabled", "paused", "capacity_issue", "stop", "idle_schedule",
+    "expired", "future", "other_asset",
+])
+def test_auto_start_compensation_requires_current_owned_intent(blocked) -> None:
+    now = dt_util.utcnow()
+    coordinator = _owned_charging_coordinator(now)
+    plan = coordinator.data
+    action = plan.actions[0]
+    if blocked == "no_ownership":
+        coordinator.store.data["ownership"] = {}
+    elif blocked == "other_topology":
+        coordinator.store.data["ownership"]["ev_smart_charging_control_topology"] = {CONF_EV_CHARGER: "switch.old"}
+    elif blocked in {"off", "unknown", "missing_charger"}:
+        coordinator.hass.states.values["switch.ev"] = None if blocked == "missing_charger" else blocked
+    elif blocked == "no_charger_mapping":
+        coordinator.entry.data.pop(CONF_EV_CHARGER)
+        coordinator.store.data["ownership"]["ev_smart_charging_control_topology"].pop(CONF_EV_CHARGER)
+    elif blocked == "no_plan":
+        coordinator.data = None
+    elif blocked == "unsafe":
+        plan.health = InputHealth.UNSAFE
+    elif blocked == "disabled":
+        plan.mode = PlannerMode.DISABLED
+    elif blocked == "paused":
+        coordinator.store.data["control_pause"] = {"active": True, "assets": ["ev"]}
+    elif blocked == "capacity_issue":
+        plan.input_issues = ["grid_import_limit_exceeded"]
+    elif blocked == "stop":
+        action.kind = ActionKind.EV_STOP
+    elif blocked == "idle_schedule":
+        action.desired_state["charging_required_now"] = False
+    elif blocked == "expired":
+        action.execute_not_after = now
+    elif blocked == "future":
+        action.execute_not_before = now + timedelta(minutes=1)
+    elif blocked == "other_asset":
+        action.asset = ActionAsset.DAIKIN
+    assert asyncio.run(coordinator._async_compensate_ev_auto_start(require_unowned=True)).applied
+    assert len(coordinator.executor.ev_auto_start_compensations) == 1
+
+
+def test_recovered_charging_feedback_does_not_stop_owned_current_charge(monkeypatch) -> None:
+    async def run():
+        callbacks = []
+        monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                            lambda hass, ids, callback: callbacks.append(callback) or (lambda: None))
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, callback: lambda: None)
+        coordinator = _owned_charging_coordinator(dt_util.utcnow())
+        tasks = []
+        coordinator._async_create_listener_task = lambda coro: tasks.append(asyncio.create_task(coro))
+        coordinator.async_start_listeners()
+        await asyncio.gather(*tasks)
+        for old in ["unavailable", "unknown", "connected"]:
+            callbacks[0](FakeEvent("sensor.ev_charging", old, "charging"))
+            await asyncio.gather(*tasks)
+        assert coordinator.executor.ev_auto_start_compensations == []
+        assert coordinator.refresh_requested == 0
+    asyncio.run(run())
+
+
+def test_control_activation_preserves_just_issued_owned_start_without_committed_plan() -> None:
+    now = dt_util.utcnow()
+    coordinator = _owned_charging_coordinator(now)
+    coordinator.data = None
+    coordinator.executor.ev_start_feedback_expected_until = now + timedelta(minutes=1)
+    assert asyncio.run(coordinator._async_compensate_ev_auto_start(require_unowned=False)) is None
+    assert coordinator.executor.ev_auto_start_compensations == []
+
+
 @pytest.mark.parametrize("running", [False, True])
 def test_manual_hvac_override_replaces_existing_override_and_turns_on_helper(running: bool) -> None:
     coordinator = _coordinator_for_runtime_services(

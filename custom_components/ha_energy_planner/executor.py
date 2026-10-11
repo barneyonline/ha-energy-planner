@@ -475,7 +475,7 @@ class Executor:
             await self._async_clear_provisional_ev_ownership()
         if enabled and result.applied:
             await self._async_dismiss_plan_fallback_notification(self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID))
-        if action_id == "ev_auto_start_compensation" and result.applied:
+        if action_id == "ev_auto_start_compensation" and result.applied and result.command_sent:
             await self._async_notify_ev_interrupted("ev_auto_start_compensation")
         await self._async_record_manual_ev_outcome(
             action,
