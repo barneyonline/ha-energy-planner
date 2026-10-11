@@ -112,6 +112,7 @@ _MISSING = object()
 _EV_COMMAND_ENTITY_OWNERSHIP_KEY = "ev_smart_charging_command_entity_id"
 _EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY = "ev_smart_charging_control_topology"
 _EV_SAFETY_STOP_FAILED_AT_KEY = "ev_safety_stop_failed_at"
+_EV_SAFE_STOP_CONFIRMED_AT_KEY = "ev_safe_stop_confirmed_at"
 _EV_SAFETY_STOP_BLOCKED_UNTIL_KEY = "ev_safety_stop_blocked_until"
 _EV_GRID_SHEDDING_CLAIM_KEY = "ev_grid_shedding_entry_id"
 _HVAC_MAIN_STATE_OWNERSHIP_KEY = "main_state"
@@ -228,6 +229,12 @@ class Executor:
         context: DecisionContext | None,
     ) -> EVCommandResult:
         """Stop an unsolicited charger auto-start through the audited EV path."""
+        if _ev_safety_stop_backoff_active(
+            self.store.data.get("execution_audit"),
+            dt_util.utcnow(),
+            limits=self.store.data.get("command_rate_limits"),
+        ):
+            return EVCommandResult(False, "ev_control_paused", {}, {})
         return await self._async_set_ev_charging(
             False,
             context,
@@ -446,6 +453,8 @@ class Executor:
         if result.command_sent:
             await self._async_record_command_attempt(action, now)
         if not result.applied:
+            if action_id == "ev_auto_start_compensation" and result.command_sent:
+                await self._async_record_ev_safety_stop_failure(now, retry_limit_reached=False)
             await self._async_pause_asset_control(
                 ActionAsset.EV,
                 now,
@@ -875,7 +884,7 @@ class Executor:
                     now,
                     additional_failures=1,
                 )
-                if planner_owned_stop:
+                if planner_owned_stop or (safety_ev_stop and ev_result.command_sent):
                     await self._async_record_ev_safety_stop_failure(
                         now,
                         retry_limit_reached=retry_limit_reached,
@@ -1834,7 +1843,7 @@ class Executor:
             )
         ):
             return "ev_safety_stop_retry_limit_reached"
-        if owned_safety_stop and _ev_safety_stop_backoff_active(
+        if safety_ev_stop and _ev_safety_stop_backoff_active(
             self.store.data.get("execution_audit"),
             now,
             limits=self.store.data.get("command_rate_limits"),
@@ -2306,6 +2315,15 @@ class Executor:
         return result
 
     async def _async_end_ev_exposure(self) -> None:
+        limits = dict(self.store.data.get("command_rate_limits", {}))
+        if _EV_SAFETY_STOP_FAILED_AT_KEY in limits or _ev_safety_stop_backoff_active(
+            self.store.data.get("execution_audit"), dt_util.utcnow(), limits=limits,
+        ):
+            # A proven safe stop closes the failed command episode. Retain an
+            # acknowledgement so historical audit failures cannot revive it.
+            limits.pop(_EV_SAFETY_STOP_FAILED_AT_KEY, None)
+            limits[_EV_SAFE_STOP_CONFIRMED_AT_KEY] = dt_util.utcnow()
+            await self.store.async_save_command_rate_limits(limits)
         if callable(self.ev_allocation_deadline_callback):
             self.ev_allocation_deadline_callback(None)
         telemetry = self.store.data.get("ev_telemetry", {})
@@ -2997,6 +3015,13 @@ def _ev_safety_stop_backoff_active(
     normalized_failure = (
         latest_failure.replace(tzinfo=UTC) if latest_failure.tzinfo is None else latest_failure.astimezone(UTC)
     )
+    confirmed_at = (
+        _parse_datetime_or_none(limits.get(_EV_SAFE_STOP_CONFIRMED_AT_KEY)) if isinstance(limits, dict) else None
+    )
+    if confirmed_at is not None:
+        normalized_confirmed = confirmed_at.replace(tzinfo=UTC) if confirmed_at.tzinfo is None else confirmed_at
+        if normalized_failure <= normalized_confirmed <= normalized_now:
+            return False
     return normalized_now < normalized_failure + ACTION_BACKOFF_DURATION
 
 
