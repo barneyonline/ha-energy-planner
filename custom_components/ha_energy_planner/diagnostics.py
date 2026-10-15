@@ -280,6 +280,7 @@ def _store_summary(store_data: dict[str, Any]) -> dict[str, Any]:
         ),
         "discovery": store_data.get("discovery", {}),
         "ownership": store_data.get("ownership", {}),
+        "restore_notification_failures": store_data.get("restore_notification_failures", {}),
         "production": store_data.get("production", {}),
         "control_pause": control_pause_status(
             store_data.get("control_pause", {}),

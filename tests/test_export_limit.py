@@ -6,6 +6,7 @@ import asyncio
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -88,6 +89,9 @@ class Store:
         self.data = {"ownership": {}, "production": {"armed": True, "dry_run_ready_cycles": 3}, "execution_audit": []}
         self.flushes = 0
         self.fail = False
+
+    async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
+        self.data["restore_notification_failures"] = failures
 
     async def async_save_ownership(self, value):
         self.data["ownership"] = deepcopy(value)
@@ -1699,4 +1703,33 @@ def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setu
         assert coordinator.last_refresh_metadata["succeeded"] is True
         assert "pause" not in coordinator.store.data["ownership"][EXPORT_ASSET]
         assert not setup.calls
+    asyncio.run(run())
+
+
+def test_export_restore_readback_clears_previously_failed_restore_alert(setup):
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    async def run():
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(action(setup), NOW)
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        owner.executor = Executor(setup.store, hass=setup.hass, entry_data=DATA, options=OPTIONS, entry_id="entry-a")
+        await owner.executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="export_limit_unconfirmed"), scope=EXPORT_ASSET,
+        )
+        setup.mode["value"] = "pending"
+        outcome = await owner.executor.async_restore_device_control(EXPORT_ASSET, "retry")
+        assert outcome.result == OutcomeResult.PENDING
+        assert setup.store.data["restore_notification_failures"] == {EXPORT_ASSET: [EXPORT_ASSET]}
+        setup.calls.clear()
+        setup.states[ENTITY] = limit_state(None)
+        await owner._async_reconcile_export_limit()
+        assert setup.store.data["restore_notification_failures"] == {}
+        assert ("persistent_notification", "dismiss", {
+            "notification_id": "ha_energy_planner_restore_safe_state_enphase_export_limit_entry-a",
+        }) in setup.calls
+
     asyncio.run(run())

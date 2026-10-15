@@ -277,6 +277,9 @@ class FakeStore:
     async def async_add_outcome(self, outcome: Any) -> None:
         self.data["outcomes"].append(outcome)
 
+    async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
+        self.data["restore_notification_failures"] = failures
+
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         self.data["ownership"] = ownership
 
@@ -353,6 +356,14 @@ class FakeHass:
     def __init__(self, values: dict[str, str | FakeState] | None = None) -> None:
         self.states = FakeStates(values)
         self.services = FakeServices(self.states)
+
+
+def _without_ev_restore_dismissals(hass: FakeHass) -> list[tuple[str, str, dict[str, Any]]]:
+    """Keep dispatch assertions independent of recovered-alert cleanup."""
+    return [call for call in hass.services.calls if not (
+        call[:2] == ("persistent_notification", "dismiss")
+        and call[2]["notification_id"].startswith("ha_energy_planner_restore_safe_state_ev")
+    )]
 
 
 def _context(now: datetime) -> DecisionContext:
@@ -601,11 +612,8 @@ def test_successful_restore_safe_state_dismisses_old_alert_without_notifying() -
     assert outcome.result == "restored"
     assert store.data["ownership"] == {}
     assert hass.services.calls == [
-        (
-            "persistent_notification",
-            "dismiss",
-            {"notification_id": "ha_energy_planner_restore_safe_state"},
-        )
+        ("persistent_notification", "dismiss", {"notification_id": f"ha_energy_planner_restore_safe_state{suffix}"})
+        for suffix in ("_daikin", "_enphase", "_enphase_export_limit", "_ev", "")
     ]
 
 
@@ -865,7 +873,7 @@ def test_infeasible_ev_schedule_creates_persistent_notification_before_rejection
         store,
         hass=hass,
         entry_data={"ev_charger_entity": "switch.ev_start"},
-        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False},
+        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, CONF_EV_CONTROL_ENABLED: True},
     )
 
     asyncio.run(executor.async_evaluate(plan, _context(now)))
@@ -1291,6 +1299,7 @@ def test_plan_fallback_notifications_are_dismissed_when_planner_disabled() -> No
             "dismiss",
             {"notification_id": "ha_energy_planner_haeo_fallback"},
         ),
+        ("persistent_notification", "dismiss", {"notification_id": "ha_energy_planner_ev_interrupted"}),
     ]
 
 
@@ -5191,7 +5200,7 @@ def test_manual_ev_stop_uses_owned_topology_after_reconfigure() -> None:
     result = asyncio.run(executor.async_manual_ev_charging(False, None))
 
     assert result.applied is True
-    assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.old_charger"})]
+    assert _without_ev_restore_dismissals(hass) == [("switch", "turn_off", {"entity_id": "switch.old_charger"})]
     assert hass.states.values["switch.old_charger"] == "off"
     assert hass.states.values["switch.new_charger"] == "on"
     assert store.data["ownership"] == {}
@@ -5217,9 +5226,11 @@ def test_ev_auto_start_compensation_uses_audited_stop_path() -> None:
 
     assert result.applied is True
     assert hass.states.values["input_boolean.ev_charger"] == "off"
-    assert hass.services.calls[0] == ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_charger"})
-    assert hass.services.calls[1][0:2] == ("persistent_notification", "create")
-    assert "Charge now" in hass.services.calls[1][2]["message"]
+    assert _without_ev_restore_dismissals(hass)[0] == (
+        "input_boolean", "turn_off", {"entity_id": "input_boolean.ev_charger"},
+    )
+    assert _without_ev_restore_dismissals(hass)[1][0:2] == ("persistent_notification", "create")
+    assert "Charge now" in _without_ev_restore_dismissals(hass)[1][2]["message"]
     outcome = store.data["outcomes"][-1]
     assert outcome.action_id == "ev_auto_start_compensation"
     assert outcome.kind == "ev_stop"
@@ -5233,7 +5244,7 @@ def test_auto_start_compensation_noop_does_not_report_charging_interrupted() -> 
     result = asyncio.run(executor.async_compensate_ev_auto_start(None))
     assert result.applied
     assert not result.command_sent
-    assert hass.services.calls == []
+    assert _without_ev_restore_dismissals(hass) == []
     assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
 
 
@@ -5285,7 +5296,7 @@ def test_compensated_manual_ev_stop_is_successful() -> None:
 
     assert result.applied is True
     assert result.reason == "ev_safe_stop_compensated"
-    assert hass.services.calls == [
+    assert _without_ev_restore_dismissals(hass) == [
         ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
         ("switch", "turn_off", {"entity_id": "switch.ev_charger"}),
     ]
@@ -5939,7 +5950,9 @@ def test_manual_ev_start_honors_backoff_while_stop_remains_available() -> None:
     assert rate_limited_start.reason == "device_command_rate_limited"
     assert store.data["outcomes"][1].result == OutcomeResult.REJECTED
     assert stop.applied is True
-    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_start"})]
+    assert _without_ev_restore_dismissals(hass) == [
+        ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_start"}),
+    ]
 
 
 def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> None:
@@ -6017,7 +6030,9 @@ def test_scheduled_ev_stop_bypasses_failure_pause_rate_limit_and_daily_cap() -> 
     asyncio.run(executor.async_evaluate(plan, context))
 
     assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
-    assert hass.services.calls == [("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})]
+    assert _without_ev_restore_dismissals(hass) == [
+        ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"}),
+    ]
     assert store.data["ownership"] == {}
 
 
@@ -6097,7 +6112,7 @@ def test_regular_planner_owned_stop_clears_ownership_and_cannot_restore_on() -> 
     context.ev_connected = True
 
     asyncio.run(executor.async_evaluate(plan, context))
-    calls_after_stop = list(hass.services.calls)
+    calls_after_stop = _without_ev_restore_dismissals(hass)
     asyncio.run(executor.async_restore_safe_state("entry_unload"))
 
     assert calls_after_stop == [("switch", "turn_off", {"entity_id": "switch.ev_charger"})]
@@ -6390,15 +6405,17 @@ def test_unhealthy_plan_stops_and_releases_planner_owned_ev_power() -> None:
 
     asyncio.run(executor.async_evaluate(plan, context))
 
-    assert hass.services.calls[0] == ("input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"})
-    assert hass.services.calls[1][0:2] == ("persistent_notification", "create")
+    assert _without_ev_restore_dismissals(hass)[0] == (
+        "input_boolean", "turn_off", {"entity_id": "input_boolean.ev_stop"},
+    )
+    assert _without_ev_restore_dismissals(hass)[1][0:2] == ("persistent_notification", "create")
     assert store.data["ownership"] == {}
     assert store.data["outcomes"][-1].result == OutcomeResult.APPLIED
     assert store.data["outcomes"][-1].desired_state["input_health_safety_stop"] is True
 
     asyncio.run(executor.async_evaluate(plan, context))
 
-    assert len(hass.services.calls) == 2
+    assert len(_without_ev_restore_dismissals(hass)) == 2
     assert len(store.data["outcomes"]) == 1
 
 
@@ -7699,7 +7716,9 @@ def test_ev_action_limit_notification_explains_configuration():
         hard_constraints=[], reason_codes=[], expected_cost_delta=None, confidence=1.0,
     )
     hass = FakeHass()
-    executor = Executor(FakeStore(), hass=hass, entry_data={}, options=DEFAULT_OPTIONS)
+    executor = Executor(
+        FakeStore(), hass=hass, entry_data={}, options={**DEFAULT_OPTIONS, CONF_EV_CONTROL_ENABLED: True},
+    )
     asyncio.run(executor._async_notify_ev_infeasible(action))
     notification = hass.services.calls[-1][2]
     assert notification["title"] == "Energy Planner EV action limit reached"
@@ -7822,7 +7841,7 @@ def test_charge_now_target_reached_stops_even_with_automatic_ev_control_disabled
                             summary="manual target", confidence=1, estimated_daily_cost=None, actions=[], preview=[])
     asyncio.run(executor.async_evaluate(executable, context))
     assert hass.states.values["switch.ev"] == "off"
-    assert not any(call[0] == "persistent_notification" for call in hass.services.calls)
+    assert not any(call[:2] == ("persistent_notification", "create") for call in hass.services.calls)
 
 
 @pytest.mark.parametrize("automatic", [False, True])
