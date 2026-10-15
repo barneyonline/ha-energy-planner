@@ -672,7 +672,33 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             limit_entity = entry_data.get("ev_power_limit_entity")
             if (event.data.get("entity_id") in {limit_entity, entry_data.get("ev_power_entity")}
                     and executor is not None):
-                executor.sync_ev_grid_reservation()
+                if executor.sync_ev_grid_reservation(
+                    power_state=(event.data.get("new_state")
+                                 if event.data.get("entity_id") == entry_data.get("ev_power_entity") else None),
+                ):
+                    async def persist_and_refresh_ev_capacity() -> None:
+                        # Capture the current reservation under the command
+                        # lock, never an event's older snapshot. A stop/reduction
+                        # that completed while queued must remain authoritative.
+                        try:
+                            async with self._command_lock:
+                                if getattr(self, "_tearing_down", False):
+                                    return
+                                await executor.async_persist_ev_grid_reservation()
+                        except Exception as error:
+                            # A transient save failure must not consume the
+                            # power event's safety trigger. Normal refresh
+                            # durability gates still protect new acquisitions.
+                            _LOGGER.warning(
+                                "EV capacity persistence failed (%s); requesting a safety refresh",
+                                type(error).__name__,
+                            )
+                        if not getattr(self, "_tearing_down", False):
+                            self._mark_forced_refresh("ev_capacity_increased")
+                            await self.async_request_refresh()
+
+                    self._async_create_listener_task(persist_and_refresh_ev_capacity())
+                    return
             charging_entity = entry_data.get(CONF_EV_CHARGING)
             if charging_entity and event.data.get("entity_id") == charging_entity:
                 new_state = event.data.get("new_state")

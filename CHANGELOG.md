@@ -15,6 +15,17 @@
 - Clear stale restore warnings after confirmed EV stops, climate releases and Export Limit restoration readback. Full restores also clear device-specific warnings; partial or pending recovery retains unresolved alerts across reloads.
 - Retain failed notification dismissals and combined-warning updates for retry on refresh or reload, without device commands; serialize retries with concurrent restoration outcomes.
 - Refresh EV feasibility warnings from the current plan, retire obsolete EV alerts when control is disabled, and prevent superseded startup reports or removed entries from leaving stale notifications.
+- Retain bounded climate command feedback after a readback timeout so delayed
+  thermostat updates do not create a false manual override or discard restoration settings.
+- Enforce EV charging lease expiry throughout start confirmation and retries,
+  stopping an uncertain or late start instead of accepting it after its deadline.
+- Use authoritative EV sample timestamps for telemetry and power-limit confirmation;
+  cached readings cannot become fresh through Home Assistant reports.
+- Reserve fresh observed EV power above the configured charging rate, retaining
+  the higher load through rejected starts until a confirmed reduction or stop.
+  Preserve the safety refresh when the initial capacity save fails.
+  Apply command confirmations before bookkeeping waits so newer power evidence survives.
+  Retain power peaks from queued state events without undoing newer confirmed reductions.
 
 ### 🔧 Improvements
 
