@@ -292,6 +292,21 @@ expiry. Load-forecast attributes expose `uncertainty_margin_kw`, `recovery_pendi
 `cost_estimates_degraded`. Actual safety/unsolicited-start stops produce a deduplicated
 notification directing you to these diagnostics and the explicit Charge now control.
 A confirmed charging restart clears the alert so a later interruption can notify again.
+Disabling EV control or selecting review/disabled planning also clears obsolete interruption and
+feasibility alerts. Confirmed unplugging retires session alerts, and a completed charge target
+clears an obsolete interruption warning. Feasibility warnings follow the latest plan, including changes between an
+action-limit blocker and a physical shortfall, without waiting for another device command.
+
+Safe-state restore warnings clear after the affected device's restoration is confirmed, including
+ordinary EV stops and climate releases. A full successful restore clears earlier device-specific
+warnings as well. Pending Export Limit readback, skipped vehicle-session guards, and unresolved
+power-limit baselines keep their warnings. Combined warnings retain the unresolved device areas
+across reloads and clear only when all of those areas recover. Failed notification updates or
+dismissals retry on planner refresh, including after a reload; these retries send no device
+commands. Removing an entry clears its
+notifications after recovery obligations are resolved; another planner's alerts remain separate.
+Explicit Explain and safety-check reports remain available until dismissed or replaced. New
+reports supersede older queued startup reports.
 
 ### Legacy vehicle-target migration repair
 

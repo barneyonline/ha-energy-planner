@@ -165,6 +165,8 @@ async def async_cancel_startup_auto_recovery(
             _LOGGER.exception("Could not restore safe state after startup recovery cancellation")
     recovery = parse_production_state(store_data.get("production")).raw.get("startup_auto_recovery")
     if not recovery_active or not isinstance(recovery, dict):
+        if not preserve_control:
+            await self.executor.async_dismiss_startup_recovery_notification()
         return
     if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload"}:
         # Persist the current grace/recovery state verbatim so the next

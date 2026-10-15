@@ -38,6 +38,9 @@ def defer_persistent_notification(
 ) -> bool:
     """Defer one keyed notification until Home Assistant has started."""
     if persistent_notifications_ready(hass):
+        # A new result can arrive while an earlier startup callback is still
+        # waiting behind another entry. Never replay that superseded result.
+        cancel_deferred_persistent_notification(hass, notification_id)
         return False
     data = getattr(hass, "data", None)
     if not isinstance(data, MutableMapping):
@@ -98,3 +101,20 @@ async def _async_flush_deferred_notifications(hass: Any) -> None:
                 await create_callback()
     if data.get(_DEFERRED_NOTIFICATIONS_DATA_KEY) is pending:
         data.pop(_DEFERRED_NOTIFICATIONS_DATA_KEY, None)
+
+
+async def async_dismiss_entry_notifications(hass: Any, entry_id: str) -> None:
+    """Remove notifications only after an entry's recovery obligations are resolved."""
+    cancel_deferred_notifications_for_entry(hass, entry_id)
+    bases = (
+        "plan_unsafe", "grid_limit_fallback", "ev_infeasible", "hvac_capability", "haeo_fallback",
+        "ev_interrupted", "startup_recovery", "restore_safe_state", "restore_safe_state_ev",
+        "restore_safe_state_daikin", "restore_safe_state_enphase", "restore_safe_state_enphase_export_limit",
+        "preflight", "ai_explanation",
+    )
+    for base in bases:
+        with suppress(Exception):
+            await hass.services.async_call(
+                "persistent_notification", "dismiss",
+                {"notification_id": f"ha_energy_planner_{base}_{entry_id}"}, blocking=False,
+            )

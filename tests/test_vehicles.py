@@ -862,7 +862,8 @@ def test_unplug_releases_capacity_without_charger_commands(rapid_replug: bool) -
         await coordinator._async_reconcile_vehicle_ownership()
         assert "entry" not in reservations
         assert coordinator.store.data["ev_grid_reservation"]["active"] is False
-        assert not hass.services.async_call.called
+        assert all(call.args[:2] == ("persistent_notification", "dismiss")
+                   for call in hass.services.async_call.call_args_list)
         # Manual selection alone cannot prove an active guest load has stopped.
         reservations["entry"] = {"load_kw": 7, "limit_kw": 10}
         hass.states.values["binary_sensor.plug"] = "on"
@@ -1069,7 +1070,8 @@ def test_unplug_during_ownership_write_is_not_consumed_by_older_release(same_veh
         await coordinator._async_reconcile_vehicle_ownership()
         assert "entry" not in reservations
         assert coordinator.store.data["ev_grid_reservation"]["active"] is False
-        assert not hass.services.async_call.called
+        assert all(call.args[:2] == ("persistent_notification", "dismiss")
+                   for call in hass.services.async_call.call_args_list)
 
     asyncio.run(run())
 

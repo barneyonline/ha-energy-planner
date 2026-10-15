@@ -557,11 +557,14 @@ async def async_unload_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntr
 
 async def async_remove_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
     """Remove resolved per-entry history; retain uncertain recovery evidence."""
+    from .notifications import async_dismiss_entry_notifications
     from .storage import PlannerStore
 
     async_clear_migration_issue(hass, entry.entry_id)
     if not await PlannerStore(hass, entry.entry_id).async_remove_if_safe():
         _LOGGER.warning("Energy Planner retained recovery storage for removed entry %s", entry.entry_id)
+    else:
+        await async_dismiss_entry_notifications(hass, entry.entry_id)
 
 
 async def _async_rehydrate_all_ev_grid_reservations(hass: HomeAssistant) -> None:
