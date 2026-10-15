@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
@@ -29,7 +29,7 @@ from custom_components.ha_energy_planner.const import (
     DOMAIN,
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
-from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter, EVCommandResult
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
@@ -457,6 +457,7 @@ def test_number_control_transaction_reserves_then_confirms_reduction_and_restore
             assert not await executor._async_save_provisional_ev_ownership(plan.actions[0], executor.entry_data)
             assert store.data["ownership"]["ev_smart_charging_state"]["ev_power_limit_entity"] == "6"
             assert store.data["ev_grid_reservation"]["load_kw"] == 3
+            assert store.data["ev_grid_reservation"]["observed_load_kw"] == 3
             executor.sync_ev_grid_reservation()
             assert store.data["ev_grid_reservation"]["load_kw"] == 3
             assert executor._rate_limit_reason(plan.actions[0], dt_util.utcnow()) == "device_command_rate_limited"
@@ -478,6 +479,64 @@ def test_number_control_transaction_reserves_then_confirms_reduction_and_restore
             assert calls[-1][1] == "set_value"
             assert hass.states.get("number.limit").state in {"6", "6.0"}
             assert not store.data["ev_grid_reservation"]["active"]
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("interleave", ["notification", "command_ledger"])
+def test_new_power_after_confirmation_survives_execution_bookkeeping(tmp_path, monkeypatch, interleave):
+    """Post-confirmation device evidence must survive asynchronous bookkeeping."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        attrs = {"unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1}
+        power_attrs = {"unit_of_measurement": "kW"}
+        hass.states.async_set("number.limit", 6, attrs)
+        hass.states.async_set("sensor.ev_power", 6, power_attrs)
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data.update({"ev_power_limit_entity": "number.limit", "ev_power_entity": "sensor.ev_power"})
+        executor.options.update({"ev_limit_min": 1, "ev_limit_max": 6, "command_rate_limit_seconds": 0})
+        _arm(store, executor)
+
+        async def limit(call):
+            hass.states.async_set("number.limit", call.data["value"], attrs)
+            hass.states.async_set("sensor.ev_power", call.data["value"], power_attrs)
+
+        method = ("_async_dismiss_plan_fallback_notification" if interleave == "notification"
+                  else "_async_record_command_attempt")
+        original = getattr(executor, method)
+        observations = []
+
+        async def bookkeeping(*args):
+            result = await original(*args)
+            if not observations and hass.states.get("switch.charger").state == "on":
+                hass.states.async_set("sensor.ev_power", 9, power_attrs)
+                executor.sync_ev_grid_reservation()
+                observations.append(executor._ev_grid_reservations()["runtime"]["load_kw"])
+                hass.states.async_set("sensor.ev_power", "unavailable", power_attrs)
+                executor.sync_ev_grid_reservation()
+            return result
+
+        monkeypatch.setattr(executor, method, bookkeeping)
+        hass.services.async_register("number", "set_value", limit)
+        plan, context = _command("ev")
+        plan.actions[0].desired_state.update({"projected_load_kw_now": 3, "power_limit": {
+            "entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3}})
+        context.slots[0].projected_ev_load_kw = 3
+        try:
+            await executor.async_evaluate(plan, context)
+            assert observations == [9]
+            reservation = store.data["ev_grid_reservation"]
+            assert reservation["load_kw"] == reservation["observed_load_kw"] == 9
+            assert not reservation.get("confirmed_power_limit")
+            context.slots[0].baseline_load_forecast_kw = 2
+            assert executor._ev_reservation_safety_issue(context) == "grid_import_limit_exceeded"
+            await store.async_flush()
+            reloaded = PlannerStore(hass, "runtime")
+            await reloaded.async_load()
+            assert reloaded.data["ev_grid_reservation"]["load_kw"] == 9
         finally:
             await hass.async_stop()
     asyncio.run(run())
@@ -606,7 +665,8 @@ def test_confirmed_power_does_not_recreate_a_released_reservation(tmp_path):
     asyncio.run(run())
 
 
-def test_delayed_power_confirmation_releases_only_the_confirmed_reduction(tmp_path):
+@pytest.mark.parametrize("cached_source", [False, True])
+def test_delayed_power_confirmation_releases_only_the_confirmed_reduction(tmp_path, cached_source):
     async def run():
         hass = HomeAssistant(str(tmp_path))
         _devices(hass)
@@ -618,9 +678,14 @@ def test_delayed_power_confirmation_releases_only_the_confirmed_reduction(tmp_pa
         executor.entry_data.update(ev_power_limit_entity="number.limit", ev_power_entity="sensor.ev_power")
         executor.options.update(ev_limit_min=1, ev_limit_max=6, ev_charge_rate_kw=6, command_rate_limit_seconds=0)
         _arm(store, executor)
+        old_sample = (dt_util.utcnow() - timedelta(minutes=1)).isoformat()
 
         async def limit(call):
             hass.states.async_set("number.limit", call.data["value"], attrs)
+            if cached_source:
+                hass.states.async_set("sensor.ev_power", 3, {
+                    "unit_of_measurement": "kW", "sampled_at_utc": old_sample,
+                })
 
         hass.services.async_register("number", "set_value", limit)
         plan, context = _command("ev")
@@ -647,12 +712,241 @@ def test_delayed_power_confirmation_releases_only_the_confirmed_reduction(tmp_pa
             repeat = await adapter.async_execute(plan.actions[0])
             executor._reconcile_ev_grid_reservation(plan.actions[0], repeat, previous)
             assert executor._ev_grid_reservations()[executor.entry_id]["pending_power_limit"]["at"] == original_boundary
-            hass.states.async_set("sensor.ev_power", 3, {"unit_of_measurement": "kW"})
+            hass.states.async_set("sensor.ev_power", 3, {
+                "unit_of_measurement": "kW", "sampled_at_utc": dt_util.utcnow().isoformat(),
+            })
             executor.sync_ev_grid_reservation()
             await executor.async_persist_ev_grid_reservation()
             assert store.data["ev_grid_reservation"]["load_kw"] == 3
             assert "pending_power_limit" not in store.data["ev_grid_reservation"]
+            assert store.data["ev_grid_reservation"]["observed_load_kw"] == 3
         finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("confirmed_limit", [False, True])
+def test_observed_ev_draw_raises_retained_capacity_and_enforces_grid_limit(tmp_path, confirmed_limit):
+    """A 7 kW setting cannot conceal an observed 7.36 kW physical load."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("sensor.ev_power", 7360, {"unit_of_measurement": "W"})
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data["ev_power_entity"] = "sensor.ev_power"
+        executor.options["grid_import_limit_kw"] = 14.2
+        reservation = {"load_kw": 7.0, "limit_kw": 14.2}
+        if confirmed_limit:
+            hass.states.async_set("number.limit", 7, {
+                "unit_of_measurement": "kW", "min": 1, "max": 7, "step": 1,
+            })
+            executor.entry_data["ev_power_limit_entity"] = "number.limit"
+            executor.options.update(ev_limit_min=1, ev_limit_max=7)
+            reservation["confirmed_power_limit"] = True
+        executor._ev_grid_reservations()[executor.entry_id] = reservation
+        _plan, context = _command("ev")
+        assert context is not None
+        context.slots[0].baseline_load_forecast_kw = 7
+        assert executor._ev_reservation_safety_issue(context) is None
+        try:
+            executor.sync_ev_grid_reservation()
+            assert reservation["load_kw"] == 7.36
+            assert not reservation.get("confirmed_power_limit")
+            assert executor._ev_reservation_safety_issue(context) == "grid_import_limit_exceeded"
+            for reading in (6500, 0, "unavailable"):
+                hass.states.async_set("sensor.ev_power", reading, {"unit_of_measurement": "W"})
+                executor.sync_ev_grid_reservation()
+                assert reservation["load_kw"] == 7.36
+            await executor.async_persist_ev_grid_reservation()
+            await store.async_flush()
+            recovered = PlannerStore(hass, "runtime")
+            await recovered.async_load()
+            assert recovered.data["ev_grid_reservation"]["load_kw"] == 7.36
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "previous_kw, requested_kw, observed_kw, expected_kw",
+    [(3, 7, None, 3), (3, 7, 6, 6), (7, 7, 7.36, 7.36), (3, 7, 9, 9)],
+)
+def test_rejected_start_retains_concurrent_physical_evidence(
+    tmp_path, previous_kw, requested_kw, observed_kw, expected_kw,
+):
+    """Rollback must keep actual draw, without reserving an unissued increase."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        store = PlannerStore(hass, "runtime")
+        executor = _executor(hass, store)
+        executor.entry_data["ev_power_entity"] = "sensor.ev_power"
+        original = {"load_kw": previous_kw, "limit_kw": 10}
+        if previous_kw == 3:
+            original["confirmed_power_limit"] = True
+        reservations = executor._ev_grid_reservations()
+        reservations[executor.entry_id] = original
+        plan, context = _command("ev")
+        assert context is not None
+        action = plan.actions[0]
+        action.desired_state["projected_load_kw_now"] = requested_kw
+        context.slots[0].projected_ev_load_kw = requested_kw
+        try:
+            reason, previous = executor._reserve_ev_grid_capacity(action, context, dt_util.utcnow())
+            assert reason is None
+            assert previous is original
+            if observed_kw is not None:
+                hass.states.async_set("sensor.ev_power", observed_kw, {"unit_of_measurement": "kW"})
+                executor.sync_ev_grid_reservation()
+                for reading in (0, "unavailable"):
+                    hass.states.async_set("sensor.ev_power", reading, {"unit_of_measurement": "kW"})
+                    executor.sync_ev_grid_reservation()
+            executor._reconcile_ev_grid_reservation(
+                action, EVCommandResult(False, "ev_control_unavailable", {}, {}), previous,
+            )
+            restored = reservations[executor.entry_id]
+            assert restored["load_kw"] == expected_kw
+            if expected_kw > previous_kw:
+                assert not restored.get("confirmed_power_limit")
+            await executor.async_persist_ev_grid_reservation()
+            await store.async_flush()
+            recovered = PlannerStore(hass, "runtime")
+            await recovered.async_load()
+            assert recovered.data["ev_grid_reservation"]["load_kw"] == expected_kw
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("confirmation", ["delayed_sample", "adapter_outcome"])
+def test_confirmed_reduction_retires_old_observed_capacity(tmp_path, confirmation):
+    """A previous physical peak must not reappear after a proven reduction."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("number.limit", 3, {
+            "unit_of_measurement": "kW", "min": 1, "max": 6, "step": 1,
+        })
+        hass.states.async_set("sensor.ev_power", 3, {"unit_of_measurement": "kW"})
+        executor = _executor(hass, PlannerStore(hass, "runtime"))
+        executor.entry_data.update(ev_power_entity="sensor.ev_power", ev_power_limit_entity="number.limit")
+        executor.options.update(ev_limit_min=1, ev_limit_max=6)
+        reservations = executor._ev_grid_reservations()
+        reservation = {"load_kw": 9, "observed_load_kw": 9, "limit_kw": 10}
+        reservations[executor.entry_id] = reservation
+        plan, context = _command("ev")
+        assert context is not None
+        action = plan.actions[0]
+        try:
+            if confirmation == "delayed_sample":
+                reservation["pending_power_limit"] = {
+                    "version": 1, "at": (dt_util.utcnow() - timedelta(seconds=1)).isoformat(),
+                    "entity_id": "number.limit", "value": 3, "unit": "kW", "physical_power_kw": 3,
+                }
+                executor.sync_ev_grid_reservation()
+            else:
+                executor._reconcile_ev_grid_reservation(action, EVCommandResult(
+                    True, "ev_power_limit_confirmed", {}, {"confirmed_power_kw": 3}, command_sent=True,
+                ), None)
+            assert reservation["load_kw"] == reservation["observed_load_kw"] == 3
+            reason, previous = executor._reserve_ev_grid_capacity(action, context, dt_util.utcnow())
+            assert reason is None
+            executor._reconcile_ev_grid_reservation(
+                action, EVCommandResult(False, "ev_control_unavailable", {}, {}), previous,
+            )
+            assert reservations[executor.entry_id]["load_kw"] == 3
+        finally:
+            await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("later", ["unavailable", "0", "confirmed_reduction", "renewed_start", "confirmed_stop"])
+def test_queued_power_event_preserves_peak_but_not_superseded_evidence(tmp_path, monkeypatch, later):
+    """Real HA queues both reports before the capacity listener can run."""
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        power_attrs = {"unit_of_measurement": "kW"}
+        hass.states.async_set("sensor.ev_power", 7, power_attrs)
+        hass.states.async_set("number.limit", 3, {
+            "unit_of_measurement": "kW", "min": 1, "max": 7, "step": 1,
+        })
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data.update(ev_power_entity="sensor.ev_power", ev_power_limit_entity="number.limit")
+        configured.options.update(ev_limit_min=1, ev_limit_max=7)
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Queued capacity", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        executor = coordinator.executor
+        reservations = executor._ev_grid_reservations()
+        reservations[entry.entry_id] = {"load_kw": 7, "limit_kw": 10}
+        plan, context = _command("ev")
+        context.slots[0].baseline_load_forecast_kw = 2
+        issues = []
+
+        async def refresh():
+            issues.append(executor._ev_reservation_safety_issue(context))
+
+        monkeypatch.setattr(coordinator, "async_request_refresh", refresh)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+
+        @callback
+        def publish(_event):
+            # HA queues nested state_changed events until this push callback
+            # returns; both listeners then see the later value in hass.states.
+            hass.states.async_set("sensor.ev_power", 9, power_attrs)
+            if later == "confirmed_stop":
+                executor._release_ev_grid_reservation()
+            elif later in {"confirmed_reduction", "renewed_start"}:
+                hass.states.async_set("sensor.ev_power", 3, power_attrs)
+                executor._reconcile_ev_grid_reservation(plan.actions[0], EVCommandResult(
+                    True, "ev_power_limit_confirmed", {}, {
+                        "confirmed_power_kw": 3,
+                        "confirmed_power_at": hass.states.get("sensor.ev_power").last_reported.isoformat(),
+                    }, command_sent=True,
+                ), None)
+                if later == "renewed_start":
+                    plan.actions[0].desired_state["projected_load_kw_now"] = 3
+                    context.slots[0].projected_ev_load_kw = 3
+                    reason, _previous = executor._reserve_ev_grid_capacity(
+                        plan.actions[0], context, dt_util.utcnow(),
+                    )
+                    assert reason is None
+            else:
+                hass.states.async_set("sensor.ev_power", later, power_attrs)
+
+        unsubscribe = hass.bus.async_listen("ev_provider_push", publish)
+        try:
+            hass.bus.async_fire("ev_provider_push")
+            await hass.async_block_till_done()
+            if later == "confirmed_stop":
+                assert entry.entry_id not in reservations
+                assert issues == []
+            elif later == "confirmed_reduction":
+                assert reservations[entry.entry_id]["load_kw"] == 3
+                assert issues == []
+            elif later == "renewed_start":
+                # Renewal remains conservative at the configured rate until
+                # its own confirmation, but must not revive the retired 9 kW.
+                assert reservations[entry.entry_id]["load_kw"] == 7
+                assert issues == [None]
+            else:
+                assert reservations[entry.entry_id]["load_kw"] == 9
+                assert issues == ["grid_import_limit_exceeded"]
+                await store.async_flush()
+                reloaded = PlannerStore(hass, "runtime")
+                await reloaded.async_load()
+                assert reloaded.data["ev_grid_reservation"]["load_kw"] == 9
+        finally:
+            unsubscribe()
+            await coordinator.async_shutdown()
             await hass.async_stop()
     asyncio.run(run())
 

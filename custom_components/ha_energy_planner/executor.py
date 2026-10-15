@@ -847,6 +847,9 @@ class Executor:
             ).async_execute(action)
             if _ev_action_wants_power(action):
                 self._reconcile_ev_start_feedback_expectation(ev_result)
+            # Consume the adapter's confirmation before yielding to notification
+            # or ledger I/O. Later power events must supersede this evidence.
+            self._reconcile_ev_grid_reservation(action, ev_result, previous_reservation)
             no_change = ev_result.reason == "already_in_desired_state"
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             if not _ev_action_wants_power(action) and safe_stop_confirmed:
@@ -912,7 +915,6 @@ class Executor:
                     pause_duration,
                     safety_stop_failure=planner_owned_stop,
                 )
-            self._reconcile_ev_grid_reservation(action, ev_result, previous_reservation)
             if planner_owned_stop and not action_applied and self.entry_id:
                 # Let another controllable EV shed load after this claimant
                 # failed, while retaining this entry's uncertain reservation.
@@ -2427,9 +2429,12 @@ class Executor:
         if _ev_action_wants_power(action) and reservations.get(self.entry_id, {}).get("pending_power_limit"):
             self.sync_ev_grid_reservation()
         pending = reservations.get(self.entry_id, {}).get("pending_power_limit")
+        confirmed_at = reservations.get(self.entry_id, {}).get("confirmed_power_at")
         result = reserve_ev_grid_capacity(reservations, self.entry_id, action, context, now, self.options)
         if pending and self.entry_id in reservations:
             reservations[self.entry_id]["pending_power_limit"] = pending
+        if confirmed_at and self.entry_id in reservations:
+            reservations[self.entry_id]["confirmed_power_at"] = confirmed_at
         return result
 
     async def _async_end_ev_exposure(self, *, safe_stop_confirmed: bool = False) -> None:
@@ -2483,6 +2488,10 @@ class Executor:
             reservations = self._ev_grid_reservations()
             if reservations is not None and self.entry_id and self.entry_id in reservations:
                 reservations[self.entry_id]["load_kw"] = confirmed_power
+                reservations[self.entry_id]["observed_load_kw"] = confirmed_power
+                reservations[self.entry_id]["confirmed_power_at"] = (
+                    timestamp(getattr(result, "post_state", {}).get("confirmed_power_at")) or dt_util.utcnow()
+                ).isoformat()
                 reservations[self.entry_id]["confirmed_power_limit"] = True
                 reservations[self.entry_id].pop("pending_power_limit", None)
         if wants_power and not result.applied:
@@ -2515,6 +2524,14 @@ class Executor:
         """Restore a prior reservation when a stop command cannot be proven safe."""
         reservations = self._ev_grid_reservations()
         if reservations is not None and self.entry_id:
+            current = reservations.get(self.entry_id, {})
+            observed_kw = _positive_float(current.get("observed_load_kw"))
+            if observed_kw > _positive_float(reservation.get("load_kw")):
+                # A rejected start can restore a snapshot captured before a
+                # power event. Carry physical evidence, never merely requested
+                # provisional capacity, across that rollback boundary.
+                reservation = {**reservation, "load_kw": observed_kw, "observed_load_kw": observed_kw}
+                reservation.pop("confirmed_power_limit", None)
             reservations[self.entry_id] = reservation
 
     def _retain_ev_grid_reservation_when_unloaded(self) -> None:
@@ -2538,20 +2555,28 @@ class Executor:
         reservation[EV_RESERVATION_EXTERNAL_BASELINE] = True
         reservation[EV_RESERVATION_RETAIN_WHEN_UNLOADED] = True
 
-    def sync_ev_grid_reservation(self) -> None:
-        """Refresh this entry's active reservation from its current options."""
+    def sync_ev_grid_reservation(self, *, power_state: Any = None) -> bool:
+        """Refresh capacity and report whether its retained load increased."""
         reservations = self._ev_grid_reservations()
         if reservations is None or not self.entry_id:
-            return
+            return False
         reservation = reservations.get(self.entry_id)
         if not isinstance(reservation, dict):
-            return
+            return False
+        previous_load_kw = _positive_float(reservation.get("load_kw"))
         limit_id = self.entry_data.get("ev_power_limit_entity")
         capability = power_capability(self.hass.states.get(limit_id), self.options) if self.hass and limit_id else None
         pending = reservation.get("pending_power_limit", {})
         power_id = self.entry_data.get("ev_power_entity")
-        power_state = self.hass.states.get(power_id) if self.hass and power_id else None
+        if power_state is None:
+            power_state = self.hass.states.get(power_id) if self.hass and power_id else None
         observed, reported = measured(power_state, dt_util.utcnow(), "power"), reported_at(power_state)
+        confirmed_at = timestamp(reservation.get("confirmed_power_at"))
+        if confirmed_at is not None and reported is not None and reported < confirmed_at:
+            # A queued event must retain physical peaks, but cannot undo a
+            # reduction proven by a newer sample. Keep this boundary after a
+            # subsequent increase so older events cannot revive retired peaks.
+            observed = None
         command_at = timestamp(pending.get("at")) if isinstance(pending, dict) else None
         if (capability is not None and command_at is not None and reported is not None and reported >= command_at
                 and pending.get("version") == 1 and pending.get("entity_id") == limit_id
@@ -2559,18 +2584,31 @@ class Executor:
                 and finite(pending.get("physical_power_kw")) == capability.current * capability.kw_per_unit
                 and observed is not None and observed <= capability.current * capability.kw_per_unit + .01):
             reservation["load_kw"] = capability.current * capability.kw_per_unit
+            reservation["observed_load_kw"] = reservation["load_kw"]
+            reservation["confirmed_power_at"] = reported.isoformat()
             reservation["confirmed_power_limit"] = True
             reservation.pop("pending_power_limit", None)
         still_confirmed = bool(reservation.get("confirmed_power_limit") and capability is not None
                                and capability.current * capability.kw_per_unit
-                               <= _positive_float(reservation.get("load_kw")))
+                               <= _positive_float(reservation.get("load_kw"))
+                               and (observed is None or observed <= _positive_float(reservation.get("load_kw")) + .01))
         if not still_confirmed:
+            # Fresh physical draw can exceed a configured rate or a previously
+            # confirmed limit. Preserve that higher load until a confirmed
+            # reduction or stop, including when later telemetry is unavailable.
+            reservation.pop("confirmed_power_limit", None)
+            if observed is not None:
+                reservation["observed_load_kw"] = max(
+                    _positive_float(reservation.get("observed_load_kw")), observed,
+                )
             reservation["load_kw"] = max(
                 _positive_float(reservation.get("load_kw")),
                 _positive_float(self.options.get(CONF_EV_CHARGE_RATE_KW)),
                 capability.current * capability.kw_per_unit if capability is not None else 0,
+                observed or 0,
             )
         reservation["limit_kw"] = _positive_float(self.options.get(CONF_GRID_IMPORT_LIMIT_KW))
+        return _positive_float(reservation.get("load_kw")) > previous_load_kw
 
     async def async_persist_ev_grid_reservation(self) -> None:
         """Persist this entry's current reservation high-watermark."""
@@ -2780,7 +2818,11 @@ class Executor:
                 pending["feedback_commands"] = self.hvac_feedback_commands
             elif record.get("failure_category") == "CancelledError":
                 self.hvac_feedback_commands.clear()
-            elif record["stage"].endswith("failed"):
+            elif record["stage"] == "service_failed":
+                # A readback timeout does not revoke an accepted command: Daikin
+                # can publish its target during the following mode retry. Keep
+                # the original bounded expectation until a newer command for
+                # that effect supersedes it, or a real manual change retires it.
                 self.hvac_feedback_commands[:] = [
                     item for item in self.hvac_feedback_commands if item["context_id"] != record["context_id"]
                 ]

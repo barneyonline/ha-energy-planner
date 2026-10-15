@@ -276,6 +276,13 @@ override attribution; credentials, vendor response bodies and location history a
 excluded. Decision summary and diagnostic exports include the lifecycle, transition
 reason, heating/cooling/coasting explanation, unresolved settings and latest failure.
 
+An accepted thermostat command can publish feedback after its five-second readback
+timeout. Its exact command expectation remains valid within the original
+two-minute settling window, including during a mode retry. This preserves planner
+ownership and the original restoration baseline when delayed feedback matches.
+It does not extend the deadline or suppress explicit user changes, different
+targets, unrelated automation contexts, superseding commands or cancellation.
+
 Recovery retries restore available unfinished dampers and automations independently
 when zone targets remain hidden after confirmed main shutdown. Unavailable controls
 retain ownership without restarting the main unit or repeatedly arming the guard.

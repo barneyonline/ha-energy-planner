@@ -37,6 +37,24 @@ accepts Wh or kWh. Observations older than ten minutes are not used for learning
 Measured energy takes precedence over integrated power. The existing configured
 charging-power calibration remains available when measured history is insufficient.
 
+When a sensor provides `sampled_at_utc`, its actual sample time is authoritative:
+cached reports cannot refresh it, and malformed, missing or naive values in
+that explicit field fail closed. Sensors without that field retain the normal
+Home Assistant report-time fallback. Confirming a power reduction also requires
+the sample to follow the command. Fresh measured power above the configured rate
+raises the retained grid reservation; low or unavailable telemetry alone cannot
+shrink that reservation.
+
+Observed capacity survives a concurrent start rejected before dispatch. Unissued
+requested increases do not become physical evidence, and a confirmed reduction
+retires the previous peak. A failed capacity save still requests a safety refresh
+to retry durability checks before new commands.
+Command confirmations are reconciled before asynchronous bookkeeping so later
+power readings remain authoritative, including if telemetry then becomes unavailable.
+Listeners consume each power event's sample rather than a later state-machine
+value. The confirmation sample timestamp retires older queued readings, so they
+cannot reinstate a peak after a proven reduction.
+
 Compact statistics are retained for aggregate performance and SOC bands below 60%,
 60–80%, 80–90%, and 90–100%. A band requires three sessions and 60 observed minutes.
 The conservative efficiency estimate includes a 10% margin. Sensor or capability
@@ -147,6 +165,11 @@ normal economic windows/price ceilings. It does not bypass capacity, connected-v
 SOC, recovery or charger checks. Its expiry and the earlier outage deadline are enforced
 by the actuator timer. `ha_energy_planner.cancel_charge_now` stops and applies the normal
 one-hour manual-stop hold. Vehicle swaps/unplug continue to invalidate session overrides.
+
+The adapter also checks the charging lease before every start/retry and while
+waiting for confirmation. A dispatched start that reaches its deadline requires
+a safe stop; delayed successful feedback cannot renew authority. An unconfirmed
+stop retains recovery ownership and capacity for the existing retry policy.
 
 Full recovery needs two advancing samples at least 60 seconds apart. Retain the first
 sample for up to 30 minutes; require only the newest to meet the configurable 1–30 minute

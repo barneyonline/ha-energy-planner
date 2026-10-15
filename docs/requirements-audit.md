@@ -1227,3 +1227,37 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 - `plan_presentation.py`, `sensor.py` and `diagnostics.py` expose stale planning and current export blockers independently of input health. Planning boundary callbacks publish clock-dependent status without waiting for a refresh. `tests/test_sensor.py` covers exact freshness limits and blocked intent; the full `scripts/docker-validate.sh` gate includes all regressions.
 
 - Docker test and environment-report runners bootstrap pinned pytest/coverage tools with `scripts/install-test-dependencies.sh` and `tests/requirements.txt`. Both quality-scale workflows and coverage jobs use the same bootstrap; stable and minimum-version compatibility remain required. `tests/scripts/test_select_ci_checks.py` verifies that test-tool changes select all dependent CI checks. Fresh stable-image reproduction and the full Docker gate verify the missing-pytest regression without relying on a cached development image.
+
+### Delayed device feedback and EV execution deadlines
+
+- `executor.py` retains an accepted HVAC command's original two-minute feedback
+  expectation after a readback timeout. `tests/test_coordinator.py` replays delayed
+  temperature feedback during a mode retry through the real executor callback and
+  state listener, including conflicting/user/automation feedback, expiry,
+  cancellation, service failure and supersession.
+- `ev_adapter.py` enforces a start's charging lease across confirmation and retries,
+  requiring a safe stop after a dispatched command expires. `tests/test_ev_adapter.py`
+  and `tests/test_executor.py` cover expired authority, late feedback, uncertain
+  compensation and retained recovery ownership/capacity.
+- `ev_telemetry.py` prefers authoritative `sampled_at_utc` over HA report timestamps.
+  `tests/test_ev_telemetry.py` and its sanitized Enphase payload fixture cover cached,
+  invalid, stale and future samples and conservative spending; power-limit
+  confirmation uses the same timestamp contract.
+- Fresh observed EV draw raises grid reservation high-watermarks, including when
+  it contradicts a previously confirmed limit. The coordinator persists increased
+  capacity under the command lock and forces a refresh even below the usual
+  material-change threshold. `tests/test_control_runtime.py` and
+  `tests/test_coordinator.py` check grid-limit enforcement, retained capacity on
+  lower/unavailable feedback, queued shutdown and persistence across reload.
+  Regressions also cover a transient save failure preserving the safety refresh,
+  observed increases surviving rejected-start rollback without retaining unissued
+  requested load, and confirmed reductions retiring old physical peaks.
+  Confirmations are reconciled before notification and ledger awaits; real HA
+  transaction regressions retain newer, higher power through those waits and
+  subsequent unavailable telemetry, persistence and reload.
+  Nested HA event dispatch regressions preserve a queued peak followed by zero or
+  unavailable telemetry, while an older queued peak cannot undo a newer confirmed
+  reduction or recreate a released reservation. Power-limit outcomes retain the
+  actual confirmation sample timestamp for this ordering boundary.
+  No live device acceptance or savings are implied by these regressions. The
+  complete gate remains `scripts/docker-validate.sh`.
