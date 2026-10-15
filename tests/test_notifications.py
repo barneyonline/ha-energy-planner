@@ -80,3 +80,80 @@ def test_entry_cleanup_cancels_only_owned_callbacks_even_during_flush(monkeypatc
         assert hass.data == {}
 
     asyncio.run(run())
+
+
+def test_running_result_supersedes_callback_waiting_behind_another_entry(monkeypatch: Any) -> None:
+    async def run() -> None:
+        hass = SimpleNamespace(state=CoreState.starting, data={})
+        monkeypatch.setattr(notifications_module, "async_at_started", lambda *args: lambda: None)
+        entered, release = asyncio.Event(), asyncio.Event()
+        seen: list[str] = []
+
+        async def slow() -> None:
+            entered.set()
+            await release.wait()
+
+        async def obsolete() -> None:
+            seen.append("obsolete")
+
+        async def current() -> None:
+            seen.append("current")
+
+        notifications_module.defer_persistent_notification(hass, "slow", slow, owner_id="other")
+        notifications_module.defer_persistent_notification(hass, "report", obsolete, owner_id="planner")
+        hass.state = CoreState.running
+        flush = asyncio.create_task(notifications_module._async_flush_deferred_notifications(hass))
+        await entered.wait()
+        assert not notifications_module.defer_persistent_notification(hass, "report", current, owner_id="planner")
+        await current()
+        release.set()
+        await flush
+        assert seen == ["current"]
+        assert hass.data == {}
+
+    asyncio.run(run())
+
+
+def test_entry_removal_dismisses_only_its_notifications_and_pending_callbacks(monkeypatch: Any) -> None:
+    async def run() -> None:
+        calls: list[Any] = []
+
+        async def dispatch(domain: str, service: str, data: dict[str, str], **kwargs: Any) -> None:
+            calls.append((domain, service, data))
+
+        hass = SimpleNamespace(state=CoreState.starting, data={}, services=SimpleNamespace(async_call=dispatch))
+        monkeypatch.setattr(notifications_module, "async_at_started", lambda *args: lambda: None)
+        notifications_module.defer_persistent_notification(hass, "mine", lambda: asyncio.sleep(0), owner_id="removed")
+        notifications_module.defer_persistent_notification(
+            hass, "theirs", lambda: asyncio.sleep(0), owner_id="retained",
+        )
+        await notifications_module.async_dismiss_entry_notifications(hass, "removed")
+        assert all(data["notification_id"].endswith("_removed") for _, _, data in calls)
+        assert any(data["notification_id"] == "ha_energy_planner_ai_explanation_removed" for _, _, data in calls)
+        assert any(data["notification_id"] == "ha_energy_planner_restore_safe_state_ev_removed" for _, _, data in calls)
+        pending = hass.data[notifications_module._DEFERRED_NOTIFICATIONS_DATA_KEY]
+        assert list(pending.callbacks) == ["theirs"]
+
+    asyncio.run(run())
+
+
+def test_startup_flush_completes_remaining_callbacks_after_one_raises(monkeypatch: Any) -> None:
+    async def run() -> None:
+        hass = SimpleNamespace(state=CoreState.starting, data={})
+        monkeypatch.setattr(notifications_module, "async_at_started", lambda *args: lambda: None)
+        calls: list[str] = []
+
+        async def failed() -> None:
+            raise RuntimeError("notification service temporarily unavailable")
+
+        async def recovered() -> None:
+            calls.append("created")
+
+        notifications_module.defer_persistent_notification(hass, "failed", failed)
+        notifications_module.defer_persistent_notification(hass, "recovered", recovered)
+        hass.state = CoreState.running
+        await notifications_module._async_flush_deferred_notifications(hass)
+        assert calls == ["created"]
+        assert hass.data == {}
+
+    asyncio.run(run())

@@ -39,6 +39,7 @@ _DICT_FIELDS = {
     "built_in_load_forecast",
     "load_source_outage",
     "ownership",
+    "restore_notification_failures",
     "control_pause",
     "production",
     "thermal_model",
@@ -371,6 +372,10 @@ class PlannerStore:
         """Persist planner ownership state."""
         await self._async_set_if_changed("ownership", ownership)
 
+    async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
+        """Retain unresolved notification scopes independently of bounded audit history."""
+        await self._async_set_if_changed("restore_notification_failures", failures)
+
     async def async_save_ev_grid_reservation(self, reservation: dict[str, Any]) -> None:
         """Persist the conservative active EV grid reservation."""
         await self._async_set_if_changed("ev_grid_reservation", reservation)
@@ -454,6 +459,7 @@ def _default_data() -> dict[str, Any]:
         "audit_history_version": 1,
         "action_attempts": [],
         "ownership": {},
+        "restore_notification_failures": {},
         "overrides": [],
         "forecast_snapshots": [],
         "dry_run_comparisons": [],

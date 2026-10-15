@@ -821,6 +821,9 @@ class FakeStore:
     async def async_flush(self) -> None:
         pass
 
+    async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
+        self.data["restore_notification_failures"] = failures
+
     async def async_save_ownership(self, ownership: dict[str, object]) -> None:
         self.data["ownership"] = ownership
 
