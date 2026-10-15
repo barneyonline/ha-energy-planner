@@ -261,3 +261,112 @@ def test_confirmed_unplug_retires_session_alerts_without_claiming_device_restora
     assert "ha_energy_planner_ev_interrupted_garage" in _alerts(executor.hass, "dismiss")
     assert "ha_energy_planner_ev_infeasible_garage" in _alerts(executor.hass, "dismiss")
     assert "ha_energy_planner_restore_safe_state_ev_garage" not in _alerts(executor.hass, "dismiss")
+
+
+@pytest.mark.parametrize("scope", [None, "ev"])
+@pytest.mark.parametrize("failure", ["exception", "service_unavailable"])
+def test_failed_restore_alert_dismissal_retries_after_refresh_and_reload(
+    scope: str | None, failure: str,
+) -> None:
+    executor = _executor()
+    notification_id = "ha_energy_planner_restore_safe_state" + ("_ev" if scope else "") + "_garage"
+    services = executor.hass.services
+    original_call = services.async_call
+    original_has_service = services.has_service
+    fail = True
+
+    async def dispatch(domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+        if fail and failure == "exception" and service == "dismiss" and data.get("notification_id") == notification_id:
+            raise RuntimeError("temporary notification service failure")
+        await original_call(domain, service, data, blocking)
+
+    services.async_call = dispatch
+    services.has_service = lambda domain, service: not (
+        fail and failure == "service_unavailable" and service == "dismiss"
+    ) and original_has_service(domain, service)
+
+    async def run() -> None:
+        nonlocal fail
+        await executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="ev_failed"), scope=scope, unresolved_assets={"ev"},
+        )
+        await executor.async_resolve_restore_notifications("ev")
+        assert executor.store.data["restore_notification_failures"].get(scope or "all") == []
+        fail = False
+        services.calls.clear()
+        reloaded = Executor(executor.store, hass=executor.hass, entry_id="garage")
+        await reloaded.async_notify_plan_fallback(_plan(), [])
+        assert notification_id in _alerts(executor.hass, "dismiss")
+        assert executor.store.data["restore_notification_failures"] == {}
+
+    asyncio.run(run())
+
+
+def test_failed_combined_alert_update_retries_without_restoring_another_asset() -> None:
+    executor = _executor()
+    services = executor.hass.services
+    original = services.async_call
+    fail = False
+
+    async def dispatch(domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+        if fail and service == "create":
+            raise RuntimeError("temporary notification service failure")
+        await original(domain, service, data, blocking)
+
+    services.async_call = dispatch
+
+    async def run() -> None:
+        nonlocal fail
+        await executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="ev_failed:hvac_failed"),
+            unresolved_assets={"ev", "daikin"},
+        )
+        fail = True
+        await executor.async_resolve_restore_notifications("ev")
+        assert executor.store.data["restore_notification_failures"] == {"all": ["daikin"]}
+        services.calls.clear()
+        fail = False
+        await executor.async_notify_plan_fallback(_plan(), [])
+        updated = [data["message"] for _, name, data in services.calls if name == "create"]
+        assert len(updated) == 1
+        assert "daikin" in updated[0] and "ev_failed" not in updated[0]
+        assert executor.store.data["restore_notification_failures"] == {"all": ["daikin"]}
+        services.calls.clear()
+        await executor.async_notify_plan_fallback(_plan(), [])
+        assert not _alerts(executor.hass, "create")
+
+    asyncio.run(run())
+
+
+def test_refresh_retry_cannot_overwrite_a_concurrent_device_failure() -> None:
+    executor = _executor()
+    services = executor.hass.services
+    original = services.async_call
+
+    async def run() -> None:
+        await executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="ev_failed"), unresolved_assets={"ev"},
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def dispatch(domain: str, service: str, data: dict[str, Any], blocking: bool = False) -> None:
+            if service == "dismiss" and data["notification_id"] == "ha_energy_planner_restore_safe_state_garage":
+                entered.set()
+                await release.wait()
+            await original(domain, service, data, blocking)
+
+        services.async_call = dispatch
+        recovered = asyncio.create_task(executor.async_resolve_restore_notifications("ev"))
+        await entered.wait()
+        failed = asyncio.create_task(executor._async_notify_restore(
+            SimpleNamespace(result=OutcomeResult.FAILED, reason="hvac_failed"), unresolved_assets={"daikin"},
+        ))
+        await asyncio.sleep(0)
+        assert not failed.done()
+        release.set()
+        await asyncio.gather(recovered, failed)
+        assert executor.store.data["restore_notification_failures"] == {"all": ["daikin"]}
+        last = next(data for _, service, data in reversed(services.calls) if service == "create")
+        assert "hvac_failed" in last["message"]
+
+    asyncio.run(run())
