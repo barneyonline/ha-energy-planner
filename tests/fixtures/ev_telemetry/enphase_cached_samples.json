@@ -1,0 +1,30 @@
+{
+  "description": "Redacted Enphase payload shapes: HA may report seeded/cached values after their source sample time.",
+  "power": {
+    "state": "0",
+    "attributes": {
+      "state_class": "measurement",
+      "sampled_at_utc": "2026-10-15T09:46:50+00:00",
+      "last_window_seconds": null,
+      "method": "seeded",
+      "actual_charging": false,
+      "unit_of_measurement": "W",
+      "device_class": "power"
+    },
+    "last_updated": "2026-10-15T09:47:29.820167+00:00",
+    "last_reported": "2026-10-15T09:47:29.820167+00:00"
+  },
+  "energy": {
+    "state": "432.95",
+    "attributes": {
+      "state_class": "total_increasing",
+      "sampled_at_utc": "2026-10-15T09:46:50+00:00",
+      "last_reset_value": null,
+      "last_reset_at": null,
+      "unit_of_measurement": "kWh",
+      "device_class": "energy"
+    },
+    "last_updated": "2026-10-15T09:46:50.568256+00:00",
+    "last_reported": "2026-10-15T09:46:57.143486+00:00"
+  }
+}

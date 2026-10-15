@@ -15,6 +15,12 @@ VERSION = 1
 
 def reported_at(state: Any) -> datetime | None:
     """Return the timestamp of the actual sensor report, never the planner poll."""
+    attributes = getattr(state, "attributes", {}) or {}
+    if "sampled_at_utc" in attributes:
+        # Cached vendor readings may be re-reported to HA indefinitely. An
+        # explicit source timestamp remains authoritative, including when it
+        # is invalid; HA's report time cannot make that sample fresh.
+        return timestamp(attributes["sampled_at_utc"])
     stamp = getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
     return stamp if isinstance(stamp, datetime) and stamp.tzinfo is not None else None
 
