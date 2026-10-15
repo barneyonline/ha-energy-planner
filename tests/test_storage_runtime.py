@@ -148,10 +148,17 @@ def test_entry_removal_preserves_uncertain_evidence(tmp_path: Path, ownership, r
     async def run():
         hass = HomeAssistant(str(tmp_path))
         store = PlannerStore(hass, "runtime")
+        alerts = {"ha_energy_planner_restore_safe_state_ev_runtime", "ha_energy_planner_ev_infeasible_other"}
+        async def dismiss(call):
+            alerts.discard(call.data["notification_id"])
+        hass.services.async_register("persistent_notification", "dismiss", dismiss)
         try:
             await store._store.async_save({"ownership": ownership, "ev_grid_reservation": reservation})
             await async_remove_entry(hass, SimpleNamespace(entry_id="runtime"))
+            await hass.async_block_till_done()
             assert Path(store._store.path).exists() is not removed
+            assert ("ha_energy_planner_restore_safe_state_ev_runtime" in alerts) is not removed
+            assert "ha_energy_planner_ev_infeasible_other" in alerts
             empty = PlannerStore(hass, "absent")
             assert await empty.async_remove_if_safe()
         finally:

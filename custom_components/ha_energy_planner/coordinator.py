@@ -1162,6 +1162,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 options = self.planner_options
                 now = dt_util.utcnow()
                 export_control = ExportLimitControl(self.hass, self.store, entry_data)
+                was_restoring = bool(export_control.state.get("restoring"))
                 await export_control.reconcile(now)
                 if getattr(self, "_tearing_down", False):
                     return
@@ -1176,6 +1177,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     if not export_control.state and not export_issue and not observed["pending"]:
                         await export_control.save({"identity": observed["identity"], "expected": {
                             "watts": observed["watts"], "slew_rate": observed["slew_rate"]}})
+                if was_restoring and not export_control.state.get("baseline"):
+                    await self.executor.async_resolve_restore_notifications(EXPORT_ASSET)
 
     async def _async_update_data_locked(self, *, defer_execution: bool = False) -> EnergyPlan:
         """Refresh planner data while holding the planner lock."""

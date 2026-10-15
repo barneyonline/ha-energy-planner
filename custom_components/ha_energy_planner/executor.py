@@ -91,6 +91,8 @@ _EV_INTERRUPTED_NOTIFICATION_ID = "ha_energy_planner_ev_interrupted"
 _EV_INFEASIBLE_NOTIFICATION_ID = "ha_energy_planner_ev_infeasible"
 _HVAC_CAPABILITY_NOTIFICATION_ID = "ha_energy_planner_hvac_capability"
 _STARTUP_RECOVERY_NOTIFICATION_ID = "ha_energy_planner_startup_recovery"
+_RESTORE_NOTIFICATION_ID = "ha_energy_planner_restore_safe_state"
+_RESTORE_ASSETS = frozenset({"ev", "daikin", "enphase", EXPORT_ASSET})
 _UNOWNED_ENPHASE_STARTUP_RESTORE_REASONS = frozenset(
     {
         "production_evidence_contract_changed",
@@ -196,6 +198,10 @@ class Executor:
             self.hass is not None
             and connection(state_value(self.hass, self.entry_data.get(CONF_EV_CONNECTED))) is False
         ):
+            await self._async_dismiss_notifications((
+                self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID),
+                self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID),
+            ))
             telemetry = dict(self.store.data.get("ev_telemetry", {}))
             if telemetry:
                 telemetry["emergency_spend"] = 0.0
@@ -480,6 +486,7 @@ class Executor:
             ownership.pop(_EV_COMMAND_ENTITY_OWNERSHIP_KEY, None)
             ownership.pop(_EV_CONTROL_TOPOLOGY_OWNERSHIP_KEY, None)
             await self.store.async_save_ownership(ownership)
+            await self.async_resolve_restore_notifications("ev")
         elif enabled and provisional_ownership and not self._has_ev_grid_reservation():
             await self._async_clear_provisional_ev_ownership()
         if enabled and result.applied:
@@ -842,6 +849,8 @@ class Executor:
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             if not _ev_action_wants_power(action) and safe_stop_confirmed:
                 await self._async_end_ev_exposure(safe_stop_confirmed=True)
+                if ev_result.applied:
+                    await self.async_resolve_restore_notifications("ev")
 
             stored_ownership = self.store.data.get("ownership")
             planner_owned_stop = bool(
@@ -1442,6 +1451,8 @@ class Executor:
             desired_state={"release_reason": reason},
         )
         await self.store.async_add_outcome(outcome)
+        if not failed:
+            await self.async_resolve_restore_notifications("daikin")
         return outcome
 
     async def async_restore_safe_state(self, reason: str) -> ActionOutcome:
@@ -1489,6 +1500,13 @@ class Executor:
             assets is None and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
             and reason in {"startup_grace_unsafe", "startup_auto_recovery", "startup_control_paused"}
         )
+        attempted_assets = {
+            asset for asset, enabled in (("ev", restore_ev), ("daikin", restore_hvac),
+                                        ("enphase", restore_enphase), (EXPORT_ASSET, restore_export))
+            if enabled
+        }
+        failed_assets: set[str] = set()
+        pending_assets: set[str] = set()
         restore_requested = bool(
             (restore_export and ownership.get(EXPORT_ASSET, {}).get("baseline")) or
             (restore_ev and (ev_state or has_ev_reservation))
@@ -1499,6 +1517,7 @@ class Executor:
         if restore_requested and self.hass is None:
             restore_failed = True
             reasons.append("home_assistant_unavailable")
+            failed_assets.update(attempted_assets)
         elif self.hass is not None:
             if restore_ev and (ev_state or has_ev_reservation):
                 try:
@@ -1533,6 +1552,7 @@ class Executor:
                 except Exception:  # noqa: BLE001 - restoration must continue for the other assets.
                     restore_failed = True
                     reasons.append("ev_restore_exception")
+                    failed_assets.add("ev")
                     self._retain_ev_grid_reservation_when_unloaded()
                 else:
                     results.append(ev_result)
@@ -1549,6 +1569,7 @@ class Executor:
                             self._release_ev_grid_reservation()
                     else:
                         restore_failed = True
+                        failed_assets.add("ev")
                         self._retain_ev_grid_reservation_when_unloaded()
 
             if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
@@ -1605,6 +1626,7 @@ class Executor:
                             hvac_zone_state.pop(entity_id, None)
                     restore_failed = True
                     reasons.append("hvac_restore_exception")
+                    failed_assets.add("daikin")
                     retained_hvac_control = dict(hvac_control)
                     retained_hvac_control["zone_states"] = hvac_zone_state
                     retained_hvac_control["required_evidence_lost"] = "hvac_release_failed"
@@ -1622,6 +1644,7 @@ class Executor:
                             remaining_ownership.pop(key, None)
                     else:
                         restore_failed = True
+                        failed_assets.add("daikin")
                         saved_automation_result = getattr(hvac_result, "saved_automation_states", None)
                         unresolved_automations = dict(
                             hvac_state if saved_automation_result is None else saved_automation_result
@@ -1679,6 +1702,7 @@ class Executor:
                 except Exception:  # noqa: BLE001 - restoration must preserve retry state.
                     restore_failed = True
                     reasons.append("enphase_restore_exception")
+                    failed_assets.add("enphase")
                 else:
                     results.append(enphase_result)
                     reasons.append(enphase_result.reason)
@@ -1693,6 +1717,7 @@ class Executor:
                         )
                     ):
                         restore_failed = True
+                        failed_assets.add("enphase")
 
         # Ownership metadata that cannot represent a pending device restore can
         # always be released. Device baselines above are retained until their
@@ -1716,6 +1741,9 @@ class Executor:
             reasons.append(export_reason)
             if export_result == OutcomeResult.FAILED:
                 restore_failed = True
+                failed_assets.add(EXPORT_ASSET)
+            elif export_result == OutcomeResult.PENDING:
+                pending_assets.add(EXPORT_ASSET)
             remaining_ownership.pop(EXPORT_ASSET, None)
             current_export = self.store.data.get("ownership", {}).get(EXPORT_ASSET)
             if current_export:
@@ -1749,7 +1777,11 @@ class Executor:
         )
         await self.store.async_add_outcome(outcome)
         notification_scope = None if assets is None else next(iter(assets))
-        await self._async_notify_restore(outcome, scope=notification_scope)
+        await self._async_notify_restore(
+            outcome, scope=notification_scope,
+            restored_assets=attempted_assets - failed_assets - pending_assets,
+            unresolved_assets=failed_assets | pending_assets,
+        )
         return outcome
 
     def _action_outcome(
@@ -2049,7 +2081,9 @@ class Executor:
             return
         if plan.mode in {PlannerMode.DISABLED, PlannerMode.DRY_RUN}:
             self._plan_fallback_notification_signatures.clear()
-            await self._async_dismiss_notifications(self._plan_fallback_notification_ids())
+            await self._async_dismiss_notifications((
+                *self._plan_fallback_notification_ids(), self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID),
+            ))
             return
         climate_target_issues = [
             issue
@@ -2121,10 +2155,20 @@ class Executor:
         # Remove notifications created by releases that supported the retired
         # optimizer. This is intentionally cleanup-only and never creates one.
         await self._async_dismiss_plan_fallback_notification(self._notification_id(_RETIRED_FALLBACK_NOTIFICATION_ID))
-        if not any(
-            action.asset == ActionAsset.EV and action.desired_state.get("infeasible") for action in plan.actions
-        ):
+        infeasible = next((action for action in plan.actions
+                           if action.asset == ActionAsset.EV and action.desired_state.get("infeasible")), None)
+        if self.options.get(CONF_EV_CONTROL_ENABLED, True) and infeasible is not None:
+            await self._async_notify_ev_infeasible(infeasible)
+        else:
             await self._async_dismiss_plan_fallback_notification(self._notification_id(_EV_INFEASIBLE_NOTIFICATION_ID))
+        target_satisfied = any(
+            action.asset == ActionAsset.EV
+            and not action.desired_state.get("charging_required_now")
+            and finite(action.desired_state.get("required_charge_percent")) == 0
+            for action in plan.actions
+        )
+        if not self.options.get(CONF_EV_CONTROL_ENABLED, True) or target_satisfied:
+            await self._async_dismiss_plan_fallback_notification(self._notification_id(_EV_INTERRUPTED_NOTIFICATION_ID))
 
     async def async_notify_startup_recovery_unsafe(self, reason: str) -> None:
         """Notify once when startup safety disarms retained automatic intent."""
@@ -2147,24 +2191,66 @@ class Executor:
         """Return whether startup warm-up should suppress fallback notifications."""
         return self.notification_grace_until is not None and dt_util.utcnow() < self.notification_grace_until
 
-    async def _async_notify_restore(self, outcome: ActionOutcome, *, scope: str | None = None) -> None:
-        """Notify only when a safe-state restore requires user attention."""
-        notification_key = "ha_energy_planner_restore_safe_state"
-        if scope is not None:
-            notification_key = f"{notification_key}_{scope}"
-        notification_id = self._notification_id(notification_key)
+    async def async_resolve_restore_notifications(self, *assets: str, all_restored: bool = False) -> None:
+        """Clear only alerts whose device restoration has been confirmed."""
+        failures = dict(self.store.data.get("restore_notification_failures", {}))
+        updated = {
+            scope: sorted(set(unresolved) - set(assets))
+            for scope, unresolved in failures.items()
+        }
+        for asset in assets:
+            await self._async_dismiss_plan_fallback_notification(
+                self._notification_id(f"{_RESTORE_NOTIFICATION_ID}_{asset}")
+            )
+            updated.pop(asset, None)
+        if all_restored:
+            updated.clear()
+        remaining = updated.get("all")
+        if all_restored or remaining == []:
+            updated.pop("all", None)
+            await self._async_dismiss_plan_fallback_notification(self._notification_id(_RESTORE_NOTIFICATION_ID))
+        elif remaining and remaining != failures.get("all"):
+            await self._async_create_plan_fallback_notification(
+                title=self._notification_title("safe-state restore failed"),
+                message=_restore_notification_message("unresolved_restore:" + ":".join(remaining)),
+                notification_id=self._notification_id(_RESTORE_NOTIFICATION_ID),
+            )
+        if updated != failures:
+            await self.store.async_save_restore_notification_failures(updated)
+
+    async def _async_notify_restore(
+        self, outcome: ActionOutcome, *, scope: str | None = None,
+        restored_assets: set[str] | None = None, unresolved_assets: set[str] | None = None,
+    ) -> None:
+        """Reconcile full and device-scoped alerts without hiding pending recovery."""
+        if restored_assets is None:
+            restored_assets = (set(_RESTORE_ASSETS) if scope is None else {scope}) if (
+                outcome.result == OutcomeResult.RESTORED
+            ) else set()
+        await self.async_resolve_restore_notifications(
+            *sorted(restored_assets),
+            all_restored=scope is None and restored_assets == _RESTORE_ASSETS,
+        )
         if outcome.result != OutcomeResult.FAILED:
-            await self._async_dismiss_plan_fallback_notification(notification_id)
             return
+        failures = dict(self.store.data.get("restore_notification_failures", {}))
+        failures[scope or "all"] = sorted(
+            set(failures.get(scope or "all", [])) | (unresolved_assets or {scope or "all"})
+        )
+        await self.store.async_save_restore_notification_failures(failures)
+        notification_key = _RESTORE_NOTIFICATION_ID if scope is None else f"{_RESTORE_NOTIFICATION_ID}_{scope}"
         await self._async_create_plan_fallback_notification(
             title=self._notification_title("safe-state restore failed"),
             message=_restore_notification_message(outcome.reason),
-            notification_id=notification_id,
+            notification_id=self._notification_id(notification_key),
         )
 
     async def _async_notify_ev_infeasible(self, action: ControlAction) -> None:
         """Create a persistent notification for infeasible EV ready-by plans."""
-        if action.asset != ActionAsset.EV or not action.desired_state.get("infeasible"):
+        if (action.asset != ActionAsset.EV or not action.desired_state.get("infeasible")
+                or not self.options.get(CONF_EV_CONTROL_ENABLED, True)
+                or not strict_bool(self.options.get(CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED), default=True)
+                or self._in_notification_grace_period()):
             return
         evidence = action.desired_state.get("optimization", {})
         action_limited = evidence.get("search_status") == "ev_daily_action_cap_reached"
@@ -2280,7 +2366,7 @@ class Executor:
     async def _async_dismiss_notifications(self, notification_ids: tuple[str, ...]) -> None:
         """Dismiss persistent notifications if the service is available."""
         for notification_id in notification_ids:
-            await self._async_dismiss_notification(notification_id)
+            await self._async_dismiss_plan_fallback_notification(notification_id)
 
     async def _async_dismiss_notification(self, notification_id: str) -> None:
         """Dismiss a persistent notification if the service is available."""

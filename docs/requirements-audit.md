@@ -359,7 +359,17 @@ use throughout; the Docker and pull-request gates enforce that result.
   notification creation is queued until Home Assistant reaches its running
   state, after every integration has had a chance to load. Each stable ID keeps
   only its latest queued alert, and recovery dismissals cancel that alert before
-  startup completes.
+  startup completes. Current plan evidence refreshes EV infeasibility diagnoses before
+  execution, and disabled/review control retires obsolete EV interruption alerts.
+  Confirmed EV stops, climate releases, and Export Limit restoration readback clear
+  the matching restore warnings; pending or guarded restores do not. Full restoration
+  clears all entry-scoped restore IDs. Compact device-scope failure metadata survives
+  reloads independently of bounded audit history, so partial recovery retains only
+  unresolved combined warnings. Resolved entry removal cleans up its own report and
+  alert IDs. Reports published after startup supersede queued versions before they
+  can replay. Regressions: `tests/test_notification_recovery.py`,
+  `tests/test_notifications.py`, `tests/test_storage.py`, `tests/test_export_limit.py`,
+  and `tests/test_storage_runtime.py`.
 - Discovery records non-commanding capability evidence for EV, Daikin,
   Enphase, and the local AI service before active control is allowed.
 - AI explanation and troubleshooting is on-demand, minimized, structured, and

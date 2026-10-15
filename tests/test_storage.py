@@ -1362,3 +1362,17 @@ def test_climate_outcome_retry_deduplication_preserves_redacted_last_readback(mo
     assert audit[0]["outcome"]["post_state"] == {"climate.zone": "off"}
     assert audit[0]["outcome"]["command_sent"] is True
     assert "secret" not in repr(audit)
+
+
+def test_restore_notification_failures_survive_reload_without_raw_reason_text(monkeypatch: Any) -> None:
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    FakeStore.saved = None
+    store = PlannerStore(object())
+    failures = {"all": ["daikin", "ev"], "ev": ["ev"]}
+    asyncio.run(store.async_save_restore_notification_failures(failures))
+    assert FakeStore.saved["restore_notification_failures"] == failures
+    FakeStore.loaded = FakeStore.saved
+    reloaded = PlannerStore(object())
+    asyncio.run(reloaded.async_load())
+    assert reloaded.data["restore_notification_failures"] == failures
