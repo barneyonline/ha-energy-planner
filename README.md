@@ -186,6 +186,26 @@ the background, publishes only for the current configuration, and backs off
 failed EV history imports for 15 minutes. Plans remain subject to the existing
 input-health and control safety gates while training is pending.
 
+Climate readback timeouts retain the original two-minute command feedback window.
+Delayed matching thermostat feedback does not create a manual hold; user changes,
+conflicting controls, superseding commands and expired expectations retain their
+normal override handling. EV start confirmation and retries respect the charging
+lease deadline, with a safe stop required if a dispatched start expires.
+
+EV sensors with `sampled_at_utc` use that source timestamp for freshness and
+power-limit confirmation. Invalid or stale source timestamps cannot be replaced
+by a newer Home Assistant report time. Fresh measured EV power above the
+configured rate raises the retained grid reservation; lower or missing readings
+alone do not release that capacity. Rejected starts retain concurrently observed
+load without reserving an unissued increase. Capacity events still request a
+safety refresh if their initial persistence attempt fails; command durability
+checks remain in force.
+Command confirmations are applied before notification and ledger waits, preserving
+newer measured load received during those waits.
+Power listeners retain each event's reading even when nested Home Assistant
+dispatch has already published another value; older samples cannot undo a newer
+confirmed power reduction.
+
 Storage errors block new device acquisitions until recovery evidence is successfully written. Check disk space and Home Assistant storage permissions if a save fails. Startup recovery waits 30 seconds between unexpected failures. Use the restore action for existing ownership and verify device feedback before resuming control.
 
 ## Removal

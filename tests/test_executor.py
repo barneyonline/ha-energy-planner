@@ -7784,6 +7784,52 @@ def test_charge_now_bypasses_price_ceiling_with_a_timer_but_not_target_or_capaci
     assert store.data["outcomes"][-1].desired_state["charge_now_until"] == until.isoformat()
 
 
+def test_charge_now_expiring_during_confirmation_retains_uncertain_load(monkeypatch) -> None:
+    """A failed compensating stop must retain durable charger recovery state."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"binary_sensor.ev_connected": "on", "input_boolean.ev_charger": "off",
+                     "sensor.feedback": "SUSPENDED_EVSE"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id="ev-a", runtime_data=object())])
+    original_call = hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        if service == "turn_off":
+            raise RuntimeError("stop rejected")
+        await original_call(domain, service, data, blocking)
+        clock[0] = now + timedelta(seconds=2)
+        hass.states.values["sensor.feedback"] = "CHARGING"
+
+    hass.services.async_call = dispatch
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={
+        CONF_EV_CONNECTED: "binary_sensor.ev_connected", CONF_EV_CHARGER: "input_boolean.ev_charger",
+        CONF_EV_CHARGING: "sensor.feedback",
+    }, options={CONF_EV_CHARGE_RATE_KW: 7, CONF_GRID_IMPORT_LIMIT_KW: 10,
+                CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0}, entry_id="ev-a")
+    deadlines = []
+    executor.ev_allocation_deadline_callback = deadlines.append
+    ctx = _context(now)
+    ctx.ev_connected, ctx.ev_target_soc_percent = True, 80
+    until = now + timedelta(seconds=1)
+
+    result = asyncio.run(executor.async_manual_ev_charging(True, ctx, charge_now_until=until))
+
+    assert result.reason == "ev_allocation_expired"
+    assert not result.applied and result.command_sent
+    assert result.safe_state_confirmed is False
+    assert result.rollback_succeeded is False
+    assert deadlines == [until]
+    assert store.data["ownership"]["ev_smart_charging_state"][CONF_EV_CHARGER] == "off"
+    reservation = hass.data["ha_energy_planner"]["ev_grid_reservations"]["ev-a"]
+    assert reservation["load_kw"] == 7 and reservation["retain_when_unloaded"] is True
+    assert store.data["ev_grid_reservation"]["active"] is True
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+
+
 def test_charge_now_fallback_capacity_failure_is_audited_before_any_start() -> None:
     now = datetime.now(UTC)
     hass = FakeHass({"binary_sensor.ev_connected": "on", "input_boolean.ev_charger": "off"})

@@ -87,6 +87,8 @@ from custom_components.ha_energy_planner.coordinator import (
     _updated_load_source_outage,
     _weather_forecast_from_response,
 )
+from custom_components.ha_energy_planner.executor import Executor
+from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
 from custom_components.ha_energy_planner.models import (
     ActionAsset,
     ActionKind,
@@ -2112,7 +2114,7 @@ def test_start_listeners_handles_manual_ev_and_material_changes(monkeypatch: obj
 
     synced = []
     coordinator.entry.data["ev_power_limit_entity"] = "number.limit"
-    coordinator.executor = SimpleNamespace(sync_ev_grid_reservation=lambda: synced.append(True))
+    coordinator.executor = SimpleNamespace(sync_ev_grid_reservation=lambda **kwargs: synced.append(True))
     coordinator.async_start_listeners()
     callback = callbacks[0]
     callback(FakeEvent("climate.daikin", "off", "heat"))
@@ -9687,4 +9689,204 @@ def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, sta
         if stage != "inflight":
             reconcile.assert_not_awaited()
         restore.assert_not_awaited()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "feedback_source",
+    ["retry_context", "fresh_context", "explicit_user", "other_automation", "conflicting_target", "expired"],
+)
+def test_climate_confirmation_timeout_keeps_delayed_feedback_without_creating_manual_hold(monkeypatch, feedback_source):
+    """Replay accepted 24 C feedback arriving during a mode retry after a 5 s timeout."""
+    callbacks = []
+    monkeypatch.setattr(
+        coordinator_module, "async_track_state_change_event",
+        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None),
+    )
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    now = datetime(2026, 10, 15, 4, 0, 12, tzinfo=UTC)
+    clock = [now]
+    monkeypatch.setattr(dt_util, "utcnow", lambda: clock[0])
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"},
+        store_data={"ownership": {"hvac_control": {
+            "phase": "preconditioning", "main_state": {"hvac_mode": "off", "target_temperature": 19},
+        }}},
+    )
+    executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=coordinator.entry_data)
+    coordinator.executor = executor
+    pending = {"hvac_mode": "heat", "target_temperature": 24}
+    executor.pending_hvac_desired_state = pending
+    adapter = DaikinHVACAdapter(coordinator.hass, coordinator.entry_data)
+    executor._configure_pending_hvac_adapter(adapter, pending)
+    coordinator._async_handle_manual_hvac_change = AsyncMock()
+    coordinator._schedule_debounced_refresh = Mock()
+    coordinator.async_start_listeners()
+    target_command = {
+        "entity_id": "climate.daikin", "domain": "climate", "service": "set_temperature",
+        "requested": {"temperature": 24}, "observed": {"hvac_mode": "heat", "target_temperature": 19},
+        "context_id": "target-command", "stage": "issued",
+    }
+    adapter._command_callback(target_command)
+    clock[0] += timedelta(seconds=5.6)
+    adapter._command_callback({**target_command, "stage": "readback_failed", "failure_category": "ConfirmationTimeout"})
+    adapter._command_callback({
+        **target_command, "service": "set_hvac_mode", "requested": {"hvac_mode": "heat"},
+        "context_id": "retry-mode-command", "stage": "issued",
+    })
+    clock[0] += timedelta(seconds=0.6)
+    if feedback_source == "expired":
+        clock[0] = now + timedelta(minutes=2)
+    event = FakeEvent(
+        "climate.daikin", "heat", "heat", old_attributes={"temperature": 19},
+        new_attributes={"temperature": 23 if feedback_source == "conflicting_target" else 24},
+        context_id="retry-mode-command" if feedback_source == "retry_context" else "device-feedback",
+        context_user_id="operator" if feedback_source == "explicit_user" else None,
+        parent_context_id="other-automation" if feedback_source == "other_automation" else None,
+    )
+    callbacks[0](event)
+    if feedback_source in {"retry_context", "fresh_context"}:
+        coordinator._async_handle_manual_hvac_change.assert_not_called()
+        assert not pending.get("manual_override_requested")
+        assert coordinator.store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 19
+        coordinator._schedule_debounced_refresh.assert_not_called()
+    else:
+        coordinator._async_handle_manual_hvac_change.assert_called_once_with(
+            "daikin_state_changed", preserve_main_state=True,
+        )
+        assert executor.hvac_feedback_commands == []
+
+
+@pytest.mark.parametrize("retirement", ["service_failed", "cancelled", "superseded"])
+def test_timed_out_climate_expectation_still_retires_on_failure_cancellation_or_new_target(monkeypatch, retirement):
+    """Retaining a timed-out readback must not authorize obsolete targets."""
+    now = datetime(2026, 10, 15, 4, tzinfo=UTC)
+    clock = [now]
+    monkeypatch.setattr(dt_util, "utcnow", lambda: clock[0])
+    coordinator = _coordinator_for_runtime_services(entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    executor = Executor(coordinator.store)
+    pending = {"hvac_mode": "heat", "target_temperature": 24}
+    adapter = DaikinHVACAdapter(coordinator.hass, coordinator.entry_data)
+    executor._configure_pending_hvac_adapter(adapter, pending)
+    command = {
+        "entity_id": "climate.daikin", "domain": "climate", "service": "set_temperature",
+        "requested": {"temperature": 24}, "observed": {"hvac_mode": "heat", "target_temperature": 19},
+        "context_id": "target-command", "stage": "issued",
+    }
+    adapter._command_callback(command)
+    deadline = executor.hvac_feedback_commands[0]["deadline"]
+    clock[0] += timedelta(seconds=6)
+    adapter._command_callback({**command, "stage": "readback_failed", "failure_category": "ConfirmationTimeout"})
+    assert executor.hvac_feedback_commands[0]["deadline"] == deadline
+    if retirement == "superseded":
+        adapter._command_callback({**command, "context_id": "replacement", "requested": {"temperature": 21}})
+    else:
+        adapter._command_callback({
+            **command, "stage": "service_failed",
+            "failure_category": "CancelledError" if retirement == "cancelled" else "RuntimeError",
+        })
+    event = FakeEvent(
+        "climate.daikin", "heat", "heat", old_attributes={"temperature": 19}, new_attributes={"temperature": 24},
+    )
+    assert not _is_planner_owned_control_feedback(
+        coordinator.entry_data, coordinator.store.data, event, clock[0],
+        pending_hvac_desired_state=pending, feedback_commands=executor.hvac_feedback_commands,
+    )
+    assert all(item["context_id"] != "target-command" for item in executor.hvac_feedback_commands)
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    ["increase", "stale", "lower", "persist_failure", "stopped_while_queued",
+     "shutdown_while_queued", "shutdown_during_persist"],
+)
+def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monkeypatch, scenario):
+    """A small physical increase can cross a hard limit and must bypass the percentage debounce."""
+    async def run():
+        callbacks = []
+        monkeypatch.setattr(
+            coordinator_module, "async_track_state_change_event",
+            lambda hass, entities, callback: callbacks.append(callback) or (lambda: None),
+        )
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+        now = datetime(2026, 10, 15, 4, tzinfo=UTC)
+        monkeypatch.setattr(dt_util, "utcnow", lambda: now)
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"ev_power_entity": "sensor.ev_power"},
+            options={"ev_charge_rate_kw": 7, "grid_import_limit_kw": 14.05, "material_change_threshold_percent": 5},
+        )
+        coordinator._listener_tasks = set()
+        coordinator.hass.async_create_task = asyncio.create_task
+        state = SimpleNamespace(
+            state="6900" if scenario == "lower" else "7100",
+            attributes={
+                "unit_of_measurement": "W",
+                "sampled_at_utc": (now - timedelta(minutes=11) if scenario == "stale" else now).isoformat(),
+            },
+            last_reported=now,
+        )
+        coordinator.hass.states = SimpleNamespace(get=lambda entity: state if entity == "sensor.ev_power" else None)
+        executor = Executor(
+            coordinator.store, hass=coordinator.hass, entry_data=coordinator.entry_data,
+            options=coordinator.options, entry_id=coordinator.entry.entry_id,
+        )
+        coordinator.executor = executor
+        reservations = executor._ev_grid_reservations()
+        reservations[executor.entry_id] = {"load_kw": 7, "limit_kw": 14.05}
+        saved = []
+
+        async def save(reservation):
+            assert coordinator._command_lock.locked()
+            assert not coordinator._planner_lock.locked()
+            saved.append(dict(reservation))
+            if scenario == "persist_failure":
+                raise OSError("transient reservation save failure")
+            coordinator.store.data["ev_grid_reservation"] = dict(reservation)
+            if scenario == "shutdown_during_persist":
+                coordinator._tearing_down = True
+
+        coordinator.store.async_save_ev_grid_reservation = save
+        issues = []
+        context = SimpleNamespace(slots=[SimpleNamespace(
+            baseline_load_forecast_kw=7, baseline_load_forecast_upper_kw=7,
+            projected_ev_load_kw=7, projected_hvac_load_kw=0, pv_forecast_kw=0, pv_forecast_lower_kw=0,
+        )])
+
+        async def refresh():
+            assert not coordinator._command_lock.locked()
+            assert saved
+            issues.append(executor._ev_reservation_safety_issue(context))
+
+        coordinator.async_request_refresh = refresh
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator.async_start_listeners()
+        event = FakeEvent("sensor.ev_power", "7000", state.state, old_attributes=dict(state.attributes))
+        event.data["new_state"] = state
+        assert not _is_material_state_change(event, coordinator.options)
+        await coordinator._command_lock.acquire()
+        callbacks[0](event)
+        await asyncio.sleep(0)
+        assert saved == []
+        if scenario == "stopped_while_queued":
+            executor._release_ev_grid_reservation()
+        elif scenario == "shutdown_while_queued":
+            coordinator._tearing_down = True
+        coordinator._command_lock.release()
+        await asyncio.gather(*coordinator._listener_tasks)
+        coordinator._schedule_debounced_refresh.assert_not_called()
+        if scenario in {"stale", "lower", "shutdown_while_queued"}:
+            assert saved == []
+            assert issues == []
+        elif scenario == "stopped_while_queued":
+            assert saved == [{"active": False}]
+            assert issues == [None]
+        else:
+            assert saved[0]["load_kw"] == pytest.approx(7.1)
+            assert saved[0]["active"] is True
+            if scenario == "shutdown_during_persist":
+                assert issues == []
+            else:
+                assert coordinator._force_next_refresh is True
+                assert issues == ["grid_import_limit_exceeded"]
+
     asyncio.run(run())

@@ -27,6 +27,7 @@ class FakeState:
 
     state: str
     attributes: dict[str, Any] | None = None
+    entity_id: str | None = None
 
 
 class FakeStates:
@@ -1506,3 +1507,230 @@ def test_ev_legacy_ready_by_only_schedule_still_uses_the_charger_switch() -> Non
     assert result.applied
     assert hass.services.calls[-1] == ("switch", "turn_on", {"entity_id": "switch.charger"})
     assert asyncio.run(adapter._async_set_entity_value("sensor.unsupported", 80)) is False
+
+
+@pytest.mark.parametrize("kind", [ActionKind.EV_START, ActionKind.EV_SCHEDULE])
+@pytest.mark.parametrize("failed_stop", [False, True])
+@pytest.mark.parametrize("service_error", [False, True])
+def test_ev_start_lease_expiry_stops_without_retry(monkeypatch, kind, failed_stop, service_error) -> None:
+    """A start waiting for feedback cannot outlive its allocation or retry it."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"switch.charger": "off", "sensor.feedback": "SUSPENDED_EVSE"})
+    original_call = hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        if service == "turn_off" and failed_stop:
+            hass.services.calls.append((domain, service, data))
+            raise RuntimeError("stop rejected")
+        await original_call(domain, service, data, blocking)
+        if service == "turn_on" and service_error:
+            raise RuntimeError("uncertain start completion")
+
+    async def sleep_until_expired(_seconds):
+        clock[0] = now + timedelta(seconds=2)
+        # Feedback arrives at the same time that authority expires. It cannot
+        # turn this into a successful start, even when it says CHARGING.
+        hass.states.values["sensor.feedback"] = "CHARGING"
+
+    hass.services.async_call = dispatch
+    monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", sleep_until_expired)
+    adapter = EVSmartChargingAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
+        confirmation_timeout_seconds=30, confirmation_retries=3,
+    )
+    result = asyncio.run(adapter.async_execute(_action(kind, {
+        "charging_required_now": True, "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
+    })))
+
+    assert result.reason == "ev_allocation_expired"
+    assert not result.applied and result.command_sent
+    assert result.safe_state_confirmed is (not failed_stop)
+    assert result.rollback_succeeded is (not failed_stop)
+    assert [service for _, service, _ in hass.services.calls] == ["turn_on", "turn_off"]
+    assert hass.states.values["switch.charger"] == ("on" if failed_stop else "off")
+
+
+@pytest.mark.parametrize("feedback", [False, True])
+@pytest.mark.parametrize("service_error", [False, True])
+@pytest.mark.parametrize("keep_on", [False, True])
+def test_ev_start_dispatch_finishing_after_lease_is_compensated(
+    monkeypatch, feedback, service_error, keep_on,
+) -> None:
+    """Late service success and late feedback both require an immediate stop."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"switch.charger": "off", "sensor.feedback": "SUSPENDED_EVSE"})
+    original_call = hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        if service == "turn_on":
+            clock[0] = now + timedelta(seconds=2)
+            hass.states.values["sensor.feedback"] = "CHARGING"
+            if service_error:
+                raise RuntimeError("uncertain service completion")
+
+    hass.services.async_call = dispatch
+    mapping = {CONF_EV_CHARGER: "switch.charger"}
+    if feedback:
+        mapping[CONF_EV_CHARGING] = "sensor.feedback"
+    adapter = EVSmartChargingAdapter(hass, mapping, confirmation_timeout_seconds=0)
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
+        "keep_charger_on": keep_on,
+    })))
+
+    assert not result.applied and result.command_sent and result.safe_state_confirmed
+    assert result.reason == "ev_allocation_expired"
+    assert [service for _, service, _ in hass.services.calls] == ["turn_on", "turn_off"]
+
+
+def test_ev_start_expired_before_dispatch_leaves_manual_control_alone(monkeypatch) -> None:
+    now = datetime.now(UTC)
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: now)
+    hass = FakeHass({"switch.charger": "on"})
+    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": now.isoformat(),
+    })))
+
+    assert not result.applied and not result.command_sent
+    assert result.reason == "ev_allocation_expired"
+    assert not hass.services.calls
+
+
+def test_ev_start_does_not_retry_after_lease_expires_between_attempts(monkeypatch) -> None:
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"switch.charger": "off", "sensor.feedback": "SUSPENDED_EVSE"})
+    adapter = EVSmartChargingAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
+        confirmation_retries=3,
+    )
+
+    async def timeout(entity_id, enabled, **kwargs):
+        if enabled:
+            clock[0] = now + timedelta(seconds=2)
+            return "timeout"
+        return "confirmed"
+
+    monkeypatch.setattr(adapter, "_async_confirm_state", timeout)
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
+    })))
+
+    assert not result.applied and result.safe_state_confirmed
+    assert result.reason == "ev_allocation_expired"
+    assert [service for _, service, _ in hass.services.calls] == ["turn_on", "turn_off"]
+
+
+def test_ev_adopted_active_control_is_stopped_when_lease_expires(monkeypatch) -> None:
+    """An already-on start still adopts a bounded allocation while confirming."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"switch.charger": "on", "sensor.feedback": "SUSPENDED_EVSE"})
+
+    async def expire(_seconds):
+        clock[0] = now + timedelta(seconds=2)
+
+    monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", expire)
+    adapter = EVSmartChargingAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
+    )
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
+    })))
+
+    assert not result.applied and result.command_sent and result.safe_state_confirmed
+    assert result.reason == "ev_allocation_expired"
+    assert [service for _, service, _ in hass.services.calls] == ["turn_off"]
+
+
+@pytest.mark.parametrize("stage", ["before_dispatch", "number_dispatch", "number_confirmation"])
+@pytest.mark.parametrize("initial_control", ["on", "off"])
+def test_ev_variable_limit_cannot_cross_start_lease(monkeypatch, stage, initial_control) -> None:
+    """An expired allocation cannot raise an active charger's power setpoint."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    attrs = {"min": 1, "max": 7, "step": 1, "unit_of_measurement": "kW"}
+    hass = FakeHass({"switch.charger": initial_control,
+                     "number.limit": FakeState("3", attrs, "number.limit")})
+    original_call = hass.services.async_call
+
+    async def dispatch(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        if domain == "number":
+            hass.states.values["number.limit"] = FakeState(
+                "3" if stage == "number_confirmation" else str(data["value"]), attrs, "number.limit",
+            )
+            if stage == "number_dispatch":
+                clock[0] = now + timedelta(seconds=2)
+
+    async def expire(_seconds):
+        clock[0] = now + timedelta(seconds=2)
+
+    hass.services.async_call = dispatch
+    monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", expire)
+    adapter = EVSmartChargingAdapter(
+        hass, {CONF_EV_CHARGER: "switch.charger", "ev_power_limit_entity": "number.limit"},
+        power_options={"ev_limit_min": 1, "ev_limit_max": 7},
+    )
+    lease = now if stage == "before_dispatch" else now + timedelta(seconds=1)
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
+        "charge_lease_until": lease.isoformat(),
+        "power_limit": {"entity_id": "number.limit", "value": 6, "unit": "kW", "physical_power_kw": 6},
+    })))
+
+    assert not result.applied and result.reason == "ev_allocation_expired"
+    if stage == "before_dispatch":
+        assert not result.command_sent and not hass.services.calls
+        assert hass.states.values["switch.charger"] == initial_control
+    else:
+        assert result.command_sent and result.safe_state_confirmed
+        assert [service for _, service, _ in hass.services.calls] == ["set_value", "turn_off"]
+        assert hass.states.values["switch.charger"] == "off"
+
+
+def test_ev_legacy_helper_delay_cannot_start_after_allocation_expires(monkeypatch) -> None:
+    """Compatibility helper writes can finish after the outer preflight check."""
+    now = datetime.now(UTC)
+    clock = [now]
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
+    hass = FakeHass({"switch.charger": "off", "input_number.target": "70"})
+    original_call = hass.services.async_call
+
+    async def delayed_helper(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        clock[0] = now + timedelta(seconds=2)
+
+    hass.services.async_call = delayed_helper
+    adapter = EVSmartChargingAdapter(hass, {
+        CONF_EV_CHARGER: "switch.charger", CONF_EV_SMART_CHARGING_TARGET_SOC: "input_number.target",
+    })
+    result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {
+        "target_soc_percent": 80, "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
+    })))
+
+    assert not result.applied and result.reason == "ev_allocation_expired"
+    assert hass.states.values["switch.charger"] == "off"
+    assert hass.services.calls == [("input_number", "set_value", {"entity_id": "input_number.target", "value": 80})]
+
+
+def test_ev_expired_number_write_preserves_active_charger_setpoint(monkeypatch) -> None:
+    """The number writer independently rejects an expired deferred request."""
+    now = datetime.now(UTC)
+    monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: now)
+    attrs = {"min": 1, "max": 7, "step": 1, "unit_of_measurement": "kW"}
+    hass = FakeHass({"switch.charger": "on", "number.limit": FakeState("3", attrs, "number.limit")})
+    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+
+    assert not asyncio.run(adapter._async_write_number("number.limit", 6, valid_until=now))
+    assert hass.states.get("number.limit").state == "3"
+    assert hass.states.values["switch.charger"] == "on"
+    assert not hass.services.calls
