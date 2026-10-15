@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from contextlib import suppress
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -165,6 +165,8 @@ class Executor:
         self.ev_allocation_deadline_callback: Any = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
         self._plan_fallback_notification_signatures: dict[str, tuple[str, str]] = {}
+        self._restore_notification_update_pending = False
+        self._restore_notification_lock = asyncio.Lock()
 
     def mark_pending_hvac_manual_override(self) -> bool:
         """Synchronously mark an in-flight HVAC command as user-superseded."""
@@ -2061,6 +2063,7 @@ class Executor:
 
     async def async_notify_plan_fallback(self, plan: EnergyPlan, violations: list[str]) -> None:
         """Create persistent notifications for major plan fallback classes."""
+        await self.async_resolve_restore_notifications()
         if not strict_bool(
             self.options.get(CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED),
             default=True,
@@ -2192,28 +2195,45 @@ class Executor:
         return self.notification_grace_until is not None and dt_util.utcnow() < self.notification_grace_until
 
     async def async_resolve_restore_notifications(self, *assets: str, all_restored: bool = False) -> None:
+        """Serialize recovery cleanup with planner refreshes and device commands."""
+        async with self._restore_notification_lock:
+            await self._async_resolve_restore_notifications_locked(*assets, all_restored=all_restored)
+
+    async def _async_resolve_restore_notifications_locked(self, *assets: str, all_restored: bool = False) -> None:
         """Clear only alerts whose device restoration has been confirmed."""
         failures = dict(self.store.data.get("restore_notification_failures", {}))
         updated = {
             scope: sorted(set(unresolved) - set(assets))
             for scope, unresolved in failures.items()
         }
-        for asset in assets:
-            await self._async_dismiss_plan_fallback_notification(
+        pending_dismissals = {scope for scope, unresolved in updated.items() if scope != "all" and not unresolved}
+        for asset in sorted(set(assets) | pending_dismissals):
+            dismissed = await self._async_dismiss_plan_fallback_notification(
                 self._notification_id(f"{_RESTORE_NOTIFICATION_ID}_{asset}")
             )
-            updated.pop(asset, None)
+            if dismissed:
+                updated.pop(asset, None)
+            else:
+                # Empty scopes retain only notification cleanup, never device
+                # command authority. Retry them after refresh or reload.
+                updated[asset] = []
         if all_restored:
-            updated.clear()
+            updated["all"] = []
         remaining = updated.get("all")
-        if all_restored or remaining == []:
-            updated.pop("all", None)
-            await self._async_dismiss_plan_fallback_notification(self._notification_id(_RESTORE_NOTIFICATION_ID))
-        elif remaining and remaining != failures.get("all"):
-            await self._async_create_plan_fallback_notification(
+        notification_id = self._notification_id(_RESTORE_NOTIFICATION_ID)
+        if remaining == []:
+            if await self._async_dismiss_plan_fallback_notification(notification_id):
+                updated.pop("all", None)
+                self._restore_notification_update_pending = False
+        elif remaining and (
+            remaining != failures.get("all")
+            or self._restore_notification_update_pending
+            or notification_id not in self._plan_fallback_notification_signatures
+        ):
+            self._restore_notification_update_pending = not await self._async_create_plan_fallback_notification(
                 title=self._notification_title("safe-state restore failed"),
                 message=_restore_notification_message("unresolved_restore:" + ":".join(remaining)),
-                notification_id=self._notification_id(_RESTORE_NOTIFICATION_ID),
+                notification_id=notification_id,
             )
         if updated != failures:
             await self.store.async_save_restore_notification_failures(updated)
@@ -2223,27 +2243,29 @@ class Executor:
         restored_assets: set[str] | None = None, unresolved_assets: set[str] | None = None,
     ) -> None:
         """Reconcile full and device-scoped alerts without hiding pending recovery."""
-        if restored_assets is None:
-            restored_assets = (set(_RESTORE_ASSETS) if scope is None else {scope}) if (
-                outcome.result == OutcomeResult.RESTORED
-            ) else set()
-        await self.async_resolve_restore_notifications(
-            *sorted(restored_assets),
-            all_restored=scope is None and restored_assets == _RESTORE_ASSETS,
-        )
-        if outcome.result != OutcomeResult.FAILED:
-            return
-        failures = dict(self.store.data.get("restore_notification_failures", {}))
-        failures[scope or "all"] = sorted(
-            set(failures.get(scope or "all", [])) | (unresolved_assets or {scope or "all"})
-        )
-        await self.store.async_save_restore_notification_failures(failures)
-        notification_key = _RESTORE_NOTIFICATION_ID if scope is None else f"{_RESTORE_NOTIFICATION_ID}_{scope}"
-        await self._async_create_plan_fallback_notification(
-            title=self._notification_title("safe-state restore failed"),
-            message=_restore_notification_message(outcome.reason),
-            notification_id=self._notification_id(notification_key),
-        )
+        async with self._restore_notification_lock:
+            if restored_assets is None:
+                restored_assets = (set(_RESTORE_ASSETS) if scope is None else {scope}) if (
+                    outcome.result == OutcomeResult.RESTORED
+                ) else set()
+            await self._async_resolve_restore_notifications_locked(
+                *sorted(restored_assets),
+                all_restored=scope is None and restored_assets == _RESTORE_ASSETS,
+            )
+            if outcome.result != OutcomeResult.FAILED:
+                return
+            failures = dict(self.store.data.get("restore_notification_failures", {}))
+            failures[scope or "all"] = sorted(
+                set(failures.get(scope or "all", [])) | (unresolved_assets or {scope or "all"})
+            )
+            await self.store.async_save_restore_notification_failures(failures)
+            notification_key = _RESTORE_NOTIFICATION_ID if scope is None else f"{_RESTORE_NOTIFICATION_ID}_{scope}"
+            await self._async_create_plan_fallback_notification(
+                title=self._notification_title("safe-state restore failed"),
+                message=_restore_notification_message(outcome.reason),
+                notification_id=self._notification_id(notification_key),
+            )
+
 
     async def _async_notify_ev_infeasible(self, action: ControlAction) -> None:
         """Create a persistent notification for infeasible EV ready-by plans."""
@@ -2295,11 +2317,11 @@ class Executor:
         title: str,
         message: str,
         notification_id: str,
-    ) -> None:
+    ) -> bool:
         """Create or update a fallback notification only when its content changes."""
         signature = (title, message)
         if self._plan_fallback_notification_signatures.get(notification_id) == signature:
-            return
+            return True
         created = await self._async_create_notification(
             title=title,
             message=message,
@@ -2307,11 +2329,14 @@ class Executor:
         )
         if created:
             self._plan_fallback_notification_signatures[notification_id] = signature
+        return created
 
-    async def _async_dismiss_plan_fallback_notification(self, notification_id: str) -> None:
+    async def _async_dismiss_plan_fallback_notification(self, notification_id: str) -> bool:
         """Dismiss a fallback notification and allow a later recurrence to alert."""
-        self._plan_fallback_notification_signatures.pop(notification_id, None)
-        await self._async_dismiss_notification(notification_id)
+        dismissed = await self._async_dismiss_notification(notification_id)
+        if dismissed:
+            self._plan_fallback_notification_signatures.pop(notification_id, None)
+        return dismissed
 
     async def _async_create_notification(self, *, title: str, message: str, notification_id: str) -> bool:
         """Create a persistent notification if the service is available."""
@@ -2341,7 +2366,7 @@ class Executor:
                     "message": message,
                     "notification_id": notification_id,
                 },
-                blocking=False,
+                blocking=True,
             )
         except Exception:  # noqa: BLE001 - notifications are best-effort Home Assistant I/O.
             return False
@@ -2368,22 +2393,25 @@ class Executor:
         for notification_id in notification_ids:
             await self._async_dismiss_plan_fallback_notification(notification_id)
 
-    async def _async_dismiss_notification(self, notification_id: str) -> None:
+    async def _async_dismiss_notification(self, notification_id: str) -> bool:
         """Dismiss a persistent notification if the service is available."""
         if self.hass is None:
-            return
+            return False
         cancel_deferred_persistent_notification(self.hass, notification_id)
         services = self.hass.services
         has_service = getattr(services, "has_service", None)
         if callable(has_service) and not has_service("persistent_notification", "dismiss"):
-            return
-        with suppress(Exception):
+            return False
+        try:
             await services.async_call(
                 "persistent_notification",
                 "dismiss",
                 {"notification_id": notification_id},
-                blocking=False,
+                blocking=True,
             )
+        except Exception:  # noqa: BLE001 - keep failed cleanup retryable without failing device control.
+            return False
+        return True
 
     def _reserve_ev_grid_capacity(
         self,

@@ -301,7 +301,9 @@ Safe-state restore warnings clear after the affected device's restoration is con
 ordinary EV stops and climate releases. A full successful restore clears earlier device-specific
 warnings as well. Pending Export Limit readback, skipped vehicle-session guards, and unresolved
 power-limit baselines keep their warnings. Combined warnings retain the unresolved device areas
-across reloads and clear only when all of those areas recover. Removing an entry clears its
+across reloads and clear only when all of those areas recover. Failed notification updates or
+dismissals retry on planner refresh, including after a reload; these retries send no device
+commands. Removing an entry clears its
 notifications after recovery obligations are resolved; another planner's alerts remain separate.
 Explicit Explain and safety-check reports remain available until dismissed or replaced. New
 reports supersede older queued startup reports.

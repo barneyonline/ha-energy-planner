@@ -365,7 +365,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   the matching restore warnings; pending or guarded restores do not. Full restoration
   clears all entry-scoped restore IDs. Compact device-scope failure metadata survives
   reloads independently of bounded audit history, so partial recovery retains only
-  unresolved combined warnings. Resolved entry removal cleans up its own report and
+  unresolved combined warnings. Failed notification dismissals retain empty cleanup scopes
+  until acknowledged; refreshes retry cleanup and failed combined-warning updates without
+  device commands. A dedicated lock prevents refresh retries from overwriting concurrent
+  restoration failures. Resolved entry removal cleans up its own report and
   alert IDs. Reports published after startup supersede queued versions before they
   can replay. Regressions: `tests/test_notification_recovery.py`,
   `tests/test_notifications.py`, `tests/test_storage.py`, `tests/test_export_limit.py`,

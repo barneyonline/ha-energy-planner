@@ -13,6 +13,7 @@
 ### 🐛 Bug fixes
 
 - Clear stale restore warnings after confirmed EV stops, climate releases and Export Limit restoration readback. Full restores also clear device-specific warnings; partial or pending recovery retains unresolved alerts across reloads.
+- Retain failed notification dismissals and combined-warning updates for retry on refresh or reload, without device commands; serialize retries with concurrent restoration outcomes.
 - Refresh EV feasibility warnings from the current plan, retire obsolete EV alerts when control is disabled, and prevent superseded startup reports or removed entries from leaving stale notifications.
 
 ### 🔧 Improvements
