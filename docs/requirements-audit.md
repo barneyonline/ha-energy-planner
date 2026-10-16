@@ -1230,6 +1230,28 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 
 ### Delayed device feedback and EV execution deadlines
 
+- Confirmed main-temperature commands retain exact coupled-zone bounds clamps for
+  150 seconds after their first confirmation, capped at three minutes after issue.
+  Direct and unconfirmed feedback remain limited to the original two-minute
+  window. `tests/fixtures/hvac/delayed_zone_clamp.json` preserves sanitized timing
+  from the 121.4-second live event; `tests/test_coordinator.py` checks attribution,
+  target/mode/auxiliary conflicts, expiry, cancellation, supersession, repeated and
+  late confirmations and no-op refreshes. Additional regressions cover polling
+  jitter, both clamp directions, temporary null/unavailable telemetry with retained
+  targets, exact recovery from captured/owned targets, combined and split mode
+  feedback in either order with transaction-local confirmed activation proof,
+  related activation parent contexts after short-cache expiry, rejection of
+  unrelated activations and target-first conflicts, harmless newer measurements,
+  current head/zone conflicts and explicit attribution. Supersession regressions
+  exercise later zone/switch off and mode changes, subsequent adapter transactions,
+  issue-order ties, unconfirmed and failed reactivation, bounded history, unrelated
+  zones and valid subsequent activation. Dispatch errors retain supersession
+  markers without reviving retired proof. Missing
+  historical targets, unconfirmed/failed/superseded activations and expired
+  expectations remain excluded. `tests/test_control_runtime.py` executes
+  real HA services/events and verifies retained ownership, suppressed automations
+  and subsequent explicit user override. This is repository validation, not live
+  deployment acceptance.
 - `executor.py` retains an accepted HVAC command's original two-minute feedback
   expectation after a readback timeout. `tests/test_coordinator.py` replays delayed
   temperature feedback during a mode retry through the real executor callback and

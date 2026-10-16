@@ -97,6 +97,8 @@ from .const import (
     DEBOUNCE_SECONDS,
     DEFAULT_OPTIONS,
     DOMAIN,
+    HVAC_ZONE_SETTLE_MAX_SECONDS,
+    HVAC_ZONE_SETTLE_SECONDS,
     MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS,
     STATE_UNKNOWN_VALUES,
 )
@@ -767,6 +769,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 now,
                 pending_hvac_desired_state=pending_hvac_desired_state,
                 feedback_commands=feedback_commands if hasattr(executor, "hvac_feedback_commands") else None,
+                hass=self.hass,
             ):
                 return
             if (is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))) and (
@@ -3310,8 +3313,102 @@ def _is_manual_hvac_zone_change(
     return True
 
 
+def _matches_confirmed_zone_feedback(
+    entry_data: dict[str, Any], command: dict[str, Any], event: Any, now: datetime,
+    hass: HomeAssistant | None, changed: set[str],
+) -> bool:
+    """Verify bounded zone settling against captured targets and current readback."""
+    issued = _parse_datetime_or_none(command.get("issued_at"))
+    confirmed = _parse_datetime_or_none(command.get("confirmed_at"))
+    deadline = _parse_datetime_or_none(command.get("deadline"))
+    if (
+        hass is None or issued is None or confirmed is None or deadline is None
+        or command.get("entity_id") != entry_data.get(CONF_DAIKIN_CLIMATE)
+        or not issued <= confirmed <= now < min(
+            deadline, confirmed + timedelta(seconds=HVAC_ZONE_SETTLE_SECONDS),
+            issued + timedelta(seconds=HVAC_ZONE_SETTLE_MAX_SECONDS),
+        )
+        or changed - {"temperature"}
+    ):
+        return False
+    old, new = event.data["old_state"], event.data["new_state"]
+    entity = event.data["entity_id"]
+    head = hass.states.get(command["entity_id"])
+    current = hass.states.get(entity)
+    target = finite(command.get("requested", {}).get("temperature"))
+    mode = command.get("requested_hvac_mode") or command.get("confirmed_mode")
+    # Only related, confirmed activations from this transaction may explain
+    # a delayed mode transition or carry its parent context past the short cache.
+    activations: list[dict[str, Any]] = []
+    for activation in command.get("mode_commands", []):
+        if not (
+            activation.get("entity_id") in {entity, command["entity_id"]}
+            or _unambiguous_coupled_zone_entity_ids_match(entry_data, activation.get("entity_id"), entity)
+        ):
+            continue
+        if (
+            activation.get("transaction_id") != command.get("transaction_id")
+            or activation.get("stage") == "service_failed"
+            or activation.get("service") == "turn_off"
+            or activation.get("service") == "set_hvac_mode" and activation.get("requested", {}).get("hvac_mode") != mode
+            or activation.get("service") == "turn_on" and activation.get("confirmed_mode") not in {mode, None}
+        ):
+            # A later zone/alias off command also supersedes older head-on proof.
+            # Cross-transaction commands may retire proof, never create it here.
+            activations.clear()
+        elif (
+            activation.get("confirmed_at") is not None
+            and activation["issued_at"] <= activation["confirmed_at"] <= now
+        ):
+            activations.append(activation)
+    parents = {None, command["context_id"], *(activation["context_id"] for activation in activations)}
+    # Reject queued events superseded by a newer state, or a changed head setting.
+    if (
+        current is None or current.state != new.state or head is None or target is None
+        or any(current.attributes.get(key) != new.attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS)
+        or mode not in _ACTIVE_HVAC_MODES or head.state != mode
+        or not _matching_hvac_target(head.attributes.get("temperature"), target)
+        or any(
+            getattr(context, "user_id", None) or getattr(context, "parent_id", None) not in parents
+            for context in (
+                getattr(event, "context", None), getattr(new, "context", None),
+                getattr(current, "context", None), getattr(head, "context", None),
+            )
+        )
+    ):
+        return False
+    snapshot = command.get("coupled_zones", {}).get(entity, {})
+    baseline = command.get("zone_targets", {}).get(entity, {})
+    previous = finite(old.attributes.get("temperature"))
+    if previous is None:
+        previous = finite(snapshot.get("target_temperature"))
+        if previous is None:
+            previous = finite(baseline.get("target_temperature"))
+    if previous is None:
+        return False
+    old_mode = old.state if old.state in _ACTIVE_HVAC_MODES or old.state == "off" else snapshot.get("mode")
+    if old_mode != mode and not activations:
+        # A temperature command alone cannot activate an off zone.
+        return False
+    mode_pending = bool(activations and new.state == old.state == snapshot.get("mode"))
+    if new.attributes.get("temperature") is None:
+        # Missing telemetry is not a new setting. Preserve the bounded evidence
+        # for a subsequent exact recovery; never extend it on missing samples.
+        return new.state in {mode, *STATE_UNKNOWN_VALUES} or mode_pending
+    if new.state in STATE_UNKNOWN_VALUES:
+        return any(_matching_hvac_target(new.attributes.get("temperature"), expected) for expected in (
+            previous, min(max(previous, target - 2), target + 2),
+        ))
+    if old.state != new.state and not changed:
+        return bool(new.state == mode)
+    return (new.state == mode or mode_pending) and _matching_hvac_target(
+        new.attributes.get("temperature"), min(max(previous, target - 2), target + 2),
+    )
+
+
 def _matches_climate_transaction(
-    entry_data: dict[str, Any], commands: list[dict[str, Any]], event: Any, now: datetime
+    entry_data: dict[str, Any], commands: list[dict[str, Any]], event: Any, now: datetime,
+    hass: HomeAssistant | None = None,
 ) -> bool:
     """Match only issued commands and fixture-supported coupled transitions."""
     old, new = event.data.get("old_state"), event.data.get("new_state")
@@ -3326,9 +3423,7 @@ def _matches_climate_transaction(
     for command in reversed(commands):
         issued = _parse_datetime_or_none(command.get("issued_at"))
         deadline = _parse_datetime_or_none(command.get("deadline"))
-        if issued is None or deadline is None or not issued <= now < min(deadline, issued + timedelta(minutes=2)):
-            continue
-        if any(getattr(context, "parent_id", None) not in {None, command["context_id"]} for context in contexts):
+        if issued is None or deadline is None or now < issued:
             continue
         same = entity == command.get("entity_id")
         coupled = (
@@ -3339,6 +3434,20 @@ def _matches_climate_transaction(
         if not same and not coupled:
             continue
         requested, service = command.get("requested", {}), command.get("service")
+        delayed_or_recovering = (
+            now >= issued + timedelta(minutes=2)
+            or old.state != new.state
+            or finite(old_attributes.get("temperature")) is None
+            or finite(new_attributes.get("temperature")) is None
+        )
+        if coupled and not same and service == "set_temperature" and delayed_or_recovering:
+            if _matches_confirmed_zone_feedback(entry_data, command, event, now, hass, changed):
+                return True
+            continue
+        if any(getattr(context, "parent_id", None) not in {None, command["context_id"]} for context in contexts):
+            continue
+        if now >= min(deadline, issued + timedelta(minutes=2)):
+            continue
         expected_mode = "off" if service == "turn_off" else requested.get("hvac_mode")
         if service == "turn_on":
             mode_matches = old.state == "off" and (
@@ -3416,6 +3525,7 @@ def _is_planner_owned_control_feedback(
     *,
     pending_hvac_desired_state: dict[str, Any] | None = None,
     feedback_commands: list[dict[str, Any]] | None = None,
+    hass: HomeAssistant | None = None,
 ) -> bool:
     """Return whether a control-state event follows a recent planner command."""
     entity_id = event.data.get("entity_id")
@@ -3443,7 +3553,7 @@ def _is_planner_owned_control_feedback(
         if feedback_commands is not None or commands or (pending_hvac_desired_state or {}).get("transaction_id"):
             # A live executor's empty cache is authoritative retirement, not
             # permission to revive an older outcome's target expectation.
-            return _matches_climate_transaction(entry_data, commands, event, now)
+            return _matches_climate_transaction(entry_data, commands, event, now, hass)
     if asset == "daikin" and pending_hvac_desired_state is not None:
         # A multi-call climate transaction can publish intermediate states (for
         # example turn_on restoring the previous mode before set_hvac_mode).
