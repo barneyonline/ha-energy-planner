@@ -280,8 +280,33 @@ An accepted thermostat command can publish feedback after its five-second readba
 timeout. Its exact command expectation remains valid within the original
 two-minute settling window, including during a mode retry. This preserves planner
 ownership and the original restoration baseline when delayed feedback matches.
-It does not extend the deadline or suppress explicit user changes, different
+Readback timeouts do not extend the deadline or suppress explicit user changes, different
 targets, unrelated automation contexts, superseding commands or cancellation.
+
+A confirmed main temperature command also permits its exact automatic zone bounds
+clamp for 150 seconds after the first confirmation, capped at three minutes after
+issuance. For example, a 24 C main target can cause a delayed 20 C zone to clamp to
+22 C. A replay of the observed 121.4-second delay preserves the preconditioning
+cycle and its restoration baseline. The extra 30 seconds accommodates polling jitter.
+The allowance requires current head mode/target readback and matching current zone
+controls; newer measurement-only updates do not invalidate it. Temporary missing
+zone targets or unavailable states preserve the bounded evidence and may recover
+to the exact clamp calculated from a finite command-time target or the owned zone
+baseline. No target is invented when both are missing. Combined or split mode and
+target feedback also requires a confirmed head/zone activation from the same
+transaction. Either update order is supported, including an exact clamp while the
+captured old mode is still reported. The related activation's parent context remains
+valid for this bounded settling period; unrelated activations and contexts do not.
+Later related off, conflicting mode or cross-transaction commands retire older
+activation proof, including through zone-switch aliases. Bounded issue-order history
+preserves intervening off commands if a later on is unconfirmed or fails; dispatch
+errors cannot revive the retired proof. A later confirmed activation can provide
+new proof within its own transaction, without extending the target deadline.
+A temperature command alone cannot activate an off zone. Explicit
+users, unrelated automation contexts, auxiliary changes and conflicting targets
+retain manual priority, including attribution on newer current states.
+Repeated confirmations, unrelated helper commands and no-op refreshes cannot renew
+the allowance, and late confirmations cannot revive an expired expectation.
 
 Recovery retries restore available unfinished dampers and automations independently
 when zone targets remain hidden after confirmed main shutdown. Unavailable controls

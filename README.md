@@ -192,6 +192,20 @@ conflicting controls, superseding commands and expired expectations retain their
 normal override handling. EV start confirmation and retries respect the charging
 lease deadline, with a safe stop required if a dispatched start expires.
 
+After a main thermostat temperature is first confirmed, its exact automatic zone
+bounds clamp can settle for 150 seconds after confirmation, capped at three minutes
+from command issuance. Direct thermostat feedback and unconfirmed commands retain
+their original two-minute window. Repeated confirmations and no-op refreshes do
+not renew the zone window; explicit user actions and conflicting changes still
+trigger manual override. Missing zone telemetry can recover to the exact clamp
+using the captured target and current thermostat readback. Combined or split mode
+and target feedback requires a confirmed activation command in the same transaction,
+including when the target arrives first or feedback carries that activation's
+parent context. Later off or conflicting mode commands retire older activation
+evidence, including across restore transactions; dispatch failures cannot revive
+it. A temperature command alone cannot turn an off zone on. Unknown targets without
+a captured or owned baseline remain subject to normal override handling.
+
 EV sensors with `sampled_at_utc` use that source timestamp for freshness and
 power-limit confirmation. Invalid or stale source timestamps cannot be replaced
 by a newer Home Assistant report time. Fresh measured EV power above the
