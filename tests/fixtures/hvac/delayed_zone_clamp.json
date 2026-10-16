@@ -1,0 +1,11 @@
+{
+  "description": "Sanitized 16 October delayed zone bounds synchronization: 121.408 seconds after issue, 119.752 seconds after confirmation.",
+  "issued_at": "2026-10-16T04:00:11.643697+00:00",
+  "confirmed_at": "2026-10-16T04:00:13.299576+00:00",
+  "feedback_at": "2026-10-16T04:02:13.051240+00:00",
+  "head_before": 19,
+  "head_target": 24,
+  "zone_before": 20,
+  "zone_after": 22,
+  "hvac_mode": "heat"
+}
