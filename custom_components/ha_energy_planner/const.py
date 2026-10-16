@@ -5,6 +5,8 @@ from __future__ import annotations
 from .ev_policy import EV_DEFAULTS
 
 STARTUP_WARMUP_SECONDS = 30 * 60
+HVAC_ZONE_SETTLE_SECONDS = 150
+HVAC_ZONE_SETTLE_MAX_SECONDS = 180
 
 DOMAIN = "ha_energy_planner"
 INTEGRATION_NAME = "Energy Planner"

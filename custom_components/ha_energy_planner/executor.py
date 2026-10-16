@@ -20,6 +20,7 @@ from .const import (
     CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
+    CONF_DAIKIN_CLIMATE,
     CONF_DRY_RUN,
     CONF_ENPHASE_CONTROL_ENABLED,
     CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
@@ -43,6 +44,8 @@ from .const import (
     DOMAIN,
     EV_RESERVATION_EXTERNAL_BASELINE,
     EV_RESERVATION_RETAIN_WHEN_UNLOADED,
+    HVAC_ZONE_SETTLE_MAX_SECONDS,
+    HVAC_ZONE_SETTLE_SECONDS,
     STARTUP_WARMUP_SECONDS,
     STATE_UNKNOWN_VALUES,
 )
@@ -2781,6 +2784,20 @@ class Executor:
             item for item in getattr(self, "hvac_feedback_commands", []) if item["deadline"] > dt_util.utcnow()
         ]
 
+        mode_commands = pending.setdefault("mode_commands", [])
+
+        def mode_command_histories() -> list[list[dict[str, Any]]]:
+            # Later transactions must also retire proof held by earlier targets.
+            # Only target records hold histories, avoiding reference cycles.
+            histories = [mode_commands]
+            for item in self.hvac_feedback_commands:
+                history = item.get("mode_commands")
+                if history is not None and item.get("service") == "set_temperature" and not any(
+                    history is existing for existing in histories
+                ):
+                    histories.append(history)
+            return histories
+
         def record_command(record: dict[str, Any]) -> None:
             now = dt_util.utcnow()
             record = {
@@ -2812,13 +2829,50 @@ class Executor:
                     "hvac_control", {}
                 ).get("zone_states", {})
                 self.hvac_feedback_commands.append(
-                    {**record, "zone_targets": zone_targets, "issued_at": now, "deadline": now + timedelta(minutes=2)}
+                    {
+                        **evidence, "zone_targets": zone_targets,
+                        "mode_commands": mode_commands if record["service"] == "set_temperature" else [],
+                        "issued_at": now, "deadline": now + timedelta(minutes=2),
+                    }
                 )
+                if record["service"] in {"turn_on", "turn_off", "set_hvac_mode"}:
+                    for commands in mode_command_histories():
+                        # Retain intervening off commands even if an unconfirmed
+                        # on follows, and preserve issue order when times tie.
+                        commands.append(self.hvac_feedback_commands[-1])
+                        del commands[:-30]
                 del self.hvac_feedback_commands[:-30]
                 pending["feedback_commands"] = self.hvac_feedback_commands
+            elif record["stage"] == "confirmed":
+                for command in self.hvac_feedback_commands:
+                    if (
+                        command["context_id"] == record["context_id"]
+                        and "confirmed_at" not in command
+                        and command["issued_at"] <= now < command["deadline"]
+                    ):
+                        # Zone bounds may settle one device poll after head
+                        # readback. Extend only the coupled clamp expectation;
+                        # direct feedback still expires two minutes from issue.
+                        command["confirmed_at"] = now
+                        command["confirmed_mode"] = record.get("observed", {}).get("hvac_mode")
+                        if (
+                            command["entity_id"] == adapter.entry_data.get(CONF_DAIKIN_CLIMATE)
+                            and command["service"] == "set_temperature"
+                            and finite(command.get("requested", {}).get("temperature")) is not None
+                        ):
+                            command["deadline"] = min(
+                                now + timedelta(seconds=HVAC_ZONE_SETTLE_SECONDS),
+                                command["issued_at"] + timedelta(seconds=HVAC_ZONE_SETTLE_MAX_SECONDS),
+                            )
             elif record.get("failure_category") == "CancelledError":
                 self.hvac_feedback_commands.clear()
             elif record["stage"] == "service_failed":
+                for commands in mode_command_histories():
+                    for command in commands:
+                        if command["context_id"] == record["context_id"]:
+                            # Dispatch errors can occur after the device acts.
+                            # Keep the superseding intent, never reuse its proof.
+                            command["stage"] = "service_failed"
                 # A readback timeout does not revoke an accepted command: Daikin
                 # can publish its target during the following mode retry. Keep
                 # the original bounded expectation until a newer command for

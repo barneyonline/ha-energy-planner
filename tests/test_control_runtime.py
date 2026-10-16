@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CoreState, HomeAssistant, ServiceCall, callback
+from homeassistant.core import Context, CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
@@ -948,6 +948,80 @@ def test_queued_power_event_preserves_peak_but_not_superseded_evidence(tmp_path,
             unsubscribe()
             await coordinator.async_shutdown()
             await hass.async_stop()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", ["captured", "jitter", "lost_target", "unavailable", "downward"])
+def test_delayed_zone_clamp_keeps_real_hvac_ownership_then_honors_user(tmp_path, monkeypatch, scenario):
+    """Real HA services and events retain the cycle at the captured 121.4 s delay."""
+    from unittest.mock import AsyncMock
+
+    async def run():
+        payload = json.loads((Path(__file__).parent / "fixtures/hvac/delayed_zone_clamp.json").read_text())
+        if scenario == "downward":
+            payload.update(head_target=20, zone_before=24)
+        clock = [datetime.fromisoformat(payload["issued_at"])]
+        monkeypatch.setattr(dt_util, "utcnow", lambda: clock[0])
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        hass.states.async_set("climate.home", "heat", {"temperature": payload["head_before"]})
+        hass.states.async_set("climate.zone", "heat", {"temperature": payload["zone_before"]})
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data[CONF_CLIMATE_ZONES] = "climate.zone"
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Delayed zone feedback", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        manual = AsyncMock()
+        monkeypatch.setattr(coordinator, "_async_handle_manual_hvac_change", manual)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+
+        async def temperature(call):
+            calls.append((call.domain, call.service, dict(call.data)))
+            clock[0] = datetime.fromisoformat(payload["confirmed_at"])
+            hass.states.async_set(call.data["entity_id"], "heat", {"temperature": call.data["temperature"]},
+                                  context=call.context)
+
+        hass.services.async_register("climate", "set_temperature", temperature)
+        plan, context = _command("hvac")
+        plan.actions[0].desired_state.update(target_temperature=payload["head_target"], phase="preconditioning")
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            await coordinator.executor.async_evaluate(plan, context)
+            await hass.async_block_till_done()
+            assert hass.states.get("climate.home").attributes["temperature"] == payload["head_target"]
+            baseline = store.data["ownership"]["hvac_control"]["main_state"]
+            assert baseline["target_temperature"] == 19
+            before = list(calls)
+            clock[0] = datetime.fromisoformat(payload["feedback_at"])
+            if scenario == "jitter":
+                clock[0] += timedelta(seconds=1)
+            if scenario in {"lost_target", "unavailable"}:
+                hass.states.async_set("climate.zone", "unavailable" if scenario == "unavailable" else "heat",
+                                      {"temperature": None})
+                await hass.async_block_till_done()
+                manual.assert_not_awaited()
+                clock[0] += timedelta(seconds=1)
+            hass.states.async_set("climate.zone", "heat", {"temperature": payload["zone_after"]})
+            await hass.async_block_till_done()
+            manual.assert_not_awaited()
+            assert not coordinator.overrides
+            assert calls == before
+            assert store.data["ownership"]["hvac_control"]["main_state"] == baseline
+            assert hass.states.get("automation.climate").state == "off"
+            hass.states.async_set("climate.zone", "heat", {"temperature": 23}, context=Context(user_id="operator"))
+            await hass.async_block_till_done()
+            manual.assert_awaited_once_with("climate_zone_changed", preserve_zone_entity_id="climate.zone")
+            assert coordinator.executor.hvac_feedback_commands == []
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
     asyncio.run(run())
 
 

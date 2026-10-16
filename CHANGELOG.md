@@ -22,6 +22,36 @@
 
 - None
 
+## 1.3.5 - 2026-10-16
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Prevent delayed Daikin zone target synchronization from falsely activating manual
+  override just after the head command's readback window. Exact zone bounds clamps
+  receive bounded settling time and polling margin after the first confirmed head
+  temperature. Missing zone targets and availability can recover using captured
+  targets; combined or split mode feedback in either order requires confirmed
+  activation evidence, including feedback linked to that activation's context.
+  Later mode/off commands retire older activation proof across restore transactions
+  and zone aliases; unconfirmed or failed reactivation cannot revive that proof.
+  Current device readback and explicit user/automation attribution retain priority.
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
 ## 1.3.4 - 2026-10-15
 
 ### 🚧 Breaking changes
