@@ -8,6 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -9693,6 +9694,56 @@ def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, sta
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("scenario", [
+    "main", "zone", "late_main", "late_zone", "user", "external", "out_of_bounds", "expired",
+    "target_only", "auxiliary", "superseded", "zone_without_head",
+])
+def test_live_daikin_mode_recall_does_not_create_false_manual_override(monkeypatch, scenario):
+    payload = json.loads((Path(__file__).parent / "fixtures/climate/daikin_mode_recall_oct_17_2026.json").read_text())
+    issued = datetime.fromisoformat(payload["issued_at"])
+    clock = [issued]
+    monkeypatch.setattr(dt_util, "utcnow", lambda: clock[0])
+    entry_data = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: "climate.zone"}
+    coordinator = _coordinator_for_runtime_services(entry_data=entry_data)
+    executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=entry_data)
+    coordinator.executor = executor
+    pending = {"hvac_mode": "cool", "target_temperature": 19}
+    executor.pending_hvac_desired_state = pending
+    adapter = DaikinHVACAdapter(coordinator.hass, entry_data)
+    executor._configure_pending_hvac_adapter(adapter, pending)
+    command = {"entity_id": "climate.daikin", "domain": "climate", "service": "set_hvac_mode",
+               "requested": {"hvac_mode": payload["requested_mode"]},
+               "observed": {"hvac_mode": "heat", "target_temperature": 19},
+               "target_bounds": {"min_temp": 7, "max_temp": 35}, "context_id": "mode-command", "stage": "issued",
+               "coupled_zones": {"climate.zone": {"mode": "heat", "target_temperature": 20}}}
+    adapter._command_callback(command)
+    adapter._command_callback({**command, "stage": "readback_pending"})
+    clock[0] = datetime.fromisoformat(payload["feedback_at"])
+    if scenario == "expired":
+        clock[0] = issued + timedelta(seconds=180)
+    if scenario in {"late_main", "late_zone"}:
+        clock[0] = issued + timedelta(seconds=179)
+    if scenario == "superseded":
+        adapter._command_callback({**command, "service": "set_temperature", "requested": {"temperature": 19},
+                                   "context_id": "target-command"})
+    entity = "climate.zone" if scenario in {"zone", "zone_without_head", "late_zone"} else "climate.daikin"
+    new_attributes = {"temperature": 36 if scenario == "out_of_bounds" else payload["reported_target"]}
+    old_mode = "cool" if scenario == "target_only" else payload["old_mode"]
+    if scenario == "auxiliary":
+        new_attributes["fan_mode"] = "high"
+    event = FakeEvent(entity, old_mode, payload["reported_mode"],
+                      old_attributes={"temperature": payload["old_target"]}, new_attributes=new_attributes,
+                      context_user_id="operator" if scenario == "user" else None,
+                      parent_context_id="other-automation" if scenario == "external" else None)
+    coordinator.hass.states.values["climate.daikin"] = FakeState(
+        "heat" if scenario == "zone_without_head" else "cool", {"temperature": 24},
+    )
+    assert _is_planner_owned_control_feedback(
+        entry_data, coordinator.store.data, event, clock[0], pending_hvac_desired_state=pending,
+        feedback_commands=executor.hvac_feedback_commands, hass=coordinator.hass,
+    ) is (scenario in {"main", "zone", "late_main", "late_zone"})
+
+
 @pytest.mark.parametrize(
     "feedback_source",
     ["retry_context", "fresh_context", "explicit_user", "other_automation", "conflicting_target", "expired"],
@@ -9737,7 +9788,7 @@ def test_climate_confirmation_timeout_keeps_delayed_feedback_without_creating_ma
     })
     clock[0] += timedelta(seconds=0.6)
     if feedback_source == "expired":
-        clock[0] = now + timedelta(minutes=2)
+        clock[0] = now + timedelta(minutes=3)
     event = FakeEvent(
         "climate.daikin", "heat", "heat", old_attributes={"temperature": 19},
         new_attributes={"temperature": 23 if feedback_source == "conflicting_target" else 24},
@@ -9878,7 +9929,7 @@ def test_confirmed_head_command_retains_only_delayed_zone_clamp(monkeypatch, sce
         FakeState("heat", {"temperature": payload["head_target"]}) if entity_id == "climate.daikin" else None
     ))
     callbacks[0](event)
-    if scenario in {"delayed_clamp", "no_op_refresh"}:
+    if scenario in {"delayed_clamp", "no_op_refresh", "late_confirmation"}:
         coordinator._async_handle_manual_hvac_change.assert_not_called()
         coordinator._schedule_debounced_refresh.assert_not_called()
         assert coordinator.store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 19
@@ -10263,5 +10314,79 @@ def test_ev_capacity_listener_persists_and_replans_below_material_threshold(monk
             else:
                 assert coordinator._force_next_refresh is True
                 assert issues == ["grid_import_limit_exceeded"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("missing_previous", [False, True])
+@pytest.mark.parametrize("scenario", ["valid", "user", "external_parent", "wrong_target", "expired", "new_off"])
+def test_review_pending_feedback_survives_json_reload_with_activation_proof(monkeypatch, missing_previous, scenario):
+    from custom_components.ha_energy_planner.models import to_jsonable
+
+    async def run():
+        issued = datetime(2026, 10, 17, tzinfo=UTC)
+        clock = [issued]
+        monkeypatch.setattr(dt_util, "utcnow", lambda: clock[0])
+        entry = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]}
+        coordinator = _coordinator_for_runtime_services(entry_data=entry, store_data={"ownership": {"hvac_control": {
+            "main_state": {"hvac_mode": "off"}, "zone_states": {"climate.zone": {"target_temperature": 20}},
+        }}})
+        executor = Executor(coordinator.store, hass=coordinator.hass, entry_data=entry)
+        adapter = DaikinHVACAdapter(coordinator.hass, entry)
+        pending = {"hvac_mode": "heat", "target_temperature": 24}
+        executor._configure_pending_hvac_adapter(adapter, pending)
+        activation = {"entity_id": "climate.daikin", "domain": "climate", "service": "turn_on", "requested": {},
+                      "observed": {"hvac_mode": "off"}, "context_id": "activation", "stage": "issued"}
+        adapter._command_callback(activation)
+        clock[0] += timedelta(seconds=0.2)
+        adapter._command_callback({**activation, "stage": "confirmed", "observed": {"hvac_mode": "heat"}})
+        clock[0] = issued + timedelta(seconds=1)
+        command = {"entity_id": "climate.daikin", "domain": "climate", "service": "set_temperature",
+                   "context_id": "target", "requested": {"temperature": 24}, "observed": {"hvac_mode": "heat"},
+                   "coupled_zones": {"climate.zone": {"mode": "off",
+                                                       "target_temperature": None if missing_previous else 20}},
+                   "issued_at": clock[0].isoformat(), "deadline": (issued + timedelta(seconds=181)).isoformat()}
+        await adapter._async_save_confirmation(command)
+        adapter._command_callback({**command, "stage": "issued"})
+        coordinator.store.data["ownership"] = json.loads(json.dumps(to_jsonable(coordinator.store.data["ownership"])))
+        clock[0] = issued + timedelta(seconds=125)
+        confirmed = {**command, "stage": "confirmed", "observed": {"hvac_mode": "heat", "target_temperature": 24}}
+        adapter._command_callback(confirmed)
+
+        def event_for(*, user=None, parent="activation", target=22):
+            return FakeEvent("climate.zone", "off", "heat", old_attributes={
+                "temperature": None if missing_previous else 20,
+            }, new_attributes={"temperature": target}, context_user_id=user, parent_context_id=parent)
+
+        event = event_for()
+        states = {"climate.daikin": FakeState("heat", {"temperature": 24}), "climate.zone": event.data["new_state"]}
+        coordinator.hass.states = SimpleNamespace(get=states.get)
+        assert _is_planner_owned_control_feedback(
+            entry, coordinator.store.data, event, clock[0], feedback_commands=executor.hvac_feedback_commands,
+            hass=coordinator.hass,
+        )
+        restarted = Executor(coordinator.store, hass=coordinator.hass, entry_data=entry)
+        restored_activation = restarted.hvac_feedback_commands[0]["mode_commands"][0]
+        assert restored_activation["confirmed_at"] == issued + timedelta(seconds=0.2)
+        assert isinstance(coordinator.store.data["ownership"]["hvac_control"]["command_confirmation"][
+            "mode_commands"][0]["confirmed_at"], str)
+        recovery = DaikinHVACAdapter(coordinator.hass, entry)
+        restarted._configure_pending_hvac_adapter(recovery, {"restore_main": {"hvac_mode": "off"}})
+        recovery._command_callback(confirmed)
+        if scenario == "user":
+            event = event_for(user="operator")
+        elif scenario == "external_parent":
+            event = event_for(parent="other-automation")
+        elif scenario == "wrong_target":
+            event = event_for(target=23)
+        elif scenario == "expired":
+            clock[0] = issued + timedelta(seconds=181)
+        elif scenario == "new_off":
+            recovery._command_callback({**activation, "context_id": "off", "service": "turn_off"})
+        states["climate.zone"] = event.data["new_state"]
+        assert _is_planner_owned_control_feedback(
+            entry, coordinator.store.data, event, clock[0], feedback_commands=restarted.hvac_feedback_commands,
+            hass=coordinator.hass,
+        ) is (scenario == "valid")
 
     asyncio.run(run())

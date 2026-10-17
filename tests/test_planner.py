@@ -3891,9 +3891,11 @@ def test_learning_message_does_not_hide_legacy_rejection_or_manual_override() ->
     )
 
 
-def test_outage_preserves_current_session_caps_power_and_attaches_hard_deadline() -> None:
+@pytest.mark.parametrize("charging", [False, True])
+def test_outage_preserves_current_session_caps_power_and_attaches_hard_deadline(charging) -> None:
     context = _context(InputHealth.DEGRADED)
-    context.ev_charging = True
+    context.ev_charging = charging
+    context.ev_connected = True
     context.input_issues = ["household_load_model_fallback_active"]
     context.ev_evidence = {"commanded_kw": 7.0, "load_fallback": {
         "fallback_applied": True, "fallback_remaining_seconds": 780,

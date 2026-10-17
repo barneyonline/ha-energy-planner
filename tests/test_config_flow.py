@@ -1774,13 +1774,18 @@ def test_validate_options_accepts_default_policy_values() -> None:
     assert _validate_options(dict(DEFAULT_OPTIONS)) == {}
 
 
-@pytest.mark.parametrize("value", [None, -1, 31])
+@pytest.mark.parametrize("value", [None, -1, 1441, float("nan"), float("inf")])
 def test_validate_options_rejects_invalid_household_load_outage_grace(
     value: object,
 ) -> None:
     errors = _validate_options({**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: value})
 
     assert errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] == ("invalid_load_outage_grace")
+
+
+@pytest.mark.parametrize("value", [0, 30, 360, 720, 1440])
+def test_validate_options_accepts_extended_load_fallback(value):
+    assert _validate_options({**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: value}) == {}
 
 
 def test_default_options_require_intentional_active_mode_enablement() -> None:

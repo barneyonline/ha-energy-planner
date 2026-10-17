@@ -2990,12 +2990,14 @@ def _updated_load_source_outage(
     state = hass.states.get(entity_id)
     attributes = getattr(state, "attributes", {}) or {}
     unit = str(attributes.get("unit_of_measurement") or attributes.get("unit") or "")
-    if state is not None and normalize_power_kw(getattr(state, "state", None), unit) is not None:
-        from .ev_resilience import recovering_load_source
+    from .ev_resilience import recovering_load_source, stale_load_source_since
 
+    numeric = state is not None and normalize_power_kw(getattr(state, "state", None), unit) is not None
+    stale_since = stale_load_source_since(state, now, options or {}) if numeric else None
+    if numeric and stale_since is None:
         return recovering_load_source(state, previous, entity_id, now, options)
-    observed_state = "missing" if state is None else str(state.state)
-    sentinel_state = observed_state.lower() in {"unknown", "unavailable"}
+    observed_state = "stale" if stale_since is not None else "missing" if state is None else str(state.state)
+    sentinel_state = stale_since is not None or observed_state.lower() in {"unknown", "unavailable"}
 
     prior = dict(previous) if isinstance(previous, dict) else {}
     prior_matches = prior.get("entity_id") == entity_id
@@ -3032,7 +3034,7 @@ def _updated_load_source_outage(
             result["invalid_reason"] = invalid_reason
         return result
 
-    state_changed_at = getattr(state, "last_changed", None)
+    state_changed_at = stale_since or getattr(state, "last_changed", None)
     if not sentinel_state or not isinstance(state_changed_at, datetime):
         return {
             "entity_id": entity_id,
@@ -3446,7 +3448,11 @@ def _matches_climate_transaction(
             continue
         if any(getattr(context, "parent_id", None) not in {None, command["context_id"]} for context in contexts):
             continue
-        if now >= min(deadline, issued + timedelta(minutes=2)):
+        direct_window = (
+            HVAC_ZONE_SETTLE_MAX_SECONDS
+            if command.get("reconciling") and command.get("confirmed_at") is None else 120
+        )
+        if now >= min(deadline, issued + timedelta(seconds=direct_window)):
             continue
         expected_mode = "off" if service == "turn_off" else requested.get("hvac_mode")
         if service == "turn_on":
@@ -3480,6 +3486,30 @@ def _matches_climate_transaction(
                 "target_temp_low": source.get("target_temp_low"),
                 "target_temp_high": source.get("target_temp_high"),
             }
+            # Daikin restores a mode-specific remembered target before the
+            # separate temperature command. It need not equal the old mode's
+            # target. Admit only this short mode transition within device bounds;
+            # later target changes and user/external contexts remain overrides.
+            bounds = command.get("target_bounds", {})
+            lower, upper = finite(bounds.get("min_temp")), finite(bounds.get("max_temp"))
+            if coupled and hass is not None:
+                head = hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE)))
+                center = finite(head.attributes.get("temperature")) if head is not None else None
+                if head is not None and head.state == new.state and center is not None:
+                    lower, upper = center - 2, center + 2
+                else:
+                    lower, upper = None, None
+            value = finite(new_attributes.get("temperature"))
+            if (
+                old.state != new.state and changed == {"temperature"}
+                and now < min(deadline, issued + timedelta(seconds=HVAC_ZONE_SETTLE_MAX_SECONDS))
+                and lower is not None and upper is not None and value is not None and lower <= value <= upper
+                and not any(
+                    later.get("service") == "set_temperature" and later.get("entity_id") == command.get("entity_id")
+                    and later.get("issued_at", now) >= issued for later in commands
+                )
+            ):
+                targets["temperature"] = value
         if service == "set_temperature" and coupled:
             # A head command only authorizes the zone's required bounds clamp.
             # A compatible zone target does not become the requested head target.
