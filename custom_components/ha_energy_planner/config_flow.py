@@ -686,7 +686,7 @@ def _option_selector(field: str) -> Any:
             NumberSelectorConfig(min=1, max=30, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: NumberSelector(
-            NumberSelectorConfig(min=0, max=30, step=1, mode=NumberSelectorMode.BOX)
+            NumberSelectorConfig(min=0, max=1440, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT: NumberSelector(
             NumberSelectorConfig(min=0, max=100, step=1, mode=NumberSelectorMode.BOX)
@@ -736,6 +736,7 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Energy Planner."""
 
     VERSION = 5
+    MINOR_VERSION = 2
 
     @classmethod
     def async_get_supported_subentry_types(
@@ -1195,7 +1196,7 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
         load_grace = float(user_input[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES])
     except (KeyError, TypeError, ValueError):
         load_grace = -1
-    if not 0 <= load_grace <= 30:
+    if not 0 <= load_grace <= 1440:
         errors[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] = "invalid_load_outage_grace"
     recovery_age = finite(user_input.get(CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, 15))
     if recovery_age is None or not 1 <= recovery_age <= 30:

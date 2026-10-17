@@ -18,6 +18,24 @@ RECOVERY_PAIR_WINDOW_SECONDS = 1800
 RECOVERY_OBSERVATION_SECONDS = 90
 
 
+def load_sample_timestamp(state: Any) -> datetime | None:
+    """Prefer the source sample clock over an entity publication timestamp."""
+    attrs = getattr(state, "attributes", {}) or {}
+    if "sampled_at_utc" in attrs:
+        return timestamp(attrs["sampled_at_utc"])
+    return timestamp(getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
+                     or getattr(state, "last_changed", None))
+
+
+def stale_load_source_since(state: Any, now: datetime, options: Mapping[str, Any]) -> datetime | None:
+    """Locate lost sample freshness; the coordinator persists its first occurrence."""
+    sample = load_sample_timestamp(state)
+    if "sampled_at_utc" in (getattr(state, "attributes", {}) or {}) and (sample is None or sample > now):
+        return now
+    maximum_age = timedelta(minutes=float(options.get(CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, 15)))
+    return sample + maximum_age if sample is not None and now > sample + maximum_age else None
+
+
 def recovering_load_source(
     state: Any, previous: Any, entity_id: str, now: datetime, options: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -25,12 +43,7 @@ def recovering_load_source(
     if not isinstance(previous, dict) or previous.get("entity_id") != entity_id:
         return {}
     prior = dict(previous)
-    attrs = state.attributes or {}
-    raw = attrs.get("sampled_at_utc")
-    sample = timestamp(raw) if raw is not None else timestamp(
-        getattr(state, "last_reported", None) or getattr(state, "last_updated", None)
-        or getattr(state, "last_changed", None)
-    )
+    sample = load_sample_timestamp(state)
     max_age = float((options or {}).get(
         CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, RECOVERY_SAMPLE_MAX_AGE_SECONDS / 60,
     )) * 60
@@ -84,9 +97,9 @@ def fallback_power(context: Any, options: Mapping[str, Any]) -> float:
 
 
 def fallback_charging_decision(
-    context: Any, options: Mapping[str, Any], override: Any
+    context: Any, options: Mapping[str, Any], override: Any, *, scheduled: bool = False,
 ) -> tuple[bool, float, str] | None:
-    """Continue only an existing session or an explicit, unexpired charge-now request."""
+    """Use conservative capacity for scheduled starts and eligible continuations."""
     if not context.ev_evidence.get("load_fallback", {}).get("fallback_applied"):
         return None
     manual_start = bool(override is not None and override.reason in {"manual_start", "charge_now"}
@@ -95,7 +108,11 @@ def fallback_charging_decision(
     target_reached = (context.current_ev_soc_percent is not None
                       and context.ev_target_soc_percent is not None
                       and context.current_ev_soc_percent >= context.ev_target_soc_percent)
-    if manual_stop or target_reached or (context.ev_charging is not True and not manual_start):
+    new_start = context.ev_charging is not True
+    recovery = context.ev_evidence["load_fallback"]
+    stabilizing = recovery.get("recovery_pending") and not recovery.get("recovery_degraded_ready")
+    if (manual_stop or target_reached or (new_start and not (manual_start or scheduled))
+            or (new_start and stabilizing)):
         return False, 0.0, "ev_load_fallback_waiting"
     power = fallback_power(context, options)
     return power > 0, power, "ev_load_fallback_continue" if power > 0 else "ev_load_fallback_capacity_pause"

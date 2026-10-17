@@ -1,0 +1,13 @@
+{
+  "name": "sanitized_mode_feedback_from_2026_10_17",
+  "issued_at": "2026-10-17T04:13:12.615769+00:00",
+  "feedback_at": "2026-10-17T04:13:19.886592+00:00",
+  "old_mode": "heat",
+  "old_target": 19,
+  "requested_mode": "cool",
+  "requested_target": 19,
+  "reported_mode": "cool",
+  "reported_target": 24,
+  "min_temp": 7,
+  "max_temp": 35
+}
