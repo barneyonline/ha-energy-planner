@@ -22,6 +22,44 @@
 
 - None
 
+## 1.3.6 - 2026-10-17
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Allow delayed Daikin mode feedback to restore its remembered temperature before
+  the separate target command, without creating a false manual override. Wait
+  30 seconds initially, then reconcile device readback until 180 seconds after
+  issue without duplicate writes. Persist uncertain commands and original restoration
+  settings across reloads, including service timeouts, while preserving manual overrides.
+- Recheck manual changes after command-intent persistence, scope restoration checks
+  to the affected entity, confirm zone targets sequentially, and reconcile accepted
+  mode writes before rollback so late feedback cannot undo restoration.
+- Preserve pending climate activation evidence through reload and retain the latest
+  uncertain command through failed acquisition or release, without resurrecting
+  an already settled intent or replacing the original restoration baseline.
+- Use conservative household-load fallback when a numeric source sample is stale
+  or its sampling clock is invalid, preserving the original outage deadline across
+  repeated publications and reloads.
+
+### 🔧 Improvements
+
+- Default household-load fallback to six hours, support up to 24 hours, and upgrade
+  earlier positive settings below six hours once. Scheduled EV starts remain
+  available with conservative capacity, observed current ceilings and normal
+  vehicle, price, target and recovery checks.
+
+### 🔄 Other changes
+
+- None
+
 ## 1.3.5 - 2026-10-16
 
 ### 🚧 Breaking changes

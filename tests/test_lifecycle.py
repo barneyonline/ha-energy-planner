@@ -33,6 +33,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SOC,
     CONF_EV_SOC_PER_KWH,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     DEFAULT_OPTIONS,
     EV_RESERVATION_EXTERNAL_BASELINE,
 )
@@ -132,6 +133,18 @@ class FakeEntry:
 
     def add_update_listener(self, listener: Any) -> Any:
         return listener
+
+
+@pytest.mark.parametrize("grace,minor,expected", [(10, 1, 360), (30, 1, 360), (0, 1, 0),
+                                               (720, 1, 720), (None, 1, None), ("bad", 1, "bad"), (10, 2, 10)])
+def test_migration_upgrades_legacy_fallback_once(grace, minor, expected):
+    entry = SimpleNamespace(entry_id="test", version=5, minor_version=minor, data={},
+                            options={CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: grace})
+    manager = FakeConfigEntries()
+    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is True
+    changes = manager.updated_entries[-1][1]
+    assert changes["options"][CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] == expected
+    assert changes["minor_version"] == 2
 
 
 def test_config_entry_migration_uses_only_measured_legacy_load() -> None:

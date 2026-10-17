@@ -2252,7 +2252,7 @@ def test_retained_climate_tariff_evidence_fails_closed() -> None:
     assert slots and slots[0].import_price == 0.1
 
 
-def test_default_outage_covers_eighteen_minutes_with_added_capacity_margin_and_expires() -> None:
+def test_default_outage_covers_six_hours_with_added_capacity_margin_and_expires() -> None:
     now = datetime(2026, 9, 22, tzinfo=UTC)
     manager = _RawInputManager(
         FakeHass({"sensor.house": FakeState("unavailable", last_changed=now-timedelta(minutes=18))}),
@@ -2262,11 +2262,62 @@ def test_default_outage_covers_eighteen_minutes_with_added_capacity_margin_and_e
     _, issue = manager._built_in_load_series(now, 1, 15)
     assert issue == "household_load_model_fallback_active"
     assert manager.load_forecast_details["uncertainty_margin_kw"] == 1.0
-    assert manager.load_forecast_details["fallback_remaining_seconds"] == 720
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 342 * 60
     assert min(manager._conservative_forecast_series["baseline_load_forecast_kw"]) >= 2.0
-    _, issue = manager._built_in_load_series(now+timedelta(minutes=12), 1, 15)
+    _, issue = manager._built_in_load_series(now+timedelta(minutes=341), 1, 15)
+    assert issue == "household_load_model_fallback_active"
+    _, issue = manager._built_in_load_series(now+timedelta(minutes=342), 1, 15)
     assert issue == "household_load_entity_unavailable"
     assert manager.load_forecast_details["fallback_reason"] == "grace_expired"
+
+
+@pytest.mark.parametrize("sample_kind", ["missing", "invalid", "future"])
+def test_numeric_source_without_a_valid_clock_keeps_original_fallback_deadline(sample_kind):
+    from custom_components.ha_energy_planner.coordinator import _updated_load_source_outage
+
+    now = datetime(2026, 10, 17, 4, tzinfo=UTC)
+    clock = {"missing": None, "invalid": "invalid", "future": (now+timedelta(days=1)).isoformat()}[sample_kind]
+    state = FakeState("1200", {"unit_of_measurement": "W", "sampled_at_utc": clock}, last_updated=now)
+    hass = FakeHass({"sensor.house": state})
+    entry_data = {CONF_HOUSEHOLD_LOAD: "sensor.house"}
+    outage = _updated_load_source_outage(hass, entry_data, {}, now=now, options=DEFAULT_OPTIONS)
+    assert outage["started_at"] == now.isoformat()
+    later = now+timedelta(hours=5)
+    outage = _updated_load_source_outage(hass, entry_data, dict(outage), now=later, options=DEFAULT_OPTIONS)
+    manager = _RawInputManager(hass, entry_data, dict(DEFAULT_OPTIONS), load_source_outage=outage,
+                              load_forecast_model=_constant_load_model("sensor.house", 1.0, now))
+    _, issue = manager._built_in_load_series(later, 12, 15)
+    assert issue == "household_load_model_fallback_active"
+    assert manager.load_forecast_details["fallback_remaining_seconds"] == 3600
+    assert manager.load_forecast_details["current_correction_applied"] is False
+
+
+@pytest.mark.parametrize("source_state", ["unavailable", "unknown", "1200"])
+def test_six_hour_fallback_survives_stale_publications_and_reload(monkeypatch, source_state):
+    from custom_components.ha_energy_planner.coordinator import _updated_load_source_outage
+
+    now = datetime(2026, 10, 17, 4, tzinfo=UTC)
+    started = now - timedelta(hours=5, minutes=59)
+    sample = started - timedelta(minutes=15)
+    state = FakeState(source_state, {"unit_of_measurement": "W", "sampled_at_utc": sample.isoformat()},
+                      last_updated=now, last_changed=started)
+    hass = FakeHass({"sensor.house": state})
+    entry_data = {CONF_HOUSEHOLD_LOAD: "sensor.house"}
+    outage = _updated_load_source_outage(hass, entry_data, {}, now=now, options=DEFAULT_OPTIONS)
+    assert outage["started_at"] == started.isoformat()
+    for tick in [now, now+timedelta(seconds=59), now+timedelta(seconds=60)]:
+        monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda tick=tick: tick)
+        outage = _updated_load_source_outage(hass, entry_data, dict(outage), now=tick, options=DEFAULT_OPTIONS)
+        manager = _RawInputManager(hass, entry_data, dict(DEFAULT_OPTIONS), load_source_outage=dict(outage),
+                                  load_forecast_model=_constant_load_model("sensor.house", 1.0, now))
+        manager._built_in_load_series(tick, 12, 15)
+        active = tick < started+timedelta(hours=6)
+        assert manager.load_forecast_details["fallback_applied"] is active
+        assert manager.load_forecast_details["current_correction_applied"] is False
+        assert manager.load_forecast_details["fallback_remaining_seconds"] == max(60-(tick-now).total_seconds(), 0)
+        if active:
+            assert manager._freshness_issues(tick) == []
+        assert outage["started_at"] == started.isoformat()
 
 
 def test_numeric_sample_does_not_end_fallback_before_stable_recovery() -> None:
@@ -2295,7 +2346,8 @@ def test_single_sample_recovery_keeps_original_capacity_deadline_and_expiry():
     later = now+timedelta(seconds=90)
     stable = recovering_load_source(state, first, "sensor.house", later)
     manager = _RawInputManager(FakeHass({"sensor.house": state}), {CONF_HOUSEHOLD_LOAD: "sensor.house"},
-                              dict(DEFAULT_OPTIONS), load_forecast_model=_constant_load_model("sensor.house", 1, now),
+                              {**DEFAULT_OPTIONS, CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES: 30},
+                              load_forecast_model=_constant_load_model("sensor.house", 1, now),
                               load_source_outage=stable)
     _, issue = manager._built_in_load_series(later, 1, 15)
     assert issue == "household_load_model_fallback_active"

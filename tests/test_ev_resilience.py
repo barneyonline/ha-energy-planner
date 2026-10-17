@@ -80,6 +80,7 @@ def test_fallback_never_increases_current_and_fixed_power_pauses_without_headroo
     ctx = context()
     ctx.slots[0].baseline_load_forecast_upper_kw = 5
     assert fallback_power(ctx, OPTIONS) == 0
+
     limit = SimpleNamespace(entity_id="number.amps", state="20", attributes={
         "unit_of_measurement": "A", "min": 6, "max": 32, "step": 1})
     capability = power_capability(limit, {"ev_voltage": 230, "ev_phases": 1, "ev_limit_min": 6, "ev_limit_max": 32})
@@ -237,3 +238,19 @@ def test_recovery_timestamp_rollback_restarts_observation_without_renewing_budge
     future_observation = {**first, "recovery_observed_since": (NOW+timedelta(minutes=1)).isoformat()}
     assert recovering_load_source(state(NOW), future_observation, "sensor.load", NOW)["recovery_observed_since"] == (
         NOW.isoformat())
+
+def test_scheduled_start_uses_conservative_capacity_during_extended_fallback():
+    ctx = context()
+    ctx.ev_charging = False
+    ctx.ev_evidence["load_fallback"]["fallback_remaining_seconds"] = 5 * 3600
+    assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True) == (True, 7.0, "ev_load_fallback_continue")
+    assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=False)[0] is False
+    ctx.slots[0].baseline_load_forecast_upper_kw = 5
+    assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True) == (
+        False, 0.0, "ev_load_fallback_capacity_pause",
+    )
+    ctx.slots[0].baseline_load_forecast_upper_kw = 3
+    ctx.ev_evidence["load_fallback"].update(recovery_pending=True, recovery_degraded_ready=False)
+    assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True)[0] is False
+    ctx.ev_evidence["load_fallback"]["recovery_degraded_ready"] = True
+    assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True)[0] is True

@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import timedelta
 from math import isfinite
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
 from homeassistant.core import Context, HomeAssistant, State
+from homeassistant.helpers.entity_component import async_update_entity
+from homeassistant.util import dt as dt_util
 
 from .adapter_helpers import async_call_device_service, available_state, zone_temperature_sync_deferred
 from .const import (
@@ -21,7 +24,9 @@ from .const import (
 )
 from .models import ActionKind, PlanAction
 
-_STATE_CONFIRMATION_TIMEOUT_SECONDS = 5.0
+_STATE_CONFIRMATION_TIMEOUT_SECONDS = 30.0
+_STATE_RECONCILIATION_TIMEOUT_SECONDS = 180.0
+_STATE_REFRESH_INTERVAL_SECONDS = 30.0
 _STATE_CONFIRMATION_POLL_SECONDS = 0.05
 _SCHEDULER_GUARD_DURATION = "00:00:30"
 _ROLLBACK_ACTIVE_HVAC_MODE = "rollback_active_hvac_mode"
@@ -75,6 +80,23 @@ class DaikinHVACAdapter:
         self._command_callback: Callable[[dict[str, Any]], None] | None = None
         self._last_commands: dict[str, dict[str, Any]] = {}
         self._abort_main_state: dict[str, Any] = {}
+        self._command_started: dict[str, float] = {}
+        self._climate_override_policy: dict[str, tuple[bool, bool]] = {}
+        self._async_persist_confirmation: Callable[[dict[str, Any] | None], Awaitable[None]] | None = None
+        self._recovery_confirmation: dict[str, Any] | None = None
+
+    def set_confirmation_persistence_callback(
+        self, callback: Callable[[dict[str, Any] | None], Awaitable[None]],
+        recovery: dict[str, Any] | None = None,
+    ) -> None:
+        """Retain an uncertain command and its original deadline across reloads."""
+        self._async_persist_confirmation = callback
+        self._recovery_confirmation = recovery
+
+    async def _async_save_confirmation(self, record: dict[str, Any] | None) -> None:
+        if self._async_persist_confirmation is not None:
+            await self._async_persist_confirmation(record)
+        self._recovery_confirmation = record
 
     def set_command_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Record the exact issued service and its bounded feedback expectation."""
@@ -95,6 +117,9 @@ class DaikinHVACAdapter:
             "context_id": context.id,
             "requested": {key: value for key, value in data.items() if key != ATTR_ENTITY_ID},
             "observed": _climate_state_snapshot(observed) if domain == "climate" and observed is not None else {},
+            "target_bounds": {
+                key: observed.attributes.get(key) for key in ("min_temp", "max_temp")
+            } if observed is not None else {},
         }
         record["coupled_zones"] = {
             entity: {
@@ -109,11 +134,45 @@ class DaikinHVACAdapter:
         main = self._state(str(self.entry_data.get(CONF_DAIKIN_CLIMATE)))
         record["main_mode"] = main.state if main is not None else None
         record["main_target"] = main.attributes.get("temperature") if main is not None else None
-        self._last_commands[str(data.get(ATTR_ENTITY_ID))] = record
+        entity_id = str(data.get(ATTR_ENTITY_ID))
+        self._last_commands[entity_id] = record
+        self._command_started[entity_id] = asyncio.get_running_loop().time()
+        if domain == "climate":
+            now = dt_util.utcnow()
+            record.update(
+                issued_at=now.isoformat(),
+                deadline=(now + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS)).isoformat(),
+            )
+            # Flush before dispatch: a lost service response is still an issued
+            # intent, and startup must not immediately replay or race it.
+            await self._async_save_confirmation(record)
+            # A listener may supersede the intent while its disk flush yields.
+            # Apply the same acquisition/restoration policy immediately before
+            # dispatch, rather than overwriting the user's new target first.
+            await asyncio.sleep(0)
+            try:
+                self._raise_if_climate_override_requested(entity_id)
+            except _HVACManualOverrideError:
+                # This intent never reached the service bus. Retire superseded
+                # baselines first so a crash cannot replay a stale user target,
+                # then remove the unsent intent rather than reconciling it as
+                # though its apparent state were authoritative device feedback.
+                await self._async_persist_requested_manual_supersessions()
+                await self._async_save_confirmation(None)
+                self._last_commands.pop(entity_id, None)
+                self._command_started.pop(entity_id, None)
+                raise
         if self._command_callback is not None:
             self._command_callback({**record, "stage": "issued"})
         try:
             await async_call_device_service(hass, domain, service, data, **kwargs)
+        except TimeoutError:
+            if domain != "climate":
+                raise
+            # The device may have accepted the write before HA timed out.
+            # Only readback can resolve this; never resend the command here.
+            if self._command_callback is not None:
+                self._command_callback({**record, "stage": "readback_pending", "reason": "service_timeout"})
         except BaseException as error:
             if self._command_callback is not None:
                 self._command_callback({**record, "stage": "service_failed", "failure_category": type(error).__name__})
@@ -624,42 +683,6 @@ class DaikinHVACAdapter:
             )
         confirmation_reason = "hvac_state_confirmation_failed"
         if not state_confirmed:
-            # A schedule action can already be running when its automation is
-            # disabled. Re-arm the classifier guard and reassert the complete
-            # desired state once after that action has settled.
-            if not await self._async_arm_scheduler_guard():
-                confirmation_reason = "climate_scheduler_guard_failed"
-            else:
-                try:
-                    self._raise_if_manual_override_requested()
-                    command_sent = (
-                        await self._async_apply_hvac_state(
-                            climate_entity,
-                            action.desired_state,
-                            force=True,
-                            takeover_main_state=saved_main_state,
-                        )
-                        or command_sent
-                    )
-                    self._raise_if_manual_override_requested()
-                    state_confirmed = await self._async_confirm_complete_hvac_state(
-                        climate_entity,
-                        action.desired_state,
-                    )
-                    self._raise_if_manual_override_requested()
-                except _HVACManualOverrideError:
-                    return await self._async_manual_override_result(
-                        pre_state,
-                        changed_automations,
-                        changed_zones,
-                        main_entity=climate_entity,
-                        saved_main_state=saved_main_state,
-                    )
-                except _HVACStateConfirmationError:
-                    confirmation_reason = "hvac_state_confirmation_failed"
-                except Exception:  # noqa: BLE001 - retry remains inside the same rollback boundary.
-                    confirmation_reason = "hvac_control_service_failed"
-        if not state_confirmed:
             (
                 rollback_succeeded,
                 unresolved_states,
@@ -727,6 +750,7 @@ class DaikinHVACAdapter:
         saved_main_state: dict[str, Any] | None = None,
     ) -> HVACCommandResult:
         """Release HVAC ownership by restoring captured actuator state."""
+        await self._async_reconcile_recovery()
         self._manual_supersession_persisted = False
         self._persisted_zone_supersessions.clear()
         pre_state = self._snapshot()
@@ -1260,6 +1284,10 @@ class DaikinHVACAdapter:
             main_superseded,
             superseded_zones,
         )
+        # An unrelated zone override does not cancel a mode write already
+        # accepted by the head. Settle that intent before trusting a cached
+        # pre-command baseline or issuing its compensation.
+        await self._async_reconcile_recovery()
         rollback_zones = {
             entity_id: state for entity_id, state in changed_zones.items() if entity_id not in superseded_zones
         }
@@ -1409,24 +1437,114 @@ class DaikinHVACAdapter:
                 return False
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
+    def _raise_if_climate_override_requested(self, entity_id: str) -> None:
+        """Honor the caller's override scope throughout persistence and readback."""
+        respect_main, respect_zones = self._climate_override_policy.get(entity_id, (True, True))
+        if respect_main:
+            self._raise_if_manual_override_requested(include_zones=respect_zones)
+        elif entity_id in self._manual_zone_override_entity_ids():
+            # Sibling cleanup survives a main or another zone's manual change,
+            # but must still preserve a superseding change to this exact zone.
+            raise _HVACManualOverrideError
+
+    async def _async_reconcile_recovery(self) -> None:
+        """Settle a persisted write before issuing compensating restoration."""
+        record = self._recovery_confirmation
+        if record is None:
+            return
+        entity_id = str(record["entity_id"])
+        self._climate_override_policy[entity_id] = (
+            entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE), False,
+        )
+        deadline = dt_util.parse_datetime(record["deadline"])
+        assert deadline is not None
+        self._last_commands[entity_id] = record
+        remaining = min(_STATE_RECONCILIATION_TIMEOUT_SECONDS, max(0.0, (deadline - dt_util.utcnow()).total_seconds()))
+        self._command_started[entity_id] = (
+            asyncio.get_running_loop().time() - (_STATE_RECONCILIATION_TIMEOUT_SECONDS - remaining)
+        )
+        try:
+            requested = record["requested"]
+            if record["service"] == "turn_on":
+                await self._async_confirm_hvac_on(entity_id)
+            else:
+                desired = dict(requested)
+                if "temperature" in desired:
+                    desired["target_temperature"] = desired.pop("temperature")
+                if record["service"] == "turn_off":
+                    desired["hvac_mode"] = "off"
+                await self._async_confirm_hvac_state(entity_id, desired)
+        except _HVACManualOverrideError:
+            # Supersession retires this entity's old intent, while unrelated
+            # restoration must still proceed with its own override policy.
+            await self._async_persist_requested_manual_supersessions()
+        await self._async_save_confirmation(None)
+
     async def _async_confirm_hvac_state(self, entity_id: str, desired_state: dict[str, Any]) -> bool:
-        """Wait briefly for Home Assistant to publish the requested thermostat state."""
-        # Older HA releases queue state listeners even when the state machine
-        # already reflects a service result. Deliver those events while the
-        # command context and manual-supersession markers are still active.
+        """Confirm a thermostat write without retransmitting an uncertain intent."""
+        return await self._async_wait_for_climate(
+            entity_id, lambda observed: _already_in_desired_state(observed, desired_state),
+        )
+
+    async def _async_wait_for_climate(self, entity_id: str, matches: Callable[[State], bool]) -> bool:
+        """Wait 30 seconds, then reconcile readback within the original 180-second lease."""
         await asyncio.sleep(0)
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
-        while True:
-            observed = self._state(entity_id)
-            if observed is not None and _already_in_desired_state(observed, desired_state):
-                self._record_confirmation(entity_id, True)
-                return True
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                self._record_confirmation(entity_id, False)
-                return False
-            await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
+        started = self._command_started.get(entity_id, loop.time())
+        initial_deadline = started + _STATE_CONFIRMATION_TIMEOUT_SECONDS
+        deadline = started + (
+            _STATE_RECONCILIATION_TIMEOUT_SECONDS
+            if entity_id in self._command_started else _STATE_CONFIRMATION_TIMEOUT_SECONDS
+        )
+        pending = False
+        next_refresh = initial_deadline
+        refresh: asyncio.Task[Any] | None = None
+        try:
+            while True:
+                observed = self._state(entity_id)
+                if observed is not None and matches(observed):
+                    self._record_confirmation(entity_id, True)
+                    if (self._recovery_confirmation is not None
+                            and self._recovery_confirmation["entity_id"] == entity_id):
+                        await self._async_save_confirmation(None)
+                    return True
+                # Synchronous listener markers must interrupt a pending wait;
+                # queued release can then preserve the superseding user state.
+                self._raise_if_climate_override_requested(entity_id)
+                now = loop.time()
+                if now >= deadline:
+                    self._record_confirmation(entity_id, False)
+                    if (self._recovery_confirmation is not None
+                            and self._recovery_confirmation["entity_id"] == entity_id):
+                        await self._async_save_confirmation(None)
+                    return False
+                if now >= initial_deadline:
+                    if not pending:
+                        pending = True
+                        record = self._last_commands.get(entity_id)
+                        if record is not None and self._command_callback is not None:
+                            self._command_callback({**record, "stage": "readback_pending"})
+                    if now >= next_refresh and refresh is None:
+                        # A state-machine poll alone cannot fetch Daikin data.
+                        # Request a coordinator refresh without issuing a write.
+                        refresh = asyncio.create_task(self._async_refresh_climate(entity_id))
+                        next_refresh = now + _STATE_REFRESH_INTERVAL_SECONDS
+                if refresh is not None and refresh.done():
+                    await refresh
+                    refresh = None
+                await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, deadline - now))
+        finally:
+            if refresh is not None:
+                refresh.cancel()
+                await asyncio.gather(refresh, return_exceptions=True)
+
+    async def _async_refresh_climate(self, entity_id: str) -> None:
+        """Bound read-only refresh independently of the device command lease."""
+        try:
+            async with asyncio.timeout(_STATE_REFRESH_INTERVAL_SECONDS):
+                await async_update_entity(self.hass, entity_id)
+        except Exception:  # noqa: BLE001 - unavailable refresh never proves command rejection.
+            pass
 
     async def _async_confirm_complete_hvac_state(
         self,
@@ -1450,23 +1568,10 @@ class DaikinHVACAdapter:
         return True
 
     async def _async_confirm_hvac_on(self, entity_id: str) -> bool:
-        """Wait for the thermostat to leave its off state."""
-        # Older HA releases queue state listeners even when the state machine
-        # already reflects a service result. Deliver those events while the
-        # command context and manual-supersession markers are still active.
-        await asyncio.sleep(0)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + _STATE_CONFIRMATION_TIMEOUT_SECONDS
-        while True:
-            observed = self._state(entity_id)
-            if observed is not None and observed.state != "off":
-                self._record_confirmation(entity_id, True)
-                return True
-            remaining = deadline - loop.time()
-            if remaining <= 0:
-                self._record_confirmation(entity_id, False)
-                return False
-            await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
+        """Confirm a real active mode rather than unavailable or unknown telemetry."""
+        return await self._async_wait_for_climate(
+            entity_id, lambda observed: observed.state not in {"off", "unknown", "unavailable"},
+        )
 
     async def _async_apply_hvac_state(
         self,
@@ -1479,6 +1584,7 @@ class DaikinHVACAdapter:
         respect_zone_manual_override: bool = True,
     ) -> bool:
         """Apply thermostat mode before its target and report whether a command was sent."""
+        self._climate_override_policy[entity_id] = (respect_manual_override, respect_zone_manual_override)
         if respect_manual_override:
             self._raise_if_manual_override_requested(
                 include_zones=respect_zone_manual_override,
@@ -1645,6 +1751,13 @@ class DaikinHVACAdapter:
                 self._raise_if_manual_override_requested(
                     include_zones=respect_zone_manual_override,
                 )
+        if _temperature_desired_state(main_desired_state):
+            # One durable uncertainty record is sufficient only when each target
+            # settles before the next zone can replace it. This also keeps a
+            # service timeout from allowing the following zone write to race it.
+            if not await self._async_confirm_hvac_state(entity_id, main_desired_state):
+                raise _HVACStateConfirmationError("climate target was not confirmed")
+            self._raise_if_climate_override_requested(entity_id)
         if desired_state.get("enable_zones") and desired_state.get("configured_zones_only") is True:
             # Daikin zone temperature bounds can depend on the main thermostat
             # target. Confirm the main target before asking subordinate climate

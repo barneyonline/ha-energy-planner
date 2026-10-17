@@ -19,7 +19,7 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Upgrades remove current and legacy separate EV start/stop mappings, retaining the configured charger switch and saved recovery snapshots and command identity. Missing original controls retain ownership. Explicit dispatch evidence is preserved in audit and rolling-attempt storage, so partial commands followed by target loss still consume allowance while local rejections do not. Regression coverage is in `tests/test_config_flow.py`, `tests/test_lifecycle.py`, `tests/test_executor.py`, `tests/test_action_limits.py`, and `tests/test_storage.py`.
 
-- Main thermostat shutdown feedback is scoped through service dispatch, confirmation and a bounded settling period of at most two minutes. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events outside the matching command transition or deadline remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
+- Main thermostat shutdown feedback is scoped through service dispatch, confirmation and a bounded settling period of at most three minutes. Configured zone climates may turn off and lose target attributes without triggering manual override; user attribution, unrelated ancestry, unexpected targets/modes, auxiliary changes, unrelated zones and events outside the matching command transition or deadline remain excluded. Adapter regressions exercise successful and failed restores (`tests/test_hvac_adapter.py`).
 
 - EV and climate action limits remain configurable (defaults 10 and 12 respectively, with a 60-minute manual HVAC override; existing values preserved). The optimizer distinguishes physically feasible candidates rejected by the rolling action allowance from capacity/price shortfalls, and notifications expose the limit and remaining allowance. Regression tests cover exhausted/one-action allowances, recovery after raising the cap, physical shortfalls, and actionable notifications (`tests/test_ev_optimization.py`, `tests/test_executor.py`). Safety-stop accounting remains conservative.
 
@@ -526,8 +526,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   only gaps of at most 30 minutes are interpolated. A bounded recent-load
   correction fades to neutral over two hours, and UTC planning slots are mapped
   through timezone-aware local timestamps for DST folds and gaps.
-- A configurable `household_load_outage_grace_minutes` (default 10, range
-  0–30) permits only a known `unknown`/`unavailable` transition to use a ready,
+- A configurable `household_load_outage_grace_minutes` (default 360, range
+  0–1440) permits a known `unknown`/`unavailable` transition or stale source sample to use a ready,
   quality-approved, current, complete model that still matches the mapped
   entity and timezone. The degraded path omits current-load correction, uses
   the conservative upper series, caps load confidence at 0.65, and records
@@ -542,7 +542,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   existing plan presentation, and exported diagnostics. Tests distinguish
   bridging, expired/disabled grace, missing/non-numeric inputs, invalid outage
   timing, ineligible continuous outages, and unready/incomplete models without
-  weakening the 10-minute default or model-quality gate.
+  weakening the model-quality gate.
 - PV freshness uses the planning parser's final-interval coverage and the same
   timestamp validation used to admit tomorrow's forecast. Regression cases
   cover 23:30, the exclusive midnight endpoint, valid tomorrow coverage, absent
@@ -1102,7 +1102,7 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 ## EV consumption-outage resilience and explicit charging
 
 - Known load outages have bounded model authority, a conservative upper-load margin,
-  no automatic starts and no setpoint increases. Shared reservations remain authoritative;
+  scheduled automatic starts after normal eligibility checks, and no setpoint increases. Shared reservations remain authoritative;
   unsafe/uncertain reductions stop safely. Evidence: `ev_resilience.py`, `inputs.py`,
   `planner.py`, `executor.py`, `ev_runtime.py`; regressions in `test_ev_resilience.py`,
   `test_inputs.py`, `test_planner.py`, `test_executor.py`.
@@ -1125,8 +1125,7 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
   newest sample using the Data health sample-age option (15-minute default, 1–30 range).
   Single-sample observation uses 90 seconds; repeats never establish normal recovery.
 - Original outage age, capacity ceilings, model quality and grace expiry remain
-  authoritative. Stabilization grants no new automatic sessions; explicit starts wait
-  for stable observation. Unknown outage age remains ineligible for bounded fallback.
+  authoritative. During initial stabilization new starts wait for stable observation; scheduled and explicit starts then retain conservative capacity checks. Unknown outage age remains ineligible for bounded fallback.
 - `startup_recovery.py` wakes on a committed healthy full recovery and runs one complete
   validation with existing restore and final activation checks. Tests in
   `test_ev_resilience.py`, `test_inputs.py`, `test_coordinator.py` and `test_config_flow.py`
@@ -1283,3 +1282,12 @@ or live deployment was performed; live cycle acceptance remains outstanding.
   actual confirmation sample timestamp for this ordering boundary.
   No live device acceptance or savings are implied by these regressions. The
   complete gate remains `scripts/docker-validate.sh`.
+
+- Six-hour consumption resilience: source sampling timestamps determine numeric freshness, and the persisted original outage deadline survives stale publications, sentinel changes and reloads. Legacy positive settings below six hours migrate once to 360 minutes (config-entry minor version 2). Scheduled EV starts use conservative forecast capacity while retaining device, tariff, SOC, recovery and current-limit checks. Evidence: `tests/test_inputs.py::test_six_hour_fallback_survives_stale_publications_and_reload`, `tests/test_lifecycle.py::test_migration_upgrades_legacy_fallback_once`, and `tests/test_ev_resilience.py::test_scheduled_start_uses_conservative_capacity_during_extended_fallback`.
+- Daikin mode recall: a sanitized 17 October device-feedback fixture covers the requested cooling mode restoring its remembered 24°C target after 7.27 seconds, before the separate 19°C command. The observed 7.27-second sequence included an intervening retry and does not prove a 15-second timeout sufficient. Confirmation now waits 30 seconds initially, then requests read-only coordinator refreshes every 30 seconds within the original 180-second issue deadline. Accepted-but-timed-out writes are reconciled without duplicate retries; uncertainty and original restoration settings are persisted before dispatch, and reload recovery settles the original command before restoration. Bounded remembered-target classification rejects explicit users, external parents, standalone target changes, expired expectations and superseded targets. Evidence: `tests/test_coordinator.py::test_live_daikin_mode_recall_does_not_create_false_manual_override` and `tests/test_hvac_adapter.py::test_mode_recall_waits_for_live_daikin_delay_before_setting_target`.
+
+- Bounded Daikin reconciliation regressions cover delayed mode readback followed by a separate target, uncertain service timeouts, offline and blocked refreshes, expiry without duplicate writes, prompt manual supersession, and reload handling for mode/target/on/off commands (`tests/test_hvac_adapter.py`). Executor tests prove the original baseline and deadline survive reload and expired, future or malformed evidence grants no feedback authority (`tests/test_executor.py`); diagnostics expose outstanding command evidence (`tests/test_diagnostics.py`). A late confirmed acquisition starts its control lease from confirmation rather than issue, and operator disarm still restores physical settings before reporting failed disk persistence (`tests/test_control_runtime.py`).
+
+- Review regressions prove that synchronous and queued main changes during an intent flush prevent on/mode/scalar/range dispatch and create no false issued/confirmed audit evidence. Restoration distinguishes a main change, a sibling-zone change and the restored zone's own supersession; a zone override cannot count an unapplied main shutdown as confirmed. Multi-zone acquisition retains the first uncertain target until readback, and zone-triggered manual rollback reconciles an accepted mode write before restoring its original baseline (`tests/test_hvac_adapter.py::test_review_manual_change_during_intent_flush_prevents_dispatch`, `test_review_zone_override_cannot_confirm_an_unapplied_main_shutdown`, `test_review_zone_restoration_respects_only_its_own_supersession`, `test_review_multiple_zones_never_replace_an_unconfirmed_command`, `test_review_manual_zone_change_settles_main_intent_before_rollback`).
+
+- Pending HVAC ownership reconciliation copies command uncertainty from the current durable control state when acquisition rollback or release fails, including exceptions and per-device safe-state restoration. It preserves original main/zone baselines while preventing both loss of a new intent and resurrection of a retired one (`tests/test_executor.py::test_review_failed_acquisition_uses_current_command_uncertainty`, `test_review_failed_release_uses_current_command_uncertainty`). Reload restores the original transaction identity, captured zone targets and a bounded activation history with parsed source timestamps. JSON round-trip regressions preserve exact delayed coupled feedback with missing prior targets while rejecting user attribution, unrelated parents, wrong targets, expired deadlines and superseding off commands (`tests/test_coordinator.py::test_review_pending_feedback_survives_json_reload_with_activation_proof`). Malformed activation history grants no authority.

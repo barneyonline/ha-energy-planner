@@ -176,6 +176,7 @@ def climate_diagnostics(store_data: dict[str, Any], plan: Any, options: dict[str
         "unresolved_automations": store_data.get("ownership", {}).get("climate_automations", {})
         if control.get("required_evidence_lost")
         else {},
+        "command_confirmation": control.get("command_confirmation"),
         "climate_audit": climate_audit[-100:],
         "last_failure_category": next(
             (item["failure_category"] for item in reversed(climate_audit) if item.get("failure_category")),

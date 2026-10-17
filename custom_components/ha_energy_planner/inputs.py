@@ -663,6 +663,11 @@ class InputManager:
             )
             if current_load is None:
                 source_issue = f"{CONF_HOUSEHOLD_LOAD}_non_numeric"
+        from .ev_resilience import stale_load_source_since
+
+        if current_load is not None and stale_load_source_since(state, now, self.options) is not None:
+            source_issue = f"{CONF_HOUSEHOLD_LOAD}_stale"
+            current_load = None
         current_ev_charging, _ev_issue = self._optional_bool_state(CONF_EV_CHARGING)
         hvac_entity_id = self.entry_data.get(CONF_DAIKIN_POWER)
         hvac_state = self._state(hvac_entity_id) if hvac_entity_id else None
@@ -715,7 +720,7 @@ class InputManager:
             value + LOAD_UNCERTAINTY_KW if fallback_active and value is not None else value
             for value in result.upper_kw
         ]
-        grace_seconds = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)), 0) * 60
+        grace_seconds = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 360)), 0) * 60
         fallback_details = {
             "fallback_status": "active" if fallback_active else "unavailable" if source_issue else "not_needed",
             "fallback_reason": fallback_reason,
@@ -751,7 +756,7 @@ class InputManager:
                 else "available"
             ),
             "live_source_outage_seconds": outage_seconds,
-            "outage_grace_minutes": int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)),
+            "outage_grace_minutes": int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 360)),
             "current_correction_applied": (
                 current_load is not None and recent_load_is_clean and current_ev_charging is not True
                 and not self.load_source_outage.get("recovering")
@@ -773,7 +778,7 @@ class InputManager:
             ),
             "live_source_outage_seconds": outage_seconds,
             "outage_grace_minutes": int(
-                self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)
+                self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 360)
             ),
             "current_correction_applied": (
                 current_load is not None
@@ -841,15 +846,17 @@ class InputManager:
         expected: list[float | None],
         upper: list[float | None],
     ) -> tuple[bool, float | None, str]:
-        """Return whether a short known live-source outage may use the safe model."""
+        """Return whether a bounded live-source outage may use the safe model."""
+        from .ev_resilience import stale_load_source_since
         if state is None:
             return False, None, "source_missing"
         if source_issue is None:
             return False, None, "live_source_available"
-        if source_issue != f"{CONF_HOUSEHOLD_LOAD}_unavailable":
+        if source_issue not in {f"{CONF_HOUSEHOLD_LOAD}_unavailable", f"{CONF_HOUSEHOLD_LOAD}_stale"}:
             return False, None, "source_non_numeric"
         if (not self.load_source_outage.get("recovering")
-                and str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}):
+                and str(getattr(state, "state", "")).lower() not in {"unknown", "unavailable"}
+                and source_issue != f"{CONF_HOUSEHOLD_LOAD}_stale"):
             return False, None, "source_non_numeric"
         entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
         changed_at: Any = None
@@ -862,7 +869,9 @@ class InputManager:
             if changed_at is None:
                 return False, None, "outage_start_unknown"
         else:
-            changed_at = getattr(state, "last_changed", None)
+            changed_at = (stale_load_source_since(state, now, self.options)
+                          if source_issue == f"{CONF_HOUSEHOLD_LOAD}_stale"
+                          else getattr(state, "last_changed", None))
         if not isinstance(changed_at, datetime):
             return False, None, "outage_start_unknown"
         if changed_at.tzinfo is None:
@@ -870,7 +879,7 @@ class InputManager:
         outage_seconds = (dt_util.as_utc(now) - dt_util.as_utc(changed_at)).total_seconds()
         if outage_seconds < 0:
             return False, None, "outage_start_in_future"
-        grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 30)), 0)
+        grace_minutes = max(int(self.options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES, 360)), 0)
         elapsed_seconds = outage_seconds
         outage_seconds = round(outage_seconds, 3)
         if grace_minutes == 0:
@@ -1190,7 +1199,8 @@ class InputManager:
                     issues.append(issue)
         load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)
         load_state = self._state(load_entity) if load_entity else None
-        if load_state and now - load_state.last_updated > forecast_timeout:
+        if (load_state and now - load_state.last_updated > forecast_timeout
+                and not self.load_forecast_details.get("fallback_applied")):
             issues.append(f"{CONF_HOUSEHOLD_LOAD}_stale")
         return issues
 

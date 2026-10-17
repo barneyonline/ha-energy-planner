@@ -8108,3 +8108,163 @@ def test_manual_supersession_retires_feedback_even_without_an_inflight_transacti
     else:
         assert executor.mark_pending_hvac_manual_override() is False
     assert executor.hvac_feedback_commands == []
+
+
+@pytest.mark.parametrize("age", [0, 180, 181, -1])
+def test_hvac_confirmation_deadline_survives_executor_reload(monkeypatch, age):
+    now = datetime(2026, 10, 17, tzinfo=UTC)
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now)
+    store = FakeStore()
+    issued = now - timedelta(seconds=age)
+    record = {"entity_id": "climate.daikin", "context_id": "issued-once", "service": "set_hvac_mode",
+              "requested": {"hvac_mode": "cool"}, "issued_at": issued.isoformat(),
+              "deadline": (issued + timedelta(seconds=180)).isoformat()}
+    original = {"hvac_mode": "off", "target_temperature": 19}
+    store.data["ownership"] = {"hvac_control": {"main_state": original, "zone_states": {"climate.zone": 20}}}
+    executor = Executor(store)
+    asyncio.run(executor._async_persist_hvac_confirmation(record))
+    assert store.data["ownership"]["hvac_control"]["main_state"] == original
+    restarted = Executor(store)
+    assert bool(restarted.hvac_feedback_commands) is (0 <= age < 180)
+    if 0 <= age < 180:
+        assert restarted.hvac_feedback_commands[0]["deadline"] == issued + timedelta(seconds=180)
+    asyncio.run(restarted._async_persist_hvac_confirmation(None))
+    assert "command_confirmation" not in store.data["ownership"]["hvac_control"]
+    assert store.data["ownership"]["hvac_control"]["main_state"] == original
+
+
+def test_invalid_legacy_confirmation_does_not_create_feedback_authority():
+    store = FakeStore()
+    store.data["ownership"] = {"hvac_control": {"command_confirmation": {"issued_at": "invalid"}}}
+    assert not Executor(store).hvac_feedback_commands
+
+
+@pytest.mark.parametrize("main", [False, True])
+def test_manual_supersession_atomically_retires_pending_command_and_baseline(main):
+    store = FakeStore()
+    entity = "climate.daikin" if main else "climate.zone"
+    store.data["ownership"] = {"hvac_control": {
+        "main_state": {"hvac_mode": "off"}, "zone_states": {"climate.zone": {"target_temperature": 20}},
+        "command_confirmation": {"entity_id": entity},
+    }}
+    executor = Executor(store, entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
+    asyncio.run(executor._async_persist_provisional_hvac_supersessions(main, set() if main else {entity}))
+    control = store.data["ownership"]["hvac_control"]
+    assert "command_confirmation" not in control
+    assert ("main_state" in control) is not main
+    assert bool(control["zone_states"]) is main
+
+
+def test_only_matching_pending_command_gets_extended_reconciliation():
+    store = FakeStore()
+    executor = Executor(store)
+    adapter = DaikinHVACAdapter(SimpleNamespace(states=SimpleNamespace(get=lambda entity: None)), {})
+    executor._configure_pending_hvac_adapter(adapter, {})
+    for context, entity in (("mode", "climate.daikin"), ("zone", "climate.zone")):
+        adapter._command_callback({"stage": "issued", "context_id": context, "entity_id": entity,
+                                   "domain": "climate", "service": "set_hvac_mode",
+                                   "requested": {"hvac_mode": "cool"}})
+    deadlines = [item["deadline"] for item in executor.hvac_feedback_commands]
+    adapter._command_callback({"stage": "readback_pending", "context_id": "mode"})
+    assert executor.hvac_feedback_commands[0]["reconciling"] is True
+    assert not executor.hvac_feedback_commands[1].get("reconciling")
+    assert [item["deadline"] for item in executor.hvac_feedback_commands] == deadlines
+
+
+def test_late_hvac_confirmation_starts_a_fresh_control_lease():
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    issued = datetime(2026, 10, 17, tzinfo=UTC)
+    confirmed = issued + timedelta(seconds=150)
+    transaction = HVACOwnershipTransaction({}, issued)
+    provisional = transaction.prepare({"hvac_mode": "cool"}, {}, {}, {"hvac_mode": "off"})
+    result = transaction.complete(
+        HVACCommandResult(True, "hvac_action_applied", {}, {}, {}), provisional, {"hvac_mode": "cool"},
+        main_state_superseded=False, superseded_zone_entity_ids=set(), confirmed_at=confirmed,
+    )
+    assert result["planner_hvac_action_expires_at"] == confirmed + timedelta(minutes=2)
+    assert result["hvac_control"]["main_state"] == {"hvac_mode": "off"}
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+@pytest.mark.parametrize("latest", [None, {"entity_id": "climate.daikin", "context_id": "latest"}])
+def test_review_failed_acquisition_uses_current_command_uncertainty(rollback, latest):
+    from copy import deepcopy
+
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    original = {"hvac_mode": "off", "target_temperature": 19}
+    previous = {"hvac_control": {"main_state": original, "command_confirmation": {"context_id": "old"}}}
+    current = deepcopy(previous)
+    current["hvac_control"].pop("command_confirmation")
+    if latest is not None:
+        current["hvac_control"]["command_confirmation"] = latest
+    result = HVACOwnershipTransaction(previous, datetime.now(UTC)).complete(
+        HVACCommandResult(False, "failed", {}, {}, {}, rollback, saved_main_state=original), current, {},
+        main_state_superseded=False, superseded_zone_entity_ids=set(),
+    )
+    assert result["hvac_control"].get("command_confirmation") == latest
+    assert result["hvac_control"]["main_state"] == original
+
+
+@pytest.mark.parametrize("path", ["release", "safe_state"])
+@pytest.mark.parametrize("error", [False, True])
+@pytest.mark.parametrize("latest", [None, {"entity_id": "climate.daikin", "context_id": "latest"}])
+def test_review_failed_release_uses_current_command_uncertainty(monkeypatch, path, error, latest):
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+
+    store = FakeStore()
+    original = {"hvac_mode": "off", "target_temperature": 19}
+    store.data["ownership"] = {"hvac_control": {
+        "main_state": original, "command_confirmation": {"context_id": "old"},
+    }}
+    executor = Executor(store, hass=FakeHass(), entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin"})
+
+    class Adapter(_HVACAdapterDouble):
+        def __init__(self, *args):
+            pass
+
+        async def async_restore(self, *args):
+            await executor._async_persist_hvac_confirmation(latest, restoration=True)
+            if error:
+                raise RuntimeError("restore failed after updating intent")
+            return HVACCommandResult(False, "hvac_release_failed", {}, {}, {}, False, saved_main_state=original)
+
+    monkeypatch.setattr(executor_module, "DaikinHVACAdapter", Adapter)
+    if path == "release":
+        result = asyncio.run(executor.async_release_hvac_control("retry"))
+    else:
+        result = asyncio.run(executor.async_restore_device_control("daikin", "retry"))
+    assert result.result == OutcomeResult.FAILED
+    assert store.data["ownership"]["hvac_control"].get("command_confirmation") == latest
+    assert store.data["ownership"]["hvac_control"]["main_state"] == original
+
+
+@pytest.mark.parametrize("history", [None, [None], [{"issued_at": "invalid"}],
+                                     [{"issued_at": "2026-10-17T00:00:00+00:00", "confirmed_at": "bad"}]])
+def test_review_invalid_activation_history_grants_no_proof(history):
+    assert executor_module._restored_hvac_mode_commands(history) == []
+
+
+def test_review_rehydrated_activation_history_is_bounded_and_keeps_unconfirmed_retirements():
+    now = datetime.now(UTC)
+    history = [{"issued_at": now.isoformat(), "context_id": str(index),
+                **({"confirmed_at": now.isoformat()} if index != 32 else {})} for index in range(33)]
+    result = executor_module._restored_hvac_mode_commands(history)
+    assert len(result) == 30
+    assert result[0]["context_id"] == "3"
+    assert result[0]["issued_at"] == result[0]["confirmed_at"] == now
+    assert "confirmed_at" not in result[-1]
+    assert isinstance(history[3]["issued_at"], str)
+
+
+def test_review_confirmation_copy_supports_aliases_and_legacy_control():
+    from custom_components.ha_energy_planner.hvac_control import copy_pending_confirmation
+
+    control = {"command_confirmation": {"context_id": "pending"}}
+    copy_pending_confirmation(control, control)
+    assert control["command_confirmation"]["context_id"] == "pending"
+    copy_pending_confirmation(control, None)
+    assert "command_confirmation" not in control
