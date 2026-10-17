@@ -287,7 +287,8 @@ def test_climate_diagnostics_distinguish_learning_from_failed_execution() -> Non
             "model": {"trained_at": "2026-09-17", "validation": {
                 "heat": {"windows": 0, "residuals": [1] * 1000}}},
         },
-        "ownership": {"hvac_control": {"required_evidence_lost": "hvac_release_failed", "zone_states": {}}},
+        "ownership": {"hvac_control": {"required_evidence_lost": "hvac_release_failed", "zone_states": {},
+                                     "command_confirmation": {"entity_id": "climate.daikin", "deadline": "bounded"}}},
         "execution_audit": [release, rejection],
     }
     plan = SimpleNamespace(device_plans={"climate": {"economics": {"status": "learning"}}})
@@ -299,6 +300,7 @@ def test_climate_diagnostics_distinguish_learning_from_failed_execution() -> Non
     assert result["last_outcome"] == rejection
     assert result["validation"] == {"heat": {"windows": 0}}
     assert result["pending_restore"]["required_evidence_lost"] == "hvac_release_failed"
+    assert result["command_confirmation"] == {"entity_id": "climate.daikin", "deadline": "bounded"}
     assert climate_diagnostics({}, None)["last_release"] is None
 
 

@@ -157,10 +157,12 @@ Main-unit shutdowns during release or settings recovery can also switch zone cli
   selected planner context is sent to that provider when Explain is requested.
 - Bypassing safety gates is an advanced, default-off setting that reduces protection and should be used only with an explicit understanding of the risk.
 
+Daikin commands initially wait 30 seconds for authoritative feedback. An uncertain command then enters readback reconciliation until at most 180 seconds after its original issue time, requesting a device refresh every 30 seconds without resending the write. A service timeout also follows this path because the device may already have accepted the command. The original restoration settings, command deadline and activation evidence are saved before dispatch; after reload, recovery reconciles that command before restoring the saved settings. Failed recovery retains the latest pending command and does not reinstate an intent that has already settled. During the bounded mode transition, an unattributed change to the requested mode may restore its remembered temperature within captured device bounds (or matching coupled-zone bounds). Once the mode is confirmed, the planner applies its separate target. Each zone target is confirmed before another zone is commanded. Restoration waits for an already accepted mode change to settle before returning to the original settings. Confirmed commands retain their shorter attribution window. Explicit user changes, unrelated automation contexts, standalone target changes and superseded commands retain their normal override handling. Diagnostics expose the outstanding command and its deadline; expiry fails the acquisition and attempts restoration with unresolved settings retained for recovery.
+
 ## Troubleshooting
 
 - **Load model stays in learning:** verify Recorder history, the sensor unit, and that the source represents gross household demand rather than solar, energy totals, forecasts, or signed net grid flow.
-- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default 30-minute grace requires a current, quality-approved model with complete coverage; missing or invalid readings and expired grace still fail closed.
+- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default six-hour grace requires a current, quality-approved model with complete coverage; missing entities, invalid readings and expired grace still fail closed.
 - **Startup climate feedback:** Until Home Assistant is running, unattributed main-climate and configured-zone updates do not create manual overrides. Explicit user-attributed changes, the override helper, and the manual-override action remain effective. Physical remote changes without user attribution cannot be distinguished from startup feedback; use the override helper during startup. Normal detection resumes immediately when Home Assistant is running, independently of the recovery warm-up. Existing overrides are preserved.
 - **Startup warm-up:** fallback notifications and automatic-control startup validation wait up to 30 minutes for upstream integrations. Unsafe actions remain blocked immediately. All device service targets (including EV, Enphase, climate and helper entities) are checked immediately before dispatch. Missing or unavailable targets wait for recovery; unknown controls also wait, except buttons that have never been pressed. Weather forecasts are requested only when the configured weather entity is available (unknown current conditions still allow forecasts); any cached fallback remains subject to its freshness limit.
 - **Input availability warnings:** warnings identify the issue code and configured entities. During Home Assistant startup, missing-input warnings have a bounded 30-minute grace period; safety gates still apply immediately. The grace applies only to inputs missing on the first refresh. Inputs that remain missing after the grace period warn once; new outages and repeat outages after an input recovers warn immediately, even while other inputs are still starting. Each warned input logs once on loss and once on recovery, including its full observed outage duration. Reason changes are logged at info level and preserve the outage start; recovery requires every issue for that input to clear. Unrecognised issue text is omitted from logs.
@@ -281,7 +283,7 @@ Resume climate planning bypasses refresh debounce and waits for fresh planning a
 ### EV charging during consumption outages
 
 A quality-approved load model can bridge a known household-consumption outage for the
-configured grace period (30 minutes by default; existing explicit settings are preserved).
+configured grace period (360 minutes / six hours by default, configurable up to 1440 minutes / 24 hours; zero disables fallback). On upgrade, earlier positive settings below six hours are raised to six hours once. Subsequent explicit choices are preserved. Numeric readings with stale source timestamps use the same bounded fallback; publishing the same old sample does not refresh its age.
 During that period, the planner adds **1 kW** to the model's conservative upper household
 load estimate. An existing EV session may continue despite economic scheduling changes,
 but its charging power cannot increase above the observed current-limit setting (or the
@@ -290,7 +292,7 @@ normal confirmed-current path permits it, or a safety pause. Other EV reservatio
 vehicle identity, target SOC, charger capability, user price ceilings and safety checks
 remain enforced. Forecast headroom is an estimate, not electrical overload protection.
 
-No new automatic charging session starts during fallback. The
+Scheduled automatic sessions may start during fallback only when the normal vehicle, tariff and readiness checks pass and conservative capacity is sufficient. They retain the observed current-limit ceiling; uncertain recovery must stabilize before a new start. The
 `ha_energy_planner.charge_now` action accepts `duration_minutes` from 1
 through 240. It bypasses economic timing and price ceilings, but retains capacity,
 connection, target SOC and charger checks. Each request waits for a fresh input assessment; a failed refresh prevents the start.
@@ -311,7 +313,7 @@ recovery. It retains the model's upper-load margin and original outage deadline.
 eligible outage continuations retain their allowance while the return stabilizes; a new
 Charge now request during stabilization waits for the 90-second check. Repeated reports
 of the same sample never establish full recovery. Missing/invalid/future samples, flapping
-and expired budgets cannot authorize a new automatic session or renew the allowance.
+and expired budgets cannot renew the allowance or bypass the remaining device and capacity checks.
 If the outage start is unknown or the model is ineligible, one sample cannot grant
 forecast-only capacity authority. Full sample recovery is still available in that case.
 

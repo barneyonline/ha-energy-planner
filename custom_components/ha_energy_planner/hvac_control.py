@@ -36,6 +36,14 @@ HVAC_LIFECYCLE_FIELDS = (
 )
 
 
+def copy_pending_confirmation(control: dict[str, Any], current: Any) -> None:
+    """Keep the latest uncertainty, never an ownership snapshot's stale intent."""
+    record = current.get("command_confirmation") if isinstance(current, dict) else None
+    control.pop("command_confirmation", None)
+    if isinstance(record, dict):
+        control["command_confirmation"] = deepcopy(record)
+
+
 @dataclass(slots=True)
 class HVACOwnershipTransaction:
     """A baseline snapshot and timestamp for one acquisition attempt."""
@@ -114,6 +122,8 @@ class HVACOwnershipTransaction:
                         rollback_zone_states.pop(entity_id, None)
                     rollback_hvac_control["zone_states"] = rollback_zone_states
                     rollback_ownership["hvac_control"] = rollback_hvac_control
+                if isinstance(rollback_ownership.get("hvac_control"), dict):
+                    copy_pending_confirmation(rollback_ownership["hvac_control"], current.get("hvac_control"))
                 return rollback_ownership
             if hvac_result.rollback_succeeded is False:
                 ownership_data = deepcopy(self.previous)
@@ -159,6 +169,7 @@ class HVACOwnershipTransaction:
                         }
                 hvac_control.pop("main_state_committed", None)
                 hvac_control["required_evidence_lost"] = "hvac_acquisition_rollback_failed"
+                copy_pending_confirmation(hvac_control, current.get("hvac_control"))
                 ownership_data["hvac_control"] = hvac_control
                 return ownership_data
         if hvac_result.applied:
@@ -201,6 +212,6 @@ class HVACOwnershipTransaction:
             ownership_data["hvac_control"] = hvac_control
             ownership_data.pop("hvac_release_hold_until", None)
             ownership_data.setdefault("planner_takeover_started_at", self.now)
-            ownership_data["planner_hvac_action_expires_at"] = self.now + timedelta(minutes=2)
+            ownership_data["planner_hvac_action_expires_at"] = (confirmed_at or self.now) + timedelta(minutes=2)
             return ownership_data
         return None

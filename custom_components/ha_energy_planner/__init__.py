@@ -26,6 +26,7 @@ from .const import (
     CONF_EV_SOC_PER_KWH,
     CONF_GRID_IMPORT_LIMIT_KW,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_INSTANCE_NAME,
     DEFAULT_OPTIONS,
     DOMAIN,
@@ -99,7 +100,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
     if version < 5:
         options.pop(CONF_EV_MAX_SOC_PERCENT, None)
         options.pop(CONF_EV_MIN_SOC_PERCENT, None)
-    hass.config_entries.async_update_entry(entry, data=data, options=options, version=5)
+    if getattr(entry, "minor_version", 1) < 2:
+        from .ev_policy import finite
+
+        grace = finite(options.get(CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES))
+        if grace is not None and 0 < grace < 360:
+            options[CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES] = 360
+    hass.config_entries.async_update_entry(entry, data=data, options=options, version=5, minor_version=2)
     async_clear_migration_issue(hass, entry.entry_id)
     return True
 

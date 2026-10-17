@@ -452,7 +452,7 @@ class DryRunPlanner:
                     current_slot.valid_at.isoformat(), charge_rate_kw)
             from .ev_resilience import fallback_charging_decision
 
-            fallback = fallback_charging_decision(context, self.options, manual_ev)
+            fallback = fallback_charging_decision(context, self.options, manual_ev, scheduled=charging_required_now)
             if fallback is not None:
                 charging_required_now, fallback_power, charging_reason = fallback
                 if current_slot is not None:

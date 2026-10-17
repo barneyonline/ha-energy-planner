@@ -62,7 +62,7 @@ from .ev_runtime import allocation_deadline, price_stop_required, settle_spendin
 from .ev_telemetry import measured, reported_at
 from .export_limit_policy import EXPORT_ASSET
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
-from .hvac_control import HVACOwnershipTransaction
+from .hvac_control import HVACOwnershipTransaction, copy_pending_confirmation
 from .models import (
     ActionAsset,
     ActionKind,
@@ -162,6 +162,15 @@ class Executor:
         self.entry_title = entry_title
         self.pending_hvac_desired_state: dict[str, Any] | None = None
         self.hvac_feedback_commands: list[dict[str, Any]] = []
+        control = store.data.get("ownership", {}).get("hvac_control")
+        recovery = control.get("command_confirmation") if isinstance(control, dict) else None
+        if isinstance(recovery, dict):
+            issued, deadline = timestamp(recovery.get("issued_at")), timestamp(recovery.get("deadline"))
+            if issued is not None and deadline is not None and issued <= dt_util.utcnow() < deadline:
+                self.hvac_feedback_commands.append({
+                    **recovery, "issued_at": issued, "deadline": deadline, "reconciling": True,
+                    "mode_commands": _restored_hvac_mode_commands(recovery.get("mode_commands")),
+                })
         self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
         self.ev_restore_guard: Callable[[], bool] = lambda: True
         self.ev_start_feedback_expected_until: datetime | None = None
@@ -1432,6 +1441,8 @@ class Executor:
             hvac_control.pop("main_state_committed", None)
             hvac_control["required_evidence_lost"] = "hvac_release_failed"
             ownership["hvac_control"] = hvac_control
+        if failed:
+            copy_pending_confirmation(hvac_control, self.store.data.get("ownership", {}).get("hvac_control"))
         await self.store.async_save_ownership(ownership)
         no_change = bool(
             not failed and not had_hvac_ownership and (result is None or result.pre_state == result.post_state)
@@ -1757,6 +1768,10 @@ class Executor:
                 remaining_ownership[EXPORT_ASSET] = current_export
         if restore_export and not ownership.get(EXPORT_ASSET, {}).get("baseline"):
             remaining_ownership.pop(EXPORT_ASSET, None)
+        if restore_hvac and isinstance(remaining_ownership.get("hvac_control"), dict):
+            copy_pending_confirmation(
+                remaining_ownership["hvac_control"], self.store.data.get("ownership", {}).get("hvac_control"),
+            )
         await self.store.async_save_ownership(remaining_ownership)
         pre_state: dict[str, Any] = {}
         post_state: dict[str, Any] = {}
@@ -2762,6 +2777,10 @@ class Executor:
         if main_superseded:
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
             hvac_control.pop("main_state_committed", None)
+        confirmation = hvac_control.get("command_confirmation", {})
+        if (main_superseded and confirmation.get("entity_id") == self.entry_data.get(CONF_DAIKIN_CLIMATE)
+                or confirmation.get("entity_id") in zone_entity_ids):
+            hvac_control.pop("command_confirmation", None)
         zone_states = dict(hvac_control.get("zone_states", {}))
         for entity_id in zone_entity_ids:
             zone_states.pop(entity_id, None)
@@ -2770,6 +2789,23 @@ class Executor:
         await self.store.async_save_ownership(ownership)
         await self._async_flush_provisional_state()
 
+    async def _async_persist_hvac_confirmation(
+        self, record: dict[str, Any] | None, *, restoration: bool = False,
+    ) -> None:
+        """Flush command uncertainty without replacing the original restoration baseline."""
+        ownership = deepcopy(self.store.data.get("ownership", {}))
+        control = ownership.setdefault("hvac_control", {})
+        if record is None:
+            control.pop("command_confirmation", None)
+        else:
+            control["command_confirmation"] = deepcopy(record)
+        await self.store.async_save_ownership(ownership)
+        # Explicit disarm batches persistence until physical restoration has
+        # completed. Its already durable baseline remains valid if disk fails.
+        # Acquisition must still force the new intent durable before dispatch.
+        if not restoration:
+            await self._async_flush_provisional_state()
+
     def _configure_pending_hvac_adapter(self, adapter: DaikinHVACAdapter, pending: dict[str, Any]) -> None:
         """Wire one adapter to the shared pending-transaction protocol."""
         pending["deferred_zone_entities"] = adapter.deferred_zone_entities
@@ -2777,6 +2813,23 @@ class Executor:
         baseline = getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {})
         if isinstance(baseline, dict):
             pending.setdefault("lifecycle_id", baseline.get("lifecycle_id"))
+            confirmation_callback = getattr(adapter, "set_confirmation_persistence_callback", None)
+            if callable(confirmation_callback) and getattr(self, "store", None) is not None:
+                restoration = "restore_main" in pending or "restore_zones" in pending
+                async def persist_confirmation(record: dict[str, Any] | None) -> None:
+                    if record is not None:
+                        record = {
+                            **record,
+                            "transaction_id": pending["transaction_id"],
+                            "requested_hvac_mode": pending.get("hvac_mode") or pending.get("restore_main", {}).get(
+                                "hvac_mode"),
+                            "zone_targets": pending.get("restore_zones") or self.store.data.get("ownership", {}).get(
+                                "hvac_control", {}).get("zone_states", {}),
+                            "mode_commands": deepcopy(pending.get("mode_commands", [])[-30:]),
+                        }
+                    await self._async_persist_hvac_confirmation(record, restoration=restoration)
+
+                confirmation_callback(persist_confirmation, baseline.get("command_confirmation"))
             abort_callback = getattr(adapter, "set_abort_main_state", None)
             if callable(abort_callback):
                 abort_callback(dict(baseline.get("main_state", {})))
@@ -2832,7 +2885,7 @@ class Executor:
                     {
                         **evidence, "zone_targets": zone_targets,
                         "mode_commands": mode_commands if record["service"] == "set_temperature" else [],
-                        "issued_at": now, "deadline": now + timedelta(minutes=2),
+                        "issued_at": now, "deadline": now + timedelta(seconds=HVAC_ZONE_SETTLE_MAX_SECONDS),
                     }
                 )
                 if record["service"] in {"turn_on", "turn_off", "set_hvac_mode"}:
@@ -2843,6 +2896,10 @@ class Executor:
                         del commands[:-30]
                 del self.hvac_feedback_commands[:-30]
                 pending["feedback_commands"] = self.hvac_feedback_commands
+            elif record["stage"] == "readback_pending":
+                for command in self.hvac_feedback_commands:
+                    if command["context_id"] == record["context_id"]:
+                        command["reconciling"] = True
             elif record["stage"] == "confirmed":
                 for command in self.hvac_feedback_commands:
                     if (
@@ -2852,7 +2909,7 @@ class Executor:
                     ):
                         # Zone bounds may settle one device poll after head
                         # readback. Extend only the coupled clamp expectation;
-                        # direct feedback still expires two minutes from issue.
+                        # confirmed direct feedback still expires two minutes from issue.
                         command["confirmed_at"] = now
                         command["confirmed_mode"] = record.get("observed", {}).get("hvac_mode")
                         if (
@@ -2874,7 +2931,7 @@ class Executor:
                             # Keep the superseding intent, never reuse its proof.
                             command["stage"] = "service_failed"
                 # A readback timeout does not revoke an accepted command: Daikin
-                # can publish its target during the following mode retry. Keep
+                # can publish its target during pending reconciliation. Keep
                 # the original bounded expectation until a newer command for
                 # that effect supersedes it, or a real manual change retires it.
                 self.hvac_feedback_commands[:] = [
@@ -3360,3 +3417,22 @@ def _truncate_notification_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return f"{value[: max(limit - 3, 0)]}..."
+
+
+def _restored_hvac_mode_commands(value: Any) -> list[dict[str, Any]]:
+    """Rehydrate bounded activation proof; malformed history grants no authority."""
+    if not isinstance(value, list):
+        return []
+    history: list[dict[str, Any]] = []
+    for item in value[-30:]:
+        if not isinstance(item, dict):
+            return []
+        issued = timestamp(item.get("issued_at"))
+        confirmed = timestamp(item.get("confirmed_at"))
+        if issued is None or ("confirmed_at" in item and confirmed is None):
+            return []
+        restored = {**item, "issued_at": issued}
+        if confirmed is not None:
+            restored["confirmed_at"] = confirmed
+        history.append(restored)
+    return history
