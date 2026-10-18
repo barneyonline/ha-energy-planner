@@ -14,6 +14,7 @@ from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
 from custom_components.ha_energy_planner.action_limits import action_budget
+from custom_components.ha_energy_planner.calendar_history import confirm_calendar_action
 from custom_components.ha_energy_planner.const import (
     CONF_AMBER_EXPORT_PRICE,
     CONF_DRY_RUN,
@@ -103,6 +104,9 @@ class Store:
 
     async def async_add_outcome(self, value):
         self.data["execution_audit"].append(to_jsonable(value))
+        self.data["calendar_history"] = confirm_calendar_action(
+            self.data.get("calendar_history"), to_jsonable(value),
+        )
 
     async def async_save_command_rate_limits(self, value):
         self.data["command_rate_limits"] = value
@@ -147,6 +151,7 @@ def setup(monkeypatch):
             watts if mode["value"] == "confirm" else states[ENTITY].attributes["confirmed_watts"],
             pending=mode["value"] == "pending",
             slew=data.get("slew_rate", states[ENTITY].attributes["slew_rate"]),
+            readback=clock["now"].timestamp(),
         )
         if mode["value"] == "pending":
             states[ENTITY].attributes.update(
@@ -160,10 +165,12 @@ def setup(monkeypatch):
         config=SimpleNamespace(time_zone="UTC"),
     )
 
+    clock = {"now": NOW}
+
     class Clock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return NOW
+            return clock["now"]
 
     monkeypatch.setattr(runtime, "datetime", Clock)
     monkeypatch.setattr("homeassistant.util.dt.utcnow", lambda: NOW)
@@ -174,6 +181,7 @@ def setup(monkeypatch):
         registry=registry,
         calls=calls,
         mode=mode,
+        clock=clock,
         control=runtime.ExportLimitControl(hass, store, DATA),
     )
 
@@ -1731,5 +1739,126 @@ def test_export_restore_readback_clears_previously_failed_restore_alert(setup):
         assert ("persistent_notification", "dismiss", {
             "notification_id": "ha_energy_planner_restore_safe_state_enphase_export_limit_entry-a",
         }) in setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("baseline", [0, None, 3000])
+def test_calendar_retains_confirmed_restoration_between_tariff_actions_after_reload(setup, baseline):
+    async def run():
+        setup.states[ENTITY] = limit_state(baseline, slew=77)
+        first = action(setup)
+        if baseline == 0:
+            first.kind = ActionKind.DISABLE_EXPORT_LIMIT
+            first.execute_not_before = NOW
+            first.desired_state["watts"] = None
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(first, NOW)
+        assert len(setup.store.data["calendar_history"]["history"]) == 1
+        original_baseline = {"watts": baseline, "slew_rate": 77}
+        assert setup.control.state["baseline"] == original_baseline
+
+        requested = NOW + timedelta(seconds=10)
+        setup.clock["now"] = requested
+        setup.mode["value"] = "pending"
+        assert await setup.control.restore(requested) == (OutcomeResult.PENDING, "export_limit_pending", True)
+        pending = setup.control.state["pending"]
+        assert pending["restore"] and pending["plan_id"] == "manual"
+        assert setup.control.state["baseline"] == original_baseline
+        assert len(setup.store.data["calendar_history"]["history"]) == 1
+
+        # Reload with the original durable request. Neither pending upstream
+        # feedback nor settled but pre-request readback establishes restoration.
+        reloaded = Store()
+        reloaded.data = deepcopy(setup.store.data)
+        control = runtime.ExportLimitControl(setup.hass, reloaded, DATA)
+        await control.restore(requested + timedelta(seconds=1))
+        setup.states[ENTITY] = limit_state(baseline, slew=77, readback=NOW.timestamp())
+        assert await control.reconcile(requested + timedelta(seconds=2)) == "export_limit_pending"
+        assert control.state["baseline"] == original_baseline
+        assert len(setup.calls) == 2
+
+        confirmed = requested + timedelta(minutes=4)
+        setup.clock["now"] = confirmed
+        setup.states[ENTITY] = limit_state(baseline, slew=77, readback=confirmed.timestamp())
+        assert await control.reconcile(confirmed) is None
+        assert not control.state
+        history = reloaded.data["calendar_history"]["history"]
+        assert len(history) == 2
+        restored = deepcopy(history[-1])
+        setting = "Disabled" if baseline is None else f"Enabled — {baseline} W"
+        assert restored["summary"] == f"Enphase Export Limit: Restored {setting} (confirmed)"
+        assert restored["uid"] == f"{pending['action_id']}-{pending['sent_at']}"
+        assert restored["start"] == restored["confirmed_start"] == confirmed.isoformat()
+        assert datetime.fromisoformat(restored["end"]) - confirmed == timedelta(seconds=1)
+        assert "not a running duration" in restored["description"]
+
+        # Replaying feedback after an outcome was saved but before ownership
+        # cleared must keep the first observed confirmation time and identity.
+        await control.save(deepcopy(setup.control.state))
+        assert await control.reconcile(confirmed + timedelta(seconds=1)) is None
+        assert await control.reconcile(confirmed + timedelta(seconds=2)) is None
+        assert (await control.restore(confirmed + timedelta(seconds=3)))[2] is False
+        assert reloaded.data["calendar_history"]["history"] == history
+        assert history[-1] == restored
+
+        setup.mode["value"] = "confirm"
+        second = deepcopy(first)
+        second.action_id, second.plan_id = "next-tariff-action", "next-plan"
+        await control.execute(second, confirmed)
+        history = reloaded.data["calendar_history"]["history"]
+        assert len(history) == 3
+        assert history[0]["summary"] == history[2]["summary"]
+        assert len({event["uid"] for event in history}) == 3
+        assert control.state["baseline"] == original_baseline
+
+        # A later restoration to the same baseline is a distinct real action.
+        later = confirmed + timedelta(seconds=10)
+        setup.clock["now"] = later
+        assert (await control.restore(later))[0] == OutcomeResult.RESTORED
+        history = reloaded.data["calendar_history"]["history"]
+        assert len(history) == 4 and len({event["uid"] for event in history}) == 4
+        assert history[-1]["summary"] == restored["summary"]
+        assert not control.state and len(setup.calls) == 4
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("mode", ["pending", "timeout", "reject", "cancel"])
+def test_unconfirmed_restoration_never_creates_calendar_activity(setup, mode):
+    async def run():
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(action(setup), NOW)
+        history = deepcopy(setup.store.data["calendar_history"]["history"])
+        setup.mode["value"] = mode
+        if mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await setup.control.restore(NOW)
+        else:
+            await setup.control.restore(NOW)
+        assert setup.store.data["calendar_history"]["history"] == history
+        assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+        assert (await setup.control.restore(NOW + timedelta(seconds=1)))[2] is False
+        assert len(setup.calls) == 2
+
+    asyncio.run(run())
+
+
+def test_restoration_already_at_original_baseline_does_not_fabricate_calendar_action(setup):
+    async def run():
+        first = action(setup)
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(first, NOW)
+        # A normal tariff command can return to the original baseline before
+        # release. Releasing that ownership is bookkeeping, not device action.
+        second = deepcopy(first)
+        second.action_id, second.kind = "return-to-baseline", ActionKind.DISABLE_EXPORT_LIMIT
+        second.desired_state["watts"] = None
+        await setup.control.execute(second, NOW)
+        history = deepcopy(setup.store.data["calendar_history"]["history"])
+        assert len(history) == 2
+        assert await setup.control.restore(NOW) == (OutcomeResult.RESTORED, "export_limit_restored", False)
+        assert not setup.control.state and len(setup.calls) == 2
+        assert setup.store.data["calendar_history"]["history"] == history
 
     asyncio.run(run())
