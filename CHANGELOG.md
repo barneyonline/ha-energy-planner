@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.3.7 - 2026-10-18
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add per-zone temperature sensor selectors and shared room comfort/completion feedback.
 - Enable source-specific heating/cooling learning with diagnostics and bounded partial preconditioning.
 - Default preconditioning lead is 90 minutes; qualified rates can extend it up to 180 minutes without replacing saved settings.
