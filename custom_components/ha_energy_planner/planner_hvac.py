@@ -27,11 +27,15 @@ from .models import (
 from .planner_confidence import _confidence_rejection_reason, confidence_from_context
 from .planner_values import finite_float as _finite_number
 from .safety import strict_bool
+from .thermal_learning import bounded_lead_slots, timing
+from .thermal_learning import rate as learned_rate
 from .thermal_model import (
     thermal_active_temperature_rate_c_per_hour,
     thermal_hvac_load_kw,
     thermal_model_summary,
 )
+from .zone_temperature import bounds, comfort_breached, control_temperature, feedback_missing, temperatures
+from .zone_temperature import target_reached as rooms_reached
 
 HVAC_PRECONDITION_PROJECTED_LOAD_KW = 1.0
 THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR = 0.5
@@ -43,6 +47,13 @@ class HVACPlanningPolicy:
     def __init__(self, options: Mapping[str, Any], thermal_model: Mapping[str, Any]) -> None:
         self.options = options
         self.thermal_model = dict(thermal_model)
+        if not strict_bool(options.get("hvac_thermal_learning_enabled"), default=True):
+            # Disabling temperature adaptation must not discard measured watts.
+            self.thermal_model.update(enabled=False, learning_enabled=False)
+            for key in (
+                "active_heat_rate_c_per_hour", "active_cool_rate_c_per_hour", "passive_indoor_drift_c_per_hour",
+            ):
+                self.thermal_model.pop(key, None)
 
     @staticmethod
     def _hvac_away_off_action(
@@ -77,9 +88,14 @@ class HVACPlanningPolicy:
         if active.get("economic_policy_version"):
             return []
         now = context.created_at
+        if feedback_missing(context):
+            _hvac_reject(context, "zone_temperature_unavailable", {})
+            return [self._hvac_release_action(context, now, now + timedelta(minutes=int(
+                self.options[CONF_PLANNING_INTERVAL_MINUTES]
+            )), "hvac_required_evidence_lost")] if active else []
         low = context.occupied_temperature_low_c
         high = context.occupied_temperature_high_c
-        current = context.current_hvac_temperature_c
+        current = control_temperature(context, str(active.get("mode", "")))
         interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
         released_until = _datetime_value(active.get("released_until"))
         if released_until is not None and set(active) == {"released_until"}:
@@ -154,17 +170,7 @@ class HVACPlanningPolicy:
             and now < min(active_period_start, active_precondition_end)
         )
         coasting = active.get("phase") in {"pre_peak_coast", "peak_coast"} or (active and not preconditioning_now)
-        comfort_boundary_breached = (
-            float(current) < float(low)
-            or float(current) > float(high)
-            or (
-                coasting
-                and (
-                    (active.get("mode") == "heat" and float(current) <= float(low))
-                    or (active.get("mode") == "cool" and float(current) >= float(high))
-                )
-            )
-        )
+        comfort_boundary_breached = comfort_breached(context, str(active.get("mode", "")), coasting=bool(coasting))
         if comfort_boundary_breached and active:
             active_end = _datetime_value(active.get("period_end"))
             return [
@@ -227,9 +233,13 @@ class HVACPlanningPolicy:
             if not _tariff_evidence_covers_period(context, period_end, interval):
                 return [self._hvac_release_action(context, now, now + interval, "hvac_tariff_evidence_lost")]
             precondition_end = _datetime_value(active.get("precondition_end")) or period_start
-            target_reached = (
-                mode == "heat" and float(current) >= float(active.get("precondition_target") or high)
-            ) or (mode == "cool" and float(current) <= float(active.get("precondition_target") or low))
+            context.climate_legacy_decision["thermal_timing"] = timing(
+                context, self.options, mode, self.thermal_model,
+                available_minutes=max((precondition_end - now).total_seconds() / 60, 0),
+            )
+            target_reached = rooms_reached(context, mode, float(active.get("precondition_target") or (
+                high if mode == "heat" else low
+            )))
             if active.get("phase") in {"pre_peak_coast", "peak_coast"} or target_reached:
                 precondition_end = min(precondition_end, now)
             phase = (
@@ -266,6 +276,8 @@ class HVACPlanningPolicy:
                     active_until=period_end,
                     starting_temperature=projected_precondition_end_temperature,
                     comfort_boundary=coast_target,
+                    room_temperatures={zone: row["predicted_finishing_temperature"] for zone, row in
+                                       context.climate_legacy_decision["thermal_timing"]["zones"].items()},
                 )
             else:
                 self._project_active_hvac_slots(
@@ -429,7 +441,7 @@ class HVACPlanningPolicy:
             return None
         low = context.occupied_temperature_low_c
         high = context.occupied_temperature_high_c
-        current = context.current_hvac_temperature_c
+        current = control_temperature(context)
         if low is None or high is None or current is None:
             _hvac_reject(context, "comfort_inputs_missing", {})
             return None
@@ -438,7 +450,6 @@ class HVACPlanningPolicy:
         if lead_minutes <= 0:
             _hvac_reject(context, "lead_time_disabled", {"lead_minutes": lead_minutes})
             return None
-        lead_slots = ceil(lead_minutes / interval_minutes)
         start_delta = max(
             float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
             float(self.options[CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA]),
@@ -451,6 +462,19 @@ class HVACPlanningPolicy:
                 _hvac_reject(context, "forecast_gap", {"at": slot.valid_at.isoformat()})
                 index += 1
                 continue
+            # Price qualification must use the same bounded adaptive window as
+            # candidate generation, including newly available earlier cheap slots.
+            current = control_temperature(context)
+            assert current is not None
+            mode = _future_hvac_mode(context, slot, current, low, high)
+            thermal_timing = timing(
+                context, self.options, mode or "cool", self.thermal_model,
+                deadline_minutes=max((slot.valid_at - context.created_at).total_seconds() / 60, 0),
+            )
+            lead_slots = bounded_lead_slots(thermal_timing, self.options)
+            if lead_slots == 0:
+                _hvac_reject(context, "preparation_time", {"maximum_minutes": thermal_timing["maximum_lead_minutes"]})
+                return None
             window_start = max(0, index - lead_slots)
             priced_window = [
                 (position, _known_float(context.slots[position].import_price))
@@ -475,13 +499,19 @@ class HVACPlanningPolicy:
                 and _known_float(context.slots[end_index].import_price) >= baseline + suppression_delta
             ):
                 end_index += 1
-            mode = _future_hvac_mode(context, slot, current, low, high)
             if mode is None:
                 _hvac_reject(context, "thermal_direction",
                     {"current_temperature": current, "comfort_low": low, "comfort_high": high}
                 )
                 index = end_index
                 continue
+            current = control_temperature(context, mode)
+            assert current is not None  # The same immutable room snapshot passed the input check above.
+            if temperatures(context) and comfort_breached(context, mode, coasting=False):
+                _hvac_reject(context, "zone_comfort_boundary", {})
+                index = end_index
+                continue
+            context.climate_legacy_decision["thermal_timing"] = thermal_timing
             target = high if mode == "heat" else low
             rate = thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode)
             best_start: int | None = None
@@ -500,7 +530,14 @@ class HVACPlanningPolicy:
                 ):
                     _hvac_reject(context, "minimum_cycle", {"earliest_start": earliest_start.isoformat()})
                     continue
-                if rate is None or rate <= 0:
+                if thermal_timing["rates_ready"]:
+                    delay = max((possible_start_at - context.created_at).total_seconds() / 60, 0)
+                    delayed_timing = timing(context, self.options, mode, self.thermal_model, delay_minutes=delay)
+                    if delayed_timing["required_minutes"] <= 0:
+                        _hvac_reject(context, "comfort_target_reached", {})
+                        continue
+                    required_slots = max(1, ceil(delayed_timing["required_minutes"] / interval_minutes))
+                elif rate is None or rate <= 0:
                     required_slots = lead_slots
                 else:
                     hours_to_start = max(
@@ -540,12 +577,10 @@ class HVACPlanningPolicy:
                 completion = possible_start + required_slots
                 coast_hours = (index - completion) * interval_minutes / 60
                 if coast_hours > 0:
-                    drift = _effective_passive_drift_c_per_hour(context, mode, self.thermal_model)
-                    available_coast = _thermal_coast_hours(
-                        mode=mode,
-                        target_temperature=target,
-                        comfort_boundary=low if mode == "heat" else high,
-                        passive_drift_c_per_hour=drift,
+                    available_coast = _room_coast_hours(
+                        context, self.thermal_model, mode, target, low if mode == "heat" else high,
+                        {zone: bounds(context, room)[1 if mode == "heat" else 0]
+                         for zone, room in temperatures(context).items()},
                     )
                     if available_coast is None or available_coast < coast_hours:
                         _hvac_reject(context, "thermal_coast",
@@ -600,6 +635,11 @@ class HVACPlanningPolicy:
                             {"projected_temperature": projected_start_temperature, "target": low}
                         )
                         continue
+                    if thermal_timing["rates_ready"] and timing(
+                        context, self.options, mode, self.thermal_model, delay_minutes=hours_to_start * 60,
+                    )["required_minutes"] <= 0:
+                        _hvac_reject(context, "comfort_target_reached", {})
+                        continue
                     run = context.slots[possible_start:index]
                     if not run or any(item.import_price is None for item in run):
                         _hvac_reject(context, "forecast_gap", {"at": possible_start_at.isoformat()})
@@ -635,6 +675,15 @@ class HVACPlanningPolicy:
             if best_start is None or best_required_slots is None:
                 index = end_index
                 continue
+            selected_timing = timing(
+                context, self.options, mode, self.thermal_model,
+                delay_minutes=max((context.slots[best_start].valid_at - context.created_at).total_seconds() / 60, 0),
+                available_minutes=best_required_slots * interval_minutes,
+            )
+            context.climate_legacy_decision["thermal_timing"] = selected_timing
+            predictions = [row["predicted_finishing_temperature"] for row in selected_timing["zones"].values()]
+            if predictions and all(value is not None for value in predictions):
+                best_projected_end_temperature = (min(predictions) if mode == "heat" else max(predictions))
             context.climate_legacy_decision.update(
                 reason="schedule_selected", summary="A thermally feasible tariff window was selected."
             )
@@ -656,6 +705,8 @@ class HVACPlanningPolicy:
                 active_until=period_end,
                 starting_temperature=best_projected_end_temperature,
                 comfort_boundary=low if mode == "heat" else high,
+                room_temperatures={zone: row["predicted_finishing_temperature"]
+                                   for zone, row in selected_timing["zones"].items()},
             )
             return {
                 "precondition_start": context.slots[best_start].valid_at,
@@ -775,7 +826,7 @@ class HVACPlanningPolicy:
                     projected_load,
                 )
             return
-        starting_temperature = context.current_hvac_temperature_c
+        starting_temperature = control_temperature(context, mode)
         if starting_temperature is None:
             return
         self._project_hvac_coast_slots(
@@ -785,6 +836,7 @@ class HVACPlanningPolicy:
             active_until=active_until,
             starting_temperature=starting_temperature,
             comfort_boundary=comfort_boundary,
+            room_temperatures={zone: room.get("temperature") for zone, room in temperatures(context).items()},
         )
 
     def _project_hvac_coast_slots(
@@ -796,21 +848,15 @@ class HVACPlanningPolicy:
         active_until: datetime,
         starting_temperature: float,
         comfort_boundary: float,
+        room_temperatures: Mapping[str, Any] | None = None,
     ) -> None:
         """Project maintenance load after thermal reserve is exhausted."""
         projected_load = thermal_hvac_load_kw(
             self.thermal_model,
             HVAC_PRECONDITION_PROJECTED_LOAD_KW,
         )
-        coast_hours = _thermal_coast_hours(
-            mode=mode,
-            target_temperature=starting_temperature,
-            comfort_boundary=comfort_boundary,
-            passive_drift_c_per_hour=_effective_passive_drift_c_per_hour(
-                context,
-                mode,
-                self.thermal_model,
-            ),
+        coast_hours = _room_coast_hours(
+            context, self.thermal_model, mode, starting_temperature, comfort_boundary, room_temperatures,
         )
         for slot in context.slots:
             if slot.valid_at < coast_started_at:
@@ -964,6 +1010,45 @@ def _future_hvac_mode(
     return None
 
 
+def _room_coast_hours(
+    context: DecisionContext, model: Mapping[str, Any], mode: str,
+    starting_temperature: float, comfort_boundary: float,
+    room_temperatures: Mapping[str, Any] | None = None,
+) -> float | None:
+    """The first participating room to reach its comfort limit bounds coast."""
+    rooms = temperatures(context)
+    if not rooms:
+        return _thermal_coast_hours(
+            mode=mode, target_temperature=starting_temperature, comfort_boundary=comfort_boundary,
+            passive_drift_c_per_hour=_effective_passive_drift_c_per_hour(context, mode, model),
+        )
+    available = []
+    for zone, room in rooms.items():
+        low, high = bounds(context, room)
+        boundary = low if mode == "heat" else high
+        if boundary is None:
+            return None
+        initial = _finite_number((room_temperatures or {}).get(zone))
+        initial = starting_temperature if initial is None else initial
+        drift = learned_rate(dict(model), zone, "passive", context.created_at)
+        if drift is None:
+            outdoor = context.current_outdoor_temperature_c
+            room_temperature = _finite_number(room.get("temperature"))
+            if outdoor is not None and room_temperature is not None:
+                if mode == "heat" and outdoor < room_temperature - 0.5:
+                    drift = -THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
+                elif mode == "cool" and outdoor > room_temperature + 0.5:
+                    drift = THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
+        hours = _thermal_coast_hours(
+            mode=mode, target_temperature=initial, comfort_boundary=boundary,
+            passive_drift_c_per_hour=drift,
+        )
+        if hours is None:
+            return None
+        available.append(hours)
+    return min(available)
+
+
 def _effective_passive_drift_c_per_hour(
     context: DecisionContext,
     mode: str,
@@ -974,9 +1059,10 @@ def _effective_passive_drift_c_per_hour(
     drift = summary.get("passive_indoor_drift_c_per_hour")
     if isinstance(drift, int | float) and isfinite(float(drift)):
         return float(drift)
-    if context.current_outdoor_temperature_c is None or context.current_hvac_temperature_c is None:
+    controlled = control_temperature(context, mode)
+    if context.current_outdoor_temperature_c is None or controlled is None:
         return None
-    outdoor_delta = float(context.current_outdoor_temperature_c) - float(context.current_hvac_temperature_c)
+    outdoor_delta = float(context.current_outdoor_temperature_c) - float(controlled)
     if mode == "heat" and outdoor_delta < -0.5:
         return -THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
     if mode == "cool" and outdoor_delta > 0.5:
@@ -1002,6 +1088,7 @@ def _thermal_coast_hours(
 
 
 _LEGACY_REASONS = {
+    "zone_temperature_unavailable": "A configured zone temperature or comfort input is missing, invalid or stale.",
     "price_difference": "The forecast price difference is below the configured minimum.",
     "thermal_direction": "The temperature forecast does not support heating or cooling preconditioning.",
     "preparation_time": "The candidate leaves insufficient time to reach the preconditioning target.",
@@ -1013,6 +1100,7 @@ _LEGACY_REASONS = {
     "comfort_inputs_missing": "Climate temperature or comfort limits are unavailable.",
     "lead_time_disabled": "The configured preconditioning lead time is zero.",
     "release_hold": "A previous comfort handoff is holding off preconditioning until this tariff period ends.",
+    "zone_comfort_boundary": "A participating room is beyond the opposite comfort boundary; takeover is withheld.",
 }
 
 

@@ -25,6 +25,7 @@ from .plan_presentation import built_in_load_forecast_attrs, export_limit_status
 from .preconditioning import current_status
 from .safety import control_pause_status
 from .storage import audit_records, climate_audit_records
+from .thermal_learning import summary as thermal_learning_summary
 from .type_defs import EnergyPlannerConfigEntry
 
 REDACT_KEYS = {
@@ -212,6 +213,7 @@ def climate_diagnostics(store_data: dict[str, Any], plan: Any, options: dict[str
         "observation_invalid_reason": engine.get("observation_invalid_reason"),
         "economic_status": engine.get("status", "learning"),
         "ever_active": bool(engine.get("ever_active")),
+        "thermal_learning": thermal_learning_summary(store_data.get("thermal_model", {}), dt_util.utcnow()),
         "readiness": engine.get("modes", {}),
         "observation_count": len(observations),
         "normal_observation_count": len(normal),

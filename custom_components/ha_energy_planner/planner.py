@@ -568,6 +568,9 @@ class DryRunPlanner:
         legacy_climate = [action for action in actions if action.asset == ActionAsset.DAIKIN]
         actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
         actions.extend(economic_actions(context, dict(self.options), legacy_climate))
+        context.climate_decision["temperature_feedback"] = context.climate_inputs.get("zones", {})
+        if "thermal_timing" in context.climate_legacy_decision:
+            context.climate_decision.setdefault("thermal_timing", context.climate_legacy_decision["thermal_timing"])
         enphase_action = self._enphase_action(context, execute_not_before, execute_not_after)
         if enphase_action is not None and context.climate_decision.get("commands_selected"):
             original_profile = context.current_enphase_profile

@@ -121,7 +121,7 @@ def update_thermal_model(
 def thermal_hvac_load_kw(model: Mapping[str, Any] | None, fallback_kw: float) -> float:
     """Return learned active HVAC load when the model is mature enough."""
     active = dict((model or {}).get("active_hvac_load_kw", {}))
-    if not (model or {}).get("enabled"):
+    if (model or {}).get("model_version") != 3 and not (model or {}).get("enabled"):
         return fallback_kw
     if _int_or_zero(active.get("sample_count")) < MIN_THERMAL_SAMPLES:
         return fallback_kw
@@ -145,6 +145,8 @@ def thermal_active_temperature_rate_c_per_hour(
         return fallback_c_per_hour
     value = _float_or_none(bucket.get("average"))
     if value is None:
+        return fallback_c_per_hour
+    if (model or {}).get("model_version") == 3 and value <= 0:
         return fallback_c_per_hour
     return round(_clamp(value, 0.05, 10.0), 4)
 

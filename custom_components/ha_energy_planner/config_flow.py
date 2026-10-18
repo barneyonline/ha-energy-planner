@@ -109,9 +109,11 @@ from .const import (
     CONF_HVAC_POWER_SOURCE_TYPE,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
+    CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
+    CONF_HVAC_THERMAL_LEARNING_ENABLED,
     CONF_HVAC_ZONE_MAPPINGS,
     CONF_INSTANCE_NAME,
     CONF_LOAD_RECOVERY_MAX_AGE_MINUTES,
@@ -433,6 +435,8 @@ _POLICY_SECTION_FIELDS = {
         CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_LEAD_MINUTES,
+        CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES,
+        CONF_HVAC_THERMAL_LEARNING_ENABLED,
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
         CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
         CONF_HVAC_PRECONDITION_WHILE_AWAY,
@@ -649,6 +653,10 @@ def _option_selector(field: str) -> Any:
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
         ),
+        CONF_HVAC_THERMAL_LEARNING_ENABLED: BooleanSelector(),
+        CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES: NumberSelector(
+            NumberSelectorConfig(min=0, max=360, step=5, mode=NumberSelectorMode.BOX)
+        ),
         CONF_HVAC_PRECONDITION_LEAD_MINUTES: NumberSelector(
             NumberSelectorConfig(min=0, max=120, step=5, mode=NumberSelectorMode.BOX)
         ),
@@ -839,7 +847,46 @@ class OptionsFlow(config_entries.OptionsFlow):
     ) -> config_entries.ConfigFlowResult:
         """Choose central settings or vehicle profile management."""
         return self.async_show_menu(
-            step_id="init", menu_options=["settings", "add_vehicle", "edit_vehicle", "remove_vehicle"],
+            step_id="init", menu_options=[
+                "settings", "zone_temperatures", "add_vehicle", "edit_vehicle", "remove_vehicle",
+            ],
+        )
+
+    async def async_step_zone_temperatures(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Map one temperature sensor per configured zone without changing actuators."""
+        zones = _entity_values(self._data.get(CONF_CLIMATE_ZONES, []))
+        if not zones:
+            return self.async_abort(reason="no_climate_zones")
+        mappings = {key: dict(value) for key, value in self._data.get(CONF_HVAC_ZONE_MAPPINGS, {}).items()}
+        errors: dict[str, str] = {}
+        fields: dict[Any, Any] = {}
+        for zone in zones:
+            fields[vol.Optional(zone)] = _entity_selector(entity_filter=_sensor_filter(("°C", "°F")))
+            if user_input is not None:
+                entity = user_input.get(zone)
+                if entity:
+                    state = self.hass.states.get(entity)
+                    if (not str(entity).startswith("sensor.") or state is None
+                            or state.attributes.get("unit_of_measurement") not in {"°C", "°F", "C", "F"}):
+                        errors[zone] = "invalid_unit"
+                    else:
+                        mappings.setdefault(zone, {})["temperature"] = entity
+                elif zone in mappings:
+                    mappings[zone].pop("temperature", None)
+                    if not mappings[zone]:
+                        del mappings[zone]
+        if user_input is not None and validate_climate_config({**self._data, CONF_HVAC_ZONE_MAPPINGS: mappings}):
+            errors["base"] = "invalid_climate_configuration"
+        if user_input is not None and not errors:
+            self._async_save_entry_data({**self._data, CONF_HVAC_ZONE_MAPPINGS: mappings})
+            return self.async_create_entry(title="", data=dict(self._options))
+        return self.async_show_form(
+            step_id="zone_temperatures",
+            data_schema=self.add_suggested_values_to_schema(vol.Schema(fields), {
+                zone: mapping["temperature"] for zone, mapping in mappings.items() if "temperature" in mapping
+            }), errors=errors,
         )
 
     async def async_step_settings(
@@ -1201,6 +1248,10 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     recovery_age = finite(user_input.get(CONF_LOAD_RECOVERY_MAX_AGE_MINUTES, 15))
     if recovery_age is None or not 1 <= recovery_age <= 30:
         errors[CONF_LOAD_RECOVERY_MAX_AGE_MINUTES] = "invalid_load_recovery_age"
+    lead = finite(user_input.get(CONF_HVAC_PRECONDITION_LEAD_MINUTES, 90))
+    maximum = finite(user_input.get(CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES, 180))
+    if lead is None or maximum is None or not 0 <= lead <= 120 or not 0 <= maximum <= 360 or maximum < lead:
+        errors[CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES] = "invalid_precondition_lead"
     for key, default in EV_DEFAULTS.items():
         if isinstance(default, (int, float)) and key in user_input:
             value = finite(user_input[key])
