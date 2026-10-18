@@ -200,7 +200,11 @@ def test_config_entry_migration_requires_vehicle_target_for_configured_ev() -> N
         options={CONF_EV_FALLBACK_TARGET_SOC_PERCENT: 85},
     )
 
-    assert asyncio.run(async_migrate_entry(FakeHass(manager), entry)) is False
+    from homeassistant.exceptions import ConfigEntryError
+
+    with pytest.raises(ConfigEntryError) as raised:
+        asyncio.run(async_migrate_entry(FakeHass(manager), entry))
+    assert raised.value.translation_key == "legacy_vehicle_target"
     assert manager.updated_entries == []
     assert entry.version == 3
 

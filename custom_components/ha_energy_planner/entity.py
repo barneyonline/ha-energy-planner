@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from itertools import islice
 from typing import Any
 
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -85,7 +86,7 @@ def recorder_safe_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "attributes_truncated": True,
-        "available_attribute_keys": [_truncate_utf8(str(key), 128) for key in list(normalized)[:32]],
+        "available_attribute_keys": [_truncate_utf8(str(key), 128) for key in islice(normalized, 32)],
     }
 
 
@@ -137,11 +138,10 @@ def _compact_attribute_value(
     if depth >= max_depth:
         return "<truncated>"
     if isinstance(value, dict):
-        items = list(value.items())
         # Preserve the entity's top-level attribute contract. Apply mapping
         # limits only to nested evidence where field counts can grow without
         # bound; list and string limits still compact top-level values.
-        selected_items = items if depth == 0 else items[:mapping_items]
+        selected_items = value.items() if depth == 0 else islice(value.items(), mapping_items)
         return {
             _truncate_utf8(str(key), 128): _compact_attribute_value(
                 item,

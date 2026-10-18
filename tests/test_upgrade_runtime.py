@@ -195,13 +195,8 @@ def test_legacy_target_reconfigure_directs_recovery_without_replacing_entry(tmp_
         try:
             from homeassistant.exceptions import ConfigEntryError
 
-            from custom_components.ha_energy_planner.migration_recovery import supports_migration_retry
-
-            if supports_migration_retry(hass):
-                with pytest.raises(ConfigEntryError):
-                    await async_migrate_entry(hass, entry)
-            else:
-                assert not await async_migrate_entry(hass, entry)
+            with pytest.raises(ConfigEntryError):
+                await async_migrate_entry(hass, entry)
             entry._async_set_state(hass, ConfigEntryState.MIGRATION_ERROR, None)
             assert (await flow.async_step_reconfigure())["type"] == "form"
             invalid = await flow.async_step_reconfigure({CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.missing"})
@@ -209,7 +204,7 @@ def test_legacy_target_reconfigure_directs_recovery_without_replacing_entry(tmp_
             hass.states.async_set("sensor.vehicle_target", "80", {"unit_of_measurement": "%"})
             with patch.object(ConfigEntries, "async_schedule_reload") as reload:
                 result = await flow.async_step_reconfigure({CONF_EV_SMART_CHARGING_TARGET_SOC: "sensor.vehicle_target"})
-                assert result["reason"] == ("repair_required" if supports_migration_retry(hass) else "restart_required")
+                assert result["reason"] == "repair_required"
                 reload.assert_not_called()
             assert await async_migrate_entry(hass, entry)
             assert entry.version == 5

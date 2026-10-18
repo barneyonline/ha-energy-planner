@@ -27,7 +27,6 @@ from custom_components.ha_energy_planner.migration_recovery import (
     async_create_migration_issue,
     async_save_vehicle_target,
     migration_issue_id,
-    supports_migration_retry,
 )
 from custom_components.ha_energy_planner.repairs import VehicleTargetRepairFlow, async_create_fix_flow
 
@@ -63,7 +62,7 @@ def flow_for(hass, entry):
 
 @pytest.mark.parametrize("use_reconfigure", [False, True])
 def test_real_failed_setup_repair_and_restart(tmp_path, use_reconfigure):
-    """Run unchanged on baseline and an actual newer Core with public retry support."""
+    """Recover immediately on supported Core and preserve state through restart."""
     shutil.copytree(ROOT / "custom_components/ha_energy_planner", tmp_path / "custom_components/ha_energy_planner")
 
     async def run():
@@ -97,24 +96,17 @@ def test_real_failed_setup_repair_and_restart(tmp_path, use_reconfigure):
                     reconfigure.hass = hass
                     reconfigure.context = {"source": "reconfigure", "entry_id": entry.entry_id}
                     result = await reconfigure.async_step_reconfigure({TARGET: "sensor.target"})
-                    if supports_migration_retry(hass):
-                        assert result["reason"] == "repair_required"
-                        result = await flow.async_step_target({TARGET: "sensor.target"})
+                    assert result["reason"] == "repair_required"
+                    result = await flow.async_step_target({TARGET: "sensor.target"})
                 else:
                     result = await flow.async_step_target({TARGET: "sensor.target"})
                 reload.assert_not_called()
-            if supports_migration_retry(hass):
-                assert result["type"] == "create_entry"
-                assert entry.state is ConfigEntryState.LOADED
-                assert entry.version == 5
-                assert entry.runtime_data.store.data["ownership"] == fixture["store"]["data"]["ownership"]
-                assert entry.runtime_data.overrides[0].reason == "operator_requested"
-                assert registry.async_get_issue(DOMAIN, issue_id) is None
-            else:
-                assert result["reason"] == "restart_required"
-                assert entry.state is ConfigEntryState.MIGRATION_ERROR and entry.version == 3
-                issue = registry.async_get_issue(DOMAIN, issue_id)
-                assert not issue.is_fixable and issue.translation_key == "migration_restart_required"
+            assert result["type"] == "create_entry"
+            assert entry.state is ConfigEntryState.LOADED
+            assert entry.version == 5
+            assert entry.runtime_data.store.data["ownership"] == fixture["store"]["data"]["ownership"]
+            assert entry.runtime_data.overrides[0].reason == "operator_requested"
+            assert registry.async_get_issue(DOMAIN, issue_id) is None
             assert entry.data[TARGET] == "sensor.target"
             assert dict(entry.options) == original_options
             entry_id = entry.entry_id
@@ -193,7 +185,7 @@ def test_repair_stale_entries_and_retry_outcomes(tmp_path, scenario):
                     entry._async_set_state(hass, ConfigEntryState.LOADED, None)
 
             with patch.object(
-                ConfigEntries, "async_retry_migration", new=AsyncMock(side_effect=retry), create=True,
+                ConfigEntries, "async_retry_migration", new=AsyncMock(side_effect=retry),
             ) as retry_mock:
                 result = await flow.async_step_target({TARGET: "sensor.target"})
                 if scenario in {"removed", "foreign", "recovered", "disabled"}:
@@ -267,16 +259,15 @@ def test_reconfigure_stale_form_and_loaded_entry(tmp_path):
     asyncio.run(run())
 
 
-def test_migration_raises_translated_error_only_with_retry_support(tmp_path):
+def test_migration_raises_translated_error_for_missing_target(tmp_path):
     async def run():
         hass = await prepare(tmp_path)
         entry = make_entry()
         hass.config_entries._entries[entry.entry_id] = entry
         original = (dict(entry.data), dict(entry.options), entry.version)
         try:
-            with patch.object(ConfigEntries, "async_retry_migration", new=AsyncMock(), create=True):
-                with pytest.raises(ConfigEntryError) as raised:
-                    await async_migrate_entry(hass, entry)
+            with pytest.raises(ConfigEntryError) as raised:
+                await async_migrate_entry(hass, entry)
             assert raised.value.translation_key == "legacy_vehicle_target"
             assert (dict(entry.data), dict(entry.options), entry.version) == original
             assert ir.async_get(hass).async_get_issue(DOMAIN, migration_issue_id(entry.entry_id)).is_fixable
@@ -285,7 +276,7 @@ def test_migration_raises_translated_error_only_with_retry_support(tmp_path):
     asyncio.run(run())
 
 
-def test_repairs_manager_preserves_restart_issue(tmp_path):
+def test_repairs_manager_recovers_migration_and_clears_issue(tmp_path):
     """Use the real frontend flow manager, including init payload and abort cleanup."""
     from homeassistant.setup import async_setup_component
 
@@ -302,12 +293,10 @@ def test_repairs_manager_preserves_restart_issue(tmp_path):
             issue_id = migration_issue_id(entry.entry_id)
             form = await manager.async_init(DOMAIN, data={"issue_id": issue_id})
             assert form["step_id"] == "target" and not form["errors"]
-            # Force the baseline path even when this test runs on a newer image.
-            with patch.object(ConfigEntries, "async_retry_migration", new=None, create=True):
-                result = await manager.async_configure(form["flow_id"], {TARGET: "sensor.target"})
-            assert result["reason"] == "restart_required"
-            issue = ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
-            assert issue is not None and issue.translation_key == "migration_restart_required"
+            result = await manager.async_configure(form["flow_id"], {TARGET: "sensor.target"})
+            assert result["type"] == "create_entry"
+            assert entry.state is ConfigEntryState.LOADED and entry.version == 5
+            assert ir.async_get(hass).async_get_issue(DOMAIN, issue_id) is None
         finally:
             await hass.async_stop(force=True)
     asyncio.run(run())
@@ -340,8 +329,7 @@ def test_future_configuration_is_not_reported_as_repaired(tmp_path, surface):
 
 
 @pytest.mark.parametrize("surface", ["repair", "reconfigure"])
-@pytest.mark.parametrize("retry_supported", [False, True])
-def test_repair_cannot_overwrite_target_during_migration(tmp_path, retry_supported, surface):
+def test_repair_cannot_overwrite_target_during_migration(tmp_path, surface):
     async def run():
         hass = await prepare(tmp_path)
         entry = make_entry()
@@ -354,8 +342,8 @@ def test_repair_cannot_overwrite_target_during_migration(tmp_path, retry_support
             hass.states.async_set("sensor.other_target", "70", {"unit_of_measurement": "%"})
             hass.config_entries.async_update_entry(entry, data={**entry.data, TARGET: "sensor.other_target"})
             entry._async_set_state(hass, ConfigEntryState.SETUP_IN_PROGRESS, None)
-            retry = AsyncMock() if retry_supported else None
-            with patch.object(ConfigEntries, "async_retry_migration", new=retry, create=True):
+            retry = AsyncMock()
+            with patch.object(ConfigEntries, "async_retry_migration", new=retry):
                 if surface == "repair":
                     result = await flow.async_step_target({TARGET: "sensor.target"})
                 else:
@@ -365,8 +353,7 @@ def test_repair_cannot_overwrite_target_during_migration(tmp_path, retry_support
                     result = await reconfigure.async_step_reconfigure({TARGET: "sensor.target"})
             assert result["errors"]["base"] == "retry_not_ready"
             assert entry.data[TARGET] == "sensor.other_target"
-            if retry is not None:
-                retry.assert_not_called()
+            retry.assert_not_called()
             assert ir.async_get(hass).async_get_issue(DOMAIN, migration_issue_id(entry.entry_id)).is_fixable
         finally:
             await hass.async_stop(force=True)

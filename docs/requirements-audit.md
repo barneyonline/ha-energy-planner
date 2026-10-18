@@ -454,7 +454,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   `scripts/select_ci_checks.py`, runs only the affected expensive jobs, and
   fails safe to the full CI set for an unclassified trigger path.
   Behavioral changes also run real runtime contracts and smoke tests on the HACS
-  minimum/pinned HA 2026.9.0 and current stable. Documentation-only
+  minimum/pinned HA 2026.10.0 and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
   complete local gate including minimum/pinned runtime contracts and package smoke.
   Coverage instruments branches, enforces exactly 100% statement coverage with
@@ -984,9 +984,20 @@ use throughout; the Docker and pull-request gates enforce that result.
   Evidence: `durable_storage.py`, `tests/test_storage_runtime.py`.
 - Real HA upgrade/reload/restart tests use a synthetic 0.9.18 Store/config fixture,
   preserve the live Mode entity ID, manual override and unresolved ownership and
-  reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. HA 2026.9 saves the correction with explicit restart instructions; newer HA retries migration through the public API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
+  reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
+- The minimum and pinned baseline are HA 2026.10.0. Migration recovery uses the
+  public retry API directly; obsolete restart branches, strings and tests are
+  removed. Schemas import Probatio directly; binary-sensor device classes use
+  the current constant module. Tests still initialize HA before collection to
+  match host startup order and preserve clean combined-runtime shutdown.
+  Charger callers use `EVChargerAdapter` directly. Unused private state,
+  schema and planning helpers are removed; relevant EV simulation and settings
+  assertions exercise the active implementation.
+- Entity attribute compaction iterates only retained nested mapping entries,
+  avoiding full mapping copies while preserving ordering and UTF-8 byte budgets
+  (`entity.py`, `tests/test_entity.py`).
 - Support policy and tooling versions come from HACS/pyproject through
   `scripts/support_policy.py`. Weekly compatibility jobs pull their runtime image.
 - Deterministic component ZIP/checksum creation runs before publication; runtime

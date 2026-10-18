@@ -11,8 +11,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
+import probatio as vol
 import pytest
-import voluptuous as vol
 
 import custom_components.ha_energy_planner.config_flow as config_flow_module
 from custom_components.ha_energy_planner.config_flow import (
@@ -38,7 +38,6 @@ from custom_components.ha_energy_planner.config_flow import (
     _form_suggested_values,
     _normalize_ai_config,
     _normalize_options_input,
-    _options_schema,
     _ready_by_valid,
     _validate_config,
     _validate_options,
@@ -250,6 +249,20 @@ def _valid_hass() -> FakeHass:
             },
         },
     )
+
+
+def _settings_policy_fields() -> dict[Any, Any]:
+    """Inspect policy fields from the actual central-settings form."""
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    policy_fields = {
+        field for fields in config_flow_module._SETTINGS_SECTION_OPTION_FIELDS.values() for field in fields
+    }
+    return {
+        marker: validator
+        for section in flow._settings_schema().schema.values()
+        for marker, validator in section.schema.schema.items()
+        if str(getattr(marker, "schema", marker)) in policy_fields
+    }
 
 
 def _settings_submission(
@@ -551,7 +564,7 @@ def test_energy_flow_filters_sensor_selectors_by_expected_units() -> None:
 
 
 def test_recommended_default_planning_horizon_is_twelve_hours() -> None:
-    schema_fields = {getattr(key, "schema", key): key for key in _options_schema({}).schema}
+    schema_fields = {getattr(key, "schema", key): key for key in _settings_policy_fields()}
 
     assert DEFAULT_OPTIONS[CONF_PLANNING_HORIZON_HOURS] == 12
     assert schema_fields[CONF_PLANNING_HORIZON_HOURS].default() == 12
@@ -828,7 +841,7 @@ def test_options_flow_fields_have_readable_translation_labels() -> None:
     for section_strings in strings["options"]["step"]["settings"]["sections"].values():
         labels.update(section_strings.get("data", {}))
         descriptions.update(section_strings.get("data_description", {}))
-    schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
+    schema_keys = {str(getattr(key, "schema", key)) for key in _settings_policy_fields()}
 
     assert schema_keys <= labels.keys()
     assert schema_keys <= descriptions.keys()
@@ -982,7 +995,7 @@ def test_ev_section_combines_mappings_ready_by_and_opportunistic_controls() -> N
 
 
 def test_options_flow_excludes_settings_managed_by_native_entities() -> None:
-    schema_keys = {str(getattr(key, "schema", key)) for key in _options_schema(dict(DEFAULT_OPTIONS)).schema}
+    schema_keys = {str(getattr(key, "schema", key)) for key in _settings_policy_fields()}
 
     assert schema_keys.isdisjoint(
         {
@@ -1211,7 +1224,7 @@ def test_options_flow_accepts_zone_only_preconditioning_with_zone_thermostat() -
 def test_options_flow_uses_ordered_priority_dropdowns() -> None:
     schema_fields = {
         str(getattr(key, "schema", key)): selector
-        for key, selector in _options_schema(dict(DEFAULT_OPTIONS)).schema.items()
+        for key, selector in _settings_policy_fields().items()
     }
 
     assert CONF_PRIORITY_WEIGHTS not in schema_fields
