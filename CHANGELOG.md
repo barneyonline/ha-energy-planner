@@ -12,7 +12,14 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep the external climate scheduler guard active through each Daikin command's
+  bounded confirmation and classifier settling interval, preventing delayed
+  target feedback from becoming a false manual override. Renew before sequential
+  writes, preserve longer shared timers and original reload deadlines, and retain
+  explicit user overrides. Skip explicitly idle automation refreshes, retire
+  cancelled unsent intents, and reconcile accepted commands before compensation
+  when recovery guard helpers fail. Charge helper setup time to the original
+  recovery deadline so expired feedback cannot be confirmed.
 
 ### 🔧 Improvements
 
