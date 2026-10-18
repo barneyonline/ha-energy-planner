@@ -4,6 +4,28 @@
 
 ### 🚧 Breaking changes
 
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.0 - 2026-10-18
+
+### 🚧 Breaking changes
+
 - Require Home Assistant 2026.10.0 or newer.
 
 ### ✨ New features
@@ -28,7 +50,7 @@
 
 ### 🔄 Other changes
 
-- None
+- Reduce the README to an overview, quick installation and compatibility guide; move detailed setup, vehicle profiles, safety, calendar history, recovery and Export Limit guidance into the wiki and refresh outdated instructions.
 
 ## 1.3.7 - 2026-10-18
 

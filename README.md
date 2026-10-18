@@ -1,393 +1,49 @@
 # Energy Planner - Home Assistant Custom Integration
 
-[![Release](https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&sort=semver)](https://github.com/barneyonline/ha-energy-planner/releases)
-[![Stars](https://img.shields.io/github/stars/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/stargazers)
-[![License](https://img.shields.io/github/license/barneyonline/ha-energy-planner)](LICENSE)
+Local-first energy planning for Home Assistant, coordinating tariffs, solar, household load, batteries, EV charging, climate comfort and Enphase controls.
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/ci.yml?branch=main&label=tests)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/ci.yml)
-[![Codecov](https://codecov.io/gh/barneyonline/ha-energy-planner/branch/main/graph/badge.svg)](https://codecov.io/gh/barneyonline/ha-energy-planner)
-[![Hassfest](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/hassfest.yml?branch=main&label=hassfest)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/hassfest.yml)
-[![Self-assessed quality: Platinum](https://img.shields.io/badge/self--assessed%20quality-platinum-blue)](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
+Energy Planner reads existing Home Assistant entities and calls their integration actions. It does not connect directly to vendor clouds or replace the integrations that supply device data and controls.
 
-[![HACS](https://img.shields.io/badge/HACS-custom-orange.svg)](https://hacs.xyz)
-[![Open Issues](https://img.shields.io/github/issues/barneyonline/ha-energy-planner)](https://github.com/barneyonline/ha-energy-planner/issues)
-![Development Status](https://img.shields.io/badge/development-active-success?style=flat-square)
+## Supported control areas
 
-Energy Planner is a local-first Home Assistant custom integration that coordinates tariffs, solar, household load, batteries, EV charging, climate comfort, and Enphase operating profiles and Export Limit in one guarded plan.
+- EV charging through a stateful charger switch, with vehicle profiles for cars sharing one charger.
+- Climate preconditioning through a main thermostat, configured zones and automations.
+- Enphase operating profiles and independent Export Limit control, where supported by the upstream integration.
 
-The Platinum quality-scale label is a repository self-assessment against the current Home Assistant integration quality rules. As a custom integration, Energy Planner is not reviewed, security audited, maintained, or supported by the Home Assistant project. Rule-by-rule evidence is tracked in [`quality_scale.yaml`](quality_scale.yaml).
+## Key features
 
-## Supported Functionality
+- Tariff-aware EV scheduling with ready-by, target SOC, solar, battery-reserve and grid constraints.
+- Climate preconditioning with room comfort protection, learned heating/cooling rates and guarded restoration.
+- Recorder-trained household-load forecasts and fail-closed checks for missing or stale inputs.
+- Current state, next actions, a plan calendar with confirmed history and redacted diagnostics.
+- Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.
+- Optional on-demand AI Task explanations that remain advisory.
 
-Energy Planner reads existing Home Assistant entities and calls Home Assistant services. It does not connect directly to vendor clouds or replace the integrations that supply device data and controls.
+## Quick install (HACS)
 
-The Energy Planner service displays a flat list containing the planner device and each tracked vehicle. Planner entities remain on the planner device; vehicle devices represent saved profiles, while their telemetry remains in the source integration. Existing vehicle sub-entries migrate automatically on reload or when saving vehicle changes before the first reload, preserving profile IDs, settings, and calibration associations. Use **Configure → Planner settings** for inputs and policy, or **Configure → Add vehicle / Edit vehicle / Remove vehicle** to manage profiles.
+1. Add `https://github.com/barneyonline/ha-energy-planner` to **HACS → Custom repositories** as an **Integration**.
+2. Download Energy Planner and restart Home Assistant.
+3. Go to **Settings → Devices & services → Add integration → Energy Planner**.
+4. Open **Configure → Planner settings** to map inputs. Keep **Automatic control** off while reviewing plans and the safety check.
 
-Planning and control include:
+[Open in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration). Manual installation and removal: see [Installation](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
 
-- Tariff-aware EV charging with ready-by, target-SOC, solar, battery-reserve, and grid-limit constraints.
-- Climate preconditioning with learned normal-operation comparisons, bounded schedule search, tariff/solar/battery economics, optional room and arrival inputs, and existing comfort, manual-override and rollback safeguards. See [Climate decision policy](docs/climate-decisions.md).
-- Enphase self-consumption, backup, and AI-profile selection where mapped controls support it.
-- A Recorder-trained household-load forecast with conservative validation and fail-closed handling of missing or stale data.
-- A plan calendar, current state, next actions, input health, forecast confidence, production readiness, and redacted support data.
-- Diagnostic sensors for Decision summary, Plan health, Current load forecast, Planning duration, and load-forecast coverage.
-- Clear `review`, `recovery`, and `active` mode states so startup recovery is distinguishable from normal review mode.
-- Independent switches for climate, EV, Enphase Profile control and Enphase Export Limit control, plus a guarded Automatic control switch.
-- Optional AI Task explanations that remain advisory and cannot call services or bypass constraints.
+## Compatibility
 
-EV planning includes capacity-aware slots, a soft readiness buffer, optional measured charging performance and number-entity power limits, battery opportunity-cost estimates, and guarded departure-priority spending. See [EV charging decisions](docs/ev-scheduling.md) for configuration, compatibility, and diagnostic evidence.
+- Home Assistant **2026.10.0** or newer, using Python **3.14+**.
+- Normal energy planning requires tariff and external PV forecasts, measured household consumption with Recorder history, and battery SOC. Each control area needs its mapped controls and feedback.
+- Export-only operation has narrower input requirements; see [Enphase Export Limit](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit).
+- The load model needs at least three qualifying history days and must pass validation before forecast-dependent commands are allowed.
+- No third-party Python dependencies or separate vendor credentials are required. A configured AI provider may run remotely.
 
-Continuous EV charging compares the total energy cost of feasible charging
-windows, including solar opportunity cost and partial final slots. Configured
-carbon preferences, active-session continuity, and ready-by limits still apply.
+## Documentation
 
-Before acquiring device control, Energy Planner requires confirmation that
-recovery metadata was written to storage. Failed writes block new commands and remain pending for retry.
-Shutdown-deferred writes are flushed before command authority is granted.
-Disarming still restores planner-owned HVAC zones and automations when storage
-is unavailable. A failed save is reported after restoration, and the resulting
-state remains pending for retry.
+See the [Wiki](https://github.com/barneyonline/ha-energy-planner/wiki) for setup, configuration, actions, upgrades, troubleshooting and limitations.
 
-Provided Home Assistant actions:
+- [Setup and configuration](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup)
+- [Safety and production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production)
+- [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) and [known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
+- [Releases](https://github.com/barneyonline/ha-energy-planner/releases), [changelog](CHANGELOG.md) and [issues](https://github.com/barneyonline/ha-energy-planner/issues)
+- [Development and validation](https://github.com/barneyonline/ha-energy-planner/wiki/Development), [requirements evidence](docs/requirements-audit.md) and [quality-scale evidence](quality_scale.yaml)
 
-- `ha_energy_planner.replan`: request an immediate planner refresh.
-- `ha_energy_planner.run_preflight`: check active-mode readiness without issuing commands.
-- `ha_energy_planner.restore_safe_state`: restore planner-owned EV, Enphase, and HVAC state where supported.
-- `ha_energy_planner.pause_control` and `ha_energy_planner.resume_control`: pause all control or a selected device class.
-- `ha_energy_planner.set_ev_ready_by`: update the EV ready-by time.
-- `ha_energy_planner.set_manual_hvac_override`: block planner HVAC control for a bounded period.
-- `ha_energy_planner.export_diagnostics` and `ha_energy_planner.export_support_bundle`: return redacted troubleshooting evidence.
-- `ha_energy_planner.arm_production_control` and `ha_energy_planner.disarm_production_control`: explicitly manage the advanced production safety gate.
-
-With multiple planner entries, provide `config_entry_id` when calling an action. Use one planner with vehicle profiles for cars sharing one charger; separate chargers use separate planner entries.
-
-Energy Planner does not provide custom automation triggers or conditions; use
-its entity state changes and the standard Home Assistant automation building
-blocks when automating planner behavior.
-
-## Installation
-
-### HACS
-
-1. Open HACS.
-2. Open the three-dot menu and select **Custom repositories**.
-3. Add `https://github.com/barneyonline/ha-energy-planner` as an **Integration** repository.
-4. Download Energy Planner.
-5. Restart Home Assistant.
-6. Go to **Settings -> Devices & services -> Add integration -> Energy Planner**.
-
-[![Open your Home Assistant instance and open the Energy Planner repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration)
-
-### Manual
-
-Published releases include a component ZIP and SHA-256 checksum after version
-validation and a packaged runtime smoke test. Maintainers can rebuild missing
-assets for an existing tag using the Release Assets workflow; see the
-[release checklist](docs/release-checklist.md).
-
-1. Copy `custom_components/ha_energy_planner` into your Home Assistant `custom_components` directory.
-2. Restart Home Assistant.
-3. Go to **Settings -> Devices & services -> Add integration -> Energy Planner**.
-
-## Requirements
-
-- Home Assistant `2026.10.0` or newer; the pinned release-validation baseline is `2026.10.0`.
-- Import and export tariff forecast sensors, commonly supplied by Amber Electric.
-- An external PV forecast, commonly Solcast Forecast Today and optionally Forecast Tomorrow.
-- A measured whole-home instantaneous consumption sensor in W, kW, or MW.
-- Home Assistant Recorder with retained history for the household-load sensor.
-- Battery state of charge and the entities or actions required by each device area you want Energy Planner to control.
-
-Weather, carbon intensity, measured PV power, and AI explanations are optional. An external solar forecast remains required. The integration has no third-party Python dependencies and does not require separate vendor credentials.
-
-Maintainers validate changes with `scripts/docker-validate.sh`. Docker test runners install the pinned development tools from `tests/requirements.txt` inside each disposable container, so validation works when a Home Assistant image omits pytest. The pinned baseline and separate stable compatibility checks retain their existing coverage and runtime gates.
-
-## Configuration
-
-Initial setup asks for a planner name. Then open **Configure** to map inputs and manage six areas:
-
-- Energy, battery, grid, and data.
-- Climate and presence.
-- Enphase.
-- Safety and troubleshooting.
-- EV charging.
-- Planning and priorities.
-
-For a safe initial rollout:
-
-1. Map tariff forecasts, PV forecasts, household load, battery SOC, and only the devices you intend to manage.
-2. Confirm Recorder retains the selected household-load sensor.
-3. Review EV, battery, grid, climate, and confirmation limits.
-4. Enable the individual climate, EV, or Enphase control switches you want to evaluate.
-5. Leave **Automatic control** off while the load model learns and you review **Current state**, **Next actions**, and the **Plan** calendar.
-6. Run the safety check and resolve missing, stale, or unconfirmed inputs.
-7. Turn on **Automatic control** only when the plan and mapped device behavior are understood.
-
-**Automatic control** records the operator's request for active control. **Armed** is the actual command-authority gate; unsafe or incomplete evidence keeps it off even when automatic-control intent is retained.
-
-EV charging uses one **Charger control** switch (or an `input_boolean` helper) for both on and off commands. Separate start/stop controls and button commands are no longer supported. Reloading removes those old mappings while preserving the mapped charger switch and recovery evidence. If only separate controls were configured, select a stateful charger control in **Configure → Planner settings** before enabling EV control. Saved ownership remains pending when its original charger control is missing or cannot be confirmed off.
-
-Saving mapped inputs may briefly make planner entities unavailable while their listeners are rebuilt. Concurrent updates from one settings save share that reload and preserve automatic recovery; after the required safety checks pass, Armed returns on. Policy-only changes apply without rebuilding the integration.
-
-When **Automatic control** is armed and **EV control** is enabled, Energy Planner immediately stops charging that a charger starts by itself on plug-in. If the stop cannot be confirmed, it checks again every 30 seconds—even while charging feedback is temporarily unavailable—until charging is confirmed inactive or control is disabled. After a dispatched stop fails, automatic stop commands share a persisted ten-minute backoff across schedule refreshes, auto-start compensation, and reloads. A first stop and explicit manual stops remain available; a confirmed safe stop closes the failure episode. Releasing vehicle policy without a stop preserves the backoff. Checks and local rejections during backoff consume no action allowance. Starts actually issued by Energy Planner or its manual EV controls are ownership-tracked and are not mistaken for plug-in auto-starts; the next plan may start charging again when the current slot calls for it. Delayed or recovered charging feedback is also preserved when the current active plan still requests charging, the same owned charger is enabled, and no EV pause or plan capacity issue blocks it. Expired plans, scheduled stops, changed controls, and ownership without current charging intent do not grant this protection. Enabling control preserves a start just issued by the replan. A stop that sends no command does not create an **EV charging paused** notification.
-
-EV control attempts are limited over a rolling 24-hour window. Configure **Maximum daily EV actions** in the integration settings under **Safety and troubleshooting** (default 10, range 0–48; 0 disables the cap). Existing saved limits are preserved. Starts, stops, dispatched failures and recovery actions count toward the allowance; local rejections before dispatch do not count, and older missing-control retry counts are removed on reload; safety stops remain available. Scheduling reserves the eventual stop as well as the start. An **EV action limit reached** notification means an otherwise feasible schedule was blocked by this allowance and includes the configured and remaining counts.
-
-The default **Manual HVAC override duration** is 60 minutes. Genuine manual changes temporarily block planner control; existing saved durations are preserved. Planner-owned feedback should not create a hold.
-
-The default **Maximum daily climate actions** is 12 in the same settings section (range 0–48; 0 disables the cap). Existing saved climate limits are preserved.
-
-Main-unit shutdowns during release or settings recovery can also switch zone climates off and remove their targets. Those expected updates are treated as planner feedback only during the shutdown command and confirmation window; user-attributed changes and conflicting targets still trigger manual protection.
-
-## Known Limitations
-
-- Tariff and PV forecasts must come from other Home Assistant integrations. Energy Planner does not fetch forecasts directly.
-- The load model needs at least three qualifying days of Recorder history and must pass coverage and holdout checks before forecast-dependent commands are allowed.
-- Missing, stale, invalid, or unconfirmed inputs fail closed. This can suppress otherwise economical actions.
-- Enphase control is limited to the verified profiles exposed by the mapped Home Assistant integration; it does not directly command battery charge or discharge power.
-- EV control requires a mapped target-SOC entity and confirmed charger feedback. Cars sharing one charger use tracked vehicle profiles.
-- After the Solcast unit correction, PV calibration restarts from new forecast evidence; older models and training snapshots are discarded. Explicit W/kW/MW forecast units remain supported.
-- Climate comfort holds prevent reacquisition until their expiry. An expired hold alone does not block a new preconditioning cycle.
-- Reaching the preconditioning target enters pre-peak or peak coast immediately, reducing thermostat demand while retaining schedule suppression and the original restoration baseline. Heating coasts until the lower comfort boundary; cooling until the upper boundary. Comfort handoffs retain the release hold through the original tariff end. Coasting may still run the compressor.
-- Climate takeover requires enough mapped state to restore the thermostat, configured zones, and automations safely. Off zones that expose no temperature target are left out of temperature synchronisation for that takeover; the main thermostat, zone switches, and zones with valid targets remain eligible. During a planner turn-on, a deferred zone may recover its target even when Daikin publishes a fresh context: the event must have no user or parent context, match the configured main startup or an unambiguous zone actuator, and restore a finite target compatible with the active transaction and current bounds. During main-unit turn-on, the remembered mode may differ from the requested mode; zone-switch feedback must match the command-time head mode, or the requested mode when the head is off. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only compatible recovered targets within the bounded command settling period. Unrelated manual changes remain protected. A later takeover can synchronise a recovered zone.
-- Optional AI explanations depend on a configured Home Assistant `ai_task`
-  entity and remain advisory only. A newly created AI Task with state `unknown`
-  can be used immediately; only a missing or explicitly `unavailable` provider
-  blocks Explain. A configured provider may run locally or in a cloud service;
-  selected planner context is sent to that provider when Explain is requested.
-- Bypassing safety gates is an advanced, default-off setting that reduces protection and should be used only with an explicit understanding of the risk.
-
-When scheduler-classifier helpers are configured, Energy Planner checks both the scheduler flag and a finite timer before every climate, zone-actuator or configured automation write. Coverage lasts through that command's original 180-second reconciliation deadline plus 10 seconds for the external classifier's trigger and settling steps (rounded up with one second of timer handling margin). Sequential writes renew coverage as needed; read-only polling and refreshes with no service writes do not. Reload recovery covers only the original remaining lease. A longer active shared timer is preserved, and completion, failure and cancellation leave its finite expiry to clear the classifier flag. An active timer without a readable expiry blocks ordinary writes. Existing emergency shutdown after an exception still attempts the guard and can return a previously-off head to off when helpers fail. Explicit user-attributed changes still supersede immediately through the existing override paths.
-
-An already-off automation is skipped only when Home Assistant explicitly reports zero running actions; missing or positive action counts still receive `stop_actions`. Cancellation before climate dispatch removes the unsent intent. If guard setup fails while recovering an already issued command, read-only reconciliation still waits for its original confirmation or expiry before restoration can proceed. Guard setup time consumes that original lease; a matching snapshot first checked at or after expiry is recorded as unconfirmed.
-
-Daikin commands initially wait 30 seconds for authoritative feedback. An uncertain command then enters readback reconciliation until at most 180 seconds after its original issue time, requesting a device refresh every 30 seconds without resending the write. A service timeout also follows this path because the device may already have accepted the command. The original restoration settings, command deadline and activation evidence are saved before dispatch; after reload, recovery reconciles that command before restoring the saved settings. Failed recovery retains the latest pending command and does not reinstate an intent that has already settled. During the bounded mode transition, an unattributed change to the requested mode may restore its remembered temperature within captured device bounds (or matching coupled-zone bounds). Once the mode is confirmed, the planner applies its separate target. Each zone target is confirmed before another zone is commanded. Restoration waits for an already accepted mode change to settle before returning to the original settings. Confirmed commands retain their shorter attribution window. Explicit user changes, unrelated automation contexts, standalone target changes and superseded commands retain their normal override handling. Diagnostics expose the outstanding command and its deadline; expiry fails the acquisition and attempts restoration with unresolved settings retained for recovery.
-
-## Troubleshooting
-
-- **Load model stays in learning:** verify Recorder history, the sensor unit, and that the source represents gross household demand rather than solar, energy totals, forecasts, or signed net grid flow.
-- **Household-load sensor drops out:** inspect the Current load forecast attributes or the diagnostics `load_forecast` section. `fallback_status` shows `active`, `unavailable`, or `not_needed`; `fallback_summary` explains the reason, and `fallback_remaining_seconds` shows the remaining configured grace when the outage start is known. `model_status` on the sensor (`status` in diagnostics) reports model readiness. The default six-hour grace requires a current, quality-approved model with complete coverage; missing entities, invalid readings and expired grace still fail closed.
-- **Startup climate feedback:** Until Home Assistant is running, unattributed main-climate and configured-zone updates do not create manual overrides. Explicit user-attributed changes, the override helper, and the manual-override action remain effective. Physical remote changes without user attribution cannot be distinguished from startup feedback; use the override helper during startup. Normal detection resumes immediately when Home Assistant is running, independently of the recovery warm-up. Existing overrides are preserved.
-- **Startup warm-up:** fallback notifications and automatic-control startup validation wait up to 30 minutes for upstream integrations. Unsafe actions remain blocked immediately. All device service targets (including EV, Enphase, climate and helper entities) are checked immediately before dispatch. Missing or unavailable targets wait for recovery; unknown controls also wait, except buttons that have never been pressed. Weather forecasts are requested only when the configured weather entity is available (unknown current conditions still allow forecasts); any cached fallback remains subject to its freshness limit.
-- **Input availability warnings:** warnings identify the issue code and configured entities. During Home Assistant startup, missing-input warnings have a bounded 30-minute grace period; safety gates still apply immediately. The grace applies only to inputs missing on the first refresh. Inputs that remain missing after the grace period warn once; new outages and repeat outages after an input recovers warn immediately, even while other inputs are still starting. Each warned input logs once on loss and once on recovery, including its full observed outage duration. Reason changes are logged at info level and preserve the outage start; recovery requires every issue for that input to clear. Unrecognised issue text is omitted from logs.
-- **Solar forecasts near midnight:** configure both today and tomorrow forecasts. Freshness follows the forecast intervals used by planning, including the final interval through its end and validated tomorrow coverage after rollover. Missing or expired coverage still blocks unsafe plans. Untimestamped values remain subject to the entity freshness timeout even when mixed with malformed dated records.
-- **Automatic control is on but Armed is off:** check Current state, Next actions, active pauses, and the output of Run safety check or `ha_energy_planner.run_preflight`.
-- **No action is planned:** confirm the relevant device-control switch is on and that the required tariff, PV, load, SOC, presence, and device inputs are current.
-- **Climate lifecycle:** Active tariff cycles retain their original time grid across refreshes and restarts, but always revalidate against fresh timestamped prices. Successful takeover retains the original main target; release restores that target and dependent zone targets before closing dampers or shutting down the main unit. Real manual changes still supersede the corresponding saved state.
-- **HVAC power source type:** Auto leaves unproven sources unknown; Measured declares a physical power measurement; Estimated supports legacy thermal planning. Known synthetic sources, including fixed Powercalc, always remain estimated and report a conflict if declared Measured. Estimated or unknown watts cannot validate economic savings. Initial learning uses passive history and does not withhold eligible legacy preconditioning for intentional observations.
-- **Zone temperatures and timing:** Configure → Zone temperatures selects one sensor or existing average helper per zone. Mapped readings drive completion and comfort protection in both planning policies; the raw Daikin reading remains separate. Explicit sensor failures prevent takeover and release affected ownership. The initial lead defaults to 90 minutes; qualified heating/cooling rates can extend it up to the default 180-minute maximum. Learning is on by default but rates require their own evidence. Partial preconditioning reports the predicted target shortfall. Coast checks use each room's bounds and passive drift; disabling temperature learning preserves qualified measured-load estimates. Shared load learning uses evidence from all rooms without counting the same measurement twice.
-- **Climate learning and decisions:** Economic-model readiness is separate from legacy preconditioning. Decision summary and exported diagnostics expose lifecycle identity, transition reason, measured-power eligibility, observation qualification, per-mode validation progress and rejection counts, override attribution, and unresolved restoration settings. A dedicated climate audit retains 100 deduplicated records for 30 days across restarts, independently of other devices. During initial learning, legacy rejection reasons remain visible instead of being replaced by a generic learning message.
-- **Pending climate restore:** Plan health reports degraded while a failed climate restore remains in durable ownership, with `pending_hvac_restore` identifying unresolved zone targets, main target, and automations. An off zone without a target, or a saved target outside its current bounds, waits without repeated invalid temperature commands. Other restorable zones and automations are released; the original target remains saved and is retried when compatible state returns. An already-observed saved target confirms recovery even if the current bounds would reject a new command. The planner does not clamp that target or turn a zone on just to restore it. Input health and confidence remain separately visible.
-- **Interrupted climate acquisition:** A failed scheduler guard cannot prevent shutdown to the captured off baseline after an exception or cancellation. A confirmed shutdown stays recorded through acquisition rollback, so hidden zone targets do not cause another power cycle. Recovery confirms already-restored main and zone targets without restarting the unit. Genuine manual changes take precedence and retire the superseded command's feedback expectations.
-- **A device command fails or is not confirmed:** turn off Automatic control, run `ha_energy_planner.restore_safe_state`, and verify the mapped services and feedback entities.
-- **Control should stop immediately:** turn off the relevant device-control switch or Automatic control. Use `ha_energy_planner.pause_control` for a bounded pause.
-- **Multiple entries call the wrong planner:** pass the intended `config_entry_id` to the action.
-- **Preconditioning did not run:** open **Decision summary → climate → preconditioning** for the current status, blocker, next start, candidate measurements, and retained missed window. See [climate decision explanations](docs/climate-decisions.md#why-preconditioning-did-not-run).
-- **More evidence is needed:** download diagnostics from the integration page or run `ha_energy_planner.export_support_bundle`. Secrets, raw AI content, and unnecessary location history are excluded.
-
-Device service dispatch is limited to 30 seconds per call, including restoration.
-A timeout can occur after a device accepted the command; the planner retains
-ownership evidence until state is reconciled. Weather requests have a ten-second
-deadline and use a still-fresh cache when available. Recorder training runs in
-the background, publishes only for the current configuration, and backs off
-failed EV history imports for 15 minutes. Plans remain subject to the existing
-input-health and control safety gates while training is pending.
-
-Climate readback timeouts retain the original two-minute command feedback window.
-Delayed matching thermostat feedback does not create a manual hold; user changes,
-conflicting controls, superseding commands and expired expectations retain their
-normal override handling. EV start confirmation and retries respect the charging
-lease deadline, with a safe stop required if a dispatched start expires.
-
-After a main thermostat temperature is first confirmed, its exact automatic zone
-bounds clamp can settle for 150 seconds after confirmation, capped at three minutes
-from command issuance. Direct thermostat feedback and unconfirmed commands retain
-their original two-minute window. Repeated confirmations and no-op refreshes do
-not renew the zone window; explicit user actions and conflicting changes still
-trigger manual override. Missing zone telemetry can recover to the exact clamp
-using the captured target and current thermostat readback. Combined or split mode
-and target feedback requires a confirmed activation command in the same transaction,
-including when the target arrives first or feedback carries that activation's
-parent context. Later off or conflicting mode commands retire older activation
-evidence, including across restore transactions; dispatch failures cannot revive
-it. A temperature command alone cannot turn an off zone on. Unknown targets without
-a captured or owned baseline remain subject to normal override handling.
-
-EV sensors with `sampled_at_utc` use that source timestamp for freshness and
-power-limit confirmation. Invalid or stale source timestamps cannot be replaced
-by a newer Home Assistant report time. Fresh measured EV power above the
-configured rate raises the retained grid reservation; lower or missing readings
-alone do not release that capacity. Rejected starts retain concurrently observed
-load without reserving an unissued increase. Capacity events still request a
-safety refresh if their initial persistence attempt fails; command durability
-checks remain in force.
-Command confirmations are applied before notification and ledger waits, preserving
-newer measured load received during those waits.
-Power listeners retain each event's reading even when nested Home Assistant
-dispatch has already published another value; older samples cannot undo a newer
-confirmed power reduction.
-
-Storage errors block new device acquisitions until recovery evidence is successfully written. Check disk space and Home Assistant storage permissions if a save fails. Startup recovery waits 30 seconds between unexpected failures. Use the restore action for existing ownership and verify device feedback before resuming control.
-
-## Removal
-
-1. Turn off **Automatic control** and each device-control switch.
-2. Run `ha_energy_planner.restore_safe_state` and confirm EV, Enphase, thermostat, zone, and automation states.
-3. Go to **Settings -> Devices & services -> Energy Planner** and delete the entry.
-4. If installed through HACS, remove Energy Planner from HACS. For a manual install, delete `custom_components/ha_energy_planner`.
-5. Restart Home Assistant if you removed the custom integration files.
-
-Deleting an entry removes its retained model and audit storage only when its saved ownership and EV reservation are resolved. Uncertain recovery evidence is retained and logged; resolve device state before deleting the entry. The shared legacy import archive is retained.
-
-Removing Energy Planner stops future plans and commands. It does not remove source integrations, their entities, vendor accounts, or vendor data.
-
-## Useful Links
-
-- [Setup examples, upgrades and stable contracts](docs/stable-release.md)
-- [Release acceptance checklist](docs/release-checklist.md)
-- [Releases](https://github.com/barneyonline/ha-energy-planner/releases)
-- [Issue tracker](https://github.com/barneyonline/ha-energy-planner/issues)
-- [Release notes](CHANGELOG.md)
-- [Requirements and implementation evidence](docs/requirements-audit.md) — `scripts/docker-validate.sh` runs the full suite and compatibility checks; the HA 2026.10.0 baseline and stable compatibility jobs retain all failure exit codes.
-- [Architecture review and implementation evidence](docs/architecture-review-2026-09-05.md)
-- [Quality-scale evidence](quality_scale.yaml)
-- [Home Assistant Integration Quality Scale](https://developers.home-assistant.io/docs/core/integration-quality-scale/)
-
-### Multiple cars sharing one charger
-
-Configure the shared charger's Plugged In sensor, charging feedback and charger control switch in **Configure → Planner settings**. Then use **Configure → Add vehicle** for each car. Each profile requires its own charging-port sensor, home-presence entity, SOC sensor and target-SOC sensor, plus a ready-by time. Vehicle charging power is optional; leave it blank to inherit the shared charger power. BMW CarData `CONNECTED` / `DISCONNECTED` and location `home` are supported. A home binary sensor may report `on` / `off`. Target SOC is read only: there is no configured target or target fallback.
-
-The **EV vehicle** selector offers **Auto**, each vehicle name, and **Manual — no tracked charging**. Auto requires the home charger to be plugged in and exactly one vehicle to be connected at home; another vehicle with missing evidence must be ruled out before identification. **Active EV vehicle** shows the result, with the detection reason in its attributes. Manual vehicle selection overrides identity detection but still requires a plugged-in charger and valid SOC/target readings.
-
-When identification is uncertain, target/SOC is unavailable, or Manual is selected, Energy Planner withholds all EV commands and leaves charging untouched. Selecting Manual invalidates pending starts, stops and retries and releases planner ownership without sending a charger command. Charger-native schedules and limits still apply. Manual can be selected before a guest plugs in and resets to Auto on unplug; its selection survives reloads while still plugged in.
-
-Unplugging ends the session. After another car is plugged in, the planner identifies it and builds a new plan with its SOC, target and ready-by time. Delayed telemetry showing both cars connected causes a wait, never a guess. A car that still reports connected from the previous session cannot be selected automatically again until its port reports disconnected; manual vehicle selection can resolve a missed port update. This handles physical swaps automatically; it does not schedule future cable swaps or promise readiness for cars that are not connected.
-
-Manual charging overrides reset before a replacement vehicle’s plan is built. Ready-by times and charging characteristics belong to each vehicle; electricity-price policies remain shared. Charging calibration is learned separately from completed charging intervals observed while that car is identified at home. Interrupted, ambiguous and Manual intervals are discarded, including stop/resume or unavailable feedback between planner refreshes; the configured initial SOC-per-kWh estimate is used until sufficient per-car evidence exists. Energy Planner’s **Shared charger power (kW)** describes the charger capacity and reserves load for Manual or unidentified charging. Each Vehicle’s optional **Vehicle charging power override (kW)** is for cars that charge more slowly; planning uses the lower of the override and shared charger power. Existing configured vehicle power remains an override; clear it to follow future shared charger power changes. SOC, target SOC, ready-by and the initial SOC-per-kWh estimate are configured only on the Vehicle once profiles are enabled. The initial SOC-per-kWh estimate is under **Advanced calibration**, with a default for new vehicles. Shared electricity-price and charging policies remain in Energy Planner’s **Charger and charging policy** section.
-
-Existing single-vehicle configurations continue unchanged until profiles are added. Configure **every** tracked car before enabling Auto control. Once profiles are enabled, old single-car SOC/target mappings are ignored, including after the last profile is removed. Removing profiles never silently reactivates the old mapping. Use **Configure → Edit vehicle** to edit a profile and **Configure → Remove vehicle** to remove it; `set_ev_ready_by` updates the currently identified or manually selected tracked vehicle. Ready-by changes replan without reloading the integration or restoring other devices. A new installation can save charger connection and charging feedback before adding its first vehicle.
-
-Manual and unidentified charging still reserve the configured charging power in household load and cost projections, conservatively throughout the horizon until feedback confirms charging has stopped or the cable is unplugged. No EV commands are issued in these modes. Confirmed unplug events release the previous session’s grid reservation, including rapid swaps between refreshes, during pending storage writes, or immediately after a charger-state outage. Port-disconnect evidence is saved even while no vehicle is selected, so a reload cannot reinstate a cleared stale-connection block.
-
-### Action allowances and resuming climate planning
-
-Action limits apply over a rolling 24-hour window. Applied and dispatched failed device attempts count; locally rejected EV commands do not count; no-change outcomes and climate restoration do not. Stopping an automation that is enabled or still running counts, while repeating suppression on an idle, already-disabled automation does not. A compact persisted attempt ledger retains allowance usage even when the presentation audit rotates. Diagnostics expose each asset's limit, used and remaining actions, next expiry, and when allowance becomes available after exhaustion. Zero means unlimited. Existing installations migrate the retained audit evidence on reload.
-
-Changing action limits, the manual climate hold duration, notification policy, or supported EV scheduling policies requests a fresh plan while preserving armed state and owned climate settings. Device mappings and other safety-sensitive changes still use the normal recovery lifecycle. Changing the default hold duration does not shorten an existing hold.
-
-Call `ha_energy_planner.resume_climate_planning` with an optional `config_entry_id` to clear both the manual helper and internal manual climate holds. The action replans and returns current climate status when response data is requested. It retains action limits, control switches, production readiness, and input-health checks. If an action cap blocks climate startup, the climate status explains usage, the next allowance time, and the **Safety and troubleshooting** setting to review. Resuming makes planning eligible again; it does not force a climate command when another gate blocks execution.
-
-Running calendar entries use the charging sensor's confirmed state-change time or the persisted confirmed climate phase start. Their identity and start stay stable across replans while the forecast end can change. Future windows remain planned times. Unknown/unavailable feedback and unconfirmed climate ownership do not claim an actual start; EV energy estimates describe the remaining planned window. A real EV stop/restart or a new climate phase gets a new start.
-
-The **Plan** calendar retains only events with confirmed activity in per-entry storage, so you can browse earlier dates after replanning, reloading, or restarting Home Assistant. EV charging windows require the charging sensor to report charging; climate windows require committed phase ownership and matching live mode. Confirmed profile changes, EV stops, and climate releases are stored as brief execution entries after a successful adapter outcome. A successful start or schedule service call alone does not establish charging or a climate phase. A committed climate phase is retained when acquisition or a later command finishes after its execution window expires; its end remains an estimate. Recovered feedback for the same phase updates one history entry, and older execution snapshots preserve a newer phase estimate. Confirmation is captured after each device transaction and on device state changes, including short activity between replans, charging feedback delivered after a window expires, and successful actions whose plan was replaced while they ran. Stop feedback preserves valid previous-state evidence for a phase committed during a persistence write. Device feedback uses the latest saved plan, including while its disk write is completing, and preserves its planned windows. The current calendar event and date-range history use the same confirmed execution entries. Skipped, failed, unconfirmed, and cancelled plans are not retained as history. Future windows still follow the latest plan. Recorded windows confirm that activity occurred; their ends are explicitly labelled as estimates when no confirmed stop time was recorded. History has no automatic time or count expiry and remains visible when a device control selector is turned off. History starts with this version and cannot reconstruct events already discarded by older versions. Removing the integration entry removes its history once device recovery evidence is safely resolved. Retained history increases storage size over time.
-
-Uncertain EV delivery contributes no assumed charging progress toward readiness, but a continuing physical command is still costed at its possible power draw, including battery/carbon and emergency-price exposure. A fresh positive power reading takes precedence over an unchanged cumulative energy counter when classifying delivery.
-
-Resume climate planning bypasses refresh debounce and waits for fresh planning and queued plan execution before reporting its result. If refresh fails, it reports an error instead of returning the previous plan status; manual holds remain cleared. An old action-cap rejection is shown as previous evidence once allowance has become available. Confirmed off-state climate coasting retains its phase start in the calendar; legacy ownership without a confirmed timestamp keeps planned timing. EV safety-stop retry protection continues to use its full failure evidence separately from ordinary action allowance counts.
-
-### EV charging during consumption outages
-
-A quality-approved load model can bridge a known household-consumption outage for the
-configured grace period (360 minutes / six hours by default, configurable up to 1440 minutes / 24 hours; zero disables fallback). On upgrade, earlier positive settings below six hours are raised to six hours once. Subsequent explicit choices are preserved. Numeric readings with stale source timestamps use the same bounded fallback; publishing the same old sample does not refresh its age.
-During that period, the planner adds **1 kW** to the model's conservative upper household
-load estimate. An existing EV session may continue despite economic scheduling changes,
-but its charging power cannot increase above the observed current-limit setting (or the
-configured fixed rate). Insufficient conservative capacity causes a reduction where the
-normal confirmed-current path permits it, or a safety pause. Other EV reservations,
-vehicle identity, target SOC, charger capability, user price ceilings and safety checks
-remain enforced. Forecast headroom is an estimate, not electrical overload protection.
-
-Scheduled automatic sessions may start during fallback only when the normal vehicle, tariff and readiness checks pass and conservative capacity is sufficient. They retain the observed current-limit ceiling; uncertain recovery must stabilize before a new start. The
-`ha_energy_planner.charge_now` action accepts `duration_minutes` from 1
-through 240. It bypasses economic timing and price ceilings, but retains capacity,
-connection, target SOC and charger checks. Each request waits for a fresh input assessment; a failed refresh prevents the start.
-Failed requests explain the blocking reason.
-The `ha_energy_planner.cancel_charge_now` action confirms a stop and holds charging off for one hour. The override
-expires using an execution timer; an earlier load-fallback deadline still wins. Reload
-recovery retains the existing conservative ownership and reservation handling.
-
-After the grace expires, automatic charging pauses: the forecast does not authorize
-indefinite operation without live consumption. Full recovery requires two advancing source samples at least 60 seconds apart.
-The first sample can be retained for a 30-minute pairing window; only the newest must
-meet **Consumption recovery sample age**, configurable from 1–30 minutes under
-**Planner settings → Energy, battery, grid, and data** (default 15 for cloud sources;
-use 10 for faster sources).
-
-One fresh sample observed without another failure for 90 seconds establishes limited
-recovery. It retains the model's upper-load margin and original outage deadline. Existing
-eligible outage continuations retain their allowance while the return stabilizes; a new
-Charge now request during stabilization waits for the 90-second check. Repeated reports
-of the same sample never establish full recovery. Missing/invalid/future samples, flapping
-and expired budgets cannot renew the allowance or bypass the remaining device and capacity checks.
-If the outage start is unknown or the model is ineligible, one sample cannot grant
-forecast-only capacity authority. Full sample recovery is still available in that case.
-
-A committed healthy plan after full sensor recovery wakes startup validation immediately.
-Failed or superseded refreshes retain this handoff until a healthy plan commits.
-One complete fresh safety validation replaces the extra three timed checks, followed by
-normal restoration, preflight and activation verification. Disabled controls stay disabled;
-climate and battery actions retain their own capability and confidence gates.
-
-The **EV charging status** sensor shows degraded operation, recovery, and any Charge now
-expiry. Load-forecast attributes expose `uncertainty_margin_kw`, `recovery_pending` and
-`cost_estimates_degraded`. Actual safety/unsolicited-start stops produce a deduplicated
-notification directing you to these diagnostics and the explicit Charge now control.
-A confirmed charging restart clears the alert so a later interruption can notify again.
-Disabling EV control or selecting review/disabled planning also clears obsolete interruption and
-feasibility alerts. Confirmed unplugging retires session alerts, and a completed charge target
-clears an obsolete interruption warning. Feasibility warnings follow the latest plan, including changes between an
-action-limit blocker and a physical shortfall, without waiting for another device command.
-
-Safe-state restore warnings clear after the affected device's restoration is confirmed, including
-ordinary EV stops and climate releases. A full successful restore clears earlier device-specific
-warnings as well. Pending Export Limit readback, skipped vehicle-session guards, and unresolved
-power-limit baselines keep their warnings. Combined warnings retain the unresolved device areas
-across reloads and clear only when all of those areas recover. Failed notification updates or
-dismissals retry on planner refresh, including after a reload; these retries send no device
-commands. Removing an entry clears its
-notifications after recovery obligations are resolved; another planner's alerts remain separate.
-Explicit Explain and safety-check reports remain available until dismissed or replaced. New
-reports supersede older queued startup reports.
-
-### Legacy vehicle-target migration repair
-
-If an older configuration cannot migrate because its vehicle target-SOC entity is missing, open **Settings > System > Repairs** and select the target entity. Existing settings and recovery data are preserved. Repairs retries migration immediately through Home Assistant's public API. Reconfigure also accepts the corrected target and directs you to Repairs. Enable disabled entries before repairing them.
-
-### Recovery diagnostics
-
-The **Recovery** sensor explains whether recovery is waiting for a valid consumption
-reading, a newer sample, a second advancing sample, a healthy plan, or startup safety
-validation. Attributes include the source entity and displayed reading, source sample
-timestamp and age, configured maximum sample age, first sample timestamp and age,
-required sample advance and pairing window, outage start, plan issues, and startup
-check progress and retry interval. The 30-second retry interval is reported only during
-active validation/recovery; startup grace uses its displayed deadline. Once the source
-samples have been accepted, remaining plan blockers are reported without treating
-the accepted pair as a new consumption outage. Ages are evaluated on coordinator updates. A visible
-numeric consumption reading does not by itself prove recovery, and a completed startup
-recovery does not guarantee that all later inputs remain healthy.
-
-The **Charge now (1 hour)**, **Stop charge now**, and **Resume climate planning**
-buttons are removed, including existing entity-registry entries on upgrade. Their
-`charge_now`, `cancel_charge_now`, and `resume_climate_planning` integration actions
-remain available for automations and Developer Tools.
-
-## Enphase Export Limit control
-
-The **Plan** calendar merges adjacent export-tariff intervals with the same setting into one **(planned)** window. Its description lists each interval's price and local times. Confirmed device actions appear as brief **(confirmed)** entries at the time the planner observes gateway confirmation, which may be later than the request or gateway state change. Existing saved Export Limit action history receives the same label without changing its identity or timestamps. Planned windows describe the intended setting for a period; they do not imply another device command at each tariff boundary.
-
-Confirmed baseline restorations also appear once in history, labelled **Restored Enabled — 0 W (confirmed)**, **Restored Enabled — 3000 W (confirmed)** (using the actual saved watts), or **Restored Disabled (confirmed)**. Their identity survives pending-request recovery and reload; repeated feedback preserves the first observed confirmation time. Pending, rejected and failed requests do not create confirmed entries, and releasing ownership when the baseline is already in effect creates no device-action entry. Earlier restorations omitted by older versions cannot be reconstructed from calendar history.
-
-Map the Enphase integration's **Export Limit Select entity** in Planner settings. Enable Export Limit controls in the upstream Enphase integration and obtain its required installer access first. Energy Planner resolves the matching read-only Export Limit sensor by registry identity on the same gateway and config entry for confirmed watts, slew rate and pending-request feedback. Sensor registration and renaming update readback observation automatically. Missing or stale readback blocks commands. Previously mapped Export Limit sensors remain supported. Each gateway Export Limit control can belong to only one planner; mapping its sensor and Select in separate planners is rejected. Commands use registered `enphase_ev.set_export_limit` / `enphase_ev.disable_export_limit` actions with the mapped entity as the explicit target; requesting exact watts avoids the Select's saved default limit. No upstream version is hard-coded.
-
-**Enphase Export Limit control** defaults off and operates independently of **Enphase Profile control**. Existing profile entities, saved options and IDs are preserved. For export-only operation, turn on **Enphase Export Limit control** and leave **Enphase Profile control** off. The Profile mapping is optional; an existing mapped profile remains unchanged while its control is off. Export-only installations need the export-price forecast, Export Limit control entity and its matching feedback sensor; import prices, solar, household consumption and battery mappings are optional for this control. Other control areas retain their input and safety gates. Enable the Export Limit selector in review mode, obtain three qualifying dry-run cycles, then enable **Automatic control** through the usual production arming process.
-
-Each timestamped 30-minute tariff block selects **Enabled — 0 W** when the export price is strictly negative, and **Disabled** at zero or a positive price. Negative zero is treated as zero. The planner previews the current and next block, schedules a fresh plan at each tariff boundary, and reconciles immediately when activated or resumed mid-block. Forecast revisions replace future intent. Prices must identify actual half-hour intervals, either explicit ends or unambiguous contiguous half-hour timestamps/cadence metadata. A scalar current price cannot authorize a write. The minimum tariff-confidence threshold applies to the supported `confidence`, `confidence_percent`, `forecast_confidence` and `forecast_confidence_percent` fields, including fraction and percentage values. Stale, invalid, low-confidence or missing forecasts hold the last confirmed setting. Feedback must include a successful gateway readback no older than ten minutes.
-
-Automation may replace an existing nonzero limit. Before its first write, Energy Planner durably records the original Disabled/limit-watts configuration and slew rate. Normal tariff changes preserve the upstream slew rate. Accepted requests appear **Pending** until matching fresh gateway readback confirms them. Pending requests suppress duplicate and opposite writes; when they resolve, the latest tariff intent is reconciled. After ten minutes without confirmation, this area pauses as **Unconfirmed** and continues observing without retransmitting. Resolve the cause and explicitly resume using `ha_energy_planner.resume_control` with `asset: enphase_export_limit`. Profile pauses, minimum holds and action limits do not govern Export Limit. Rejected requests identify disabled upstream controls or unavailable/expired installer access separately. Its separate rolling daily action allowance defaults to `0` (unlimited), and its command cooldown uses the shared configured duration with a separate key.
-
-Turning off Export Limit control restores only its owned baseline; turning off Profile control restores only a profile the planner owns. When Profile control is off and no profile ownership is pending, startup recovery, configuration changes, unload and `restore_safe_state` leave the mapped profile unchanged and do not require it to be available. A previously owned profile still needs a confirmed baseline restore before ownership can be cleared. Leaving Automatic control, entering dry-run or calling `restore_safe_state` also restores owned Export Limit state. Restoration uses exact saved watts and slew rate and remains outstanding until matching readback. Unavailable or pending targets are retried after feedback recovery; uncertain commands are never resent. Re-enabling control cannot replace an unresolved restoration baseline. A replaced target is rejected. While Export Limit control is enabled, an unexpected configuration change supersedes the old restoration baseline and is automatically reconciled with the current tariff. After fresh, settled readback, the next required write records that configuration as its new baseline. Turn off Export Limit control before managing the limit externally. Existing external-conflict pauses clear automatically on fresh, settled readback; uncertain commands and other failure pauses still require explicit resolution. Pause/resume selectors support `enphase_export_limit`, existing `enphase` for profiles, and `all` for both.
-
-Outstanding restoration remains visible after the Export Limit selector is turned off. An explicit integration unload is deferred while owned restoration is pending, so readback observation can continue. Shutdown drains export reconciliation before final restoration and prevents queued reconciliation from issuing new commands. Enphase retains its pending request when reporting Unconfirmed; the planner keeps the confirmed and requested values separate. External slew-rate changes during matching confirmation retire the superseded baseline and continue tariff reconciliation using the observed slew rate. External changes preserve existing Unconfirmed, unsupported-control and service-rejection pauses until explicit Resume control. A persistence failure before dispatch discards the unsent request, and conflicting declared tariff cadence cannot authorize a command.
-
-Plan, timeline, preflight and diagnostics expose tariff intervals, price, desired and confirmed setting, pending request, baseline, last readback, failure pause and restoration state. Current state and Next actions show execution blockers instead of presenting blocked intent as the next command. Plan health becomes Degraded when an enabled Export Limit area is blocked or planning is stale. Boundary timers update this status even if a refresh is waiting; freshness uses the production preflight limit of the greater of two planning intervals or 15 minutes. Diagnostics and Planning duration expose planning age, last completion and a recovery step. Planned zero export limits grid-export and cost previews while retaining solar production for local loads; it is an assumption until gateway confirmation. Missing energy inputs prevent a monetary estimate. Enphase performs curtailment, so a dispatched boundary command cannot guarantee instantaneous zero physical export.
+The Platinum quality-scale claim is a repository self-assessment. This custom integration is not reviewed, security audited, maintained or supported by the Home Assistant project.
