@@ -9,6 +9,7 @@ from .climate_inputs import instant
 from .models import ActionAsset, DecisionContext, OccupancyState, PlanAction, PlannerMode, to_jsonable
 from .planner_confidence import _confidence_rejection_reason, _hvac_rollback_capability_unavailable
 from .safety import strict_bool
+from .zone_temperature import control_temperature
 
 
 def planning_status(
@@ -34,7 +35,7 @@ def planning_status(
             "An opportunity was evaluated, but no preconditioning command was selected; "
             "review policy and existing ownership.",
         )
-    if not economic or economic.get("legacy_fallback"):
+    if not economic.get("summary") or economic.get("legacy_fallback"):
         if _confidence_rejection_reason(ActionAsset.DAIKIN, context, options) is not None:
             status, code = "blocked", "insufficient_confidence"
         elif any(
@@ -51,13 +52,14 @@ def planning_status(
         elif any(
             value is None
             for value in (
-                context.current_hvac_temperature_c,
+                control_temperature(context),
                 context.occupied_temperature_low_c,
                 context.occupied_temperature_high_c,
             )
         ):
             status, code = "blocked", "comfort_inputs_missing"
-        elif code in {"forecast_gap", "forecast_too_short", "release_hold", "minimum_cycle", "lead_time_disabled"}:
+        elif code in {"forecast_gap", "forecast_too_short", "release_hold", "minimum_cycle", "lead_time_disabled",
+                      "zone_temperature_unavailable", "zone_comfort_boundary"}:
             status = "blocked"
     if controls:
         status, code, reason = (

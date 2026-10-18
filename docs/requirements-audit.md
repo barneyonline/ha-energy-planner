@@ -1330,3 +1330,15 @@ or live deployment was performed; live cycle acceptance remains outstanding.
   grants no confirmation authority and no guard renewal. Both mode and turn-on
   recovery reject feedback queued across expiry after a valid guard wait. Regression:
   `tests/test_hvac_adapter.py::test_review_recovery_guard_setup_cannot_confirm_past_original_deadline`.
+
+## Zone feedback and adaptive thermal preparation
+
+- Zone temperature selectors preserve advanced mappings; `zone_temperature.py` applies mapped comfort and target checks in both policies.
+- `thermal_learning.py` bounds per-source heating/cooling/passive observations, distinguishes readiness from enabled learning, and shares adaptive timing across fallback and economic search.
+- Defaults are 90 minutes initially and 180 minutes maximum; existing options and measured-energy qualification remain intact. Tests: `tests/test_zone_temperature.py`, existing planner, climate-engine, configuration and coordinator regressions.
+
+- Review regressions reject opposite room comfort boundaries before fallback or economic takeover, including retained economic schedules; failed explicit comfort helpers and invalid mappings cannot inherit raw-head/global feedback. Both search grids respect the hard maximum, extended leads qualify prices over the expanded window, and zero-duration qualified preparation is skipped. Dated thermal and measured-load evidence expires individually before readiness is evaluated (`test_review_*` in `tests/test_zone_temperature.py`; economic boundary/grid cases in `tests/test_climate_engine.py`).
+
+- Further review regressions use sensor-report clocks rather than planner refresh time, reject pre-regime readings and excessive report gaps, preserve qualified measured watts with temperature learning disabled, and expose separate electrical readiness. Fallback coast and maintenance projections respect each room's own drift and comfort band; economic search covers candidate-specific deadlines rather than assuming the end of the horizon (`test_second_review_*` in `tests/test_zone_temperature.py` and `tests/test_climate_engine.py`).
+
+- Shared-unit electrical learning combines every mapped room's qualifying measured-power evidence, deduplicates report instants and enforces five-minute spacing with the existing 96-sample/14-day bounds. Off or unavailable rooms cannot hide another room's qualified electrical evidence, and multiple rooms cannot inflate the shared sample count (`tests/test_zone_temperature.py::test_third_review_shared_power_is_independent_of_room_order`, `test_third_review_shared_power_samples_are_not_duplicated_by_rooms`, `test_third_review_staggered_load_windows_keep_spacing_and_bound`).

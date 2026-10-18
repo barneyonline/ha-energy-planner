@@ -1853,3 +1853,80 @@ def test_learning_era_counter_does_not_withhold_first_validated_opportunity():
     assert actions and not ctx.climate_decision["observing"]
     assert ctx.climate_engine["opportunities"] == 1
     assert ctx.climate_engine["observation_cadence_version"] == 1
+
+
+@pytest.mark.parametrize(("interval", "maximum", "expected"), [(5,180,36),(25,180,7),(30,175,5),(60,30,0)])
+def test_economic_candidates_use_shared_learned_lead_limit(monkeypatch,interval,maximum,expected):
+    ctx = context()
+    ctx.climate_inputs['thermal_model'] = {
+        'model_version':3, 'learning_enabled':True, 'sources':{'head':{'buckets':{'heat':{
+            'count':12, 'minutes':60, 'last_at':NOW.isoformat(), 'rate_c_per_hour':1,
+        }}}},
+    }
+    leads = []
+
+    def capture_slots(count, lead, targets, limit):
+        leads.append(lead)
+        return None  # Stop after recording the bounded search interface.
+
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules', capture_slots)
+    options = {**DEFAULT_OPTIONS, 'planning_interval_minutes':interval,
+               'hvac_precondition_lead_minutes':min(90,maximum), 'hvac_precondition_max_lead_minutes':maximum}
+    _, decision = optimise(ctx, options, simulation_model())
+    assert leads == [expected]
+    assert decision['thermal_timing']['heat']['effective_lead_minutes'] == maximum
+
+
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+def test_review_economic_room_opposite_boundary_blocks_new_and_retained_candidates(monkeypatch, mode):
+    ctx = context()
+    ctx.climate_inputs['zones'] = {'climate.room':{
+        'temperature_entity':'sensor.room', 'temperature':25 if mode == 'heat' else 19,
+    }}
+    model = simulation_model()
+    model['rooms'] = {'climate.room':{}}
+    model['validation'] = {mode:{'blockers':[]}}
+
+    def unexpected_simulation(*args, **kwargs):
+        pytest.fail('Unsafe room must be rejected before simulation or acquiring control')
+
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.simulate',unexpected_simulation)
+    candidate,decision = optimise(ctx,DEFAULT_OPTIONS,model)
+    assert candidate is None and decision['rejected']['zone_comfort_boundary'] == 1
+    scheduled = {'start':NOW.isoformat(),'stop':(NOW+timedelta(minutes=5)).isoformat(),
+                 'release':(NOW+timedelta(minutes=15)).isoformat(),'identity':'id','mode':mode}
+    assert revalidate_schedule(ctx,DEFAULT_OPTIONS,model,scheduled) is None
+
+
+def test_second_review_economic_lead_does_not_use_a_distant_deadline(monkeypatch):
+    ctx = context(145)
+    ctx.current_hvac_temperature_c = 19
+    ctx.climate_inputs['thermal_model'] = {'model_version':3,'learning_enabled':True,'sources':{'head':{'buckets':{
+        name:{'count':12,'minutes':60,'last_at':NOW.isoformat(),'rate_c_per_hour':value}
+        for name,value in [('heat',2),('passive',1)]
+    }}}}
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.simulate',
+                        lambda *a,**k:ClimateTrajectory((21,)*145,(1,)*145))
+    leads = []
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules',
+                        lambda count,lead,targets,limit:leads.append(lead))
+    optimise(ctx,DEFAULT_OPTIONS,simulation_model())
+    assert leads[0]*5 >= 120  # An opportunity three hours away needs 120 minutes, even with a 12-hour horizon.
+
+
+def test_second_review_economic_candidates_enforce_their_own_lead_and_report_actual_run(monkeypatch):
+    ctx = context(145)
+    ctx.current_hvac_temperature_c = 19
+    ctx.climate_inputs['thermal_model'] = {'model_version':3,'learning_enabled':True,'sources':{'head':{'buckets':{
+        name:{'count':12,'minutes':60,'last_at':NOW.isoformat(),'rate_c_per_hour':value}
+        for name,value in [('heat',2),('passive',1)]
+    }}}}
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.simulate',
+                        lambda *a,**k:ClimateTrajectory((21,)*145,((1 if k.get('start',-1)<0 else 0),)*145))
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules',
+                        lambda *a:[(7,36,100,24),(12,36,100,24)])
+    candidate,decision = optimise(ctx,DEFAULT_OPTIONS,simulation_model())
+    assert candidate is not None and candidate.start == 12
+    assert decision['rejected']['adaptive_lead_limit'] == 1
+    assert decision['thermal_timing']['heat']['available_run_minutes'] == 120
+    assert not decision['thermal_timing']['heat']['partial_preconditioning']

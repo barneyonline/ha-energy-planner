@@ -8,10 +8,20 @@
 
 ### ✨ New features
 
-- None
+- Add per-zone temperature sensor selectors and shared room comfort/completion feedback.
+- Enable source-specific heating/cooling learning with diagnostics and bounded partial preconditioning.
+- Default preconditioning lead is 90 minutes; qualified rates can extend it up to 180 minutes without replacing saved settings.
 
 ### 🐛 Bug fixes
 
+- Protect every mapped room before climate takeover and reject unavailable room
+  comfort helpers or invalid mappings. Keep adaptive tariff searches inside their
+  maximum lead, skip already-complete preparation and expire individual thermal
+  and measured-load observations before determining readiness. Use actual sensor
+  report intervals, per-room coast limits and each economic candidate's deadline.
+  Preserve qualified measured-load estimates when temperature learning is disabled,
+  and combine shared-unit measurements across rooms without duplicate credit or
+  depending on the first room's availability.
 - Keep the external climate scheduler guard active through each Daikin command's
   bounded confirmation and classifier settling interval, preventing delayed
   target feedback from becoming a false manual override. Renew before sequential

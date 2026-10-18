@@ -175,7 +175,9 @@ from .startup_recovery import (
     _startup_auto_recovery_validation_ready as _startup_auto_recovery_validation_ready,
 )
 from .storage import PlannerStore
-from .thermal_model import thermal_model_summary, update_thermal_model
+from .thermal_learning import sample as thermal_sample
+from .thermal_learning import update as update_zone_thermal_model
+from .thermal_model import thermal_model_summary
 from .training import HistoryTraining, TrainingRequest, TrainingResult, training_request
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import (
@@ -1386,13 +1388,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
         if context.hvac_control and climate_issues:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
-        thermal_model, thermal_model_changed = update_thermal_model(
-            dict(self.store.data.get("thermal_model", {})),
-            dict(self.store.data.get("thermal_model", {})).get("last_sample"),
-            manager.thermal_sample(context),
-        )
-        if thermal_model_changed:
+        stored_thermal = dict(self.store.data.get("thermal_model", {}))
+        thermal_model = update_zone_thermal_model(stored_thermal, thermal_sample(
+            context, options, self.hass.states, entry_data.get(CONF_DAIKIN_CLIMATE, ""),
+        ))
+        if thermal_model != stored_thermal:
             await self.store.async_save_thermal_model(thermal_model)
+        context.climate_inputs["thermal_model"] = thermal_model
         climate_state = observe(dict(self.store.data.get("climate_engine", {})), context,
                                 int(options.get("hvac_min_cycle_minutes", 20)))
         context.climate_engine = update_readiness(climate_state, climate_state.get("model", {}), context, options)
