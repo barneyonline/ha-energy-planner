@@ -1376,3 +1376,33 @@ def test_restore_notification_failures_survive_reload_without_raw_reason_text(mo
     reloaded = PlannerStore(object())
     asyncio.run(reloaded.async_load())
     assert reloaded.data["restore_notification_failures"] == failures
+
+
+def test_export_restoration_history_survives_storage_reload_and_duplicate_outcome(monkeypatch):
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded = None
+    FakeStore.loaded_by_key = None
+    now = datetime.now(UTC)
+
+    async def run():
+        store = PlannerStore(object(), "export-restoration")
+        outcome = ActionOutcome(
+            action_id="restore_export_limit-1790813400.0", plan_id="manual", attempted_at=now,
+            asset="enphase_export_limit", kind="restore_export_limit", result=OutcomeResult.RESTORED,
+            reason="export_limit_restored", pre_state={"watts": None, "slew_rate": 77},
+            post_state={"watts": 0, "slew_rate": 77}, desired_state={"watts": 0},
+        )
+        await store.async_add_outcome(outcome)
+        history = deepcopy(store.data["calendar_history"]["history"])
+        assert len(history) == 1
+        assert history[0]["summary"] == "Enphase Export Limit: Restored Enabled — 0 W (confirmed)"
+        FakeStore.loaded = deepcopy(FakeStore.saved)
+        restored = PlannerStore(object(), "export-restoration")
+        await restored.async_load()
+        outcome.attempted_at += timedelta(minutes=1)
+        await restored.async_add_outcome(outcome)
+        await restored.async_save_calendar_events([], now=outcome.attempted_at)
+        assert restored.data["calendar_history"]["history"] == history
+        assert FakeStore.saved["calendar_history"]["history"] == history
+
+    asyncio.run(run())

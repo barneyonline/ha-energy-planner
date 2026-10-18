@@ -306,3 +306,36 @@ def test_old_elapsed_execution_confirmation_preserves_newer_running_phase_extent
     older = record(start=-20, end=-1, actual=True)
     state = update_calendar_history({"pending": [newer]}, [older], NOW, replace_plan=False)
     assert state == {"history": [], "pending": [newer]}
+
+
+@pytest.mark.parametrize("extra", [
+    {"asset": "enphase"}, {"result": "applied"}, {"result": "pending"},
+    {"result": "failed"}, {"result": "rejected"}, {"result": "skipped"},
+    {"action_id": ""}, {"action_id": None},
+    {"pre_state": None}, {"pre_state": {}}, {"post_state": None}, {"post_state": {}},
+    *[{"post_state": {"watts": watts}} for watts in (-1, 100001, True, 0.0, "0")],
+    {"post_state": {"watts": None, "slew_rate": 77}},
+])
+def test_export_restoration_requires_confirmed_changed_setting_even_with_matching_plan(extra):
+    planned = record(uid="restore-request")
+    state = {"pending": [planned]}
+    outcome = {
+        "result": "restored", "asset": "enphase_export_limit", "kind": "restore_export_limit",
+        "plan_id": "manual", "action_id": planned["uid"], "attempted_at": NOW.isoformat(),
+        "pre_state": {"watts": None, "slew_rate": 77}, "post_state": {"watts": 0, "slew_rate": 77},
+        **extra,
+    }
+    result = confirm_calendar_action(state, outcome)
+    assert not result.get("history")
+    assert result["pending"] == [planned]
+
+
+def test_slew_only_restoration_uses_readback_setting_and_keeps_future_plan_separate():
+    planned = record(uid="restore-request", summary="Enphase Export Limit: Disabled (planned)")
+    state = confirm_calendar_action({"pending": [planned]}, {
+        "result": "restored", "asset": "enphase_export_limit", "kind": "restore_export_limit",
+        "plan_id": "manual", "action_id": planned["uid"], "attempted_at": NOW.isoformat(),
+        "pre_state": {"watts": 3000, "slew_rate": 100}, "post_state": {"watts": 3000, "slew_rate": 77},
+    })
+    assert state["history"][0]["summary"] == "Enphase Export Limit: Restored Enabled — 3000 W (confirmed)"
+    assert state["pending"] == [planned]
