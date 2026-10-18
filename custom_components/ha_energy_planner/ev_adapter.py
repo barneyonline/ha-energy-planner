@@ -897,10 +897,6 @@ def _unconfirmed_stop_reason(result: EVCommandResult) -> str:
     return "ev_stop_not_confirmed" if result.applied else result.reason
 
 
-# Kept as an import alias for custom code and one-release test compatibility.
-EVSmartChargingAdapter = EVChargerAdapter
-
-
 def _float_equal(left: Any, right: Any) -> bool:
     try:
         return abs(float(str(left).strip().removesuffix("%")) - float(str(right).strip().removesuffix("%"))) < 0.05

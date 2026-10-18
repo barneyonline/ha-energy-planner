@@ -40,7 +40,6 @@ from custom_components.ha_energy_planner.planner import (
     _ev_earliest_start,
     _next_ready_by,
 )
-from custom_components.ha_energy_planner.planner_battery import _arbitrage_spread
 from custom_components.ha_energy_planner.thermal_model import update_thermal_model
 
 
@@ -1214,10 +1213,7 @@ def test_planner_small_helpers_cover_invalid_ready_by_and_empty_prices() -> None
     context.slots = [DecisionSlot(now, None, None, None, None)]
 
     assert _next_ready_by(now, "bad") == datetime(2026, 6, 28, 7, 0, tzinfo=UTC)
-    assert _arbitrage_spread(context) == 0.0
     assert battery_module._forecast_solar_export_value(context, 5) is None
-    context.slots = [DecisionSlot(now, 0.25, 0.50, None, None)]
-    assert _arbitrage_spread(context) == 0.25
     context.input_health = InputHealth.DEGRADED
     assert DryRunPlanner(DEFAULT_OPTIONS)._confidence(context) == 0.65
     assert presentation_module._display_text("   ") == "Unknown"

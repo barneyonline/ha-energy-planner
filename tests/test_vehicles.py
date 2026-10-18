@@ -25,7 +25,7 @@ from custom_components.ha_energy_planner.const import (
 )
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator, _configured_entity_ids
 from custom_components.ha_energy_planner.entry_data import combined_entry_data
-from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 from custom_components.ha_energy_planner.sensor import ActiveVehicleSensor
@@ -258,7 +258,7 @@ def test_adapter_cannot_stop_or_write_helpers_after_identity_is_lost() -> None:
     async def run() -> None:
         hass, data = setup()
         coordinator = make_coordinator(hass, data)
-        adapter = EVSmartChargingAdapter(
+        adapter = EVChargerAdapter(
             hass,
             data,
             command_guard=coordinator._ev_command_guard(),
@@ -628,7 +628,7 @@ def test_charger_retry_and_rollback_stop_at_a_vehicle_boundary() -> None:
             hass.states.values["sensor.b_port"] = "CONNECTED"
 
         hass.services.async_call.side_effect = actuate
-        adapter = EVSmartChargingAdapter(
+        adapter = EVChargerAdapter(
             hass,
             data,
             command_guard=coordinator._ev_command_guard(),

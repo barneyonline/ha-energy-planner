@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import voluptuous as vol
+import probatio as vol
 from homeassistant.components.repairs import RepairsFlow, RepairsFlowResult
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
@@ -14,14 +14,13 @@ from .config_flow import _EV_TARGET_SOC_FILTER, ConfigFlow, _entity_selector
 from .const import CONF_EV_SMART_CHARGING_TARGET_SOC, DOMAIN
 from .migration_recovery import (
     async_clear_migration_issue,
-    async_create_migration_issue,
     async_save_vehicle_target,
     migration_issue_id,
 )
 
 
 class VehicleTargetRepairFlow(RepairsFlow):
-    """Select the missing target, then recover or explain the required restart."""
+    """Select the missing target, then retry migration through Home Assistant."""
 
     def __init__(self, entry_id: str) -> None:
         """Remember only the entry identity; fetch fresh state on every step."""
@@ -51,12 +50,8 @@ class VehicleTargetRepairFlow(RepairsFlow):
             else:
                 errors = async_save_vehicle_target(self.hass, entry, user_input)
             if not errors:
-                retry = getattr(self.hass.config_entries, "async_retry_migration", None)
-                if not callable(retry):
-                    async_create_migration_issue(self.hass, entry, restart_required=True)
-                    return self.async_abort(reason="restart_required")
                 try:
-                    await retry(entry.entry_id)
+                    await self.hass.config_entries.async_retry_migration(entry.entry_id)
                 except HomeAssistantError:
                     errors["base"] = "retry_failed"
                 else:

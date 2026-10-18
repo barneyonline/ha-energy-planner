@@ -95,10 +95,10 @@ def test_safe_stop_with_failed_power_limit_restoration_retains_warning(manual: b
         return execute_failed
 
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.ev_adapter.EVSmartChargingAdapter.async_restore", fail_restore,
+        "custom_components.ha_energy_planner.ev_adapter.EVChargerAdapter.async_restore", fail_restore,
     )
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.ev_adapter.EVSmartChargingAdapter.async_execute", fail_execute,
+        "custom_components.ha_energy_planner.ev_adapter.EVChargerAdapter.async_execute", fail_execute,
     )
 
     async def run() -> None:

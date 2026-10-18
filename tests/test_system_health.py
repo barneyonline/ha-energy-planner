@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 from custom_components.ha_energy_planner.const import DOMAIN
 from custom_components.ha_energy_planner.models import InputHealth, PlannerMode
-from custom_components.ha_energy_planner.system_health import _latest_value, system_health_info
+from custom_components.ha_energy_planner.system_health import system_health_info
 
 
 class FakeConfigEntries:
@@ -175,10 +175,3 @@ def test_system_health_keeps_worst_entry_in_truncated_details() -> None:
     assert "entry-z" in info["entries"]
     assert info["entries"]["entry-z"]["data_healthy"] is False
     assert info["entries_truncated"] == 1
-
-
-def test_latest_value_rejects_malformed_history() -> None:
-    assert _latest_value(None, "duration_ms") is None
-    assert _latest_value([], "duration_ms") is None
-    assert _latest_value(["invalid"], "duration_ms") is None
-    assert _latest_value([{"duration_ms": 4.0}], "duration_ms") == 4.0

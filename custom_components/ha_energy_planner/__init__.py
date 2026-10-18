@@ -51,7 +51,6 @@ from .entry_data import combined_entry_data, remove_retired_config_keys
 from .migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
-    supports_migration_retry,
 )
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import VEHICLE, VEHICLES
@@ -93,9 +92,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: EnergyPlannerConfigEnt
             from homeassistant.exceptions import ConfigEntryError
 
             async_create_migration_issue(hass, entry)
-            if supports_migration_retry(hass):
-                raise ConfigEntryError(translation_domain=DOMAIN, translation_key="legacy_vehicle_target")
-            return False
+            raise ConfigEntryError(translation_domain=DOMAIN, translation_key="legacy_vehicle_target")
         options.pop(CONF_EV_FALLBACK_TARGET_SOC_PERCENT, None)
     if version < 5:
         options.pop(CONF_EV_MAX_SOC_PERCENT, None)
@@ -130,7 +127,7 @@ def _legacy_ev_configuration_requires_target(entry: EnergyPlannerConfigEntry) ->
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up integration-level services."""
-    import voluptuous as vol
+    import probatio as vol
     from homeassistant.core import SupportsResponse
     from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
     from homeassistant.helpers import config_validation as cv
@@ -802,7 +799,7 @@ def _async_migrate_duplicate_entity_ids(ent_reg: Any) -> None:
 
 def _validate_ready_by_time(value: Any) -> str:
     """Validate and normalize a local ready-by time string."""
-    import voluptuous as vol
+    import probatio as vol
 
     parts = str(value).strip().split(":")
     if len(parts) not in {2, 3}:
@@ -820,7 +817,7 @@ def _validate_ready_by_time(value: Any) -> str:
 
 def _validate_reason_code(value: Any) -> str:
     """Validate and normalize a redacted audit reason code."""
-    import voluptuous as vol
+    import probatio as vol
 
     reason = str(value).strip()
     if not _REASON_CODE_PATTERN.fullmatch(reason):

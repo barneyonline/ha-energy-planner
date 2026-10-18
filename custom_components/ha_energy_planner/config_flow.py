@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-import voluptuous as vol
+import probatio as vol
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import SectionConfig, section
@@ -25,7 +25,7 @@ from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
 )
-from voluptuous import Invalid
+from probatio import Invalid
 
 if TYPE_CHECKING:
     from homeassistant.helpers.selector import EntityWithDeviceFilterSelectorConfig
@@ -377,16 +377,6 @@ POLICY_STEP_AI_SAFETY = "ai_safety"
 POLICY_STEP_DATA_HEALTH = "data_health"
 POLICY_STEP_PRIORITIES = "priorities"
 
-_POLICY_SECTION_OPTIONS = (
-    POLICY_STEP_SCHEDULE,
-    POLICY_STEP_EV_BATTERY_GRID,
-    POLICY_STEP_CLIMATE,
-    POLICY_STEP_ENPHASE,
-    POLICY_STEP_AI_SAFETY,
-    POLICY_STEP_DATA_HEALTH,
-    POLICY_STEP_PRIORITIES,
-)
-
 # Options configure planner/device structure and operating constraints. Settings
 # with native entities are intentionally omitted so day-to-day control has one
 # Home Assistant surface that can also be automated.
@@ -484,8 +474,6 @@ _POLICY_SECTION_FIELDS = {
     for step_id, fields in _POLICY_SECTION_FIELDS.items()
 }
 
-_POLICY_ALL_FIELDS = tuple(field for step_id in _POLICY_SECTION_OPTIONS for field in _POLICY_SECTION_FIELDS[step_id])
-
 _SETTINGS_SECTION_INPUT_TYPES = {
     INPUT_STEP_ENERGY: (SUBENTRY_ENERGY,),
     INPUT_STEP_CLIMATE: (SUBENTRY_CLIMATE, SUBENTRY_PRESENCE),
@@ -539,11 +527,6 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
 }
 
 _SETTINGS_SECTION_ORDER = tuple(_SETTINGS_SECTION_INPUT_TYPES)
-
-
-def _options_schema(options: dict[str, Any]) -> vol.Schema:
-    """Return the complete policy schema used by tests and legacy callers."""
-    return _options_section_schema(options, _POLICY_ALL_FIELDS)
 
 
 def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) -> vol.Schema:
@@ -760,7 +743,6 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         from .migration_recovery import (
             async_create_migration_issue,
             async_save_vehicle_target,
-            supports_migration_retry,
         )
 
         entry = self.hass.config_entries.async_get_entry(self.context.get("entry_id", ""))
@@ -782,9 +764,8 @@ class ConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 errors = async_save_vehicle_target(self.hass, entry, user_input)
             if not errors:
                 if entry.state is config_entries.ConfigEntryState.MIGRATION_ERROR or entry.version < 4:
-                    retry_supported = supports_migration_retry(self.hass)
-                    async_create_migration_issue(self.hass, entry, restart_required=not retry_supported)
-                    return self.async_abort(reason="repair_required" if retry_supported else "restart_required")
+                    async_create_migration_issue(self.hass, entry)
+                    return self.async_abort(reason="repair_required")
                 if not entry.update_listeners:
                     self.hass.config_entries.async_schedule_reload(entry.entry_id)
                 return self.async_abort(reason="reconfigure_successful")
@@ -1199,7 +1180,7 @@ def _optional_settings_fields(schema: vol.Schema) -> dict[Any, Any]:
 
 
 def _schema_field_names(schema: vol.Schema) -> set[str]:
-    """Return field names declared by a voluptuous form schema."""
+    """Return field names declared by a Probatio form schema."""
     return {str(getattr(field, "schema", field)) for field in schema.schema}
 
 

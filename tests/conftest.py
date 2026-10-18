@@ -1,6 +1,6 @@
-"""Bootstrap Home Assistant before schema imports, matching the live host.
+"""Initialize Home Assistant before collecting integration tests.
 
-Recent Home Assistant installs its schema compatibility module during startup;
-loading voluptuous first can leave tests holding incompatible marker classes.
+Match the live host startup order and keep combined runtime-test shutdown clean.
 """
+
 import homeassistant  # noqa: F401

@@ -151,18 +151,6 @@ def _battery_model(context: DecisionContext, options: Mapping[str, Any]) -> dict
     }
 
 
-def _arbitrage_spread(context: DecisionContext) -> float:
-    import_prices = [
-        price for price in (_float_or_none(slot.import_price) for slot in context.slots) if price is not None
-    ]
-    export_prices = [
-        price for price in (_float_or_none(slot.export_price) for slot in context.slots) if price is not None
-    ]
-    if not import_prices or not export_prices:
-        return 0.0
-    return max(export_prices) - min(import_prices)
-
-
 def _marginal_budget_summary(context: DecisionContext, options: Mapping[str, Any]) -> dict[str, Any]:
     """Return shared energy budget used by marginal device decisions."""
     interval_minutes = int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5) or 5)

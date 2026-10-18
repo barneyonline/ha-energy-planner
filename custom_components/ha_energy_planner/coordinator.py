@@ -110,7 +110,7 @@ from .enphase_export_limit import feedback as export_limit_feedback
 from .enphase_export_limit import feedback_entity_id as export_limit_feedback_entity_id
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
-from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
+from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power
 from .ev_runtime import audit_evidence
 from .ev_telemetry import sample_ev, update_ev_telemetry
@@ -1939,7 +1939,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if callable(update_entry):
             update_entry(self.entry, options=options)
         if self.entry_data.get(CONF_EV_SMART_CHARGING_READY_BY):
-            await EVSmartChargingAdapter(self.hass, self.entry_data).async_set_ready_by(ready_by)
+            await EVChargerAdapter(self.hass, self.entry_data).async_set_ready_by(ready_by)
         self._mark_forced_refresh("ready_by_changed")
         await self.async_request_refresh()
 
@@ -4151,53 +4151,6 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
-
-
-def _bool_state_value(hass: HomeAssistant, entity_id: Any) -> bool | None:
-    if not entity_id:
-        return None
-    state = hass.states.get(entity_id)
-    if state is None:
-        return None
-    value = str(state.state).lower()
-    if value in {
-        "on",
-        "true",
-        "1",
-        "connected",
-        "charging",
-        "home",
-        "plugged_in",
-        "connected_not_charging",
-        "fully_charged",
-    }:
-        return True
-    if value in {
-        "off",
-        "false",
-        "0",
-        "disconnected",
-        "not_home",
-        "idle",
-        "unplugged",
-        "not_plugged_in",
-        "vehicle_not_connected",
-    }:
-        return False
-    return None
-
-
-def _float_state_value(hass: HomeAssistant, entity_id: Any) -> float | None:
-    if not entity_id:
-        return None
-    state = hass.states.get(entity_id)
-    if state is None:
-        return None
-    try:
-        value = float(state.state)
-    except (TypeError, ValueError):
-        return None
-    return value if isfinite(value) else None
 
 
 def _overrides_from_store(

@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Require Home Assistant 2026.10.0 or newer.
 
 ### ✨ New features
 
@@ -16,7 +16,15 @@
 
 ### 🔧 Improvements
 
-- None
+- Import Probatio directly for schemas and use the current binary-sensor
+  device-class import.
+- Use Home Assistant's migration retry API directly and remove obsolete restart
+  recovery paths, translations and compatibility tests.
+- Remove the retired EV Smart Charging adapter import alias; callers use the
+  direct charger adapter.
+- Remove unused state readers, planning helpers and legacy options-schema wrappers
+  with tests that exercised only retired paths.
+- Avoid copying entire mappings when compacting oversized entity attributes.
 
 ### 🔄 Other changes
 

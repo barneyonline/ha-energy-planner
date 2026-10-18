@@ -51,7 +51,6 @@ from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
     _active_control_not_ready_reason,
     _ai_advice_notification_message,
-    _bool_state_value,
     _bounded_reason,
     _configured_entity_ids,
     _consume_expected_ev_start_feedback,
@@ -60,7 +59,6 @@ from custom_components.ha_energy_planner.coordinator import (
     _ev_start_feedback_is_expected,
     _event_reports_ev_charging_started,
     _expired_manual_hvac_state,
-    _float_state_value,
     _hvac_control_from_ownership,
     _is_manual_hvac_change,
     _is_manual_hvac_zone_change,
@@ -4659,7 +4657,7 @@ def test_explicit_replan_marks_next_refresh_as_forced() -> None:
     assert coordinator._pending_refresh_trigger == "manual_replan"
 
 
-def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
+def test_latest_ai_service_call_and_datetime_helpers_cover_edge_cases() -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
 
     assert _latest_ai_service_call_at("bad") is None
@@ -4667,16 +4665,6 @@ def test_latest_ai_service_call_and_state_helpers_cover_edge_cases() -> None:
     assert _latest_ai_service_call_at([{"created_at": "bad", "service_called": "ai_task.generate_data"}]) is None
     assert _split_entity_values([" sensor.a ", "bad", "binary_sensor.b"]) == ["sensor.a", "binary_sensor.b"]
     assert _split_entity_values(123) == []
-    assert _bool_state_value(FakeHass(), None) is None
-    assert _bool_state_value(FakeHass(), "binary_sensor.missing") is None
-    assert _bool_state_value(FakeHass({"binary_sensor.yes": "on"}), "binary_sensor.yes") is True
-    assert _bool_state_value(FakeHass({"binary_sensor.no": "off"}), "binary_sensor.no") is False
-    assert _bool_state_value(FakeHass({"binary_sensor.unknown": "maybe"}), "binary_sensor.unknown") is None
-    assert _float_state_value(FakeHass(), None) is None
-    assert _float_state_value(FakeHass(), "sensor.missing") is None
-    assert _float_state_value(FakeHass({"sensor.bad": "bad"}), "sensor.bad") is None
-    assert _float_state_value(FakeHass({"sensor.nan": "nan"}), "sensor.nan") is None
-    assert _float_state_value(FakeHass({"sensor.value": "12.5"}), "sensor.value") == 12.5
     assert _parse_datetime_or_none(now) is now
     assert _parse_datetime_or_none(None) is None
     assert _parse_datetime_or_none(123) is None
@@ -5128,7 +5116,7 @@ def test_set_ready_by_updates_configured_ev_helper(monkeypatch: object) -> None:
         async def async_set_ready_by(self, ready_by: str) -> None:
             calls.append((self.hass, self.entry_data, ready_by))
 
-    monkeypatch.setattr(coordinator_module, "EVSmartChargingAdapter", FakeEVAdapter)
+    monkeypatch.setattr(coordinator_module, "EVChargerAdapter", FakeEVAdapter)
     coordinator = _coordinator_for_runtime_services(
         entry_data={CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ev_ready_by"}
     )
