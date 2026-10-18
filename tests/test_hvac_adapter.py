@@ -80,7 +80,9 @@ class FakeServices:
         elif service == "turn_off":
             self.states.values[entity_id] = "off"
         elif service == "start" and domain == "timer":
-            self.states.values[entity_id] = "active"
+            self.states.values[entity_id] = FakeState("active", {
+                "finishes_at": (hvac_adapter_module.dt_util.utcnow() + timedelta(seconds=data["duration"])).isoformat(),
+            })
         elif service == "cancel" and domain == "timer":
             self.states.values[entity_id] = "idle"
         elif service == "set_hvac_mode":
@@ -180,7 +182,7 @@ def test_hvac_action_arms_scheduler_classifier_guard_before_actuators() -> None:
         (
             "timer",
             "start",
-            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+            {"entity_id": "timer.scheduler_guard", "duration": 191},
         ),
         ("input_boolean", "turn_on", {"entity_id": "input_boolean.scheduler_change"}),
         ("automation", "turn_off", {"entity_id": "automation.climate", "stop_actions": True}),
@@ -211,7 +213,7 @@ def test_hvac_action_fails_closed_when_scheduler_guard_is_incomplete() -> None:
     assert hass.services.calls == []
 
 
-def test_hvac_action_rolls_back_failed_guard_without_touching_actuators() -> None:
+def test_hvac_action_leaves_failed_guard_to_finite_expiry_without_touching_actuators() -> None:
     hass = FakeHass(
         {
             "climate.daikin": "heat",
@@ -236,11 +238,9 @@ def test_hvac_action_rolls_back_failed_guard_without_touching_actuators() -> Non
         (
             "timer",
             "start",
-            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+            {"entity_id": "timer.scheduler_guard", "duration": 191},
         ),
         ("input_boolean", "turn_on", {"entity_id": "input_boolean.scheduler_change"}),
-        ("input_boolean", "turn_off", {"entity_id": "input_boolean.scheduler_change"}),
-        ("timer", "cancel", {"entity_id": "timer.scheduler_guard"}),
     ]
 
 
@@ -271,10 +271,8 @@ def test_hvac_guard_fails_when_timer_does_not_confirm(monkeypatch: Any) -> None:
         (
             "timer",
             "start",
-            {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"},
+            {"entity_id": "timer.scheduler_guard", "duration": 11},
         ),
-        ("input_boolean", "turn_off", {"entity_id": "input_boolean.scheduler_change"}),
-        ("timer", "cancel", {"entity_id": "timer.scheduler_guard"}),
     ]
 
 
@@ -625,8 +623,6 @@ def test_hvac_action_does_not_reassert_an_uncertain_target(monkeypatch: object) 
         {
             CONF_DAIKIN_CLIMATE: "climate.daikin",
             CONF_CLIMATE_AUTOMATIONS: "automation.climate",
-            CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
-            CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
         },
     )
     original_call = hass.services.async_call
@@ -655,9 +651,7 @@ def test_hvac_action_does_not_reassert_an_uncertain_target(monkeypatch: object) 
     assert result.rollback_succeeded is True
     assert temperature_calls == 1
     assert hass.states.get("climate.daikin") == FakeState("heat", {"temperature": 19})
-    assert [call for call in hass.services.calls if call[:2] == ("timer", "start")] == [
-        ("timer", "start", {"entity_id": "timer.scheduler_guard", "duration": "00:00:30"}),
-    ]
+    assert not any(domain == "timer" for domain, _, _ in hass.services.calls)
 
 
 def test_hvac_failure_preserves_originally_revealed_active_mode(monkeypatch: object) -> None:
@@ -2330,10 +2324,10 @@ def test_hvac_manual_override_after_confirmation_preserves_user_target(
     manual_override = False
     guard_calls = 0
 
-    async def arm_guard() -> bool:
+    async def arm_guard(**kwargs) -> bool:
         nonlocal guard_calls, manual_override
         guard_calls += 1
-        if guard_calls == 2:
+        if guard_calls == 3:
             hass.states.values["climate.daikin"] = FakeState(
                 "heat",
                 {"temperature": 24},
@@ -4625,3 +4619,617 @@ def test_review_late_target_drift_fails_acquisition_without_reassertion(monkeypa
     assert sum(call[2].get("temperature") == 21 for call in hass.services.calls) == 1
     if phase == "main_before_zones":
         assert all(call[2]["entity_id"] != "climate.zone" for call in hass.services.calls)
+
+
+class ClassifierClock:
+    """Controlled HA timer and external classifier trigger/settling behavior.
+
+    The classifier requires BOTH helpers for ambiguous device feedback. User
+    contexts take priority; targets trigger after 3 seconds, modes after 5,
+    then ambiguous direct changes settle for another 3 seconds. This models
+    the expanded automation, not an asserted capture of the rolled-out trace.
+    """
+
+    def __init__(self, monkeypatch, hass):
+        self.elapsed = 0.0
+        self.epoch = datetime(2026, 10, 18, 4, tzinfo=UTC)
+        self.hass = hass
+        self.events = []
+        self.decisions = []
+        self.manual = False
+        monkeypatch.setattr(hvac_adapter_module.dt_util, "utcnow", self.utcnow)
+        monkeypatch.setattr(hvac_adapter_module, "asyncio", SimpleNamespace(
+            get_running_loop=lambda: self, sleep=self.sleep,
+            create_task=asyncio.create_task, gather=asyncio.gather, timeout=asyncio.timeout,
+        ))
+
+    def time(self):
+        return self.elapsed
+
+    def utcnow(self):
+        return self.epoch + timedelta(seconds=self.elapsed)
+
+    def later(self, when, callback):
+        self.events.append((when, callback))
+
+    async def sleep(self, delay):
+        self.advance(self.elapsed + delay)
+        await asyncio.sleep(0)
+
+    def advance(self, until):
+        while self.events and min(item[0] for item in self.events) <= until:
+            when, callback = min(self.events, key=lambda item: item[0])
+            self.events.remove((when, callback))
+            self.elapsed = when
+            self.expire_timer()
+            callback()
+        self.elapsed = until
+        self.expire_timer()
+
+    def expire_timer(self):
+        state = self.hass.states.get("timer.scheduler_guard")
+        if state.state == "active" and self.utcnow() >= datetime.fromisoformat(state.attributes["finishes_at"]):
+            self.hass.states.values["timer.scheduler_guard"] = "idle"
+            # The classifier's timer-stopped branch clears the scheduler flag.
+            self.hass.states.values["input_boolean.scheduler_change"] = "off"
+
+    def feedback(self, entity, state, *, user=False):
+        previous = self.hass.states.get(entity)
+        self.hass.states.values[entity] = state
+        trigger = 5 if previous.state != state.state else 3
+
+        def classify():
+            guarded = (self.hass.states.get("timer.scheduler_guard").state == "active"
+                       and self.hass.states.get("input_boolean.scheduler_change").state == "on")
+            manual = user or not guarded
+            self.decisions.append((entity, self.elapsed, manual))
+            self.manual |= manual
+
+        self.later(self.elapsed + trigger + (0 if user else 3), classify)
+
+
+def _classifier_adapter(monkeypatch):
+    hass = FakeHass({
+        "climate.daikin": FakeState("cool", {"temperature": 24}),
+        "climate.zone": FakeState("cool", {"temperature": 24}),
+        "switch.zone": "off", "automation.climate": "on",
+        "input_boolean.scheduler_change": "off", "timer.scheduler_guard": "idle",
+    })
+    clock = ClassifierClock(monkeypatch, hass)
+    adapter = DaikinHVACAdapter(hass, {
+        CONF_DAIKIN_CLIMATE: "climate.daikin",
+        CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"],
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.scheduler_change",
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER: "timer.scheduler_guard",
+    })
+    adapter.set_manual_override_check(lambda: clock.manual)
+    return hass, clock, adapter
+
+
+@pytest.mark.parametrize("delay", [30.341, 179.8])
+@pytest.mark.parametrize("service_timeout", [False, True])
+def test_external_classifier_delayed_target_and_zone_clamp_stay_guarded(monkeypatch, delay, service_timeout):
+    """Exact 24->19 C feedback 30.341 seconds after target issue, or near lease end."""
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+    refreshes = []
+    records = []
+    adapter.set_command_callback(records.append)
+
+    async def dispatch(domain, service, data, **kwargs):
+        if domain == "climate":
+            hass.services.calls.append((domain, service, data))
+            clock.later(clock.elapsed + delay, lambda: clock.feedback(
+                "climate.daikin", FakeState("cool", {"temperature": 19})))
+            clock.later(clock.elapsed + delay + 0.022, lambda: clock.feedback(
+                "climate.zone", FakeState("cool", {"temperature": 21})))
+            if service_timeout:
+                raise TimeoutError
+        else:
+            await original(domain, service, data, **kwargs)
+
+    async def refresh(_hass, entity):
+        refreshes.append((clock.elapsed, entity))
+
+    hass.services.async_call = dispatch
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", refresh)
+
+    async def run():
+        result = await adapter.async_execute(_action({"hvac_mode": "cool", "target_temperature": 19}))
+        assert result.applied and result.saved_main_state == {}
+        assert result.pre_state[CONF_DAIKIN_CLIMATE] == "cool"
+        clock.advance(delay + 8)
+        assert not clock.manual and len(clock.decisions) == 2
+        assert all(not decision[2] for decision in clock.decisions)
+        assert len([call for call in hass.services.calls if call[0] == "timer"]) == 1
+        assert len([call for call in hass.services.calls if call[0] == "climate"]) == 1
+        issued = next(item for item in records if item["stage"] == "issued" and item["domain"] == "climate")
+        assert datetime.fromisoformat(issued["deadline"]) == clock.epoch + timedelta(seconds=180)
+        clock.advance(192)
+        assert hass.states.get("timer.scheduler_guard").state == "idle"
+        assert hass.states.get("input_boolean.scheduler_change").state == "off"
+
+    asyncio.run(run())
+    assert refreshes
+
+
+def test_external_classifier_old_guard_reproduces_false_manual_override(monkeypatch):
+    """Negative control establishes that the model detects the original fault."""
+    hass, clock, _ = _classifier_adapter(monkeypatch)
+    hass.states.values["timer.scheduler_guard"] = FakeState("active", {
+        "finishes_at": (clock.epoch + timedelta(seconds=30)).isoformat(),
+    })
+    hass.states.values["input_boolean.scheduler_change"] = "on"
+    clock.advance(32.043)
+    clock.feedback("climate.daikin", FakeState("cool", {"temperature": 19}))
+    clock.advance(38.043)
+    assert clock.manual
+
+
+def test_external_classifier_explicit_user_supersedes_during_guard(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+
+    async def dispatch(domain, service, data, **kwargs):
+        if domain == "climate":
+            hass.services.calls.append((domain, service, data))
+            clock.later(10, lambda: clock.feedback("climate.daikin", FakeState("cool", {"temperature": 25}), user=True))
+        else:
+            await original(domain, service, data, **kwargs)
+
+    hass.services.async_call = dispatch
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", lambda *args: asyncio.sleep(0))
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool", "target_temperature": 19})))
+    assert result.reason == "manual_hvac_override_detected" and result.rollback_succeeded
+    assert clock.elapsed < 14 and clock.manual
+    assert hass.states.get("climate.daikin").attributes["temperature"] == 25
+    assert len([call for call in hass.services.calls if call[0] == "climate"]) == 1
+    clock.advance(192)
+    assert hass.states.get("timer.scheduler_guard").state == "idle"
+
+
+@pytest.mark.parametrize("domain,service,entity", [
+    ("climate", "set_temperature", "climate.zone"),
+    ("switch", "turn_on", "switch.zone"),
+    ("automation", "turn_on", "automation.climate"),
+])
+def test_guard_renews_only_for_next_write_in_long_transaction(monkeypatch, domain, service, entity):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+
+    async def run():
+        assert await adapter._async_arm_scheduler_guard()
+        clock.advance(179)
+        data = {"entity_id": entity}
+        if domain == "climate":
+            data["temperature"] = 19
+        await adapter._async_command(hass, domain, service, data)
+        end = datetime.fromisoformat(hass.states.get("timer.scheduler_guard").attributes["finishes_at"])
+        assert end >= clock.epoch + timedelta(seconds=369)
+        assert len([call for call in hass.services.calls if call[0] == "timer"]) == 2
+        clock.advance(371)
+        assert hass.states.get("timer.scheduler_guard").state == "idle"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_guard_preserves_longer_shared_timer_even_on_helper_failure(monkeypatch, fail):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    end = clock.epoch + timedelta(minutes=10)
+    hass.states.values["timer.scheduler_guard"] = FakeState("active", {"finishes_at": end.isoformat()})
+    if fail:
+        hass.services.fail_services.add(("input_boolean", "turn_on"))
+    assert asyncio.run(adapter._async_arm_scheduler_guard()) is not fail
+    assert hass.states.get("timer.scheduler_guard").attributes["finishes_at"] == end.isoformat()
+    assert not any(domain == "timer" or service == "turn_off" for domain, service, _ in hass.services.calls)
+
+
+@pytest.mark.parametrize("finishes", [None, "bad", "2026-10-18T04:10:00"])
+def test_guard_unknown_shared_expiry_fails_closed(monkeypatch, finishes):
+    hass, _, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["timer.scheduler_guard"] = FakeState("active", {"finishes_at": finishes})
+    assert not asyncio.run(adapter._async_arm_scheduler_guard())
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize("remaining", [0, 8, 100])
+def test_recovery_guard_uses_original_deadline_without_poll_renewal(monkeypatch, remaining):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    issued = clock.epoch - timedelta(seconds=180 - remaining)
+    record = {"entity_id": "climate.daikin", "domain": "climate", "service": "set_temperature",
+              "requested": {"temperature": 19}, "context_id": "old",
+              "issued_at": issued.isoformat(), "deadline": (issued + timedelta(seconds=180)).isoformat()}
+    persisted = []
+
+    async def save(value):
+        persisted.append(value)
+
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", lambda *args: asyncio.sleep(0))
+    adapter.set_confirmation_persistence_callback(save, record)
+    asyncio.run(adapter._async_reconcile_recovery())
+    assert persisted[-1] is None and clock.elapsed <= remaining + 0.01
+    timers = [call for call in hass.services.calls if call[0] == "timer"]
+    if remaining:
+        assert len(timers) == 1 and timers[0][2]["duration"] == remaining + 11
+        clock.advance(remaining + 12)
+    else:
+        assert not timers
+    assert hass.states.get("timer.scheduler_guard").state == "idle"
+    assert not any(call[0] == "climate" for call in hass.services.calls)
+
+
+@pytest.mark.parametrize("failure", ["timer", "helper_noop", "cancel", "short_timer", "lost_timer", "expired"])
+def test_guard_failure_and_cancellation_never_dispatch_or_claim_restoration(monkeypatch, failure):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+    saved = []
+    events = []
+
+    async def persist(record):
+        saved.append(record)
+
+    async def dispatch(domain, service, data, **kwargs):
+        if domain == "timer" and failure == "timer":
+            raise TimeoutError
+        await original(domain, service, data, **kwargs)
+        if domain == "input_boolean":
+            if failure == "helper_noop":
+                hass.states.values[data["entity_id"]] = "off"
+            elif failure == "cancel":
+                raise asyncio.CancelledError
+            elif failure == "short_timer":
+                hass.states.values["timer.scheduler_guard"] = FakeState("active", {
+                    "finishes_at": (clock.epoch + timedelta(seconds=5)).isoformat(),
+                })
+            elif failure == "lost_timer":
+                hass.states.values.pop("timer.scheduler_guard")
+            elif failure == "expired":
+                clock.advance(181)
+
+    hass.services.async_call = dispatch
+    adapter.set_confirmation_persistence_callback(persist)
+    adapter.set_command_callback(events.append)
+
+    async def run():
+        if failure == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await adapter._async_command(hass, "climate", "set_temperature",
+                                             {"entity_id": "climate.daikin", "temperature": 19})
+            # The climate intent never reached dispatch. Retire it without
+            # shortening the finite shared timer or issuing compensation.
+            assert saved[-1] is None
+        else:
+            with pytest.raises(hvac_adapter_module._HVACStateConfirmationError):
+                await adapter._async_command(hass, "climate", "set_temperature",
+                                             {"entity_id": "climate.daikin", "temperature": 19})
+            assert saved[-1] is None
+        assert not any(item["domain"] == "climate" for item in events)
+        assert not any(domain == "climate" or service in {"cancel", "turn_off"}
+                       for domain, service, _ in hass.services.calls)
+        if failure != "lost_timer":
+            clock.advance(192)
+            assert hass.states.get("timer.scheduler_guard").state == "idle"
+
+    asyncio.run(run())
+
+
+def test_failed_recovery_guard_waits_original_lease_and_retains_baseline(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.services.fail_services.add(("timer", "start"))
+    record = {"entity_id": "climate.daikin", "domain": "climate", "service": "set_temperature",
+              "requested": {"temperature": 19}, "context_id": "old",
+              "issued_at": clock.epoch.isoformat(), "deadline": (clock.epoch + timedelta(seconds=180)).isoformat()}
+    baseline = {"hvac_mode": "cool", "target_temperature": 25}
+
+    persisted = []
+
+    async def persist(record):
+        assert clock.elapsed >= 180
+        persisted.append(record)
+
+    adapter.set_confirmation_persistence_callback(persist, record)
+    result = asyncio.run(adapter.async_restore(saved_main_state=baseline))
+    assert not result.applied and not result.rollback_succeeded
+    assert result.saved_main_state == baseline
+    assert adapter._recovery_confirmation is None and persisted
+    assert all(value is None for value in persisted)
+    assert baseline == {"hvac_mode": "cool", "target_temperature": 25}
+    assert not any(domain == "climate" for domain, _, _ in hass.services.calls)
+
+
+def test_external_classifier_full_incident_sequence_preserves_original_off_baseline(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["climate.daikin"] = FakeState("off", {"temperature": 19})
+    hass.states.values["climate.zone"] = FakeState("off", {"temperature": 24})
+    original = hass.services.async_call
+    baseline_updates = []
+
+    async def persist_main(value):
+        baseline_updates.append(dict(value))
+
+    async def dispatch(domain, service, data, **kwargs):
+        if domain != "climate":
+            await original(domain, service, data, **kwargs)
+            return
+        hass.services.calls.append((domain, service, data))
+        delay, mode, target = {
+            "turn_on": (0.978, "heat", 19),
+            "set_hvac_mode": (0.669, "cool", 24),
+            "set_temperature": (30.341, "cool", 19),
+        }[service]
+        clock.later(clock.elapsed + delay, lambda: clock.feedback(
+            "climate.daikin", FakeState(mode, {"temperature": target})))
+        if service == "set_temperature":
+            clock.later(clock.elapsed + delay + 0.022, lambda: clock.feedback(
+                "climate.zone", FakeState("cool", {"temperature": 21})))
+
+    hass.services.async_call = dispatch
+    adapter.set_main_state_persistence_callback(persist_main)
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", lambda *args: asyncio.sleep(0))
+    result = asyncio.run(adapter.async_execute(_action({"hvac_mode": "cool", "target_temperature": 19})))
+    assert result.applied
+    assert [call[1] for call in hass.services.calls if call[0] == "climate"] == [
+        "turn_on", "set_hvac_mode", "set_temperature",
+    ]
+    assert baseline_updates and all(item["hvac_mode"] == "off" and item["target_temperature"] == 19
+                                    for item in baseline_updates)
+    assert baseline_updates[-1]["rollback_active_hvac_mode"] == "heat"
+    clock.advance(clock.elapsed + 9)
+    assert len(clock.decisions) == 4 and not clock.manual
+    clock.advance(200)
+    assert hass.states.get("timer.scheduler_guard").state == "idle"
+
+
+def test_external_classifier_expiry_does_not_renew_uncertainty_or_confirm_late_feedback(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+    records = []
+    adapter.set_command_callback(records.append)
+
+    async def dispatch(domain, service, data, **kwargs):
+        if domain == "climate":
+            hass.services.calls.append((domain, service, data))
+            clock.later(192, lambda: clock.feedback("climate.daikin", FakeState("cool", {"temperature": 19})))
+        else:
+            await original(domain, service, data, **kwargs)
+
+    hass.services.async_call = dispatch
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", lambda *args: asyncio.sleep(0))
+
+    async def run():
+        await adapter._async_command(
+            hass, "climate", "set_temperature", {"entity_id": "climate.daikin", "temperature": 19},
+        )
+        assert not await adapter._async_confirm_hvac_state("climate.daikin", {"target_temperature": 19})
+        assert clock.elapsed == 180
+        assert not any(record["domain"] == "climate" and record["stage"] == "confirmed" for record in records)
+        clock.advance(200)
+        assert clock.manual and hass.states.get("timer.scheduler_guard").state == "idle"
+        assert len([call for call in hass.services.calls if call[0] == "timer"]) == 1
+        assert len([call for call in hass.services.calls if call[0] == "climate"]) == 1
+
+    asyncio.run(run())
+
+
+def test_guard_does_not_replace_paused_shared_timer(monkeypatch):
+    hass, _, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["timer.scheduler_guard"] = FakeState("paused", {"remaining": "00:10:00"})
+    assert not asyncio.run(adapter._async_arm_scheduler_guard())
+    assert not hass.services.calls
+
+
+@pytest.mark.parametrize("restoring,changed", [(False, "main"), (False, "zone"), (True, "zone"), (True, "main")])
+def test_guard_yield_respects_nonclimate_acquisition_and_entity_scoped_restoration(monkeypatch, restoring, changed):
+    hass, _, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+    manual = False
+    zones = set()
+
+    async def dispatch(domain, service, data, **kwargs):
+        nonlocal manual
+        await original(domain, service, data, **kwargs)
+        if domain == "input_boolean":
+            manual = changed == "main"
+            if changed == "zone":
+                zones.add("switch.zone")
+
+    hass.services.async_call = dispatch
+    adapter.set_manual_override_check(lambda: manual)
+    adapter.set_zone_manual_override_check(lambda: zones)
+
+    async def run():
+        if restoring and changed == "main":
+            await adapter._async_command(hass, "switch", "turn_on", {"entity_id": "switch.zone"},
+                                         respect_manual_override=False)
+            assert hass.states.get("switch.zone").state == "on"
+        else:
+            with pytest.raises(hvac_adapter_module._HVACManualOverrideError):
+                await adapter._async_command(hass, "switch", "turn_on", {"entity_id": "switch.zone"},
+                                             respect_manual_override=not restoring)
+            assert hass.states.get("switch.zone").state == "off"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("phase", ["acquisition", "zone_acquisition", "restoration"])
+def test_noop_refreshes_do_not_extend_or_rearm_shared_guard(monkeypatch, phase):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["climate.daikin"] = FakeState("cool", {"temperature": 19})
+    hass.states.values["climate.zone"] = FakeState("cool", {"temperature": 19})
+    adapter.entry_data[CONF_CLIMATE_ZONES] = ["climate.zone"]
+    original = dict(adapter.entry_data)
+
+    async def run():
+        # Existing finite coverage could be our previous write or a companion
+        # automation. A fresh adapter on every refresh must not renew either.
+        assert await adapter._async_arm_scheduler_guard()
+        expiry = hass.states.get("timer.scheduler_guard").attributes["finishes_at"]
+        hass.services.calls.clear()
+        for when in (40, 120, 179, 195, 240):
+            clock.advance(when)
+            fresh = DaikinHVACAdapter(hass, original)
+            if phase == "restoration":
+                result = await fresh.async_restore(
+                    {"automation.climate": "on"}, {}, {"hvac_mode": "cool", "target_temperature": 19},
+                )
+            else:
+                result = await fresh.async_execute(_action({
+                    "hvac_mode": "cool", "target_temperature": 19,
+                    "enable_zones": phase == "zone_acquisition", "configured_zones_only": phase == "zone_acquisition",
+                }))
+            assert result.applied
+            assert not hass.services.calls
+        assert datetime.fromisoformat(expiry) == clock.epoch + timedelta(seconds=191)
+        assert hass.states.get("timer.scheduler_guard").state == "idle"
+        assert hass.states.get("input_boolean.scheduler_change").state == "off"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("domain,service,entity", [
+    ("switch", "turn_on", "switch.zone"), ("automation", "turn_off", "automation.climate"),
+])
+def test_nonclimate_guard_failure_blocks_actuators(monkeypatch, domain, service, entity):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.services.fail_services.add(("timer", "start"))
+    with pytest.raises(hvac_adapter_module._HVACStateConfirmationError):
+        asyncio.run(adapter._async_command(hass, domain, service, {"entity_id": entity}))
+    assert not any(call[0] == domain for call in hass.services.calls)
+    assert clock.elapsed == 0
+
+
+def test_review_recovery_guard_failure_does_not_race_an_accepted_mode(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["climate.daikin"] = FakeState("heat", {"temperature": 19})
+    hass.services.fail_services.add(("timer", "start"))
+    record = {"entity_id": "climate.daikin", "domain": "climate", "service": "set_hvac_mode",
+              "requested": {"hvac_mode": "cool"}, "context_id": "accepted",
+              "issued_at": clock.epoch.isoformat(), "deadline": (clock.epoch + timedelta(seconds=180)).isoformat()}
+    persisted = []
+    clock.later(12, lambda: hass.states.values.__setitem__("climate.daikin", FakeState("cool", {"temperature": 24})))
+
+    async def persist(value):
+        persisted.append(value)
+
+    monkeypatch.setattr(hvac_adapter_module, "async_update_entity", lambda *args: asyncio.sleep(0))
+    adapter.set_confirmation_persistence_callback(persist, record)
+    baseline = {"hvac_mode": "off", "target_temperature": 19}
+    result = asyncio.run(adapter.async_restore(saved_main_state=baseline))
+    assert clock.elapsed >= 12
+    assert not result.applied and not result.rollback_succeeded
+    assert result.saved_main_state == baseline
+    assert not any(domain == "climate" for domain, _, _ in hass.services.calls)
+    assert persisted[-1] is None
+    assert hass.states.get("climate.daikin").state == "cool"
+
+
+def test_review_cancel_during_guard_retires_unsent_climate_intent_before_reload(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    original = hass.services.async_call
+    persisted, audit = [], []
+
+    async def save(record):
+        persisted.append(record)
+
+    async def dispatch(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "input_boolean":
+            raise asyncio.CancelledError
+
+    hass.services.async_call = dispatch
+    adapter.set_confirmation_persistence_callback(save)
+    adapter.set_command_callback(audit.append)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(adapter._async_command(hass, "climate", "set_temperature",
+                                          {"entity_id": "climate.daikin", "temperature": 19}))
+    assert persisted[-1] is None
+    assert adapter._recovery_confirmation is None
+    assert not any(record["domain"] == "climate" for record in audit)
+    assert not any(domain == "climate" for domain, _, _ in hass.services.calls)
+    clock.advance(200)
+    assert hass.states.get("timer.scheduler_guard").state == "idle"
+    reloaded = DaikinHVACAdapter(hass, adapter.entry_data)
+    reloaded.set_confirmation_persistence_callback(save, persisted[-1])
+    reloaded.set_command_callback(audit.append)
+    result = asyncio.run(reloaded.async_restore(saved_main_state={"hvac_mode": "cool", "target_temperature": 24}))
+    assert result.applied and clock.elapsed == 200
+    assert not any(record["domain"] == "climate" for record in audit)
+    assert not any(domain == "climate" for domain, _, _ in hass.services.calls)
+
+
+def test_review_idle_automation_noop_refreshes_do_not_keep_guard_active(monkeypatch):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["climate.daikin"] = FakeState("cool", {"temperature": 19})
+    hass.states.values["automation.climate"] = FakeState("off", {"current": 0})
+    adapter.entry_data[CONF_CLIMATE_AUTOMATIONS] = ["automation.climate"]
+
+    async def run():
+        assert await adapter._async_arm_scheduler_guard()
+        hass.services.calls.clear()
+        for when in (60, 120, 180, 240):
+            clock.advance(when)
+            fresh = DaikinHVACAdapter(hass, adapter.entry_data)
+            result = await fresh.async_execute(_action({"hvac_mode": "cool", "target_temperature": 19}))
+            assert result.applied and not result.command_sent
+            assert not hass.services.calls
+        assert hass.states.get("timer.scheduler_guard").state == "idle"
+        assert hass.states.get("input_boolean.scheduler_change").state == "off"
+        clock.feedback("climate.daikin", FakeState("cool", {"temperature": 25}))
+        clock.advance(246)
+        assert clock.manual
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("service,requested,initial", [
+    ("set_hvac_mode", {"hvac_mode": "cool"}, "heat"), ("turn_on", {}, "off"),
+])
+@pytest.mark.parametrize("remaining,guard_delay,feedback_at,confirmed,queued_delay", [
+    (8, 7, 6, True, 0), (8, 8, 8, False, 0), (8, 12, 10, False, 0), (0, 0, 0, False, 0),
+    (8, 7, 8.5, False, 2),
+])
+def test_review_recovery_guard_setup_cannot_confirm_past_original_deadline(
+    monkeypatch, service, requested, initial, remaining, guard_delay, feedback_at, confirmed, queued_delay,
+):
+    hass, clock, adapter = _classifier_adapter(monkeypatch)
+    hass.states.values["climate.daikin"] = FakeState(initial, {"temperature": 19})
+    original = hass.services.async_call
+    audit, persisted = [], []
+    issued = clock.epoch - timedelta(seconds=180 - remaining)
+    record = {"entity_id": "climate.daikin", "domain": "climate", "service": service,
+              "requested": requested, "context_id": "original",
+              "issued_at": issued.isoformat(), "deadline": (issued + timedelta(seconds=180)).isoformat()}
+    clock.later(feedback_at, lambda: hass.states.values.__setitem__(
+        "climate.daikin", FakeState("cool", {"temperature": 24})))
+
+    async def dispatch(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if domain == "input_boolean":
+            # A helper can complete while device feedback arrives. Its wait
+            # must consume the saved lease, not grant authority after expiry.
+            clock.advance(guard_delay)
+
+    async def save(value):
+        persisted.append(value)
+
+    original_wait = adapter._async_wait_for_climate
+
+    async def queued_wait(entity, matches):
+        # Model queued state processing between the post-guard check and the
+        # first readback poll, including device feedback after lease expiry.
+        clock.advance(clock.elapsed + queued_delay)
+        return await original_wait(entity, matches)
+
+    monkeypatch.setattr(adapter, "_async_wait_for_climate", queued_wait)
+    hass.services.async_call = dispatch
+    adapter.set_command_callback(audit.append)
+    adapter.set_confirmation_persistence_callback(save, record)
+    asyncio.run(adapter._async_reconcile_recovery())
+    command_audit = [item for item in audit if item.get("context_id") == "original"]
+    assert any(item["stage"] == "confirmed" for item in command_audit) is confirmed
+    assert any(item["stage"] == "readback_failed" for item in command_audit) is not confirmed
+    assert persisted[-1] is None and adapter._recovery_confirmation is None
+    assert record["deadline"] == (clock.epoch + timedelta(seconds=remaining)).isoformat()
+    assert not any(domain == "climate" for domain, _, _ in hass.services.calls)
+    clock.advance(25)
+    assert hass.states.get("timer.scheduler_guard").state == "idle"
