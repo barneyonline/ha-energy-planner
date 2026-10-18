@@ -1884,7 +1884,7 @@ def test_executor_pauses_failed_adapter_results(monkeypatch: Any) -> None:
                 rollback_succeeded=None,
             )
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedEVAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FailedEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedHVACAdapter)
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FailedEnphaseAdapter)
 
@@ -4257,7 +4257,7 @@ def test_executor_restore_safe_state_reports_failed_restore(monkeypatch: object)
                 {"applied": False, "reason": "enphase_profile_unavailable", "pre_state": {}, "post_state": {}},
             )()
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FakeEVAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FakeEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", FakeEnphaseAdapter)
     store = FakeStore()
@@ -4321,7 +4321,7 @@ def test_executor_restore_device_control_restores_only_selected_asset(monkeypatc
         def __init__(self, *args: object, **kwargs: object) -> None:
             raise AssertionError("An unrelated device adapter was constructed")
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FakeEVAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FakeEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", UnexpectedAdapter)
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", UnexpectedAdapter)
     store = FakeStore()
@@ -4541,7 +4541,7 @@ def test_executor_restore_safe_state_continues_after_asset_exception(monkeypatch
                 post_state={"automation.hvac": "on"},
             )
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", RaisingEVAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", RaisingEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", SuccessfulDaikinAdapter)
     store = FakeStore()
     store.data["ownership"] = {
@@ -4580,7 +4580,7 @@ def test_executor_restore_clears_ev_and_retains_failed_hvac_and_enphase(monkeypa
         async def async_restore_ai(self) -> object:
             raise RuntimeError("service failure")
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", SuccessfulEVAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", SuccessfulEVAdapter)
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FailedDaikinAdapter)
     monkeypatch.setattr(executor_module, "EnphaseProfileAdapter", RaisingEnphaseAdapter)
     store = FakeStore()
@@ -5617,7 +5617,7 @@ def test_manual_ev_uncertain_failure_retains_reservation_and_ownership(
             )
             return result
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", UncertainAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", UncertainAdapter)
     now = datetime.now(UTC)
     hass = FakeHass(
         {
@@ -5683,7 +5683,7 @@ def test_manual_ev_rolled_back_start_clears_provisional_recovery_state(
 
     monkeypatch.setattr(
         executor_module,
-        "EVSmartChargingAdapter",
+        "EVChargerAdapter",
         RolledBackAdapter,
     )
     now = datetime.now(UTC)
@@ -6160,7 +6160,7 @@ def test_regular_planner_owned_stop_requires_confirmed_safe_state(
     monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
     monkeypatch.setattr(
         executor_module,
-        "EVSmartChargingAdapter",
+        "EVChargerAdapter",
         UnconfirmedStopAdapter,
     )
     now = datetime.now(UTC)
@@ -6253,7 +6253,7 @@ def test_auto_start_stop_backoff_survives_reload_and_does_not_consume_attempts(m
             calls.append(enabled)
             return EVCommandResult(False, "ev_charging_confirmation_timeout", {}, {}, command_sent=True)
 
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedStopAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FailedStopAdapter)
     now = datetime.now(UTC)
     clock = [now]
     monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: clock[0])
@@ -6688,7 +6688,7 @@ def test_disconnected_ev_retains_capacity_when_safety_stop_fails(
             )
 
     monkeypatch.setattr(executor_module, "CapabilityDiscovery", SupportedDiscovery)
-    monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedStopAdapter)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FailedStopAdapter)
     reservation = {
         "load_kw": 7.0,
         "limit_kw": 9.0,
@@ -7332,7 +7332,7 @@ def test_ev_grid_reservation_reconciles_failed_commands(monkeypatch: object) -> 
                     ) == executor_module._ev_control_topology(executor.entry_data)
                 return result
 
-        monkeypatch.setattr(executor_module, "EVSmartChargingAdapter", FailedAdapter)
+        monkeypatch.setattr(executor_module, "EVChargerAdapter", FailedAdapter)
         hass = FakeHass()
         reservations = {"ev-a": previous} if previous is not None else {}
         hass.data = {"ha_energy_planner": {"ev_grid_reservations": reservations}}

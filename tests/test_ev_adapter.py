@@ -17,7 +17,7 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
 )
-from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter
 from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, PlanAction
 
 
@@ -154,7 +154,7 @@ def test_ev_schedule_sets_helpers_then_starts() -> None:
             "input_text.ev_ready_by": "06:00",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -177,7 +177,7 @@ def test_ev_schedule_sets_helpers_then_starts() -> None:
 
 def test_set_ready_by_updates_helper_without_starting_charging() -> None:
     hass = FakeHass({"input_datetime.ev_ready_by": "06:00:00", "switch.ev_start": "off"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ev_ready_by",
@@ -198,7 +198,7 @@ def test_set_ready_by_updates_helper_without_starting_charging() -> None:
 
 
 def test_set_ready_by_reports_missing_helper() -> None:
-    adapter = EVSmartChargingAdapter(FakeHass({}), {})
+    adapter = EVChargerAdapter(FakeHass({}), {})
 
     result = asyncio.run(adapter.async_set_ready_by("23:45"))
 
@@ -207,7 +207,7 @@ def test_set_ready_by_reports_missing_helper() -> None:
 
 
 def test_set_ready_by_reports_unsupported_helper_domain() -> None:
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         FakeHass({"sensor.ready_by": "06:00"}),
         {CONF_EV_SMART_CHARGING_READY_BY: "sensor.ready_by"},
     )
@@ -219,7 +219,7 @@ def test_set_ready_by_reports_unsupported_helper_domain() -> None:
 
 
 def test_set_ready_by_reports_helper_service_failure() -> None:
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         FailingHass({"input_datetime.ready_by": "06:00:00"}),
         {CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ready_by"},
     )
@@ -239,7 +239,7 @@ def test_ev_schedule_skips_helper_writes_when_values_already_match() -> None:
             "input_datetime.ev_ready_by": "07:00:00",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -268,7 +268,7 @@ def test_ev_schedule_sets_select_target_soc_and_ready_by_helpers() -> None:
             "input_select.ev_ready_by": FakeState("06:00", {"options": ["06:00", "07:00:00", "08:00"]}),
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -307,7 +307,7 @@ def test_ev_schedule_accepts_matching_read_only_target_soc_sensor() -> None:
             "input_text.ev_ready_by": "07:00",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -335,7 +335,7 @@ def test_ev_schedule_rejects_select_target_soc_without_matching_option() -> None
             "select.ev_target_soc": FakeState("70%", {"options": ["70%", "90%"]}),
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -360,7 +360,7 @@ def test_ev_schedule_skips_every_command_when_helpers_and_start_state_match() ->
             "input_text.ev_ready_by": "07:00",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -385,7 +385,7 @@ def test_ev_schedule_skips_every_command_when_helpers_and_start_state_match() ->
 
 def test_ev_stop_does_not_press_legacy_single_button_control() -> None:
     hass = FakeHass({"button.ev_control": "unknown"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             "ev_smart_charging_entity": "button.ev_control",
@@ -401,7 +401,7 @@ def test_ev_stop_does_not_press_legacy_single_button_control() -> None:
 
 def test_ev_start_fails_when_disconnected() -> None:
     hass = FakeHass({"binary_sensor.ev_connected": "off", "switch.ev_start": "off"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -421,7 +421,7 @@ def test_ev_start_fails_when_configured_connection_state_is_unavailable() -> Non
             "switch.ev_start": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -446,7 +446,7 @@ def test_ev_start_and_stop_require_confirmed_charging_feedback() -> None:
             "switch.ev_control": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -484,7 +484,7 @@ def test_ev_stop_disables_switch_when_vehicle_has_suspended_charging() -> None:
             "switch.ev_charger": "on",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CHARGING: "sensor.ev_connector_status",
@@ -510,7 +510,7 @@ def test_ev_stop_confirms_stateful_control_without_charging_feedback(
 
     monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", unexpected_sleep)
     hass = FakeHass({"switch.ev_charger": "on"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {CONF_EV_CHARGER: "switch.ev_charger"},
     )
@@ -534,7 +534,7 @@ def test_ev_confirmation_failure_without_a_new_command_does_not_claim_ownership(
             "switch.ev_control": "on",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -580,7 +580,7 @@ def test_ev_retry_service_failure_still_restores_first_command() -> None:
         }
     )
     hass.services = RetryFailServices(hass.states)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -608,7 +608,7 @@ def test_ev_switch_confirmation_timeout_is_not_downgraded_to_no_change() -> None
             "input_boolean.ev_stop": "on",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -652,7 +652,7 @@ def test_ev_unconfirmed_compensation_retains_rollback_failure_evidence() -> None
         }
     )
     hass.services = StuckControlServices(hass.states)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -679,7 +679,7 @@ def test_ev_keep_on_confirms_stateful_control_without_requiring_active_charging(
             "switch.ev_control": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -703,7 +703,7 @@ def test_ev_keep_on_rejects_momentary_start_control() -> None:
             "button.ev_start": "unknown",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -726,7 +726,7 @@ def test_ev_keep_on_prefers_persistent_charger_over_optional_start_button() -> N
             "switch.ev_control": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -750,7 +750,7 @@ def test_ev_keep_on_rejects_separate_start_switch_without_persistent_control() -
             "switch.ev_start": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -773,7 +773,7 @@ def test_ev_confirmation_accepts_matching_feedback_when_control_is_already_set()
             "switch.ev_control": "on",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -792,7 +792,7 @@ def test_ev_confirmation_accepts_matching_feedback_when_control_is_already_set()
 
 def test_ev_confirmation_rejects_service_failure_and_unknown_feedback() -> None:
     failed = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             FailingHass(
                 {
                     "binary_sensor.ev_connected": "on",
@@ -816,7 +816,7 @@ def test_ev_confirmation_rejects_service_failure_and_unknown_feedback() -> None:
         }
     )
     unknown = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             unknown_hass,
             {
                 CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -842,7 +842,7 @@ def test_ev_confirmation_fails_when_feedback_is_unavailable() -> None:
             "switch.ev_start": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -860,7 +860,7 @@ def test_ev_confirmation_fails_when_feedback_is_unavailable() -> None:
 
 def test_ev_schedule_fails_closed_without_target_helper() -> None:
     hass = FakeHass({"binary_sensor.ev_connected": "on", "switch.ev_start": "off"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -881,7 +881,7 @@ def test_ev_schedule_fails_closed_when_helper_service_fails() -> None:
             "input_number.ev_target_soc": "50",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -903,7 +903,7 @@ def test_ev_schedule_preflights_helpers_before_writing_values() -> None:
             "input_datetime.ev_ready_by": "06:00:00",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -925,7 +925,7 @@ def test_ev_schedule_preflights_helpers_before_writing_values() -> None:
 
 def test_ev_restore_uses_saved_persistent_switch_state() -> None:
     hass = FakeHass({"switch.ev_control": "on"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CHARGER: "switch.ev_control",
@@ -943,7 +943,7 @@ def test_ev_restore_uses_saved_persistent_switch_state() -> None:
 
 def test_ev_restore_deduplicates_new_and_legacy_aliases_for_same_control() -> None:
     hass = FakeHass({"switch.ev_control": "on"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CHARGER: "switch.ev_control",
@@ -966,7 +966,7 @@ def test_ev_restore_deduplicates_new_and_legacy_aliases_for_same_control() -> No
 
 def test_ev_execute_rejects_unsupported_action_kind() -> None:
     hass = FakeHass({})
-    adapter = EVSmartChargingAdapter(hass, {})
+    adapter = EVChargerAdapter(hass, {})
 
     result = asyncio.run(adapter.async_execute(_action(ActionKind.SET_HVAC)))
 
@@ -981,7 +981,7 @@ def test_ev_restore_without_saved_state_stops_as_fallback() -> None:
             "switch.ev_stop": "on",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
@@ -1006,7 +1006,7 @@ def test_disconnected_ev_with_off_persistent_control_is_already_safely_stopped()
             "button.ev_stop": "unknown",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1034,7 +1034,7 @@ def test_inactive_connected_ev_with_off_persistent_control_is_already_safe() -> 
             "switch.ev_charger": "off",
         }
     )
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1062,7 +1062,7 @@ def test_inactive_connected_ev_with_off_persistent_control_is_already_safe() -> 
 
 def test_ev_restore_reports_unrestorable_saved_state() -> None:
     hass = FakeHass({"sensor.ev": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "sensor.ev"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "sensor.ev"})
 
     result = asyncio.run(adapter.async_restore({CONF_EV_CHARGER: "on"}))
 
@@ -1073,7 +1073,7 @@ def test_ev_restore_reports_unrestorable_saved_state() -> None:
 
 def test_ev_restore_invalid_persistent_control_falls_back_to_safe_stop() -> None:
     hass = FakeHass({"sensor.ev": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "sensor.ev"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "sensor.ev"})
 
     result = asyncio.run(adapter.async_restore({CONF_EV_CHARGER: "on"}))
 
@@ -1085,7 +1085,7 @@ def test_ev_restore_invalid_persistent_control_falls_back_to_safe_stop() -> None
 
 def test_ev_native_connected_helper_blocks_manual_start_when_disconnected() -> None:
     hass = FakeHass({"switch.ev_start": "off"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {CONF_EV_CHARGER: "switch.ev_start"},
         connected_override=False,
@@ -1100,7 +1100,7 @@ def test_ev_native_connected_helper_blocks_manual_start_when_disconnected() -> N
 
 def test_ev_start_requires_configured_start_control() -> None:
     hass = FakeHass({"binary_sensor.ev_connected": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CONNECTED: "binary_sensor.ev_connected"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CONNECTED: "binary_sensor.ev_connected"})
 
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START)))
 
@@ -1110,7 +1110,7 @@ def test_ev_start_requires_configured_start_control() -> None:
 
 def test_ev_stop_requires_configured_stop_control() -> None:
     hass = FakeHass({})
-    adapter = EVSmartChargingAdapter(hass, {})
+    adapter = EVChargerAdapter(hass, {})
 
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_STOP)))
 
@@ -1120,7 +1120,7 @@ def test_ev_stop_requires_configured_stop_control() -> None:
 
 def test_ev_schedule_requires_ready_by_helper() -> None:
     hass = FakeHass({"binary_sensor.ev_connected": "on", "switch.ev_start": "off"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1136,7 +1136,7 @@ def test_ev_schedule_requires_ready_by_helper() -> None:
 
 def test_ev_schedule_rejects_unsupported_target_helper_domain() -> None:
     hass = FakeHass({"binary_sensor.ev_connected": "on", "switch.ev_start": "off", "sensor.target": "50"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1153,12 +1153,12 @@ def test_ev_schedule_rejects_unsupported_target_helper_domain() -> None:
 
 def test_ev_controls_fail_closed_for_unavailable_and_unsupported_domains() -> None:
     missing = asyncio.run(
-        EVSmartChargingAdapter(FakeHass({}), {CONF_EV_CHARGER: "switch.ev_start"}).async_execute(
+        EVChargerAdapter(FakeHass({}), {CONF_EV_CHARGER: "switch.ev_start"}).async_execute(
             _action(ActionKind.EV_START)
         )
     )
     unsupported = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             FakeHass({"sensor.ev_start": "off"}), {CONF_EV_CHARGER: "sensor.ev_start"}
         ).async_execute(_action(ActionKind.EV_START))
     )
@@ -1169,12 +1169,12 @@ def test_ev_controls_fail_closed_for_unavailable_and_unsupported_domains() -> No
 
 def test_ev_control_service_errors_fail_closed() -> None:
     button = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             FailingHass({"button.ev_start": "off"}), {CONF_EV_CHARGER: "button.ev_start"}
         ).async_execute(_action(ActionKind.EV_START))
     )
     switch = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             FailingHass({"switch.ev_start": "off"}), {CONF_EV_CHARGER: "switch.ev_start"}
         ).async_execute(_action(ActionKind.EV_START))
     )
@@ -1214,7 +1214,7 @@ def test_ev_start_service_error_waits_for_delayed_feedback_before_rollback() -> 
         }
     )
     hass.services = AcceptedThenRaisedServices(hass.states)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1256,7 +1256,7 @@ def test_ev_stateful_stop_service_error_confirms_control_and_feedback() -> None:
         }
     )
     hass.services = AcceptedThenRaisedServices(hass.states)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CHARGING: "binary_sensor.ev_charging",
@@ -1293,7 +1293,7 @@ def test_ev_control_service_exception_restores_a_mutated_switch() -> None:
         }
     )
     hass.services = ApplyThenRaiseServices(hass.states)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1326,7 +1326,7 @@ def test_ev_schedule_writes_all_supported_helper_domains() -> None:
             "time.ev_ready_by": "06:00",
         }
     )
-    datetime_adapter = EVSmartChargingAdapter(
+    datetime_adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1334,7 +1334,7 @@ def test_ev_schedule_writes_all_supported_helper_domains() -> None:
             CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ev_ready_by",
         },
     )
-    time_adapter = EVSmartChargingAdapter(
+    time_adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1356,7 +1356,7 @@ def test_ev_schedule_writes_all_supported_helper_domains() -> None:
 
 
 def test_ev_value_match_helpers_handle_invalid_values() -> None:
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         FakeHass(
             {
                 "input_number.bad": "not-number",
@@ -1385,7 +1385,7 @@ def test_ev_value_match_helpers_handle_invalid_values() -> None:
 
 def test_native_schedule_and_manual_commands_control_charger_directly() -> None:
     hass = FakeHass({"switch.charger": "off"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
 
     start = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"charging_required_now": True})))
     stop = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"charging_required_now": False})))
@@ -1424,7 +1424,7 @@ def test_ev_dispatch_timeout_accepts_observed_feedback_without_retry(monkeypatch
         await asyncio.Event().wait()
 
     hass.services.async_call = accepted
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass,
         {
             CONF_EV_CONNECTED: "binary_sensor.ev_connected",
@@ -1444,7 +1444,7 @@ def test_ev_dispatch_timeout_accepts_observed_feedback_without_retry(monkeypatch
 def test_ev_buttons_never_dispatch_or_claim_command_sent(domain: str) -> None:
     entity_id = f"{domain}.start"
     hass = FakeHass({entity_id: "unavailable"})
-    adapter = EVSmartChargingAdapter(hass, {})
+    adapter = EVChargerAdapter(hass, {})
     result = asyncio.run(adapter._async_call_control(entity_id, turn_on=True))
     assert not result.applied
     assert not result.command_sent
@@ -1459,7 +1459,7 @@ def test_ev_buttons_never_dispatch_or_claim_command_sent(domain: str) -> None:
 @pytest.mark.parametrize("saved", [{CONF_EV_CHARGER: "unknown"}, {"ev_charger_start_entity": "off"}])
 def test_ev_restore_invalid_snapshot_safely_stops_the_configured_switch(saved) -> None:
     hass = FakeHass({"switch.charger": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
     result = asyncio.run(adapter.async_restore(saved))
     assert result.applied and result.safe_state_confirmed
     assert result.reason == "ev_saved_state_safe_stop"
@@ -1468,7 +1468,7 @@ def test_ev_restore_invalid_snapshot_safely_stops_the_configured_switch(saved) -
 
 def test_ev_restore_snapshot_cannot_touch_conflicting_legacy_alias() -> None:
     hass = FakeHass({"switch.current": "on", "switch.legacy": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.current",
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.current",
                                           "ev_smart_charging_entity": "switch.legacy"})
     result = asyncio.run(adapter.async_restore({"ev_smart_charging_entity": "off"}))
     assert result.applied and result.safe_state_confirmed
@@ -1478,7 +1478,7 @@ def test_ev_restore_snapshot_cannot_touch_conflicting_legacy_alias() -> None:
 
 def test_ev_recovery_rejects_non_stateful_snapshot_targets() -> None:
     hass = FakeHass({"sensor.invalid": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "sensor.invalid"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "sensor.invalid"})
     assert asyncio.run(adapter._async_restore_control_snapshot({CONF_EV_CHARGER: "off"})) == (False, False)
     assert asyncio.run(adapter._async_control_proves_safe("sensor.invalid")) is False
     assert asyncio.run(adapter._async_control_proves_safe(None)) is False
@@ -1492,7 +1492,7 @@ def test_ev_failed_stop_retains_uncertainty_if_mapping_disappears_during_dispatc
         data.clear()
         raise RuntimeError("configuration changed during dispatch")
     hass.services.async_call = lost_control
-    adapter = EVSmartChargingAdapter(hass, data, confirmation_timeout_seconds=0)
+    adapter = EVChargerAdapter(hass, data, confirmation_timeout_seconds=0)
     result = asyncio.run(adapter.async_set_charging(False))
     assert not result.applied and result.command_sent
     assert result.rollback_succeeded is False
@@ -1501,7 +1501,7 @@ def test_ev_failed_stop_retains_uncertainty_if_mapping_disappears_during_dispatc
 
 def test_ev_legacy_ready_by_only_schedule_still_uses_the_charger_switch() -> None:
     hass = FakeHass({"switch.charger": "off", "input_datetime.ready_by": "06:00:00"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger",
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.charger",
         CONF_EV_SMART_CHARGING_READY_BY: "input_datetime.ready_by"})
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {"ready_by": "07:00"})))
     assert result.applied
@@ -1536,7 +1536,7 @@ def test_ev_start_lease_expiry_stops_without_retry(monkeypatch, kind, failed_sto
 
     hass.services.async_call = dispatch
     monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", sleep_until_expired)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
         confirmation_timeout_seconds=30, confirmation_retries=3,
     )
@@ -1577,7 +1577,7 @@ def test_ev_start_dispatch_finishing_after_lease_is_compensated(
     mapping = {CONF_EV_CHARGER: "switch.charger"}
     if feedback:
         mapping[CONF_EV_CHARGING] = "sensor.feedback"
-    adapter = EVSmartChargingAdapter(hass, mapping, confirmation_timeout_seconds=0)
+    adapter = EVChargerAdapter(hass, mapping, confirmation_timeout_seconds=0)
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
         "charge_lease_until": (now + timedelta(seconds=1)).isoformat(),
         "keep_charger_on": keep_on,
@@ -1592,7 +1592,7 @@ def test_ev_start_expired_before_dispatch_leaves_manual_control_alone(monkeypatc
     now = datetime.now(UTC)
     monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: now)
     hass = FakeHass({"switch.charger": "on"})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
         "charge_lease_until": now.isoformat(),
     })))
@@ -1607,7 +1607,7 @@ def test_ev_start_does_not_retry_after_lease_expires_between_attempts(monkeypatc
     clock = [now]
     monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: clock[0])
     hass = FakeHass({"switch.charger": "off", "sensor.feedback": "SUSPENDED_EVSE"})
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
         confirmation_retries=3,
     )
@@ -1639,7 +1639,7 @@ def test_ev_adopted_active_control_is_stopped_when_lease_expires(monkeypatch) ->
         clock[0] = now + timedelta(seconds=2)
 
     monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", expire)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass, {CONF_EV_CHARGER: "switch.charger", CONF_EV_CHARGING: "sensor.feedback"},
     )
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_START, {
@@ -1677,7 +1677,7 @@ def test_ev_variable_limit_cannot_cross_start_lease(monkeypatch, stage, initial_
 
     hass.services.async_call = dispatch
     monkeypatch.setattr(ev_adapter_module.asyncio, "sleep", expire)
-    adapter = EVSmartChargingAdapter(
+    adapter = EVChargerAdapter(
         hass, {CONF_EV_CHARGER: "switch.charger", "ev_power_limit_entity": "number.limit"},
         power_options={"ev_limit_min": 1, "ev_limit_max": 7},
     )
@@ -1710,7 +1710,7 @@ def test_ev_legacy_helper_delay_cannot_start_after_allocation_expires(monkeypatc
         clock[0] = now + timedelta(seconds=2)
 
     hass.services.async_call = delayed_helper
-    adapter = EVSmartChargingAdapter(hass, {
+    adapter = EVChargerAdapter(hass, {
         CONF_EV_CHARGER: "switch.charger", CONF_EV_SMART_CHARGING_TARGET_SOC: "input_number.target",
     })
     result = asyncio.run(adapter.async_execute(_action(ActionKind.EV_SCHEDULE, {
@@ -1728,7 +1728,7 @@ def test_ev_expired_number_write_preserves_active_charger_setpoint(monkeypatch) 
     monkeypatch.setattr(ev_adapter_module.dt_util, "utcnow", lambda: now)
     attrs = {"min": 1, "max": 7, "step": 1, "unit_of_measurement": "kW"}
     hass = FakeHass({"switch.charger": "on", "number.limit": FakeState("3", attrs, "number.limit")})
-    adapter = EVSmartChargingAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
+    adapter = EVChargerAdapter(hass, {CONF_EV_CHARGER: "switch.charger"})
 
     assert not asyncio.run(adapter._async_write_number("number.limit", 6, valid_until=now))
     assert hass.states.get("number.limit").state == "3"

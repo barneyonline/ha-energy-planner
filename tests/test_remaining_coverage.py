@@ -41,7 +41,7 @@ from custom_components.ha_energy_planner.diagnostics import (
 from custom_components.ha_energy_planner.discovery import CapabilityEvidence, DiscoveryReport
 from custom_components.ha_energy_planner.discovery import _split_entity_values as discovery_split_entities
 from custom_components.ha_energy_planner.entity import planner_device_identifier
-from custom_components.ha_energy_planner.ev_adapter import EVSmartChargingAdapter, _time_parts
+from custom_components.ha_energy_planner.ev_adapter import EVChargerAdapter, _time_parts
 from custom_components.ha_energy_planner.executor import Executor, _profile_control_service_for_target
 from custom_components.ha_energy_planner.forecasts import _energy_items_as_average_power, _items_from_value, _parse_item
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter
@@ -119,7 +119,7 @@ class Services:
 
 
 def test_remaining_validation_and_small_helpers(monkeypatch: pytest.MonkeyPatch) -> None:
-    import voluptuous as vol
+    import probatio as vol
 
     with pytest.raises(vol.Invalid):
         _validate_ready_by_time("bad")
@@ -510,7 +510,7 @@ def test_remaining_config_and_adapter_tail_branches(monkeypatch: pytest.MonkeyPa
 
 
 def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None:
-    import voluptuous as vol
+    import probatio as vol
 
     from custom_components.ha_energy_planner import diagnostics as diagnostics_module
     from custom_components.ha_energy_planner import system_health as system_health_module
@@ -683,7 +683,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
     assert async_migrate_subentries_to_entry_data(hass2, entry) is False
 
     assert (
-        EVSmartChargingAdapter(SimpleNamespace(states=States({}), services=Services()), {})._entity_value_matches(
+        EVChargerAdapter(SimpleNamespace(states=States({}), services=Services()), {})._entity_value_matches(
             "sensor.missing", "x"
         )
         is False
@@ -714,7 +714,7 @@ def test_final_exact_remaining_branches(monkeypatch: pytest.MonkeyPatch) -> None
         1,
     )
     ev_result = asyncio.run(
-        EVSmartChargingAdapter(
+        EVChargerAdapter(
             SimpleNamespace(
                 states=States({"time.ready": "06:00", "switch.ev": "off", "binary_sensor.connected": "on"}),
                 services=FailingServices(),

@@ -145,10 +145,3 @@ def _latest_status(value: Any) -> str | None:
     if isinstance(baseline, dict) and baseline.get("status") is not None:
         return str(baseline["status"])
     return None
-
-
-def _latest_value(value: Any, key: str) -> Any:
-    """Return a compact value from the latest stored dictionary."""
-    if not isinstance(value, list) or not value or not isinstance(value[-1], dict):
-        return None
-    return value[-1].get(key)

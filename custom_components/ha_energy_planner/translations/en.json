@@ -46,7 +46,6 @@
       "entry_removed": "This Energy Planner configuration was removed.",
       "already_repaired": "This configuration has already been repaired.",
       "entry_disabled": "Enable this Energy Planner configuration, then open Repairs again.",
-      "restart_required": "The vehicle target was saved. Restart Home Assistant to finish migrating this configuration.",
       "repair_required": "The vehicle target was saved. Open Settings > System > Repairs to finish migrating this configuration.",
       "unsupported_version": "This configuration was created by a newer Energy Planner version. Update Energy Planner before changing it."
     }
@@ -711,7 +710,7 @@
         "step": {
           "target": {
             "title": "Repair vehicle target",
-            "description": "Select the vehicle target-SOC entity. Home Assistant 2026.9 requires a restart after saving; newer versions can retry immediately.",
+            "description": "Select the vehicle target-SOC entity to retry migration immediately.",
             "data": {
               "ev_smart_charging_target_soc_entity": "Vehicle target SOC"
             }
@@ -730,14 +729,9 @@
           "entry_removed": "This Energy Planner configuration was removed.",
           "already_repaired": "This configuration has already been repaired.",
           "entry_disabled": "Enable this Energy Planner configuration, then open Repairs again.",
-          "restart_required": "The vehicle target was saved. Restart Home Assistant to finish migrating this configuration.",
           "unsupported_version": "This configuration was created by a newer Energy Planner version. Update Energy Planner before changing it."
         }
       }
-    },
-    "migration_restart_required": {
-      "title": "Restart to finish repairing {title}",
-      "description": "The vehicle target was saved. This Home Assistant version requires a restart to retry the migration. Restart Home Assistant; the configuration and recovery data will be preserved."
     }
   }
 }

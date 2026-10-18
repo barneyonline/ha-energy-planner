@@ -5,7 +5,7 @@ requires-python = ">=3.14"
 dependencies = []
 
 [tool.energy-planner.support]
-baseline = "2026.9.0"
+baseline = "2026.10.0"
 previous = []
 mypy = "1.19.1"
 

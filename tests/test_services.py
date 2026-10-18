@@ -1111,8 +1111,8 @@ def test_resume_climate_service_returns_remaining_blocker():
 def test_charge_now_services_validate_duration_and_surface_rejections() -> None:
     from unittest.mock import AsyncMock
 
+    import probatio as vol
     import pytest
-    import voluptuous as vol
     from homeassistant.exceptions import HomeAssistantError
 
     coordinator = _coordinator()
