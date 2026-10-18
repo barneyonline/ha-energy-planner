@@ -40,8 +40,8 @@ body:
     id: homeassistant_version
     attributes:
       label: Home Assistant version
-      description: "Example: 2026.9.0"
-      placeholder: "2026.9.0"
+      description: "Example: 2026.10.0"
+      placeholder: "2026.10.0"
     validations:
       required: true
   - type: input

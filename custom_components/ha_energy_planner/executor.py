@@ -55,7 +55,7 @@ from .enphase_adapter import EnphaseCommandResult, EnphaseProfileAdapter
 from .enphase_control import EnphaseControlTransaction
 from .enphase_export_limit import ExportLimitControl
 from .enphase_export_limit import evidence as export_limit_evidence
-from .ev_adapter import EVCommandResult, EVSmartChargingAdapter
+from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power, _positive_float, reserve_ev_grid_capacity
 from .ev_policy import finite, power_capability
 from .ev_runtime import allocation_deadline, price_stop_required, settle_spending, timestamp
@@ -442,7 +442,7 @@ class Executor:
         )
         if not enabled:
             self.ev_start_feedback_expected_until = None
-        manual_adapter = EVSmartChargingAdapter(
+        manual_adapter = EVChargerAdapter(
             self.hass,
             ev_entry_data,
             command_guard=command_guard,
@@ -849,7 +849,7 @@ class Executor:
                 if "ev_power_limit_entity" in saved_ev:
                     action.desired_state["restore_power_limit"] = saved_ev["ev_power_limit_entity"]
                     action.desired_state["restore_power_limit_unit"] = saved_ev.get("ev_power_limit_unit")
-            ev_result = await EVSmartChargingAdapter(
+            ev_result = await EVChargerAdapter(
                 self.hass,
                 ev_entry_data,
                 command_guard=command_guard,
@@ -1539,7 +1539,7 @@ class Executor:
         elif self.hass is not None:
             if restore_ev and (ev_state or has_ev_reservation):
                 try:
-                    ev_adapter = EVSmartChargingAdapter(
+                    ev_adapter = EVChargerAdapter(
                         self.hass,
                         (
                             dict(ev_control_topology)

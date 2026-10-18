@@ -27,14 +27,14 @@ def test_combined_modules_preserve_test_and_crash_failures(tmp_path: Path, exit_
     docker.chmod(0o755)
     calls_file = tmp_path / "calls"
     result = subprocess.run(
-        ["bash", str(ROOT / "scripts/docker-compatibility.sh"), "2026.9.0", "stable"],
+        ["bash", str(ROOT / "scripts/docker-compatibility.sh"), "2026.10.0", "stable"],
         env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}",
              "CALLS_FILE": str(calls_file), "DOCKER_TEST_EXIT": str(exit_code)},
         capture_output=True, text=True, check=False,
     )
     assert result.returncode == exit_code, result.stderr
     calls = calls_file.read_text().splitlines()
-    versions = ["2026.9.0", "stable"] if exit_code == 0 else ["2026.9.0"]
+    versions = ["2026.10.0", "stable"] if exit_code == 0 else ["2026.10.0"]
     assert len(calls) == len(versions)
     for version in versions:
         version_calls = [line for line in calls if f"home-assistant:{version} " in line]

@@ -9,7 +9,7 @@ import pytest
 
 from custom_components.ha_energy_planner.const import DEFAULT_OPTIONS
 from custom_components.ha_energy_planner.ev import EVChargeSchedule
-from custom_components.ha_energy_planner.ev_optimization import _battery_cost, _deliver, optimise_ev
+from custom_components.ha_energy_planner.ev_optimization import _battery_simulator, _charge_interval, optimise_ev
 from custom_components.ha_energy_planner.ev_policy import finite, power_capability, strategy
 from custom_components.ha_energy_planner.ev_telemetry import measured, update_ev_telemetry
 from custom_components.ha_energy_planner.models import DecisionContext, DecisionSlot, InputHealth, OccupancyState
@@ -161,17 +161,18 @@ def test_battery_reserve_and_opportunity_cost():
     ctx.slots[0].pv_forecast_kw = 7
     ctx.current_battery_soc_percent = 10
     ctx.current_enphase_profile = ctx.enphase_self_consumption_profile = "self"
-    baseline, terminal, reason = _battery_cost(ctx, DEFAULT_OPTIONS, {}, timedelta(minutes=5))
-    candidate, _, _ = _battery_cost(ctx, DEFAULT_OPTIONS, {0: 0.5}, timedelta(minutes=5))
+    baseline, terminal, reason = _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5))({})
+    candidate, _, _ = _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5))({0: 0.5})
     assert reason == "observed_profile_simulation"
     assert terminal > 0
     assert candidate > baseline
     ctx.current_enphase_profile = "opaque ai"
-    assert _battery_cost(ctx, DEFAULT_OPTIONS, {}, timedelta(minutes=5))[2] == "battery_profile_or_model_unavailable"
+    unavailable = _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5))({})
+    assert unavailable[2] == "battery_profile_or_model_unavailable"
     ctx.current_enphase_profile = ctx.enphase_full_backup_profile = "backup"
-    assert _battery_cost(ctx, DEFAULT_OPTIONS, {}, timedelta(minutes=5))[2] == "observed_profile_simulation"
+    assert _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5))({})[2] == "observed_profile_simulation"
     ctx.slots[-1].import_price = None
-    assert _battery_cost(ctx, DEFAULT_OPTIONS, {}, timedelta(minutes=5))[2] == "battery_forecast_incomplete"
+    assert _battery_simulator(ctx, DEFAULT_OPTIONS, timedelta(minutes=5))({})[2] == "battery_forecast_incomplete"
 
 
 def test_band_rates_integrate_across_boundaries():
@@ -180,10 +181,10 @@ def test_band_rates_integrate_across_boundaries():
         "aggregate": {"minutes": 60, "soc_per_kwh": 10},
         "bands": {"80": {"sessions": 3, "minutes": 60, "soc_per_kwh": 5}},
     }
-    assert _deliver(ctx, 79, 1, 10, expected=True) == pytest.approx(84.5)
-    assert _deliver(ctx, 99, 10, 10) == 100
+    assert _charge_interval(ctx, 79, 100, 1, 1, 10, expected=True)[0] == pytest.approx(84.5)
+    assert _charge_interval(ctx, 99, 100, 10, 1, 10)[0] == 100
     ctx.ev_evidence["performance"]["bands"]["80"]["sessions"] = 2
-    assert _deliver(ctx, 80, 1, 10, expected=True) == 90
+    assert _charge_interval(ctx, 80, 100, 1, 1, 10, expected=True)[0] == 90
 
 
 def test_forecast_gap_distinguished_from_capacity_shortfall():
@@ -726,8 +727,6 @@ def test_positive_power_overrides_unchanged_energy_meter_for_delivery_status():
     ("backup", [0.149, 0.39249999999999996, 0.08250000000000006]),
 ])
 def test_prepared_battery_candidates_match_reference_and_reset_storage(mode, expected):
-    from custom_components.ha_energy_planner.ev_optimization import _battery_simulator
-
     ctx = context((0.1, -0.2, 0.5, 0.3, 0.1), pv=2)
     ctx.created_at += timedelta(minutes=7)
     ctx.current_battery_soc_percent = 10

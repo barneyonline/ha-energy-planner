@@ -17,11 +17,6 @@ def migration_issue_id(entry_id: str) -> str:
     return f"legacy_vehicle_target_{entry_id}"
 
 
-def supports_migration_retry(hass: HomeAssistant) -> bool:
-    """The public retry API is absent from the supported HA 2026.9 baseline."""
-    return callable(getattr(hass.config_entries, "async_retry_migration", None))
-
-
 def async_clear_migration_issue(hass: HomeAssistant, entry_id: str) -> None:
     """Remove obsolete recovery instructions without initializing a registry."""
     from homeassistant.helpers import issue_registry as ir
@@ -30,18 +25,16 @@ def async_clear_migration_issue(hass: HomeAssistant, entry_id: str) -> None:
         ir.async_delete_issue(hass, DOMAIN, migration_issue_id(entry_id))
 
 
-def async_create_migration_issue(
-    hass: HomeAssistant, entry: EnergyPlannerConfigEntry, *, restart_required: bool = False,
-) -> None:
+def async_create_migration_issue(hass: HomeAssistant, entry: EnergyPlannerConfigEntry) -> None:
     """Create or update the entry's actionable migration issue."""
     from homeassistant.helpers import issue_registry as ir
 
     ir.async_create_issue(
         hass, DOMAIN, migration_issue_id(entry.entry_id),
-        is_fixable=not restart_required,
+        is_fixable=True,
         is_persistent=False,
         severity=ir.IssueSeverity.ERROR,
-        translation_key="migration_restart_required" if restart_required else "legacy_vehicle_target",
+        translation_key="legacy_vehicle_target",
         translation_placeholders={"title": entry.title},
         data={"entry_id": entry.entry_id},
     )

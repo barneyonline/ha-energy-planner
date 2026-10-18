@@ -103,21 +103,6 @@ def _rate(context: DecisionContext, soc: float, fallback: float, *, expected: bo
     return rate if expected else rate * 0.9
 
 
-def _deliver(context: DecisionContext, soc: float, energy: float, fallback: float, *, expected: bool = False) -> float:
-    """Integrate across SOC boundaries instead of extrapolating one band."""
-    remaining = energy
-    for boundary in (60.0, 80.0, 90.0, 100.0):
-        if soc >= boundary:
-            continue
-        rate = _rate(context, soc, fallback, expected=expected)
-        used = min(remaining, (boundary - soc) / rate)
-        soc += used * rate
-        remaining -= used
-        if remaining <= 1e-9:
-            break
-    return min(soc, 100.0)
-
-
 def _charge_interval(
     context: DecisionContext,
     soc: float,
@@ -213,17 +198,6 @@ def _battery_simulator(
         return cost - max(current_stored - floor, 0) * terminal_value, terminal_value, "observed_profile_simulation"
 
     return simulate
-
-
-def _battery_cost(
-    context: DecisionContext,
-    options: Mapping[str, Any],
-    energy: Mapping[int, float],
-    interval: timedelta,
-    scenario: str | None = None,
-) -> tuple[float, float, str]:
-    """Simulate observed self-consumption/backup; never invent AI dispatch."""
-    return _battery_simulator(context, options, interval, scenario)(energy)
 
 
 def optimise_ev(

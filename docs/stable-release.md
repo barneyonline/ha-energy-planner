@@ -1,7 +1,7 @@
 # Setup, upgrades and stable contracts
 
-Home Assistant 2026.6.0 remains the minimum. The pinned validation baseline is
-2026.9.0; CI also exercises 2026.8.2 and floating stable. HACS owns the minimum
+Home Assistant 2026.10.0 is the minimum and pinned validation baseline.
+CI also exercises floating stable. HACS owns the minimum
 declaration and `tool.energy-planner.support` in pyproject owns tested versions.
 Weekly runtime checks detect upstream changes even without a repository push.
 
