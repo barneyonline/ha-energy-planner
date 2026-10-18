@@ -1,0 +1,117 @@
+{
+  "kind": "climate_inputs",
+  "name": "synthetic_zone_temperature_units_and_freshness",
+  "now": "2026-10-18T00:00:00+00:00",
+  "end": "2026-10-18T12:00:00+00:00",
+  "data": {
+    "climate_zone_entities": [
+      "climate.living",
+      "climate.family",
+      "climate.stale"
+    ],
+    "hvac_zone_mappings": {
+      "climate.living": {
+        "temperature": "sensor.living_temperature"
+      },
+      "climate.family": {
+        "temperature": "sensor.family_temperature"
+      },
+      "climate.stale": {
+        "temperature": "sensor.stale_temperature"
+      }
+    }
+  },
+  "states": {
+    "climate.living": {
+      "state": "cool",
+      "attributes": {},
+      "last_updated": "2026-10-18T00:00:00+00:00"
+    },
+    "sensor.living_temperature": {
+      "state": "23",
+      "attributes": {
+        "unit_of_measurement": "\u00b0C"
+      },
+      "last_updated": "2026-10-18T00:00:00+00:00"
+    },
+    "climate.family": {
+      "state": "cool",
+      "attributes": {},
+      "last_updated": "2026-10-18T00:00:00+00:00"
+    },
+    "sensor.family_temperature": {
+      "state": "77",
+      "attributes": {
+        "unit_of_measurement": "\u00b0F"
+      },
+      "last_updated": "2026-10-18T00:00:00+00:00"
+    },
+    "climate.stale": {
+      "state": "cool",
+      "attributes": {},
+      "last_updated": "2026-10-18T00:00:00+00:00"
+    },
+    "sensor.stale_temperature": {
+      "state": "24",
+      "attributes": {
+        "unit_of_measurement": "\u00b0C"
+      },
+      "last_updated": "2026-10-17T21:00:00+00:00"
+    }
+  },
+  "expected": {
+    "zones": {
+      "climate.living": {
+        "temperature": 23,
+        "temperature_entity": "sensor.living_temperature",
+        "temperature_source": {
+          "updated_at": "2026-10-18T00:00:00+00:00",
+          "fresh": true,
+          "status": "ready"
+        },
+        "humidity": null,
+        "low": null,
+        "high": null,
+        "occupied": null,
+        "maximum_humidity": null,
+        "enabled": true,
+        "low_entity": null,
+        "high_entity": null
+      },
+      "climate.family": {
+        "temperature": 25,
+        "temperature_entity": "sensor.family_temperature",
+        "temperature_source": {
+          "updated_at": "2026-10-18T00:00:00+00:00",
+          "fresh": true,
+          "status": "ready"
+        },
+        "humidity": null,
+        "low": null,
+        "high": null,
+        "occupied": null,
+        "maximum_humidity": null,
+        "enabled": true,
+        "low_entity": null,
+        "high_entity": null
+      },
+      "climate.stale": {
+        "temperature": null,
+        "temperature_entity": "sensor.stale_temperature",
+        "temperature_source": {
+          "updated_at": "2026-10-17T21:00:00+00:00",
+          "fresh": false,
+          "status": "stale"
+        },
+        "humidity": null,
+        "low": null,
+        "high": null,
+        "occupied": null,
+        "maximum_humidity": null,
+        "enabled": true,
+        "low_entity": null,
+        "high_entity": null
+      }
+    }
+  }
+}

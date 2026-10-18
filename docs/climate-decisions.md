@@ -33,6 +33,59 @@ validations before reactivation. Each mapped room must also pass its own
 chronological validation; whole-home accuracy cannot qualify an inaccurate room.
 These engineering thresholds are not guarantees of future performance.
 
+## Zone feedback and learned timing
+
+Configure → **Zone temperatures** selects one temperature sensor for each configured
+zone, preserving other room mappings. Existing average helpers can represent a
+shared zone. Selecting a sensor does not enable the zone. Celsius and Fahrenheit
+readings use the existing freshness policy. Missing or stale explicitly mapped
+readings block acquisition and safely release shared-unit ownership; they never
+silently fall back to the Daikin temperature. Unmapped installations retain their
+existing main-unit feedback. Explicit room comfort helpers must also be available
+and ordered correctly; a failed helper cannot inherit household bounds. Invalid
+explicit mappings block shared-unit control.
+
+Cooling follows the warmest mapped room and heating the coldest. All mapped rooms
+must reach their applicable target before early coast. Opposite comfort limits
+remain protected before acquisition and during preparation, and coast hands back
+at the comfort boundary. Qualified zero-duration preparation does not start a cycle.
+
+Temperature learning is enabled by default, independently of economic-model
+readiness. Separate source-specific heating, cooling and passive trends use
+non-overlapping windows of 5–30 minutes, accumulating coarse readings rather than
+turning each whole-degree step into a five-minute rate. Flat and adverse trends
+are retained. Transitions, sensor failures, interventions and uncertain commands
+break the observation interval. Rates use distinct sensor-report timestamps; an old
+reading from before the observed operating regime cannot become a recent change.
+Each mode needs 12 accepted windows covering at
+least 60 minutes from the last 14 days. Individual dated windows and measured-load
+evidence expire, so one new observation cannot revive old readiness.
+Sensor or topology changes reset incompatible statistics.
+
+The initial lead defaults to **90 minutes**. Existing saved values are preserved.
+Qualified rates extend preparation up to **Maximum learned preconditioning lead**
+(default **180 minutes**). Zero initial lead still disables preconditioning.
+Insufficient evidence uses the initial lead. When a target needs longer than the
+maximum, the fallback policy can use the remaining priced window and report its
+predicted shortfall. Price qualification includes the same expanded window used
+for candidate selection. Both search grids round within the hard maximum, even
+when it is not a whole planning interval. Economic candidates use their own
+preparation deadline rather than the far end of the forecast. Fallback coast
+feasibility and maintenance-load projections use the first mapped room to exhaust
+its own comfort reserve, including its own passive drift.
+Economic candidates retain their savings
+and recovery checks.
+Learning does not manufacture compressor measurements: mode feedback and estimated
+watts can describe net room response, but economic energy validation still requires
+measured power. Disabling temperature learning retains qualified measured-load
+estimates; electrical-load readiness is reported independently. Shared-unit load
+evidence combines qualifying measurements from every mapped room, irrespective
+of room order or availability. Duplicate timestamps count once, retained
+measurements stay at least five minutes apart, and the shared series retains at
+most 96 measurements from the last 14 days.
+Decision diagnostics expose sensors, rates, learning rejections,
+effective lead and finishing-temperature estimates.
+
 ## Optional inputs
 
 Measured HVAC power is optional for setup but required to validate energy savings.

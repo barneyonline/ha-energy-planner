@@ -277,7 +277,9 @@
               "hvac_irradiance_forecast_entity": "Solar irradiance forecast",
               "hvac_zone_mappings": "Room measurements",
               "hvac_cop_table": "Equipment efficiency curve",
-              "hvac_power_source_type": "HVAC power source type"
+              "hvac_power_source_type": "HVAC power source type",
+              "hvac_precondition_max_lead_minutes": "Maximum learned preconditioning lead (minutes)",
+              "hvac_thermal_learning_enabled": "Learn heating and cooling rates"
             },
             "data_description": {
               "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
@@ -293,7 +295,7 @@
               "person_entities": "Person entities used to infer occupied or away state.",
               "occupied_temperature_tolerance_percent": "Allowed comfort-band widening while the home is occupied.",
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
-              "hvac_precondition_lead_minutes": "How far ahead HVAC may precondition before an expensive or comfort-sensitive period.",
+              "hvac_precondition_lead_minutes": "Initial lead before rates are ready; defaults to 90 minutes. Zero disables preconditioning.",
               "hvac_precondition_min_price_delta": "Minimum price difference required before HVAC preconditioning is considered worthwhile.",
               "hvac_precondition_configured_zones_only": "After applying and confirming each tariff preconditioning and coast target on the main Daikin thermostat, apply the same target to configured zone climate entities. Leave disabled to keep zone climate targets unchanged while still controlling zone switches or helpers.",
               "hvac_precondition_while_away": "Allow tariff-driven preconditioning while every configured person is away. Leave off to retain the conservative occupied-only policy.",
@@ -309,7 +311,9 @@
               "hvac_irradiance_forecast_entity": "Optional forecast sensor with issued_at and timestamped valid_at/irradiance points in W/m².",
               "hvac_zone_mappings": "Map configured zone entity IDs to temperature, humidity, presence, low/high helper IDs and optional maximum_humidity.",
               "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration.",
-              "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated."
+              "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated.",
+              "hvac_precondition_max_lead_minutes": "Allow learned rates to start earlier, up to this limit. Defaults to 180 minutes.",
+              "hvac_thermal_learning_enabled": "Collect room temperature trends and use qualified heating/cooling rates for timing. This does not enable measured-energy savings."
             }
           },
           "enphase_inputs": {
@@ -498,7 +502,8 @@
           "settings": "Planner settings",
           "add_vehicle": "Add vehicle",
           "edit_vehicle": "Edit vehicle",
-          "remove_vehicle": "Remove vehicle"
+          "remove_vehicle": "Remove vehicle",
+          "zone_temperatures": "Zone temperatures"
         }
       },
       "add_vehicle": {
@@ -571,6 +576,10 @@
         "data": {
           "vehicle_id": "Vehicle"
         }
+      },
+      "zone_temperatures": {
+        "title": "Zone temperatures",
+        "description": "Choose one temperature sensor for each zone. An existing average helper can represent several rooms. Leave empty to retain Daikin feedback. Selecting a sensor does not turn the zone on."
       }
     },
     "error": {
@@ -587,11 +596,14 @@
       "invalid_vehicle_settings": "Enter a valid ready-by time and positive charging characteristics.",
       "vehicle_requires_charger_connection": "First configure the shared charger Plugged In sensor in Configure.",
       "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes.",
-      "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported."
+      "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported.",
+      "invalid_unit": "Select an existing Celsius or Fahrenheit temperature sensor.",
+      "invalid_precondition_lead": "The maximum learned lead must be at least the initial lead and no greater than 360 minutes."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",
-      "vehicle_not_found": "This vehicle was removed. Open Configure again."
+      "vehicle_not_found": "This vehicle was removed. Open Configure again.",
+      "no_climate_zones": "Configure Climate Zones in Planner settings before mapping zone temperatures."
     }
   },
   "exceptions": {

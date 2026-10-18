@@ -4735,6 +4735,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
         input_issues=[],
         occupancy_state=OccupancyState.OCCUPIED,
         climate_inputs={}, climate_engine={}, active_overrides=[],
+        climate_zone_entities=[],
         current_hvac_temperature_c=None, current_outdoor_temperature_c=None,
         current_hvac_power_kw=None, occupied_temperature_low_c=None,
         occupied_temperature_high_c=None, current_hvac_mode=None,
@@ -4817,8 +4818,8 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
         lambda *args, **kwargs: ({"enabled": True}, True),
     )
     monkeypatch.setattr(
-        "custom_components.ha_energy_planner.coordinator.update_thermal_model",
-        lambda *args, **kwargs: ({"enabled": True}, True),
+        "custom_components.ha_energy_planner.coordinator.update_zone_thermal_model",
+        lambda *args, **kwargs: {"enabled": True},
     )
     monkeypatch.setattr("custom_components.ha_energy_planner.coordinator.DryRunPlanner", FakePlanner)
     monkeypatch.setattr(

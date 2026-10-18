@@ -95,7 +95,9 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
                 device_ids.update(d.id for d in own_devices)
                 menu = await hass.config_entries.options.async_init(current.entry_id)
                 assert menu["type"] == "menu"
-                assert menu["menu_options"] == ["settings", "add_vehicle", "edit_vehicle", "remove_vehicle"]
+                assert menu["menu_options"] == [
+                    "settings", "zone_temperatures", "add_vehicle", "edit_vehicle", "remove_vehicle",
+                ]
                 selection = await hass.config_entries.options.async_configure(
                     menu["flow_id"], {"next_step_id": "edit_vehicle"},
                 )
