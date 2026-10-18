@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Retain confirmed Export Limit baseline restorations in calendar history with the restored setting and an explicit restoration label, including delayed feedback and reload recovery, without duplicating confirmations or recording failed requests and no-op releases as device actions.
 
 ### 🔧 Improvements
 
