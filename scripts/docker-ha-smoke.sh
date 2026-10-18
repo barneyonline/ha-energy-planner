@@ -93,22 +93,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             )
 
     async def seed_thermal_model_sample(call: ServiceCall) -> None:
-        """Seed a recent prior HVAC sample for smoke thermal-model validation."""
+        """Seed a recent same-regime anchor; the real coordinator must learn the next window."""
+        from custom_components.ha_energy_planner.thermal_learning import sample, update
+
         sampled_at = dt_util.utcnow() - timedelta(minutes=5)
         for entry in hass.config_entries.async_entries("ha_energy_planner"):
-            coordinator = getattr(entry, "runtime_data", None)
-            store = getattr(coordinator, "store", None)
-            if store is None:
-                continue
-            model = dict(store.data.get("thermal_model", {}))
-            model["last_sample"] = {
-                "sampled_at": sampled_at.isoformat(),
-                "hvac_mode": "heat",
-                "indoor_temperature_c": 20.0,
-                "outdoor_temperature_c": 12.0,
-                "hvac_power_kw": 1.8,
-            }
-            await store.async_save_thermal_model(model)
+            coordinator = entry.runtime_data
+            context = coordinator._last_decision_context
+            previous = sample(context, coordinator.options, hass.states, "climate.fake_daikin")
+            if previous["intervention"] or previous["sources"]["head"]["mode"] != "heat":
+                raise ValueError(f"Thermal smoke must start in confirmed normal heating: {previous}")
+            previous["at"] = sampled_at.isoformat()
+            for reading in previous["sources"].values():
+                reading["temperature"] -= 0.1
+                reading["reported_at"] = sampled_at.isoformat()
+            await coordinator.store.async_save_thermal_model(update({}, previous))
 
     async def seed_enphase_command_rate_limit(call: ServiceCall) -> None:
         """Seed a future Enphase command cooldown for smoke execution-gate validation."""
@@ -679,6 +678,10 @@ automation:
         data:
           entity_id: input_number.import_price
           value: 0.10
+      - action: fake_planner_test.wait_for_planner_idle
+      - action: fake_planner_test.seed_thermal_model_sample
+      - action: ha_energy_planner.replan
+      - action: fake_planner_test.wait_for_planner_idle
       - action: fake_planner_test.seed_production_evidence
       - action: ha_energy_planner.arm_production_control
         data:
@@ -832,7 +835,6 @@ automation:
       - action: input_boolean.turn_off
         data:
           entity_id: input_boolean.climate_change_from_scheduler
-      - action: fake_planner_test.seed_thermal_model_sample
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
       - action: input_select.select_option
@@ -1506,15 +1508,14 @@ if any(failure in training_failures for failure in {"recorder_unavailable", "tra
 if "thermal_model" not in store_data:
     raise SystemExit("Planner Store did not initialize thermal model state")
 thermal_model = store_data.get("thermal_model", {})
-active_model = thermal_model.get("active_hvac_load_kw", {})
-if active_model.get("sample_count", 0) < 1:
-    raise SystemExit(f"Thermal model did not record an active HVAC power sample: {thermal_model}")
-try:
-    active_average = float(active_model.get("average"))
-except (TypeError, ValueError):
-    active_average = 0.0
-if active_average < 1.7:
-    raise SystemExit(f"Thermal model active HVAC load average was not sourced from HA power state: {thermal_model}")
+if thermal_model.get("model_version") != 3 or not thermal_model.get("learning_enabled"):
+    raise SystemExit(f"Temperature learning was not enabled in HA: {thermal_model}")
+head_model = thermal_model.get("sources", {}).get("head", {})
+heating = head_model.get("buckets", {}).get("heat", {})
+if heating.get("count", 0) < 1 or not 1.0 <= heating.get("rate_c_per_hour", 0) <= 1.3:
+    raise SystemExit(f"The real coordinator did not learn the seeded heating interval: {thermal_model}")
+if thermal_model.get("active_hvac_load_kw", {}).get("sample_count", 0) != 0:
+    raise SystemExit(f"Synthetic power must not establish measured electrical-load readiness: {thermal_model}")
 overrides = store_data.get("overrides", [])
 if not any(item.get("reason") == "docker_smoke_manual_override" for item in overrides):
     raise SystemExit("set_manual_hvac_override service did not persist the smoke override")

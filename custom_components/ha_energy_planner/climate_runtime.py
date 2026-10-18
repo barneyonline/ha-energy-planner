@@ -25,6 +25,8 @@ from .const import (
 )
 from .models import ActionAsset, ActionKind, DecisionContext, PlanAction
 from .safety import strict_bool
+from .thermal_learning import timing
+from .zone_temperature import comfort_breached, feedback_missing, target_reached
 
 
 def update_readiness(
@@ -118,6 +120,14 @@ def update_readiness(
 
 def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: list[PlanAction]) -> list[PlanAction]:
     """Return one policy's actions; authority still belongs to the existing executor."""
+    if feedback_missing(context):
+        context.climate_decision = {
+            "reason": "zone_temperature_unavailable", "preconditioning_status": "blocked",
+            "summary": "A configured zone temperature or comfort input is missing, invalid or stale.",
+        }
+        return [release_action(context, "hvac_required_evidence_lost", timedelta(minutes=int(
+            options[CONF_PLANNING_INTERVAL_MINUTES]
+        )))] if context.hvac_control else []
     state = dict(context.climate_engine)
     policy = options.get(CONF_HVAC_POLICY, "automatic")
     if policy == "legacy" or not context.climate_inputs:
@@ -169,26 +179,9 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         active = {}
     early_coast = False
     if owned_economic:
-        current = context.current_hvac_temperature_c
-        low, high = context.occupied_temperature_low_c, context.occupied_temperature_high_c
         stop = instant(active.get("precondition_end"))
         preconditioning = active.get("phase") == "preconditioning" and stop is not None and now < stop
-        if (
-            current is not None
-            and low is not None
-            and high is not None
-            and (
-                current < low
-                or current > high
-                or (
-                    not preconditioning
-                    and (
-                        (active.get("mode") == "heat" and current <= low)
-                        or (active.get("mode") == "cool" and current >= high)
-                    )
-                )
-            )
-        ):
+        if comfort_breached(context, str(active.get("mode", "")), coasting=not preconditioning):
             state.pop("scheduled", None)
             context.climate_engine = state
             return [
@@ -217,6 +210,12 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
         for mode, result in model.get("validation", {}).items()
     }
     decision["model_trained_at"] = model.get("trained_at")
+    if owned_economic:
+        stop = instant(active.get("precondition_end"))
+        decision["thermal_timing"] = timing(
+            context, options, str(active.get("mode")),
+            available_minutes=max((stop - now).total_seconds() / 60, 0) if stop else 0,
+        )
     decision["capabilities"] = {
         "arrival": bool(context.climate_inputs.get("arrival")),
         "rooms": sorted(model.get("rooms", {})),
@@ -227,18 +226,14 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
     incumbent = dict(state.get("scheduled", {}))
     if owned_economic:
         stop = instant(active.get("precondition_end"))
-        temperature, target = context.current_hvac_temperature_c, active.get("precondition_target")
+        target = active.get("precondition_target")
         early_coast = (
             active.get("main_state_committed") is True
             and active.get("phase") == "preconditioning"
             and stop is not None
             and now < stop
-            and temperature is not None
             and target is not None
-            and (
-                (active.get("mode") == "heat" and temperature >= target)
-                or (active.get("mode") == "cool" and temperature <= target)
-            )
+            and target_reached(context, str(active.get("mode")), float(target))
         )
         if early_coast:
             incumbent["stop"] = now.isoformat()

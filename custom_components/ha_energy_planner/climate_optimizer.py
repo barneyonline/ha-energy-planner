@@ -19,8 +19,10 @@ from .climate_learning import (
     temperature_step,
 )
 from .climate_models import RECOVERY_TOLERANCE_C, TERMINAL_BATTERY_TOLERANCE_KWH, ClimateCandidate, ClimateTrajectory
-from .const import CONF_HVAC_MIN_SAVING, CONF_HVAC_PRECONDITION_LEAD_MINUTES, CONF_PLANNING_INTERVAL_MINUTES
+from .const import CONF_HVAC_MIN_SAVING, CONF_PLANNING_INTERVAL_MINUTES
 from .models import DecisionContext, DecisionSlot, OccupancyState
+from .thermal_learning import bounded_lead_slots, timing
+from .zone_temperature import comfort_breached, temperatures
 
 # Bound the generated comparison set before evaluating it. Every generated
 # candidate is checked; insufficient budget for mandatory coverage fails closed.
@@ -355,7 +357,6 @@ def optimise(
     if low is None or high is None or not low < high:
         reject("comfort_inputs_unavailable")
         return None, decision
-    lead = ceil(float(options[CONF_HVAC_PRECONDITION_LEAD_MINUTES]) / float(options[CONF_PLANNING_INTERVAL_MINUTES]))
     best: ClimateCandidate | None = None
     best_key: tuple[float, float, int, int] | None = None
     cache: dict[Any, Any] = {}
@@ -368,6 +369,9 @@ def optimise(
         evidence = model.get("validation", {}).get(mode, {})
         if evidence.get("blockers", ["model_unavailable"]):
             reject(f"{mode}_model_not_ready")
+            continue
+        if temperatures(context) and comfort_breached(context, mode, coasting=False):
+            reject("zone_comfort_boundary")
             continue
         baseline = simulate(context, model, options, mode=mode, cache=cache)
         if baseline is None:
@@ -388,12 +392,25 @@ def optimise(
         if not targets:
             reject("device_temperature_range_unsupported")
             continue
+        # A distant end-of-horizon deadline cannot bound nearer opportunities.
+        # Search the union of their leads, then enforce each stop's own bound.
+        timings = {stop: timing(
+            context, options, mode,
+            deadline_minutes=max((context.slots[stop].valid_at - context.created_at).total_seconds() / 60, 0),
+        ) for stop in range(1, len(context.slots) - 1)}
+        thermal_timing = max(timings.values(), key=lambda row: row["effective_lead_minutes"],
+                             default=timing(context, options, mode))
+        decision.setdefault("thermal_timing", {})[mode] = thermal_timing
+        lead = bounded_lead_slots(thermal_timing, options)
         schedules = candidate_schedules(len(context.slots), lead, targets, candidate_limit)
         if schedules is None:
             reject("search_work_limit")
             return None, decision
         decision["search"] = "bounded_deterministic_candidates"
         for start, stop, release, target in schedules:
+            if stop - start > bounded_lead_slots(timings[stop], options):
+                reject("adaptive_lead_limit")
+                continue
             normal_target = baseline.normal_targets[start] if baseline.normal_targets else reference
             if normal_target is None:
                 reject("normal_target_missing")
@@ -482,6 +499,13 @@ def optimise(
             if best_key is None or key < best_key:
                 best = candidate
                 best_key = key
+                decision["thermal_timing"][mode] = timing(
+                    context, options, mode,
+                    delay_minutes=max((context.slots[start].valid_at - context.created_at).total_seconds() / 60, 0),
+                    available_minutes=(
+                        context.slots[stop].valid_at - context.slots[start].valid_at
+                    ).total_seconds() / 60,
+                )
     if best is not None:
         decision.update(candidate_summary(context, best))
     return best, decision
@@ -526,6 +550,8 @@ def revalidate_schedule(
     if start is None or stop is None or end is None or not context.slots or end <= context.created_at:
         return None
     if scheduled.get("identity") != context.climate_inputs.get("identity"):
+        return None
+    if temperatures(context) and comfort_breached(context, str(scheduled.get("mode")), coasting=False):
         return None
     dates = [slot.valid_at for slot in context.slots]
     start_index = next((i for i, at in enumerate(dates) if at >= start), len(dates))

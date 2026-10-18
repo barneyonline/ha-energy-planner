@@ -707,3 +707,8 @@ rules:
 # Docker runners bootstrap pinned development tools from tests/requirements.txt;
 # scripts/install-test-dependencies.sh supports production images without pytest.
 # tests/scripts/test_select_ci_checks.py keeps all dependent CI gates selected.
+
+# Zone temperature and adaptive timing evidence: zone_temperature.py, thermal_learning.py;
+# tests/test_zone_temperature.py (sensor clocks, per-room coast, independent electrical readiness);
+# tests/test_climate_engine.py (candidate-specific lead bounds); docs/climate-decisions.md.
+# Shared electrical evidence: test_third_review_* in tests/test_zone_temperature.py.

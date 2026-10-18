@@ -190,7 +190,7 @@ def read_climate_inputs(
         item = state(entity)
         if item is None:
             if isinstance(entity, str) and entity:
-                sources[entity] = {"updated_at": None, "fresh": False}
+                sources[entity] = {"updated_at": None, "fresh": False, "status": "missing"}
             return None
         updated = instant(getattr(item, "last_reported", getattr(item, "last_updated", None)))
         valid = str(entity).startswith("input_number.") or (
@@ -199,6 +199,7 @@ def read_climate_inputs(
         sources[str(entity)] = {"updated_at": updated.isoformat() if updated else None, "fresh": valid}
         value = finite(item.state)
         sources[str(entity)]["fresh"] = False
+        sources[str(entity)]["status"] = "invalid" if valid else "stale"
         if not valid or value is None:
             return None
         unit = item.attributes.get("unit_of_measurement")
@@ -213,6 +214,7 @@ def read_climate_inputs(
         elif unit not in {"W/m²", "W/m2"} or value < 0:
             return None
         sources[str(entity)]["fresh"] = True
+        sources[str(entity)]["status"] = "ready"
         return value
 
     main = state(data.get(CONF_DAIKIN_CLIMATE))
@@ -243,9 +245,13 @@ def read_climate_inputs(
             presence = state(mapping.get("presence"))
             zones[entity] = {
                 "temperature": number(mapping.get("temperature"), "temperature"),
+                "temperature_entity": mapping.get("temperature"),
+                "temperature_source": dict(sources.get(mapping.get("temperature"), {})),
                 "humidity": number(mapping.get("humidity"), "humidity"),
                 "low": number(mapping.get("low"), "temperature"),
+                "low_entity": mapping.get("low"),
                 "high": number(mapping.get("high"), "temperature"),
+                "high_entity": mapping.get("high"),
                 "occupied": (presence.state == "on") if presence and presence.state in {"on", "off"} else None,
                 "maximum_humidity": finite(mapping.get("maximum_humidity")),
                 "enabled": bool(zone and zone.state not in {"off", "unknown", "unavailable"}),
@@ -298,6 +304,10 @@ def read_climate_inputs(
         if not validate_climate_config(data)
         else {},
         "configuration_valid": not bool(validate_climate_config(data)),
+        "zone_temperature_inputs_configured": any(
+            isinstance(mapping, dict) and bool(mapping.get("temperature"))
+            for mapping in mappings.values()
+        ) if isinstance(mappings, dict) else False,
         "battery_configured": bool(data.get(CONF_BATTERY_SOC)),
         "load_excludes_hvac": load_details.get("hvac_power_subtracted") is True,
         "currency": currency,
