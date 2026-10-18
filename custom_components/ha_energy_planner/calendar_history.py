@@ -182,10 +182,11 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
     # Charging windows need physical charging feedback, and HVAC phases need
     # committed ownership plus matching live mode, rather than service acceptance.
     confirmed = outcome.get("result") == "applied" or (
-        outcome.get("kind") == "release_hvac" and outcome.get("result") == "restored"
+        outcome.get("kind") in {"release_hvac", "restore_export_limit"} and outcome.get("result") == "restored"
     )
     if not confirmed or outcome.get("kind") not in {
         "set_profile", "restore_ai", "ev_stop", "release_hvac", "set_export_limit", "disable_export_limit",
+        "restore_export_limit",
     }:
         return state
     start = _timestamp(outcome.get("attempted_at"))
@@ -193,7 +194,12 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
         return state
     history = [record for record in calendar_records(state.get("history")) if _confirmed_start(record)]
     pending = calendar_records(state.get("pending"))
-    matches = [record for record in pending if record["uid"] == outcome.get("action_id")]
+    restoring_export = outcome.get("kind") == "restore_export_limit"
+    if restoring_export and any(record["uid"] == outcome.get("action_id") for record in history):
+        return state
+    # Restoration has no planned tariff window. Always derive its label from
+    # confirmed readback rather than matching provisional intent.
+    matches = [] if restoring_export else [record for record in pending if record["uid"] == outcome.get("action_id")]
     if not matches:
         fallback = _outcome_record(outcome, start)
         if fallback is not None:
@@ -216,6 +222,8 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
 def _outcome_record(outcome: dict[str, Any], start: datetime) -> dict[str, str] | None:
     """Recover a superseded plan's discrete event from its confirmed outcome."""
     plan_id, action_id = outcome.get("plan_id"), outcome.get("action_id")
+    if outcome.get("kind") == "restore_export_limit":
+        return _export_restore_record(outcome, start)
     if not isinstance(plan_id, str) or plan_id in {"", "manual"} or not isinstance(action_id, str) or not action_id:
         return None
     labels = {
@@ -232,5 +240,29 @@ def _outcome_record(outcome: dict[str, Any], start: datetime) -> dict[str, str] 
     location, summary = labels[(asset, kind)]
     return calendar_records([{
         "uid": action_id, "summary": f"{location}: {summary}", "location": location,
+        "start": start.isoformat(), "end": (start + timedelta(seconds=1)).isoformat(),
+    }])[0]
+
+
+def _export_restore_record(outcome: dict[str, Any], start: datetime) -> dict[str, str] | None:
+    """Admit only state-changing export restoration, including manual recovery."""
+    before, after = outcome.get("pre_state"), outcome.get("post_state")
+    action_id = outcome.get("action_id")
+    if (
+        outcome.get("asset") != "enphase_export_limit" or outcome.get("result") != "restored"
+        or not isinstance(action_id, str) or not action_id
+        or not isinstance(before, dict) or "watts" not in before
+        or not isinstance(after, dict) or "watts" not in after
+    ):
+        return None
+    watts = after["watts"]
+    if watts is not None and (type(watts) is not int or not 0 <= watts <= 100000):
+        return None
+    if all(before.get(key) == after.get(key) for key in ("watts", "slew_rate")):
+        return None
+    setting = "Disabled" if watts is None else f"Enabled — {watts} W"
+    return calendar_records([{
+        "uid": action_id, "summary": f"Enphase Export Limit: Restored {setting} (confirmed)",
+        "location": "Enphase Export Limit",
         "start": start.isoformat(), "end": (start + timedelta(seconds=1)).isoformat(),
     }])[0]

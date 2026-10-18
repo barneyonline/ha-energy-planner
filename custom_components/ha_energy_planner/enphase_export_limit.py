@@ -111,7 +111,11 @@ class ExportLimitControl:
     ) -> None:
         await self.store.async_add_outcome(
             ActionOutcome(
-                action_id=pending["action_id"],
+                # Manual restorations share a lifecycle label. The persisted
+                # request time distinguishes cycles, including legacy pending
+                # requests, and stays stable across feedback retries/reloads.
+                action_id=(f"{pending['action_id']}-{pending['sent_at']}"
+                           if pending["restore"] else pending["action_id"]),
                 attempted_at=now,
                 result=result,
                 reason=reason,
