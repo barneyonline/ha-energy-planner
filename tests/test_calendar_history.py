@@ -339,3 +339,15 @@ def test_slew_only_restoration_uses_readback_setting_and_keeps_future_plan_separ
     })
     assert state["history"][0]["summary"] == "Enphase Export Limit: Restored Enabled — 3000 W (confirmed)"
     assert state["pending"] == [planned]
+
+
+def test_confirmed_climate_release_cannot_keep_its_future_planned_label():
+    future = {**record(start=20, end=21, uid='release'), 'location': 'Climate',
+              'summary': 'Climate: Release climate control (planned)'}
+    saved = {'pending': [future]}
+    outcome = {'attempted_at': (NOW + timedelta(minutes=20)).isoformat(), 'asset': 'daikin',
+               'kind': 'release_hvac', 'result': 'restored', 'action_id': 'release', 'plan_id': 'plan'}
+    confirmed = confirm_calendar_action(saved, outcome)
+    assert confirmed['history'][0]['summary'] == 'Climate: Release climate control (confirmed)'
+    failed = confirm_calendar_action(saved, {**outcome, 'result': 'failed'})
+    assert failed.get('history', []) == []

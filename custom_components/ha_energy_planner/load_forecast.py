@@ -242,11 +242,12 @@ def load_forecast_from_model(
     horizon_hours: int,
     interval_minutes: int,
     source_entity_id: str,
+    slot_starts: list[datetime] | None = None,
     current_load_kw: float | None = None,
     current_ev_charging: bool | None = None,
 ) -> LoadForecastResult:
     """Return planning-interval expected and conservative load forecasts."""
-    slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
+    slot_count = len(slot_starts) if slot_starts is not None else max(int(horizon_hours * 60 / interval_minutes), 0)
     empty: list[float | None] = [None] * slot_count
     validated = _validated_model(model, source_entity_id, timezone)
     if validated is None:
@@ -265,18 +266,23 @@ def load_forecast_from_model(
     expected: list[float | None] = []
     upper: list[float | None] = []
     for index in range(slot_count):
-        target = now_utc + timedelta(minutes=index * interval_minutes)
+        target = (slot_starts[index] if slot_starts is not None
+                  else now_utc + timedelta(minutes=index * interval_minutes))
+        duration = (
+            ((slot_starts[index + 1] if index + 1 < slot_count else now_utc + timedelta(hours=horizon_hours))
+             - target).total_seconds() / 60 if slot_starts is not None else interval_minutes
+        )
         expected_value = _profile_interval_average(
             profiles,
             target,
-            interval_minutes=interval_minutes,
+            interval_minutes=duration,
             zone=zone,
             profile_key="expected",
         )
         upper_value = _profile_interval_average(
             profiles,
             target,
-            interval_minutes=interval_minutes,
+            interval_minutes=duration,
             zone=zone,
             profile_key="upper",
         )
@@ -284,7 +290,7 @@ def load_forecast_from_model(
             expected.append(None)
             upper.append(None)
             continue
-        elapsed_hours = index * interval_minutes / 60
+        elapsed_hours = (target - now_utc).total_seconds() / 3600
         correction_weight = max(1.0 - elapsed_hours / RECENT_CORRECTION_HOURS, 0.0)
         factor = 1.0 + (correction - 1.0) * correction_weight
         adjusted_expected = max(expected_value * factor, 0.0)
@@ -837,21 +843,22 @@ def _profile_interval_average(
     profiles: dict[str, Any],
     start: datetime,
     *,
-    interval_minutes: int,
+    interval_minutes: float,
     zone: ZoneInfo,
     profile_key: str,
 ) -> float | None:
     """Return the time-weighted profile average across one UTC planning slot."""
     total = 0.0
-    for minute in range(interval_minutes):
-        midpoint = start + timedelta(minutes=minute, seconds=30)
+    for minute in range(ceil(interval_minutes)):
+        weight = min(1.0, interval_minutes - minute)
+        midpoint = start + timedelta(minutes=minute + weight / 2)
         local = midpoint.astimezone(zone)
         values = profiles[_day_type(local.date())][profile_key]
         index = local.hour * 4 + local.minute // BUCKET_MINUTES
         value = _nearest_profile_value(values, index)
         if value is None:
             return None
-        total += value
+        total += value * weight
     return total / interval_minutes
 
 

@@ -69,6 +69,7 @@ from .planner_confidence import (
 from .planner_ev import _daylight_preferred_ev_schedule, _ev_earliest_start, _next_ready_by
 from .planner_hvac import HVACPlanningPolicy
 from .planner_presentation import _display_text, _timeline_card_rows, build_device_plans
+from .planning_grid import slot_hours
 from .preconditioning import planning_status
 from .safety import strict_bool
 
@@ -702,8 +703,9 @@ class DryRunPlanner:
             return None
         total = 0.0
         has_data = False
-        interval_hours = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES])).total_seconds() / 3600
+        interval_minutes = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         for slot in context.slots:
+            interval_hours = slot_hours(slot, interval_minutes)
             if slot.import_price is None or slot.baseline_load_forecast_kw is None:
                 continue
             load_kw = slot.baseline_load_forecast_kw + slot.projected_ev_load_kw + slot.projected_hvac_load_kw
@@ -717,13 +719,13 @@ class DryRunPlanner:
 
     def _estimated_cost_horizon_hours(self, context: DecisionContext) -> float | None:
         """Return the duration represented by usable estimated-cost slots."""
-        usable_slots = 0
+        usable_hours = 0.0
         for slot in context.slots:
             if slot.import_price is not None and slot.baseline_load_forecast_kw is not None:
-                usable_slots += 1
-        if usable_slots == 0:
+                usable_hours += slot_hours(slot, int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
+        if usable_hours == 0:
             return None
-        return round(usable_slots * int(self.options[CONF_PLANNING_INTERVAL_MINUTES]) / 60, 4)
+        return round(usable_hours, 4)
 
     @staticmethod
     def _confidence(context: DecisionContext) -> float:

@@ -54,7 +54,7 @@ def constant_forecast(
 def tariff_source_intervals(state: Any, interval_minutes: int) -> list[dict[str, Any]]:
     """Expose sanitized source boundaries used to identify tariff lifecycles."""
     attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
-    keys = ("import_price", "general_price", "per_kwh", "price", "value")
+    keys = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
     parsed = [
         _parse_item(
             item, value_keys=keys, value_kind="price", default_unit=str(attributes.get("unit_of_measurement", ""))
@@ -83,6 +83,7 @@ def forecast_series_from_state(
     value_keys: tuple[str, ...],
     value_kind: str,
     require_timestamped: bool = False,
+    slot_starts: list[datetime] | None = None,
 ) -> list[float | None] | None:
     """Return a slot-aligned numeric forecast series from common HA attributes.
 
@@ -101,7 +102,7 @@ def forecast_series_from_state(
             attributes.get("unit", attributes.get("temperature_unit", "")),
         )
     )
-    slot_count = int((horizon_hours * 60) / interval_minutes)
+    slot_count = len(slot_starts) if slot_starts is not None else int((horizon_hours * 60) / interval_minutes)
     if not raw_items:
         return None
     if value_kind == "power":
@@ -122,6 +123,12 @@ def forecast_series_from_state(
         # deliberately conservative: inventing a longer cadence would silently
         # extend a short forecast across the rest of the planning horizon.
         source_interval = _explicit_interval_minutes(attributes) or float(interval_minutes)
+        if slot_starts is not None:
+            values = [item[1] if item is not None else None for item in parsed_items]
+            return [
+                values[index] if 0 <= (index := int((at - issued_at).total_seconds() / 60 / source_interval))
+                < len(values) else None for at in slot_starts
+            ]
         return _align_ordered_values(parsed_items, slot_count, interval_minutes, source_interval)
 
     timestamped = sorted(
@@ -136,10 +143,10 @@ def forecast_series_from_state(
         maximum=explicit_cadence,
     )
     issued_at = _as_aware_utc(issued_at)
-    return [
-        _value_for_slot(issued_at + timedelta(minutes=offset), timestamped, final_cadence=cadence)
-        for offset in range(0, horizon_hours * 60, interval_minutes)
+    starts = slot_starts if slot_starts is not None else [
+        issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
+    return [_value_for_slot(at, timestamped, final_cadence=cadence) for at in starts]
 
 
 def forecast_coverage_ratio(series: list[float | None] | None) -> float:
@@ -154,6 +161,8 @@ def forecast_coverage_details(
     *,
     starts_at: datetime,
     interval_minutes: int,
+    slot_starts: list[datetime] | None = None,
+    horizon_end: datetime | None = None,
 ) -> dict[str, Any]:
     """Return bounded temporal coverage evidence for one aligned forecast.
 
@@ -176,18 +185,19 @@ def forecast_coverage_details(
         if value is None:
             break
         continuous_slots += 1
-    longest_continuous_slots = 0
-    current_run = 0
-    for value in values:
-        if value is None:
-            current_run = 0
-            continue
-        current_run += 1
-        longest_continuous_slots = max(longest_continuous_slots, current_run)
-
-    interval_hours = interval_minutes / 60
-    requested_hours = slot_count * interval_hours
-    continuous_hours = continuous_slots * interval_hours
+    starts = slot_starts if slot_starts is not None else [
+        starts_at + timedelta(minutes=i * interval_minutes) for i in range(slot_count)
+    ]
+    hours = [
+        ((starts[i + 1] if i + 1 < slot_count else horizon_end or at + timedelta(minutes=interval_minutes))
+         - at).total_seconds() / 3600 for i, at in enumerate(starts)
+    ]
+    longest_hours = current_hours = 0.0
+    for i, value in enumerate(values):
+        current_hours = current_hours + hours[i] if value is not None else 0.0
+        longest_hours = max(longest_hours, current_hours)
+    requested_hours = sum(hours)
+    continuous_hours = sum(hours[:continuous_slots])
     healthy_threshold = min(FORECAST_HEALTHY_HOURS, requested_hours)
     degraded_threshold = min(FORECAST_DEGRADED_HOURS, requested_hours)
     if slot_count and continuous_hours >= healthy_threshold:
@@ -202,13 +212,13 @@ def forecast_coverage_details(
         "classification": classification,
         "first_timestamp": None
         if first_index is None
-        else (starts_at + timedelta(minutes=first_index * interval_minutes)).isoformat(),
+        else starts[first_index].isoformat(),
         "last_timestamp": None
         if last_index is None
-        else (starts_at + timedelta(minutes=last_index * interval_minutes)).isoformat(),
-        "covered_hours": round(len(present) * interval_hours, 4),
+        else starts[last_index].isoformat(),
+        "covered_hours": round(sum(hours[i] for i in present), 4),
         "continuous_hours": round(continuous_hours, 4),
-        "longest_continuous_hours": round(longest_continuous_slots * interval_hours, 4),
+        "longest_continuous_hours": round(longest_hours, 4),
         "leading_missing_slots": leading_missing_slots,
         "trailing_missing_slots": trailing_missing_slots,
         "internal_missing_slots": max(slot_count - len(present) - leading_missing_slots - trailing_missing_slots, 0),
@@ -326,7 +336,12 @@ def normalize_scalar_value(value: float, *, value_kind: str, value_key: str = ""
 
 def _forecast_items(attributes: dict[str, Any], value_keys: tuple[str, ...]) -> list[Any]:
     attributes = _with_canonical_keys(attributes)
-    for key in _FORECAST_CONTAINER_KEYS:
+    containers: tuple[str, ...] = _FORECAST_CONTAINER_KEYS
+    if "per_kwh" in value_keys or any("price" in key for key in value_keys):
+        # Provider-native tariff blocks take precedence over a convenience
+        # forecast that may already have been resampled on a rolling grid.
+        containers = ("detailedForecast", "detailed_forecast", *containers)
+    for key in containers:
         value = attributes.get(key)
         items = _items_from_value(value, value_keys)
         if items:

@@ -67,6 +67,10 @@ def planning_status(
             "schedule_selected",
             "Preconditioning is scheduled; execution gates still apply.",
         )
+    thermal = legacy.get("thermal_timing", {})
+    if controls and thermal and not thermal.get("rates_ready"):
+        reason = (f"Scheduled using the {thermal['base_lead_minutes']:g}-minute fallback; "
+                  "finishing temperature is unknown. Execution gates still apply.")
     if _hvac_rollback_capability_unavailable(context):
         status, code, reason = (
             "blocked",
@@ -87,6 +91,7 @@ def planning_status(
         "summary": reason,
         "evaluated_at": context.created_at.isoformat(),
         "next_start": to_jsonable(next_start),
+        "thermal_timing": thermal,
         "legacy_rejections": [
             {"reason": key, "count": item["count"], **item["evidence"]}
             for key, item in legacy.get("rejected", {}).items()

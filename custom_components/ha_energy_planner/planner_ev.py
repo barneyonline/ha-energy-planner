@@ -11,6 +11,7 @@ from .ev import EVChargeSchedule, allocate_least_cost_charging
 from .models import (
     DecisionContext,
 )
+from .planning_grid import slot_end as interval_end
 
 
 def _daylight_preferred_ev_schedule(
@@ -80,7 +81,7 @@ def _daylight_preferred_ev_schedule(
     complete = bool(
         daylight_forecast_slots
         and daylight_forecast_slots[0].valid_at < remaining_start + interval
-        and daylight_forecast_slots[-1].valid_at + interval >= window.end
+        and interval_end(daylight_forecast_slots[-1], interval_minutes) >= window.end
         and all(
             right.valid_at - left.valid_at == interval
             for left, right in zip(
@@ -96,7 +97,7 @@ def _daylight_preferred_ev_schedule(
         evidence["reason"] = "ev_daylight_forecast_incomplete"
         return standard_schedule, evidence
 
-    daylight_slots = [slot for slot in daylight_forecast_slots if slot.valid_at + interval <= window.end]
+    daylight_slots = [slot for slot in daylight_forecast_slots if interval_end(slot, interval_minutes) <= window.end]
     daylight_schedule = allocate_least_cost_charging(
         daylight_slots,
         current_soc_percent=current_soc_percent,

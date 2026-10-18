@@ -678,6 +678,9 @@ async def _async_update_listener(hass: HomeAssistant, entry: EnergyPlannerConfig
                     await prepare_reload()
                 await hass.config_entries.async_reload(entry.entry_id)
                 return
+            handle_zone_mapping_update = getattr(coordinator, "async_handle_zone_mapping_update", None)
+            if callable(handle_zone_mapping_update):
+                await handle_zone_mapping_update()
             handle_options_update = getattr(coordinator, "async_handle_options_update", None)
             if callable(handle_options_update):
                 await handle_options_update()
@@ -698,7 +701,7 @@ def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...
         _freeze_config_value({
             key: [{k: v for k, v in p.items() if k != CONF_DEFAULT_READY_BY} for p in value]
             if key == VEHICLES else value
-            for key, value in getattr(entry, "data", {}).items()
+            for key, value in getattr(entry, "data", {}).items() if key != "hvac_zone_mappings"
         }),
         tuple(
             sorted(
@@ -707,7 +710,9 @@ def _entry_topology_signature(entry: EnergyPlannerConfigEntry) -> tuple[Any, ...
                     str(getattr(subentry, "subentry_type", "")),
                     _freeze_config_value({
                         key: value for key, value in getattr(subentry, "data", {}).items()
-                        if getattr(subentry, "subentry_type", "") != VEHICLE or key != CONF_DEFAULT_READY_BY
+                        if key != "hvac_zone_mappings" and (
+                            getattr(subentry, "subentry_type", "") != VEHICLE or key != CONF_DEFAULT_READY_BY
+                        )
                     }),
                 )
                 for subentry_id, subentry in subentries.items()

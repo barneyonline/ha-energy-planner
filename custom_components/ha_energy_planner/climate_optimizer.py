@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import timedelta
 from hashlib import sha256
 from math import ceil, floor
 from typing import Any
@@ -21,6 +20,7 @@ from .climate_learning import (
 from .climate_models import RECOVERY_TOLERANCE_C, TERMINAL_BATTERY_TOLERANCE_KWH, ClimateCandidate, ClimateTrajectory
 from .const import CONF_HVAC_MIN_SAVING, CONF_PLANNING_INTERVAL_MINUTES
 from .models import DecisionContext, DecisionSlot, OccupancyState
+from .planning_grid import slot_end as interval_end
 from .thermal_learning import bounded_lead_slots, timing
 from .zone_temperature import comfort_breached, temperatures
 
@@ -268,10 +268,9 @@ def recovery_valid(candidate: ClimateTrajectory, baseline: ClimateTrajectory) ->
 
 def slot_end(context: DecisionContext, index: int, options: dict[str, Any]) -> Any:
     """Use actual boundaries when revalidation splits a planning slot."""
-    return (
-        context.slots[index + 1].valid_at
-        if index + 1 < len(context.slots)
-        else context.slots[index].valid_at + timedelta(minutes=float(options[CONF_PLANNING_INTERVAL_MINUTES]))
+    return context.slots[index].end_at or (
+        context.slots[index + 1].valid_at if index + 1 < len(context.slots)
+        else interval_end(context.slots[index], float(options[CONF_PLANNING_INTERVAL_MINUTES]))
     )
 
 
@@ -402,13 +401,21 @@ def optimise(
                              default=timing(context, options, mode))
         decision.setdefault("thermal_timing", {})[mode] = thermal_timing
         lead = bounded_lead_slots(thermal_timing, options)
+        if lead and any(slot.end_at is not None for slot in context.slots):
+            lead_minutes = float(thermal_timing["effective_lead_minutes"])
+            lead = max(lead, max((stop - start for stop in range(1, len(context.slots) - 1)
+                       for start in range(stop)
+                       if (context.slots[stop].valid_at - context.slots[start].valid_at).total_seconds()
+                       <= lead_minutes * 60), default=0))
         schedules = candidate_schedules(len(context.slots), lead, targets, candidate_limit)
         if schedules is None:
             reject("search_work_limit")
             return None, decision
         decision["search"] = "bounded_deterministic_candidates"
         for start, stop, release, target in schedules:
-            if stop - start > bounded_lead_slots(timings[stop], options):
+            if (context.slots[stop].valid_at - context.slots[start].valid_at).total_seconds() > (
+                bounded_lead_slots(timings[stop], options) * float(options[CONF_PLANNING_INTERVAL_MINUTES]) * 60
+            ):
                 reject("adaptive_lead_limit")
                 continue
             normal_target = baseline.normal_targets[start] if baseline.normal_targets else reference
@@ -574,7 +581,9 @@ def revalidate_schedule(
                 *(at for at in (start, stop, end) if slot.valid_at < at < slot_end(original, index, options)),
             }
         )
-        expanded.extend(replace(slot, valid_at=at) for at in points)
+        expanded.extend(replace(slot, valid_at=at, end_at=(
+            points[j + 1] if j + 1 < len(points) else slot_end(original, index, options)))
+                        for j, at in enumerate(points))
     context = replace(original, slots=expanded)
     split_dates = [slot.valid_at for slot in expanded]
     split_start, split_stop, split_end = (

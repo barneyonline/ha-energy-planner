@@ -2362,3 +2362,62 @@ def test_single_sample_recovery_keeps_original_capacity_deadline_and_expiry():
     assert manager.load_forecast_details["fallback_reason"] == "grace_expired"
     assert manager.load_forecast_details["recovery_stage"] == "waiting_for_capacity"
     assert manager.load_forecast_details["fallback_remaining_seconds"] == 0
+
+
+def test_native_grid_retains_partial_intervals_and_exact_horizon(monkeypatch):
+    now = datetime(2026, 10, 19, 9, 3, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, 'utcnow', lambda: now)
+    origin = now.replace(hour=9, minute=0)
+    native = [{'start_time': (origin + timedelta(minutes=m)).isoformat(), 'per_kwh': .1}
+              for m in range(0, 13 * 60, 30)]
+    data = {CONF_AMBER_IMPORT_PRICE: 'sensor.import', CONF_AMBER_EXPORT_PRICE: 'sensor.export',
+            CONF_PV_FORECAST: 'sensor.pv', CONF_HOUSEHOLD_LOAD: 'sensor.house', CONF_BATTERY_SOC: 'sensor.battery'}
+    hass = FakeHass({'sensor.import': FakeState('.1', {'forecast': native}, now),
+                     'sensor.export': FakeState('.1', {'forecast': native}, now),
+                     'sensor.pv': FakeState('1', {'forecast': [1] * 48}, now),
+                     'sensor.house': FakeState('1', {}, now), 'sensor.battery': FakeState('50', {}, now)})
+    manager = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15})
+    context = manager.build_context()
+    assert context.slots[0].valid_at == now
+    assert context.slots[0].end_at == origin + timedelta(minutes=15)
+    assert context.slots[-1].end_at == now + timedelta(hours=12)
+    assert context.slots[-1].end_at - context.slots[-1].valid_at == timedelta(minutes=3)
+    assert len(context.slots) == 49
+    assert all(s.baseline_load_forecast_kw is not None for s in context.slots)
+    imported = next(x for x in manager.forecast_coverage_details if x['config_key'] == CONF_AMBER_IMPORT_PRICE)
+    assert imported['requested_hours'] == imported['covered_hours'] == 12
+    context.hvac_control = {'period_start': (now + timedelta(hours=7)).isoformat()}
+    assert manager.retained_hvac_tariff_slots(context) == context.slots
+    # An export grid must not promote untimestamped import arrays to native evidence.
+    hass.states.values['sensor.import'] = FakeState('.1', {'forecast': [.1] * 48}, now)
+    relative = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15})
+    relative_context = relative.build_context()
+    relative_context.hvac_control = dict(context.hvac_control)
+    assert relative.retained_hvac_tariff_slots(relative_context) == []
+
+
+def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monkeypatch):
+    now = datetime(2026, 10, 19, 20, 3, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, 'utcnow', lambda: now)
+    origin = now.replace(minute=2)
+    tariffs = [{'start_time': (origin + timedelta(minutes=m)).isoformat(), 'per_kwh': .1}
+               for m in range(0, 4 * 60, 30)]
+    data = {CONF_AMBER_IMPORT_PRICE: 'sensor.import', CONF_AMBER_EXPORT_PRICE: 'sensor.export',
+            CONF_PV_FORECAST: 'sensor.pv', CONF_HOUSEHOLD_LOAD: 'sensor.house', CONF_BATTERY_SOC: 'sensor.battery',
+            CONF_EV_SOC: 'sensor.soc', CONF_EV_CONNECTED: 'binary_sensor.connected',
+            CONF_EV_SMART_CHARGING_TARGET_SOC: 'sensor.target'}
+    hass = FakeHass({'sensor.import': FakeState('.1', {'forecast': tariffs}, now),
+                     'sensor.export': FakeState('.1', {'forecast': tariffs}, now),
+                     'sensor.pv': FakeState('1', {'forecast': [1] * 20}, now),
+                     'sensor.house': FakeState('1', {}, now), 'sensor.battery': FakeState('50', {}, now),
+                     'sensor.soc': FakeState('40', {}, now), 'binary_sensor.connected': FakeState('on', {}, now),
+                     'sensor.target': FakeState('80', {}, now)})
+    model = _constant_load_model('sensor.house', 1, now)
+    for profile in model['profiles'].values():
+        profile['expected'][21 * 4 + 1] = profile['upper'][21 * 4 + 1] = 10
+    manager = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15,
+                'planning_horizon_hours': 1, 'default_ready_by': '23:00'}, load_forecast_model=model)
+    context = manager.build_context()
+    tail = next(s for s in context.slots if s.valid_at == now.replace(hour=21, minute=2))
+    assert tail.end_at == now.replace(hour=21, minute=17)
+    assert tail.baseline_load_forecast_kw == 2.2

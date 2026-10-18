@@ -276,6 +276,8 @@ def timing(context: DecisionContext, options: Mapping[str, Any], mode: str,
         prediction["shortfall_c"] = abs(target - finish) if target is not None and finish is not None else None
     return {"effective_lead_minutes": lead, "base_lead_minutes": base, "maximum_lead_minutes": maximum,
             "rates_ready": ready, "required_minutes": required if ready else None,
+            "preparation_basis": "learned_rates" if ready else "configured_fallback",
+            "finishing_temperature_known": ready,
             "available_run_minutes": duration,
             "partial_preconditioning": bool(ready and required > duration), "zones": predictions}
 
