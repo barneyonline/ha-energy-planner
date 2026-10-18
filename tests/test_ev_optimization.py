@@ -742,3 +742,23 @@ def test_prepared_battery_candidates_match_reference_and_reset_storage(mode, exp
         assert cost == pytest.approx(expected[index], abs=1e-12)
         assert terminal == pytest.approx(0.2846049894151541, abs=1e-12)
         assert reason == "observed_profile_simulation"
+
+
+def test_split_current_intervals_cannot_double_count_ev_energy():
+    from custom_components.ha_energy_planner.ev import allocate_least_cost_charging
+
+    ctx = context((.1, .1))
+    ctx.slots[0].end_at = NOW + timedelta(minutes=2)
+    ctx.slots[1].valid_at = NOW + timedelta(minutes=2)
+    ctx.slots[1].end_at = NOW + timedelta(minutes=5)
+    schedule, evidence = solve(ctx)
+    assert schedule.scheduled_soc_percent == pytest.approx(45)
+    intervals = list(evidence['allocation_intervals'].values())
+    assert sum(row['energy_kwh'] for row in intervals) == pytest.approx(.5)
+    assert intervals[0]['interval_end'] == intervals[1]['interval_start']
+    assert evidence['modelled_incremental_cost'] == pytest.approx(.05)
+    legacy = allocate_least_cost_charging(ctx.slots, current_soc_percent=40, target_soc_percent=45,
+        ready_by=NOW + timedelta(minutes=5), charge_rate_kw=6, soc_per_kwh=10,
+        interval_minutes=5, continuous=True)
+    assert len(legacy.allocations) == 2
+    assert legacy.scheduled_soc_percent == pytest.approx(45)

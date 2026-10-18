@@ -2606,7 +2606,8 @@ def test_zero_hvac_precondition_lead_disables_tariff_takeover() -> None:
     assert climate_actions == []
 
 
-def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -> None:
+@pytest.mark.parametrize("old_prediction", [None, 19.0])
+def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window(old_prediction) -> None:
     options = {
         **DEFAULT_OPTIONS,
         "planner_enabled": True,
@@ -2637,7 +2638,7 @@ def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -
     assert climate_actions[0].desired_state["phase"] == "preconditioning"
     assert climate_actions[0].execute_not_before == context.created_at
     assert climate_actions[0].desired_state["target_temperature"] == 23.0
-    assert climate_actions[0].desired_state["projected_precondition_end_temperature"] == 19.0
+    assert climate_actions[0].desired_state["projected_precondition_end_temperature"] is None
     assert all(slot.projected_hvac_load_kw > 0 for slot in context.slots[2:])
 
     persisted_keys = {
@@ -2656,12 +2657,13 @@ def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window() -
     context.hvac_control = {
         key: value for key, value in climate_actions[0].desired_state.items() if key in persisted_keys
     }
+    context.hvac_control["projected_precondition_end_temperature"] = old_prediction
     for slot in context.slots:
         slot.projected_hvac_load_kw = 0.0
 
     continuation = [action for action in planner.create_plan(context).actions if action.asset == ActionAsset.DAIKIN]
 
-    assert continuation[0].desired_state["projected_precondition_end_temperature"] == 19.0
+    assert continuation[0].desired_state["projected_precondition_end_temperature"] is None
     assert all(slot.projected_hvac_load_kw > 0 for slot in context.slots[2:])
 
 
@@ -3934,3 +3936,87 @@ def test_outage_without_capacity_slots_never_claims_charging_authority() -> None
     action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
     assert action.desired_state["charging_required_now"] is False
     assert action.desired_state["charging_reason"] == "ev_load_fallback_capacity_pause"
+
+
+@pytest.mark.parametrize("offset_seconds", [0, 1])
+def test_native_tariff_boundaries_and_lifecycle_do_not_drift_with_refresh(offset_seconds):
+    from types import SimpleNamespace
+
+    from custom_components.ha_energy_planner.forecasts import forecast_series_from_state, tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    day = datetime(2026, 10, 19, tzinfo=UTC) + timedelta(seconds=offset_seconds)
+    source = SimpleNamespace(attributes={"forecast": [
+        {"start_time": (day + timedelta(minutes=m)).isoformat(),
+         "per_kwh": 0.4 if 16 * 60 <= m < 21 * 60 else 0.04}
+        for m in range(0, 24 * 60, 30)
+    ]})
+    options = {**DEFAULT_OPTIONS, "planning_interval_minutes": 15, "hvac_precondition_lead_minutes": 90,
+               "planner_enabled": True, "dry_run": False, "climate_control_enabled": True}
+    identities = []
+    for minute in (3, 8, 14):
+        context = _context()
+        context.created_at = day + timedelta(hours=9, minutes=minute)
+        native = tariff_source_intervals(source, 15)
+        starts = planning_starts(context.created_at, 12, 15, native)
+        prices = forecast_series_from_state(source, issued_at=context.created_at, horizon_hours=12,
+                    interval_minutes=15, value_keys=("per_kwh",), value_kind="price", slot_starts=starts)
+        context.slots = [DecisionSlot(at, prices[i], 0.05, 0, 1, outdoor_temperature_forecast_c=30,
+            end_at=starts[i + 1] if i + 1 < len(starts) else context.created_at + timedelta(hours=12))
+            for i, at in enumerate(starts)]
+        context.current_ev_soc_percent = None
+        context.current_hvac_mode = "off"
+        context.current_hvac_temperature_c = 20.85
+        context.occupied_temperature_low_c, context.occupied_temperature_high_c = 19, 24
+        context.climate_inputs = {"tariff_intervals": native}
+        plan = DryRunPlanner(options).create_plan(context)
+        actions = [a for a in plan.actions if a.asset == ActionAsset.DAIKIN]
+        assert actions[0].execute_not_before == day + timedelta(hours=14, minutes=30)
+        assert actions[1].execute_not_before == day + timedelta(hours=16)
+        assert actions[2].execute_not_before == day + timedelta(hours=21)
+        assert actions[0].desired_state['projected_precondition_end_temperature'] is None
+        identities.append(actions[0].desired_state['lifecycle_id'])
+        explanation = plan.device_plans['climate']['preconditioning']
+        assert '90-minute fallback' in explanation['summary']
+        assert explanation['thermal_timing']['finishing_temperature_known'] is False
+    assert len(set(identities)) == 1
+
+
+def test_partial_intervals_do_not_overestimate_energy_or_horizon():
+    from custom_components.ha_energy_planner.planner_presentation import _device_plan
+
+    context = _context()
+    start = context.created_at
+    context.slots = [DecisionSlot(start, .2, 0, 0, 1, end_at=start + timedelta(minutes=12)),
+                     DecisionSlot(start + timedelta(minutes=12), .5, 0, 0, 1,
+                                  end_at=start + timedelta(minutes=15))]
+    planner = DryRunPlanner({**DEFAULT_OPTIONS, 'planning_interval_minutes': 15})
+    assert planner._estimate_cost(context) == .065
+    assert planner._estimated_cost_horizon_hours(context) == .25
+    timeline = _device_plan(context, 15, lambda *_: {'projected_hvac_load_kw': 1}, [])
+    assert timeline['horizon_hours'] == .25
+    assert timeline['total_estimated_energy_kwh'] == .25
+
+
+def test_tariff_opportunity_without_a_thermal_direction_is_withheld():
+    context = _context()
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = 'off'
+    context.current_hvac_temperature_c = 21
+    context.current_outdoor_temperature_c = None
+    context.occupied_temperature_low_c, context.occupied_temperature_high_c = 19, 23
+    context.slots = [DecisionSlot(context.created_at + timedelta(minutes=15 * i), p, 0, 0, 1,
+                                  outdoor_temperature_forecast_c=21) for i, p in enumerate([.05, .5, .05])]
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, 'planner_enabled': True, 'dry_run': False,
+                          'planning_interval_minutes': 15, 'hvac_precondition_lead_minutes': 30}).create_plan(context)
+    assert not any(a.asset == ActionAsset.DAIKIN for a in plan.actions)
+    assert context.climate_legacy_decision['rejected']['thermal_direction']['count'] == 1
+
+
+def test_room_coast_reserve_uses_a_qualified_passive_rate():
+    context = _context()
+    context.occupied_temperature_low_c, context.occupied_temperature_high_c = 19, 24
+    context.climate_inputs = {'zones': {'climate.room': {'temperature_entity': 'sensor.room', 'temperature': 23}}}
+    model = {'model_version': 3, 'learning_enabled': True, 'sources': {'climate.room': {'buckets': {'passive': {
+        'count': 12, 'minutes': 60, 'last_at': context.created_at.isoformat(), 'rate_c_per_hour': -.5}}}}}
+    assert hvac_module._room_coast_hours(context, model, 'heat', 23, 19) == 8

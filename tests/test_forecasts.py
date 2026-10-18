@@ -685,3 +685,56 @@ def test_pv_estimate_preserves_inherited_power_units(unit: str, value: float, ke
         state, issued_at=now, horizon_hours=1, interval_minutes=30,
         value_keys=(key,), value_kind="power",
     ) == [1.5, None]
+
+
+@pytest.mark.parametrize("native_key", ["per_kwh", "feed_in_price", "export_price"])
+def test_native_tariff_detail_overrides_a_resampled_convenience_forecast(native_key):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    now = datetime(2026, 10, 19, 9, 3, tzinfo=UTC)
+    native = [{'start_time': now.replace(minute=0).isoformat(), native_key: .1},
+              {'start_time': now.replace(minute=30).isoformat(), native_key: .5}]
+    source = FakeState('.1', {'forecast': [{'valid_at': now.isoformat(), 'price': .9}],
+                               'detailedForecast': native})
+    intervals = tariff_source_intervals(source, 15)
+    starts = planning_starts(now, 1, 15, intervals)
+    assert starts[1] == now.replace(minute=15)
+    assert starts[2] == now.replace(minute=30)
+    values = forecast_series_from_state(source, issued_at=now, horizon_hours=1,
+        interval_minutes=15, value_keys=(native_key, 'price'), value_kind='price', slot_starts=starts)
+    assert values == [.1, .1, .5, .5, None]
+
+
+def test_grid_retains_native_forecast_expiry_between_regular_boundaries():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    origin = datetime(2026, 10, 19, 9, tzinfo=UTC)
+    now = origin + timedelta(minutes=3)
+    source = FakeState('.1', {'forecast': [{'start_time': origin.isoformat(), 'per_kwh': .1},
+        {'start_time': (origin + timedelta(minutes=20)).isoformat(), 'per_kwh': .5}]})
+    intervals = tariff_source_intervals(source, 15)
+    starts = planning_starts(now, 1, 15, intervals)
+    expiry = origin + timedelta(minutes=40)
+    assert expiry in starts
+    values = forecast_series_from_state(source, issued_at=now, horizon_hours=1, interval_minutes=15,
+        value_keys=('per_kwh',), value_kind='price', slot_starts=starts)
+    assert values[starts.index(expiry)] is None
+    assert values[starts.index(expiry) - 1] == .5
+
+
+def test_tariff_grid_uses_utc_across_the_repeated_daylight_saving_hour():
+    from zoneinfo import ZoneInfo
+
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    now = datetime(2026, 4, 4, 15, 53, tzinfo=UTC)
+    boundary = now.replace(hour=16, minute=0)
+    starts = planning_starts(now, 1, 15, [{'start': boundary.isoformat(),
+                                         'end': (boundary + timedelta(minutes=30)).isoformat()}])
+    zone = ZoneInfo('Australia/Melbourne')
+    assert now.astimezone(zone).strftime('%H:%M %z') == '02:53 +1100'
+    assert starts[1] == boundary
+    assert starts[1].astimezone(zone).strftime('%H:%M %z') == '02:00 +1000'
+    assert starts == sorted(set(starts))

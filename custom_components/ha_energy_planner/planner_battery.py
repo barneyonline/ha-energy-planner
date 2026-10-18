@@ -18,6 +18,7 @@ from .models import (
 )
 from .planner_values import finite_float as _float_or_none
 from .planner_values import nonnegative_float_or_none as _positive_or_none
+from .planning_grid import slot_hours
 
 
 def _arbitrage_value(
@@ -53,12 +54,12 @@ def _forecast_solar_export_value(
     """Return estimated value of forecast solar surplus that could be self-consumed."""
     total = 0.0
     has_surplus = False
-    interval_hours = interval_minutes / 60
     battery = _battery_model(context, options or {})
     remaining_charge_kwh = battery["charge_headroom_kwh"]
     accepted_surplus_kwh = 0.0
     forecast_surplus_kwh = 0.0
     for slot in context.slots:
+        interval_hours = slot_hours(slot, interval_minutes)
         pv_kw = _positive_or_none(
             slot.pv_forecast_lower_kw if slot.pv_forecast_lower_kw is not None else slot.pv_forecast_kw
         )
@@ -103,9 +104,9 @@ def _forecast_solar_export_value(
 
 def _forecast_surplus_kwh(context: DecisionContext, interval_minutes: int) -> float:
     """Return forecast solar surplus after projected flexible loads."""
-    interval_hours = interval_minutes / 60
     total = 0.0
     for slot in context.slots:
+        interval_hours = slot_hours(slot, interval_minutes)
         pv_kw = _positive_or_none(
             slot.pv_forecast_lower_kw if slot.pv_forecast_lower_kw is not None else slot.pv_forecast_kw
         )

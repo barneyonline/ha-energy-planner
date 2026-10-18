@@ -19,6 +19,8 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 - Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.
 - Optional on-demand AI Task explanations that remain advisory.
 
+Tariff plans retain the provider's UTC boundaries across refreshes, including partial current intervals. Climate calendar entries show planned preconditioning and coast phases; command deadlines appear in their details. Finishing temperatures remain unknown until the relevant heating or cooling rate is ready. HVAC timing and room-feedback edits preserve unrelated controls; changing actuators or global safety settings retains guarded restoration.
+
 ## Quick install (HACS)
 
 1. Add `https://github.com/barneyonline/ha-energy-planner` to **HACS → Custom repositories** as an **Integration**.

@@ -1930,3 +1930,20 @@ def test_second_review_economic_candidates_enforce_their_own_lead_and_report_act
     assert decision['rejected']['adaptive_lead_limit'] == 1
     assert decision['thermal_timing']['heat']['available_run_minutes'] == 120
     assert not decision['thermal_timing']['heat']['partial_preconditioning']
+
+
+def test_economic_search_counts_split_slots_by_elapsed_lead_time(monkeypatch):
+    from custom_components.ha_energy_planner.climate_models import ClimateTrajectory
+
+    ctx = context(count=50)
+    ctx.created_at = NOW + timedelta(minutes=3)
+    ctx.slots[0].valid_at = ctx.created_at
+    for i, slot in enumerate(ctx.slots):
+        slot.end_at = ctx.slots[i + 1].valid_at if i + 1 < len(ctx.slots) else slot.valid_at + timedelta(minutes=5)
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.simulate',
+        lambda *args, **kw: ClimateTrajectory((21,) * 50, (.4,) * 50))
+    captured = []
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules',
+        lambda count, lead, targets, limit: captured.append(lead))
+    optimise(ctx, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15}, simulation_model())
+    assert captured == [18]  # Eighteen native five-minute intervals, not six nominal slots.

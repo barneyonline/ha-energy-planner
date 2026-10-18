@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from math import ceil, isfinite
 from typing import Any
 
+from .planning_grid import slot_end, slot_hours
+
 EV_CHARGE_CALIBRATION_MODEL_VERSION = 1
 MIN_EV_CHARGE_CALIBRATION_MINUTES = 30
 MIN_EV_CHARGE_CALIBRATION_SOC_GAIN = 3.0
@@ -398,13 +400,15 @@ def allocate_least_cost_charging(
     for slot in ordered:
         if remaining <= 0:
             break
-        added_soc = min(soc_per_slot, remaining)
-        charge_fraction = added_soc / soc_per_slot
+        capacity = soc_per_slot * slot_hours(slot, interval_minutes) / (interval_minutes / 60)
+        added_soc = min(capacity, remaining)
+        charge_fraction = added_soc / capacity
         charge_kw = round(charge_rate_kw * charge_fraction, 6)
         effective_price, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
         carbon_intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
         estimated_carbon = (
-            round(grid_kw * (interval_minutes / 60.0) * carbon_intensity, 3) if carbon_intensity is not None else None
+            round(grid_kw * slot_hours(slot, interval_minutes) * carbon_intensity, 3)
+            if carbon_intensity is not None else None
         )
         allocations.append(
             EVChargeAllocation(
@@ -460,14 +464,16 @@ def _best_continuous_slots(
         return []
     windows: list[list[Any]] = []
     for index in range(len(chronological)):
-        window = chronological[index : index + required_slots]
-        if len(window) != required_slots:
-            continue
-        if all(
-            (right.valid_at - left.valid_at).total_seconds() == interval_minutes * 60
-            for left, right in zip(window, window[1:], strict=False)
-        ):
-            windows.append(window)
+        window: list[Any] = []
+        capacity = 0.0
+        for slot in chronological[index:]:
+            if window and slot_end(window[-1], interval_minutes) != slot.valid_at:
+                break
+            window.append(slot)
+            capacity += soc_per_slot * slot_hours(slot, interval_minutes) / (interval_minutes / 60)
+            if capacity >= required_soc_percent - 1e-9:
+                windows.append(window)
+                break
     if force_current:
         windows = [window for window in windows if window[0] is chronological[0]]
     if windows:
@@ -483,18 +489,17 @@ def _best_continuous_slots(
     for slot in chronological:
         if (
             not runs
-            or (slot.valid_at - runs[-1][-1].valid_at).total_seconds()
-            != interval_minutes * 60
+            or slot_end(runs[-1][-1], interval_minutes) != slot.valid_at
         ):
             runs.append([slot])
         else:
             runs[-1].append(slot)
     if force_current:
         runs = [run for run in runs if run[0] is chronological[0]]
-    candidates = [run[:required_slots] for run in runs if run]
-    longest = max(len(run) for run in candidates)
+    candidates = [run for run in runs if run]
+    longest = max(sum(slot_hours(slot, interval_minutes) for slot in run) for run in candidates)
     return _lowest_cost_window(
-        [run for run in candidates if len(run) == longest],
+        [run for run in candidates if sum(slot_hours(slot, interval_minutes) for slot in run) == longest],
         charge_rate_kw, required_soc_percent, soc_per_slot, interval_minutes, carbon_weight,
     )
 
@@ -518,10 +523,11 @@ def _lowest_cost_window(
         remaining = required_soc_percent
         cost = carbon = 0.0
         for slot in window:
-            added = min(soc_per_slot, remaining)
-            charge_kw = charge_rate_kw * added / soc_per_slot
+            capacity = soc_per_slot * slot_hours(slot, interval_minutes) / (interval_minutes / 60)
+            added = min(capacity, remaining)
+            charge_kw = charge_rate_kw * added / capacity
             _effective, solar_kw, grid_kw = _charge_cost_components(slot, charge_kw)
-            hours = interval_minutes / 60.0
+            hours = slot_hours(slot, interval_minutes)
             cost += hours * (solar_kw * (slot.export_price or 0.0) + grid_kw * slot.import_price)
             intensity = _float_or_none(getattr(slot, "carbon_intensity_g_per_kwh", None))
             carbon += hours * grid_kw * (worst_intensity if intensity is None else intensity)

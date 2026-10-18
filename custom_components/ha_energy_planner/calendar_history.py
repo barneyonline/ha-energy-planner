@@ -37,6 +37,8 @@ def calendar_records(value: Any) -> list[dict[str, str]]:
 def _confirmed_action_summary(record: dict[str, str]) -> str:
     """Distinguish export confirmations, including already saved action history."""
     summary = record["summary"]
+    if record.get("location") == "Climate" and summary.endswith(" (planned)"):
+        return summary.removesuffix(" (planned)") + " (confirmed)"
     if record.get("location") == "Enphase Export Limit" and summary in {
         "Enphase Export Limit: Enabled — 0 W", "Enphase Export Limit: Disabled",
     }:

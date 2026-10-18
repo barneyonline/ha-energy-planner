@@ -12,11 +12,13 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep tariff and preconditioning boundaries stable across refreshes; account for partial intervals in EV, battery, climate and site-energy estimates.
+- Preserve unrelated control ownership and pending gateway confirmation when HVAC timing or room-feedback configuration changes.
+- Render climate phase durations separately from command deadlines, distinguish planned and confirmed activity, and explain occupancy handoffs accurately.
 
 ### 🔧 Improvements
 
-- None
+- Explain fallback lead times and unknown finishing temperatures while heating/cooling rates are learning; highlight pending export-limit gateway confirmation separately from input health.
 
 ### 🔄 Other changes
 

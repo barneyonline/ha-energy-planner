@@ -63,9 +63,11 @@ from .forecasts import (
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
+    tariff_source_intervals,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
+from .planning_grid import planning_starts
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -209,6 +211,7 @@ class InputManager:
             weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
         )
         extended = extended_manager._build_context(overrides, now=context.created_at)
+        context.slots[-1] = extended.slots[len(context.slots) - 1]
         context.slots.extend(extended.slots[len(context.slots):])
         context.daylight_windows = extended.daylight_windows
         context.ev_evidence["requested_horizon_hours"] = horizon
@@ -225,6 +228,12 @@ class InputManager:
         self.forecast_coverage_details = []
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
+        tariffs = []
+        for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
+            state = self._state(self.entry_data.get(key))
+            if state is not None:
+                tariffs.extend(tariff_source_intervals(state, interval))
+        self._slot_starts = planning_starts(now, horizon, interval, tariffs)
         import_prices, import_issue = self._required_series(
             CONF_AMBER_IMPORT_PRICE,
             ("import_price", "general_price", "per_kwh", "price", "value"),
@@ -267,7 +276,7 @@ class InputManager:
         training_indices = _forecast_training_indices(horizon, interval)
         self.forecast_training_slots = [
             {
-                "valid_at": now + timedelta(minutes=offset),
+                "valid_at": self._slot_starts[index],
                 "pv_forecast_kw_issued_at": self._forecast_source_issued_at.get("pv_forecast_kw"),
                 "pv_forecast_kw": _series_value(self._raw_forecast_series.get("pv_forecast_kw", pv_forecasts), index),
                 "baseline_load_forecast_kw_issued_at": self._forecast_source_issued_at.get("baseline_load_forecast_kw"),
@@ -313,10 +322,12 @@ class InputManager:
         comfort_high, comfort_high_issue = self._optional_numeric_state(CONF_CLIMATE_TARGET_HIGH)
 
         slots = []
-        for index, offset in enumerate(range(0, horizon * 60, interval)):
+        for index, at in enumerate(self._slot_starts):
             slots.append(
                 DecisionSlot(
-                    valid_at=now + timedelta(minutes=offset),
+                    valid_at=at,
+                    end_at=(self._slot_starts[index + 1] if index + 1 < len(self._slot_starts)
+                            else now + timedelta(hours=horizon)),
                     import_price=_series_value(import_prices, index),
                     export_price=_series_value(export_prices, index),
                     pv_forecast_kw=_series_value(pv_forecasts, index),
@@ -459,6 +470,11 @@ class InputManager:
                 return []
         except (TypeError, ValueError):
             return []
+        if (context.climate_inputs.get("tariff_intervals") and context.slots
+                and all(slot.end_at is not None for slot in context.slots)):
+            # Native boundaries already remain stable between refreshes. Keep
+            # every provider boundary, including short price intervals.
+            return list(context.slots)
         interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
         origin = peak + ((context.created_at - peak) // interval) * interval
         state = self._state(self.entry_data.get(CONF_AMBER_IMPORT_PRICE))
@@ -495,7 +511,7 @@ class InputManager:
         secondary_config_key: str | None = None,
     ) -> tuple[list[float | None], str | None]:
         entity_id = self.entry_data.get(config_key)
-        slot_count = int((horizon * 60) / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int((horizon * 60) / interval)
         if not entity_id:
             return [None] * slot_count, f"{config_key}_not_configured"
         state = self._state(entity_id)
@@ -544,6 +560,7 @@ class InputManager:
                 interval_minutes=interval,
                 value_keys=value_keys,
                 value_kind=value_kind,
+                slot_starts=getattr(self, "_slot_starts", None),
             )
             for _source_key, _source_entity, source_state in source_states
         ]
@@ -553,7 +570,8 @@ class InputManager:
             primary_forecast = source_forecasts[0]
             raw_forecast = list(primary_forecast or [None] * slot_count)
             coverage = forecast_coverage_ratio(forecast)
-            coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval)
+            coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
                 * coverage,
@@ -622,7 +640,8 @@ class InputManager:
         value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_keys[0], unit=unit)
         if config_key in _REQUIRED_FORECAST_CONFIGS:
             point_series = [value, *([None] * max(slot_count - 1, 0))]
-            coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval)
+            coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
             self._record_forecast_confidence(
                 _POINT_SENSOR_CONFIDENCE * forecast_coverage_ratio(point_series),
                 config_key=config_key,
@@ -646,7 +665,7 @@ class InputManager:
         interval: int,
     ) -> tuple[list[float | None], str | None]:
         """Return the Recorder-trained household baseline load forecast."""
-        slot_count = int(horizon * 60 / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int(horizon * 60 / interval)
         entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
         if not entity_id:
             return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_not_configured"
@@ -699,6 +718,7 @@ class InputManager:
             horizon_hours=horizon,
             interval_minutes=interval,
             source_entity_id=entity_id,
+            slot_starts=getattr(self, "_slot_starts", None),
             current_load_kw=clean_current_load if recent_load_is_clean else None,
             current_ev_charging=current_ev_charging,
         )
@@ -1030,7 +1050,7 @@ class InputManager:
         interval: int,
     ) -> tuple[float | None, list[float | None], str | None]:
         entity_id = self.entry_data.get(config_key)
-        slot_count = int((horizon * 60) / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int((horizon * 60) / interval)
         if not entity_id:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
@@ -1076,6 +1096,7 @@ class InputManager:
             interval_minutes=interval,
             value_keys=("outdoor_temperature_forecast_c", "temperature", "native_temperature", "temp", "value"),
             value_kind="temperature",
+            slot_starts=getattr(self, "_slot_starts", None),
         )
         if forecast:
             coverage = forecast_coverage_ratio(forecast)
@@ -1092,6 +1113,7 @@ class InputManager:
                 forecast,
                 starts_at=now,
                 interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
             )
             self.weather_forecast_details = {
                 **self.weather_forecast_details,

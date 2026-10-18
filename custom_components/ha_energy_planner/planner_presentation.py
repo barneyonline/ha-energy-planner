@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import timedelta
 from typing import Any
 
 from .models import (
@@ -13,6 +12,8 @@ from .models import (
     PlanAction,
 )
 from .planner_values import nonnegative_float_or_none as _positive_or_none
+from .planning_grid import slot_end as interval_end
+from .planning_grid import slot_hours
 
 
 def _device_plan(
@@ -23,19 +24,18 @@ def _device_plan(
 ) -> dict[str, Any]:
     """Build a compressed timeline for one device over the planning horizon."""
     timeline: list[dict[str, Any]] = []
-    interval_hours = interval_minutes / 60
     for slot in context.slots:
         slot_actions = [
             action for action in actions if action.execute_not_before <= slot.valid_at < action.execute_not_after
         ]
         entry = entry_fn(slot, slot_actions, actions)
-        _add_energy_estimates(entry, interval_hours)
+        _add_energy_estimates(entry, slot_hours(slot, interval_minutes))
         entry["start"] = slot.valid_at.isoformat()
-        entry["end"] = (slot.valid_at + timedelta(minutes=interval_minutes)).isoformat()
+        entry["end"] = interval_end(slot, interval_minutes).isoformat()
         _append_timeline_entry(timeline, entry)
     return {
         "generated_at": context.created_at.isoformat(),
-        "horizon_hours": len(context.slots) * interval_minutes / 60,
+        "horizon_hours": sum(slot_hours(slot, interval_minutes) for slot in context.slots),
         "interval_minutes": interval_minutes,
         "total_estimated_energy_kwh": _timeline_sum(timeline, "estimated_energy_kwh"),
         "timeline": timeline,
