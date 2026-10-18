@@ -1291,3 +1291,42 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 - Review regressions prove that synchronous and queued main changes during an intent flush prevent on/mode/scalar/range dispatch and create no false issued/confirmed audit evidence. Restoration distinguishes a main change, a sibling-zone change and the restored zone's own supersession; a zone override cannot count an unapplied main shutdown as confirmed. Multi-zone acquisition retains the first uncertain target until readback, and zone-triggered manual rollback reconciles an accepted mode write before restoring its original baseline (`tests/test_hvac_adapter.py::test_review_manual_change_during_intent_flush_prevents_dispatch`, `test_review_zone_override_cannot_confirm_an_unapplied_main_shutdown`, `test_review_zone_restoration_respects_only_its_own_supersession`, `test_review_multiple_zones_never_replace_an_unconfirmed_command`, `test_review_manual_zone_change_settles_main_intent_before_rollback`).
 
 - Pending HVAC ownership reconciliation copies command uncertainty from the current durable control state when acquisition rollback or release fails, including exceptions and per-device safe-state restoration. It preserves original main/zone baselines while preventing both loss of a new intent and resurrection of a retired one (`tests/test_executor.py::test_review_failed_acquisition_uses_current_command_uncertainty`, `test_review_failed_release_uses_current_command_uncertainty`). Reload restores the original transaction identity, captured zone targets and a bounded activation history with parsed source timestamps. JSON round-trip regressions preserve exact delayed coupled feedback with missing prior targets while rejecting user attribution, unrelated parents, wrong targets, expired deadlines and superseding off commands (`tests/test_coordinator.py::test_review_pending_feedback_survives_json_reload_with_activation_proof`). Malformed activation history grants no authority.
+
+- Scheduler guard expiry (18 October 2026): `hvac_adapter.py` checks finite timer
+  and scheduler-flag coverage before climate, configured zone and automation
+  writes. It covers the original 180-second command lease plus a 10-second
+  classifier interval, with upward rounding and one second of timer-service
+  margin; polls and refreshes with no service writes never renew it, and reload
+  recovery retains the original deadline.
+  Longer active shared timers are reused; no completion/failure/cancellation path
+  clears or cancels shared coverage. Missing expiry or failed helpers block
+  ordinary writes; the existing exception-only shutdown still attempts the guard
+  and preserves independent off cleanup for a previously-off head.
+  `tests/test_hvac_adapter.py` uses a controlled-time external classifier model
+  (target trigger 3 seconds, mode trigger 5 seconds, ambiguous settling 3 seconds,
+  both scheduler helpers required, explicit-user priority). Its negative control
+  reproduces the old 30-second expiry fault. Regressions cover delayed 24-to-19 C
+  readback, coupled 24-to-21 C zone clamps near the 180-second deadline, service
+  timeouts, explicit-user supersession, sequential writes, longer shared timers,
+  helper failures, expiry, cancellation and reload. The original incident trace
+  had rolled out; the model follows the inspected classifier configuration and
+  retained timeline, rather than claiming that exact trace was captured.
+
+- Guard review regressions (`tests/test_hvac_adapter.py`) reproduce recovery guard
+  failure with a previously-off head and an accepted mode still in flight,
+  cancellation during guard setup before climate dispatch, and repeated no-op
+  refreshes with a disabled automation reporting `current: 0`. Recovery still
+  reconciles the accepted command before compensation, pre-dispatch cancellation
+  retires unsent uncertainty, and an explicitly idle automation receives no
+  repeated stop/guard writes. Missing or positive action counts still require
+  `stop_actions`, preserving the running-automation safety boundary.
+
+- Recovery guard latency is charged to the original command deadline before
+  inspecting state. Every readback predicate enforces that immutable deadline,
+  including queued state delivery after guard setup. A controlled eight-second
+  remaining lease confirms feedback
+  read at seven seconds, but rejects matching snapshots first read exactly at
+  eight seconds or after a twelve-second helper wait. Already-expired recovery
+  grants no confirmation authority and no guard renewal. Both mode and turn-on
+  recovery reject feedback queued across expiry after a valid guard wait. Regression:
+  `tests/test_hvac_adapter.py::test_review_recovery_guard_setup_cannot_confirm_past_original_deadline`.

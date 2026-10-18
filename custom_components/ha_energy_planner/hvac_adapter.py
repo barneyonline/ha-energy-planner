@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
-from math import isfinite
+from datetime import datetime, timedelta
+from math import ceil, isfinite
 from typing import Any
 
 from homeassistant.const import ATTR_ENTITY_ID, SERVICE_TURN_OFF, SERVICE_TURN_ON
@@ -28,7 +28,9 @@ _STATE_CONFIRMATION_TIMEOUT_SECONDS = 30.0
 _STATE_RECONCILIATION_TIMEOUT_SECONDS = 180.0
 _STATE_REFRESH_INTERVAL_SECONDS = 30.0
 _STATE_CONFIRMATION_POLL_SECONDS = 0.05
-_SCHEDULER_GUARD_DURATION = "00:00:30"
+# External classifier: up to five seconds for a mode trigger, then three
+# seconds of settling. Include two seconds for queued state listeners.
+_SCHEDULER_GUARD_SETTLE_SECONDS = 10.0
 _ROLLBACK_ACTIVE_HVAC_MODE = "rollback_active_hvac_mode"
 _ROLLBACK_HVAC_MODE_CHANGED = "rollback_hvac_mode_changed"
 _ACTIVE_HVAC_MODES = frozenset({"auto", "cool", "dry", "fan_only", "heat", "heat_cool"})
@@ -103,9 +105,22 @@ class DaikinHVACAdapter:
         self._command_callback = callback
 
     async def _async_command(
-        self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any], **kwargs: Any
+        self, hass: HomeAssistant, domain: str, service: str, data: dict[str, Any],
+        *, emergency_off: bool = False, respect_manual_override: bool = True, **kwargs: Any
     ) -> None:
         """Issue a contextual command without retaining vendor response bodies."""
+        entity_id = str(data.get(ATTR_ENTITY_ID))
+        if domain != "climate" and (
+            domain == "automation" or entity_id in self._zone_entities()
+        ) and entity_id != self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER):
+            if not await self._async_arm_scheduler_guard():
+                raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
+            # Renewing a guard yields too: acquisition must stop for any user
+            # change, while restoration can finish siblings but never this zone.
+            if respect_manual_override:
+                self._raise_if_manual_override_requested()
+            elif entity_id in self._manual_zone_override_entity_ids():
+                raise _HVACManualOverrideError
         context = kwargs.get("context") or Context()
         if self._command_callback is not None:
             kwargs["context"] = context
@@ -152,7 +167,15 @@ class DaikinHVACAdapter:
             await asyncio.sleep(0)
             try:
                 self._raise_if_climate_override_requested(entity_id)
-            except _HVACManualOverrideError:
+                # Existing exception cleanup must still shut down a head whose
+                # original baseline was off when classifier helpers are broken.
+                if not await self._async_arm_scheduler_guard(
+                    deadline=now + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS),
+                ) and not (emergency_off and service == SERVICE_TURN_OFF):
+                    raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
+                # Guard services can yield to explicit user actions too.
+                self._raise_if_climate_override_requested(entity_id)
+            except BaseException:  # Cancellation before dispatch is an unsent intent too.
                 # This intent never reached the service bus. Retire superseded
                 # baselines first so a crash cannot replay a stale user target,
                 # then remove the unsent intent rather than reconciling it as
@@ -410,6 +433,7 @@ class DaikinHVACAdapter:
                         str(self.entry_data.get(CONF_DAIKIN_CLIMATE)),
                         {"hvac_mode": "off"},
                         respect_zone_manual_override=False,
+                        emergency_off=True,
                     )
             raise
         finally:
@@ -517,7 +541,22 @@ class DaikinHVACAdapter:
                 {},
                 True,
             )
-        if not await self._async_arm_scheduler_guard():
+        guard_work = bool(
+            automation_work
+            or not _already_in_desired_state(climate_state, _main_hvac_desired_state(action.desired_state))
+            or any(state != "on" for entity, state in saved_zone_states.items() if not entity.startswith("climate."))
+            or (
+                synchronize_zone_temperatures
+                and any(
+                    (zone := self._state(entity)) is not None
+                    and not _already_in_desired_state(zone, _temperature_desired_state(action.desired_state))
+                    for entity in saved_zone_states if entity.startswith("climate.")
+                )
+            )
+        )
+        # A refresh with no service writes must not renew shared coverage. Each
+        # actual write also checks again after any preceding confirmation wait.
+        if guard_work and not await self._async_arm_scheduler_guard():
             await self._async_persist_requested_manual_supersessions()
             superseded_zones = self._manual_zone_override_entity_ids()
             return HVACCommandResult(
@@ -740,7 +779,9 @@ class DaikinHVACAdapter:
             if (saved_main_state or {}).get("hvac_mode") == "off" and not (
                 self._manual_override_requested is not None and self._manual_override_requested()
             ):
-                await self._async_apply_hvac_state(main, {"hvac_mode": "off"}, respect_zone_manual_override=False)
+                await self._async_apply_hvac_state(
+                    main, {"hvac_mode": "off"}, respect_zone_manual_override=False, emergency_off=True,
+                )
             raise
 
     async def _async_restore(
@@ -846,7 +887,9 @@ class DaikinHVACAdapter:
                 saved_main_state=main_state if zones else {},
             )
         if (
-            states or zones or main_state or self._automation_entities()
+            zones or main_state or any(
+                desired == "on" and self._state_value(entity) != "on" for entity, desired in states.items()
+            )
         ) and not await self._async_arm_scheduler_guard():
             await self._async_persist_requested_manual_supersessions()
             main_superseded = self._manual_override_requested is not None and self._manual_override_requested()
@@ -906,86 +949,63 @@ class DaikinHVACAdapter:
             saved_main_state=unresolved_main_state,
         )
 
-    async def _async_arm_scheduler_guard(self) -> bool:
-        """Arm and confirm the classifier guard before planner-owned mutations."""
+    async def _async_arm_scheduler_guard(self, *, deadline: datetime | None = None) -> bool:
+        """Cover one original command lease plus the external classifier settle.
+
+        Every write checks coverage. Read-only polling never renews this lease.
+        The timer is shared: reuse longer coverage, and never cancel or clear it
+        on completion, failure or cancellation. Its finite expiry owns cleanup.
+        """
         guard_entity = self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER)
         timer_entity = self.entry_data.get(CONF_CLIMATE_SCHEDULER_GUARD_TIMER)
         if not guard_entity and not timer_entity:
             return True
         if not guard_entity or not timer_entity:
             return False
-
-        timer_was_active = self._state_value(timer_entity) == "active"
-        guard_was_on = self._state_value(guard_entity) == "on"
-        try:
-            await self._async_command(
-                self.hass,
-                "timer",
-                "start",
-                {
-                    ATTR_ENTITY_ID: timer_entity,
-                    "duration": _SCHEDULER_GUARD_DURATION,
-                },
-                blocking=True,
-            )
-            if not await self._async_confirm_state(timer_entity, "active"):
-                await self._async_restore_failed_guard(
-                    guard_entity,
-                    timer_entity,
-                    guard_was_on=guard_was_on,
-                    timer_was_active=timer_was_active,
-                )
+        now = dt_util.utcnow()
+        if deadline is None:
+            deadline = now + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS)
+        required_end = deadline + timedelta(seconds=_SCHEDULER_GUARD_SETTLE_SECONDS)
+        timer = self._state(timer_entity)
+        if timer is not None and timer.state not in {"idle", "active"}:
+            # A paused shared timer belongs to its existing resume workflow.
+            return False
+        end = None
+        if timer is not None and timer.state == "active":
+            end = dt_util.parse_datetime(str(timer.attributes.get("finishes_at", "")))
+            # Without a finite end we cannot safely restart a shared timer.
+            if end is None or end.tzinfo is None:
                 return False
-            await self._async_command(
-                self.hass,
-                "input_boolean",
-                SERVICE_TURN_ON,
-                {ATTR_ENTITY_ID: guard_entity},
-                blocking=True,
+        try:
+            if end is None or end < required_end:
+                await self._async_command(
+                    self.hass, "timer", "start",
+                    {
+                        ATTR_ENTITY_ID: timer_entity,
+                        # HA accepts seconds. Round up and allow one second for
+                        # timer service handling without moving the intent deadline.
+                        "duration": max(1, ceil((required_end - now).total_seconds()) + 1),
+                    },
+                    blocking=True,
+                )
+                if not await self._async_confirm_state(timer_entity, "active"):
+                    return False
+            if self._state_value(guard_entity) != "on":
+                await self._async_command(
+                    self.hass, "input_boolean", SERVICE_TURN_ON,
+                    {ATTR_ENTITY_ID: guard_entity}, blocking=True,
+                )
+                if not await self._async_confirm_state(guard_entity, "on"):
+                    return False
+            timer = self._state(timer_entity)
+            end = None if timer is None else dt_util.parse_datetime(str(timer.attributes.get("finishes_at", "")))
+            return bool(
+                timer is not None and timer.state == "active"
+                and end is not None and end.tzinfo is not None and end >= required_end
+                and dt_util.utcnow() < deadline
             )
-            if await self._async_confirm_state(guard_entity, "on"):
-                return True
         except Exception:  # noqa: BLE001 - a missing guard must prevent actuator commands.
-            pass
-        await self._async_restore_failed_guard(
-            guard_entity,
-            timer_entity,
-            guard_was_on=guard_was_on,
-            timer_was_active=timer_was_active,
-        )
-        return False
-
-    async def _async_restore_failed_guard(
-        self,
-        guard_entity: str,
-        timer_entity: str,
-        *,
-        guard_was_on: bool,
-        timer_was_active: bool,
-    ) -> None:
-        """Best-effort rollback of guard state changed by a failed arm."""
-        if not guard_was_on:
-            try:
-                await self._async_command(
-                    self.hass,
-                    "input_boolean",
-                    SERVICE_TURN_OFF,
-                    {ATTR_ENTITY_ID: guard_entity},
-                    blocking=True,
-                )
-            except Exception:  # noqa: BLE001 - original guard state is best-effort cleanup.
-                pass
-        if not timer_was_active:
-            try:
-                await self._async_command(
-                    self.hass,
-                    "timer",
-                    "cancel",
-                    {ATTR_ENTITY_ID: timer_entity},
-                    blocking=True,
-                )
-            except Exception:  # noqa: BLE001 - original guard state is best-effort cleanup.
-                pass
+            return False
 
     async def _async_enable_automation_entities(
         self,
@@ -1000,7 +1020,8 @@ class DaikinHVACAdapter:
                 continue
             try:
                 await self._async_command(
-                    self.hass, "automation", SERVICE_TURN_ON, {ATTR_ENTITY_ID: entity_id}, blocking=True
+                    self.hass, "automation", SERVICE_TURN_ON, {ATTR_ENTITY_ID: entity_id},
+                    blocking=True, respect_manual_override=False,
                 )
             except Exception:  # noqa: BLE001
                 await self._async_persist_requested_manual_supersessions()
@@ -1152,6 +1173,7 @@ class DaikinHVACAdapter:
                             service,
                             service_data,
                             blocking=True,
+                            respect_manual_override=False,
                         )
                     else:
                         await self._async_command(
@@ -1160,6 +1182,7 @@ class DaikinHVACAdapter:
                             service,
                             service_data,
                             blocking=True,
+                            respect_manual_override=False,
                             context=service_context,
                         )
                     confirmed = await self._async_confirm_state(
@@ -1460,20 +1483,39 @@ class DaikinHVACAdapter:
         assert deadline is not None
         self._last_commands[entity_id] = record
         remaining = min(_STATE_RECONCILIATION_TIMEOUT_SECONDS, max(0.0, (deadline - dt_util.utcnow()).total_seconds()))
-        self._command_started[entity_id] = (
-            asyncio.get_running_loop().time() - (_STATE_RECONCILIATION_TIMEOUT_SECONDS - remaining)
-        )
+        loop = asyncio.get_running_loop()
+        confirmation_deadline = loop.time() + remaining
+        self._command_started[entity_id] = confirmation_deadline - _STATE_RECONCILIATION_TIMEOUT_SECONDS
+        if remaining > 0:
+            # Guard failure cannot revoke a write the device already accepted.
+            # Keep read-only reconciliation on its original deadline before any
+            # compensation, including the independent emergency-off path. Each
+            # later write must still pass its own guard check.
+            await self._async_arm_scheduler_guard(
+                deadline=min(deadline, dt_util.utcnow() + timedelta(seconds=_STATE_RECONCILIATION_TIMEOUT_SECONDS)),
+            )
         try:
+            self._raise_if_climate_override_requested(entity_id)
             requested = record["requested"]
+            # Enforce the deadline inside each readback predicate: guard waits
+            # and queued state delivery both consume this original lease.
             if record["service"] == "turn_on":
-                await self._async_confirm_hvac_on(entity_id)
+                await self._async_wait_for_climate(
+                    entity_id,
+                    lambda observed: loop.time() < confirmation_deadline
+                    and observed.state not in {"off", "unknown", "unavailable"},
+                )
             else:
                 desired = dict(requested)
                 if "temperature" in desired:
                     desired["target_temperature"] = desired.pop("temperature")
                 if record["service"] == "turn_off":
                     desired["hvac_mode"] = "off"
-                await self._async_confirm_hvac_state(entity_id, desired)
+                await self._async_wait_for_climate(
+                    entity_id,
+                    lambda observed: loop.time() < confirmation_deadline
+                    and _already_in_desired_state(observed, desired),
+                )
         except _HVACManualOverrideError:
             # Supersession retires this entity's old intent, while unrelated
             # restoration must still proceed with its own override policy.
@@ -1580,6 +1622,7 @@ class DaikinHVACAdapter:
         *,
         force: bool = False,
         takeover_main_state: dict[str, Any] | None = None,
+        emergency_off: bool = False,
         respect_manual_override: bool = True,
         respect_zone_manual_override: bool = True,
     ) -> bool:
@@ -1613,6 +1656,7 @@ class DaikinHVACAdapter:
                         {ATTR_ENTITY_ID: entity_id},
                         blocking=True,
                         context=service_context,
+                        emergency_off=emergency_off,
                     )
                     if respect_manual_override:
                         self._raise_if_manual_override_requested(
@@ -1782,6 +1826,15 @@ class DaikinHVACAdapter:
         """Stop configured automations and return the states actually changed."""
         changed_states: dict[str, str] = {}
         for automation_id, state in states.items():
+            observed = self._state(automation_id)
+            if (
+                state == "off" and observed is not None and observed.state == "off"
+                and observed.attributes.get("current") == 0
+            ):
+                # Core explicitly reports no running actions. Reissuing this
+                # no-op would continually renew the external scheduler guard.
+                # Missing/positive current still needs stop_actions below.
+                continue
             if state == "on":
                 # Treat the boundary as uncertain: a service handler can apply
                 # the state change before propagating an exception.
