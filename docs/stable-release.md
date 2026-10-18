@@ -5,6 +5,42 @@ CI also exercises floating stable. HACS owns the minimum
 declaration and `tool.energy-planner.support` in pyproject owns tested versions.
 Weekly runtime checks detect upstream changes even without a repository push.
 
+## Operator documentation
+
+The README is the short overview and quick-install entry point. Detailed operator
+guidance lives in the [wiki](https://github.com/barneyonline/ha-energy-planner/wiki).
+The wiki refresh accompanying 1.4.0 replaces the previous v1.0 instructions and
+preserves the detailed material removed from the README.
+
+| Topic | Guide |
+| --- | --- |
+| Installation, requirements, updates and removal | [Installation](https://github.com/barneyonline/ha-energy-planner/wiki/Installation) |
+| Inputs, settings, device layout and safe initial rollout | [Setup and Configuration](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup) |
+| Forecasts, Recorder learning, battery and grid limits | [Energy Planning](https://github.com/barneyonline/ha-energy-planner/wiki/Energy-Planning) |
+| Charger controls, scheduling and confirmation | [EV Charging](https://github.com/barneyonline/ha-energy-planner/wiki/EV-Charging) |
+| Shared chargers and vehicle profiles | [Vehicle Profiles](https://github.com/barneyonline/ha-energy-planner/wiki/EV-Vehicles) |
+| Consumption fallback, Charge now and sample recovery | [EV Load Recovery](https://github.com/barneyonline/ha-energy-planner/wiki/EV-Load-Recovery) |
+| Climate, zones, comfort, learning and scheduler guards | [Climate and Presence](https://github.com/barneyonline/ha-energy-planner/wiki/Climate-and-Presence) |
+| Profile ownership and optional AI explanations/privacy | [Enphase and AI](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-and-AI) |
+| Negative export tariffs, readback and baseline restoration | [Enphase Export Limit](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) |
+| Planned windows and retained confirmed activity | [Plan Calendar](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar) |
+| Automatic control, Armed, actions and YAML examples | [Safety and Production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production) |
+| Rolling action caps and resuming climate planning | [Action Allowances](https://github.com/barneyonline/ha-energy-planner/wiki/Action-Allowances) |
+| Source clocks, startup, pending ownership and feedback | [Recovery Diagnostics](https://github.com/barneyonline/ha-energy-planner/wiki/Recovery-Diagnostics) |
+| Common problems and support evidence | [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) |
+| Safety, device, forecast and AI limits | [Known Limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations) |
+| Upgrade checklist, migration repairs and stable interfaces | [Upgrading and Changes](https://github.com/barneyonline/ha-energy-planner/wiki/Upgrading-and-Changes) |
+| Validation, architecture and contributor guidance | [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) |
+
+Energy Planner supplies actions and entities, with no custom automation triggers
+or conditions. Use standard Home Assistant state triggers and conditions.
+
+The source-controlled [EV policy](ev-scheduling.md), [climate policy](climate-decisions.md),
+[requirements audit](requirements-audit.md), [quality evidence](../quality_scale.yaml)
+and [release checklist](release-checklist.md) remain implementation and validation
+references. Publishing a release and deploying it to Home Assistant are separate
+steps from preparing a release pull request.
+
 ## Example setup
 
 Create an entry named **Family EV**, then open Configure. The initial dialog only
@@ -17,7 +53,7 @@ asks for a name; it does not map planning inputs.
 | Load | `sensor.house_consumption_power` | Gross consumption in W/kW/MW, recorded for qualifying training days; not net grid power. |
 | Battery | `sensor.battery_soc` | SOC reflects the managed household battery. |
 | EV | Vehicle SOC, charging, connected and target-SOC entities | Target SOC is authoritative and uses percent. Feedback confirms commands. |
-| Charger | `switch.ev_charger` or separate start/stop entities | Service behavior and feedback match the selected controls. |
+| Charger | `switch.ev_charger` or `input_boolean` for on/off control | Service behavior and feedback match the selected controls. |
 
 These names are examples. Select entities actually supplied by your integrations.
 Keep Automatic control off, enable the device areas you intend to evaluate,
@@ -80,8 +116,10 @@ values are compact audit codes, not free-form personal information.
    fixture exercises real HA setup, reload and restart. Older migration helpers
    remain supported, but every historical release is not a runtime baseline.
 3. For pre-0.9.13 EV configurations that fail migration because no vehicle target
-   SOC is mapped, open the entry menu → Reconfigure. Select a valid target-SOC
-   entity. This repairs the original entry and retries migration. Do not
+   SOC is mapped, open Settings → System → Repairs and select a valid target-SOC
+   entity. This repairs the original entry and retries migration immediately.
+   Reconfigure also accepts the target and directs you to Repairs; enable
+   disabled entries before repairing them. Do not
    delete/recreate it or edit `.storage` to bypass the check. Configure remains
    the normal entry point for other inputs and options.
 4. Confirm original entity IDs, control intent, overrides and device feedback.
