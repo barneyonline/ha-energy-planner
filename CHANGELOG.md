@@ -12,6 +12,28 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.1 - 2026-10-19
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Keep tariff and preconditioning boundaries stable across refreshes; account for partial intervals in EV, battery, climate and site-energy estimates.
 - Handle split intervals in daylight/continuous EV scheduling, elapsed PV calibration and measured climate observation comparisons.
 - Weight forecast confidence and load coverage by elapsed time; preserve confirmed climate phase identity across calendar-label upgrades.
