@@ -26,6 +26,7 @@ from .models import (
 )
 from .planner_confidence import _confidence_rejection_reason, confidence_from_context
 from .planner_values import finite_float as _finite_number
+from .planning_grid import slot_end, slot_hours
 from .safety import strict_bool
 from .thermal_learning import bounded_lead_slots, timing
 from .thermal_learning import rate as learned_rate
@@ -144,6 +145,8 @@ class HVACPlanningPolicy:
             active.get("phase") == "away_off" and context.occupancy_state == OccupancyState.AWAY
         )
         away_off_started_at = _datetime_value(active.get("started_at")) if away_off_ownership_active else None
+        if active.get("phase") == "away_off" and context.occupancy_state == OccupancyState.OCCUPIED:
+            return [self._hvac_release_action(context, now, now + interval, "hvac_occupancy_returned")]
         if away_off_ownership_active and precondition_while_away:
             # Away-off is stable planner ownership, not an active tariff
             # lifecycle. Keep it when no candidate exists, but allow a newly
@@ -260,7 +263,8 @@ class HVACPlanningPolicy:
                 active.get("projected_precondition_end_temperature")
             )
             if projected_precondition_end_temperature is None:
-                projected_precondition_end_temperature = precondition_target
+                projected_precondition_end_temperature = (precondition_target
+                    if thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode) else coast_target)
             if phase == "preconditioning":
                 self._project_active_hvac_slots(
                     context,
@@ -300,7 +304,8 @@ class HVACPlanningPolicy:
                 "suppression_min_price_delta": suppression_delta,
                 "precondition_target": _finite_number(active.get("precondition_target")) or precondition_target,
                 "coast_target": _finite_number(active.get("coast_target")) or coast_target,
-                "projected_precondition_end_temperature": projected_precondition_end_temperature,
+                "projected_precondition_end_temperature": (projected_precondition_end_temperature
+                    if context.climate_legacy_decision.get("thermal_timing", {}).get("rates_ready") else None),
             }
             actions = [
                 self._hvac_control_action(
@@ -475,7 +480,9 @@ class HVACPlanningPolicy:
             if lead_slots == 0:
                 _hvac_reject(context, "preparation_time", {"maximum_minutes": thermal_timing["maximum_lead_minutes"]})
                 return None
-            window_start = max(0, index - lead_slots)
+            earliest = slot.valid_at - timedelta(minutes=lead_slots * interval_minutes)
+            window_start = next((j for j in range(index) if context.slots[j].valid_at >= earliest), index)
+
             priced_window = [
                 (position, _known_float(context.slots[position].import_price))
                 for position in range(window_start, index)
@@ -561,10 +568,20 @@ class HVACPlanningPolicy:
                         1,
                         ceil(abs(target - projected_start_temperature) / rate / (interval_minutes / 60)),
                     )
-                if possible_start + required_slots > index:
+                required_minutes = required_slots * interval_minutes
+                completion = possible_start
+                while completion < index and sum(
+                    slot_hours(item, interval_minutes) * 60 for item in context.slots[possible_start:completion]
+                ) < required_minutes:
+                    completion += 1
+                actual_minutes = sum(slot_hours(item, interval_minutes) * 60
+                                     for item in context.slots[possible_start:completion])
+                required_slots = completion - possible_start
+                if actual_minutes < required_minutes or actual_minutes > thermal_timing["maximum_lead_minutes"]:
                     _hvac_reject(context, "preparation_time",
-                        {"required_minutes": required_slots * interval_minutes,
-                         "available_minutes": (index - possible_start) * interval_minutes}
+                        {"required_minutes": required_minutes,
+                         "available_minutes": sum(slot_hours(item, interval_minutes) * 60
+                                                  for item in context.slots[possible_start:index])}
                     )
                     continue
                 run = context.slots[possible_start : possible_start + required_slots]
@@ -575,7 +592,7 @@ class HVACPlanningPolicy:
                 if float(slot.import_price) < run_baseline + start_delta:
                     continue
                 completion = possible_start + required_slots
-                coast_hours = (index - completion) * interval_minutes / 60
+                coast_hours = (slot.valid_at - context.slots[completion].valid_at).total_seconds() / 3600
                 if coast_hours > 0:
                     available_coast = _room_coast_hours(
                         context, self.thermal_model, mode, target, low if mode == "heat" else high,
@@ -587,7 +604,7 @@ class HVACPlanningPolicy:
                             {"available_hours": available_coast, "required_hours": coast_hours}
                         )
                         continue
-                cost = sum(_known_float(item.import_price) for item in run)
+                cost = sum(_known_float(item.import_price) * slot_hours(item, interval_minutes) for item in run)
                 if (
                     best_cost is None
                     or cost < best_cost
@@ -665,7 +682,7 @@ class HVACPlanningPolicy:
                         # from the comfort boundary instead.
                         best_projected_end_temperature = low if mode == "heat" else high
                     else:
-                        active_delta = rate * len(run) * interval_minutes / 60
+                        active_delta = rate * sum(slot_hours(item, interval_minutes) for item in run)
                         best_projected_end_temperature = (
                             min(projected_start_temperature + active_delta, target)
                             if mode == "heat"
@@ -678,7 +695,8 @@ class HVACPlanningPolicy:
             selected_timing = timing(
                 context, self.options, mode, self.thermal_model,
                 delay_minutes=max((context.slots[best_start].valid_at - context.created_at).total_seconds() / 60, 0),
-                available_minutes=best_required_slots * interval_minutes,
+                available_minutes=sum(slot_hours(item, interval_minutes) * 60
+                                      for item in context.slots[best_start:best_start + best_required_slots]),
             )
             context.climate_legacy_decision["thermal_timing"] = selected_timing
             predictions = [row["predicted_finishing_temperature"] for row in selected_timing["zones"].values()]
@@ -696,7 +714,7 @@ class HVACPlanningPolicy:
             period_end = (
                 context.slots[end_index].valid_at
                 if end_index < len(context.slots)
-                else context.slots[-1].valid_at + timedelta(minutes=interval_minutes)
+                else slot_end(context.slots[-1], interval_minutes)
             )
             self._project_hvac_coast_slots(
                 context,
@@ -713,7 +731,7 @@ class HVACPlanningPolicy:
                 "precondition_end": (
                     context.slots[best_start + required_slots].valid_at
                     if best_start + required_slots < len(context.slots)
-                    else context.slots[-1].valid_at + timedelta(minutes=interval_minutes)
+                    else slot_end(context.slots[-1], interval_minutes)
                 ),
                 "period_start": slot.valid_at,
                 "period_end": period_end,
@@ -721,7 +739,9 @@ class HVACPlanningPolicy:
                 "precondition_min_price_delta": float(self.options[CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA]),
                 "suppression_min_price_delta": suppression_delta,
                 "mode": mode,
-                "projected_precondition_end_temperature": best_projected_end_temperature,
+                "projected_precondition_end_temperature": (
+                    best_projected_end_temperature if selected_timing["rates_ready"] else None
+                ),
             }
         return None
 
@@ -773,11 +793,7 @@ class HVACPlanningPolicy:
                 "mode": mode,
                 "precondition_target": precondition_target if precondition_target is not None else target,
                 "coast_target": coast_target if coast_target is not None else target,
-                "projected_precondition_end_temperature": (
-                    projected_precondition_end_temperature
-                    if projected_precondition_end_temperature is not None
-                    else target
-                ),
+                "projected_precondition_end_temperature": projected_precondition_end_temperature,
                 "suppress_automations": True,
                 "enable_zones": True,
                 "configured_zones_only": bool(self.options.get(CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY, False)),
@@ -935,16 +951,17 @@ def _persisted_hvac_period_qualifies(
     if interval <= timedelta(0):
         return False
     period_slots = [
-        slot for slot in slots if slot.valid_at < period_end and slot.valid_at + interval > period_start
+        slot for slot in slots if slot.valid_at < period_end
+        and slot_end(slot, interval.total_seconds() / 60) > period_start
     ]
     if (
         not period_slots
-        or not period_slots[0].valid_at <= period_start < period_slots[0].valid_at + interval
+        or not period_slots[0].valid_at <= period_start < slot_end(period_slots[0], interval.total_seconds() / 60)
         or any(
-            right.valid_at != left.valid_at + interval
+            right.valid_at != slot_end(left, interval.total_seconds() / 60)
             for left, right in zip(period_slots, period_slots[1:], strict=False)
         )
-        or period_slots[-1].valid_at + interval < period_end
+        or slot_end(period_slots[-1], interval.total_seconds() / 60) < period_end
     ):
         return False
     if period_slots[0].import_price is None or float(period_slots[0].import_price) < baseline + max(
@@ -972,11 +989,11 @@ def _tariff_evidence_covers_period(
     if any(slot.import_price is None for slot in remaining_slots):
         return False
     if any(
-        right.valid_at != left.valid_at + interval
+        right.valid_at != slot_end(left, interval.total_seconds() / 60)
         for left, right in zip(remaining_slots, remaining_slots[1:], strict=False)
     ):
         return False
-    return remaining_slots[-1].valid_at + interval >= period_end
+    return slot_end(remaining_slots[-1], interval.total_seconds() / 60) >= period_end
 
 
 def _future_hvac_mode(

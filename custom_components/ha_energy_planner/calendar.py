@@ -188,6 +188,7 @@ def _calendar_windows(
                     # command window. Retain its confirmed phase, with the same
                     # estimated boundary and a positive interval at exact expiry.
                     event, start=actual_start,
+                    summary=event.summary.replace(" (planned)", " (confirmed)"),
                     end=event.end if event.end > actual_start else actual_start + timedelta(seconds=1),
                     description=recorder_safe_text(
                         f"Actual start: {_local_datetime_text(actual_start)}\n{description}", max_bytes=4_096,
@@ -486,10 +487,37 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
             "Load forecast",
             forecast_details,
         )
+    start, end = action.execute_not_before, action.execute_not_after
+    summary = f"{asset_name(action.asset)}: {details['action']}"
+    phase = action.desired_state.get("phase")
+    if action.asset == ActionAsset.DAIKIN:
+        phase_end = {
+            "preconditioning": "precondition_end", "pre_peak_coast": "period_start", "peak_coast": "period_end",
+        }.get(str(phase))
+        if phase_end:
+            boundary = _calendar_datetime(action.desired_state.get(phase_end))
+            if boundary is not None and boundary > start:
+                end = boundary
+            target = action.desired_state.get("target_temperature")
+            if target is not None:
+                label = ("Pre-heat" if action.desired_state.get("hvac_mode") == "heat" else "Pre-cool"
+                         ) if phase == "preconditioning" else "Coast"
+                verb = "to" if phase == "preconditioning" else "at"
+                summary = f"Climate: {label} {verb} {float(target):g} °C (planned)"
+        elif action.kind == ActionKind.RELEASE_HVAC:
+            end = start + timedelta(seconds=1)
+            summary = "Climate: Release climate control (planned)"
+        elif action.desired_state.get("hvac_mode") == "off":
+            end = start + timedelta(seconds=1)
+            summary = "Climate: Keep off while away (planned)"
+        _append_description_section(description_lines, "Command eligibility", [
+            f"From {_local_datetime_text(action.execute_not_before)} to "
+            f"{_local_datetime_text(action.execute_not_after)}. This is not the operating duration.",
+        ])
     return CalendarEvent(
-        start=action.execute_not_before,
-        end=action.execute_not_after,
-        summary=recorder_safe_text(f"{asset_name(action.asset)}: {details['action']}", max_bytes=255),
+        start=start,
+        end=end,
+        summary=recorder_safe_text(summary, max_bytes=255),
         description=recorder_safe_text("\n".join(description_lines), max_bytes=4_096),
         location=recorder_safe_text(asset_name(action.asset), max_bytes=255),
         uid=recorder_safe_identifier(action.action_id, max_bytes=255),

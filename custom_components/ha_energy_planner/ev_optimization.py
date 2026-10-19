@@ -16,6 +16,7 @@ from .ev import EVChargeAllocation, EVChargeSchedule, _charge_cost_components
 from .ev_policy import finite, strategy
 from .ev_runtime import timestamp
 from .models import DecisionContext
+from .planning_grid import slot_end as interval_end
 
 MAX_EVALUATIONS = 2000
 
@@ -159,7 +160,7 @@ def _battery_simulator(
     efficiency = sqrt(min(max(float(options.get("battery_round_trip_efficiency_percent", 90)) / 100, 0.01), 1))
     floor = capacity * max(float(options.get("battery_min_soc_percent", 0)), 0) / 100
     stored = capacity * soc / 100
-    valid = [slot for slot in context.slots if slot.valid_at + interval > context.created_at]
+    valid = [slot for slot in context.slots if interval_end(slot, interval.total_seconds() / 60) > context.created_at]
     if not valid or any(
         any(finite(v) is None for v in (s.import_price, s.export_price, s.pv_forecast_kw, s.baseline_load_forecast_kw))
         for s in valid
@@ -172,7 +173,8 @@ def _battery_simulator(
     terminal_value = median(prices) * efficiency if prices else 0.0
     rows = []
     for index, slot in enumerate(context.slots):
-        hours = max((slot.valid_at + interval - max(slot.valid_at, context.created_at)).total_seconds() / 3600, 0)
+        hours = max((interval_end(slot, interval.total_seconds() / 60)
+                     - max(slot.valid_at, context.created_at)).total_seconds() / 3600, 0)
         if hours <= 0:
             continue
         net = (
@@ -241,7 +243,8 @@ def optimise_ev(
     forecast_missing = False
     covered_until = context.created_at
     for index, source in enumerate(context.slots):
-        start, end = max(source.valid_at, context.created_at), min(source.valid_at + interval, ready_by)
+        start = max(source.valid_at, context.created_at)
+        end = min(interval_end(source, interval.total_seconds() / 60), ready_by)
         if end <= start:
             continue
         if start > covered_until + timedelta(seconds=1):

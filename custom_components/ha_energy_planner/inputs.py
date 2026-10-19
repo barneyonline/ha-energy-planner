@@ -58,14 +58,15 @@ from .ev import ev_charging_state
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     forecast_coverage_details,
-    forecast_coverage_ratio,
     forecast_series_from_state,
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
+    tariff_source_intervals,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
+from .planning_grid import planning_starts
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -209,6 +210,7 @@ class InputManager:
             weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
         )
         extended = extended_manager._build_context(overrides, now=context.created_at)
+        context.slots[-1] = extended.slots[len(context.slots) - 1]
         context.slots.extend(extended.slots[len(context.slots):])
         context.daylight_windows = extended.daylight_windows
         context.ev_evidence["requested_horizon_hours"] = horizon
@@ -225,6 +227,12 @@ class InputManager:
         self.forecast_coverage_details = []
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
+        tariffs = []
+        for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
+            state = self._state(self.entry_data.get(key))
+            if state is not None:
+                tariffs.extend(tariff_source_intervals(state, interval))
+        self._slot_starts = planning_starts(now, horizon, interval, tariffs)
         import_prices, import_issue = self._required_series(
             CONF_AMBER_IMPORT_PRICE,
             ("import_price", "general_price", "per_kwh", "price", "value"),
@@ -264,10 +272,10 @@ class InputManager:
             interval,
         )
         carbon_issue = _advisory_issue(carbon_issue)
-        training_indices = _forecast_training_indices(horizon, interval)
+        training_indices = _forecast_training_indices(horizon, interval, self._slot_starts)
         self.forecast_training_slots = [
             {
-                "valid_at": now + timedelta(minutes=offset),
+                "valid_at": self._slot_starts[index],
                 "pv_forecast_kw_issued_at": self._forecast_source_issued_at.get("pv_forecast_kw"),
                 "pv_forecast_kw": _series_value(self._raw_forecast_series.get("pv_forecast_kw", pv_forecasts), index),
                 "baseline_load_forecast_kw_issued_at": self._forecast_source_issued_at.get("baseline_load_forecast_kw"),
@@ -277,7 +285,6 @@ class InputManager:
                 ),
             }
             for index in training_indices
-            for offset in (index * interval,)
         ]
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
@@ -313,10 +320,12 @@ class InputManager:
         comfort_high, comfort_high_issue = self._optional_numeric_state(CONF_CLIMATE_TARGET_HIGH)
 
         slots = []
-        for index, offset in enumerate(range(0, horizon * 60, interval)):
+        for index, at in enumerate(self._slot_starts):
             slots.append(
                 DecisionSlot(
-                    valid_at=now + timedelta(minutes=offset),
+                    valid_at=at,
+                    end_at=(self._slot_starts[index + 1] if index + 1 < len(self._slot_starts)
+                            else now + timedelta(hours=horizon)),
                     import_price=_series_value(import_prices, index),
                     export_price=_series_value(export_prices, index),
                     pv_forecast_kw=_series_value(pv_forecasts, index),
@@ -459,6 +468,11 @@ class InputManager:
                 return []
         except (TypeError, ValueError):
             return []
+        if (context.climate_inputs.get("tariff_intervals") and context.slots
+                and all(slot.end_at is not None for slot in context.slots)):
+            # Native boundaries already remain stable between refreshes. Keep
+            # every provider boundary, including short price intervals.
+            return list(context.slots)
         interval = timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
         origin = peak + ((context.created_at - peak) // interval) * interval
         state = self._state(self.entry_data.get(CONF_AMBER_IMPORT_PRICE))
@@ -495,7 +509,7 @@ class InputManager:
         secondary_config_key: str | None = None,
     ) -> tuple[list[float | None], str | None]:
         entity_id = self.entry_data.get(config_key)
-        slot_count = int((horizon * 60) / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int((horizon * 60) / interval)
         if not entity_id:
             return [None] * slot_count, f"{config_key}_not_configured"
         state = self._state(entity_id)
@@ -544,6 +558,7 @@ class InputManager:
                 interval_minutes=interval,
                 value_keys=value_keys,
                 value_kind=value_kind,
+                slot_starts=getattr(self, "_slot_starts", None),
             )
             for _source_key, _source_entity, source_state in source_states
         ]
@@ -552,8 +567,9 @@ class InputManager:
         if forecast:
             primary_forecast = source_forecasts[0]
             raw_forecast = list(primary_forecast or [None] * slot_count)
-            coverage = forecast_coverage_ratio(forecast)
-            coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval)
+            coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
+            coverage = float(coverage_details["coverage_ratio"])
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
                 * coverage,
@@ -576,6 +592,9 @@ class InputManager:
                 self._raw_forecast_series[calibration_field] = list(raw_forecast[:slot_count])
                 lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
                 if lead_offset_minutes >= 0:
+                    starts = getattr(self, "_slot_starts", [
+                        now + timedelta(minutes=i * interval) for i in range(len(padded))])
+                    slot_leads = [(at - source_issued_at).total_seconds() / 60 for at in starts]
                     uncertainty_mode = "lower" if calibration_field == "pv_forecast_kw" else "upper"
                     conservative = apply_forecast_calibration(
                         padded,
@@ -583,6 +602,7 @@ class InputManager:
                         calibration_field,
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
+                        slot_lead_minutes=slot_leads,
                         uncertainty_mode=uncertainty_mode,
                     )
                     expected = apply_forecast_calibration(
@@ -591,6 +611,7 @@ class InputManager:
                         calibration_field,
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
+                        slot_lead_minutes=slot_leads,
                     )
                     self._conservative_forecast_series[calibration_field] = _retain_uncalibrated_secondary_slots(
                         padded,
@@ -622,9 +643,10 @@ class InputManager:
         value = normalize_scalar_value(value, value_kind=value_kind, value_key=value_keys[0], unit=unit)
         if config_key in _REQUIRED_FORECAST_CONFIGS:
             point_series = [value, *([None] * max(slot_count - 1, 0))]
-            coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval)
+            coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
             self._record_forecast_confidence(
-                _POINT_SENSOR_CONFIDENCE * forecast_coverage_ratio(point_series),
+                _POINT_SENSOR_CONFIDENCE * float(coverage_details["coverage_ratio"]),
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source="point_value_only",
@@ -646,7 +668,7 @@ class InputManager:
         interval: int,
     ) -> tuple[list[float | None], str | None]:
         """Return the Recorder-trained household baseline load forecast."""
-        slot_count = int(horizon * 60 / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int(horizon * 60 / interval)
         entity_id = str(self.entry_data.get(CONF_HOUSEHOLD_LOAD, "") or "").strip()
         if not entity_id:
             return [None] * slot_count, f"{CONF_HOUSEHOLD_LOAD}_not_configured"
@@ -699,6 +721,7 @@ class InputManager:
             horizon_hours=horizon,
             interval_minutes=interval,
             source_entity_id=entity_id,
+            slot_starts=getattr(self, "_slot_starts", None),
             current_load_kw=clean_current_load if recent_load_is_clean else None,
             current_ev_charging=current_ev_charging,
         )
@@ -770,6 +793,10 @@ class InputManager:
             if source_issue
             else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
         )
+        temporal_coverage = forecast_coverage_details(
+            result.expected_kw, starts_at=now, interval_minutes=interval,
+            slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
+        )
         coverage_details = {
             **result.details,
             **fallback_details,
@@ -787,14 +814,8 @@ class InputManager:
                 and not self.load_source_outage.get("recovering")
             ),
             "fallback_applied": fallback_active,
-            "covered_hours": round(
-                sum(value is not None for value in result.expected_kw) * interval / 60,
-                4,
-            ),
-            "continuous_hours": round(
-                _leading_present_slots(result.expected_kw) * interval / 60,
-                4,
-            ),
+            "covered_hours": temporal_coverage["covered_hours"],
+            "continuous_hours": temporal_coverage["continuous_hours"],
         }
         self._record_forecast_confidence(
             confidence,
@@ -1030,7 +1051,7 @@ class InputManager:
         interval: int,
     ) -> tuple[float | None, list[float | None], str | None]:
         entity_id = self.entry_data.get(config_key)
-        slot_count = int((horizon * 60) / interval)
+        slot_count = len(getattr(self, "_slot_starts", [])) or int((horizon * 60) / interval)
         if not entity_id:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
@@ -1076,9 +1097,16 @@ class InputManager:
             interval_minutes=interval,
             value_keys=("outdoor_temperature_forecast_c", "temperature", "native_temperature", "temp", "value"),
             value_kind="temperature",
+            slot_starts=getattr(self, "_slot_starts", None),
         )
         if forecast:
-            coverage = forecast_coverage_ratio(forecast)
+            coverage_details = forecast_coverage_details(
+                forecast,
+                starts_at=now,
+                interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
+            )
+            coverage = float(coverage_details["coverage_ratio"])
             source = (
                 "weather_service_hourly"
                 if forecast_state is not state and coverage == 1.0
@@ -1087,11 +1115,6 @@ class InputManager:
                 else "forecast_series"
                 if coverage == 1.0
                 else "forecast_series_partial"
-            )
-            coverage_details = forecast_coverage_details(
-                forecast,
-                starts_at=now,
-                interval_minutes=interval,
             )
             self.weather_forecast_details = {
                 **self.weather_forecast_details,
@@ -1382,12 +1405,20 @@ def _retain_uncalibrated_secondary_slots(
     ]
 
 
-def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> list[int]:
+def _forecast_training_indices(
+    horizon_hours: int, interval_minutes: int, slot_starts: list[datetime] | None = None,
+) -> list[int]:
     """Sample forecast leads across the full horizon without growing snapshots."""
-    slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
+    slot_count = len(slot_starts) if slot_starts is not None else max(int(horizon_hours * 60 / interval_minutes), 0)
     if slot_count == 0:
         return []
     target_minutes = (0, 30, 60, 120, 240, 480, 720, 1080, horizon_hours * 60 - interval_minutes)
+    if slot_starts is not None:
+        return sorted(set(range(min(12, slot_count))) | {slot_count - 1} | {
+            min(range(slot_count), key=lambda i: abs(
+                (slot_starts[i] - slot_starts[0]).total_seconds() / 60 - minutes))
+            for minutes in target_minutes if minutes >= 0
+        })
     return sorted(
         set(range(min(12, slot_count)))
         | {min(max(round(minutes / interval_minutes), 0), slot_count - 1) for minutes in target_minutes if minutes >= 0}

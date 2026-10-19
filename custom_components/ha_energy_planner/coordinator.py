@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
@@ -396,6 +397,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
         self.entry_topology_signature: tuple[Any, ...] | None = None
+        self._last_zone_mappings = deepcopy(self.entry_data.get("hvac_zone_mappings", {}))
         self._refresh_generation = 0
         self._last_non_manual_refresh_requested_at: float | None = None
         self._pending_refresh_trigger = "startup"
@@ -925,6 +927,19 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             unsubscribe_states()
 
         self._unsub_listeners.append(_unsubscribe_states)
+
+        @callback
+        def _refresh_input_subscription() -> None:
+            nonlocal unsubscribe_states
+            watched = _configured_entity_ids(self.entry_data)
+            sensor = export_limit_feedback_entity_id(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY))
+            if sensor and sensor not in watched:
+                watched.append(sensor)
+            unsubscribe_states()
+            unsubscribe_states = async_track_state_change_event(self.hass, watched, _handle_state_change)
+
+        self._refresh_input_subscription = _refresh_input_subscription
+
         export_entity = entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
         if export_entity and export_entity.startswith("select."):
             @callback
@@ -1688,6 +1703,34 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     _async_update_startup_auto_recovery = startup_recovery._async_update_startup_auto_recovery
 
+    async def async_handle_zone_mapping_update(self) -> None:
+        """Refresh room feedback without restoring unrelated actuator ownership."""
+        current = deepcopy(self.entry_data.get("hvac_zone_mappings", {}))
+        previous = getattr(self, "_last_zone_mappings", current)
+        if current == previous:
+            return
+        async with self._options_update_lock:
+            async with self._command_lock:
+                # Actuator mappings are unchanged: the persisted original HVAC
+                # baselines remain the restoration targets. Reconcile uncertain
+                # HVAC commands before the new feedback can acquire control.
+                await self.executor.async_release_hvac_control("hvac_configuration_changed")
+                production = dict(parse_production_state(self.store.data.get("production")).raw)
+                old_data = {**self.entry_data, "hvac_zone_mappings": previous}
+                if production.get("dry_run_evidence_fingerprint") == production_evidence_fingerprint(
+                    old_data, self.options,
+                ):
+                    production["dry_run_evidence_fingerprint"] = production_evidence_fingerprint(
+                        self.entry_data, self.options,
+                    )
+                    await self._async_save_production(production)
+                self.executor.entry_data = self.entry_data
+                self._last_zone_mappings = current
+                refresh = getattr(self, "_refresh_input_subscription", None)
+                if callable(refresh):
+                    refresh()
+            await self.async_request_replan()
+
     async def async_handle_options_update(self) -> None:
         """Apply option transitions, restoring ownership when control becomes safe."""
         async with self._options_update_lock:
@@ -1721,6 +1764,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "manual_hvac_override_minutes", "plan_fallback_notifications_enabled",
                 "ev_charging_strategy", "ev_readiness_buffer_minutes", "ev_schedule_min_saving",
                 "ev_schedule_min_saving_percent", "ev_min_dwell_minutes",
+                "hvac_precondition_lead_minutes", "hvac_precondition_max_lead_minutes",
+                "hvac_thermal_learning_enabled", "hvac_precondition_min_price_delta",
+                "hvac_suppression_min_price_delta", "hvac_precondition_while_away",
+                "hvac_precondition_configured_zones_only",
             }
             if previous_options is not None and changed_option_keys <= hot_policy_keys:
                 async with self._command_lock:

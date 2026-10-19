@@ -272,6 +272,8 @@ def test_lead_buckets_train_and_apply_independent_factors() -> None:
     assert calibration["buckets"]["2"]["factor"] == 0.8
     assert apply_forecast_calibration([1.0], model, "pv_forecast_kw") == [1.2]
     assert apply_forecast_calibration([1.0], model, "pv_forecast_kw", lead_offset_minutes=65) == [0.8]
+    assert apply_forecast_calibration([1.0, 1.0, 1.0], model, 'pv_forecast_kw',
+        interval_minutes=30, slot_lead_minutes=[5, 7, 65]) == [1.2, 1.2, 0.8]
 
 
 def test_apply_forecast_calibration_uses_conservative_uncertainty_factors() -> None:

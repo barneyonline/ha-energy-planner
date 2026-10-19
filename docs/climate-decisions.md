@@ -382,3 +382,22 @@ heating cycle through coasting and restoration. Cooling acceptance uses determin
 replay until a natural cooling opportunity occurs. On failure, retain transaction
 evidence, restore through the supported ownership path and roll back if required;
 do not clear ownership or override records to make the UI appear healthy.
+
+
+## Stable timing, configuration edits and calendar evidence
+
+Timestamped tariffs retain their native UTC boundaries, including source coverage expiry. Native detailed tariff blocks take precedence over already-resampled convenience forecasts. A refresh at 09:03, 09:08 or 09:14 does not move an unchanged 16:00 peak or its 14:30 preconditioning start. The current and final intervals can be shorter than the configured cadence; energy and thermal calculations use their actual durations. Extending EV coverage replaces the former partial tail with a newly averaged complete interval. UTC boundaries remain unambiguous through daylight-saving changes. Untimestamped forecast arrays retain their relative-time interpretation and cannot establish native tariff boundaries.
+
+HVAC lead, learning and price-policy changes replan the affected lifecycle without restoring EV, profile or Export Limit ownership. Zone temperature/comfort mappings restore affected HVAC ownership, update input subscriptions and invalidate affected learned models through source identity, while unrelated controls continue. Physical actuator mappings and global safety changes retain full guarded recovery. Original restoration baselines, uncertain commands, manual overrides and shared power constraints remain authoritative.
+
+The calendar shows preconditioning until its selected completion boundary and coast until the tariff period ends, rather than treating a command eligibility deadline as the operating end. Future phases are labeled planned; independent live feedback and committed ownership establish confirmed history. Release events are discrete actions. An occupancy-return handoff has its own reason instead of claiming an expensive tariff period ended.
+
+Until active temperature rates qualify, diagnostics identify the configured fallback duration and report finishing temperatures as unknown. A target setting is an instruction, not a prediction. Passive drift readiness alone does not establish heating/cooling readiness or measured energy savings. Pending Export Limit requests explicitly say gateway confirmation is outstanding, independently of healthy planning inputs.
+
+Regression evidence: tests/test_inputs.py (native grid and complete horizon), tests/test_planner.py (stable lifecycle, tariff times and integrated partial-slot energy), tests/test_calendar.py (phase duration, command detail and point releases), tests/test_coordinator.py (policy/mapping isolation), and the full scripts/docker-validate.sh gate. These tests do not establish deployed or physical-device performance.
+
+Climate observation predictions persist each baseline interval's end, so measured comparisons integrate partial and split intervals without double-counting or dropping coverage. Older predictions retain their original fixed-cadence interpretation. PV calibration selects lead buckets by elapsed time, and sparse training snapshots still cover the full horizon. Daylight EV coverage checks interval adjacency; continuous charging credits only the actual capacity of a retained pre-window slot.
+
+Forecast confidence weights coverage by actual duration rather than interval count, including point-only inputs. Load coverage diagnostics use the same elapsed durations. Calendar label upgrades retain a confirmed climate phase's existing identity (UID, confirmed start and location), while separate phase UIDs and discrete actions remain distinct.
+
+Coverage classification sums elapsed durations before converting to hours. Exact eight- and twelve-hour windows qualify at their existing thresholds even when import/export tariff boundaries are a second apart; a window ending one second short still fails that threshold.

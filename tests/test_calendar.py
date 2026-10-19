@@ -828,3 +828,40 @@ def test_late_ev_feedback_does_not_confirm_future_or_preceding_allocations(monke
         state="on", last_changed=now - timedelta(minutes=1),
     ))
     assert all("confirmed_start" not in record for record in calendar_module.calendar_event_records(coordinator))
+
+
+@pytest.mark.parametrize('phase,label,end_key', [
+    ('preconditioning', 'Pre-cool', 'precondition_end'),
+    ('pre_peak_coast', 'Coast', 'period_start'),
+    ('peak_coast', 'Coast', 'period_end'),
+])
+def test_climate_calendar_displays_phase_duration_and_separate_command_deadline(phase, label, end_key):
+    start = datetime(2026, 10, 19, 3, 30, tzinfo=UTC)
+    action = replace(_action('phase', start, start + timedelta(minutes=15)),
+        asset=ActionAsset.DAIKIN, kind=ActionKind.SET_HVAC,
+        desired_state={'phase': phase, 'hvac_mode': 'cool', 'target_temperature': 19,
+                       end_key: start + timedelta(minutes=90)})
+    event = calendar_module._calendar_event(action, _coordinator(_plan([action])))
+    assert event.end == start + timedelta(minutes=90)
+    verb = 'to' if phase == 'preconditioning' else 'at'
+    assert event.summary == f'Climate: {label} {verb} 19 °C (planned)'
+    assert 'Command eligibility' in event.description
+    assert 'not the operating duration' in event.description
+
+
+def test_climate_release_is_a_point_event_not_a_fifteen_minute_phase():
+    start = datetime(2026, 10, 19, 10, tzinfo=UTC)
+    action = replace(_action('release', start, start + timedelta(minutes=15)),
+                     asset=ActionAsset.DAIKIN, kind=ActionKind.RELEASE_HVAC)
+    event = calendar_module._calendar_event(action, _coordinator(_plan([action])))
+    assert event.end == start + timedelta(seconds=1)
+    assert event.summary.endswith('(planned)')
+
+
+def test_away_off_calendar_is_a_discrete_policy_action():
+    start = datetime(2026, 10, 19, 0, tzinfo=UTC)
+    action = replace(_action('away', start, start + timedelta(minutes=15)),
+                     asset=ActionAsset.DAIKIN, kind=ActionKind.SET_HVAC, desired_state={'hvac_mode': 'off'})
+    event = calendar_module._calendar_event(action, _coordinator(_plan([action])))
+    assert event.summary == 'Climate: Keep off while away (planned)'
+    assert event.end == start + timedelta(seconds=1)

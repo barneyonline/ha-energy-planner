@@ -10,6 +10,7 @@ from .climate_models import SiteCost
 from .const import CONF_GRID_EXPORT_LIMIT_KW, CONF_GRID_IMPORT_LIMIT_KW, CONF_PLANNING_INTERVAL_MINUTES
 from .models import DecisionContext
 from .planner_battery import _battery_model
+from .planning_grid import slot_end
 
 
 def site_cost(
@@ -32,12 +33,11 @@ def site_cost(
     efficiency = sqrt(battery["round_trip_efficiency"])
     total = imported = exported = hvac = 0.0
     for index, (slot, power) in enumerate(zip(context.slots, powers, strict=True)):
-        duration = (
-            (context.slots[index + 1].valid_at - slot.valid_at).total_seconds() / 3600
-            if index + 1 < len(context.slots)
-            else float(options[CONF_PLANNING_INTERVAL_MINUTES]) / 60
-        )
-        if duration <= 0 or duration - float(options[CONF_PLANNING_INTERVAL_MINUTES]) / 60 > 1e-6:
+        end = slot.end_at or (context.slots[index + 1].valid_at if index + 1 < len(context.slots)
+                              else slot_end(slot, float(options[CONF_PLANNING_INTERVAL_MINUTES])))
+        duration = (end - slot.valid_at).total_seconds() / 3600
+        if (duration <= 0 or duration - float(options[CONF_PLANNING_INTERVAL_MINUTES]) / 60 > 1e-6
+                or index + 1 < len(context.slots) and end != context.slots[index + 1].valid_at):
             return None
         pv = (
             slot.pv_forecast_lower_kw if conservative and slot.pv_forecast_lower_kw is not None else slot.pv_forecast_kw

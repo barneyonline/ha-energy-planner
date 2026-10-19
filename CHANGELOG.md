@@ -12,11 +12,16 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep tariff and preconditioning boundaries stable across refreshes; account for partial intervals in EV, battery, climate and site-energy estimates.
+- Handle split intervals in daylight/continuous EV scheduling, elapsed PV calibration and measured climate observation comparisons.
+- Weight forecast confidence and load coverage by elapsed time; preserve confirmed climate phase identity across calendar-label upgrades.
+- Avoid rounding exact eight/twelve-hour forecast coverage below its safety threshold when tariff boundaries differ by seconds.
+- Preserve unrelated control ownership and pending gateway confirmation when HVAC timing or room-feedback configuration changes.
+- Render climate phase durations separately from command deadlines, distinguish planned and confirmed activity, and explain occupancy handoffs accurately.
 
 ### 🔧 Improvements
 
-- None
+- Explain fallback lead times and unknown finishing temperatures while heating/cooling rates are learning; highlight pending export-limit gateway confirmation separately from input health.
 
 ### 🔄 Other changes
 

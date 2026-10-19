@@ -54,6 +54,8 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
                                      asset="enphase_export_limit")
         if pause:
             status.update(ready=False, reason=pause)
+    if status.get("reason") in {"export_limit_pending", "export_limit_restoration_pending"}:
+        status["summary"] = "Waiting for gateway confirmation; the planned setting is not yet confirmed."
     return status
 
 
