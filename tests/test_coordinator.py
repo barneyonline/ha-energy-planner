@@ -10379,3 +10379,73 @@ def test_review_pending_feedback_survives_json_reload_with_activation_proof(monk
         ) is (scenario == "valid")
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('key,value', [
+    ('hvac_precondition_lead_minutes', 120), ('hvac_precondition_max_lead_minutes', 240),
+    ('hvac_thermal_learning_enabled', False), ('hvac_precondition_min_price_delta', .15),
+    ('hvac_suppression_min_price_delta', .15), ('hvac_precondition_while_away', True),
+    ('hvac_precondition_configured_zones_only', True),
+])
+def test_climate_policy_edits_preserve_export_ownership_and_pending_confirmation(key, value):
+    export = {'baseline': {'watts': None}, 'expected': {'watts': 0},
+              'pending': {'action_id': 'existing', 'sent_at': 123}}
+    coordinator = _coordinator_for_runtime_services(
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        store_data={'production': {'armed': True}, 'ownership': {'enphase_export_limit': export}},
+    )
+    coordinator.entry.options = {**coordinator.entry.options, key: value}
+    asyncio.run(coordinator.async_handle_options_update())
+    assert coordinator.store.data['ownership']['enphase_export_limit'] == export
+    assert coordinator.store.data['production']['armed'] is True
+    assert coordinator.executor.device_restores == []
+    assert coordinator.executor.restored == []
+    assert coordinator.refresh_requested == 1
+
+
+@pytest.mark.parametrize("has_listener", [True, False])
+def test_zone_feedback_mapping_change_releases_only_hvac_and_refreshes_sensor_listener(has_listener):
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={'hvac_zone_mappings': {'climate.room': {'temperature': 'sensor.new'}}},
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        store_data={'production': {'armed': True}, 'ownership': {'enphase_export_limit': {'baseline': {'watts': 0}}}},
+    )
+    coordinator._last_zone_mappings = {'climate.room': {'temperature': 'sensor.old'}}
+    refreshed = []
+    if has_listener:
+        coordinator._refresh_input_subscription = lambda: refreshed.append(True)
+    asyncio.run(coordinator.async_handle_zone_mapping_update())
+    asyncio.run(coordinator.async_handle_zone_mapping_update())
+    assert coordinator.executor.hvac_releases == ['hvac_configuration_changed']
+    assert coordinator.executor.restored == []
+    assert coordinator.executor.device_restores == []
+    assert coordinator.store.data['production']['armed'] is True
+    assert coordinator.store.data['ownership']['enphase_export_limit']['baseline']['watts'] == 0
+    assert refreshed == ([True] if has_listener else [])
+
+
+@pytest.mark.parametrize("feedback_available", [True, False])
+def test_zone_mapping_refresh_rebinds_new_sensor_and_matching_production_evidence(monkeypatch, feedback_available):
+    old = {'climate.room': {'temperature': 'sensor.old'}}
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={'hvac_zone_mappings': old, 'enphase_export_limit_entity': 'select.export'},
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        store_data={'production': {'armed': True}},
+    )
+    coordinator.hass.bus = SimpleNamespace(async_listen=lambda *_: lambda: None)
+    monkeypatch.setattr(coordinator_module, 'export_limit_feedback_entity_id',
+                        lambda *_: 'sensor.export_feedback' if feedback_available else None)
+    coordinator._last_zone_mappings = old
+    coordinator.store.data['production']['dry_run_evidence_fingerprint'] = production_evidence_fingerprint(
+        coordinator.entry_data, coordinator.options)
+    tracked = []
+    monkeypatch.setattr(coordinator_module, 'async_call_later', lambda *_: lambda: None)
+    monkeypatch.setattr(coordinator_module, 'async_track_state_change_event',
+                        lambda hass, entities, callback: tracked.append(list(entities)) or (lambda: None))
+    coordinator.async_start_listeners()
+    coordinator.entry.data['hvac_zone_mappings'] = {'climate.room': {'temperature': 'sensor.new'}}
+    asyncio.run(coordinator.async_handle_zone_mapping_update())
+    assert 'sensor.new' in tracked[-1] and 'sensor.old' not in tracked[-1]
+    assert ('sensor.export_feedback' in tracked[-1]) is feedback_available
+    assert coordinator.store.data['production']['dry_run_evidence_fingerprint'] == production_evidence_fingerprint(
+        coordinator.entry_data, coordinator.options)

@@ -95,7 +95,7 @@ class Override:
 
 @dataclass(slots=True)
 class DecisionSlot:
-    """Five-minute decision slot."""
+    """Timestamped decision interval, including partial current/tail intervals."""
 
     valid_at: datetime
     import_price: float | None
@@ -109,6 +109,7 @@ class DecisionSlot:
     pv_forecast_lower_kw: float | None = None
     baseline_load_forecast_upper_kw: float | None = None
     carbon_intensity_g_per_kwh: float | None = None
+    end_at: datetime | None = None
 
 
 @dataclass(slots=True)

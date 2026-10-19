@@ -1209,6 +1209,23 @@ def test_observation_energy_uses_forecast_timestamps(interval):
     assert not state["comparisons"][-1]["valid"]
 
 
+@pytest.mark.parametrize('invalid_end', [False, True])
+def test_observation_energy_uses_partial_interval_ends(invalid_end):
+    from custom_components.ha_energy_planner.climate_learning import finish_observation
+
+    end = NOW + timedelta(minutes=15)
+    state = {'observation_started_at': NOW.isoformat(), 'observation_until': end.isoformat(),
+        'observation_prediction': {'qualified': True, 'power_source_type': 'measured',
+            'baseline_slots': [NOW.isoformat(), (NOW + timedelta(minutes=2)).isoformat()],
+            'baseline_ends': ['invalid' if invalid_end else (NOW + timedelta(minutes=2)).isoformat(),
+                              end.isoformat()], 'baseline_powers_kw': [3, 1], 'interval_minutes': 15}}
+    finish_observation(state, [row(NOW + timedelta(minutes=i)) for i in range(0, 16, 5)], end)
+    result = state['comparisons'][-1]
+    assert result['valid'] is (not invalid_end)
+    if not invalid_end:
+        assert result['predicted_hvac_kwh'] == pytest.approx(19 / 60)
+
+
 def test_room_without_presence_uses_household_occupancy():
     ctx = context()
     model = simulation_model()
@@ -1930,3 +1947,20 @@ def test_second_review_economic_candidates_enforce_their_own_lead_and_report_act
     assert decision['rejected']['adaptive_lead_limit'] == 1
     assert decision['thermal_timing']['heat']['available_run_minutes'] == 120
     assert not decision['thermal_timing']['heat']['partial_preconditioning']
+
+
+def test_economic_search_counts_split_slots_by_elapsed_lead_time(monkeypatch):
+    from custom_components.ha_energy_planner.climate_models import ClimateTrajectory
+
+    ctx = context(count=50)
+    ctx.created_at = NOW + timedelta(minutes=3)
+    ctx.slots[0].valid_at = ctx.created_at
+    for i, slot in enumerate(ctx.slots):
+        slot.end_at = ctx.slots[i + 1].valid_at if i + 1 < len(ctx.slots) else slot.valid_at + timedelta(minutes=5)
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.simulate',
+        lambda *args, **kw: ClimateTrajectory((21,) * 50, (.4,) * 50))
+    captured = []
+    monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules',
+        lambda count, lead, targets, limit: captured.append(lead))
+    optimise(ctx, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15}, simulation_model())
+    assert captured == [18]  # Eighteen native five-minute intervals, not six nominal slots.

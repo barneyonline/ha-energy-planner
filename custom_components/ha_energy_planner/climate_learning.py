@@ -551,13 +551,17 @@ def finish_observation(state: dict[str, Any], rows: list[dict[str, Any]], now: d
     prediction = state.get("observation_prediction", {})
     reference = prediction.get("baseline_powers_kw", [])
     dates = [instant(value) for value in prediction.get("baseline_slots", [])]
+    ends = [instant(value) for value in prediction.get("baseline_ends", [])]
     interval = timedelta(minutes=float(prediction.get("interval_minutes", 5)))
     forecast_energy = 0.0
     coverage_end = start
-    for at, power in zip(dates, reference, strict=False):
+    for index, (at, power) in enumerate(zip(dates, reference, strict=False)):
         if at is None or finite(power) is None:
             continue
-        overlap_start, overlap_end = max(start, at), min(end, at + interval)
+        boundary = ends[index] if index < len(ends) else at + interval
+        if boundary is None:
+            continue
+        overlap_start, overlap_end = max(start, at), min(end, boundary)
         if overlap_start < overlap_end and overlap_start == coverage_end:
             forecast_energy += float(power) * (overlap_end - overlap_start).total_seconds() / 3600
             coverage_end = overlap_end
