@@ -186,6 +186,32 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             if ai_task is not None:
                 await ai_task
 
+    async def assert_startup_climate_restored(call: ServiceCall) -> None:
+        """Check the restored baseline and include actual state on failure."""
+        states = {
+            entity_id: getattr(hass.states.get(entity_id), "state", None)
+            for entity_id in (
+                "binary_sensor.energy_planner_climate_control_active",
+                "binary_sensor.energy_planner_armed",
+                "automation.fake_climate_conflict",
+                "climate.fake_daikin",
+            )
+        }
+        ownership = {
+            entry.entry_id: entry.runtime_data.store.data.get("ownership", {})
+            for entry in hass.config_entries.async_entries("ha_energy_planner")
+            if getattr(entry, "runtime_data", None) is not None
+        }
+        if (
+            not ownership
+            or states["binary_sensor.energy_planner_climate_control_active"] != "off"
+            or states["automation.fake_climate_conflict"] != "on"
+        ):
+            raise RuntimeError(
+                "Startup climate restoration failed: "
+                + json.dumps({"states": states, "ownership": ownership}, default=str, sort_keys=True)
+            )
+
     async def wait_for_manual_override_clear(call: ServiceCall) -> None:
         """Wait until the asynchronous helper-off release has completed."""
         deadline = asyncio.get_running_loop().time() + 30
@@ -380,6 +406,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     hass.services.async_register(DOMAIN, "seed_production_evidence", seed_production_evidence)
     hass.services.async_register(DOMAIN, "assert_unsafe_arm_rejected", assert_unsafe_arm_rejected)
     hass.services.async_register(DOMAIN, "wait_for_planner_idle", wait_for_planner_idle)
+    hass.services.async_register(DOMAIN, "assert_startup_climate_restored", assert_startup_climate_restored)
     hass.services.async_register(DOMAIN, "wait_for_manual_override_clear", wait_for_manual_override_clear)
     hass.services.async_register(DOMAIN, "wait_for_hvac_away_off", wait_for_hvac_away_off)
     hass.services.async_register(DOMAIN, "mark_smoke_complete", mark_smoke_complete)
@@ -649,9 +676,6 @@ automation:
       - condition: state
         entity_id: binary_sensor.energy_planner_armed
         state: "off"
-      - condition: state
-        entity_id: binary_sensor.energy_planner_climate_control_active
-        state: "off"
       # Entity platforms can finish after the planner's first refresh. Wait for
       # their actual inputs before replanning instead of relying on a later
       # coordinator timer to recover the deliberately unsafe startup snapshot.
@@ -665,6 +689,14 @@ automation:
         continue_on_timeout: false
       - action: ha_energy_planner.replan
       - action: fake_planner_test.wait_for_planner_idle
+      # The fixture deliberately seeds legacy HVAC ownership. Being disarmed
+      # does not release it; restore only once its input entities are available,
+      # then drain before asserting that ownership has actually been released.
+      - action: ha_energy_planner.restore_safe_state
+        data:
+          reason: docker_smoke_startup_restore
+      - action: fake_planner_test.wait_for_planner_idle
+      - action: fake_planner_test.assert_startup_climate_restored
       - wait_template: >-
           {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
         timeout: "00:00:30"
