@@ -38,6 +38,9 @@
     "binary_sensor": {
       "armed": {
         "default": "mdi:shield-check-outline"
+      },
+      "climate_control_active": {
+        "default": "mdi:thermostat-cog"
       }
     },
     "button": {

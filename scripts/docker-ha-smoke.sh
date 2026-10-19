@@ -637,7 +637,8 @@ automation:
         event: start
     actions:
       - wait_template: >-
-          {{ states('binary_sensor.energy_planner_armed') not in ['unknown', 'unavailable'] }}
+          {{ states('binary_sensor.energy_planner_armed') not in ['unknown', 'unavailable']
+             and states('binary_sensor.energy_planner_climate_control_active') not in ['unknown', 'unavailable'] }}
         timeout: "00:00:30"
         continue_on_timeout: false
       # Explicit arming must not turn a persisted request into apparent command
@@ -648,7 +649,22 @@ automation:
       - condition: state
         entity_id: binary_sensor.energy_planner_armed
         state: "off"
+      - condition: state
+        entity_id: binary_sensor.energy_planner_climate_control_active
+        state: "off"
+      # Entity platforms can finish after the planner's first refresh. Wait for
+      # their actual inputs before replanning instead of relying on a later
+      # coordinator timer to recover the deliberately unsafe startup snapshot.
+      - wait_template: >-
+          {{ is_number(states('sensor.smoke_import_price_forecast'))
+             and is_number(states('sensor.smoke_export_price_forecast'))
+             and is_number(states('sensor.smoke_pv_forecast_series'))
+             and is_number(state_attr('climate.fake_daikin', 'current_temperature'))
+             and states('automation.fake_climate_conflict') in ['on', 'off'] }}
+        timeout: "00:01:30"
+        continue_on_timeout: false
       - action: ha_energy_planner.replan
+      - action: fake_planner_test.wait_for_planner_idle
       - wait_template: >-
           {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
         timeout: "00:00:30"
@@ -692,7 +708,8 @@ automation:
       # race a serialized startup refresh on slower Docker hosts.
       - wait_template: >-
           {{ is_state('automation.fake_climate_conflict', 'off')
-             and is_state('input_boolean.fake_climate_zone', 'on') }}
+             and is_state('input_boolean.fake_climate_zone', 'on')
+             and is_state('binary_sensor.energy_planner_climate_control_active', 'on') }}
         timeout: "00:00:30"
         continue_on_timeout: false
       - action: ha_energy_planner.restore_safe_state
@@ -728,6 +745,9 @@ automation:
         data:
           entity_id: input_boolean.climate_manual_override
       - action: fake_planner_test.wait_for_planner_idle
+      - condition: state
+        entity_id: binary_sensor.energy_planner_climate_control_active
+        state: "off"
       - action: input_text.set_value
         target:
           entity_id: input_text.manual_override_release_seen
@@ -1270,6 +1290,29 @@ payload["data"]["built_in_load_forecast"] = {
 path.write_text(json.dumps(payload, indent=2) + "\n")
 PY
 
+report_smoke_failure() {
+  cat "$LOG_FILE"
+  python3 - "$TMP_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]) / ".storage" / "trace.saved_traces"
+if path.exists():
+    for record in json.loads(path.read_text()).get("data", {}).get("automation.ha_energy_planner_service_smoke", []):
+        trace = record.get("extended_dict", {})
+        step = trace.get("last_step")
+        events = trace.get("trace", {}).get(step, [])
+        result = events[-1].get("result", {}) if events else {}
+        print("Smoke automation trace:", json.dumps({
+            "last_step": step,
+            "execution": trace.get("script_execution"),
+            "wait": result.get("wait"),
+            "condition_result": result.get("result"),
+        }))
+PY
+}
+
 set +e
 docker run --rm \
   -v "$TMP_DIR:/config" \
@@ -1280,7 +1323,7 @@ STATUS=$?
 set -e
 
 if [[ "$STATUS" != "0" ]]; then
-  cat "$LOG_FILE"
+  report_smoke_failure
   if [[ "$STATUS" == "124" ]]; then
     echo "Home Assistant smoke automation did not finish within 240 seconds" >&2
   fi
@@ -1288,7 +1331,7 @@ if [[ "$STATUS" != "0" ]]; then
 fi
 
 if [[ ! -f "$TMP_DIR/.ha_energy_planner_smoke_complete" ]]; then
-  cat "$LOG_FILE"
+  report_smoke_failure
   echo "Home Assistant stopped before the smoke automation completed" >&2
   exit 1
 fi
@@ -1333,6 +1376,7 @@ expected_entities = {
     "sensor.energy_planner_current_state",
     "sensor.energy_planner_next_actions",
     "binary_sensor.energy_planner_armed",
+    "binary_sensor.energy_planner_climate_control_active",
     "calendar.energy_planner_plan",
     "switch.energy_planner_automatic_control",
     "switch.energy_planner_climate_control",

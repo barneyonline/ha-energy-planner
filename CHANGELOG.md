@@ -22,6 +22,28 @@
 
 - None
 
+## 1.4.3 - 2026-10-19
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- Add a **Climate control active** binary sensor that follows HVAC ownership during acquisition, preconditioning, coast and pending restoration, so other automations can yield before changing the shared unit.
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- Wait for initialized synthetic inputs before the packaged compatibility smoke test requests its first plan, avoiding startup-order failures in CI.
+
 ## 1.4.2 - 2026-10-19
 
 ### 🚧 Breaking changes

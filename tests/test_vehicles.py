@@ -198,6 +198,7 @@ def make_coordinator(hass: Any, data: dict) -> EnergyPlannerCoordinator:
     coordinator.store.data = {}
     coordinator.store._saved_generation = 0
     coordinator.store._mutation_generation = 0
+    coordinator.store._ownership_listeners = set()
     coordinator.store._async_save = AsyncMock()
     coordinator.executor = Executor(coordinator.store, hass=hass, entry_data=data, options=DEFAULT_OPTIONS)
     coordinator.executor.ev_command_guard = coordinator._ev_command_guard
