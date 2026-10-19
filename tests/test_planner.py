@@ -126,6 +126,23 @@ def test_daylight_lowest_cost_selects_cheapest_complete_contiguous_window() -> N
     assert {item["allocation_source"] for item in action.desired_state["allocated_slots"]} == {"daylight"}
 
 
+def test_daylight_preference_accepts_contiguous_split_intervals():
+    from dataclasses import replace
+
+    context = _daylight_ev_context()
+    original = next(s for s in context.slots if s.valid_at.hour == 12)
+    index = context.slots.index(original)
+    split = original.valid_at + timedelta(minutes=2)
+    context.slots[index:index + 1] = [replace(original, end_at=split),
+        replace(original, valid_at=split, end_at=original.valid_at + timedelta(minutes=5))]
+    plan = DryRunPlanner({**DEFAULT_OPTIONS, 'planner_enabled': True, 'dry_run': False,
+        CONF_EV_DAYLIGHT_LOWEST_COST_CHARGING_ENABLED: True, 'ev_earliest_start': '23:00',
+        'default_ready_by': '07:00', 'ev_charge_rate_kw': 6, 'ev_soc_per_kwh': 10}).create_plan(context)
+    action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
+    assert action.desired_state['daylight_lowest_cost']['forecast_complete']
+    assert action.desired_state['daylight_lowest_cost']['selected']
+
+
 def test_daylight_schedule_does_not_allocate_a_slot_past_sunset() -> None:
     context = _daylight_ev_context()
     context.current_ev_soc_percent = 49.5

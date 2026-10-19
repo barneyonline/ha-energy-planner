@@ -365,17 +365,19 @@ def allocate_least_cost_charging(
     ranked = _rank_charging_slots(price_eligible, charge_rate_kw, carbon_weight)
     if continuous:
         required_slots = ceil(required / soc_per_slot)
-        if current_outside_window and current_slot in price_eligible:
+        if current_slot is not None and current_outside_window and current_slot in price_eligible:
+            current_capacity = soc_per_slot * slot_hours(current_slot, interval_minutes) / (interval_minutes / 60)
+            remaining_required = max(required - current_capacity, 0.0)
             regular_price_eligible = [slot for slot in price_eligible if slot is not current_slot]
             ordered = [
                 current_slot,
                 *_best_continuous_slots(
                     regular_price_eligible,
-                    required_slots=max(required_slots - 1, 0),
+                    required_slots=ceil(remaining_required / soc_per_slot),
                     interval_minutes=interval_minutes,
                     force_current=False,
                     charge_rate_kw=charge_rate_kw,
-                    required_soc_percent=max(required - soc_per_slot, 0.0),
+                    required_soc_percent=remaining_required,
                     soc_per_slot=soc_per_slot,
                     carbon_weight=carbon_weight,
                 ),

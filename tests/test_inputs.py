@@ -1631,6 +1631,7 @@ def test_forecast_training_indices_span_full_horizon_sparsely() -> None:
 
 def test_forecast_training_indices_handles_empty_horizon() -> None:
     assert _forecast_training_indices(0, 5) == []
+    assert _forecast_training_indices(1, 5, []) == []
 
 
 def test_input_manager_normalizes_optional_carbon_forecast_without_making_it_required() -> None:
@@ -2376,13 +2377,18 @@ def test_native_grid_retains_partial_intervals_and_exact_horizon(monkeypatch):
                      'sensor.export': FakeState('.1', {'forecast': native}, now),
                      'sensor.pv': FakeState('1', {'forecast': [1] * 48}, now),
                      'sensor.house': FakeState('1', {}, now), 'sensor.battery': FakeState('50', {}, now)})
-    manager = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15})
+    calibration = {'pv_forecast_kw': {'model_version': 4, 'buckets': {
+        '0': {'enabled': True, 'factor': 1.2}, '1': {'enabled': True, 'factor': .8}}}}
+    manager = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15},
+                           forecast_calibration=calibration)
     context = manager.build_context()
     assert context.slots[0].valid_at == now
     assert context.slots[0].end_at == origin + timedelta(minutes=15)
     assert context.slots[-1].end_at == now + timedelta(hours=12)
     assert context.slots[-1].end_at - context.slots[-1].valid_at == timedelta(minutes=3)
     assert len(context.slots) == 49
+    assert context.slots[2].pv_forecast_kw == 1.2  # 27-minute lead, not index 2 * 15 minutes.
+    assert manager.forecast_training_slots[-1]['valid_at'] == context.slots[-1].valid_at
     assert all(s.baseline_load_forecast_kw is not None for s in context.slots)
     imported = next(x for x in manager.forecast_coverage_details if x['config_key'] == CONF_AMBER_IMPORT_PRICE)
     assert imported['requested_hours'] == imported['covered_hours'] == 12
