@@ -373,6 +373,24 @@ def test_forecast_coverage_details_classifies_continuous_coverage() -> None:
     assert degraded["trailing_missing_slots"] == 8
 
 
+@pytest.mark.parametrize('covered_minutes,classification', [(480, 'degraded'), (720, 'healthy')])
+@pytest.mark.parametrize('short_by_seconds', [0, 1])
+@pytest.mark.parametrize('split_seconds', [0, 1])
+def test_forecast_coverage_thresholds_use_exact_elapsed_duration(
+    covered_minutes, classification, short_by_seconds, split_seconds,
+):
+    start = datetime(2026, 10, 19, tzinfo=UTC)
+    starts = [start + timedelta(minutes=m) for m in range(0, 24 * 60, 5)]
+    starts = sorted(set(starts) | {at + timedelta(seconds=split_seconds) for at in starts})
+    count = sum(at < start + timedelta(minutes=covered_minutes) for at in starts)
+    starts[count] -= timedelta(seconds=short_by_seconds)
+    details = forecast_coverage_details([1] * count + [None] * (len(starts) - count),
+        starts_at=start, interval_minutes=5, slot_starts=starts, horizon_end=start + timedelta(hours=24))
+    expected = classification if not short_by_seconds else 'unsafe' if covered_minutes == 480 else 'degraded'
+    assert details['classification'] == expected
+    assert details['continuous_hours'] == round((covered_minutes * 60 - short_by_seconds) / 3600, 4)
+
+
 def test_forecast_coverage_details_fails_closed_on_leading_and_internal_gaps() -> None:
     starts_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     leading = forecast_coverage_details(
