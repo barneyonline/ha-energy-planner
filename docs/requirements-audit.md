@@ -95,7 +95,11 @@ use throughout; the Docker and pull-request gates enforce that result.
   removal on entity unload and isolation of observer failures protect recovery.
   `tests/test_climate_ownership_sensor.py` covers these transitions, slow persistence,
   entry isolation and legacy evidence; `scripts/docker-ha-smoke.sh` verifies real HA
-  registration and acquisition/manual-release On/Off states. The explicit-Off
+  registration and acquisition/manual-release On/Off states. The smoke automation
+  waits for its synthetic tariff, PV, room-temperature and automation inputs before
+  explicitly replanning; `tests/scripts/test_smoke_startup.py` exercises late, missing
+  and unavailable startup inputs through Home Assistant's actual script runner.
+  The explicit-Off
   automation guard and its manual/emergency priority limitations are documented in
   `docs/climate-decisions.md`.
 - The primary user-facing status surface includes **Armed**, **Current
