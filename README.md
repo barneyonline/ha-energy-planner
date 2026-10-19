@@ -14,6 +14,7 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 
 - Tariff-aware EV scheduling with ready-by, target SOC, solar, battery-reserve and grid constraints.
 - Climate preconditioning with room comfort protection, learned heating/cooling rates and guarded restoration.
+- A read-only **Climate control active** binary sensor for coordinating other HVAC automations; see [automation guards](docs/climate-decisions.md#coordinating-other-automations).
 - Recorder-trained household-load forecasts and fail-closed checks for missing or stale inputs.
 - Current state, next actions, a plan calendar with confirmed history and redacted diagnostics.
 - Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.

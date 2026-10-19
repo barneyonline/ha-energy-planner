@@ -698,6 +698,9 @@
     "binary_sensor": {
       "armed": {
         "name": "Armed"
+      },
+      "climate_control_active": {
+        "name": "Climate control active"
       }
     },
     "calendar": {

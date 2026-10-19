@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Add a **Climate control active** binary sensor that follows HVAC ownership during acquisition, preconditioning, coast and pending restoration, so other automations can yield before changing the shared unit.
 
 ### 🐛 Bug fixes
 

@@ -87,7 +87,18 @@ use throughout; the Docker and pull-request gates enforce that result.
   falls back to safe list/dict defaults while preserving unknown metadata, and
   malformed persisted execution timestamps are ignored instead of raising
   through safety-gate evaluation.
-- The primary user-facing status surface is limited to **Armed**, **Current
+- The enabled-by-default **Climate control active** binary sensor follows per-entry
+  HVAC ownership, independently of command authority or compressor activity. Store
+  callbacks publish acquisition before command dispatch and retain On during coast,
+  uncertain commands, failed restoration and persisted reload recovery. Manual
+  override timers and EV/Enphase ownership alone do not activate it. Callback
+  removal on entity unload and isolation of observer failures protect recovery.
+  `tests/test_climate_ownership_sensor.py` covers these transitions, slow persistence,
+  entry isolation and legacy evidence; `scripts/docker-ha-smoke.sh` verifies real HA
+  registration and acquisition/manual-release On/Off states. The explicit-Off
+  automation guard and its manual/emergency priority limitations are documented in
+  `docs/climate-decisions.md`.
+- The primary user-facing status surface includes **Armed**, **Current
   state**, **Next actions**, and the read-only **Plan** calendar. Diagnostic
   **Decision summary**, **Plan health**, **Current load forecast**, **Planning
   duration**, and **Load forecast coverage score** sensors provide deeper

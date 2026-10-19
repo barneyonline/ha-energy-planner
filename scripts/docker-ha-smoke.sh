@@ -637,7 +637,8 @@ automation:
         event: start
     actions:
       - wait_template: >-
-          {{ states('binary_sensor.energy_planner_armed') not in ['unknown', 'unavailable'] }}
+          {{ states('binary_sensor.energy_planner_armed') not in ['unknown', 'unavailable']
+             and states('binary_sensor.energy_planner_climate_control_active') not in ['unknown', 'unavailable'] }}
         timeout: "00:00:30"
         continue_on_timeout: false
       # Explicit arming must not turn a persisted request into apparent command
@@ -647,6 +648,9 @@ automation:
       - action: fake_planner_test.assert_unsafe_arm_rejected
       - condition: state
         entity_id: binary_sensor.energy_planner_armed
+        state: "off"
+      - condition: state
+        entity_id: binary_sensor.energy_planner_climate_control_active
         state: "off"
       - action: ha_energy_planner.replan
       - wait_template: >-
@@ -692,7 +696,8 @@ automation:
       # race a serialized startup refresh on slower Docker hosts.
       - wait_template: >-
           {{ is_state('automation.fake_climate_conflict', 'off')
-             and is_state('input_boolean.fake_climate_zone', 'on') }}
+             and is_state('input_boolean.fake_climate_zone', 'on')
+             and is_state('binary_sensor.energy_planner_climate_control_active', 'on') }}
         timeout: "00:00:30"
         continue_on_timeout: false
       - action: ha_energy_planner.restore_safe_state
@@ -728,6 +733,9 @@ automation:
         data:
           entity_id: input_boolean.climate_manual_override
       - action: fake_planner_test.wait_for_planner_idle
+      - condition: state
+        entity_id: binary_sensor.energy_planner_climate_control_active
+        state: "off"
       - action: input_text.set_value
         target:
           entity_id: input_text.manual_override_release_seen
@@ -1333,6 +1341,7 @@ expected_entities = {
     "sensor.energy_planner_current_state",
     "sensor.energy_planner_next_actions",
     "binary_sensor.energy_planner_armed",
+    "binary_sensor.energy_planner_climate_control_active",
     "calendar.energy_planner_plan",
     "switch.energy_planner_automatic_control",
     "switch.energy_planner_climate_control",

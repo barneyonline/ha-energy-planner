@@ -296,6 +296,46 @@ override requests also retire prior expectations before releasing owned controls
 Historical outcomes remain diagnostic evidence and cannot revive retired
 expectations in the live state listener.
 
+## Coordinating other automations
+
+The enabled-by-default **Climate control active** binary sensor normally has the
+entity ID `binary_sensor.energy_planner_climate_control_active`. Use the entity
+belonging to the planner entry that controls your unit; Home Assistant may rename
+it if that ID is already taken. It is read-only and reports ownership independently
+of Armed, Automatic control and whether the compressor is running.
+
+It turns **On** when acquisition is recorded, before the first HVAC command, and
+stays on through preconditioning, target-based coast, peak coast, away-off control,
+uncertain commands and unresolved restoration. Persisted ownership keeps it on
+after reload. It turns **Off** once climate ownership is released; a manual
+override timer by itself does not count as planner ownership. Attributes expose
+`phase`, `command_pending` and `restoration_pending` when that context is available.
+
+For an ordinary HVAC automation, require this sensor to be explicitly **Off**
+immediately before changing the main unit or its zones. Unknown or unavailable
+must not authorize those writes. Check again after any delay. In a departure
+automation that also controls lights or locks, guard only the HVAC branch:
+
+```yaml
+actions:
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: binary_sensor.energy_planner_climate_control_active
+            state: "off"
+        sequence:
+          - action: climate.turn_off
+            target:
+              entity_id: climate.your_unit
+  # Other departure actions can follow here.
+```
+
+The sensor does not edit existing automations and is a coordination signal rather
+than an atomic lock. Keep deliberate manual changes and emergency shutdowns able
+to take priority. If normal occupancy or comfort policy should resume after
+release, an On-to-Off trigger can re-evaluate that policy using current conditions
+and respecting manual overrides.
+
 ## Power provenance and validation diagnostics
 
 **HVAC power source type** accepts `auto` (default), `measured` or `estimated`.
