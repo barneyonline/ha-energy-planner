@@ -273,7 +273,7 @@ class InputManager:
             interval,
         )
         carbon_issue = _advisory_issue(carbon_issue)
-        training_indices = _forecast_training_indices(horizon, interval)
+        training_indices = _forecast_training_indices(horizon, interval, self._slot_starts)
         self.forecast_training_slots = [
             {
                 "valid_at": self._slot_starts[index],
@@ -286,7 +286,6 @@ class InputManager:
                 ),
             }
             for index in training_indices
-            for offset in (index * interval,)
         ]
         battery_soc, battery_issue = self._numeric_state(CONF_BATTERY_SOC)
         ev_soc, ev_issue = self._optional_numeric_state(CONF_EV_SOC)
@@ -594,6 +593,9 @@ class InputManager:
                 self._raw_forecast_series[calibration_field] = list(raw_forecast[:slot_count])
                 lead_offset_minutes = (now - source_issued_at).total_seconds() / 60
                 if lead_offset_minutes >= 0:
+                    starts = getattr(self, "_slot_starts", [
+                        now + timedelta(minutes=i * interval) for i in range(len(padded))])
+                    slot_leads = [(at - source_issued_at).total_seconds() / 60 for at in starts]
                     uncertainty_mode = "lower" if calibration_field == "pv_forecast_kw" else "upper"
                     conservative = apply_forecast_calibration(
                         padded,
@@ -601,6 +603,7 @@ class InputManager:
                         calibration_field,
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
+                        slot_lead_minutes=slot_leads,
                         uncertainty_mode=uncertainty_mode,
                     )
                     expected = apply_forecast_calibration(
@@ -609,6 +612,7 @@ class InputManager:
                         calibration_field,
                         interval_minutes=interval,
                         lead_offset_minutes=lead_offset_minutes,
+                        slot_lead_minutes=slot_leads,
                     )
                     self._conservative_forecast_series[calibration_field] = _retain_uncalibrated_secondary_slots(
                         padded,
@@ -1404,12 +1408,20 @@ def _retain_uncalibrated_secondary_slots(
     ]
 
 
-def _forecast_training_indices(horizon_hours: int, interval_minutes: int) -> list[int]:
+def _forecast_training_indices(
+    horizon_hours: int, interval_minutes: int, slot_starts: list[datetime] | None = None,
+) -> list[int]:
     """Sample forecast leads across the full horizon without growing snapshots."""
-    slot_count = max(int(horizon_hours * 60 / interval_minutes), 0)
+    slot_count = len(slot_starts) if slot_starts is not None else max(int(horizon_hours * 60 / interval_minutes), 0)
     if slot_count == 0:
         return []
     target_minutes = (0, 30, 60, 120, 240, 480, 720, 1080, horizon_hours * 60 - interval_minutes)
+    if slot_starts is not None:
+        return sorted(set(range(min(12, slot_count))) | {slot_count - 1} | {
+            min(range(slot_count), key=lambda i: abs(
+                (slot_starts[i] - slot_starts[0]).total_seconds() / 60 - minutes))
+            for minutes in target_minutes if minutes >= 0
+        })
     return sorted(
         set(range(min(12, slot_count)))
         | {min(max(round(minutes / interval_minutes), 0), slot_count - 1) for minutes in target_minutes if minutes >= 0}

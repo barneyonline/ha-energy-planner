@@ -762,3 +762,22 @@ def test_split_current_intervals_cannot_double_count_ev_energy():
         interval_minutes=5, continuous=True)
     assert len(legacy.allocations) == 2
     assert legacy.scheduled_soc_percent == pytest.approx(45)
+
+
+@pytest.mark.parametrize('force_current', [True, False])
+def test_continuous_pre_window_partial_slot_keeps_enough_future_capacity(force_current):
+    from custom_components.ha_energy_planner.ev import allocate_least_cost_charging
+
+    ctx = context((.1, .1, .1))
+    ctx.slots[0].end_at = NOW + timedelta(minutes=2)
+    ctx.slots[1].valid_at = NOW + timedelta(minutes=2)
+    ctx.slots[1].end_at = NOW + timedelta(minutes=5)
+    ctx.slots[2].valid_at = NOW + timedelta(minutes=5)
+    ctx.slots[2].end_at = NOW + timedelta(minutes=10)
+    schedule = allocate_least_cost_charging(ctx.slots, current_soc_percent=40, target_soc_percent=45,
+        ready_by=NOW + timedelta(minutes=10), earliest_start=NOW + timedelta(minutes=2),
+        charge_rate_kw=6, soc_per_kwh=10, interval_minutes=5, continuous=True,
+        force_current=force_current, continue_current=not force_current)
+    assert not schedule.infeasible
+    assert schedule.scheduled_soc_percent == 45
+    assert len(schedule.allocations) == 2

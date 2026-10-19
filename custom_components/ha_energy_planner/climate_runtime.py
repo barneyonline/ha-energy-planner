@@ -15,7 +15,7 @@ from .climate_models import (
     VALIDATION_EXPIRY_DAYS,
     VALIDATION_VERSION,
 )
-from .climate_optimizer import candidate_summary, optimise, revalidate_schedule, supported_targets
+from .climate_optimizer import candidate_summary, optimise, revalidate_schedule, slot_end, supported_targets
 from .const import (
     CONF_HVAC_OBSERVATION_CADENCE,
     CONF_HVAC_POLICY,
@@ -339,6 +339,7 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
                 "power_source_type": "measured",
                 "identity": context.climate_inputs.get("identity"),
                 "baseline_slots": [slot.valid_at.isoformat() for slot in context.slots],
+                "baseline_ends": [slot_end(context, i, options).isoformat() for i in range(len(context.slots))],
                 "interval_minutes": int(options[CONF_PLANNING_INTERVAL_MINUTES]),
             }
     decision["observation_until"] = state.get("observation_until")

@@ -83,7 +83,7 @@ def _daylight_preferred_ev_schedule(
         and daylight_forecast_slots[0].valid_at < remaining_start + interval
         and interval_end(daylight_forecast_slots[-1], interval_minutes) >= window.end
         and all(
-            right.valid_at - left.valid_at == interval
+            interval_end(left, interval_minutes) == right.valid_at
             for left, right in zip(
                 daylight_forecast_slots,
                 daylight_forecast_slots[1:],

@@ -32,6 +32,7 @@ def apply_forecast_calibration(
     *,
     interval_minutes: int = 5,
     lead_offset_minutes: float = 0.0,
+    slot_lead_minutes: list[float] | None = None,
     uncertainty_mode: str | None = None,
 ) -> list[float | None]:
     """Adjust values with a proven expected or conservative lead-time factor."""
@@ -47,7 +48,9 @@ def apply_forecast_calibration(
         if number is None:
             adjusted.append(None)
             continue
-        bucket = buckets.get(str(max(int((lead_offset_minutes + index * interval_minutes) // 30), 0)))
+        lead = (slot_lead_minutes[index] if slot_lead_minutes is not None
+                else lead_offset_minutes + index * interval_minutes)
+        bucket = buckets.get(str(max(int(lead // 30), 0)))
         calibration_enabled = (
             bucket.get("uncertainty_enabled", bucket.get("enabled"))
             if uncertainty_mode in {"lower", "upper"}
