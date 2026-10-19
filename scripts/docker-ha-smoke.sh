@@ -664,6 +664,7 @@ automation:
         timeout: "00:01:30"
         continue_on_timeout: false
       - action: ha_energy_planner.replan
+      - action: fake_planner_test.wait_for_planner_idle
       - wait_template: >-
           {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}
         timeout: "00:00:30"
@@ -1289,6 +1290,29 @@ payload["data"]["built_in_load_forecast"] = {
 path.write_text(json.dumps(payload, indent=2) + "\n")
 PY
 
+report_smoke_failure() {
+  cat "$LOG_FILE"
+  python3 - "$TMP_DIR" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1]) / ".storage" / "trace.saved_traces"
+if path.exists():
+    for record in json.loads(path.read_text()).get("data", {}).get("automation.ha_energy_planner_service_smoke", []):
+        trace = record.get("extended_dict", {})
+        step = trace.get("last_step")
+        events = trace.get("trace", {}).get(step, [])
+        result = events[-1].get("result", {}) if events else {}
+        print("Smoke automation trace:", json.dumps({
+            "last_step": step,
+            "execution": trace.get("script_execution"),
+            "wait": result.get("wait"),
+            "condition_result": result.get("result"),
+        }))
+PY
+}
+
 set +e
 docker run --rm \
   -v "$TMP_DIR:/config" \
@@ -1299,7 +1323,7 @@ STATUS=$?
 set -e
 
 if [[ "$STATUS" != "0" ]]; then
-  cat "$LOG_FILE"
+  report_smoke_failure
   if [[ "$STATUS" == "124" ]]; then
     echo "Home Assistant smoke automation did not finish within 240 seconds" >&2
   fi
@@ -1307,7 +1331,7 @@ if [[ "$STATUS" != "0" ]]; then
 fi
 
 if [[ ! -f "$TMP_DIR/.ha_energy_planner_smoke_complete" ]]; then
-  cat "$LOG_FILE"
+  report_smoke_failure
   echo "Home Assistant stopped before the smoke automation completed" >&2
   exit 1
 fi

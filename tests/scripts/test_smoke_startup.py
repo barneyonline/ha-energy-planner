@@ -29,7 +29,7 @@ def startup_sequence():
         if item["id"] == "ha_energy_planner_service_smoke"
     )
     replan = next(index for index, step in enumerate(actions) if step.get("action") == "ha_energy_planner.replan")
-    return cv.SCRIPT_SCHEMA(actions[replan - 1:replan + 1])
+    return cv.SCRIPT_SCHEMA(actions[replan - 1:replan + 2])
 
 
 @pytest.mark.parametrize("delayed", INPUTS)
@@ -44,6 +44,7 @@ def test_replan_waits_for_each_late_input(tmp_path, delayed, initial):
             calls.append(call)
 
         hass.services.async_register("ha_energy_planner", "replan", replan)
+        hass.services.async_register("fake_planner_test", "wait_for_planner_idle", replan)
         try:
             for entity, (state, attributes) in INPUTS.items():
                 if entity != delayed:
@@ -57,7 +58,9 @@ def test_replan_waits_for_each_late_input(tmp_path, delayed, initial):
             assert not task.done()
             hass.states.async_set(delayed, *INPUTS[delayed])
             await asyncio.wait_for(task, 3)
-            assert len(calls) == 1
+            assert [(call.domain, call.service) for call in calls] == [
+                ("ha_energy_planner", "replan"), ("fake_planner_test", "wait_for_planner_idle"),
+            ]
         finally:
             if task is not None and not task.done():
                 task.cancel()
