@@ -351,3 +351,19 @@ def test_confirmed_climate_release_cannot_keep_its_future_planned_label():
     assert confirmed['history'][0]['summary'] == 'Climate: Release climate control (confirmed)'
     failed = confirm_calendar_action(saved, {**outcome, 'result': 'failed'})
     assert failed.get('history', []) == []
+
+
+@pytest.mark.parametrize('archived', [False, True])
+def test_climate_phase_label_upgrade_does_not_duplicate_confirmed_activity(archived):
+    previous = {**record(start=-30, end=-1 if archived else 5, actual=True), 'location': 'Climate',
+                'summary': 'Climate: Change climate state'}
+    current = {**previous, 'end': (NOW + timedelta(minutes=60)).isoformat(),
+               'summary': 'Climate: Pre-cool to 19 °C (confirmed)'}
+    saved = {'history' if archived else 'pending': [previous]}
+    updated = update_calendar_history(saved, [current], NOW)
+    assert updated == {'history': [], 'pending': [current]}
+    expired = update_calendar_history(updated, [], NOW + timedelta(hours=2))
+    assert len(expired['history']) == 1
+    # A different confirmed phase UID must retain a separate history record.
+    separate = update_calendar_history(saved, [{**current, 'uid': 'other-phase'}], NOW)
+    assert len(separate['history']) == len(separate['pending']) == 1

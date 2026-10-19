@@ -151,13 +151,17 @@ def _same_confirmed_window(previous: dict[str, str], current: dict[str, str]) ->
     return (
         _confirmed_start(previous) and _confirmed_start(current)
         and not previous.get("confirmed_action") and not current.get("confirmed_action")
-        and all(previous.get(key) == current.get(key) for key in ("start", "summary", "location"))
+        and all(previous.get(key) == current.get(key) for key in ("start", "location"))
+        and (previous.get("summary") == current.get("summary") or (
+            previous.get("location") == "Climate" and previous["uid"] == current["uid"]
+        ))
     )
 
 
 def _same_running_window(previous: dict[str, str], current: dict[str, str], now: datetime) -> bool:
     """Match continuous plan windows while keeping real restarts separate."""
-    if any(previous.get(key) != current.get(key) for key in ("summary", "location")):
+    if (any(previous.get(key) != current.get(key) for key in ("summary", "location"))
+            and not _same_confirmed_window(previous, current)):
         return False
     if not (_confirmed_start(previous) and _confirmed_start(current)) or previous["start"] != current["start"]:
         return False

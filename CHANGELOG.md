@@ -14,6 +14,7 @@
 
 - Keep tariff and preconditioning boundaries stable across refreshes; account for partial intervals in EV, battery, climate and site-energy estimates.
 - Handle split intervals in daylight/continuous EV scheduling, elapsed PV calibration and measured climate observation comparisons.
+- Weight forecast confidence and load coverage by elapsed time; preserve confirmed climate phase identity across calendar-label upgrades.
 - Preserve unrelated control ownership and pending gateway confirmation when HVAC timing or room-feedback configuration changes.
 - Render climate phase durations separately from command deadlines, distinguish planned and confirmed activity, and explain occupancy handoffs accurately.
 

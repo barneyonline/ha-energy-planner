@@ -58,7 +58,6 @@ from .ev import ev_charging_state
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     forecast_coverage_details,
-    forecast_coverage_ratio,
     forecast_series_from_state,
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
@@ -568,9 +567,9 @@ class InputManager:
         if forecast:
             primary_forecast = source_forecasts[0]
             raw_forecast = list(primary_forecast or [None] * slot_count)
-            coverage = forecast_coverage_ratio(forecast)
             coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval,
                 slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
+            coverage = float(coverage_details["coverage_ratio"])
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)
                 * coverage,
@@ -647,7 +646,7 @@ class InputManager:
             coverage_details = forecast_coverage_details(point_series, starts_at=now, interval_minutes=interval,
                 slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
             self._record_forecast_confidence(
-                _POINT_SENSOR_CONFIDENCE * forecast_coverage_ratio(point_series),
+                _POINT_SENSOR_CONFIDENCE * float(coverage_details["coverage_ratio"]),
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source="point_value_only",
@@ -794,6 +793,10 @@ class InputManager:
             if source_issue
             else {"ready": 1.0, "degraded": 0.65}.get(result.status, 0.0)
         )
+        temporal_coverage = forecast_coverage_details(
+            result.expected_kw, starts_at=now, interval_minutes=interval,
+            slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
+        )
         coverage_details = {
             **result.details,
             **fallback_details,
@@ -811,14 +814,8 @@ class InputManager:
                 and not self.load_source_outage.get("recovering")
             ),
             "fallback_applied": fallback_active,
-            "covered_hours": round(
-                sum(value is not None for value in result.expected_kw) * interval / 60,
-                4,
-            ),
-            "continuous_hours": round(
-                _leading_present_slots(result.expected_kw) * interval / 60,
-                4,
-            ),
+            "covered_hours": temporal_coverage["covered_hours"],
+            "continuous_hours": temporal_coverage["continuous_hours"],
         }
         self._record_forecast_confidence(
             confidence,
@@ -1103,7 +1100,13 @@ class InputManager:
             slot_starts=getattr(self, "_slot_starts", None),
         )
         if forecast:
-            coverage = forecast_coverage_ratio(forecast)
+            coverage_details = forecast_coverage_details(
+                forecast,
+                starts_at=now,
+                interval_minutes=interval,
+                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
+            )
+            coverage = float(coverage_details["coverage_ratio"])
             source = (
                 "weather_service_hourly"
                 if forecast_state is not state and coverage == 1.0
@@ -1112,12 +1115,6 @@ class InputManager:
                 else "forecast_series"
                 if coverage == 1.0
                 else "forecast_series_partial"
-            )
-            coverage_details = forecast_coverage_details(
-                forecast,
-                starts_at=now,
-                interval_minutes=interval,
-                slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon),
             )
             self.weather_forecast_details = {
                 **self.weather_forecast_details,

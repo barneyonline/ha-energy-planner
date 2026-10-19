@@ -197,6 +197,7 @@ def forecast_coverage_details(
         current_hours = current_hours + hours[i] if value is not None else 0.0
         longest_hours = max(longest_hours, current_hours)
     requested_hours = sum(hours)
+    covered_hours = sum(hours[i] for i in present)
     continuous_hours = sum(hours[:continuous_slots])
     healthy_threshold = min(FORECAST_HEALTHY_HOURS, requested_hours)
     degraded_threshold = min(FORECAST_DEGRADED_HOURS, requested_hours)
@@ -216,7 +217,8 @@ def forecast_coverage_details(
         "last_timestamp": None
         if last_index is None
         else starts[last_index].isoformat(),
-        "covered_hours": round(sum(hours[i] for i in present), 4),
+        "covered_hours": round(covered_hours, 4),
+        "coverage_ratio": covered_hours / requested_hours if requested_hours > 0 else 0.0,
         "continuous_hours": round(continuous_hours, 4),
         "longest_continuous_hours": round(longest_hours, 4),
         "leading_missing_slots": leading_missing_slots,

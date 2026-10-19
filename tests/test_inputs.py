@@ -2427,3 +2427,44 @@ def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monke
     tail = next(s for s in context.slots if s.valid_at == now.replace(hour=21, minute=2))
     assert tail.end_at == now.replace(hour=21, minute=17)
     assert tail.baseline_load_forecast_kw == 2.2
+
+
+@pytest.mark.parametrize('config_key', [CONF_AMBER_IMPORT_PRICE, CONF_PV_FORECAST, CONF_WEATHER])
+def test_split_interval_confidence_measures_covered_time(config_key):
+    now = datetime(2026, 10, 19, tzinfo=UTC)
+    state = FakeState('1', {'forecast': [
+        {'valid_at': (now + timedelta(minutes=m)).isoformat(), 'value': 1}
+        for m in range(0, 12 * 60, 5)]}, now)
+    manager = InputManager(FakeHass({'sensor.source': state}), {config_key: 'sensor.source'},
+        {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15, 'planning_horizon_hours': 24})
+    manager._slot_starts = [now + timedelta(minutes=m) for m in [
+        *range(0, 12 * 60, 5), *range(12 * 60, 24 * 60, 15)]]
+    if config_key == CONF_WEATHER:
+        manager._optional_weather_temperatures(config_key, now, 24, 15)
+    else:
+        manager._required_series(config_key, ('value',), 'price' if config_key == CONF_AMBER_IMPORT_PRICE else 'power',
+                                 now, 24, 15)
+    assert manager.forecast_confidence_details[-1]['confidence'] == .5
+
+
+def test_load_forecast_coverage_cannot_exceed_native_grid_horizon(monkeypatch):
+    now = datetime(2026, 10, 19, 9, 3, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, 'utcnow', lambda: now)
+    data = {CONF_HOUSEHOLD_LOAD: 'sensor.house', CONF_AMBER_IMPORT_PRICE: 'sensor.import'}
+    state = FakeState('1', {'forecast': [
+        {'valid_at': (now.replace(minute=0) + timedelta(minutes=m)).isoformat(), 'price': .1}
+        for m in range(0, 90, 30)]}, now)
+    manager = InputManager(FakeHass({'sensor.house': FakeState('1', {}, now), 'sensor.import': state}), data,
+        {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15, 'planning_horizon_hours': 1})
+    manager.build_context()
+    details = next(d for d in manager.forecast_coverage_details if d['config_key'] == CONF_HOUSEHOLD_LOAD)
+    assert details['covered_hours'] == details['continuous_hours'] == 1
+
+
+def test_point_sensor_confidence_uses_only_the_partial_current_interval():
+    now = datetime(2026, 10, 19, tzinfo=UTC)
+    manager = InputManager(FakeHass({'sensor.pv': FakeState('1', {}, now)}), {CONF_PV_FORECAST: 'sensor.pv'},
+        {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15, 'planning_horizon_hours': 1})
+    manager._slot_starts = [now + timedelta(minutes=m) for m in [0, 2, 15, 30, 45]]
+    manager._required_series(CONF_PV_FORECAST, ('value',), 'power', now, 1, 15)
+    assert manager.forecast_confidence_details[-1]['confidence'] == pytest.approx(.7 * 2 / 60, abs=5e-5)
