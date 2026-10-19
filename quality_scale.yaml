@@ -547,6 +547,7 @@ rules:
       tests:
         - tests/test_sensor.py
         - tests/test_climate_ownership_sensor.py
+        - tests/scripts/test_smoke_startup.py
         - scripts/docker-ha-smoke.sh
   entity-disabled-by-default:
     status: done

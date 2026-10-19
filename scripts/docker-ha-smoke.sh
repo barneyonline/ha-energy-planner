@@ -652,6 +652,17 @@ automation:
       - condition: state
         entity_id: binary_sensor.energy_planner_climate_control_active
         state: "off"
+      # Entity platforms can finish after the planner's first refresh. Wait for
+      # their actual inputs before replanning instead of relying on a later
+      # coordinator timer to recover the deliberately unsafe startup snapshot.
+      - wait_template: >-
+          {{ is_number(states('sensor.smoke_import_price_forecast'))
+             and is_number(states('sensor.smoke_export_price_forecast'))
+             and is_number(states('sensor.smoke_pv_forecast_series'))
+             and is_number(state_attr('climate.fake_daikin', 'current_temperature'))
+             and states('automation.fake_climate_conflict') in ['on', 'off'] }}
+        timeout: "00:01:30"
+        continue_on_timeout: false
       - action: ha_energy_planner.replan
       - wait_template: >-
           {{ state_attr('sensor.energy_planner_next_actions', 'health') == 'Healthy' }}

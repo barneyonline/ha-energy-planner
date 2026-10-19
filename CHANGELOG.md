@@ -42,7 +42,7 @@
 
 ### 🔄 Other changes
 
-- None
+- Wait for initialized synthetic inputs before the packaged compatibility smoke test requests its first plan, avoiding startup-order failures in CI.
 
 ## 1.4.2 - 2026-10-19
 
