@@ -402,6 +402,8 @@ def test_forecast_coverage_details_caps_thresholds_for_short_configured_horizon(
     assert complete["classification"] == "healthy"
     assert complete["healthy_threshold_hours"] == 1
     assert partial["classification"] == "unsafe"
+    assert partial['coverage_ratio'] == .5
+    assert forecast_coverage_details(None, starts_at=starts_at, interval_minutes=15)['coverage_ratio'] == 0
 
 
 def test_constant_forecast_builds_interval_points() -> None:
