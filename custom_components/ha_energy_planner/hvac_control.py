@@ -36,6 +36,15 @@ HVAC_LIFECYCLE_FIELDS = (
 )
 
 
+def has_hvac_ownership(ownership: Any) -> bool:
+    """Retain the automation guard until all current or legacy HVAC ownership is released."""
+    if not isinstance(ownership, dict):
+        return True
+    return any(ownership.get(key) for key in (
+        "hvac_control", "climate_automations", "planner_takeover_started_at", "planner_hvac_action_expires_at",
+    ))
+
+
 def copy_pending_confirmation(control: dict[str, Any], current: Any) -> None:
     """Keep the latest uncertainty, never an ownership snapshot's stale intent."""
     record = current.get("command_confirmation") if isinstance(current, dict) else None
