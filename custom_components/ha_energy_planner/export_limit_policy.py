@@ -101,6 +101,22 @@ def _tariff_confidence(attributes: dict[str, Any]) -> float | None:
     return 1.0
 
 
+def _half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]) -> datetime:
+    """Translate Amber's declared half-hour first-second start to a half-open block."""
+    # Amber documents duration=30 with e.g. 02:00:01Z through 02:30:00Z.
+    # Only this exact, aligned representation warrants adding the first second;
+    # arbitrary near-half-hour durations and real gaps/overlaps remain invalid.
+    if (
+        end is not None
+        and type(item.get("duration")) in (int, float)
+        and item["duration"] == 30
+        and (end.minute % 30, end.second, end.microsecond) == (0, 0, 0)
+        and end - start == BLOCK_DURATION - timedelta(seconds=1)
+    ):
+        return start - timedelta(seconds=1)
+    return start
+
+
 def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
     """Preserve real half-hour source intervals without extrapolating scalar prices."""
     if state is None or state.state in {"unknown", "unavailable"}:
@@ -133,6 +149,7 @@ def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[l
         end = aware_time(item[end_key]) if end_key else None
         if end_key and end is None:
             return [], "export_tariff_invalid"
+        start = _half_hour_start(start, end, item)
         parsed.append((start, end, price))
     parsed.sort(key=lambda value: value[0])
     blocks: list[dict[str, Any]] = []

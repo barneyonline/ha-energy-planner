@@ -68,6 +68,17 @@ def price_state(prices=(-0.1, 0.0, 0.2), *, start=None, explicit=True, unit="$/k
     )
 
 
+def amber_price_state(prices=(-0.1, 0.0, 0.2), *, start=None):
+    """Sanitized Amber detailedForecast shape with inclusive first-second starts."""
+    state = price_state(prices, start=start)
+    items = state.attributes.pop("forecasts")
+    for item in items:
+        item["duration"] = 30
+        item["start_time"] = (datetime.fromisoformat(item["start_time"]) + timedelta(seconds=1)).isoformat()
+    state.attributes["detailedForecast"] = items
+    return state
+
+
 def limit_state(watts=None, *, pending=False, slew=100.0, readback=None):
     return SimpleNamespace(
         state="pending" if pending else "disabled" if watts is None else "zero_export" if watts == 0 else "limited",
@@ -213,6 +224,111 @@ def test_half_hour_sign_and_units(prices, expected, explicit):
     assert [b["watts"] for b in blocks] == expected
     assert blocks[0]["price"] == prices[0] / 100
     assert block_time(blocks[0]["end"]) == NOW.replace(minute=30)
+
+
+@pytest.mark.parametrize("offset,expected", [(0, 0), (1, 0), (1799, 0), (1800, None), (1801, None)])
+@pytest.mark.parametrize("camel_case", [False, True])
+def test_amber_half_hour_boundary_sign_and_native_precedence(offset, expected, camel_case):
+    start = NOW.replace(minute=0)
+    state = amber_price_state()
+    if camel_case:
+        for item in state.attributes["detailedForecast"]:
+            item["startTime"] = item.pop("start_time")
+            item["endTime"] = item.pop("end_time")
+            item["perKwh"] = item.pop("per_kwh")
+    # Convenience forecasts must not override the native prices.
+    state.attributes["forecast"] = price_state((0.2, -0.1, -0.1)).attributes["forecasts"]
+    now = start + timedelta(seconds=offset)
+    state.last_updated = now
+    blocks, issue = tariff_blocks(state, now, OPTIONS)
+    assert issue is None
+    assert blocks[0]["watts"] == expected
+    assert block_time(blocks[0]["start"]) == start + timedelta(minutes=30 if offset >= 1800 else 0)
+    assert block_time(blocks[0]["end"]) == block_time(blocks[1]["start"])
+    assert all(block_time(block["end"]) - block_time(block["start"]) == timedelta(minutes=30)
+               for block in blocks)
+
+
+@pytest.mark.parametrize("native_index", [0, 1, 2])
+def test_amber_and_exact_half_hours_can_be_mixed(native_index):
+    state = price_state()
+    state.attributes["forecasts"][native_index] = amber_price_state().attributes["detailedForecast"][native_index]
+    blocks, issue = tariff_blocks(state, NOW, OPTIONS)
+    assert issue is None
+    assert [block["watts"] for block in blocks] == [0, None]
+
+
+def test_amber_float_duration_and_input_are_preserved():
+    state = amber_price_state()
+    state.attributes["detailedForecast"][0]["duration"] = 30.0
+    original = deepcopy(state.attributes)
+    assert tariff_blocks(state, NOW, OPTIONS)[1] is None
+    assert state.attributes == original
+
+
+@pytest.mark.parametrize("duration", [None, 5, 15, "30", True, float("nan")])
+def test_amber_short_interval_requires_explicit_numeric_half_hour_duration(duration):
+    state = amber_price_state()
+    state.attributes["detailedForecast"][0]["duration"] = duration
+    assert tariff_blocks(state, NOW, OPTIONS) == ([], "export_tariff_overlap_or_duration")
+
+
+@pytest.mark.parametrize("start_delta,end_delta", [(1, 0), (-2, 0), (0, -1), (60, 60), (0.000001, 0)])
+def test_amber_normalization_rejects_other_timestamp_offsets(start_delta, end_delta):
+    state = amber_price_state()
+    item = state.attributes["detailedForecast"][0]
+    item["start_time"] = (datetime.fromisoformat(item["start_time"]) + timedelta(seconds=start_delta)).isoformat()
+    item["end_time"] = (datetime.fromisoformat(item["end_time"]) + timedelta(seconds=end_delta)).isoformat()
+    assert tariff_blocks(state, NOW, OPTIONS) == ([], "export_tariff_overlap_or_duration")
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_amber_normalization_preserves_real_gap_and_overlap_rejection(overlap):
+    state = amber_price_state()
+    items = state.attributes["detailedForecast"]
+    if overlap:
+        items[1] = deepcopy(items[0])
+    else:
+        items.pop(1)
+    assert tariff_blocks(state, NOW, OPTIONS) == (
+        [], "export_tariff_overlap_or_duration" if overlap else "export_tariff_gap",
+    )
+
+
+def test_amber_normalization_handles_dst_in_absolute_time():
+    local = datetime(2026, 10, 4, 1, 30, tzinfo=ZoneInfo("Australia/Melbourne"))
+    state = amber_price_state(start=local.astimezone(UTC))
+    state.last_updated = local
+    blocks, issue = tariff_blocks(state, local, OPTIONS)
+    assert issue is None
+    assert block_time(blocks[1]["start"]).astimezone(local.tzinfo).hour == 3
+    assert block_time(blocks[1]["start"]) - block_time(blocks[0]["start"]) == timedelta(minutes=30)
+
+
+def test_amber_export_execution_confirms_sign_changes_without_repeating_commands(setup):
+    async def run():
+        setup.states["sensor.export_price"] = amber_price_state()
+        setup.mode["value"] = "confirm"
+        planned = action(setup)
+        assert (await setup.control.execute(planned, NOW))[0] == OutcomeResult.PENDING
+        assert await setup.control.reconcile(NOW) is None
+        assert [call[1] for call in setup.calls] == ["set_export_limit"]
+        remaining = build_actions(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
+        assert [action.kind for action in remaining] == [ActionKind.DISABLE_EXPORT_LIMIT]
+        assert remaining[0].execute_not_before == NOW.replace(minute=30)
+        assert (await setup.control.execute(planned, NOW))[0] == OutcomeResult.SKIPPED
+        assert len(setup.calls) == 1
+        boundary = NOW.replace(minute=30)
+        setup.clock["now"] = boundary
+        setup.states[ENTITY] = limit_state(0, readback=boundary.timestamp())
+        setup.states["sensor.export_price"].last_updated = boundary
+        assert (await setup.control.execute(remaining[0], boundary))[0] == OutcomeResult.PENDING
+        assert await setup.control.reconcile(boundary) is None
+        assert [call[1] for call in setup.calls] == ["set_export_limit", "disable_export_limit"]
+        assert (await setup.control.execute(remaining[0], boundary))[0] == OutcomeResult.SKIPPED
+        assert len(setup.calls) == 2
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
