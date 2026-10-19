@@ -23,6 +23,7 @@ Tariff plans retain the provider's UTC boundaries across refreshes, including pa
 
 EV daylight and continuous charging, PV calibration lead times and climate observation comparisons also use actual interval boundaries.
 Forecast confidence measures covered time, and confirmed climate activity keeps its identity when calendar labels change.
+Coverage thresholds retain exact elapsed durations when tariff timestamps differ by seconds.
 
 ## Quick install (HACS)
 

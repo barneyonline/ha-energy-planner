@@ -188,17 +188,19 @@ def forecast_coverage_details(
     starts = slot_starts if slot_starts is not None else [
         starts_at + timedelta(minutes=i * interval_minutes) for i in range(slot_count)
     ]
-    hours = [
+    durations = [
         ((starts[i + 1] if i + 1 < slot_count else horizon_end or at + timedelta(minutes=interval_minutes))
-         - at).total_seconds() / 3600 for i, at in enumerate(starts)
+         - at) for i, at in enumerate(starts)
     ]
-    longest_hours = current_hours = 0.0
+    longest_duration = current_duration = timedelta()
     for i, value in enumerate(values):
-        current_hours = current_hours + hours[i] if value is not None else 0.0
-        longest_hours = max(longest_hours, current_hours)
-    requested_hours = sum(hours)
-    covered_hours = sum(hours[i] for i in present)
-    continuous_hours = sum(hours[:continuous_slots])
+        current_duration = current_duration + durations[i] if value is not None else timedelta()
+        longest_duration = max(longest_duration, current_duration)
+    # Sum timedeltas at datetime precision before converting to hours. A
+    # one-second tariff split must not turn exactly eight hours into < 8.
+    requested_hours = sum(durations, timedelta()).total_seconds() / 3600
+    covered_hours = sum((durations[i] for i in present), timedelta()).total_seconds() / 3600
+    continuous_hours = sum(durations[:continuous_slots], timedelta()).total_seconds() / 3600
     healthy_threshold = min(FORECAST_HEALTHY_HOURS, requested_hours)
     degraded_threshold = min(FORECAST_DEGRADED_HOURS, requested_hours)
     if slot_count and continuous_hours >= healthy_threshold:
@@ -220,7 +222,7 @@ def forecast_coverage_details(
         "covered_hours": round(covered_hours, 4),
         "coverage_ratio": covered_hours / requested_hours if requested_hours > 0 else 0.0,
         "continuous_hours": round(continuous_hours, 4),
-        "longest_continuous_hours": round(longest_hours, 4),
+        "longest_continuous_hours": round(longest_duration.total_seconds() / 3600, 4),
         "leading_missing_slots": leading_missing_slots,
         "trailing_missing_slots": trailing_missing_slots,
         "internal_missing_slots": max(slot_count - len(present) - leading_missing_slots - trailing_missing_slots, 0),
