@@ -1,0 +1,55 @@
+{
+  "name": "export_tariff_amber_first_second",
+  "kind": "export_tariff",
+  "now": "2026-10-01T00:00:00+00:00",
+  "state": {
+    "state": "-0.0328",
+    "last_updated": "2026-10-01T00:00:00+00:00",
+    "attributes": {
+      "unit_of_measurement": "$/kWh",
+      "detailedForecast": [
+        {
+          "start_time": "2026-10-01T00:00:01+00:00",
+          "end_time": "2026-10-01T00:30:00+00:00",
+          "duration": 30,
+          "per_kwh": -0.0328,
+          "estimate": true
+        },
+        {
+          "start_time": "2026-10-01T00:30:01+00:00",
+          "end_time": "2026-10-01T01:00:00+00:00",
+          "duration": 30,
+          "per_kwh": 0,
+          "estimate": true
+        },
+        {
+          "start_time": "2026-10-01T01:00:01+00:00",
+          "end_time": "2026-10-01T01:30:00+00:00",
+          "duration": 30,
+          "per_kwh": 0.02,
+          "estimate": true
+        }
+      ],
+      "forecast": [
+        {"time": "2026-10-01T00:00:00+00:00", "value": 0.02},
+        {"time": "2026-10-01T00:30:00+00:00", "value": -0.0328}
+      ]
+    }
+  },
+  "expected": [
+    {
+      "start": "2026-10-01T00:00:00+00:00",
+      "end": "2026-10-01T00:30:00+00:00",
+      "price": -0.0328,
+      "watts": 0,
+      "confidence": 1.0
+    },
+    {
+      "start": "2026-10-01T00:30:00+00:00",
+      "end": "2026-10-01T01:00:00+00:00",
+      "price": 0,
+      "watts": null,
+      "confidence": 1.0
+    }
+  ]
+}
