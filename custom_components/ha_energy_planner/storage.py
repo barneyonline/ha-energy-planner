@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -52,6 +54,7 @@ _FORECAST_SNAPSHOT_BUCKET_MINUTES = 30
 _FORECAST_SNAPSHOT_HARD_CAP = 128
 _DRY_RUN_COMPARISON_BUCKET_MINUTES = 30
 _DRY_RUN_COMPARISON_HARD_CAP = 384
+_LOGGER = logging.getLogger(__name__)
 
 
 class PlannerStore:
@@ -83,6 +86,7 @@ class PlannerStore:
         self._mutation_generation = 0
         self._saved_generation = 0
         self._save_lock = asyncio.Lock()
+        self._ownership_listeners: set[Callable[[], None]] = set()
 
     async def async_load(self) -> None:
         """Load persisted state."""
@@ -372,6 +376,15 @@ class PlannerStore:
         """Persist planner ownership state."""
         await self._async_set_if_changed("ownership", ownership)
 
+    def async_add_ownership_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Observe ownership transitions before the executor can dispatch a command."""
+        self._ownership_listeners.add(listener)
+
+        def remove() -> None:
+            self._ownership_listeners.discard(listener)
+
+        return remove
+
     async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
         """Retain unresolved notification scopes independently of bounded audit history."""
         await self._async_set_if_changed("restore_notification_failures", failures)
@@ -447,6 +460,12 @@ class PlannerStore:
                 await self._async_flush()
             return
         self.data[key] = jsonable
+        if key == "ownership":
+            for listener in tuple(self._ownership_listeners):
+                try:
+                    listener()
+                except Exception:  # noqa: BLE001 - entity listeners must not interrupt durable recovery.
+                    _LOGGER.exception("Error publishing planner ownership state")
         await self._async_save()
 
 

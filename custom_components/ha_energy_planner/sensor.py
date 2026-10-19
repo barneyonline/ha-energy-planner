@@ -47,6 +47,7 @@ from .diagnostics import climate_diagnostics
 from .discovery import CapabilityDiscovery
 from .entity import EnergyPlannerEntity, recorder_safe_attributes
 from .entry_data import combined_entry_data
+from .hvac_control import has_hvac_ownership
 from .load_forecast import MIN_UPPER_COVERAGE
 from .models import ActionAsset, EnergyPlan, InputHealth, PlanAction, to_jsonable
 from .plan_presentation import (
@@ -560,11 +561,7 @@ def _asset_owned(store_data: dict[str, Any], asset: ActionAsset) -> bool:
     """Return whether persisted ownership currently belongs to one asset."""
     ownership = dict(store_data.get("ownership", {}))
     if asset == ActionAsset.DAIKIN:
-        return bool(
-            ownership.get("hvac_control")
-            or ownership.get("climate_automations")
-            or ownership.get("planner_takeover_started_at")
-        )
+        return has_hvac_ownership(ownership)
     if asset == ActionAsset.EV:
         reservation = store_data.get("ev_grid_reservation", {})
         return bool(

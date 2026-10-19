@@ -12,7 +12,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.components.binary_sensor.const import BinarySensorDeviceClass
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -22,6 +22,7 @@ from .const import (
 )
 from .coordinator import STARTUP_AUTO_RECOVERY_REQUIRED_RUNS, EnergyPlannerCoordinator
 from .entity import EnergyPlannerEntity, recorder_safe_attributes
+from .hvac_control import has_hvac_ownership
 from .models import InputHealth
 from .preflight import (
     _current_plan_report,
@@ -56,6 +57,12 @@ BINARY_SENSORS: tuple[PlannerBinarySensorDescription, ...] = (
         value_fn=lambda coordinator: _armed_attrs(coordinator)["armed"],
         attrs_fn=lambda coordinator: _armed_attrs(coordinator),
     ),
+    PlannerBinarySensorDescription(
+        key="climate_control_active",
+        translation_key="climate_control_active",
+        value_fn=lambda coordinator: has_hvac_ownership(coordinator.store.data.get("ownership", {})),
+        attrs_fn=lambda coordinator: _climate_control_attrs(coordinator),
+    ),
 )
 
 
@@ -69,6 +76,18 @@ async def async_setup_entry(
     async_add_entities(
         (PlannerBinarySensor(coordinator, description) for description in BINARY_SENSORS),
     )
+
+
+def _climate_control_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
+    """Expose compact ownership context independently of plans, arming or HVAC power."""
+    ownership = coordinator.store.data.get("ownership", {})
+    control = ownership.get("hvac_control", {}) if isinstance(ownership, dict) else {}
+    control = control if isinstance(control, dict) else {}
+    return {
+        "phase": control.get("phase"),
+        "restoration_pending": bool(control.get("required_evidence_lost")),
+        "command_pending": bool(control.get("command_confirmation")),
+    }
 
 
 def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
@@ -224,6 +243,16 @@ class PlannerBinarySensor(EnergyPlannerEntity, BinarySensorEntity):
         """Initialize sensor."""
         super().__init__(coordinator, description.key)
         self.entity_description = description
+
+    async def async_added_to_hass(self) -> None:
+        """Publish HVAC ownership without waiting for a long planner refresh to finish."""
+        await super().async_added_to_hass()
+        if self.entity_description.key == "climate_control_active":
+            self.async_on_remove(self.coordinator.store.async_add_ownership_listener(self._ownership_changed))
+
+    @callback
+    def _ownership_changed(self) -> None:
+        self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:
