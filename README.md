@@ -39,6 +39,7 @@ Coverage thresholds retain exact elapsed durations when tariff timestamps differ
 - Home Assistant **2026.10.0** or newer, using Python **3.14+**.
 - Normal energy planning requires tariff and external PV forecasts, measured household consumption with Recorder history, and battery SOC. Each control area needs its mapped controls and feedback.
 - Export-only operation has narrower input requirements; see [Enphase Export Limit](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit).
+- Export Limit accepts Amber's declared 30-minute intervals with first-second starts as contiguous half-hour windows. Other malformed intervals, gaps and overlaps still block control.
 - The load model needs at least three qualifying history days and must pass validation before forecast-dependent commands are allowed.
 - No third-party Python dependencies or separate vendor credentials are required. A configured AI provider may run remotely.
 

@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Accept Amber's declared 30-minute Export Limit tariff intervals with first-second starts (for example, 12:30:01–13:00:00), using contiguous half-hour control windows while retaining rejection of malformed durations, gaps and overlaps.
 
 ### 🔧 Improvements
 
