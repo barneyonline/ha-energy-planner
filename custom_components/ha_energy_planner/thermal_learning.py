@@ -35,7 +35,15 @@ def sample(context: DecisionContext, options: dict[str, Any], states: Any, head:
         entity = room.get("temperature_entity")
         state = states.get(entity)
         reported = getattr(state, "last_reported", getattr(state, "last_updated", None))
-        identity = sha256(str((entity, head, sorted(context.climate_zone_entities))).encode()).hexdigest()[:24]
+        topology = context.climate_inputs.get("zone_topology", {})
+        transition = instant(context.hvac_control.get("zone_transition_at"))
+        regime = ({"power": {key: getattr(states.get(key), "state", None) for key in sorted(topology.get("pairs", {}))},
+                   "transition_at": transition.isoformat() if transition is not None else None}
+                  if topology.get("supported") else None)
+        source_identity = (entity, head, sorted(context.climate_zone_entities))
+        identity = sha256(str(
+            (*source_identity, regime) if regime is not None else source_identity
+        ).encode()).hexdigest()[:24]
         actuator = states.get(zone) if zone != "head" else states.get(head)
         actuator_state = getattr(actuator, "state", "unknown")
         zone_mode = context.current_hvac_mode

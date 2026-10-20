@@ -290,6 +290,10 @@ class ConstraintValidator:
                 )
             )
         lifecycle_continuation = _is_same_hvac_lifecycle(context, action, ownership)
+        zone_coast_stop = bool(
+            lifecycle_continuation and desired_mode == "off" and action.desired_state.get("zone_stop")
+            and action.desired_state.get("phase") in {"pre_peak_coast", "peak_coast"}
+        )
         if desired_mode != "off" and not lifecycle_continuation and _hvac_min_cycle_active(
             now,
             ownership,
@@ -302,10 +306,12 @@ class ConstraintValidator:
                     "HVAC minimum cycle/rest period has not elapsed.",
                 )
             )
-        if action.desired_state.get("suppress_automations") and not _hvac_suppression_is_directionally_safe(
+        if action.desired_state.get("suppress_automations") and not zone_coast_stop and not (
+            _hvac_suppression_is_directionally_safe(
             context,
             desired_mode,
             float(self.options[CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT]),
+            )
         ):
             violations.append(
                 _action_violation(
@@ -414,7 +420,11 @@ def _is_same_hvac_lifecycle(
         and persisted.get("phase") in lifecycle_phases
         and persisted.get("mode") in {"heat", "cool"}
         and desired.get("mode") == persisted.get("mode")
-        and desired.get("hvac_mode") == persisted.get("mode")
+        and (desired.get("hvac_mode") == persisted.get("mode") or (
+            desired.get("hvac_mode") == "off" and desired.get("zone_stop")
+            and context.climate_inputs.get("zone_topology", {}).get("supported")
+            and desired.get("zone_intent", {}).get("pairs") == context.climate_inputs["zone_topology"]["pairs"]
+        ))
     ):
         return False
     if persisted.get("lifecycle_id") and desired.get("lifecycle_id"):
@@ -471,7 +481,13 @@ def _hvac_suppression_is_directionally_safe(
     tolerance = tolerance_percent / 100.0
     low = context.occupied_temperature_low_c * (1 - tolerance)
     high = context.occupied_temperature_high_c * (1 + tolerance)
-    current = float(context.current_hvac_temperature_c)
+    from .zone_temperature import control_temperature
+    temperature = (control_temperature(context, str(desired_mode))
+                   if context.climate_inputs.get("zone_topology", {}).get("supported")
+                   else context.current_hvac_temperature_c)
+    if temperature is None:
+        return False
+    current = float(temperature)
     if desired_mode == "heat":
         return current <= high
     if desired_mode == "cool":

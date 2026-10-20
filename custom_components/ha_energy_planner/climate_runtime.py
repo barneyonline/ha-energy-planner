@@ -138,6 +138,26 @@ def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: 
                 )
             ]
         return legacy
+    if context.climate_inputs.get("zone_topology", {}).get("supported"):
+        # The economic model was qualified for a fixed zone topology. No
+        # counterfactual saving is transferable to independently closed rooms.
+        context.climate_decision = {
+            "reason": "zone_subset_economic_model_unvalidated", "preconditioning_status": "learning",
+            "summary": "Independent zone preparation uses fallback timing; subset energy predictions are unvalidated.",
+            "zone_control": context.climate_legacy_decision.get("zone_control"),
+        }
+        if context.hvac_control.get("economic_policy_version"):
+            return [release_action(context, "zone_subset_economic_model_unvalidated", timedelta(minutes=int(
+                options[CONF_PLANNING_INTERVAL_MINUTES]
+            )))]
+        # Observe applies to the economic engine, not the fallback lifecycle.
+        # Only an existing tariff lifecycle may continue after activation.
+        # Away-off ownership can otherwise be replaced by a new preparation
+        # window, so it cannot authorize fallback through the degradation guard.
+        owned_legacy = context.hvac_control.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"}
+        if owned_legacy or not state.get("ever_active"):
+            return legacy
+        return [action for action in legacy if action.kind == ActionKind.RELEASE_HVAC]
     model = dict(state.get("model", {}))
     state["model"] = model
     eligible_model = {

@@ -86,6 +86,48 @@ class DaikinHVACAdapter:
         self._climate_override_policy: dict[str, tuple[bool, bool]] = {}
         self._async_persist_confirmation: Callable[[dict[str, Any] | None], Awaitable[None]] | None = None
         self._recovery_confirmation: dict[str, Any] | None = None
+        self._zone_desired: dict[str, Any] = {}
+        self._zone_options: dict[str, Any] = {}
+        self._zone_baseline: dict[str, Any] = {}
+
+    def set_zone_control_context(self, options: dict[str, Any], control: dict[str, Any]) -> None:
+        """Keep original zone targets available while a planner-paused alias is null."""
+        self._zone_options = options
+        self._zone_baseline = control
+
+    def _zone_control_rejection(self) -> str | None:
+        from .zone_control import live_rejection
+        return live_rejection(self.hass, self.entry_data, self._zone_options, self._zone_desired,
+                              self._zone_baseline, dt_util.utcnow())
+
+    def _independent_pairs(self) -> dict[str, str]:
+        from .zone_control import topology
+        return dict(topology(self.entry_data).get("pairs", {}))
+
+    def _assert_zone_airflow(self, domain: str, service: str, data: dict[str, Any]) -> None:
+        """Require each intermediate open combination while the head can demand."""
+        from .zone_control import topology
+        config = topology(self.entry_data)
+        pairs = config.get("pairs", {})
+        entity_id = str(data.get(ATTR_ENTITY_ID))
+        head_id = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        head = self._state(str(head_id))
+        switch_change = entity_id in pairs and service in {SERVICE_TURN_ON, SERVICE_TURN_OFF}
+        starts_head = entity_id == head_id and (
+            service == SERVICE_TURN_ON or service == "set_hvac_mode" and data.get("hvac_mode") != "off"
+        )
+        head_target = entity_id == head_id and service == "set_temperature"
+        if pairs and (switch_change or starts_head or head_target) and (
+            starts_head or head is None or head.state != "off"
+        ):
+            if any(self._state_value(entity) not in {"on", "off"} for entity in pairs):
+                raise _HVACStateConfirmationError("zone power feedback is not available to verify airflow")
+            remaining = {entity for entity in pairs if entity != (entity_id if switch_change else None)
+                         and (state := self._state(entity)) is not None and state.state == "on"}
+            if switch_change and service == SERVICE_TURN_ON:
+                remaining.add(entity_id)
+            if not any(remaining == set(row) for row in config["safe_open_sets"]):
+                raise _HVACStateConfirmationError("remaining airflow is not verified")
 
     def set_confirmation_persistence_callback(
         self, callback: Callable[[dict[str, Any] | None], Awaitable[None]],
@@ -110,6 +152,15 @@ class DaikinHVACAdapter:
     ) -> None:
         """Issue a contextual command without retaining vendor response bodies."""
         entity_id = str(data.get(ATTR_ENTITY_ID))
+        if respect_manual_override and self._zone_control_rejection() is not None:
+            raise _HVACStateConfirmationError("zone intent no longer matches fresh room evidence")
+        pairs = self._independent_pairs()
+        if entity_id in pairs:
+            # Switches share the durable climate command/readback protocol,
+            # including its override scope. Recovery still preserves this exact
+            # zone, but a main or sibling override cannot block its restoration.
+            self._climate_override_policy[entity_id] = (respect_manual_override, True)
+        self._assert_zone_airflow(domain, service, data)
         if domain != "climate" and (
             domain == "automation" or entity_id in self._zone_entities()
         ) and entity_id != self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER):
@@ -152,7 +203,7 @@ class DaikinHVACAdapter:
         entity_id = str(data.get(ATTR_ENTITY_ID))
         self._last_commands[entity_id] = record
         self._command_started[entity_id] = asyncio.get_running_loop().time()
-        if domain == "climate":
+        if domain == "climate" or entity_id in pairs:
             now = dt_util.utcnow()
             record.update(
                 issued_at=now.isoformat(),
@@ -175,6 +226,9 @@ class DaikinHVACAdapter:
                     raise _HVACStateConfirmationError("climate scheduler guard was not confirmed")
                 # Guard services can yield to explicit user actions too.
                 self._raise_if_climate_override_requested(entity_id)
+                if respect_manual_override and self._zone_control_rejection() is not None:
+                    raise _HVACStateConfirmationError("zone evidence changed during intent persistence")
+                self._assert_zone_airflow(domain, service, data)
             except BaseException:  # Cancellation before dispatch is an unsent intent too.
                 # This intent never reached the service bus. Retire superseded
                 # baselines first so a crash cannot replay a stale user target,
@@ -190,7 +244,7 @@ class DaikinHVACAdapter:
         try:
             await async_call_device_service(hass, domain, service, data, **kwargs)
         except TimeoutError:
-            if domain != "climate":
+            if domain != "climate" and entity_id not in pairs:
                 raise
             # The device may have accepted the write before HA timed out.
             # Only readback can resolve this; never resend the command here.
@@ -388,6 +442,7 @@ class DaikinHVACAdapter:
                 entity_id
                 for entity_id in self._zone_climate_entities()
                 if zone_temperature_sync_deferred(self._state(entity_id))
+                and not self._zone_baseline.get("zone_states", {}).get(entity_id)
             }
         return self._enabled_automation_states(), {
             entity_id: state
@@ -444,6 +499,10 @@ class DaikinHVACAdapter:
         self._manual_supersession_persisted = False
         self._persisted_zone_supersessions.clear()
         pre_state = self._snapshot()
+        self._zone_desired = action.desired_state
+        rejection = self._zone_control_rejection()
+        if rejection:
+            return HVACCommandResult(False, rejection, pre_state, pre_state, {}, True)
         saved_automation_states = self._automation_states()
         automation_work = any(
             state == "on" or bool(getattr(self._state(entity_id), "attributes", {}).get("current", 0))
@@ -544,13 +603,16 @@ class DaikinHVACAdapter:
         guard_work = bool(
             automation_work
             or not _already_in_desired_state(climate_state, _main_hvac_desired_state(action.desired_state))
-            or any(state != "on" for entity, state in saved_zone_states.items() if not entity.startswith("climate."))
+            or any(state != action.desired_state.get("zone_power", {}).get(entity, "on")
+                   for entity, state in saved_zone_states.items() if not entity.startswith("climate."))
             or (
                 synchronize_zone_temperatures
                 and any(
                     (zone := self._state(entity)) is not None
-                    and not _already_in_desired_state(zone, _temperature_desired_state(action.desired_state))
-                    for entity in saved_zone_states if entity.startswith("climate.")
+                    and not _already_in_desired_state(zone, {"target_temperature": target} if (
+                        target := action.desired_state.get("zone_targets", {}).get(entity)
+                    ) is not None else _temperature_desired_state(action.desired_state))
+                    for entity in self._synchronized_zone_climate_entities()
                 )
             )
         )
@@ -648,6 +710,12 @@ class DaikinHVACAdapter:
         if manual_override_result is not None:
             return manual_override_result
         if not zones_enabled:
+            if action.desired_state.get("zone_intent"):
+                # Never continue demand while an intended cold-room closure is
+                # uncertain. Executor retains the original durable baseline and
+                # immediately uses the established restoration transaction.
+                return HVACCommandResult(False, "zone_subset_confirmation_failed", pre_state, self._snapshot(),
+                                         changed_automations, False, saved_zone_states, saved_main_state)
             (
                 rollback_succeeded,
                 unresolved_states,
@@ -699,6 +767,9 @@ class DaikinHVACAdapter:
         except _HVACStateConfirmationError:
             state_confirmed = False
         except Exception:  # noqa: BLE001 - device adapter must fail closed on service-layer errors.
+            if action.desired_state.get("zone_intent"):
+                return HVACCommandResult(False, "zone_subset_service_failed", pre_state, self._snapshot(),
+                                         changed_automations, False, saved_zone_states, saved_main_state)
             (
                 rollback_succeeded,
                 unresolved_states,
@@ -722,6 +793,9 @@ class DaikinHVACAdapter:
             )
         confirmation_reason = "hvac_state_confirmation_failed"
         if not state_confirmed:
+            if action.desired_state.get("zone_intent"):
+                return HVACCommandResult(False, "zone_subset_confirmation_failed", pre_state, self._snapshot(),
+                                         changed_automations, False, saved_zone_states, saved_main_state)
             (
                 rollback_succeeded,
                 unresolved_states,
@@ -791,6 +865,9 @@ class DaikinHVACAdapter:
         saved_main_state: dict[str, Any] | None = None,
     ) -> HVACCommandResult:
         """Release HVAC ownership by restoring captured actuator state."""
+        # Lost room feedback must not block compensation to original settings.
+        # Physical airflow and manual supersession are still checked per write.
+        self._zone_desired = {}
         await self._async_reconcile_recovery()
         self._manual_supersession_persisted = False
         self._persisted_zone_supersessions.clear()
@@ -847,6 +924,7 @@ class DaikinHVACAdapter:
         deferred_only = bool(
             zones
             and (not main_state or deferred_recovery)
+            and not self._can_restore_paired_targets(zones)
             and all(
                 self._zone_restore_deferred(entity_id, target)
                 for entity_id, target in zones.items()
@@ -858,15 +936,16 @@ class DaikinHVACAdapter:
         if deferred_only:
             # Switch recovery must not wake a head whose shutdown is confirmed.
             # Keep unavailable controls pending, without dispatch or guard work.
-            zones = {
+            zones = self._retain_paired_zone_power(zones, {
                 entity: target
                 for entity, target in zones.items()
                 if entity.startswith("climate.") or self._state_value(entity) != target
-            }
+            })
             actionable_zones = {
                 entity: target
                 for entity, target in zones.items()
                 if not entity.startswith("climate.") and self._state(entity) is not None
+                and self._state_value(entity) != target
             }
             states = {entity: desired for entity, desired in states.items() if self._state_value(entity) != desired}
             deferred_automations = {
@@ -913,6 +992,7 @@ class DaikinHVACAdapter:
             _, unfinished_zones = await self._async_restore_zone_states(actionable_zones)
             unresolved_zones = {entity: target for entity, target in zones.items() if entity not in actionable_zones}
             unresolved_zones.update(unfinished_zones)
+            unresolved_zones = self._retain_paired_zone_power(zones, unresolved_zones)
             main_restored, zones_restored = True, not unresolved_zones
         else:
             main_restored, zones_restored, unresolved_zones = await self._async_restore_main_and_zones(
@@ -1036,20 +1116,23 @@ class DaikinHVACAdapter:
     async def _async_enable_zones(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Enable configured zone entities and return those changed."""
         changed: dict[str, Any] = {}
-        for entity_id, state in states.items():
+        power = self._zone_desired.get("zone_power", {})
+        # Confirm new airflow paths before closing any old ones.
+        for entity_id, state in sorted(states.items(), key=lambda item: power.get(item[0], "on") == "off"):
             if entity_id.split(".", 1)[0] == "climate":
                 # Target snapshots are restored if any later command in the
                 # takeover transaction fails.
                 changed[entity_id] = state
                 continue
-            if state == "on":
+            requested = power.get(entity_id, "on")
+            if state == requested:
                 continue
             changed[entity_id] = state
             service_context = Context() if self._set_coupled_zone_feedback_expected is not None else None
             if self._set_coupled_zone_feedback_expected is not None:
                 self._set_coupled_zone_feedback_expected(
                     entity_id,
-                    "on",
+                    requested,
                     service_context.id if service_context is not None else None,
                 )
             try:
@@ -1059,7 +1142,7 @@ class DaikinHVACAdapter:
                         await self._async_command(
                             self.hass,
                             entity_id.split(".", 1)[0],
-                            SERVICE_TURN_ON,
+                            SERVICE_TURN_ON if requested == "on" else SERVICE_TURN_OFF,
                             service_data,
                             blocking=True,
                         )
@@ -1067,7 +1150,7 @@ class DaikinHVACAdapter:
                         await self._async_command(
                             self.hass,
                             entity_id.split(".", 1)[0],
-                            SERVICE_TURN_ON,
+                            SERVICE_TURN_ON if requested == "on" else SERVICE_TURN_OFF,
                             service_data,
                             blocking=True,
                             context=service_context,
@@ -1078,7 +1161,7 @@ class DaikinHVACAdapter:
                     self._raise_if_manual_override_requested()
                 except _HVACManualOverrideError:
                     return False, changed
-                if not await self._async_confirm_state(entity_id, "on"):
+                if not await self._async_confirm_state(entity_id, requested):
                     return False, changed
                 try:
                     self._raise_if_manual_override_requested()
@@ -1104,14 +1187,19 @@ class DaikinHVACAdapter:
             and _temperature_range_matches(observed, target.get("target_temp_low"), target.get("target_temp_high"))
         ):
             return False
+        return not self._zone_target_within_bounds(observed, target)
+
+    @staticmethod
+    def _zone_target_within_bounds(observed: State, target: dict[str, Any]) -> bool:
+        """Check published bounds before requesting or exposing a saved target."""
         attributes = observed.attributes
         try:
             values = [float(value) for value in _temperature_desired_state(target).values()]
             low = float(attributes.get("min_temp", float("-inf")))
             high = float(attributes.get("max_temp", float("inf")))
-            return any(not isfinite(value) or not low <= value <= high for value in values)
+            return all(isfinite(value) and low <= value <= high for value in values)
         except (TypeError, ValueError):
-            return True
+            return False
 
     async def _async_restore_zone_states(self, states: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         """Restore captured zone states."""
@@ -1238,10 +1326,67 @@ class DaikinHVACAdapter:
             unresolved_main_state,
         )
 
+    def _can_restore_paired_targets(self, zones: dict[str, Any]) -> bool:
+        """Allow owned zone recovery under an already-active, possibly user-controlled head."""
+        head = self._state(str(self.entry_data.get(CONF_DAIKIN_CLIMATE)))
+        return bool(head is not None and head.state in _ACTIVE_HVAC_MODES and self._paired_target_open_states(zones))
+
+    def _paired_target_open_states(self, zones: dict[str, Any]) -> dict[str, str]:
+        """Open only owned pairs whose unfinished target fits the current head's bounds."""
+        result = {}
+        for actuator, climate in self._independent_pairs().items():
+            target = zones.get(climate)
+            observed = self._state(climate)
+            if (actuator in zones and isinstance(target, dict) and _has_restorable_temperature_target(target)
+                    and observed is not None and not _already_in_desired_state(observed, target)
+                    and self._zone_target_within_bounds(observed, target)):
+                result[actuator] = "on"
+        return result
+
+    def _retain_paired_zone_power(self, saved: dict[str, Any], pending: dict[str, Any]) -> dict[str, Any]:
+        """Keep power needed to expose an unfinished target without acquiring an excluded actuator."""
+        result = dict(pending)
+        for actuator, climate in self._independent_pairs().items():
+            if climate in result and actuator in saved:
+                result.setdefault(actuator, saved[actuator])
+        return result
+
     async def _async_restore_main_and_zones(
         self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
     ) -> tuple[bool, bool, dict[str, Any]]:
         """Restore dependent targets before removing the mode that exposes them."""
+        from .zone_control import topology
+        config = topology(self.entry_data)
+        independent = bool(config.get("supported") and zones
+                           and (main_state or self._can_restore_paired_targets(zones)))
+        open_states = ({entity: "on" for entity in config.get("pairs", {}) if entity in zones}
+                       if main_state else self._paired_target_open_states(zones))
+        if independent and main_state:
+            # Never restart a restored/running head just to recover a zone.
+            # When the head is already off, open paths before restoring a mode
+            # that can demand. Unsafe current/original airflow stays fail closed.
+            try:
+                original_power = {entity: zones.get(entity, self._state_value(entity)) for entity in config["pairs"]}
+                original_open = {entity for entity, power in original_power.items() if power == "on"}
+                if (main_state.get("hvac_mode") != "off"
+                        and (any(power not in {"on", "off"} for power in original_power.values())
+                             or not any(original_open == set(row) for row in config["safe_open_sets"]))):
+                    await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+                    return False, False, dict(zones)
+                observed = self._state(main_entity)
+                current_power = {entity: self._state_value(entity) for entity in config["pairs"]}
+                current_open = {entity for entity, power in current_power.items() if power == "on"}
+                if (any(power not in {"on", "off"} for power in current_power.values())
+                        or not any(current_open == set(row) for row in config["safe_open_sets"])):
+                    if not await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"}):
+                        return False, False, dict(zones)
+                    observed = self._state(main_entity)
+                if observed is None or observed.state == "off":
+                    opened, _ = await self._async_restore_zone_states(open_states)
+                    if not opened:
+                        return False, False, dict(zones)
+            except Exception:  # noqa: BLE001 - preserve ownership until safe restoration confirms.
+                return False, False, dict(zones)
         observed = self._state(main_entity)
         defer_off = (
             main_state.get("hvac_mode") == "off"
@@ -1277,7 +1422,29 @@ class DaikinHVACAdapter:
             # temperature snapshots first, then restore switches and main power.
             ordered_zones = dict(sorted(zones.items(), key=lambda item: not item[0].startswith("climate.")))
             if main_restored:
-                zones_restored, unresolved_zones = await self._async_restore_zone_states(ordered_zones)
+                if independent:
+                    # Main settings now match the normal baseline. Only then
+                    # expose hidden zone targets, without an extra head cycle.
+                    opened, _ = await self._async_restore_zone_states(open_states)
+                    if not opened:
+                        return False, False, dict(zones)
+                if config.get("supported") and defer_off:
+                    # Targets may need an active mode, but original closed
+                    # dampers must wait for a confirmed head shutdown.
+                    _, unresolved_zones = await self._async_restore_zone_states({
+                        entity: value for entity, value in ordered_zones.items() if entity.startswith("climate.")
+                    })
+                    off_restored = await self._async_restore_main_state_preserving_manual(main_entity, main_state)
+                    powers = {entity: value for entity, value in ordered_zones.items()
+                              if not entity.startswith("climate.")}
+                    if off_restored:
+                        _, pending_powers = await self._async_restore_zone_states(powers)
+                        unresolved_zones.update(pending_powers)
+                    else:
+                        unresolved_zones.update(powers)
+                    zones_restored = not unresolved_zones
+                else:
+                    zones_restored, unresolved_zones = await self._async_restore_zone_states(ordered_zones)
             else:
                 zones_restored, unresolved_zones = not zones, dict(zones)
         finally:
@@ -1286,8 +1453,13 @@ class DaikinHVACAdapter:
             if defer_off:
                 if self._set_pending_main_restore is not None:
                     self._set_pending_main_restore(main_state)
-                off_restored = await self._async_restore_main_state_preserving_manual(main_entity, main_state)
+                final_state = {"hvac_mode": "off"} if config.get("supported") and off_restored else main_state
+                off_restored = await self._async_restore_main_state_preserving_manual(main_entity, final_state)
         main_restored = main_restored and off_restored
+        # A closed paired actuator may hide a failed target again. Retain its
+        # original power alongside that target so a retry/reload can expose it
+        # and still return the actuator to its exact original power afterward.
+        unresolved_zones = self._retain_paired_zone_power(zones, unresolved_zones)
         await self._async_persist_requested_manual_supersessions()
         return main_restored, zones_restored, unresolved_zones
 
@@ -1443,6 +1615,8 @@ class DaikinHVACAdapter:
 
     async def _async_confirm_state(self, entity_id: str, expected_state: str) -> bool:
         """Wait briefly for Home Assistant to publish a requested actuator state."""
+        if entity_id in self._independent_pairs():
+            return await self._async_wait_for_climate(entity_id, lambda observed: observed.state == expected_state)
         # Older HA releases queue state listeners even when the state machine
         # already reflects a service result. Deliver those events while the
         # command context and manual-supersession markers are still active.
@@ -1499,7 +1673,12 @@ class DaikinHVACAdapter:
             requested = record["requested"]
             # Enforce the deadline inside each readback predicate: guard waits
             # and queued state delivery both consume this original lease.
-            if record["service"] == "turn_on":
+            if record.get("domain") == "switch":
+                expected = "on" if record["service"] == "turn_on" else "off"
+                await self._async_wait_for_climate(
+                    entity_id, lambda observed: loop.time() < confirmation_deadline and observed.state == expected,
+                )
+            elif record["service"] == "turn_on":
                 await self._async_wait_for_climate(
                     entity_id,
                     lambda observed: loop.time() < confirmation_deadline
@@ -1605,7 +1784,12 @@ class DaikinHVACAdapter:
         if not zone_target:
             return True
         for zone_entity in self._synchronized_zone_climate_entities():
-            if not await self._async_confirm_hvac_state(zone_entity, zone_target):
+            target = self._zone_desired.get("zone_targets", {}).get(zone_entity)
+            expected = {"target_temperature": target} if target is not None else zone_target
+            if not await self._async_confirm_hvac_state(zone_entity, expected):
+                return False
+        for actuator, power in self._zone_desired.get("zone_power", {}).items():
+            if not await self._async_confirm_state(actuator, power):
                 return False
         return True
 
@@ -1810,10 +1994,11 @@ class DaikinHVACAdapter:
                 raise _HVACStateConfirmationError("main climate state was not confirmed before zone targets")
             zone_target = _temperature_desired_state(desired_state)
             for zone_entity in self._synchronized_zone_climate_entities():
+                target = self._zone_desired.get("zone_targets", {}).get(zone_entity)
                 command_sent = (
                     await self._async_apply_hvac_state(
                         zone_entity,
-                        zone_target,
+                        {"target_temperature": target} if target is not None else zone_target,
                         force=force,
                         respect_manual_override=respect_manual_override,
                         respect_zone_manual_override=respect_zone_manual_override,
@@ -1890,7 +2075,8 @@ class DaikinHVACAdapter:
             if state is None:
                 continue
             if entity_id.split(".", 1)[0] == "climate":
-                states[entity_id] = _climate_target_snapshot(state)
+                states[entity_id] = (_climate_target_snapshot(state)
+                                     or self._zone_baseline.get("zone_states", {}).get(entity_id, {}))
             else:
                 states[entity_id] = state.state
         return states
@@ -1901,6 +2087,10 @@ class DaikinHVACAdapter:
             entity_id
             for entity_id in self._zone_climate_entities()
             if entity_id not in (self._deferred_zone_entities or set())
+            and entity_id not in {
+                climate for actuator, climate in self._zone_desired.get("zone_intent", {}).get("pairs", {}).items()
+                if self._zone_desired.get("zone_power", {}).get(actuator) == "off"
+            }
         ]
 
     def _zone_climate_entities(self) -> list[str]:
