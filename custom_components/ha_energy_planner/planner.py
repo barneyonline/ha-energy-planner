@@ -460,6 +460,11 @@ class DryRunPlanner:
                     current_slot.projected_ev_load_kw = fallback_power
                     optimization_evidence["physical_power_by_time"][current_slot.valid_at.isoformat()] = fallback_power
                 optimization_evidence["cost_estimates_degraded"] = True
+            if context.ev_evidence.get("vehicle_suspended") and not preconditioning_required_now:
+                charging_required_now = False
+                charging_reason = "ev_vehicle_suspended"
+                if current_slot is not None:
+                    current_slot.projected_ev_load_kw = 0.0
             projected_load_kw_now = (
                 max(float(current_slot.projected_ev_load_kw), 0.0)
                 if charging_required_now and current_slot is not None
@@ -486,6 +491,7 @@ class DryRunPlanner:
                            if context.ev_evidence.get("load_fallback", {}).get("fallback_applied") else {}),
                         **self._ev_power_command(context, optimization_evidence, charging_required_now),
                         "charging_observed": context.ev_charging,
+                        "vehicle_suspended": bool(context.ev_evidence.get("vehicle_suspended")),
                         "charging_reason": charging_reason,
                         "target_soc_percent": target_soc,
                         "vehicle_target_soc_percent": requested_target_soc,

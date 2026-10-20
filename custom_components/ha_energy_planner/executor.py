@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
@@ -59,7 +60,7 @@ from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power, _positive_float, reserve_ev_grid_capacity
 from .ev_policy import finite, power_capability
 from .ev_runtime import allocation_deadline, price_stop_required, settle_spending, timestamp
-from .ev_telemetry import measured, reported_at
+from .ev_telemetry import measured, reported_at, sample_ev, suspension_identity, vehicle_suspension_evidence
 from .export_limit_policy import EXPORT_ASSET
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
 from .hvac_control import HVACOwnershipTransaction, copy_pending_confirmation
@@ -86,6 +87,8 @@ from .safety import (
 )
 from .storage import PlannerStore
 from .vehicles import connection, state_value
+
+_LOGGER = logging.getLogger(__name__)
 
 _PLAN_UNSAFE_NOTIFICATION_ID = "ha_energy_planner_plan_unsafe"
 _GRID_LIMIT_NOTIFICATION_ID = "ha_energy_planner_grid_limit_fallback"
@@ -201,8 +204,18 @@ class Executor:
         pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(entity_ids)
         return True
 
-    async def async_release_ev_policy(self, *, unplugged: bool = False) -> None:
+    async def async_release_ev_policy(
+        self, *, unplugged: bool = False, unplugged_at: datetime | None = None,
+    ) -> None:
         """Forget charger command ownership while preserving external load accounting."""
+        # Capture the boundary before any I/O: a newer refusal can arrive while
+        # releasing old ownership and must belong to the new connected session.
+        connected_id = self.entry_data.get(CONF_EV_CONNECTED)
+        connected_state = self.hass.states.get(connected_id) if self.hass and connected_id else None
+        unplug_boundary = unplugged_at or (
+            reported_at(connected_state)
+            if connection(getattr(connected_state, "state", None)) is False else None
+        ) or dt_util.utcnow()
         ownership = {k: v for k, v in self.store.data.get("ownership", {}).items()
                      if not k.startswith("ev_")}
         await self.store.async_save_ownership(ownership)
@@ -222,6 +235,11 @@ class Executor:
                 telemetry.pop("budget_uncertain", None)
                 telemetry["pending"] = {}
                 telemetry.pop("last_sample", None)
+                refusal = telemetry.get("vehicle_refusal", {})
+                refusal_at = timestamp(refusal.get("at")) if isinstance(refusal, dict) else None
+                if ((telemetry.get("vehicle_suspended") or refusal)
+                        and (refusal_at is None or refusal_at <= unplug_boundary)):
+                    telemetry.update(vehicle_suspended=False, vehicle_refusal={})
                 await self.store.async_save_ev_telemetry(telemetry)
             self._release_ev_grid_reservation()
         else:
@@ -261,6 +279,59 @@ class Executor:
             action_id="ev_auto_start_compensation",
             charging_reason="ev_auto_start_compensation",
         )
+
+    async def _async_ev_vehicle_suspension(self, context: DecisionContext | None) -> bool:
+        """Refresh only refusal evidence; do not learn or settle a telemetry interval."""
+        if self.hass is None:
+            return False
+        from .ev import ev_charging_state, ev_vehicle_suspended
+
+        entity = self.entry_data.get(CONF_EV_CHARGING)
+        feedback = self.hass.states.get(entity) if entity else None
+        raw = getattr(feedback, "state", None)
+        sample = sample_ev(self.hass, self.entry_data, self.options, context) if context is not None else {
+            "suspension_identity": suspension_identity(self.entry_data), "at": dt_util.utcnow().isoformat(),
+        }
+        sample.update(vehicle_suspended=ev_vehicle_suspended(raw), charging=ev_charging_state(raw),
+                      charging_feedback=raw)
+        telemetry = self.store.data.get("ev_telemetry", {})
+        evidence = vehicle_suspension_evidence(telemetry, sample)
+        if evidence["vehicle_suspended"] or telemetry.get("vehicle_suspended"):
+            updated = {**telemetry, **evidence}
+            try:
+                await self.store.async_save_ev_telemetry(updated)
+            except Exception:  # noqa: BLE001 - refusal persistence must never prevent a safety stop.
+                # Native Store retains a dirty generation after a failed flush;
+                # keep the wait in memory too, and retry persistence next cycle.
+                self.store.data["ev_telemetry"] = updated
+                _LOGGER.warning("Unable to persist EV refusal evidence; retaining the wait in memory for safety")
+        if context is not None:
+            context.ev_evidence.update(evidence)
+        return bool(evidence["vehicle_suspended"])
+
+    async def _async_remember_ev_refusal(
+        self, context: DecisionContext | None, feedback: str | None = None, observed_at: str | None = None,
+    ) -> None:
+        """Persist refusal seen during confirmation even after compensation changes feedback."""
+        from .ev import ev_vehicle_suspended
+
+        telemetry = self.store.data.get("ev_telemetry", {})
+        entity = self.entry_data.get(CONF_EV_CHARGING)
+        current = getattr(self.hass.states.get(entity), "state", None) if self.hass and entity else None
+        feedback = feedback or (current if ev_vehicle_suspended(current) else "SUSPENDED_EV")
+        sample = {
+            "suspension_identity": suspension_identity(self.entry_data),
+            "at": observed_at or dt_util.utcnow().isoformat(),
+            "target_soc": context.ev_target_soc_percent if context else None,
+            "vehicle_suspended": True, "charging_feedback": feedback,
+        }
+        # A no-command preflight observation retains the original event and
+        # unplug proof. Refusal from an actual confirmation is a fresh event.
+        evidence = vehicle_suspension_evidence({} if observed_at else telemetry, sample)
+        evidence["vehicle_refusal"]["source"] = "adapter_vehicle_refusal"
+        await self.store.async_save_ev_telemetry({
+            **telemetry, "version": telemetry.get("version", 1), **evidence,
+        })
 
     async def _async_set_ev_charging(
         self,
@@ -389,6 +460,22 @@ class Executor:
                 result = EVCommandResult(False, fallback_reason, {}, {})
                 await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id, rejected=True)
                 return result
+        if enabled:
+            from .ev import ev_charging_state, ev_charging_state_proves_safe, ev_vehicle_suspended
+
+            feedback_id = self.entry_data.get(CONF_EV_CHARGING)
+            feedback = self.hass.states.get(feedback_id) if feedback_id else None
+            raw_feedback = getattr(feedback, "state", None)
+            telemetry = self.store.data.get("ev_telemetry", {})
+            if ev_vehicle_suspended(raw_feedback) or (
+                telemetry.get("vehicle_suspended") and feedback_id
+                and not (ev_charging_state_proves_safe(raw_feedback) or ev_charging_state(raw_feedback) is True)
+            ):
+                if ev_vehicle_suspended(raw_feedback):
+                    await self._async_remember_ev_refusal(context)
+                result = EVCommandResult(False, "ev_vehicle_suspended", {}, {})
+                await self._async_record_manual_ev_outcome(action, result, now, plan_id=plan_id)
+                return result
         manual_lease = None
         manual_cost_rate = 0.0
         manual_telemetry = settle_spending(self.store.data.get("ev_telemetry", {}), now)
@@ -472,7 +559,27 @@ class Executor:
         await self.async_persist_ev_grid_reservation()
         if result.command_sent:
             await self._async_record_command_attempt(action, now)
-        if not result.applied:
+        if result.reason == "ev_vehicle_suspended" or result.post_state.get("vehicle_refusal_feedback"):
+            await self._async_remember_ev_refusal(
+                context, result.post_state.get("vehicle_refusal_feedback"), result.post_state.get("vehicle_refusal_at"))
+            if result.reason == "ev_vehicle_suspended" and _ev_result_proves_safe(result):
+                await self._async_end_ev_exposure(safe_stop_confirmed=True)
+        elif enabled and result.applied:
+            from .ev import ev_charging_state_proves_active
+
+            feedback_id = self.entry_data.get(CONF_EV_CHARGING)
+            feedback = self.hass.states.get(feedback_id) if feedback_id else None
+            telemetry = self.store.data.get("ev_telemetry", {})
+            refusal_at = timestamp(telemetry.get("vehicle_refusal", {}).get("at"))
+            charging_at = reported_at(feedback)
+            if not feedback_id or (ev_charging_state_proves_active(getattr(feedback, "state", None)) and (
+                refusal_at is None or charging_at is not None and charging_at >= refusal_at
+            )):
+                if telemetry.get("vehicle_suspended"):
+                    await self.store.async_save_ev_telemetry({
+                        **telemetry, "vehicle_suspended": False, "vehicle_refusal": {},
+                    })
+        if not result.applied and not _ev_expected_refusal(result):
             if action_id == "ev_auto_start_compensation" and result.command_sent:
                 await self._async_record_ev_safety_stop_failure(now, retry_limit_reached=False)
             await self._async_pause_asset_control(
@@ -527,12 +634,12 @@ class Executor:
         ev_entry_data: dict[str, Any] | None = None,
     ) -> None:
         """Persist one explicit EV command outcome through the normal audit path."""
-        no_change = result.reason == "already_in_desired_state"
+        no_change = result.reason == "already_in_desired_state" or _ev_expected_refusal(result)
         outcome_result = (
-            OutcomeResult.REJECTED
-            if rejected or (not result.applied and not result.command_sent)
-            else OutcomeResult.SKIPPED
+            OutcomeResult.SKIPPED
             if no_change
+            else OutcomeResult.REJECTED
+            if rejected or (not result.applied and not result.command_sent)
             else OutcomeResult.APPLIED
             if result.applied
             else OutcomeResult.FAILED
@@ -627,6 +734,14 @@ class Executor:
                     return due_hvac_continuation
         if action is None:
             return None
+        vehicle_suspended = (await self._async_ev_vehicle_suspension(context)
+                             if action.asset == ActionAsset.EV else False)
+        if (vehicle_suspended and _ev_action_wants_power(action)
+                and not action.desired_state.get("keep_charger_on")):
+            desired = {**action.desired_state, "charging_required_now": False,
+                       "charging_reason": "ev_vehicle_suspended", "projected_load_kw_now": 0.0}
+            desired.pop("power_limit", None)
+            action = replace(action, kind=ActionKind.EV_STOP, desired_state=desired)
         safety_ev_stop = _ev_action_is_safety_stop(action)
         owned_safety_stop = _ev_action_is_owned_safety_stop(action)
         if not owned_safety_stop and (now < action.execute_not_before or now > action.execute_not_after):
@@ -862,7 +977,14 @@ class Executor:
             # Consume the adapter's confirmation before yielding to notification
             # or ledger I/O. Later power events must supersede this evidence.
             self._reconcile_ev_grid_reservation(action, ev_result, previous_reservation)
-            no_change = ev_result.reason == "already_in_desired_state"
+            vehicle_declined = _ev_expected_refusal(ev_result)
+            if ev_result.reason == "ev_vehicle_suspended" or ev_result.post_state.get("vehicle_refusal_feedback"):
+                await self._async_remember_ev_refusal(
+                    context, ev_result.post_state.get("vehicle_refusal_feedback"),
+                    ev_result.post_state.get("vehicle_refusal_at"))
+                if ev_result.reason == "ev_vehicle_suspended" and _ev_result_proves_safe(ev_result):
+                    await self._async_end_ev_exposure(safe_stop_confirmed=True)
+            no_change = ev_result.reason == "already_in_desired_state" or vehicle_declined
             safe_stop_confirmed = _ev_result_proves_safe(ev_result)
             if not _ev_action_wants_power(action) and safe_stop_confirmed:
                 await self._async_end_ev_exposure(safe_stop_confirmed=True)
@@ -892,7 +1014,9 @@ class Executor:
                 )
             if action_applied and (owned_safety_stop or
                     action.desired_state.get("charging_reason") == "ev_load_fallback_capacity_pause"
-            ) and action.desired_state.get("charging_reason") != "ev_charge_now_target_reached":
+            ) and action.desired_state.get("charging_reason") not in {
+                "ev_charge_now_target_reached", "ev_vehicle_suspended",
+            }:
                 await self._async_notify_ev_interrupted(str(action.desired_state.get("charging_reason")))
             result_reason = (
                 "ev_stop_not_confirmed"
@@ -903,7 +1027,7 @@ class Executor:
             )
             if ev_result.command_sent:
                 await self._async_record_command_attempt(action, now)
-            if not action_applied:
+            if not action_applied and not vehicle_declined:
                 pause_duration = ACTION_BACKOFF_DURATION
                 retry_limit_reached = planner_owned_stop and _ev_safety_stop_attempt_limit_reached(
                     self.store.data.get("execution_audit"),
@@ -3436,3 +3560,10 @@ def _restored_hvac_mode_commands(value: Any) -> list[dict[str, Any]]:
             restored["confirmed_at"] = confirmed
         history.append(restored)
     return history
+
+
+def _ev_expected_refusal(result: EVCommandResult) -> bool:
+    """Expected waiting is distinct from an unconfirmed compensation failure."""
+    return result.reason == "ev_vehicle_suspended" and (
+        not result.command_sent or result.safe_state_confirmed is True
+    )

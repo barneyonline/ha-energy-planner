@@ -13,6 +13,7 @@
 ### 🐛 Bug fixes
 
 - Clear a false missed-preconditioning diagnostic when a tariff tail update changes the lifecycle ID but the same preparation episode has confirmed execution. Failed or unconfirmed replacements remain unfulfilled.
+- Honor vehicle-side EV charging suspension without repeated automatic start timeouts. Persist the wait across planner stops and restarts, retain uncertain safety ownership, and keep SOC readiness separate from charger permission.
 
 ### 🔧 Improvements
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any
 
-from .action_limits import action_budget
+from .action_limits import action_budget, counted_attempt
 from .ev_policy import finite
 
 
@@ -23,7 +23,7 @@ def audit_evidence(audit: list[Any], options: dict[str, Any], now: datetime) -> 
         for row in audit
         if isinstance(row, dict)
         and row.get("asset") == "ev"
-        and row.get("result") in {"applied", "failed", "restored"}
+        and counted_attempt(row)
         and (at := timestamp(row.get("attempted_at"))) is not None
         and now - timedelta(hours=24) <= at <= now
     ]
