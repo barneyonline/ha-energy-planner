@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
+from .climate_inputs import instant
 from .hvac_adapter import HVACCommandResult
 
 _HVAC_MAIN_STATE_OWNERSHIP_KEY = "main_state"
 
 HVAC_LIFECYCLE_FIELDS = (
+    "zone_intent",
     "economic_policy_version",
     "lifecycle_id",
     "configuration_identity",
@@ -51,6 +53,24 @@ def copy_pending_confirmation(control: dict[str, Any], current: Any) -> None:
     control.pop("command_confirmation", None)
     if isinstance(record, dict):
         control["command_confirmation"] = deepcopy(record)
+
+
+def _zone_intent_pause_times(
+    desired: dict[str, Any], previous: dict[str, Any], confirmed_at: datetime | None = None,
+) -> dict[str, Any]:
+    """Retain confirmed pauses through queued intent saves and completions."""
+    from .zone_control import PAUSE_MINUTES
+    intent = deepcopy(desired)
+    for entity, row in intent.get("zones", {}).items():
+        if row.get("status") != "paused":
+            continue
+        previous_pause = instant(previous.get("zones", {}).get(entity, {}).get("paused_at"))
+        paused_at = (previous_pause if previous.get("power", {}).get(entity) == "off"
+                     and previous_pause is not None else confirmed_at)
+        if paused_at is not None:
+            row["paused_at"] = paused_at.isoformat()
+            row["restart_not_before"] = (paused_at + timedelta(minutes=PAUSE_MINUTES)).isoformat()
+    return intent
 
 
 @dataclass(slots=True)
@@ -93,6 +113,10 @@ class HVACOwnershipTransaction:
         for key in HVAC_LIFECYCLE_FIELDS:
             if desired.get(key) is not None:
                 provisional_hvac_control[key] = desired[key]
+        if desired.get("zone_intent"):
+            provisional_hvac_control["zone_intent"] = _zone_intent_pause_times(
+                desired["zone_intent"], self.previous.get("hvac_control", {}).get("zone_intent", {}),
+            )
         if provisional_hvac_control.get("phase") is None:
             provisional_hvac_control["phase"] = "away_off" if desired.get("hvac_mode") == "off" else "direct_control"
         provisional_hvac_control.setdefault("started_at", self.now)
@@ -193,6 +217,9 @@ class HVACOwnershipTransaction:
                 if (not hvac_control.get("preconditioning_started_at")
                         or self.previous.get("hvac_control", {}).get("lifecycle_id") != desired.get("lifecycle_id")):
                     hvac_control["preconditioning_started_at"] = self.now
+            if (desired.get("zone_intent") and desired["zone_intent"].get("power")
+                    != self.previous.get("hvac_control", {}).get("zone_intent", {}).get("power")):
+                hvac_control["zone_transition_at"] = confirmed_at or self.now
             saved_zones = dict(hvac_control.get("zone_states", {}))
             for entity_id, state in hvac_result.saved_zone_states.items():
                 saved_zones.setdefault(entity_id, state)
@@ -213,6 +240,13 @@ class HVACOwnershipTransaction:
             for key in HVAC_LIFECYCLE_FIELDS:
                 if desired.get(key) is not None:
                     hvac_control[key] = desired[key]
+            if desired.get("zone_intent"):
+                # The durable request starts recovery, but the off dwell starts
+                # at confirmed completion, never before a slow closure settles.
+                hvac_control["zone_intent"] = _zone_intent_pause_times(
+                    desired["zone_intent"], self.previous.get("hvac_control", {}).get("zone_intent", {}),
+                    confirmed_at or self.now,
+                )
             if (
                 desired.get("phase") in {"pre_peak_coast", "peak_coast"}
                 and desired.get("phase_transition_reason") == "target_reached"

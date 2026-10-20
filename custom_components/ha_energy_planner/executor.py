@@ -87,6 +87,7 @@ from .safety import (
 )
 from .storage import PlannerStore
 from .vehicles import connection, state_value
+from .zone_control import superseded_entities
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ class Executor:
             return False
         entity_ids = {str(item) for item in pending.get(_PENDING_HVAC_MANUAL_ZONE_IDS_KEY, []) if str(item)}
         entity_ids.add(entity_id)
-        pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(entity_ids)
+        pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(superseded_entities(self.entry_data, entity_ids))
         return True
 
     async def async_release_ev_policy(
@@ -1125,6 +1126,9 @@ class Executor:
                 )
                 return None
             adapter = DaikinHVACAdapter(self.hass, self.entry_data)
+            zone_context = getattr(adapter, "set_zone_control_context", None)
+            if callable(zone_context):
+                zone_context(dict(self.options), existing_hvac_control)
             ownership_before = deepcopy(dict(self.store.data.get("ownership", {})))
             automation_snapshot, zone_snapshot = adapter.takeover_snapshot()
             main_snapshot = adapter.main_takeover_snapshot()
@@ -1196,6 +1200,10 @@ class Executor:
             )
             if completed_ownership is not None:
                 await self.store.async_save_ownership(completed_ownership)
+            if not hvac_result.applied and (
+                action.desired_state.get("zone_intent") or action.desired_state.get("zone_control_blocked")
+            ):
+                await self.async_release_hvac_control("zone_subset_failed", plan_id=plan.plan_id)
             await self.store.async_add_outcome(
                 self._action_outcome(
                     action,
@@ -1455,9 +1463,16 @@ class Executor:
             # A main-entity manual change supersedes any failed acquisition
             # snapshot; a release must not overwrite the user's new state.
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
-        zone_state_superseded = bool(preserve_zone_entity_id and preserve_zone_entity_id in zone_states)
+        preserved_zone_ids = superseded_entities(self.entry_data, {preserve_zone_entity_id}) if (
+            preserve_zone_entity_id
+        ) else set()
+        zone_state_superseded = bool(preserved_zone_ids & zone_states.keys())
+        if hvac_control.get("command_confirmation", {}).get("entity_id") in preserved_zone_ids:
+            hvac_control.pop("command_confirmation")
+            zone_state_superseded = True
         if preserve_zone_entity_id:
-            zone_states.pop(preserve_zone_entity_id, None)
+            for entity_id in preserved_zone_ids:
+                zone_states.pop(entity_id, None)
             # A failed release may retain unresolved ownership for a later retry.
             # Do not retain the user-controlled zone or that retry would overwrite
             # the manual target that caused this release.
@@ -2896,6 +2911,7 @@ class Executor:
         zone_entity_ids: set[str],
     ) -> None:
         """Atomically discard all user-superseded HVAC baselines."""
+        zone_entity_ids = superseded_entities(self.entry_data, zone_entity_ids)
         ownership = deepcopy(dict(self.store.data.get("ownership", {})))
         hvac_control = dict(ownership.get("hvac_control", {}))
         if main_superseded:

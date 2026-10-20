@@ -250,6 +250,123 @@ rejections instead. Historical records from before this feature cannot be
 reconstructed. Pending restoration takes priority in the current status until
 ownership recovery is resolved.
 
+## Independent zone completion
+
+This optional control supports two to eight independently switchable zones on one
+registered controller. Configure `hvac_zone_control` in Climate settings only
+after verifying the physical actuator/thermostat pairs and minimum airflow with
+the manufacturer or installer. Home Assistant's entity registry must put the head,
+switches and thermostats on the same device, integration platform and config
+entry. Different device registrations, climate-only zones, missing controls,
+ambiguous room mappings and incomplete configured-zone coverage are unsupported.
+Names, common sensor mappings and zone floor area do not prove independence or
+safe airflow. No settings or hardware capabilities are inferred.
+
+For example, after the installer has confirmed that either zone alone supports
+the unit's required airflow:
+
+```json
+{
+  "pairs": {
+    "switch.main": "climate.main_temperature",
+    "switch.bedrooms": "climate.bedrooms_temperature"
+  },
+  "safe_open_sets": [
+    ["switch.main", "switch.bedrooms"],
+    ["switch.main"],
+    ["switch.bedrooms"]
+  ]
+}
+```
+
+Each listed set is an **exact** permitted open combination. The full set must be
+listed. Intermediate combinations during sequential writes also need verification
+while the head is active. Omit unverified combinations; a requested subset without an exact match
+hands control back safely. Do not copy the single-zone entries above as an airflow
+assessment for your installation. All paired entities must be explicitly included
+in Climate zones. Removing a zone from that list is an exclusion and invalidates
+this complete topology declaration. Normal manual changes still supersede planner
+control and initiate restoration; they are never treated as an invitation to
+reopen an excluded zone.
+
+Map a fresh temperature sensor to each physical zone's switch or thermostat in
+Room measurements. If both aliases are mapped, their temperature sensor and
+comfort bounds must agree. Two different switches sharing a sensor remain two
+different physical zones. Room-specific low/high helpers take precedence over
+household bounds. Independent preparation explicitly synchronizes the active
+paired thermostats, with original targets captured before writes. A previously
+off thermostat exposing no target retains the existing deferred-target rules.
+There is no substitution from the head's temperature when room feedback is lost.
+
+Cooling pauses a zone at or below its applicable target; heating pauses it at or
+above target. Other rooms continue only when their remaining open combination is
+verified safe. A paused zone can reopen **ten minutes after confirmed closure** and at least
+**0.3°C** beyond its target in the direction requiring preparation. Safety-driven
+closure is immediate; the dwell never forces a completed room to continue
+conditioning. Confirmations and sequential writes keep the existing service
+deadlines, action budgets and compressor start/rest guards. Each actual write
+rechecks fresh room feedback. Failed or uncertain closures cause shared-unit
+restoration, with ownership retained while any recovery remains unresolved.
+Airflow-dependent writes require known on/off feedback from every paired damper;
+an unavailable actuator is never counted as closed. Recovery stops demand and
+waits for available feedback before restoring a safe original combination.
+Queued refreshes retain the confirmed closure time, so they cannot shorten the
+restart dwell using an older planning timestamp.
+
+The last airflow path is never closed for completion. When all zones finish, the
+head is confirmed off for coast while paths remain as they were. With verified
+current airflow, restoration confirms the original head settings in place before
+reopening paused controls and restoring their dependent targets. An already-off
+head gets open paths before any active mode is restored. Original off baselines
+are confirmed before closing their last path. Restoration confirms the original
+head/zone power and automation baselines without cycling an already-correct head.
+Original baselines are never replaced by a subset, pause, reopen or coast state.
+An unresolved target retains its paired power baseline across retries and reloads.
+Deferred retries keep that dependency even when the actuator already matches its
+original power. They leave an already-off head off; when normal operation makes
+recovery actionable, the saved pair can reopen, restore its target and return to
+its original power. Recovery never acquires a paired actuator without a saved
+power baseline.
+If a manual head change supersedes its saved baseline while owned zones remain
+pending, an already-active head permits recovery of those explicitly saved pairs.
+That recovery sends no head commands and retains the user's mode and target.
+Only unfinished pairs with saved targets inside their published bounds are
+opened. Incompatible or invalid bounds keep that pair pending without switch
+cycling or guard renewal, even while an eligible sibling makes progress. A target
+already confirmed at its baseline does not require reopening its closed actuator.
+Restoration that cannot establish a safe original open combination remains
+pending. Manual supersession durably retires both paired snapshots before any
+remaining restoration writes.
+A manual change to the head or another zone leaves unrelated switch recovery
+available, including during intent persistence and delayed readback. A manual
+change to that exact zone still prevents its restoration.
+
+Plan diagnostics `climate.economics.zone_control` and ownership
+`hvac_control.zone_intent` expose active/paused/completed zones, mapped source
+temperature and freshness, target, hysteresis, pause time, restart blocker and
+topology limitations. Pending command/restoration evidence remains in the
+existing ownership and climate audit. A room paused within the hysteresis margin
+is still reported as paused; completion is not proof of a measured energy saving.
+
+The current economic model is qualified for a fixed zone set. Independent subset
+control therefore uses the existing eligible fallback lifecycle and refuses new
+economic candidates or hands an owned economic cycle back. It does not inherit
+old savings predictions or bypass the existing ever-active degradation guard.
+Observe still permits fallback lifecycle releases. A release hold or away-off
+ownership cannot authorize a new fallback after economic control has activated;
+only an existing tariff preparation/coast lifecycle may continue. Explicit Legacy
+policy retains its configured fallback behavior.
+Thermal observations reset their source regime when physical zone power changes;
+starts, stops and uncertain commands cannot train across that transition.
+Finishing-temperature estimates require newly qualified observations for the
+actual open-zone regime. Configured fallback timing remains explicitly uncertain.
+
+Repository tests cannot establish real damper movement, sufficient airflow,
+upstream mode/target coupling or compressor behavior. Live acceptance requires
+installer airflow evidence plus observed heating and cooling trials, independent
+zone closures, bounded reopening, all-complete shutdown and exact restoration.
+This feature does not change live settings during development.
+
 ## Completing a tariff cycle and restoration
 
 Reaching the preconditioning target enters coast immediately. Before the original
