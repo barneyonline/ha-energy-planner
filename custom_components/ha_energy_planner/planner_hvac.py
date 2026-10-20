@@ -35,6 +35,7 @@ from .thermal_model import (
     thermal_hvac_load_kw,
     thermal_model_summary,
 )
+from .zone_control import desired_fields
 from .zone_temperature import bounds, comfort_breached, control_temperature, feedback_missing, temperatures
 from .zone_temperature import target_reached as rooms_reached
 
@@ -804,6 +805,8 @@ class HVACPlanningPolicy:
                 "active_heat_rate_c_per_hour": thermal_summary["active_heat_rate_c_per_hour"],
                 "active_cool_rate_c_per_hour": thermal_summary["active_cool_rate_c_per_hour"],
                 "passive_indoor_drift_c_per_hour": thermal_summary["passive_indoor_drift_c_per_hour"],
+                **desired_fields(context, mode, precondition_target if precondition_target is not None else target,
+                                 phase),
             },
             hard_constraints=[
                 (

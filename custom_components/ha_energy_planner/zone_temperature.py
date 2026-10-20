@@ -54,6 +54,11 @@ def control_temperature(context: DecisionContext, mode: str | None = None) -> fl
 
 def target_reached(context: DecisionContext, mode: str, target: float) -> bool:
     """All mapped rooms must reach their applicable target before early coast."""
+    if context.climate_inputs.get("zone_topology", {}).get("supported"):
+        from .zone_control import evaluate
+        intent = evaluate(context, mode, target)
+        if intent.get("supported"):
+            return bool(intent["all_complete"])
     rooms = temperatures(context)
     if not rooms:
         value = context.current_hvac_temperature_c
@@ -71,6 +76,15 @@ def target_reached(context: DecisionContext, mode: str, target: float) -> bool:
 def comfort_breached(context: DecisionContext, mode: str, *, coasting: bool) -> bool:
     """Protect each room, including the opposite boundary during preparation."""
     rooms = temperatures(context)
+    if not coasting and context.climate_inputs.get("zone_topology", {}).get("supported"):
+        from .zone_control import evaluate
+        target = context.hvac_control.get("precondition_target")
+        target = finite(target) or (context.occupied_temperature_high_c if mode == "heat"
+                                    else context.occupied_temperature_low_c)
+        if target is not None and evaluate(context, mode, target).get("supported"):
+            # Completed rooms will be physically isolated by the same intent.
+            # If airflow/mapping proof fails, retain the established handoff.
+            return False
     if not rooms:
         value = context.current_hvac_temperature_c
         low, high = context.occupied_temperature_low_c, context.occupied_temperature_high_c
