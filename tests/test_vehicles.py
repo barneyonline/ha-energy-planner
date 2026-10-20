@@ -1147,3 +1147,31 @@ def test_vehicle_form_optional_power_and_advanced_calibration(monkeypatch: Any) 
         assert invalid["errors"]["base"] == "invalid_vehicle_settings"
 
     asyncio.run(run())
+
+
+
+def test_delayed_unplug_reconciliation_preserves_new_session_refusal(monkeypatch):
+    from custom_components.ha_energy_planner import coordinator as coordinator_module
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+
+    async def run():
+        hass, data = setup()
+        coordinator = make_coordinator(hass, data)
+        coordinator._update_vehicle_session()
+        await coordinator._async_reconcile_vehicle_ownership()
+        first = datetime.now(UTC)
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: first)
+        hass.states.values.update({"binary_sensor.plug": "off", "sensor.a_port": "DISCONNECTED"})
+        coordinator._update_vehicle_session()
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: first+timedelta(seconds=1))
+        hass.states.values.update({"binary_sensor.plug": "on", "sensor.a_port": "CONNECTED"})
+        coordinator._update_vehicle_session()
+        coordinator.executor.entry_data = coordinator.entry_data
+        coordinator.store.data["ev_telemetry"] = {"vehicle_suspended": True, "vehicle_refusal": {
+            "identity": suspension_identity(coordinator.entry_data),
+            "at": (first+timedelta(seconds=2)).isoformat(), "feedback": "SUSPENDED_EV"}}
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: first+timedelta(seconds=3))
+        await coordinator._async_reconcile_vehicle_ownership()
+        assert coordinator.store.data["ev_telemetry"]["vehicle_suspended"]
+
+    asyncio.run(run())

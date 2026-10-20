@@ -781,3 +781,54 @@ def test_continuous_pre_window_partial_slot_keeps_enough_future_capacity(force_c
     assert not schedule.infeasible
     assert schedule.scheduled_soc_percent == 45
     assert len(schedule.allocations) == 2
+
+
+@pytest.mark.parametrize("status,refused,inactive", [
+    ("SUSPENDED_EV", True, False), ("SuspendedEV", True, False),
+    ("SUSPENDED_EVSE", False, False), ("SuspendedEVSE", False, False),
+    ("faulted", False, False), ("unknown", False, None), ("unavailable", False, False),
+])
+def test_vehicle_refusal_normalization(status, refused, inactive):
+    from custom_components.ha_energy_planner.ev import ev_charging_state, ev_vehicle_suspended
+    assert ev_vehicle_suspended(status) is refused
+    assert ev_charging_state(status) is inactive
+
+
+def test_refusal_persists_after_compensation_without_learning_target_completion():
+    import json
+    record = update_ev_telemetry({}, sample(charging=False, vehicle_suspended=True, soc=79, target_soc=80))
+    assert record["vehicle_suspended"]
+    record = json.loads(json.dumps(record))
+    record = update_ev_telemetry(record, sample(NOW + timedelta(minutes=5), charging=False,
+                                               soc=79, target_soc=80, power_kw=0))
+    assert record["vehicle_suspended"]
+    assert record["last_sample"]["soc"] == 79
+    assert not record.get("performance", {}).get("aggregate")
+    assert record["vehicle_refusal"]["target_soc"] == 80
+
+
+@pytest.mark.parametrize("change", ["disconnect", "charging", "target", "topology"])
+def test_refusal_reset_requires_session_vehicle_or_intent_evidence(change):
+    record = update_ev_telemetry({}, sample(charging=False, vehicle_suspended=True, target_soc=80))
+    updates = {"disconnect": {"connected": False}, "charging": {"charging": True},
+               "target": {"target_soc": 90}, "topology": {"identity": ["new", None, None, None, None, 6, 1, 6, 250, 1]}}
+    next_sample = sample(NOW + timedelta(minutes=5), **{"charging": False, "target_soc": 80, **updates[change]})
+    assert not update_ev_telemetry(record, next_sample)["vehicle_suspended"]
+
+
+def test_current_refusal_wins_over_target_change_and_disconnected_race():
+    record = update_ev_telemetry({}, sample(charging=False, vehicle_suspended=True, target_soc=80))
+    record = update_ev_telemetry(record, sample(NOW + timedelta(minutes=5), charging=False,
+                                               connected=False, vehicle_suspended=True, target_soc=90))
+    assert record["vehicle_suspended"]
+    record = update_ev_telemetry(record, sample(NOW + timedelta(minutes=10), charging=False,
+                                               connected=True, target_soc=90))
+    assert not record["vehicle_suspended"]
+
+
+def test_first_confirmation_refusal_does_not_require_performance_identity_or_target():
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_refusal": {"identity": ["vehicle"], "target_soc": None}}
+    evidence = vehicle_suspension_evidence(record, sample(charging=False, target_soc=80,
+                                                         suspension_identity=["vehicle"]))
+    assert evidence["vehicle_suspended"]

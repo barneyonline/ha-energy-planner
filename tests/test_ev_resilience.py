@@ -254,3 +254,15 @@ def test_scheduled_start_uses_conservative_capacity_during_extended_fallback():
     assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True)[0] is False
     ctx.ev_evidence["load_fallback"]["recovery_degraded_ready"] = True
     assert fallback_charging_decision(ctx, OPTIONS, None, scheduled=True)[0] is True
+
+
+def test_vehicle_refusal_status_keeps_unmet_soc_separate():
+    from types import SimpleNamespace
+    context = SimpleNamespace(ev_evidence={"vehicle_suspended": True}, ev_charging=False,
+                              current_ev_soc_percent=79, ev_target_soc_percent=80)
+    status = charging_status(context, [], NOW)
+    assert "Vehicle declined" in status["summary"]
+    assert status["soc_target_met"] is False
+    assert status["charging_observed"] is False
+    context.current_ev_soc_percent = None
+    assert charging_status(context, [], NOW)["soc_target_met"] is None

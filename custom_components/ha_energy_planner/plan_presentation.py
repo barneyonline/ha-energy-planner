@@ -593,6 +593,7 @@ def plain_reason(value: Any) -> str:
             "There is not enough forecast battery or solar value to justify Enphase profile ownership."
         ),
         "enphase_arbitrage_below_threshold": "The expected Enphase value is below the configured savings threshold.",
+        "ev_vehicle_suspended": "The vehicle declined or paused charging; its SOC target remains separate.",
         "ev_soc_below_target": "The EV battery is below the target state of charge.",
         "least_cost_slots_before_ready_by": "Charging was placed in the cheapest slots before the ready-by time.",
         "least_cost_solar_aware_slots_before_ready_by": (

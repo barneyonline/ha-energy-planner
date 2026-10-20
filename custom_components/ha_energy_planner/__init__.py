@@ -200,6 +200,10 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     async def handle_charge_now(call: ServiceCall) -> dict[str, Any]:
         coordinator = await _require_coordinator(call)
         result = await coordinator.async_charge_now(int(call.data[ATTR_DURATION_MINUTES]))
+        if getattr(result, "reason", None) == "ev_vehicle_suspended" and (
+            not result.command_sent or result.safe_state_confirmed is True
+        ):
+            return {"status": "waiting_for_vehicle", "reason": result.reason}
         if not result.applied:
             raise HomeAssistantError(
                 f"Charge now is blocked: {result.reason}. Capacity and charger safety checks remain active.",

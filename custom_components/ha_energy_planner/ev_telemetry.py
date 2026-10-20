@@ -7,6 +7,7 @@ from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
+from .ev import ev_charging_state_proves_active, ev_vehicle_suspended
 from .ev_policy import EV_INPUTS, finite, power_capability
 from .ev_runtime import settle_spending, timestamp
 
@@ -56,7 +57,21 @@ def sample_ev(hass: Any, entry_data: Mapping[str, Any], options: Mapping[str, An
         "at": context.created_at.isoformat(),
         "soc": context.current_ev_soc_percent,
         "connected": context.ev_connected,
+        "connected_reported_at": (stamp.isoformat() if (stamp := reported_at(
+            hass.states.get(entry_data["ev_connected_entity"]) if entry_data.get("ev_connected_entity") else None
+        )) else None),
         "charging": context.ev_charging,
+        "vehicle_suspended": ev_vehicle_suspended(getattr(
+            hass.states.get(entry_data.get("ev_charging_entity")), "state", None
+        )) if entry_data.get("ev_charging_entity") else False,
+        "target_soc": getattr(context, "ev_target_soc_percent", None),
+        "suspension_identity": suspension_identity(entry_data),
+        "charging_reported_at": (stamp.isoformat() if (stamp := reported_at(
+            hass.states.get(entry_data["ev_charging_entity"]) if entry_data.get("ev_charging_entity") else None
+        )) else None),
+        "charging_feedback": getattr(
+            hass.states.get(entry_data["ev_charging_entity"]) if entry_data.get("ev_charging_entity") else None,
+            "state", None),
         "power_kw": measured(states["ev_power_entity"], context.created_at, "power"),
         "energy_kwh": measured(states["ev_energy_entity"], context.created_at, "energy"),
         "power_mapped": bool(entry_data.get("ev_power_entity")),
@@ -101,6 +116,7 @@ def update_ev_telemetry(
     if not isinstance(prior, dict):
         prior = {}
     same_identity = old.get("identity") == sample["identity"]
+    record.update(vehicle_suspension_evidence(old, sample))
     try:
         elapsed = (datetime.fromisoformat(sample["at"]) - datetime.fromisoformat(prior["at"])).total_seconds() / 3600
     except (KeyError, TypeError, ValueError):
@@ -228,3 +244,73 @@ def update_ev_telemetry(
         else "observed"
     )
     return record
+
+
+def suspension_identity(entry_data: Mapping[str, Any]) -> list[Any]:
+    """Scope a refusal to vehicle/session and control topology, not power tuning."""
+    return [entry_data.get(key) for key in (
+        "ev_vehicle_id", "ev_connected_entity", "ev_charging_entity",
+        "ev_soc_entity", "ev_charger_entity", "ev_smart_charging_entity",
+    )]
+
+
+def vehicle_suspension_evidence(previous: Mapping[str, Any], sample: Mapping[str, Any]) -> dict[str, Any]:
+    """Retain vehicle refusal after our stop, without claiming target completion."""
+    identity = sample.get("suspension_identity", sample.get("identity"))
+    prior = previous.get("last_sample", {})
+    prior = prior if isinstance(prior, dict) else {}
+    refusal = previous.get("vehicle_refusal", {})
+    prior_identity = refusal.get("identity") if isinstance(refusal, dict) else None
+    if (isinstance(prior_identity, list) and isinstance(identity, list) and len(identity) == 6
+            and len(prior_identity) == 6):
+        # Vehicle resolution can temporarily withhold identity/SOC mapping.
+        # That is not a new car or a new plug session. Runtime generation is
+        # intentionally excluded: it changes with SOC and resets on reload.
+        identity = [old if new is None and index in {0, 3} else new
+                    for index, (old, new) in enumerate(zip(prior_identity, identity, strict=True))]
+        compatible = all(old == new or old is None and index in {0, 3}
+                         for index, (old, new) in enumerate(zip(prior_identity, identity, strict=True)))
+    else:
+        compatible = prior_identity == identity
+    refusal = dict(refusal) if isinstance(refusal, dict) and compatible else {}
+    if refusal:
+        refusal["identity"] = identity
+    before, after = finite(refusal.get("target_soc")), finite(sample.get("target_soc"))
+    observed_at = timestamp(sample.get("charging_reported_at")) or timestamp(sample.get("at"))
+    recorded_refusal_at = timestamp(refusal.get("at"))
+    refusal_at = recorded_refusal_at or observed_at
+    connection_at = timestamp(sample.get("connected_reported_at", sample.get("at")))
+    prior_connection_at = timestamp(prior.get("connected_reported_at", prior.get("at")))
+    disconnected_at = timestamp(refusal.get("disconnected_at"))
+    disconnect_confirmed = (sample.get("connected") is False and connection_at is not None
+                            and (refusal_at is None or connection_at >= refusal_at))
+    reconnected = sample.get("connected") is True and (
+        disconnected_at is not None and connection_at is not None and connection_at >= disconnected_at
+        or prior.get("connected") is False and prior_connection_at is not None
+        and (refusal_at is None or prior_connection_at >= refusal_at)
+    )
+    charging_confirmed = (ev_charging_state_proves_active(sample["charging_feedback"])
+                          if "charging_feedback" in sample else sample.get("charging") is True)
+    charging_at = timestamp(sample.get("charging_reported_at", sample.get("at")))
+    # Cached or out-of-order reports cannot prove delivery resumed after refusal.
+    charging_confirmed = charging_confirmed and (
+        recorded_refusal_at is None or charging_at is not None and charging_at >= recorded_refusal_at
+    )
+    if sample.get("vehicle_suspended"):
+        # Current refusal still wins, but retain unplug proof through stale or
+        # contradictory status polls so a verified new session can reconsider.
+        # A new session with current refusal owns a fresh boundary: its previous
+        # unplug evidence must never clear that new refusal on the next poll.
+        first_at = observed_at.isoformat() if observed_at else sample.get("at")
+        event_at = sample.get("at", first_at) if reconnected else refusal.get("at", first_at)
+        refusal = {"identity": identity, "at": event_at,
+                   "target_soc": sample.get("target_soc"), "feedback": sample.get("charging_feedback"),
+                   "source": "charging_feedback"}
+        if disconnect_confirmed:
+            refusal["disconnected_at"] = connection_at.isoformat() if connection_at else None
+        elif disconnected_at is not None and not reconnected:
+            refusal["disconnected_at"] = disconnected_at.isoformat()
+    elif (charging_confirmed or disconnect_confirmed or reconnected
+            or before is not None and after is not None and before != after):
+        refusal = {}
+    return {"vehicle_suspended": bool(refusal), "vehicle_refusal": refusal}

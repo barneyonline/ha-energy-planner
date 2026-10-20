@@ -1146,3 +1146,16 @@ def test_control_fingerprint_normalizes_legacy_switch_and_ignores_retired_endpoi
     # Legacy primary names remain compatible; retired command mappings have no authority.
     assert production_evidence_fingerprint(legacy, {}) == production_evidence_fingerprint(
         {**canonical, "ev_smart_charging_entity": "switch.charger"}, {})
+
+
+def test_charge_now_vehicle_refusal_returns_expected_waiting_status():
+    from unittest.mock import AsyncMock
+
+    from custom_components.ha_energy_planner.ev_adapter import EVCommandResult
+    coordinator = _coordinator()
+    coordinator.async_charge_now = AsyncMock(return_value=EVCommandResult(False, "ev_vehicle_suspended", {}, {}))
+    hass = FakeHass(coordinator)
+    asyncio.run(async_setup(hass, {}))
+    handler = hass.services.handlers[(DOMAIN, "charge_now")]
+    assert asyncio.run(handler(FakeCall({ATTR_DURATION_MINUTES: 30}))) == {
+        "status": "waiting_for_vehicle", "reason": "ev_vehicle_suspended"}
