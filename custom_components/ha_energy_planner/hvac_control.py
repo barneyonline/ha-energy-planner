@@ -190,6 +190,9 @@ class HVACOwnershipTransaction:
             hvac_control = dict(ownership_data.get("hvac_control", {}))
             if desired.get("phase") == "preconditioning":
                 hvac_control["preconditioning_confirmed"] = True
+                if (not hvac_control.get("preconditioning_started_at")
+                        or self.previous.get("hvac_control", {}).get("lifecycle_id") != desired.get("lifecycle_id")):
+                    hvac_control["preconditioning_started_at"] = self.now
             saved_zones = dict(hvac_control.get("zone_states", {}))
             for entity_id, state in hvac_result.saved_zone_states.items():
                 saved_zones.setdefault(entity_id, state)
