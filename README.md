@@ -22,6 +22,8 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 
 Tariff plans retain the provider's UTC boundaries across refreshes, including partial current intervals. Climate calendar entries show planned preconditioning and coast phases; command deadlines appear in their details. Finishing temperatures remain unknown until the relevant heating or cooling rate is ready. HVAC timing and room-feedback edits preserve unrelated controls; changing actuators or global safety settings retains guarded restoration.
 
+Missed-preconditioning diagnostics reconcile a changed tariff tail with confirmed execution of the same preparation episode. Matching requires the same configuration, mode, target, peak and preparation deadline. Confirmed evidence retains its original execution time and window across overlapping replacements whose regenerated starts differ; a replacement plan alone does not prove success. Older history or coasting ownership without this correlation evidence retains strict lifecycle matching.
+
 EV daylight and continuous charging, PV calibration lead times and climate observation comparisons also use actual interval boundaries.
 Forecast confidence measures covered time, and confirmed climate activity keeps its identity when calendar labels change.
 Coverage thresholds retain exact elapsed durations when tariff timestamps differ by seconds.

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .climate_inputs import instant
+from .climate_inputs import finite, instant
 from .models import ActionAsset, DecisionContext, OccupancyState, PlanAction, PlannerMode, to_jsonable
 from .planner_confidence import _confidence_rejection_reason, _hvac_rollback_capability_unavailable
 from .safety import strict_bool
@@ -119,8 +119,19 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
     """Retain one pending window and the last unexecuted expired/withdrawn window."""
     history = dict(history)
     control = control if isinstance(control, dict) else {}
+    previous_windows = [history.get(key, {}) for key in ("pending", "last_missed")]
+    # Preserve confirmation across overlapping replacements, including after
+    # early coast changes the ownership deadline or a late audit predates the
+    # replacement's regenerated start. Neither a plan nor overlap proves success.
+    confirmed = [
+        evidence for key in ("pending", "last_missed")
+        if (evidence := _confirmed_record(history.get(key, {}), control)) is not None
+    ]
     missed = history.get("last_missed", {})
-    if missed and _confirmed_window(control, missed["window"]):
+    if missed and (
+        _confirmed_window(control, missed)
+        or any(_same_episode(missed, record) for record in confirmed)
+    ):
         history.pop("last_missed")
     now = instant(plan["created_at"])
     candidates = [
@@ -133,13 +144,22 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
     if pending:
         pending = {
             **pending,
-            "fulfilled": bool(pending.get("fulfilled") or _confirmed_window(control, pending["window"])),
+            "fulfilled": bool(
+                pending.get("fulfilled") or _confirmed_window(control, pending)
+                or any(_same_episode(pending, record) for record in confirmed)
+            ),
         }
         history["pending"] = pending
         changed = upcoming is None or window_key(upcoming["desired_state"]) != pending["window"]
         if upcoming is not None and not changed:
             pending = {**pending, "end": upcoming["desired_state"].get("precondition_end", pending["end"])}
+            if pending.get("preparation") is not None:
+                pending["preparation"] = _preparation(upcoming["desired_state"])
             history["pending"] = pending
+        for record in confirmed:
+            if _same_episode(pending, record):
+                pending = {**pending, "confirmation": _confirmation(record, record["attempted_at"])}
+                history["pending"] = pending
         end = instant(pending["end"])
         if changed or (now is not None and end is not None and now >= end):
             if not pending.get("fulfilled"):
@@ -166,8 +186,22 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
                 "planned_at": plan["created_at"],
                 "start": upcoming["execute_not_before"],
                 "end": end.isoformat(),
-                "fulfilled": _confirmed_window(control, window_key(desired)),
+                "preparation": _preparation(desired),
+                "fulfilled": False,
             }
+            for previous in previous_windows:
+                previous_start = instant(previous.get("episode_start", previous.get("start")))
+                current_start = instant(history["pending"].get("episode_start", upcoming["execute_not_before"]))
+                if (previous_start is not None and current_start is not None
+                        and _same_episode(history["pending"], previous)):
+                    history["pending"]["episode_start"] = min(current_start, previous_start).isoformat()
+            history["pending"]["fulfilled"] = _confirmed_window(control, history["pending"])
+            for record in confirmed:
+                if _same_episode(history["pending"], record):
+                    history["pending"]["fulfilled"] = True
+                    history["pending"]["confirmation"] = _confirmation(record, record["attempted_at"])
+                    if record.get("last_outcome"):
+                        history["pending"]["last_outcome"] = record["last_outcome"]
     return history
 
 
@@ -181,9 +215,17 @@ def record_outcome(history: dict[str, Any], outcome: dict[str, Any]) -> dict[str
     ):
         return history
     history = dict(history)
+    matched = [
+        record for key in ("pending", "last_missed")
+        if (record := history.get(key, {}))
+        and _same_preparation(record, _preparation(desired), outcome.get("attempted_at"))
+    ]
     for key in ("pending", "last_missed"):
         record = history.get(key, {})
-        if not record or window_key(desired) != record["window"]:
+        if not record or not (
+            window_key(desired) == record["window"]
+            or any(_same_episode(record, source) for source in matched)
+        ):
             continue
         if key == "last_missed" and _fulfilled(outcome):
             history.pop(key)
@@ -195,6 +237,11 @@ def record_outcome(history: dict[str, Any], outcome: dict[str, Any]) -> dict[str
                     field: outcome.get(field) for field in ("attempted_at", "plan_id", "action_id", "result", "reason")
                 },
             }
+            if _fulfilled(outcome):
+                for source in matched:
+                    if _same_episode(record, source):
+                        history[key]["confirmation"] = _confirmation(source, outcome["attempted_at"])
+                        break
     return history
 
 
@@ -261,10 +308,95 @@ def _fulfilled(outcome: dict[str, Any]) -> bool:
     )
 
 
-def _confirmed_window(control: dict[str, Any], window: list[Any]) -> bool:
+def _preparation(desired: dict[str, Any]) -> dict[str, Any] | None:
+    """Describe a legacy preparation without changing the control lifecycle ID."""
+    configuration = desired.get("configuration_identity")
+    mode = desired.get("hvac_mode", desired.get("mode"))
+    target = finite(desired.get("target_temperature", desired.get("precondition_target")))
+    peak = instant(desired.get("period_start"))
+    deadline = instant(desired.get("precondition_end"))
+    if (
+        not isinstance(configuration, str) or not configuration.startswith("legacy:")
+        or not desired.get("lifecycle_id") or mode not in {"heat", "cool"}
+        or target is None or peak is None or deadline is None or deadline > peak
+    ):
+        return None
+    return {
+        "configuration": configuration,
+        "mode": mode,
+        "target": target,
+        "peak": peak.isoformat(),
+        "deadline": deadline.isoformat(),
+    }
+
+
+def _same_preparation(record: dict[str, Any], preparation: Any, at: Any) -> bool:
+    """Bound cross-ID reporting correlation to execution inside the saved window."""
+    start = instant(record.get("episode_start", record.get("start")))
+    end, attempted = instant(record.get("end")), instant(at)
+    return bool(
+        preparation and preparation == record.get("preparation")
+        and start is not None and end is not None and attempted is not None
+        and start <= attempted < end
+    )
+
+
+def _same_episode(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """Transfer existing proof only between complete, overlapping preparations."""
+    left_start = instant(left.get("episode_start", left.get("start")))
+    right_start = instant(right.get("episode_start", right.get("start")))
+    left_end, right_end = instant(left.get("end")), instant(right.get("end"))
+    return bool(
+        left.get("preparation") and left["preparation"] == right.get("preparation")
+        and left_start is not None and left_end is not None
+        and right_start is not None and right_end is not None
+        and max(left_start, right_start) < min(left_end, right_end)
+    )
+
+
+def _confirmation(record: dict[str, Any], at: Any) -> dict[str, Any]:
+    """Keep the bounded source window when proof predates a regenerated start."""
+    return {
+        "preparation": record["preparation"],
+        "start": record.get("episode_start", record["start"]),
+        "end": record["end"],
+        "attempted_at": to_jsonable(at),
+    }
+
+
+def _confirmed_record(record: dict[str, Any], control: dict[str, Any]) -> dict[str, Any] | None:
+    """General strict-ID fulfillment alone is not bounded cross-ID evidence."""
+    proof = record.get("confirmation", {})
+    if _same_episode(record, proof) and _same_preparation(proof, proof.get("preparation"), proof.get("attempted_at")):
+        return {**record, **proof}
+    outcome = record.get("last_outcome", {})
+    if (record.get("fulfilled") and _fulfilled(outcome)
+            and _same_preparation(record, record.get("preparation"), outcome.get("attempted_at"))):
+        return {**record, "attempted_at": outcome["attempted_at"]}
+    if _confirmed_window(control, record):
+        at = _preparation_started_at(control)
+        if _same_preparation(record, record.get("preparation"), at):
+            return {**record, "attempted_at": at}
+    return None
+
+
+def _preparation_started_at(control: dict[str, Any]) -> Any:
+    """A later coast timestamp cannot establish when preparation began."""
+    if control.get("preconditioning_started_at") is not None:
+        return control["preconditioning_started_at"]
+    return (
+        control.get("phase_started_at", control.get("started_at"))
+        if control.get("phase") == "preconditioning" else None
+    )
+
+
+def _confirmed_window(control: dict[str, Any], record: dict[str, Any]) -> bool:
     """Use committed preconditioning ownership, never a later coasting-only acquisition."""
     return bool(
         control.get("main_state_committed")
         and (control.get("phase") == "preconditioning" or control.get("preconditioning_confirmed") is True)
-        and window_key(control) == window
+        and (
+            window_key(control) == record.get("window")
+            or _same_preparation(record, _preparation(control), _preparation_started_at(control))
+        )
     )

@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Clear a false missed-preconditioning diagnostic when a tariff tail update changes the lifecycle ID but the same preparation episode has confirmed execution. Failed or unconfirmed replacements remain unfulfilled.
 
 ### 🔧 Improvements
 

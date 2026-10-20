@@ -752,3 +752,447 @@ def test_tariff_identity_respects_explicit_intervals_when_forecast_gaps_fill():
     tariff.attributes["forecast"].insert(1, {"valid_at": (NOW + timedelta(minutes=30)).isoformat(), "price": 0.1})
     ctx.climate_inputs["tariff_intervals"] = tariff_source_intervals(tariff, 5)
     assert _legacy_lifecycle_id(ctx, OPTIONS, NOW, NOW + timedelta(minutes=30), "heat") == cycle
+
+
+def tariff_tail_plan(end_hour, *, at=NOW - timedelta(minutes=15)):
+    """Replay the audit's 03:00 preparation, 05:00 peak and changing tail."""
+    ctx = context()
+    ctx.created_at = at
+    ctx.plan_id = f"tail-{end_hour}-{at.isoformat()}"
+    ctx.current_hvac_mode = "cool"
+    ctx.current_hvac_temperature_c = 23.98
+    ctx.current_outdoor_temperature_c = 32
+    ctx.occupied_temperature_low_c = 21
+    ctx.occupied_temperature_high_c = 24
+    ctx.climate_inputs = {"identity": "fixed-controls-and-rooms"}
+    grid_start = at.replace(minute=at.minute // 5 * 5, second=0, microsecond=0)
+    instants = [at, *(grid_start + timedelta(minutes=5 * index) for index in range(1, 24 * 12))]
+    ctx.slots = [
+        DecisionSlot(
+            valid_at,
+            0.7 if 5 <= valid_at.hour < end_hour else 0.0247 if end_hour == 10 else 0.0055,
+            0.05, 0, 1, outdoor_temperature_forecast_c=32,
+        )
+        for valid_at in instants
+    ]
+    return DryRunPlanner({**OPTIONS, "hvac_precondition_lead_minutes": 120}).create_plan(ctx)
+
+
+def preparation_action(generated):
+    return next(a for a in generated.actions if a.desired_state.get("phase") == "preconditioning")
+
+
+@pytest.mark.parametrize("tail", [7, 21])
+@pytest.mark.parametrize("confirmation", ["applied", "already_confirmed", "ownership", "coast_ownership"])
+def test_tariff_tail_replacement_clears_miss_only_after_confirmation_and_reload(monkeypatch, tail, confirmation):
+    persisted = {}
+
+    class Disk:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_load(self):
+            return deepcopy(persisted)
+
+        async def async_save(self, data):
+            persisted.clear()
+            persisted.update(deepcopy(data))
+
+    monkeypatch.setattr(storage, "Store", Disk)
+
+    async def scenario():
+        original = tariff_tail_plan(10)
+        replacement = tariff_tail_plan(tail, at=NOW + timedelta(seconds=10))
+        before, after = preparation_action(original), preparation_action(replacement)
+        assert before.execute_not_before == NOW
+        assert after.execute_not_before == replacement.created_at
+        assert before.desired_state["precondition_end"] == NOW.replace(hour=5)
+        assert after.desired_state["precondition_end"] == NOW.replace(hour=5)
+        assert before.desired_state["lifecycle_id"] != after.desired_state["lifecycle_id"]
+        assert before.desired_state["configuration_identity"] == after.desired_state["configuration_identity"]
+        assert after.desired_state["target_temperature"] == 21
+        assert after.desired_state["period_end"] == NOW.replace(hour=tail)
+        assert before.desired_state["baseline_price"] != after.desired_state["baseline_price"]
+        first = storage.PlannerStore(object())
+        await first.async_save_plan(original)
+        saved_original = deepcopy(first.data["preconditioning_history"])
+        await first.async_save_plan(replacement)
+        missed = first.data["preconditioning_history"]["last_missed"]
+        assert missed["reason"] == "window_replaced"
+        assert not missed["fulfilled"]
+        assert not first.data["preconditioning_history"]["pending"]["fulfilled"]
+        if confirmation in {"ownership", "coast_ownership"}:
+            control = {
+                **after.desired_state,
+                "main_state_committed": True,
+                "preconditioning_confirmed": True,
+                "preconditioning_started_at": NOW + timedelta(seconds=10),
+                "started_at": NOW + timedelta(seconds=10),
+            }
+            # Persisted ownership carries lifecycle mode/target, not command fields.
+            control.pop("target_temperature")
+            control.pop("hvac_mode")
+            if confirmation == "coast_ownership":
+                control.update(phase="pre_peak_coast", precondition_end=NOW + timedelta(minutes=25))
+            await first.async_save_ownership({"hvac_control": control})
+        else:
+            await first.async_add_outcome(outcome(
+                OutcomeResult.APPLIED if confirmation == "applied" else OutcomeResult.SKIPPED,
+                reason="hvac_action_applied" if confirmation == "applied" else "already_in_desired_hvac_state",
+                desired_state=after.desired_state, attempted_at=NOW + timedelta(seconds=10),
+                plan_id=replacement.plan_id, action_id=after.action_id,
+            ))
+            assert first.data["preconditioning_history"]["pending"]["fulfilled"]
+            assert "last_missed" not in first.data["preconditioning_history"]
+            assert current_status(first.data, replacement)["last_attempt"]["action_id"] == after.action_id
+        # Ownership confirmation must work even if the separate outcome write was lost.
+        reloaded = storage.PlannerStore(object())
+        await reloaded.async_load()
+        later = plan([])
+        later.created_at = NOW + timedelta(hours=3)
+        await reloaded.async_save_plan(later)
+        await reloaded.async_save_plan(later)
+        assert reloaded.data["preconditioning_history"] == persisted["preconditioning_history"] == {}
+        assert current_status(reloaded.data, later)["last_missed_opportunity"] is None
+        assert saved_original["pending"]["fulfilled"] is False
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("result,reason", [
+    (OutcomeResult.REJECTED, "manual_hvac_override_detected"),
+    (OutcomeResult.FAILED, "hvac_confirmation_timeout"),
+    (OutcomeResult.SKIPPED, "cancelled"),
+])
+def test_tail_replacement_failure_and_cancellation_remain_missed(result, reason):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW)
+    history = record_plan({}, to_jsonable(original))
+    history = record_plan(history, to_jsonable(replacement))
+    failed = record_outcome(history, to_jsonable(outcome(
+        result, reason=reason, desired_state=preparation_action(replacement).desired_state,
+    )))
+    assert failed["last_missed"]["last_outcome"]["reason"] == reason
+    assert not failed["last_missed"]["fulfilled"]
+    assert not failed["pending"]["fulfilled"]
+    later = plan([])
+    later.created_at = NOW + timedelta(hours=3)
+    expired = record_plan(failed, to_jsonable(later))
+    assert expired["last_missed"]["reason"] == "window_expired"
+    assert expired["last_missed"]["last_outcome"]["reason"] == reason
+    assert not expired["last_missed"]["fulfilled"]
+
+
+@pytest.mark.parametrize("change", [
+    "configuration", "mode", "target", "peak", "deadline", "not_legacy", "no_lifecycle", "no_target",
+    "bad_peak", "bad_deadline", "deadline_after_peak", "old_record", "nonoverlapping", "before_start",
+    "missing_time", "bad_start", "bad_end",
+])
+def test_cross_lifecycle_confirmation_requires_complete_matching_preparation(change):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW)
+    history = record_plan({}, to_jsonable(original))
+    desired = to_jsonable(preparation_action(replacement).desired_state)
+    at = NOW
+    updates = {
+        "configuration": {"configuration_identity": "legacy:different-controls"},
+        "mode": {"mode": "heat", "hvac_mode": "heat"},
+        "target": {"target_temperature": 22},
+        "peak": {"period_start": (NOW + timedelta(hours=3)).isoformat()},
+        "deadline": {"precondition_end": (NOW + timedelta(hours=1)).isoformat()},
+        "not_legacy": {"configuration_identity": "economic:other"},
+        "no_lifecycle": {"lifecycle_id": None},
+        "no_target": {"target_temperature": None},
+        "bad_peak": {"period_start": "bad"},
+        "bad_deadline": {"precondition_end": "bad"},
+        "deadline_after_peak": {"precondition_end": (NOW + timedelta(hours=3)).isoformat()},
+    }
+    desired.update(updates.get(change, {}))
+    if change == "old_record":
+        history["pending"].pop("preparation")
+    elif change == "nonoverlapping":
+        at += timedelta(hours=2)
+    elif change == "before_start":
+        at -= timedelta(seconds=1)
+    elif change == "missing_time":
+        at = None
+    elif change in {"bad_start", "bad_end"}:
+        history["pending"][change.removeprefix("bad_")] = "bad"
+    entry = to_jsonable(outcome(OutcomeResult.APPLIED, desired_state=desired, attempted_at=at))
+    assert record_outcome(history, entry) == history
+    control = {**desired, "main_state_committed": True, "started_at": at}
+    withdrawn = record_plan(history, to_jsonable(plan([])), control)
+    assert not withdrawn["last_missed"]["fulfilled"]
+
+
+@pytest.mark.parametrize("phase,committed,confirmed", [
+    ("preconditioning", False, True), ("peak_coast", True, False), ("preconditioning", False, False),
+    ("peak_coast", True, True),
+])
+def test_cross_lifecycle_uncertain_ownership_never_proves_fulfillment(phase, committed, confirmed):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW)
+    history = record_plan({}, to_jsonable(original))
+    control = {
+        **to_jsonable(preparation_action(replacement).desired_state),
+        "main_state_committed": committed, "phase": phase,
+        "preconditioning_confirmed": confirmed, "started_at": NOW.isoformat(),
+    }
+    withdrawn = record_plan(history, to_jsonable(plan([])), control)
+    assert not withdrawn["last_missed"]["fulfilled"]
+
+
+def test_confirmed_replacement_ownership_matches_without_replacement_plan_or_outcome():
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW)
+    history = record_plan({}, to_jsonable(original))
+    control = {
+        **to_jsonable(preparation_action(replacement).desired_state),
+        "main_state_committed": True, "started_at": NOW.isoformat(),
+    }
+    assert record_plan(history, to_jsonable(plan([])), control) == {}
+    missed = record_plan(history, to_jsonable(plan([])))
+    assert record_plan(missed, to_jsonable(plan([])), control) == {}
+    assert record_plan({}, to_jsonable(original), control)["pending"]["fulfilled"]
+
+
+@pytest.mark.parametrize("confirmation", ["late_outcome", "prior_outcome", "ownership", "prior_ownership"])
+def test_original_confirmation_also_fulfills_later_matching_replacement(confirmation):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    applied = to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(original).desired_state,
+    ))
+    history = record_plan({}, to_jsonable(original))
+    if confirmation == "prior_outcome":
+        history = record_outcome(history, applied)
+    control = {
+        **to_jsonable(preparation_action(original).desired_state),
+        "main_state_committed": True, "started_at": NOW.isoformat(),
+    }
+    history = record_plan(
+        history, to_jsonable(replacement), control if confirmation == "prior_ownership" else None,
+    )
+    previous = deepcopy(history)
+    if confirmation == "late_outcome":
+        confirmed = record_outcome(history, applied)
+    elif confirmation == "ownership":
+        confirmed = record_plan(history, to_jsonable(replacement), control)
+    else:
+        confirmed = history
+    assert "last_missed" not in confirmed
+    assert confirmed["pending"]["fulfilled"]
+    if confirmation in {"late_outcome", "prior_outcome"}:
+        assert current_status({"preconditioning_history": confirmed}, replacement)["last_attempt"]["attempted_at"]
+    later = plan([])
+    later.created_at = NOW + timedelta(hours=3)
+    assert record_plan(confirmed, to_jsonable(later)) == {}
+    assert history == previous  # old storage generations remain immutable
+
+
+@pytest.mark.parametrize("change", ["configuration", "mode", "target", "peak", "nonoverlapping"])
+def test_confirmation_does_not_transfer_to_an_unrelated_replacement(change):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    selected = preparation_action(replacement)
+    if change == "configuration":
+        selected.desired_state["configuration_identity"] = "legacy:other-controls"
+    elif change == "mode":
+        selected.desired_state.update(mode="heat", hvac_mode="heat")
+    elif change == "target":
+        selected.desired_state["target_temperature"] = 22
+    elif change == "peak":
+        selected.desired_state["period_start"] += timedelta(hours=1)
+    else:
+        selected.execute_not_before = NOW.replace(hour=5)
+    history = record_outcome(record_plan({}, to_jsonable(original)), to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(original).desired_state,
+    )))
+    revised = record_plan(history, to_jsonable(replacement))
+    assert not revised["pending"]["fulfilled"]
+    assert "last_outcome" not in revised["pending"]
+    assert history["pending"]["fulfilled"]
+
+
+@pytest.mark.parametrize("attempted_at", [NOW - timedelta(seconds=1), NOW.replace(hour=5), None])
+@pytest.mark.parametrize("owned", [False, True])
+def test_outcome_outside_both_preparations_does_not_transfer_across_ids(attempted_at, owned):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    history = record_plan(record_plan({}, to_jsonable(original)), to_jsonable(replacement))
+    applied = to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(replacement).desired_state,
+        attempted_at=attempted_at,
+    ))
+    revised = record_outcome(history, applied)
+    # Preserve existing strict-ID semantics without spreading out-of-window evidence.
+    assert revised["pending"]["fulfilled"]
+    assert not revised["last_missed"]["fulfilled"]
+    control = {
+        **to_jsonable(preparation_action(replacement).desired_state), "main_state_committed": True,
+        "preconditioning_started_at": to_jsonable(attempted_at),
+        "phase_started_at": to_jsonable(attempted_at),
+    } if owned else {}
+    revised = record_plan(deepcopy(revised), to_jsonable(replacement), control)
+    assert not revised["last_missed"]["fulfilled"]
+    later = plan([])
+    later.created_at = NOW + timedelta(hours=3)
+    assert not record_plan(revised, to_jsonable(later), control)["last_missed"]["fulfilled"]
+
+
+@pytest.mark.parametrize("later_result", [OutcomeResult.FAILED, OutcomeResult.APPLIED])
+def test_bounded_confirmation_survives_later_out_of_window_attempt(later_result):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    desired = preparation_action(original).desired_state
+    history = record_outcome(record_plan({}, to_jsonable(original)), to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=desired,
+    )))
+    history = record_outcome(history, to_jsonable(outcome(
+        later_result, desired_state=desired, attempted_at=NOW.replace(hour=5),
+    )))
+    history = record_plan(deepcopy(history), to_jsonable(replacement))
+    assert history["pending"]["fulfilled"]
+    assert history["pending"]["confirmation"]["attempted_at"] == NOW.isoformat()
+    assert history["pending"]["last_outcome"]["attempted_at"] == NOW.replace(hour=5).isoformat()
+    later = plan([])
+    later.created_at = NOW + timedelta(hours=3)
+    assert record_plan(deepcopy(history), to_jsonable(later)) == {}
+
+
+def test_same_lifecycle_revision_revalidates_saved_confirmation_bounds():
+    original = tariff_tail_plan(10)
+    history = record_outcome(record_plan({}, to_jsonable(original)), to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(original).desired_state,
+    )))
+    previous = deepcopy(history)
+    revised = deepcopy(original)
+    deadline = NOW.replace(hour=5) - timedelta(minutes=20)
+    preparation_action(revised).desired_state["precondition_end"] = deadline
+    updated = record_plan(history, to_jsonable(revised))
+    # Refresh revalidates the actual attempt time against the revised bounds.
+    updated = record_plan(updated, to_jsonable(revised))
+    assert updated["pending"]["confirmation"]["end"] == deadline.isoformat()
+    replacement = tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    preparation_action(replacement).desired_state["precondition_end"] = deadline
+    assert record_plan(updated, to_jsonable(replacement))["pending"]["fulfilled"]
+    assert history == previous
+
+
+def test_late_outcome_with_revised_deadline_does_not_copy_mismatched_proof():
+    original = tariff_tail_plan(10)
+    preparation_action(original).desired_state["precondition_end"] -= timedelta(minutes=20)
+    replacement = tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    preparation_action(replacement).desired_state["precondition_end"] -= timedelta(minutes=20)
+    history = record_plan(record_plan({}, to_jsonable(original)), to_jsonable(replacement))
+    restored_tail = tariff_tail_plan(10, at=NOW + timedelta(seconds=15))
+    history = record_plan(history, to_jsonable(restored_tail))
+    history = record_outcome(history, to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(original).desired_state,
+        attempted_at=NOW + timedelta(seconds=20),
+    )))
+    assert history["pending"]["fulfilled"]
+    assert "last_missed" not in history
+    assert "confirmation" not in history["pending"]
+
+
+@pytest.mark.parametrize("minutes", [10, 30])
+def test_same_lifecycle_deadline_revision_updates_replacement_descriptor(minutes):
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    history = record_plan({}, to_jsonable(original))
+    original_descriptor = deepcopy(history["pending"]["preparation"])
+    revised = deepcopy(original)
+    deadline = NOW.replace(hour=5) - timedelta(minutes=minutes)
+    preparation_action(revised).desired_state["precondition_end"] = deadline
+    preparation_action(replacement).desired_state["precondition_end"] = deadline
+    history = record_plan(history, to_jsonable(revised))
+    assert history["pending"]["preparation"]["deadline"] == deadline.isoformat()
+    assert history["pending"]["preparation"] != original_descriptor
+    history = record_plan(history, to_jsonable(replacement))
+    confirmed = record_outcome(history, to_jsonable(outcome(
+        OutcomeResult.APPLIED, desired_state=preparation_action(replacement).desired_state,
+        attempted_at=replacement.created_at,
+    )))
+    assert "last_missed" not in confirmed
+    assert confirmed["pending"]["fulfilled"]
+    # Older persisted records must not be hydrated from a newer plan.
+    legacy = record_plan({}, to_jsonable(original))
+    legacy["pending"].pop("preparation")
+    assert "preparation" not in record_plan(legacy, to_jsonable(revised))["pending"]
+
+
+@pytest.mark.parametrize("coast", [False, True])
+def test_persisted_away_off_takeover_time_does_not_hide_preparation_confirmation(coast):
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    original, replacement = tariff_tail_plan(10), tariff_tail_plan(21, at=NOW + timedelta(seconds=10))
+    history = record_plan(record_plan({}, to_jsonable(original)), to_jsonable(replacement))
+    takeover = NOW - timedelta(hours=1)
+    previous = {"hvac_control": {
+        "phase": "away_off", "started_at": takeover,
+        "main_state": {"hvac_mode": "off", "target_temperature": 24},
+    }}
+    desired = preparation_action(replacement).desired_state
+    transaction = HVACOwnershipTransaction(previous, replacement.created_at)
+    provisional = transaction.prepare(desired, {}, {}, {})
+    completed = transaction.complete(
+        HVACCommandResult(True, "hvac_action_applied", {}, {}, {}), provisional, desired,
+        main_state_superseded=False, superseded_zone_entity_ids=set(),
+    )
+    control = completed["hvac_control"]
+    assert control["started_at"] == takeover
+    assert control["phase_started_at"] == replacement.created_at
+    assert control["preconditioning_started_at"] == replacement.created_at
+    if coast:
+        control.update(phase="peak_coast", phase_started_at=NOW.replace(hour=5), precondition_end=NOW.replace(hour=5))
+    later = plan([])
+    later.created_at = NOW + timedelta(hours=3)
+    # Round-trip the ownership data as it is persisted, without any outcome.
+    assert record_plan(history, to_jsonable(later), to_jsonable(control)) == {}
+    if not coast:
+        pending_original = record_plan({}, to_jsonable(original))
+        assert record_plan(pending_original, to_jsonable(later), to_jsonable(control)) == {}
+
+
+def test_confirmed_preparation_start_survives_continuation_and_resets_on_new_lifecycle():
+    from custom_components.ha_energy_planner.hvac_adapter import HVACCommandResult
+    from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
+
+    desired = preparation_action(tariff_tail_plan(10)).desired_state
+    ownership = {}
+    first = None
+    for minute in range(3):
+        now = NOW + timedelta(minutes=minute)
+        if minute == 2:
+            desired = {**desired, "lifecycle_id": "replacement"}
+        transaction = HVACOwnershipTransaction(deepcopy(ownership), now)
+        provisional = transaction.prepare(desired, {}, {}, {"hvac_mode": "off", "target_temperature": 24})
+        ownership = transaction.complete(
+            HVACCommandResult(True, "hvac_action_applied", {}, {}, {}), provisional, desired,
+            main_state_superseded=False, superseded_zone_entity_ids=set(),
+        )
+        assert ownership["hvac_control"]["preconditioning_started_at"] == (now if minute == 2 else NOW)
+        if minute == 0:
+            first = deepcopy(ownership)
+    assert first["hvac_control"]["preconditioning_started_at"] == NOW
+
+
+@pytest.mark.parametrize("confirmation", ["outcome", "ownership", "none", "before_episode"])
+def test_repeated_replacements_retain_the_original_preparation_window(confirmation):
+    original = tariff_tail_plan(10)
+    history = record_plan({}, to_jsonable(original))
+    for seconds, tail in ((10, 21), (20, 7), (30, 13)):
+        replacement = tariff_tail_plan(tail, at=NOW + timedelta(seconds=seconds))
+        history = record_plan(history, to_jsonable(replacement))
+        assert not history["pending"]["fulfilled"]
+        assert history["pending"]["start"] == replacement.created_at.isoformat()
+        assert history["pending"]["episode_start"] == NOW.isoformat()
+    previous = deepcopy(history)
+    at = NOW + timedelta(seconds=-1 if confirmation == "before_episode" else 1)
+    if confirmation in {"outcome", "before_episode"}:
+        history = record_outcome(history, to_jsonable(outcome(
+            OutcomeResult.APPLIED, desired_state=preparation_action(original).desired_state, attempted_at=at,
+        )))
+    elif confirmation == "ownership":
+        control = {
+            **to_jsonable(preparation_action(original).desired_state),
+            "main_state_committed": True, "preconditioning_started_at": at.isoformat(),
+        }
+        history = record_plan(history, to_jsonable(replacement), control)
+    expected = confirmation in {"outcome", "ownership"}
+    assert history["pending"]["fulfilled"] is expected
+    assert ("last_missed" not in history) is expected
+    assert not previous["pending"]["fulfilled"]
