@@ -83,6 +83,9 @@ def climate_identity(data: dict[str, Any], options: dict[str, Any]) -> str:
 def validate_climate_config(data: dict[str, Any]) -> dict[str, str]:
     """Validate structured optional mappings before they reach a model."""
     errors: dict[str, str] = {}
+    from .zone_control import CONFIG_KEY, topology
+    if data.get(CONFIG_KEY) and not topology(data)["supported"]:
+        errors[CONFIG_KEY] = "invalid_climate_configuration"
     if data.get(CONF_HVAC_POWER_SOURCE_TYPE, "auto") not in {"auto", "measured", "estimated"}:
         errors[CONF_HVAC_POWER_SOURCE_TYPE] = "invalid_climate_configuration"
     maximum = data.get(CONF_HVAC_MAX_HUMIDITY)
@@ -180,6 +183,7 @@ def read_climate_inputs(
     hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime, load_details: dict[str, Any]
 ) -> dict[str, Any]:
     """Read only mapped sensors; missing optional evidence stays explicitly absent."""
+    from .zone_control import read_topology
     sources: dict[str, Any] = {}
     freshness = timedelta(minutes=float(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)))
 
@@ -296,6 +300,7 @@ def read_climate_inputs(
         "irradiance": number(data.get(CONF_HVAC_IRRADIANCE), "irradiance"),
         "irradiance_forecast": forecast,
         "zones": zones,
+        "zone_topology": read_topology(hass, data),
         "sources": sources,
         "cop_table": {
             mode: [{"temperature": float(row["temperature"]), "cop": float(row["cop"])} for row in rows]

@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Add optional independent heating/cooling zone completion with explicit controller pairing and verified minimum-airflow combinations, fresh room feedback, persisted pause intent, 0.3°C hysteresis and a ten-minute restart dwell. Preserve original restoration baselines and stop the shared head before removing its last airflow path; unsupported systems retain the existing handoff.
 
 ### 🐛 Bug fixes
 
@@ -17,7 +17,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Expose per-zone preparation, input freshness, restart blockers and topology limitations. Keep independently changing zone sets out of unvalidated economic savings predictions and thermal observation windows. Defer incompatible zone restoration targets without repeatedly opening and closing their actuators. Preserve the economic degradation guard when away-off ownership could otherwise start a new fallback cycle.
 
 ### 🔄 Other changes
 

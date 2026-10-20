@@ -26,6 +26,12 @@ Tariff plans retain the provider's UTC boundaries across refreshes, including pa
 
 Missed-preconditioning diagnostics reconcile a changed tariff tail with confirmed execution of the same preparation episode. Matching requires the same configuration, mode, target, peak and preparation deadline. Confirmed evidence retains its original execution time and window across overlapping replacements whose regenerated starts differ; a replacement plan alone does not prove success. Older history or coasting ownership without this correlation evidence retains strict lifecycle matching.
 
+Independent room completion is available for explicitly paired switch zones with fresh room sensors, confirmed actuator states and installer-verified minimum-airflow combinations. A completed room pauses while remaining rooms prepare; reopening requires a 0.3°C temperature margin and ten minutes paused. The shared head stops with an airflow path retained when preparation completes. Unsupported installations keep the existing shared-unit handoff. See [zone topology and airflow requirements](docs/climate-decisions.md#independent-zone-completion) before enabling this optional control.
+
+Independent room control preserves the economic degradation guard: away-off ownership cannot start a new fallback cycle after economic control has activated. Existing tariff cycles can finish; explicit Legacy policy keeps its fallback behavior.
+
+Unfinished room targets retain their paired actuator baselines through deferred recovery and reloads. Recovery under a manually controlled head waits for compatible room bounds before reopening a zone.
+
 EV daylight and continuous charging, PV calibration lead times and climate observation comparisons also use actual interval boundaries.
 Forecast confidence measures covered time, and confirmed climate activity keeps its identity when calendar labels change.
 Coverage thresholds retain exact elapsed durations when tariff timestamps differ by seconds.

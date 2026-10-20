@@ -3976,6 +3976,10 @@ def _matches_pending_coupled_zone_hvac_feedback(
             _matching_hvac_target(new_attributes.get(attribute), new_attributes.get(attribute))
             for attribute in changed_attributes
         )
+    if expected_state == "off" and entity_pair_matches:
+        return changed_attributes <= {"temperature", "target_temp_low", "target_temp_high"} and all(
+            new_attributes.get(key) is None for key in changed_attributes
+        )
     return not changed_attributes and (context_matches or entity_pair_matches)
 
 
@@ -4000,6 +4004,10 @@ def _unambiguous_coupled_zone_entity_ids_match(
     climate_entity_id: Any,
 ) -> bool:
     """Return whether exactly one configured climate zone matches an actuator."""
+    from .zone_control import topology
+    explicit = topology(entry_data)
+    if explicit.get("supported"):
+        return bool(explicit["pairs"].get(str(actuator_entity_id)) == str(climate_entity_id))
     climate = str(climate_entity_id or "")
     matches = {
         entity_id
@@ -4066,7 +4074,8 @@ def _pending_zone_hvac_manual_change_entity_id(
         # request zone enabling; the generic listener is guard-suppressed while
         # the transaction is active and cannot safely classify it later.
         return entity_id
-    return None if str(new_state.state).lower() == "on" else entity_id
+    expected_power = pending.get("zone_power", {}).get(entity_id, "on")
+    return None if str(new_state.state).lower() == expected_power else entity_id
 
 
 def _matching_hvac_target(observed: Any, expected: Any) -> bool:

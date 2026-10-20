@@ -114,6 +114,7 @@ from .const import (
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_HVAC_THERMAL_LEARNING_ENABLED,
+    CONF_HVAC_ZONE_CONTROL,
     CONF_HVAC_ZONE_MAPPINGS,
     CONF_INSTANCE_NAME,
     CONF_LOAD_RECOVERY_MAX_AGE_MINUTES,
@@ -279,6 +280,7 @@ CLIMATE_DATA_SCHEMA = vol.Schema(
         vol.Optional(CONF_HVAC_IRRADIANCE_FORECAST): _entity_selector("sensor"),
         vol.Optional(CONF_HVAC_MAX_HUMIDITY): NumberSelector(NumberSelectorConfig(min=1, max=100, step=1)),
         vol.Optional(CONF_HVAC_ZONE_MAPPINGS): ObjectSelector(),
+        vol.Optional(CONF_HVAC_ZONE_CONTROL): ObjectSelector(),
         vol.Optional(CONF_HVAC_COP_TABLE): ObjectSelector(),
         vol.Required(CONF_DAIKIN_CLIMATE): _entity_selector("climate"),
         vol.Optional(CONF_HVAC_POWER_SOURCE_TYPE, default="auto"): SelectSelector(
