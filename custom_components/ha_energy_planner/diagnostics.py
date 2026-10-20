@@ -99,6 +99,7 @@ async def async_get_config_entry_diagnostics(
             "issues": plan.input_issues[:20],
         },
         "planning_status": planning_status(coordinator),
+        "ev_vehicle_refusal": _redact(dict(store_data.get("ev_telemetry", {}).get("vehicle_refusal", {}))),
         "export_limit": _redact(export_limit_status(coordinator)),
         "refresh_performance": _redact(_refresh_performance(coordinator)),
         "load_forecast": _redact(built_in_load_forecast_attrs(coordinator)),

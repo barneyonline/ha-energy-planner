@@ -11,7 +11,9 @@ def counted_attempt(row: Any) -> bool:
         and row.get("asset") in {"ev", "daikin", "enphase", "enphase_export_limit"}
         and ((row.get("result") == "pending" or str(row.get("reason", "")).startswith("export_limit_service_rejected"))
              if row.get("asset") == "enphase_export_limit"
-             else row.get("result") in {"applied", "failed", "restored"})
+             else (row.get("result") in {"applied", "failed", "restored"}
+                   or row.get("asset") == "ev" and row.get("reason") == "ev_vehicle_suspended"
+                   and row.get("command_sent") is True))
         and row.get("reason") not in {"already_in_desired_state", "already_in_desired_hvac_state"}
         # Older EV safety-stop retries recorded missing local targets as failed
         # commands even though the adapter never dispatched a service call.

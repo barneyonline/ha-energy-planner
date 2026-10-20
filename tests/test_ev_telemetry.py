@@ -88,3 +88,103 @@ def test_cached_energy_re_report_cannot_refund_commanded_spending():
     updated = update_ev_telemetry(record, cached, reserved_kw=6)
     assert updated["emergency_spend"] == pytest.approx(0.25)
     assert "spending_source" not in updated
+
+
+def test_late_disconnect_does_not_erase_confirmation_refusal():
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_refusal": {"identity": ["vehicle"], "at": NOW.isoformat(), "target_soc": 80}}
+    sample = {"suspension_identity": ["vehicle"], "at": (NOW + timedelta(seconds=10)).isoformat(),
+              "connected": False, "charging": False, "connected_reported_at": (NOW-timedelta(seconds=1)).isoformat()}
+    assert vehicle_suspension_evidence(record, sample)["vehicle_suspended"]
+    sample["connected_reported_at"] = (NOW + timedelta(seconds=5)).isoformat()
+    assert not vehicle_suspension_evidence(record, sample)["vehicle_suspended"]
+
+
+def test_refusal_scope_does_not_depend_on_power_tuning():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    data = {"ev_vehicle_id": "vehicle", "ev_charger_entity": "switch.charger", "ev_session_generation": 1}
+    scope = suspension_identity(data)
+    assert scope == suspension_identity({**data, "ev_power_limit_entity": "number.limit", "ev_charge_rate_kw": 5})
+    assert scope == suspension_identity({**data, "ev_session_generation": 2})
+    assert scope != suspension_identity({**data, "ev_charger_entity": "switch.other"})
+
+
+def test_vehicle_resolution_gap_and_runtime_generation_do_not_reset_refusal():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity, vehicle_suspension_evidence
+    data = {"ev_vehicle_id": "car", "ev_soc_entity": "sensor.car_soc", "ev_charger_entity": "switch.charger"}
+    record = {"vehicle_refusal": {"identity": suspension_identity(data), "target_soc": 80}}
+    missing = {"suspension_identity": suspension_identity({"ev_charger_entity": "switch.charger"})}
+    evidence = vehicle_suspension_evidence(record, missing)
+    assert evidence["vehicle_suspended"]
+    sample = {"suspension_identity": suspension_identity({**data, "ev_session_generation": 99}),
+              "soc": 79.5, "target_soc": 80}
+    assert vehicle_suspension_evidence(evidence, sample)["vehicle_suspended"]
+    sample["suspension_identity"] = suspension_identity({**data, "ev_vehicle_id": "other"})
+    assert not vehicle_suspension_evidence(evidence, sample)["vehicle_suspended"]
+
+
+def test_first_refusal_can_bind_later_vehicle_identity_without_discarding_wait():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity, vehicle_suspension_evidence
+    record = {"vehicle_refusal": {"identity": suspension_identity({"ev_charger_entity": "switch.charger"})}}
+    sample = {"suspension_identity": suspension_identity({"ev_vehicle_id": "car", "ev_soc_entity": "sensor.soc",
+                                                         "ev_charger_entity": "switch.charger"})}
+    evidence = vehicle_suspension_evidence(record, sample)
+    assert evidence["vehicle_suspended"]
+    assert evidence["vehicle_refusal"]["identity"][0] == "car"
+
+
+
+def test_verified_unplug_replug_resets_wait_after_repeated_refusal_feedback():
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_suspended": True,
+              "vehicle_refusal": {"identity": ["vehicle"], "at": NOW.isoformat(), "target_soc": 80}}
+    disconnected = {"suspension_identity": ["vehicle"], "at": (NOW+timedelta(minutes=5)).isoformat(),
+                    "connected": False, "charging": False, "vehicle_suspended": True,
+                    "target_soc": 80, "charging_feedback": "SUSPENDED_EV",
+                    "connected_reported_at": (NOW+timedelta(minutes=4)).isoformat()}
+    record.update(vehicle_suspension_evidence(record, disconnected))
+    assert record["vehicle_suspended"]
+    # A refresh of the same contradictory feedback must retain unplug proof.
+    disconnected["at"] = (NOW+timedelta(minutes=6)).isoformat()
+    record.update(vehicle_suspension_evidence(record, disconnected))
+    record["last_sample"] = disconnected
+    replugged = {**disconnected, "at": (NOW+timedelta(minutes=7)).isoformat(),
+                 "connected": True, "vehicle_suspended": False, "charging_feedback": "SUSPENDED_EVSE",
+                 "connected_reported_at": (NOW+timedelta(minutes=7)).isoformat()}
+    assert not vehicle_suspension_evidence(record, replugged)["vehicle_suspended"]
+
+
+def test_finishing_feedback_does_not_count_as_positive_vehicle_charging():
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_suspended": True, "vehicle_refusal": {"identity": ["vehicle"], "target_soc": 80}}
+    sample = {"suspension_identity": ["vehicle"], "charging": True, "charging_feedback": "Finishing",
+              "connected": True, "target_soc": 80}
+    assert vehicle_suspension_evidence(record, sample)["vehicle_suspended"]
+
+
+
+def test_new_session_current_refusal_is_not_cleared_by_its_old_unplug_report():
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_refusal": {"identity": ["vehicle"], "at": NOW.isoformat(),
+                                 "disconnected_at": (NOW+timedelta(minutes=1)).isoformat()}}
+    sample = {"suspension_identity": ["vehicle"], "connected": True, "charging": False,
+              "vehicle_suspended": True, "charging_feedback": "SUSPENDED_EV", "charging_reported_at": NOW.isoformat(),
+              "at": (NOW+timedelta(minutes=3)).isoformat(),
+              "connected_reported_at": (NOW+timedelta(minutes=2)).isoformat()}
+    evidence = vehicle_suspension_evidence(record, sample)
+    assert evidence["vehicle_suspended"]
+    late_unplug = {**sample, "connected": False, "vehicle_suspended": False, "charging_feedback": "SUSPENDED_EVSE",
+                   "connected_reported_at": (NOW+timedelta(minutes=1)).isoformat()}
+    assert vehicle_suspension_evidence(evidence, late_unplug)["vehicle_suspended"]
+
+
+@pytest.mark.parametrize("offset,cleared", [(-1, False), (None, False), (1, True)])
+def test_only_charging_reports_after_refusal_can_reset_wait(offset, cleared):
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    record = {"vehicle_suspended": True, "vehicle_refusal": {
+        "identity": ["vehicle"], "at": NOW.isoformat(), "target_soc": 80}}
+    sample = {"suspension_identity": ["vehicle"], "connected": True,
+              "at": (NOW+timedelta(seconds=10)).isoformat(), "target_soc": 80,
+              "charging": True, "charging_feedback": "Charging",
+              "charging_reported_at": (NOW+timedelta(seconds=offset)).isoformat() if offset is not None else None}
+    assert vehicle_suspension_evidence(record, sample)["vehicle_suspended"] is not cleared

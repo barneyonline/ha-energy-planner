@@ -280,6 +280,9 @@ class FakeStore:
     async def async_save_restore_notification_failures(self, failures: dict[str, Any]) -> None:
         self.data["restore_notification_failures"] = failures
 
+    async def async_save_ev_telemetry(self, telemetry: dict[str, Any]) -> None:
+        self.data["ev_telemetry"] = telemetry
+
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         self.data["ownership"] = ownership
 
@@ -8268,3 +8271,343 @@ def test_review_confirmation_copy_supports_aliases_and_legacy_control():
     assert control["command_confirmation"]["context_id"] == "pending"
     copy_pending_confirmation(control, None)
     assert "command_confirmation" not in control
+
+
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("safe", [False, True])
+def test_vehicle_refusal_execution_retains_uncertainty_and_counts_real_attempts(monkeypatch, manual, safe):
+    from custom_components.ha_energy_planner.action_limits import counted_attempt
+    from custom_components.ha_energy_planner.ev_adapter import EVCommandResult
+    from custom_components.ha_energy_planner.models import to_jsonable
+
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_charging = False
+    context.current_ev_soc_percent = 79
+    context.ev_target_soc_percent = 80
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "SUSPENDED_EVSE"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [
+        SimpleNamespace(entry_id="ev", runtime_data=object())])
+    store = FakeStore()
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+               CONF_EV_CONTROL_ENABLED: True, CONF_EV_CHARGE_RATE_KW: 6, CONF_GRID_IMPORT_LIMIT_KW: 20}
+    executor = Executor(store, hass=hass, options=options, entry_id="ev",
+                        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"})
+    _arm_store(store, executor)
+    store.data["ev_telemetry"] = {"version": 1, "command_exposure": {
+        "at": (now-timedelta(minutes=1)).isoformat(), "cost_per_hour": 1}}
+    deadlines = []
+    executor.ev_allocation_deadline_callback = deadlines.append
+    result = EVCommandResult(False, "ev_vehicle_suspended", {CONF_EV_CHARGER: "off"},
+                             {CONF_EV_CHARGER: "off" if safe else "on"}, command_sent=True,
+                             rollback_succeeded=safe, safe_state_confirmed=safe)
+    class RefusingAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def async_execute(self, action):
+            return result
+        async def async_set_charging(self, enabled):
+            return result
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", RefusingAdapter)
+    action = PlanAction("ev", "plan", now-timedelta(seconds=1), now+timedelta(minutes=5),
+                        ActionAsset.EV, ActionKind.EV_START, {"charging_required_now": True}, [], [], None, 1)
+    plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                      "test", 1, None, [action], [])
+    if manual:
+        asyncio.run(executor.async_manual_ev_charging(True, context))
+    else:
+        asyncio.run(executor.async_evaluate(plan, context))
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+    assert bool(store.data.get("control_pause")) is not safe
+    assert bool(hass.data["ha_energy_planner"]["ev_grid_reservations"]) is not safe
+    assert bool(store.data["ownership"]) is not safe
+    assert bool(store.data["ev_telemetry"].get("command_exposure")) is not safe
+    assert store.data["ev_telemetry"].get("emergency_spend", 0) > 0
+    assert deadlines[-1] is None
+    outcome = store.data["outcomes"][-1]
+    assert outcome.result == (OutcomeResult.SKIPPED if safe else OutcomeResult.FAILED)
+    assert counted_attempt(to_jsonable(outcome))
+    assert not any(call[0] == "persistent_notification" and call[1] == "create" for call in hass.services.calls)
+
+
+@pytest.mark.parametrize("permission", ["on", "off"])
+def test_fresh_refusal_stops_stale_plan_and_persists_across_evse_feedback(permission):
+    from custom_components.ha_energy_planner.action_limits import counted_attempt
+    from custom_components.ha_energy_planner.models import to_jsonable
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_charging = False
+    context.current_ev_soc_percent = 79
+    context.ev_target_soc_percent = 80
+    hass = FakeHass({"switch.ev": permission, "sensor.status": "SUSPENDED_EV"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={**DEFAULT_OPTIONS, "planner_enabled": True,
+                                 "dry_run": False, CONF_EV_CONTROL_ENABLED: True})
+    _arm_store(store, executor)
+    action = PlanAction("ev", "plan", now-timedelta(seconds=1), now+timedelta(minutes=5),
+                        ActionAsset.EV, ActionKind.EV_START,
+                        {"charging_required_now": True, "power_limit": {"value": 3}}, [], [], None, 1)
+    plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                      "test", 1, None, [action], [])
+    asyncio.run(executor.async_evaluate(plan, context))
+    assert hass.states.values["switch.ev"] == "off"
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+    assert not store.data.get("control_pause")
+    assert all(call[1] == "turn_off" for call in hass.services.calls if call[0] == "switch")
+    assert not any(call[0] == "persistent_notification" and call[1] == "create" for call in hass.services.calls)
+    first_count = sum(call[0] == "switch" for call in hass.services.calls)
+    hass.states.values["sensor.status"] = "SUSPENDED_EVSE"
+    asyncio.run(executor.async_evaluate(plan, context))
+    assert sum(call[0] == "switch" for call in hass.services.calls) == first_count
+    assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
+    assert not counted_attempt(to_jsonable(store.data["outcomes"][-1]))
+
+
+def test_explicit_manual_start_resets_latch_once_but_live_refusal_still_blocks():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "SUSPENDED_EV"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={CONF_EV_CHARGE_RATE_KW: 6, CONF_GRID_IMPORT_LIMIT_KW: 20,
+                                 CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0})
+    store.data["ev_telemetry"] = {"vehicle_suspended": True,
+        "vehicle_refusal": {"identity": suspension_identity(executor.entry_data)}}
+    result = asyncio.run(executor.async_manual_ev_charging(True, context))
+    assert result.reason == "ev_vehicle_suspended" and not result.command_sent
+    assert not hass.services.calls
+    assert not store.data.get("control_pause")
+    hass.states.values["sensor.status"] = "off"
+    original = hass.services.async_call
+    async def confirm(domain, service, data, **kwargs):
+        await original(domain, service, data, **kwargs)
+        if service == "turn_on":
+            hass.states.values["sensor.status"] = FakeState(
+                "charging", {"sampled_at_utc": datetime.now(UTC).isoformat()})
+    hass.services.async_call = confirm
+    assert asyncio.run(executor.async_manual_ev_charging(True, context)).applied
+    assert not store.data["ev_telemetry"]["vehicle_suspended"]
+
+
+
+def test_executor_refusal_guard_without_context_uses_persisted_scope():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    hass = FakeHass({"sensor.status": "SUSPENDED_EVSE"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGING: "sensor.status"})
+    store.data["ev_telemetry"] = {"vehicle_suspended": True,
+        "vehicle_refusal": {"identity": suspension_identity(executor.entry_data)}}
+    assert asyncio.run(executor._async_ev_vehicle_suspension(None))
+    assert not asyncio.run(Executor(FakeStore())._async_ev_vehicle_suspension(None))
+
+
+
+@pytest.mark.parametrize("failure", ["capacity", "lease", "confirmation"])
+def test_rejected_or_unconfirmed_manual_attempt_preserves_refusal(failure):
+    from copy import deepcopy
+
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_charging = False
+    context.current_ev_soc_percent = 79
+    context.ev_target_soc_percent = 80
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "SUSPENDED_EVSE"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [
+        SimpleNamespace(entry_id="ev", runtime_data=object())])
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_id="ev",
+                        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={CONF_EV_CHARGE_RATE_KW: 6,
+                                 CONF_GRID_IMPORT_LIMIT_KW: 1 if failure == "capacity" else 20,
+                                 CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0, CONF_EV_CONFIRMATION_RETRIES: 0})
+    store.data["ev_telemetry"] = {"version": 1, "vehicle_suspended": True, "vehicle_refusal": {
+        "identity": suspension_identity(executor.entry_data), "at": (now-timedelta(hours=1)).isoformat(),
+        "target_soc": 80, "feedback": "SuspendedEV", "source": "charging_feedback"}}
+    prior = deepcopy(store.data["ev_telemetry"]["vehicle_refusal"])
+    until = (now+timedelta(minutes=30)) if failure == "lease" else None
+    result = asyncio.run(executor.async_manual_ev_charging(True, context, charge_now_until=until))
+    assert not result.applied
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+    assert store.data["ev_telemetry"]["vehicle_refusal"] == prior
+    if failure != "confirmation":
+        assert not any(call[0] == "switch" for call in hass.services.calls)
+
+
+def test_blocked_manual_attempt_does_not_fabricate_a_fresh_vehicle_refusal():
+    from copy import deepcopy
+
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    now = datetime.now(UTC)
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "faulted"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass,
+                        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={CONF_EV_CHARGE_RATE_KW: 6, CONF_GRID_IMPORT_LIMIT_KW: 20})
+    store.data["ev_telemetry"] = {"vehicle_suspended": True, "vehicle_refusal": {
+        "identity": suspension_identity(executor.entry_data), "at": (now-timedelta(hours=1)).isoformat(),
+        "target_soc": 80, "feedback": "SuspendedEV", "source": "charging_feedback"}}
+    prior = deepcopy(store.data["ev_telemetry"]["vehicle_refusal"])
+    result = asyncio.run(executor.async_manual_ev_charging(True, _context(now)))
+    assert not result.applied and not result.command_sent
+    assert store.data["ev_telemetry"]["vehicle_refusal"] == prior
+
+
+
+@pytest.mark.parametrize("manual", [False, True])
+def test_power_failure_refusal_metadata_is_persisted_without_hiding_the_failure(monkeypatch, manual):
+    from custom_components.ha_energy_planner.ev_adapter import EVCommandResult
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_target_soc_percent = 80
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "SUSPENDED_EVSE"})
+    hass.data = {}
+    hass.config_entries = SimpleNamespace(async_entries=lambda domain: [
+        SimpleNamespace(entry_id="ev", runtime_data=object())])
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_id="ev",
+                        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+                                 CONF_EV_CONTROL_ENABLED: True, CONF_EV_CHARGE_RATE_KW: 6,
+                                 CONF_GRID_IMPORT_LIMIT_KW: 20})
+    _arm_store(store, executor)
+    class FailedAdapter:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def async_set_charging(self, enabled):
+            return EVCommandResult(False, "ev_power_limit_unconfirmed", {CONF_EV_CHARGER: "off"},
+                {CONF_EV_CHARGER: "off", "vehicle_refusal_feedback": "SuspendedEV",
+                 "vehicle_refusal_at": now.isoformat()}, command_sent=True, safe_state_confirmed=True)
+        async def async_execute(self, action):
+            return await self.async_set_charging(True)
+    monkeypatch.setattr(executor_module, "EVChargerAdapter", FailedAdapter)
+    if manual:
+        asyncio.run(executor.async_manual_ev_charging(True, context))
+    else:
+        action = PlanAction("ev", "plan", now-timedelta(seconds=1), now+timedelta(minutes=5),
+                            ActionAsset.EV, ActionKind.EV_START, {}, [], [], None, 1)
+        plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                          "test", 1, None, [action], [])
+        asyncio.run(executor.async_evaluate(plan, context))
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+    assert store.data["ev_telemetry"]["vehicle_refusal"]["feedback"] == "SuspendedEV"
+    assert store.data["control_pause"]["reason"] == "ev_power_limit_unconfirmed"
+    assert store.data["outcomes"][-1].result == OutcomeResult.FAILED
+    assert store.data["ev_grid_reservation"]["active"]
+    assert store.data["ownership"]
+
+
+
+def test_no_command_refusal_preflight_retains_original_unplug_evidence():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity, vehicle_suspension_evidence
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_target_soc_percent = 80
+    hass = FakeHass({"sensor.status": "SUSPENDED_EV"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGING: "sensor.status"})
+    first_at = (now-timedelta(minutes=5)).isoformat()
+    disconnected_at = (now-timedelta(minutes=4)).isoformat()
+    store.data["ev_telemetry"] = {"vehicle_suspended": True, "vehicle_refusal": {
+        "identity": suspension_identity(executor.entry_data), "at": first_at,
+        "disconnected_at": disconnected_at, "target_soc": 80}}
+    asyncio.run(executor._async_remember_ev_refusal(context))
+    record = store.data["ev_telemetry"]
+    assert record["vehicle_refusal"]["at"] == first_at
+    assert record["vehicle_refusal"]["disconnected_at"] == disconnected_at
+    replugged = {"suspension_identity": suspension_identity(executor.entry_data), "connected": True,
+                 "connected_reported_at": now.isoformat(), "target_soc": 80}
+    assert not vehicle_suspension_evidence(record, replugged)["vehicle_suspended"]
+
+
+
+@pytest.mark.parametrize("kind", [ActionKind.EV_STOP, ActionKind.EV_START])
+def test_refusal_storage_failure_cannot_block_safe_stop(kind):
+    class FailingTelemetryStore(FakeStore):
+        async def async_save_ev_telemetry(self, record):
+            raise OSError("telemetry storage unavailable")
+    now = datetime.now(UTC)
+    hass = FakeHass({"switch.ev": "on", "sensor.status": "SUSPENDED_EV"})
+    store = FailingTelemetryStore()
+    store.data["ownership"] = {"ev_smart_charging_state": {CONF_EV_CHARGER: "off"}}
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+                                 CONF_EV_CONTROL_ENABLED: True, CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0})
+    _arm_store(store, executor)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_charging = False
+    action = PlanAction("ev", "plan", now-timedelta(seconds=1), now+timedelta(minutes=5),
+                        ActionAsset.EV, kind, {"charging_required_now": kind == ActionKind.EV_START}, [], [], None, 1)
+    plan = EnergyPlan("plan", now, 24, 5, "current", InputHealth.HEALTHY, PlannerMode.ACTIVE_HEALTHY,
+                      "test", 1, None, [action], [])
+    asyncio.run(executor.async_evaluate(plan, context))
+    assert hass.states.values["switch.ev"] == "off"
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+    assert not any(call[1] == "turn_on" for call in hass.services.calls)
+
+
+def test_verified_policy_unplug_clears_refusal_without_a_disconnected_telemetry_sample():
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    now = datetime.now(UTC)
+    hass = FakeHass({"switch.ev": "off", "sensor.status": "SUSPENDED_EVSE", "binary_sensor.plug": "off"})
+    store = FakeStore()
+    executor = Executor(store, hass=hass, entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status",
+                                                    CONF_EV_CONNECTED: "binary_sensor.plug"})
+    store.data["ev_telemetry"] = {"vehicle_suspended": True, "vehicle_refusal": {
+        "identity": suspension_identity(executor.entry_data), "at": (now-timedelta(minutes=5)).isoformat(),
+        "target_soc": 80}, "last_sample": {"connected": True}}
+    asyncio.run(executor.async_release_ev_policy(unplugged=True))
+    assert not store.data["ev_telemetry"]["vehicle_suspended"]
+    hass.states.values["binary_sensor.plug"] = "on"
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_charging = False
+    context.ev_target_soc_percent = 80
+    assert not asyncio.run(executor._async_ev_vehicle_suspension(context))
+
+
+
+def test_old_policy_release_preserves_refusal_received_during_its_write(monkeypatch):
+    now = datetime.now(UTC)
+    monkeypatch.setattr(executor_module.dt_util, "utcnow", lambda: now)
+    class RefusalDuringReleaseStore(FakeStore):
+        async def async_save_ownership(self, ownership):
+            self.data["ev_telemetry"] = {"vehicle_suspended": True, "vehicle_refusal": {
+                "at": (now+timedelta(seconds=1)).isoformat(), "feedback": "SUSPENDED_EV"}}
+            await super().async_save_ownership(ownership)
+    store = RefusalDuringReleaseStore()
+    executor = Executor(store, hass=FakeHass())
+    asyncio.run(executor.async_release_ev_policy(unplugged=True))
+    assert store.data["ev_telemetry"]["vehicle_suspended"]
+
+
+@pytest.mark.parametrize("offset,cleared", [(-1, False), (None, False), (1, True)])
+def test_manual_start_cannot_reset_newer_refusal_using_cached_charging(offset, cleared):
+    from custom_components.ha_energy_planner.ev_telemetry import suspension_identity
+    now = datetime.now(UTC)
+    context = _context(now)
+    context.ev_connected = True
+    context.ev_target_soc_percent = 80
+    refusal_at = now-timedelta(minutes=1)
+    source_at = (refusal_at+timedelta(seconds=offset)).isoformat() if offset is not None else None
+    hass = FakeHass({"switch.ev": "off", "sensor.status": FakeState(
+        "Charging", {"sampled_at_utc": source_at})})
+    store = FakeStore()
+    executor = Executor(store, hass=hass,
+                        entry_data={CONF_EV_CHARGER: "switch.ev", CONF_EV_CHARGING: "sensor.status"},
+                        options={CONF_EV_CHARGE_RATE_KW: 6, CONF_GRID_IMPORT_LIMIT_KW: 20,
+                                 CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0})
+    store.data["ev_telemetry"] = {"version": 1, "vehicle_suspended": True, "vehicle_refusal": {
+        "identity": suspension_identity(executor.entry_data), "at": refusal_at.isoformat(), "target_soc": 80}}
+    assert asyncio.run(executor.async_manual_ev_charging(True, context)).applied
+    assert store.data["ev_telemetry"]["vehicle_suspended"] is not cleared

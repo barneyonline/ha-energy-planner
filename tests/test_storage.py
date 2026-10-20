@@ -1406,3 +1406,26 @@ def test_export_restoration_history_survives_storage_reload_and_duplicate_outcom
         assert FakeStore.saved["calendar_history"]["history"] == history
 
     asyncio.run(run())
+
+
+def test_vehicle_refusal_and_issued_attempt_survive_store_reload(monkeypatch):
+    from custom_components.ha_energy_planner.ev_telemetry import vehicle_suspension_evidence
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    FakeStore.loaded_by_key = None
+    FakeStore.loaded = None
+    store = PlannerStore(object())
+    record = {"version": 1, "vehicle_suspended": True,
+              "vehicle_refusal": {"identity": ["vehicle"], "target_soc": 80, "feedback": "SUSPENDED_EV"}}
+    asyncio.run(store.async_save_ev_telemetry(record))
+    now = datetime.now(UTC)
+    outcome = ActionOutcome("ev", now, OutcomeResult.SKIPPED, "ev_vehicle_suspended", {}, {}, "plan",
+                            asset="ev", kind="ev_start", command_sent=True)
+    asyncio.run(store.async_add_outcome(outcome))
+    FakeStore.loaded = deepcopy(FakeStore.saved)
+    reloaded = PlannerStore(object())
+    asyncio.run(reloaded.async_load())
+    assert reloaded.data["action_attempts"][-1]["command_sent"] is True
+    assert vehicle_suspension_evidence(reloaded.data["ev_telemetry"], {
+        "suspension_identity": ["vehicle"], "target_soc": 80, "connected": True, "charging": False,
+    })["vehicle_suspended"]
+    FakeStore.loaded = None

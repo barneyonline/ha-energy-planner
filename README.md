@@ -20,6 +20,8 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 - Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.
 - Optional on-demand AI Task explanations that remain advisory.
 
+EV charging waits when the vehicle reports `SUSPENDED_EV` / `SuspendedEV`, including after a planner stop or restart. This does not prove the SOC target was reached. Cached charging reports from before a recorded refusal do not reset the wait. See [vehicle suspension and retry rules](docs/ev-scheduling.md#vehicle-suspension-and-waiting).
+
 Tariff plans retain the provider's UTC boundaries across refreshes, including partial current intervals. Climate calendar entries show planned preconditioning and coast phases; command deadlines appear in their details. Finishing temperatures remain unknown until the relevant heating or cooling rate is ready. HVAC timing and room-feedback edits preserve unrelated controls; changing actuators or global safety settings retains guarded restoration.
 
 Missed-preconditioning diagnostics reconcile a changed tariff tail with confirmed execution of the same preparation episode. Matching requires the same configuration, mode, target, peak and preparation deadline. Confirmed evidence retains its original execution time and window across overlapping replacements whose regenerated starts differ; a replacement plan alone does not prove success. Older history or coasting ownership without this correlation evidence retains strict lifecycle matching.

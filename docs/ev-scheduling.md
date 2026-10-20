@@ -193,3 +193,69 @@ charger switch and remove old start/stop mappings; entries with only separate
 controls require a stateful control before EV operation can resume. Saved
 command identity remains recovery evidence, and a confirmed switch-off is
 required to release charging owned through an old command endpoint.
+
+
+## Vehicle suspension and waiting
+
+`SUSPENDED_EV` and `SuspendedEV` mean the vehicle is declining or pausing offered
+energy. `SUSPENDED_EVSE` / `SuspendedEVSE` mean the charger is withholding energy
+and do not by themselves block a permitted start. These meanings follow the
+[Open Charge Alliance status definitions](https://openchargealliance.org/wp-content/uploads/2025/05/Using-OCPP-with-CHAdeMO.pdf).
+Neither vehicle suspension nor zero power proves the battery is full. For example,
+79% SOC against an 80% target remains unmet; missing SOC remains uncertain.
+The charging-status sensor shows the vehicle wait and exposes `soc_target_met`
+separately. Future schedule completion and savings remain modelled estimates.
+
+Automatic starts wait during vehicle refusal, including Adaptive, Continuous,
+Split, saved legacy schedules, degraded-load fallback and execution of an older
+plan. No charging or power-limit command is issued just to test a current refusal.
+If refusal arrives during start confirmation, including after a service error,
+the adapter stops retrying and makes one bounded safe-stop compensation. Permission
+must be confirmed off; inactive vehicle feedback alone never proves that. A
+confirmed compensation is expected waiting, not successful charging or a failed
+charger. Unconfirmed compensation retains ownership, grid capacity, conservative
+billing exposure and the existing safety-stop recovery/backoff rules. Refusal
+observed during a failed power-limit write is also retained before compensation
+changes feedback; the power-limit failure remains recorded as a failure.
+
+The wait is persisted for the vehicle/session and mapped charger topology. A
+planner stop may change feedback to `SUSPENDED_EVSE`; that does not erase the wait.
+A verified disconnection/new plug session, changed vehicle/control mapping,
+changed known target, or positive charging feedback allows reconsideration.
+Current vehicle refusal takes precedence over a target change or contradictory
+connection sample. Changing power tuning alone does not reset the wait. A new
+SOC sample below target never resets it by itself. `Finishing` is a stopped
+transaction state, so it does not count as positive charging evidence for a reset.
+Verified unplug evidence survives repeated contradictory refusal reports; a new
+session with current refusal remains blocked on its own evidence boundary.
+
+An explicit **Charge now** / manual start may reset the remembered wait for one
+attempt when current feedback permits charging. It cannot override live refusal
+or unknown/faulted feedback during a remembered refusal. Charge now returns
+`waiting_for_vehicle` for an expected refusal, creates no running override, and
+leaves the SOC target unchanged. Rejected or unconfirmed manual starts retain the
+remembered wait; a blocked attempt does not invent a fresh vehicle refusal or
+replace its original evidence. Only confirmed active charging clears that wait. When a refusal timestamp is known,
+the positive charging report must have a valid source/report timestamp at or after
+that refusal; an older cached report or an invalid source timestamp cannot reset it.
+Automatic replans do not repeat a refused manual attempt. Resolve the vehicle-side pause, change the target if appropriate, or
+unplug/replug before trying again. Real issued commands remain counted in the
+action allowance; no-command waiting does not consume it or create failed history.
+
+**Keep charger On** retains its existing stateful permission behavior after the
+measured SOC reaches target. It can enable preconditioning permission while the
+vehicle declines traction-battery charging, without reporting active charging.
+It cannot bypass tariff, capacity, safety, expiry or power-limit restoration rules.
+
+These behaviors are verified with deterministic tests. Live acceptance still
+requires observing the actual vehicle status, charger switch, meter and SOC across
+a refusal, confirmed stop, restart and new plug session. A passing repository gate
+does not establish physical charger behavior or measured energy savings.
+
+
+Refusal-evidence storage errors cannot abort a safety stop. The wait is retained
+in memory and its durable write is retried on a later cycle; persistence across
+restart cannot be guaranteed while storage is unavailable. Verified tracked-vehicle
+unplug reconciliation clears an older wait even when no disconnected telemetry
+sample was collected. Its captured unplug timestamp protects refusal received in
+a newer session while reconciliation was queued or awaiting storage.
