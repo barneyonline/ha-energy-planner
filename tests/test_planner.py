@@ -4037,3 +4037,56 @@ def test_room_coast_reserve_uses_a_qualified_passive_rate():
     model = {'model_version': 3, 'learning_enabled': True, 'sources': {'climate.room': {'buckets': {'passive': {
         'count': 12, 'minutes': 60, 'last_at': context.created_at.isoformat(), 'rate_c_per_hour': -.5}}}}}
     assert hvac_module._room_coast_hours(context, model, 'heat', 23, 19) == 8
+
+
+@pytest.mark.parametrize("strategy", ["adaptive", "continuous", "split", "legacy"])
+@pytest.mark.parametrize("manual", [False, True])
+def test_vehicle_refusal_suppresses_planned_starts_even_below_target(strategy, manual):
+    context = _context()
+    context.current_ev_soc_percent = 79
+    context.ev_target_soc_percent = 80
+    context.ev_connected = True
+    context.ev_charging = False
+    context.ev_evidence["vehicle_suspended"] = True
+    if manual:
+        from custom_components.ha_energy_planner.models import Override
+        context.active_overrides = [Override(
+            "manual_ev_charging", "button", context.created_at + timedelta(hours=1), "manual_start")]
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_charging_strategy": strategy}
+    plan = DryRunPlanner(options).create_plan(context)
+    action = next(a for a in plan.actions if a.asset == ActionAsset.EV)
+    assert action.desired_state["charging_required_now"] is False
+    assert action.desired_state["charging_reason"] == "ev_vehicle_suspended"
+    assert action.desired_state["target_soc_percent"] == 80
+    assert "power_limit" not in action.desired_state
+    assert context.current_ev_soc_percent == 79
+
+
+
+def test_vehicle_refusal_stays_authoritative_after_degraded_fallback_recalculation():
+    context = _context(InputHealth.DEGRADED)
+    context.ev_charging = False
+    context.ev_connected = True
+    context.input_issues = ["household_load_model_fallback_active"]
+    context.ev_evidence = {"vehicle_suspended": True, "commanded_kw": 7.0, "load_fallback": {
+        "fallback_applied": True, "fallback_remaining_seconds": 780}}
+    for slot in context.slots:
+        slot.baseline_load_forecast_upper_kw = 2
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+               "grid_import_limit_kw": 20, "ev_charge_rate_kw": 7}
+    action = next(a for a in DryRunPlanner(options).create_plan(context).actions if a.asset == ActionAsset.EV)
+    assert not action.desired_state["charging_required_now"]
+    assert action.desired_state["charging_reason"] == "ev_vehicle_suspended"
+
+
+def test_vehicle_refusal_keeps_confirmed_target_preconditioning_permission():
+    context = _context()
+    context.ev_connected = True
+    context.ev_charging = False
+    context.current_ev_soc_percent = context.ev_target_soc_percent = 80
+    context.ev_evidence["vehicle_suspended"] = True
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False, "ev_keep_charger_on": True}
+    action = next(a for a in DryRunPlanner(options).create_plan(context).actions if a.asset == ActionAsset.EV)
+    assert action.desired_state["keep_charger_on"]
+    assert action.desired_state["charging_required_now"]
+    assert not action.desired_state["charging_observed"]

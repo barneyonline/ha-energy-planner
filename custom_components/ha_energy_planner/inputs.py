@@ -54,7 +54,7 @@ from .const import (
     DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE,
     STATE_UNKNOWN_VALUES,
 )
-from .ev import ev_charging_state
+from .ev import ev_charging_state, ev_vehicle_suspended
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
     forecast_coverage_details,
@@ -422,6 +422,9 @@ class InputManager:
             ev_session_generation=self.entry_data.get("ev_session_generation"),
             ev_connected=ev_connected,
             ev_charging=ev_charging,
+            ev_evidence={"vehicle_suspended": ev_vehicle_suspended(
+                getattr(self._state(self.entry_data.get(CONF_EV_CHARGING)), "state", None)
+            )},
             ev_target_soc_percent=ev_target_soc,
             ev_ready_by=ev_ready_by,
             occupied_temperature_low_c=comfort_low,

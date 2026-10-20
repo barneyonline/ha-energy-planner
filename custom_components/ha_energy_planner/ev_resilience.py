@@ -151,7 +151,9 @@ def charging_status(context: Any, overrides: list[Any], now: datetime) -> dict[s
     fallback = context.ev_evidence.get("load_fallback", {})
     override = next((o for o in overrides if o.kind == "manual_ev_charging"
                      and o.reason == "charge_now" and o.expires_at is not None and o.expires_at > now), None)
-    if fallback.get("recovery_stage") == "bounded_degraded" and fallback.get("fallback_applied"):
+    if context.ev_evidence.get("vehicle_suspended"):
+        summary = "Vehicle declined charging; waiting for vehicle or user"
+    elif fallback.get("recovery_stage") == "bounded_degraded" and fallback.get("fallback_applied"):
         summary = "Limited recovery; conservative charging limits remain active"
     elif fallback.get("recovery_pending"):
         summary = "Consumption recovering; waiting for stable readings"
@@ -167,6 +169,10 @@ def charging_status(context: Any, overrides: list[Any], now: datetime) -> dict[s
     else:
         summary = "Not charging"
     return {"summary": summary, "charging_observed": context.ev_charging,
+            "vehicle_suspended": bool(context.ev_evidence.get("vehicle_suspended")),
+            "soc_target_met": (context.current_ev_soc_percent >= context.ev_target_soc_percent
+                               if context.current_ev_soc_percent is not None
+                               and context.ev_target_soc_percent is not None else None),
             "charge_now_until": override.expires_at.isoformat() if override else None,
             "cost_estimates_degraded": bool(fallback.get("cost_estimates_degraded")),
             "fallback_remaining_seconds": fallback.get("fallback_remaining_seconds"),

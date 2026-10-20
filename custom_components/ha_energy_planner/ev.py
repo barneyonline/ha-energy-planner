@@ -45,7 +45,9 @@ _EV_INACTIVE_CHARGING_STATES = frozenset(
         "occupied",
         "suspended",
         "suspended_ev",
+        "suspendedev",
         "suspended_evse",
+        "suspendedevse",
         "disconnected",
         "unplugged",
         "not_plugged_in",
@@ -62,7 +64,9 @@ _EV_SAFE_CONNECTED_INACTIVE_STATES = frozenset(
         "fully_charged",
         "suspended",
         "suspended_ev",
+        "suspendedev",
         "suspended_evse",
+        "suspendedevse",
     }
 )
 
@@ -80,6 +84,16 @@ def ev_charging_state(value: object) -> bool | None:
 def ev_charging_state_proves_safe(value: object) -> bool:
     """Return whether feedback proves no charging while connection may remain."""
     return str(value).strip().lower() in _EV_SAFE_CONNECTED_INACTIVE_STATES
+
+
+def ev_charging_state_proves_active(value: object) -> bool:
+    """Require charging feedback, excluding OCPP's stopped Finishing state."""
+    return ev_charging_state(value) is True and str(value).strip().lower() != "finishing"
+
+
+def ev_vehicle_suspended(value: object) -> bool:
+    """Recognize vehicle refusal without inferring a full battery or charger fault."""
+    return str(value).strip().lower() in {"suspended_ev", "suspendedev"}
 
 
 @dataclass(slots=True)

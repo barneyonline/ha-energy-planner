@@ -1400,3 +1400,43 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 - Interval-consumer review regressions cover split daylight EV coverage (`tests/test_planner.py`), actual pre-window charging capacity (`tests/test_ev_optimization.py`), elapsed PV calibration leads and full-horizon training snapshots (`tests/test_inputs.py`, `tests/test_forecast_calibration.py`), and persisted climate baseline ends with invalid-evidence rejection (`tests/test_climate_engine.py`).
 - Further review checks duration-weighted tariff/PV/weather confidence, partial point inputs and exact household-load coverage (`tests/test_inputs.py`, `tests/test_forecasts.py`). Calendar regressions verify label upgrades coalesce running or archived confirmed climate phases without merging different phase UIDs (`tests/test_calendar_history.py`).
 - `tests/test_forecasts.py::test_forecast_coverage_thresholds_use_exact_elapsed_duration` verifies exact eight/twelve-hour qualification and one-second shortfalls with uniform intervals and tariff boundaries split by one second. `forecasts.py` accumulates timedeltas before conversion, preserving the existing safety thresholds without floating-point misclassification.
+
+
+### Vehicle-side EV charging refusal
+
+`ev.py`, `inputs.py`, `ev_telemetry.py`, `coordinator.py`, `planner.py` and
+`executor.py` distinguish vehicle refusal from EVSE withholding and preserve a
+session/topology-scoped wait across compensation and reload. `ev_adapter.py`
+checks before writes, stops confirmation/service-error retries, and requires
+stateful off readback for safe compensation. `ev_resilience.py` exposes waiting
+and measured SOC target status separately; diagnostics retain bounded refusal
+provenance. `action_limits.py` / `ev_runtime.py` count real commands while excluding
+no-command waits. Charge now returns an expected waiting status without a running
+override. No target completion, metered energy or savings are inferred from refusal.
+
+Evidence: refusal regressions in `tests/test_ev_adapter.py`,
+`tests/test_ev_optimization.py`, `tests/test_ev_telemetry.py`, `tests/test_planner.py`,
+`tests/test_executor.py`, `tests/test_ev_resilience.py`, `tests/test_services.py`
+and `tests/test_storage.py`. Existing stop/backoff, capacity, lease and power-limit
+restoration tests remain required. The full gate is `scripts/docker-validate.sh`;
+physical acceptance remains separate as described in `docs/ev-scheduling.md`.
+
+Review regressions additionally cover rejection before capacity/lease dispatch,
+unconfirmed manual outcomes, preservation of original evidence on blocked manual
+attempts, repeated refusal through verified unplug/replug and independent new
+session refusal, exclusion of stopped `Finishing` feedback from positive reset
+proof, and refusal metadata through failed power-limit writes in manual and
+automatic execution. These preserve the original power-failure audit/pause,
+reservation and ownership recovery contracts.
+
+Further review evidence: `tests/test_executor.py` covers refusal storage failures
+before scheduled and substituted safety stops, unplug-policy release without a
+disconnected sample, and newer refusal during ownership writes. `tests/test_vehicles.py`
+covers delayed unplug reconciliation after a new session has already refused.
+The refusal stays in memory on telemetry write failure; durable recovery remains
+subject to storage availability. Existing ownership/billing boundaries are retained.
+
+Timestamp reset review: `tests/test_ev_telemetry.py` and `tests/test_executor.py`
+verify that older cached charging feedback and invalid authoritative timestamps
+cannot clear a newer refusal through telemetry or manual start confirmation.
+Valid charging evidence at or after the refusal remains an allowed reset.

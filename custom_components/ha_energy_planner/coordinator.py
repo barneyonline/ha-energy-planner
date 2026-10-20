@@ -114,7 +114,7 @@ from .ev import ev_charging_state
 from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power
 from .ev_runtime import audit_evidence
-from .ev_telemetry import sample_ev, update_ev_telemetry
+from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
 from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
@@ -471,6 +471,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             and connection(state_value(self.hass, data.get(CONF_EV_CONNECTED))) is False
         ):
             self._ev_unplug_generation = getattr(self, "_ev_unplug_generation", 0) + 1
+            self._ev_last_unplug_at = (
+                reported_at(self.hass.states.get(data[CONF_EV_CONNECTED])) or dt_util.utcnow()
+            )
         old_signature = self.vehicle_session.signature
         changed = self.vehicle_session.update(self.hass, data)
         if changed and self.vehicle_session.signature is not None and (
@@ -515,7 +518,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         unplug_generation = getattr(self, "_ev_unplug_generation", 0)
         unplugged = unplug_generation != getattr(self, "_ev_reconciled_unplug_generation", 0)
         if key != self._vehicle_ownership_key or unplugged:
-            await self.executor.async_release_ev_policy(unplugged=unplugged)
+            await self.executor.async_release_ev_policy(
+                unplugged=unplugged, unplugged_at=getattr(self, "_ev_last_unplug_at", None) if unplugged else None,
+            )
             self.overrides = [o for o in self.overrides if o.kind != "manual_ev_charging"]
             await self.store.async_save_overrides(self.overrides)
             self._vehicle_ownership_key = key
@@ -628,6 +633,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 # Events can be queued across a rapid unplug/replug. Preserve
                 # the observed boundary even if hass.states already says on.
                 self._ev_unplug_generation = getattr(self, "_ev_unplug_generation", 0) + 1
+                self._ev_last_unplug_at = reported_at(event.data.get("new_state")) or dt_util.utcnow()
                 self.vehicle_session.note_unplug()
                 self.vehicle_calibration.pending = None
                 self._vehicle_ownership_key = None
@@ -1356,7 +1362,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             reserved_kw=float(reservation.get("load_kw", 0) or 0),
         )
         if (any(entry_data.get(key) for key in ("ev_power_entity", "ev_energy_entity", "ev_power_limit_entity"))
-                or options.get("ev_price_limit_enabled") or self.store.data.get("ev_telemetry")):
+                or options.get("ev_price_limit_enabled") or telemetry.get("vehicle_suspended")
+                or self.store.data.get("ev_telemetry")):
             await self.store.async_save_ev_telemetry(telemetry)
         context.ev_evidence["load_fallback"] = dict(getattr(manager, "load_forecast_details", {}))
         from .ev_resilience import retain_outage_power_ceiling
@@ -1367,6 +1374,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if load_source_outage:
             await self._async_save_load_source_outage(load_source_outage)
         context.ev_evidence.update({
+            "vehicle_suspended": telemetry.get("vehicle_suspended", False),
             "performance": telemetry.get("performance", {}),
             "emergency_spend": telemetry.get("emergency_spend", 0),
             "budget_uncertain": telemetry.get("budget_uncertain", False),
