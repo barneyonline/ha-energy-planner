@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.4 - 2026-10-20
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add optional independent heating/cooling zone completion with explicit controller pairing and verified minimum-airflow combinations, fresh room feedback, persisted pause intent, 0.3°C hysteresis and a ten-minute restart dwell. Preserve original restoration baselines and stop the shared head before removing its last airflow path; unsupported systems retain the existing handoff.
 
 ### 🐛 Bug fixes
@@ -21,7 +43,7 @@
 
 ### 🔄 Other changes
 
-- None
+- Restore persisted control ownership before smoke-test startup assertions, avoiding checks against incomplete recovery state.
 
 ## 1.4.3 - 2026-10-19
 
