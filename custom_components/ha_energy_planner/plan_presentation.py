@@ -611,7 +611,7 @@ def plain_reason(value: Any) -> str:
         ),
         "ev_daylight_lowest_cost_charge_now": "The EV is in its selected lowest-cost daylight window.",
         "ev_daylight_lowest_cost_with_ready_by_fallback": (
-            "Daylight and ready-by slots were selected without increasing the candidate's estimated cost."
+            "Daylight and ready-by charging were combined after checking capacity, readiness and estimated cost."
         ),
         "ev_daylight_forecast_incomplete": (
             "The complete remaining sunrise-to-sunset forecast is not available, so ready-by scheduling is used."
