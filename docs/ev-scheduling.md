@@ -30,6 +30,37 @@ fit at its full configured rate. Battery discharge is never assumed to create sa
 headroom. Existing cross-entry reservations remain the final execution safeguard;
 this feature does not jointly schedule multiple EVs.
 
+### Daylight preference and peak prices
+
+Daylight is an economic tie-breaker, not an instruction to maximise charging
+before sunset regardless of price. A complete daylight candidate is compared
+with the ordinary ready-by candidate using delivered energy and effective cost,
+including partial intervals and solar export opportunity cost. Seed estimates
+are reported at four-decimal currency precision.
+These seed estimates do not discard daylight options: cheaper overnight seeds
+may lack physical capacity or miss the readiness buffer. Continuous schedules
+still need one contiguous window; split candidates can combine daylight and
+ready-by capacity without duplicates.
+
+The physical optimiser revalidates every candidate against capacity, the actual
+ready-by deadline, the configured readiness buffer, price limits, action limits
+and minimum dwell. Only after these checks does it rank estimated cost before
+daylight energy. A costlier daylight slot remains eligible if required for
+readiness, but a 40 c/kWh evening slot does not displace a 9 c/kWh morning slot
+merely because it is still daylight. Explicit active Continuous or opportunistic
+charge-now intent keeps its existing precedence. Carbon preferences and economic
+schedule-retention thresholds remain configured objectives; daylight does not
+bypass them. A retained cheaper night schedule is valid with daylight enabled.
+
+Decision evidence reports both seed candidate costs, whether daylight was
+selected, and whether physical and economic validation displaced it. Candidate
+comparisons are modelled estimates; they are not measured savings or proof of
+successful charging. A combined daylight/ready-by explanation does not claim
+cost neutrality: learned charging rates or physical validation can raise the
+final estimate above a seed estimate. Enabling daylight does not require actual
+solar surplus; surplus already lowers effective cost when
+forecast evidence supports it.
+
 ## Charging observations
 
 Optional measured charging power accepts W or kW. Optional cumulative energy
@@ -139,8 +170,9 @@ Recorder fallback until measured statistics meet the model's observation thresho
 
 Expiry of a charging lease requires a confirmed stop, including when the saved
 charger baseline was on. Confirmed stops end spending accrual even if restoring
-the original number limit remains pending. Economic schedule retention cannot
-override the selected daylight preference.
+the original number limit remains pending. Economic schedule retention compares
+feasible cost choices; daylight cannot force replacement with a more expensive
+schedule.
 
 Confirmed stops also close the preceding telemetry sample's billing exposure,
 so a later refresh cannot debit it again. A retained capacity reservation does

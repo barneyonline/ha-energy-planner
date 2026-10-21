@@ -327,8 +327,12 @@ use throughout; the Docker and pull-request gates enforce that result.
   remains authoritative. Daylight preference is evaluated from deterministic sunrise/sunset windows
   calculated from Home Assistant's configured location. It requires complete
   effective-cost evidence through sunset; continuous schedules fall back as a
-  whole when daylight capacity is insufficient, while split schedules allocate
-  daylight first and de-duplicate ready-by fallback slots. Completed Recorder
+  whole when daylight capacity is insufficient, while split schedules compare
+  combined daylight/ready-by seed costs with the ordinary schedule and de-duplicate
+  fallback slots. Seed costs never discard daylight before physical validation.
+  Better target coverage and lower estimated effective cost take
+  precedence over daylight; the physical optimiser uses daylight only after its
+  readiness, dwell and economic comparison. Completed Recorder
   charging sessions of at least 30 minutes calibrate effective SOC gained per
   kWh from SOC gain, configured charger power, and active duration. At least 60
   minutes and 3% gain are required; the learned rate carries a 10% conservative
@@ -1114,7 +1118,9 @@ lookup uses the same 0.25°C grid in validation and runtime simulation.
 
 - Candidate-constraint regressions cover active Continuous sessions with retained future windows and low-price charge-now triggers in Split/Adaptive modes. Calibration regressions include measured stalls and immature-model diagnostics (`tests/test_ev_optimization.py`).
 
-- Runtime recovery regressions verify that lease expiry stops a previously-on baseline and that a confirmed stop ends spending despite failed number restoration (`tests/test_control_runtime.py`). A retained-night-window regression preserves selected daylight preference (`tests/test_ev_optimization.py`).
+- Runtime recovery regressions verify that lease expiry stops a previously-on baseline and that a confirmed stop ends spending despite failed number restoration (`tests/test_control_runtime.py`). A retained-night-window regression prevents daylight preference displacing cheaper charging (`tests/test_ev_optimization.py`).
+- Peak-price daylight regressions (`tests/test_ev_daylight_cost.py`) reproduce an evening 40 c/kWh window with feasible 9.3 c/kWh morning capacity, across Continuous, Split and Adaptive, including a previously retained expensive schedule. Additional evidence covers partial daylight seeds, solar export opportunity cost, legacy missing/zero effective prices and diagnostics after capacity revalidation. All three strategies retain daylight eligibility before earliest-start when cheap overnight seeds lack physical capacity or miss the readiness buffer. Equal-cost daylight ties and necessary expensive readiness slots are covered by `tests/test_ev_optimization.py`; `scripts/docker-validate.sh` remains the complete gate.
+- Combined daylight/ready-by presentation regressions use learned rates and limited overnight capacity to demonstrate final modelled cost above both seed estimates. Both the action explanation and daylight status avoid claiming cost neutrality (`tests/test_ev_daylight_cost.py`).
 
 - `test_confirmed_stop_is_not_billed_again_on_the_next_telemetry_update` exercises lease expiry followed by repeated telemetry updates with a retained reservation, preserving the settled spending total.
 
