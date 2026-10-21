@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- Stop daylight preference selecting expensive peak-period EV charging when cheaper eligible charging can meet readiness. Compare candidate costs before preferring daylight, preserve cheaper retained night schedules, and report when readiness or physical validation chooses another candidate.
+- Stop daylight preference selecting expensive peak-period EV charging when cheaper eligible charging can meet readiness. Compare candidate costs after physical readiness validation, preserve cheaper retained night schedules, and report when readiness or physical validation chooses another candidate.
 
 ### 🔧 Improvements
 

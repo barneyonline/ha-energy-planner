@@ -606,9 +606,6 @@ def plain_reason(value: Any) -> str:
             "Daylight and ready-by charging were combined after comparing their estimated effective cost."
         ),
         "ev_daylight_lowest_cost_selected": "A complete lowest-cost daylight charging window was selected.",
-        "ev_daylight_ready_by_preferred": (
-            "A ready-by schedule offers lower cost or better target coverage than the daylight candidate."
-        ),
         "ev_daylight_candidate_not_selected": (
             "The daylight candidate was not selected after checking capacity, readiness and estimated cost."
         ),
