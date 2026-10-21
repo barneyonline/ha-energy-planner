@@ -32,7 +32,7 @@ def _daylight_preferred_ev_schedule(
     force_current: bool,
     max_import_price: float | None,
 ) -> tuple[EVChargeSchedule, dict[str, Any]]:
-    """Prefer a fully known daylight window without weakening ready-by behavior."""
+    """Propose known daylight slots without increasing cost or weakening readiness."""
     evidence: dict[str, Any] = {
         "applicable": False,
         "forecast_complete": False,
@@ -114,9 +114,27 @@ def _daylight_preferred_ev_schedule(
     if not daylight_schedule.allocations:
         evidence["reason"] = "ev_daylight_no_eligible_charge"
         return standard_schedule, evidence
+
+    def choose(candidate: EVChargeSchedule, reason: str) -> tuple[EVChargeSchedule, dict[str, Any]]:
+        # Compare actual partial-slot delivery, not slot counts or the current
+        # import price. Effective price includes the value of exported solar.
+        def economic_rank(schedule: EVChargeSchedule) -> tuple[bool, float, float]:
+            cost = sum(a.added_soc_percent / soc_per_kwh * (
+                a.import_price if a.effective_price is None else a.effective_price
+            ) for a in schedule.allocations)
+            return (schedule.infeasible, -schedule.scheduled_soc_percent if schedule.infeasible else 0,
+                    round(cost, 4))
+
+        candidate_rank, standard_rank = economic_rank(candidate), economic_rank(standard_schedule)
+        evidence.update(daylight_candidate_cost=candidate_rank[2], ready_by_candidate_cost=standard_rank[2])
+        if candidate_rank > standard_rank:
+            evidence["reason"] = "ev_daylight_ready_by_preferred"
+            return standard_schedule, evidence
+        evidence.update(selected=True, reason=reason)
+        return candidate, evidence
+
     if not daylight_schedule.infeasible:
-        evidence.update({"selected": True, "reason": "ev_daylight_lowest_cost_selected"})
-        return (
+        return choose(
             EVChargeSchedule(
                 allocations=daylight_schedule.allocations,
                 target_soc_percent=daylight_schedule.target_soc_percent,
@@ -125,7 +143,7 @@ def _daylight_preferred_ev_schedule(
                 infeasible=False,
                 reason="daylight_lowest_effective_cost_slots",
             ),
-            evidence,
+            "ev_daylight_lowest_cost_selected",
         )
     if continuous:
         evidence["reason"] = "ev_daylight_continuous_capacity_insufficient"
@@ -146,13 +164,7 @@ def _daylight_preferred_ev_schedule(
         max_import_price=max_import_price,
         allocation_source="ready_by_fallback",
     )
-    evidence.update(
-        {
-            "selected": True,
-            "reason": "ev_daylight_lowest_cost_with_ready_by_fallback",
-        }
-    )
-    return (
+    return choose(
         EVChargeSchedule(
             allocations=[*daylight_schedule.allocations, *fallback_schedule.allocations],
             target_soc_percent=target_soc_percent,
@@ -161,7 +173,7 @@ def _daylight_preferred_ev_schedule(
             infeasible=fallback_schedule.infeasible,
             reason="daylight_lowest_effective_cost_with_ready_by_fallback",
         ),
-        evidence,
+        "ev_daylight_lowest_cost_with_ready_by_fallback",
     )
 
 

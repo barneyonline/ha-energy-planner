@@ -154,7 +154,7 @@ def test_daylight_schedule_does_not_allocate_a_slot_past_sunset() -> None:
     ]
     for slot in context.slots:
         if slot.valid_at == datetime(2026, 6, 27, 17, 0, tzinfo=UTC):
-            slot.import_price = -1.0
+            slot.import_price = 0.02
         elif slot.valid_at == datetime(2026, 6, 27, 16, 55, tzinfo=UTC):
             slot.import_price = 0.01
     options = {

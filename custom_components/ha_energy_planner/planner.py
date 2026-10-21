@@ -408,6 +408,10 @@ class DryRunPlanner:
                 soc_per_kwh=soc_per_kwh, standard=schedule,
                 carbon_weight=_carbon_schedule_weight(self.options), force_current=low_price_charge,
             )
+            if daylight_evidence.get("selected") and not any(
+                allocation.allocation_source == "daylight" for allocation in schedule.allocations
+            ):
+                daylight_evidence.update(selected=False, reason="ev_daylight_candidate_not_selected")
             max_attainable_soc_percent = max(
                 max_attainable_soc_percent,
                 schedule.scheduled_soc_percent,
