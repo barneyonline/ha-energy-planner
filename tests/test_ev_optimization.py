@@ -662,7 +662,7 @@ def test_zero_energy_with_soc_jump_is_not_a_valid_stall_interval():
     assert not record["pending"]
 
 
-def test_retained_night_window_cannot_override_selected_daylight_preference():
+def test_daylight_preference_cannot_displace_a_cheaper_retained_night_window():
     from custom_components.ha_energy_planner.models import DaylightWindow
 
     ctx = context((0.01, 0.4, 0.4))
@@ -670,8 +670,32 @@ def test_retained_night_window_cannot_override_selected_daylight_preference():
     ctx.ev_evidence["retained_schedule"] = [
         {"valid_at": NOW.isoformat(), "physical_power_kw": 6}]
     schedule, evidence = solve(ctx, ev_charging_strategy="split", ev_daylight_lowest_cost_charging_enabled=True)
-    assert schedule.allocations[0].valid_at == NOW + timedelta(minutes=5)
-    assert evidence["schedule_change_reason"] != "saving_below_schedule_change_threshold"
+    assert schedule.allocations[0].valid_at == NOW
+    assert evidence["modelled_incremental_cost"] == pytest.approx(0.005)
+
+
+@pytest.mark.parametrize("strategy", ["continuous", "split", "adaptive"])
+def test_daylight_is_an_equal_cost_tie_breaker_not_a_price_override(strategy):
+    from custom_components.ha_energy_planner.models import DaylightWindow
+
+    ctx = context((0.09, 0.40, 0.09))
+    ctx.daylight_windows = [DaylightWindow(NOW + timedelta(minutes=5), NOW + timedelta(minutes=15))]
+    schedule, evidence = solve(ctx, ev_charging_strategy=strategy, ev_daylight_lowest_cost_charging_enabled=True)
+    assert schedule.allocations[0].valid_at == NOW + timedelta(minutes=10)
+    assert evidence["modelled_incremental_cost"] == pytest.approx(0.045)
+
+
+@pytest.mark.parametrize("strategy", ["continuous", "split", "adaptive"])
+def test_expensive_daylight_remains_available_when_required_for_readiness(strategy):
+    from custom_components.ha_energy_planner.models import DaylightWindow
+
+    ctx = context((0.4, 0.09))
+    ctx.ev_target_soc_percent = 50
+    ctx.daylight_windows = [DaylightWindow(NOW, NOW + timedelta(minutes=5))]
+    schedule, _ = solve(ctx, ev_charging_strategy=strategy, ev_daylight_lowest_cost_charging_enabled=True)
+    assert not schedule.infeasible
+    assert len(schedule.allocations) == 2
+    assert schedule.scheduled_soc_percent == 50
 
 
 @pytest.mark.parametrize("remaining", [0, 1])

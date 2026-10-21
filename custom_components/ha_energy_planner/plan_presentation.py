@@ -608,12 +608,15 @@ def plain_reason(value: Any) -> str:
             "Charging was placed in the lowest effective-cost complete daylight window."
         ),
         "daylight_lowest_effective_cost_with_ready_by_fallback": (
-            "Daylight charging was preferred first, with remaining charge placed before ready-by."
+            "Daylight and ready-by charging were combined after comparing their estimated effective cost."
         ),
         "ev_daylight_lowest_cost_selected": "A complete lowest-cost daylight charging window was selected.",
+        "ev_daylight_candidate_not_selected": (
+            "The daylight candidate was not selected after checking capacity, readiness and estimated cost."
+        ),
         "ev_daylight_lowest_cost_charge_now": "The EV is in its selected lowest-cost daylight window.",
         "ev_daylight_lowest_cost_with_ready_by_fallback": (
-            "Daylight slots were selected first and ready-by slots cover the remaining charge."
+            "Daylight and ready-by charging were combined after checking capacity, readiness and estimated cost."
         ),
         "ev_daylight_forecast_incomplete": (
             "The complete remaining sunrise-to-sunset forecast is not available, so ready-by scheduling is used."

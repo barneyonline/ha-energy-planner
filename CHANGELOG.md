@@ -12,6 +12,8 @@
 
 ### 🐛 Bug fixes
 
+- Stop daylight preference selecting expensive peak-period EV charging when cheaper eligible charging can meet readiness. Compare candidate costs after physical readiness validation, preserve cheaper retained night schedules, and report when readiness or physical validation chooses another candidate.
+- Remove an unsupported cost-neutrality claim from combined daylight and ready-by charging explanations when physical validation changes the estimated cost.
 - Keep Current load forecast values and model attributes aligned with the committed plan while a refresh replaces its forecast history bucket. Prevent brief unknown-state pulses during successful refreshes without substituting another plan's evidence or hiding missing data and refresh failures.
 
 ### 🔧 Improvements
