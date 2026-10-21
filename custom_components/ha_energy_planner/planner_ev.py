@@ -32,7 +32,7 @@ def _daylight_preferred_ev_schedule(
     force_current: bool,
     max_import_price: float | None,
 ) -> tuple[EVChargeSchedule, dict[str, Any]]:
-    """Propose known daylight slots without increasing cost or weakening readiness."""
+    """Propose known daylight slots for physical and economic validation."""
     evidence: dict[str, Any] = {
         "applicable": False,
         "forecast_complete": False,
@@ -115,26 +115,25 @@ def _daylight_preferred_ev_schedule(
         evidence["reason"] = "ev_daylight_no_eligible_charge"
         return standard_schedule, evidence
 
-    def choose(candidate: EVChargeSchedule, reason: str) -> tuple[EVChargeSchedule, dict[str, Any]]:
+    def propose(candidate: EVChargeSchedule, reason: str) -> tuple[EVChargeSchedule, dict[str, Any]]:
         # Compare actual partial-slot delivery, not slot counts or the current
         # import price. Effective price includes the value of exported solar.
-        def economic_rank(schedule: EVChargeSchedule) -> tuple[bool, float, float]:
+        def estimated_cost(schedule: EVChargeSchedule) -> float:
             cost = sum(a.added_soc_percent / soc_per_kwh * (
                 a.import_price if a.effective_price is None else a.effective_price
             ) for a in schedule.allocations)
-            return (schedule.infeasible, -schedule.scheduled_soc_percent if schedule.infeasible else 0,
-                    round(cost, 4))
+            return round(cost, 4)
 
-        candidate_rank, standard_rank = economic_rank(candidate), economic_rank(standard_schedule)
-        evidence.update(daylight_candidate_cost=candidate_rank[2], ready_by_candidate_cost=standard_rank[2])
-        if candidate_rank > standard_rank:
-            evidence["reason"] = "ev_daylight_ready_by_preferred"
-            return standard_schedule, evidence
+        evidence.update(daylight_candidate_cost=estimated_cost(candidate),
+                        ready_by_candidate_cost=estimated_cost(standard_schedule))
+        # Seed costs cannot prove physical readiness. Keep the daylight option
+        # eligible before earliest_start until the optimiser checks capacity,
+        # learned delivery rates, the readiness buffer and battery economics.
         evidence.update(selected=True, reason=reason)
         return candidate, evidence
 
     if not daylight_schedule.infeasible:
-        return choose(
+        return propose(
             EVChargeSchedule(
                 allocations=daylight_schedule.allocations,
                 target_soc_percent=daylight_schedule.target_soc_percent,
@@ -164,7 +163,7 @@ def _daylight_preferred_ev_schedule(
         max_import_price=max_import_price,
         allocation_source="ready_by_fallback",
     )
-    return choose(
+    return propose(
         EVChargeSchedule(
             allocations=[*daylight_schedule.allocations, *fallback_schedule.allocations],
             target_soc_percent=target_soc_percent,

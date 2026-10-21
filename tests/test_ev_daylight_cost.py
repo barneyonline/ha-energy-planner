@@ -71,13 +71,35 @@ def test_solar_export_opportunity_cost_is_not_overridden_by_daylight():
     assert all(row["import_price"] == 0.093 for row in desired["allocated_slots"])
 
 
-def test_partial_daylight_seed_is_rejected_when_cheaper_night_can_finish():
+@pytest.mark.parametrize("mode", ["continuous", "split", "adaptive"])
+@pytest.mark.parametrize("late_capacity", [False, True])
+def test_daylight_survives_seed_cost_comparison_until_physical_readiness_is_checked(mode, late_capacity):
     ctx = evening()
+    ctx.ev_target_soc_percent = 73
+    ctx.daylight_windows = ctx.daylight_windows[:1]
+    for slot in ctx.slots[3:]:
+        if not late_capacity or slot is not ctx.slots[-1]:
+            slot.baseline_load_forecast_upper_kw = 20
+    desired = action(ctx, mode, ev_earliest_start="23:00").desired_state
+    daylight = desired["daylight_lowest_cost"]
+    assert not desired["infeasible"]
+    assert desired["charging_required_now"]
+    assert daylight["selected"]
+    assert daylight["daylight_candidate_cost"] > daylight["ready_by_candidate_cost"]
+    assert datetime.fromisoformat(desired["optimization"]["conservative_completion"]) <= READY - timedelta(minutes=30)
+    assert desired["optimization"]["projected_departure_soc"] == 73
+
+
+def test_partial_daylight_seed_is_displaced_when_cheaper_night_can_finish():
+    ctx = evening()
+    ctx.daylight_windows = ctx.daylight_windows[:1]
     desired = action(ctx, "split", ev_earliest_start="23:00").desired_state
     daylight = desired["daylight_lowest_cost"]
     assert not daylight["selected"]
-    assert daylight["reason"] == "ev_daylight_ready_by_preferred"
+    assert daylight["reason"] == "ev_daylight_candidate_not_selected"
     assert daylight["daylight_candidate_cost"] > daylight["ready_by_candidate_cost"]
+    assert not desired["charging_required_now"]
+    assert all(row["import_price"] == 0.093 for row in desired["allocated_slots"])
 
 
 def test_daylight_selection_evidence_tracks_capacity_revalidation():
@@ -106,7 +128,7 @@ def test_legacy_daylight_cost_comparison_preserves_missing_and_zero_effective_pr
         soc_per_kwh=1.1825, interval_minutes=15, carbon_weight=0,
         continuous=False, continue_current=False, force_current=False, max_import_price=None,
     )
-    assert selected is standard
-    assert not evidence["selected"]
+    assert selected is not standard
+    assert evidence["selected"]
     assert evidence["ready_by_candidate_cost"] == pytest.approx((0.1 if effective_price is None else 0) / 1.1825,
                                                                 abs=0.00005)

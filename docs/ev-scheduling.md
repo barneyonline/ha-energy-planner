@@ -35,15 +35,16 @@ this feature does not jointly schedule multiple EVs.
 Daylight is an economic tie-breaker, not an instruction to maximise charging
 before sunset regardless of price. A complete daylight candidate is compared
 with the ordinary ready-by candidate using delivered energy and effective cost,
-including partial intervals and solar export opportunity cost. Cost comparisons
-use the same four-decimal currency precision as reported optimisation costs.
-A daylight candidate cannot replace better target coverage or a cheaper candidate
-with the same coverage. Continuous schedules still need one contiguous window;
-split candidates can combine daylight and ready-by capacity without duplicates.
+including partial intervals and solar export opportunity cost. Seed estimates
+are reported at four-decimal currency precision.
+These seed estimates do not discard daylight options: cheaper overnight seeds
+may lack physical capacity or miss the readiness buffer. Continuous schedules
+still need one contiguous window; split candidates can combine daylight and
+ready-by capacity without duplicates.
 
 The physical optimiser revalidates every candidate against capacity, the actual
 ready-by deadline, the configured readiness buffer, price limits, action limits
-and minimum dwell. Within those requirements it ranks estimated cost before
+and minimum dwell. Only after these checks does it rank estimated cost before
 daylight energy. A costlier daylight slot remains eligible if required for
 readiness, but a 40 c/kWh evening slot does not displace a 9 c/kWh morning slot
 merely because it is still daylight. Explicit active Continuous or opportunistic
@@ -52,9 +53,9 @@ schedule-retention thresholds remain configured objectives; daylight does not
 bypass them. A retained cheaper night schedule is valid with daylight enabled.
 
 Decision evidence reports both seed candidate costs, whether daylight was
-selected, and whether a better ready-by schedule or subsequent physical
-revalidation displaced it. Candidate comparisons are modelled estimates; they
-are not measured savings or proof of successful charging. Enabling daylight does
+selected, and whether physical and economic validation displaced it. Candidate
+comparisons are modelled estimates; they are not measured savings or proof of
+successful charging. Enabling daylight does
 not require actual solar surplus; surplus already lowers effective cost when
 forecast evidence supports it.
 

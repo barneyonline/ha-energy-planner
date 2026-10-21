@@ -34,6 +34,7 @@ Unfinished room targets retain their paired actuator baselines through deferred 
 
 EV daylight and continuous charging, PV calibration lead times and climate observation comparisons also use actual interval boundaries.
 Daylight preference never authorises a higher-cost charging candidate when a cheaper schedule meets the same readiness requirements. After safety, readiness and dwell checks, estimated cost takes precedence; daylight breaks economic ties. Forecast solar is valued at its export opportunity cost rather than treated as free energy.
+Preliminary cost estimates preserve daylight options until physical capacity and readiness-buffer checks establish whether cheaper overnight charging can actually meet the same requirements.
 Forecast confidence measures covered time, and confirmed climate activity keeps its identity when calendar labels change.
 Coverage thresholds retain exact elapsed durations when tariff timestamps differ by seconds.
 
