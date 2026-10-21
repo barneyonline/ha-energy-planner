@@ -403,6 +403,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._pending_refresh_trigger = "startup"
         self._last_decision_fingerprint: str | None = None
         self._last_decision_context: DecisionContext | None = None
+        self._retained_forecast_snapshot: dict[str, Any] = {}
         self._tearing_down = False
         self._force_next_refresh = False
         self._manual_override_helper_guard: tuple[str, datetime] | None = None
@@ -1444,6 +1445,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._log_availability_transition(plan.input_issues)
         self._record_startup_auto_recovery_validation_candidate(plan, violations)
         await self.executor.async_notify_plan_fallback(plan, violations)
+        from .plan_presentation import latest_forecast_snapshot
+
+        # Replay history coalesces by half-hour before this result is published.
+        # Keep one complete snapshot for the still-committed plan across Store
+        # awaits and independent listener notifications. Never retain the new
+        # result here: generation checks may still discard it.
+        self._retained_forecast_snapshot = deepcopy(latest_forecast_snapshot(self))
         await self.store.async_add_forecast_snapshot(
             {
                 "created_at": context.created_at,
