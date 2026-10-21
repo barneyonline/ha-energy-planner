@@ -583,9 +583,9 @@ def optimise_ev(
             result.schedule.infeasible,
             -result.schedule.scheduled_soc_percent if result.schedule.infeasible else 0,
             result.completion is None or result.completion > buffered_deadline,
-            -result.daylight_energy if options.get("ev_daylight_lowest_cost_charging_enabled") else 0,
             result.dwell_violations,
             result.cost,
+            -result.daylight_energy if options.get("ev_daylight_lowest_cost_charging_enabled") else 0,
             result.completion or ready_by,
         )
 
@@ -627,8 +627,9 @@ def optimise_ev(
                 break
     best = min(results, key=rank)
     # Carbon uses the existing normalized cost/emission preference within the
-    # same feasibility, buffer, and daylight priority class.
-    peers = [r for r in results if rank(r)[:5] == rank(best)[:5]]
+    # same feasibility, buffer, and dwell class. Daylight is a tie-breaker,
+    # never authority to displace a cheaper economic choice.
+    peers = [r for r in results if rank(r)[:4] == rank(best)[:4]]
     if carbon_weight > 0 and peers:
         costs, emissions = [r.cost for r in peers], [r.carbon for r in peers]
         weight = min(max(carbon_weight, 0), 1)
@@ -638,6 +639,7 @@ def optimise_ev(
                 (1 - weight) * (r.cost - min(costs)) / max(max(costs) - min(costs), 1e-9)
                 + weight * (r.carbon - min(emissions)) / max(max(emissions) - min(emissions), 1e-9),
                 r.cost,
+                -r.daylight_energy if options.get("ev_daylight_lowest_cost_charging_enabled") else 0,
             ),
         )
     retained_reason = "candidate_selected"
