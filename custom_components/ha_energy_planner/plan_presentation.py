@@ -460,14 +460,19 @@ def action_load_forecast_attrs(
 
 
 def latest_forecast_snapshot(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
-    """Return the most recent forecast snapshot for the current plan where possible."""
+    """Return forecast evidence belonging only to the published plan."""
+    plan_id = None if coordinator.data is None else coordinator.data.plan_id
+    if plan_id is None:
+        return {}
     snapshots = coordinator.store.data.get("forecast_snapshots", [])
     if not isinstance(snapshots, list):
         return {}
-    plan_id = None if coordinator.data is None else coordinator.data.plan_id
     for item in reversed(snapshots):
-        if isinstance(item, dict) and (plan_id is None or item.get("plan_id") == plan_id):
+        if isinstance(item, dict) and item.get("plan_id") == plan_id:
             return item
+    retained = getattr(coordinator, "_retained_forecast_snapshot", {})
+    if retained.get("plan_id") == plan_id:
+        return retained
     return {}
 
 

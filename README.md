@@ -20,6 +20,8 @@ Energy Planner reads existing Home Assistant entities and calls their integratio
 - Review mode, per-area controls and guarded Automatic control, with Armed showing actual command authority.
 - Optional on-demand AI Task explanations that remain advisory.
 
+**Current load forecast** keeps the committed plan's value and model evidence visible while the next refresh saves its replacement. The new plan and its forecast appear together, avoiding brief unknown-state pulses in Recorder. Missing or invalid forecast evidence remains explicit; refresh failures and stale-plan safety checks retain their normal behavior.
+
 EV charging waits when the vehicle reports `SUSPENDED_EV` / `SuspendedEV`, including after a planner stop or restart. This does not prove the SOC target was reached. Cached charging reports from before a recorded refusal do not reset the wait. See [vehicle suspension and retry rules](docs/ev-scheduling.md#vehicle-suspension-and-waiting).
 
 Tariff plans retain the provider's UTC boundaries across refreshes, including partial current intervals. Climate calendar entries show planned preconditioning and coast phases; command deadlines appear in their details. Finishing temperatures remain unknown until the relevant heating or cooling rate is ready. HVAC timing and room-feedback edits preserve unrelated controls; changing actuators or global safety settings retains guarded restoration.

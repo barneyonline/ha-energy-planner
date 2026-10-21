@@ -611,6 +611,17 @@ use throughout; the Docker and pull-request gates enforce that result.
   The complementary `current_load_forecast` diagnostic sensor exposes the
   expected load used for the current interval, its conservative upper bound,
   horizon coverage, correction state, model age, and source/fallback health.
+  During refresh persistence, presentation retains one complete snapshot for
+  the still-committed plan when half-hour replay coalescing replaces its bucket.
+  Every lookup requires the published plan ID; no-plan, missing, invalid, stale
+  model and unsafe-input evidence cannot borrow a different plan's forecast.
+  Retention does not extend plan freshness or change command authority, and
+  Home Assistant still marks entities unavailable on refresh failure. The
+  48-hour/128-snapshot replay retention and disk-save behavior are unchanged.
+  Evidence: `tests/test_forecast_publication.py` exercises real Store upserts,
+  immediate and coalesced persistence yields, interval-boundary and background
+  execution listeners, Home Assistant result publication/failure handling,
+  EV connected/disconnected contexts and obsolete-generation rejection.
 - Readiness requires three training days with at least 80% valid buckets per
   day, 80% valid historical coverage, two
   leakage-free holdout origins with at least 144 aligned samples, MAE no more
