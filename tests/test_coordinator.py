@@ -4816,6 +4816,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
     )
 
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.data = None
     coordinator.hass = FakeHass()
     coordinator.entry = FakeEntry({"ev_power_limit_entity": "number.unavailable"} if mapped_power else {},
                                   {"ai_enabled": False})
@@ -8092,6 +8093,7 @@ def _coordinator_for_runtime_services(
     store_data: dict[str, object] | None = None,
 ) -> EnergyPlannerCoordinator:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
+    coordinator.data = None
     coordinator.hass = hass or FakeHass()
     coordinator.entry = FakeEntry(entry_data or {}, options or {})
     coordinator.store = FakeStore(store_data or {})
