@@ -14,6 +14,7 @@ from custom_components.ha_energy_planner.models import (
     InputHealth,
     OccupancyState,
 )
+from custom_components.ha_energy_planner.plan_presentation import plain_action
 from custom_components.ha_energy_planner.planner import DryRunPlanner
 from custom_components.ha_energy_planner.planner_ev import _daylight_preferred_ev_schedule
 
@@ -113,6 +114,31 @@ def test_daylight_selection_evidence_tracks_capacity_revalidation():
     assert not desired["daylight_lowest_cost"]["selected"]
     assert desired["daylight_lowest_cost"]["reason"] == "ev_daylight_candidate_not_selected"
     assert not desired["charging_required_now"]
+
+
+@pytest.mark.parametrize("mode", ["split", "adaptive"])
+def test_combined_daylight_explanation_does_not_claim_cost_neutrality_after_learned_rate_validation(mode):
+    ctx = evening()
+    ctx.daylight_windows = ctx.daylight_windows[:1]
+    ctx.ev_evidence["performance"] = {"aggregate": {"minutes": 60, "soc_per_kwh": 0.6}}
+    for slot in ctx.slots[3:-6]:
+        slot.baseline_load_forecast_upper_kw = 20
+    planned = action(ctx, mode, ev_earliest_start="23:00")
+    desired = planned.desired_state
+    daylight = desired["daylight_lowest_cost"]
+    assert not desired["infeasible"]
+    assert desired["optimization"]["projected_departure_soc"] == 80
+    assert daylight["reason"] == "ev_daylight_lowest_cost_with_ready_by_fallback"
+    assert {row["allocation_source"] for row in desired["allocated_slots"]} == {"daylight", "ready_by_fallback"}
+    assert desired["optimization"]["modelled_incremental_cost"] > daylight["daylight_candidate_cost"]
+    assert daylight["daylight_candidate_cost"] > daylight["ready_by_candidate_cost"]
+    displayed = plain_action(planned)
+    for explanation in (
+        displayed["why"],
+        displayed["desired_state"]["Daylight lowest-cost charging"]["Status"],
+    ):
+        assert "without increasing" not in explanation
+        assert "capacity, readiness and estimated cost" in explanation
 
 
 @pytest.mark.parametrize("effective_price", [None, 0])

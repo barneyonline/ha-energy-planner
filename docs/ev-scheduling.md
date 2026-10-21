@@ -55,8 +55,10 @@ bypass them. A retained cheaper night schedule is valid with daylight enabled.
 Decision evidence reports both seed candidate costs, whether daylight was
 selected, and whether physical and economic validation displaced it. Candidate
 comparisons are modelled estimates; they are not measured savings or proof of
-successful charging. Enabling daylight does
-not require actual solar surplus; surplus already lowers effective cost when
+successful charging. A combined daylight/ready-by explanation does not claim
+cost neutrality: learned charging rates or physical validation can raise the
+final estimate above a seed estimate. Enabling daylight does not require actual
+solar surplus; surplus already lowers effective cost when
 forecast evidence supports it.
 
 ## Charging observations
