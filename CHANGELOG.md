@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep Current load forecast values and model attributes aligned with the committed plan while a refresh replaces its forecast history bucket. Prevent brief unknown-state pulses during successful refreshes without substituting another plan's evidence or hiding missing data and refresh failures.
 
 ### 🔧 Improvements
 
