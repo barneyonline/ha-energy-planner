@@ -116,9 +116,15 @@ def window_key(desired: dict[str, Any]) -> list[Any]:
 
 
 def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = None) -> dict[str, Any]:
-    """Retain one pending window and the last unexecuted expired/withdrawn window."""
+    """Retain one pending window and the last unexecuted window that could run."""
     history = dict(history)
     control = control if isinstance(control, dict) else {}
+    missed = history.get("last_missed", {})
+    # Repair persisted premature replacement reports using their original time,
+    # even when the next refresh is after the scheduled start. Later, untimed
+    # and in-flight attempt evidence must survive an older planning timestamp.
+    if missed.get("reason") == "window_replaced" and _unstarted(missed, missed.get("recorded_at"), control):
+        history.pop("last_missed")
     previous_windows = [history.get(key, {}) for key in ("pending", "last_missed")]
     # Preserve confirmation across overlapping replacements, including after
     # early coast changes the ownership deadline or a late audit predates the
@@ -151,6 +157,13 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
         }
         history["pending"] = pending
         changed = upcoming is None or window_key(upcoming["desired_state"]) != pending["window"]
+        future = _unstarted(pending, now, control)
+        if future and not pending.get("fulfilled") and upcoming is not None:
+            changed = changed or (
+                instant(upcoming["execute_not_before"]) != instant(pending["start"])
+                or (pending.get("preparation") is not None
+                    and _preparation(upcoming["desired_state"]) != pending["preparation"])
+            )
         if upcoming is not None and not changed:
             pending = {**pending, "end": upcoming["desired_state"].get("precondition_end", pending["end"])}
             if pending.get("preparation") is not None:
@@ -162,7 +175,7 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
                 history["pending"] = pending
         end = instant(pending["end"])
         if changed or (now is not None and end is not None and now >= end):
-            if not pending.get("fulfilled"):
+            if not pending.get("fulfilled") and not future:
                 history["last_missed"] = {
                     **pending,
                     "recorded_at": plan["created_at"],
@@ -193,8 +206,11 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
                 previous_start = instant(previous.get("episode_start", previous.get("start")))
                 current_start = instant(history["pending"].get("episode_start", upcoming["execute_not_before"]))
                 if (previous_start is not None and current_start is not None
+                        and (not _unstarted(previous, now, control) or previous_start == current_start)
                         and _same_episode(history["pending"], previous)):
                     history["pending"]["episode_start"] = min(current_start, previous_start).isoformat()
+                    if previous.get("attempt_started") is True:
+                        history["pending"]["attempt_started"] = True
             history["pending"]["fulfilled"] = _confirmed_window(control, history["pending"])
             for record in confirmed:
                 if _same_episode(history["pending"], record):
@@ -202,6 +218,44 @@ def record_plan(history: dict[str, Any], plan: dict[str, Any], control: Any = No
                     history["pending"]["confirmation"] = _confirmation(record, record["attempted_at"])
                     if record.get("last_outcome"):
                         history["pending"]["last_outcome"] = record["last_outcome"]
+    return history
+
+
+def _unstarted(record: dict[str, Any], at: Any, control: dict[str, Any]) -> bool:
+    """Require a future episode without later, untimed or in-flight attempts."""
+    start, evaluated = instant(record.get("episode_start", record.get("start"))), instant(at)
+    outcome = record.get("last_outcome", {})
+    attempted = instant(outcome.get("attempted_at"))
+    return bool(
+        start is not None and evaluated is not None and evaluated < start
+        and (not outcome or (attempted is not None and attempted < start))
+        and record.get("attempt_started") is not True
+        and not _attempt_in_progress(control, record)
+    )
+
+
+def _attempt_in_progress(control: dict[str, Any], record: dict[str, Any]) -> bool:
+    """Keep uncertain acquisition history without treating it as fulfillment."""
+    preparation = _preparation(control)
+    return bool(
+        control.get("main_state") and not control.get("main_state_committed")
+        and control.get("phase") == "preconditioning"
+        and (record.get("preparation") is None or record["preparation"] == preparation)
+        and (
+            window_key(control) == record.get("window")
+            or _same_preparation(record, preparation, control.get("command_confirmation", {}).get("issued_at"))
+        )
+    )
+
+
+def record_acquisition(history: dict[str, Any], control: Any) -> dict[str, Any]:
+    """Retain attempted preparation before rollback can retire ownership."""
+    history = dict(history)
+    control = control if isinstance(control, dict) else {}
+    for key in ("pending", "last_missed"):
+        record = history.get(key, {})
+        if record and _attempt_in_progress(control, record):
+            history[key] = {**record, "attempt_started": True}
     return history
 
 
