@@ -10,13 +10,15 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 import pytest
-from homeassistant.config_entries import ConfigEntry
+from homeassistant import loader
+from homeassistant.config_entries import ConfigEntries, ConfigEntry
 from homeassistant.core import Context, CoreState, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import storage as ha_storage
 from homeassistant.util import dt as dt_util
 
 from custom_components.ha_energy_planner import _rehydrate_ev_grid_reservation, adapter_helpers
+from custom_components.ha_energy_planner.config_flow import INPUT_STEP_CLIMATE, OptionsFlow
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_ZONES,
@@ -1404,4 +1406,52 @@ def test_charge_now_requires_fresh_evidence_during_debounce_cooldown(tmp_path, m
         finally:
             await coordinator.async_shutdown()
             await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("base", [240, 360])
+def test_extended_preconditioning_options_survive_home_assistant_restart(tmp_path, base):
+    """Use HA's entry persistence rather than writing integration or Core storage ourselves."""
+    async def prepare():
+        hass = HomeAssistant(str(tmp_path))
+        loader.async_setup(hass)
+        hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
+        return hass
+
+    async def run():
+        hass = await prepare()
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Lead persistence", data={},
+            options={"hvac_precondition_lead_minutes": 120, "hvac_precondition_max_lead_minutes": 240,
+                     "ev_charge_rate_kw": 5.5},
+            source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        hass.config_entries._entries[entry.entry_id] = entry
+        try:
+            flow = OptionsFlow(entry)
+            flow.hass = hass
+            climate = next(validator for marker, validator in flow._settings_schema().schema.items()
+                           if marker.schema == INPUT_STEP_CLIMATE)
+            submitted = climate({"hvac_precondition_lead_minutes": base,
+                                 "hvac_precondition_max_lead_minutes": base})
+            result = await flow.async_step_settings({INPUT_STEP_CLIMATE: submitted})
+            assert result["type"] == "create_entry"
+            hass.config_entries.async_update_entry(entry, options=result["data"])
+        finally:
+            await hass.async_stop(force=True)
+        restarted = await prepare()
+        try:
+            restored = restarted.config_entries.async_get_entry(entry.entry_id)
+            assert restored is not None
+            assert restored.options["hvac_precondition_lead_minutes"] == base
+            assert restored.options["hvac_precondition_max_lead_minutes"] == base
+            assert restored.options["ev_charge_rate_kw"] == 5.5
+            flow = OptionsFlow(restored)
+            climate = next(validator for marker, validator in flow._settings_schema().schema.items()
+                           if marker.schema == INPUT_STEP_CLIMATE)
+            assert climate({})["hvac_precondition_lead_minutes"] == base
+        finally:
+            await restarted.async_stop(force=True)
     asyncio.run(run())

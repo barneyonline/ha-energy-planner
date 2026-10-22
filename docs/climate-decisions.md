@@ -62,10 +62,23 @@ least 60 minutes from the last 14 days. Individual dated windows and measured-lo
 evidence expire, so one new observation cannot revive old readiness.
 Sensor or topology changes reset incompatible statistics.
 
-The initial lead defaults to **90 minutes**. Existing saved values are preserved.
-Qualified rates extend preparation up to **Maximum learned preconditioning lead**
-(default **180 minutes**). Zero initial lead still disables preconditioning.
-Insufficient evidence uses the initial lead. When a target needs longer than the
+**Base preconditioning lead** accepts **0–360 minutes** and defaults to **90 minutes**.
+Existing saved values are preserved. The base is the fallback duration when the
+relevant heating/cooling rates are not ready or temperature learning is disabled.
+Qualified rates can extend preparation up to **Maximum learned preconditioning lead**
+(default **180 minutes**, configurable up to **360 minutes**). The maximum must be
+at least the base. Raising only the maximum does not lengthen the fallback.
+Zero base lead disables preconditioning.
+
+For a four-hour fallback, set the base to **240** and the learned maximum to
+**240 or higher** in the normal Home Assistant options form. With adequate forecast
+coverage and a qualified 16:00 tariff boundary, this permits a 12:00 start. Price,
+minimum-cycle, comfort, ownership and restoration checks still apply; room targets
+and independent-zone completion are unchanged. More available time does not prove
+that a room will reach its target. Finishing temperatures remain unknown until the
+relevant directional rates are ready, and estimated energy remains estimated.
+
+Insufficient evidence uses the base lead. When a target needs longer than the
 maximum, the fallback policy can use the remaining priced window and report its
 predicted shortfall. Price qualification includes the same expanded window used
 for candidate selection. Both search grids round within the hard maximum, even

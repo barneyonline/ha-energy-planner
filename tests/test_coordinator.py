@@ -10384,7 +10384,8 @@ def test_review_pending_feedback_survives_json_reload_with_activation_proof(monk
 
 
 @pytest.mark.parametrize('key,value', [
-    ('hvac_precondition_lead_minutes', 120), ('hvac_precondition_max_lead_minutes', 240),
+    ('hvac_precondition_lead_minutes', 120), ('hvac_precondition_lead_minutes', 240),
+    ('hvac_precondition_max_lead_minutes', 240),
     ('hvac_thermal_learning_enabled', False), ('hvac_precondition_min_price_delta', .15),
     ('hvac_suppression_min_price_delta', .15), ('hvac_precondition_while_away', True),
     ('hvac_precondition_configured_zones_only', True),
@@ -10393,7 +10394,7 @@ def test_climate_policy_edits_preserve_export_ownership_and_pending_confirmation
     export = {'baseline': {'watts': None}, 'expected': {'watts': 0},
               'pending': {'action_id': 'existing', 'sent_at': 123}}
     coordinator = _coordinator_for_runtime_services(
-        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+        options={CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False, 'hvac_precondition_max_lead_minutes': 360},
         store_data={'production': {'armed': True}, 'ownership': {'enphase_export_limit': export}},
     )
     coordinator.entry.options = {**coordinator.entry.options, key: value}

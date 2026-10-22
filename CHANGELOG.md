@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Support a four-hour base HVAC preconditioning lead through the normal options form. Both base and learned-maximum leads accept 0–360 minutes, with the maximum at least the base. Preserve the 90/180-minute defaults, saved values, zero disabling, and all existing tariff, comfort and execution gates.
 
 ### 🐛 Bug fixes
 

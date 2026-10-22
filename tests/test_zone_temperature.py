@@ -672,3 +672,25 @@ def test_third_review_staggered_load_windows_keep_spacing_and_bound():
     assert all(right-left >= timedelta(minutes=5) for left,right in zip(times,times[1:],strict=False))
     assert rows[-1]['at'] == (NOW+timedelta(minutes=477.5)).isoformat()
     assert not _load_windows(model,NOW+timedelta(days=15))
+
+
+@pytest.mark.parametrize("base", [240, 360])
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+@pytest.mark.parametrize("evidence", ["unready", "opposite_mode", "learning_disabled", "ready"])
+def test_extended_base_lead_preserves_directional_readiness(base, mode, evidence):
+    c = context()
+    model = mature(mode=mode if evidence != "opposite_mode" else ("cool" if mode == "heat" else "heat"))
+    if evidence == "unready":
+        model['sources'][ZONE]['buckets'][mode]['count'] = 11
+    options = {**DEFAULT_OPTIONS, 'hvac_precondition_lead_minutes': base,
+               'hvac_precondition_max_lead_minutes': base,
+               'hvac_thermal_learning_enabled': evidence != "learning_disabled"}
+    details = timing(c, options, mode, model)
+    assert details['effective_lead_minutes'] == base
+    assert details['maximum_lead_minutes'] == base
+    assert details['rates_ready'] is (evidence == "ready")
+    assert details['finishing_temperature_known'] is (evidence == "ready")
+    if evidence != "ready":
+        assert details['required_minutes'] is None
+        assert details['preparation_basis'] == 'configured_fallback'
+        assert details['zones'][ZONE]['predicted_finishing_temperature'] is None
