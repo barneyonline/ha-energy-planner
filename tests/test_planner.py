@@ -4090,3 +4090,57 @@ def test_vehicle_refusal_keeps_confirmed_target_preconditioning_permission():
     assert action.desired_state["keep_charger_on"]
     assert action.desired_state["charging_required_now"]
     assert not action.desired_state["charging_observed"]
+
+
+@pytest.mark.parametrize("lead_minutes", [0, 120, 240, 360])
+@pytest.mark.parametrize("learning_enabled", [True, False])
+def test_configured_base_lead_schedules_full_fallback_before_tariff_boundary(lead_minutes, learning_enabled):
+    """A four-hour base lead permits noon preparation for a 16:00 peak with unready rates."""
+    day = datetime(2026, 10, 23, tzinfo=UTC)
+    context = _context()
+    context.created_at = day + timedelta(hours=9)
+    context.current_ev_soc_percent = None
+    context.current_hvac_mode = "off"
+    context.current_hvac_temperature_c = 21.0  # Head feedback does not replace mapped room feedback.
+    context.current_outdoor_temperature_c = 30.0
+    context.occupied_temperature_low_c, context.occupied_temperature_high_c = 21, 25
+    context.climate_zone_entities = ["climate.main", "climate.bedrooms"]
+    context.climate_inputs = {
+        "power_source_type": "estimated",
+        "thermal_model": {},
+        "zones": {zone: {"temperature_entity": f"sensor.{name}", "temperature": 23.5}
+                  for zone, name in [("climate.main", "main"), ("climate.bedrooms", "bedrooms")]},
+    }
+    context.slots = [DecisionSlot(
+        at := context.created_at + timedelta(minutes=15 * i),
+        .5 if day + timedelta(hours=16) <= at < day + timedelta(hours=18) else .1,
+        .05, 0, 1, outdoor_temperature_forecast_c=30, end_at=at + timedelta(minutes=15),
+    ) for i in range(48)]
+    options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
+               "climate_control_enabled": True, "planning_interval_minutes": 15,
+               "hvac_precondition_lead_minutes": lead_minutes,
+               "hvac_precondition_max_lead_minutes": max(lead_minutes, 180),
+               "hvac_thermal_learning_enabled": learning_enabled}
+    plan = DryRunPlanner(options).create_plan(context)
+    preparation = [a for a in plan.actions if a.desired_state.get("phase") == "preconditioning"]
+    if lead_minutes == 0:
+        assert preparation == []
+        assert plan.device_plans['climate']['preconditioning']['reason'] == 'lead_time_disabled'
+        return
+    assert len(preparation) == 1
+    action = preparation[0]
+    peak = day + timedelta(hours=16)
+    assert action.execute_not_before == peak - timedelta(minutes=lead_minutes)
+    assert action.desired_state['precondition_end'] == peak
+    assert action.desired_state['period_start'] == peak
+    assert action.desired_state['target_temperature'] == 21
+    assert action.desired_state['projected_precondition_end_temperature'] is None
+    explanation = plan.device_plans['climate']['preconditioning']
+    assert explanation['status'] == 'scheduled'
+    assert f'{lead_minutes}-minute fallback' in explanation['summary']
+    details = explanation['thermal_timing']
+    assert details['effective_lead_minutes'] == lead_minutes
+    assert details['rates_ready'] is False
+    assert details['finishing_temperature_known'] is False
+    assert all(row['predicted_finishing_temperature'] is None for row in details['zones'].values())
+    assert context.climate_inputs['power_source_type'] == 'estimated'

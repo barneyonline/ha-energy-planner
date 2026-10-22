@@ -736,6 +736,12 @@ rules:
 # Zone temperature and adaptive timing evidence: zone_temperature.py, thermal_learning.py;
 # tests/test_zone_temperature.py (sensor clocks, per-room coast, independent electrical readiness);
 # tests/test_climate_engine.py (candidate-specific lead bounds); docs/climate-decisions.md.
+# Base lead configuration: const.py/config_flow.py share a 360-minute limit for base and maximum;
+# test_config_flow.py covers 240/240, 360/360, serialized save/reopen, defaults, zero and invalid values.
+# test_control_runtime.py verifies real Core options persistence through restart at 240/240 and 360/360.
+# test_planner.py verifies a genuine noon-to-16:00 unready-rate fallback; test_zone_temperature.py
+# preserves directional readiness and disabled-learning behavior. Defaults remain 90/180 minutes;
+# tariff, comfort, ownership, restoration and measured-energy gates remain in the full Docker gate.
 # Shared electrical evidence: test_third_review_* in tests/test_zone_temperature.py.
 # Independent zone completion: zone_control.py requires explicit registry-matched pairs and installer-verified safe open sets; hvac_adapter.py confirms opens before closures and retains original baselines via hvac_control.py. tests/test_zone_control.py covers directional room completion, dwell, freshness, airflow rejection, feedback, restoration and model isolation. See docs/climate-decisions.md and docs/requirements-audit.md; full validation remains scripts/docker-validate.sh.
 # Zone review regressions: tests/test_zone_control.py verifies durable paired manual supersession, hidden-target retries with retained power, no-op head restoration, Observe release preservation, hold-only economic isolation and confirmed pause timestamps across queued refreshes.
