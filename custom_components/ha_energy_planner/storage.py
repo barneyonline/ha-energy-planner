@@ -17,7 +17,7 @@ from .climate_inputs import instant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
-from .preconditioning import record_outcome, record_plan
+from .preconditioning import record_acquisition, record_outcome, record_plan
 
 _LIST_FIELDS = {
     "ai_recommendations",
@@ -374,6 +374,10 @@ class PlannerStore:
 
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         """Persist planner ownership state."""
+        history = record_acquisition(self.data.get("preconditioning_history", {}), ownership.get("hvac_control"))
+        if history != self.data.get("preconditioning_history", {}):
+            self.data["preconditioning_history"] = history
+            self._mutation_generation += 1
         await self._async_set_if_changed("ownership", ownership)
 
     def async_add_ownership_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
