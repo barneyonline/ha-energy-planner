@@ -1872,8 +1872,10 @@ def test_learning_era_counter_does_not_withhold_first_validated_opportunity():
     assert ctx.climate_engine["observation_cadence_version"] == 1
 
 
-@pytest.mark.parametrize(("interval", "maximum", "expected"), [(5,180,36),(25,180,7),(30,175,5),(60,30,0)])
-def test_economic_candidates_use_shared_learned_lead_limit(monkeypatch,interval,maximum,expected):
+@pytest.mark.parametrize(("interval", "base", "maximum", "expected"), [
+    (5,90,180,36), (25,90,180,7), (30,90,175,5), (60,30,30,0), (5,240,240,48), (5,360,360,72),
+])
+def test_economic_candidates_use_shared_learned_lead_limit(monkeypatch,interval,base,maximum,expected):
     ctx = context()
     ctx.climate_inputs['thermal_model'] = {
         'model_version':3, 'learning_enabled':True, 'sources':{'head':{'buckets':{'heat':{
@@ -1888,7 +1890,7 @@ def test_economic_candidates_use_shared_learned_lead_limit(monkeypatch,interval,
 
     monkeypatch.setattr('custom_components.ha_energy_planner.climate_optimizer.candidate_schedules', capture_slots)
     options = {**DEFAULT_OPTIONS, 'planning_interval_minutes':interval,
-               'hvac_precondition_lead_minutes':min(90,maximum), 'hvac_precondition_max_lead_minutes':maximum}
+               'hvac_precondition_lead_minutes':base, 'hvac_precondition_max_lead_minutes':maximum}
     _, decision = optimise(ctx, options, simulation_model())
     assert leads == [expected]
     assert decision['thermal_timing']['heat']['effective_lead_minutes'] == maximum
