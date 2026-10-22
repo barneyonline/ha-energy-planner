@@ -91,6 +91,8 @@ from custom_components.ha_energy_planner.const import (
     CONF_HOUSEHOLD_LOAD,
     CONF_HOUSEHOLD_LOAD_OUTAGE_GRACE_MINUTES,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    CONF_HVAC_PRECONDITION_LEAD_MINUTES,
+    CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES,
     CONF_INSTANCE_NAME,
     CONF_PERSON_ENTITIES,
     CONF_PLAN_FALLBACK_NOTIFICATIONS_ENABLED,
@@ -1952,3 +1954,62 @@ def test_validate_config_rejects_momentary_primary_charger_control(domain) -> No
     entity = f"{domain}.charger"
     hass.states.entity_ids.add(entity)
     assert _validate_config(hass, {CONF_EV_CHARGER: entity})[CONF_EV_CHARGER] == "invalid_entity_domain"
+
+
+@pytest.mark.parametrize(("base", "maximum"), [(0, 0), (0, 360), (90, 180), (120, 240), (240, 240), (360, 360)])
+def test_preconditioning_leads_save_and_reopen_through_options_form(tmp_path, base, maximum):
+    """Validate the actual selectors, save payload, and persisted options on reopen."""
+    entry = SimpleNamespace(data={}, options={CONF_EV_CHARGE_RATE_KW: 5.5})
+    flow = OptionsFlow(entry)
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    climate = next(validator for marker, validator in flow._settings_schema().schema.items()
+                   if marker.schema == INPUT_STEP_CLIMATE)
+    submitted = climate({CONF_HVAC_PRECONDITION_LEAD_MINUTES: base,
+                         CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES: maximum})
+    assert _validate_options({**DEFAULT_OPTIONS, **submitted}) == {}
+    result = asyncio.run(flow.async_step_settings({INPUT_STEP_CLIMATE: submitted}))
+    assert result["type"] == "create_entry"
+    assert result["data"][CONF_EV_CHARGE_RATE_KW] == 5.5
+    saved = tmp_path / "options.json"
+    saved.write_text(json.dumps(result["data"]))
+    entry.options = json.loads(saved.read_text())
+    reopened = OptionsFlow(entry)
+    form = _settings_submission(reopened)
+    assert form[INPUT_STEP_CLIMATE][CONF_HVAC_PRECONDITION_LEAD_MINUTES] == base
+    assert form[INPUT_STEP_CLIMATE][CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES] == maximum
+    reopened.hass = flow.hass
+    # Saving another section preserves the persisted climate policy.
+    again = asyncio.run(reopened.async_step_settings({POLICY_STEP_PRIORITIES: form[POLICY_STEP_PRIORITIES]}))
+    assert again["data"][CONF_HVAC_PRECONDITION_LEAD_MINUTES] == base
+    assert again["data"][CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES] == maximum
+
+
+def test_preconditioning_lead_defaults_remain_unchanged_on_unrelated_options_save():
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    result = asyncio.run(flow.async_step_settings({}))
+    assert result["data"][CONF_HVAC_PRECONDITION_LEAD_MINUTES] == 90
+    assert result["data"][CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES] == 180
+
+
+@pytest.mark.parametrize(("base", "maximum"), [
+    (240, 180), (360, 240), (-5, 180), (90, -5), (361, 361), (90, 361),
+    (float("nan"), 240), (240, float("nan")), (float("inf"), 360), (90, float("inf")),
+    (float("-inf"), 180), (None, 180), (90, "invalid"),
+])
+def test_preconditioning_lead_backend_rejects_invalid_form_submissions(base, maximum):
+    flow = OptionsFlow(SimpleNamespace(data={}, options={}))
+    flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+    result = asyncio.run(flow.async_step_settings({INPUT_STEP_CLIMATE: {
+        CONF_HVAC_PRECONDITION_LEAD_MINUTES: base, CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES: maximum,
+    }}))
+    assert result["type"] == "form"
+    assert result["errors"] == {"base": "invalid_precondition_lead"}
+    assert flow._options == {}
+
+
+@pytest.mark.parametrize("field", [CONF_HVAC_PRECONDITION_LEAD_MINUTES, CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES])
+@pytest.mark.parametrize("value", [-5, 365])
+def test_preconditioning_lead_selectors_reject_out_of_range_values(field, value):
+    with pytest.raises(vol.Invalid):
+        config_flow_module._option_selector(field)(value)

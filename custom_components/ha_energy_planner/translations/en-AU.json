@@ -260,7 +260,7 @@
               "person_entities": "People",
               "occupied_temperature_tolerance_percent": "Occupied temperature tolerance",
               "hvac_suppression_min_price_delta": "HVAC suppression price delta",
-              "hvac_precondition_lead_minutes": "HVAC precondition lead time",
+              "hvac_precondition_lead_minutes": "Base preconditioning lead (minutes)",
               "hvac_precondition_min_price_delta": "HVAC precondition price delta",
               "hvac_precondition_configured_zones_only": "Synchronise configured zone temperatures",
               "hvac_precondition_while_away": "Precondition while away",
@@ -295,7 +295,7 @@
               "person_entities": "Person entities used to infer occupied or away state.",
               "occupied_temperature_tolerance_percent": "Allowed comfort-band widening while the home is occupied.",
               "hvac_suppression_min_price_delta": "Minimum price difference before the planner suppresses HVAC usage.",
-              "hvac_precondition_lead_minutes": "Initial lead before rates are ready; defaults to 90 minutes. Zero disables preconditioning.",
+              "hvac_precondition_lead_minutes": "Base duration when heating/cooling rates are not ready or temperature learning is disabled. Choose 0–360 minutes; defaults to 90. Zero disables preconditioning. For four hours, set 240 and a learned maximum of at least 240.",
               "hvac_precondition_min_price_delta": "Minimum price difference required before HVAC preconditioning is considered worthwhile.",
               "hvac_precondition_configured_zones_only": "After applying and confirming each tariff preconditioning and coast target on the main Daikin thermostat, apply the same target to configured zone climate entities. Leave disabled to keep zone climate targets unchanged while still controlling zone switches or helpers.",
               "hvac_precondition_while_away": "Allow tariff-driven preconditioning while every configured person is away. Leave off to retain the conservative occupied-only policy.",
@@ -313,7 +313,7 @@
               "hvac_zone_control": "Optional object with explicit switch-to-thermostat pairs and safe_open_sets verified against manufacturer or installer minimum airflow. Every configured zone must be paired on the same registered controller. See the climate documentation before enabling.",
               "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration.",
               "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated.",
-              "hvac_precondition_max_lead_minutes": "Allow learned rates to start earlier, up to this limit. Defaults to 180 minutes.",
+              "hvac_precondition_max_lead_minutes": "Allow ready heating/cooling rates to extend the base lead up to this limit (0–360 minutes). Must be at least the base lead; defaults to 180. Raising only this maximum does not extend the fallback duration.",
               "hvac_thermal_learning_enabled": "Collect room temperature trends and use qualified heating/cooling rates for timing. This does not enable measured-energy savings."
             }
           },
@@ -599,7 +599,7 @@
       "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes.",
       "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported.",
       "invalid_unit": "Select an existing Celsius or Fahrenheit temperature sensor.",
-      "invalid_precondition_lead": "The maximum learned lead must be at least the initial lead and no greater than 360 minutes."
+      "invalid_precondition_lead": "Both preconditioning leads must be finite values from 0 to 360 minutes, and the maximum learned lead must be at least the base lead."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",

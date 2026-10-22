@@ -147,6 +147,7 @@ from .const import (
     DEFAULT_ENPHASE_SELF_CONSUMPTION_PROFILE,
     DEFAULT_OPTIONS,
     DOMAIN,
+    HVAC_PRECONDITION_LEAD_LIMIT_MINUTES,
     INTEGRATION_NAME,
 )
 from .entry_data import combined_entry_data
@@ -640,10 +641,10 @@ def _option_selector(field: str) -> Any:
         ),
         CONF_HVAC_THERMAL_LEARNING_ENABLED: BooleanSelector(),
         CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES: NumberSelector(
-            NumberSelectorConfig(min=0, max=360, step=5, mode=NumberSelectorMode.BOX)
+            NumberSelectorConfig(min=0, max=HVAC_PRECONDITION_LEAD_LIMIT_MINUTES, step=5, mode=NumberSelectorMode.BOX)
         ),
         CONF_HVAC_PRECONDITION_LEAD_MINUTES: NumberSelector(
-            NumberSelectorConfig(min=0, max=120, step=5, mode=NumberSelectorMode.BOX)
+            NumberSelectorConfig(min=0, max=HVAC_PRECONDITION_LEAD_LIMIT_MINUTES, step=5, mode=NumberSelectorMode.BOX)
         ),
         CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: NumberSelector(
             NumberSelectorConfig(min=0, max=5, step=0.01, mode=NumberSelectorMode.BOX)
@@ -1233,7 +1234,12 @@ def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
         errors[CONF_LOAD_RECOVERY_MAX_AGE_MINUTES] = "invalid_load_recovery_age"
     lead = finite(user_input.get(CONF_HVAC_PRECONDITION_LEAD_MINUTES, 90))
     maximum = finite(user_input.get(CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES, 180))
-    if lead is None or maximum is None or not 0 <= lead <= 120 or not 0 <= maximum <= 360 or maximum < lead:
+    if (
+        lead is None or maximum is None
+        or not 0 <= lead <= HVAC_PRECONDITION_LEAD_LIMIT_MINUTES
+        or not 0 <= maximum <= HVAC_PRECONDITION_LEAD_LIMIT_MINUTES
+        or maximum < lead
+    ):
         errors[CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES] = "invalid_precondition_lead"
     for key, default in EV_DEFAULTS.items():
         if isinstance(default, (int, float)) and key in user_input:
