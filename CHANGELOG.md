@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep future preconditioning replacements pending and remove cancelled future windows without reporting a missed execution. Clear persisted premature replacement reports only when later, untimed or matching acquisition evidence is absent; preserve actual failures across older planning snapshots, rollback and reloads. Acquisition-start reporting persists with provisional ownership until the outcome arrives without proving fulfillment. Execution confirmation and genuine missed-window evidence remain required.
 
 ### 🔧 Improvements
 
