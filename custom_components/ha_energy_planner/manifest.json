@@ -1,6 +1,9 @@
 {
   "domain": "ha_energy_planner",
   "name": "Energy Planner",
+  "categories": [
+    "energy"
+  ],
   "codeowners": [
     "@barneyonline"
   ],
