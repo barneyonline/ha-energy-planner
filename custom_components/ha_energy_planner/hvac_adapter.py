@@ -15,6 +15,7 @@ from homeassistant.helpers.entity_component import async_update_entity
 from homeassistant.util import dt as dt_util
 
 from .adapter_helpers import async_call_device_service, available_state, zone_temperature_sync_deferred
+from .climate_inputs import finite
 from .const import (
     CONF_CLIMATE_AUTOMATIONS,
     CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
@@ -97,8 +98,19 @@ class DaikinHVACAdapter:
 
     def _zone_control_rejection(self) -> str | None:
         from .zone_control import live_rejection
-        return live_rejection(self.hass, self.entry_data, self._zone_options, self._zone_desired,
-                              self._zone_baseline, dt_util.utcnow())
+        rejection = live_rejection(self.hass, self.entry_data, self._zone_options, self._zone_desired,
+                                   self._zone_baseline, dt_util.utcnow())
+        if rejection is None and self._zone_desired.get("equipment_compensation"):
+            head_id = str(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+            head = self._state(head_id)
+            # Mode-specific target limits can change on wake or mode selection.
+            # Check availability before activation; validate the exact target in
+            # confirmed cooling feedback before any temperature write.
+            if (head is None or "cool" not in (head.attributes.get("hvac_modes") or [])
+                    or (head.state == "cool" and not self._equipment_target_available(
+                        head_id, self._zone_desired.get("target_temperature")))):
+                return "zone_equipment_capability_unavailable"
+        return rejection
 
     def _independent_pairs(self) -> dict[str, str]:
         from .zone_control import topology
@@ -128,6 +140,30 @@ class DaikinHVACAdapter:
                 remaining.add(entity_id)
             if not any(remaining == set(row) for row in config["safe_open_sets"]):
                 raise _HVACStateConfirmationError("remaining airflow is not verified")
+
+    def _equipment_target_available(self, entity_id: str, target: Any) -> bool:
+        """Require exact live bounds/step, with no silent setpoint rounding."""
+        state = self._state(entity_id)
+        attrs = state.attributes if state is not None else {}
+        value, low, high, step = (finite(value) for value in (
+            target, attrs.get("min_temp"), attrs.get("max_temp"), attrs.get("target_temp_step")))
+        if (value is None or low is None or high is None or step is None or step <= 0
+                or not low <= value <= high or abs((value - low) / step - round((value - low) / step)) > 1e-6):
+            return False
+        head_id = str(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+        if entity_id != head_id:
+            head = self._state(head_id)
+            head_target = finite(head.attributes.get("temperature")) if head is not None else None
+            return (head is not None and head.state == "cool" and head_target is not None
+                    and head_target == self._zone_desired.get("target_temperature")
+                    and abs(value - head_target) <= 2)
+        return True
+
+    def _assert_equipment_command(self, service: str, data: dict[str, Any]) -> None:
+        """Recheck capabilities after each await at compensated command boundaries."""
+        entity = str(data.get(ATTR_ENTITY_ID))
+        if service == "set_temperature" and not self._equipment_target_available(entity, data.get("temperature")):
+            raise _HVACStateConfirmationError("equipment target is outside live bounds or step")
 
     def set_confirmation_persistence_callback(
         self, callback: Callable[[dict[str, Any] | None], Awaitable[None]],
@@ -161,6 +197,8 @@ class DaikinHVACAdapter:
             # zone, but a main or sibling override cannot block its restoration.
             self._climate_override_policy[entity_id] = (respect_manual_override, True)
         self._assert_zone_airflow(domain, service, data)
+        if domain == "climate" and respect_manual_override and self._zone_desired.get("equipment_compensation"):
+            self._assert_equipment_command(service, data)
         if domain != "climate" and (
             domain == "automation" or entity_id in self._zone_entities()
         ) and entity_id != self.entry_data.get(CONF_CLIMATE_CHANGE_FROM_SCHEDULER):
@@ -229,6 +267,9 @@ class DaikinHVACAdapter:
                 if respect_manual_override and self._zone_control_rejection() is not None:
                     raise _HVACStateConfirmationError("zone evidence changed during intent persistence")
                 self._assert_zone_airflow(domain, service, data)
+                if (domain == "climate" and respect_manual_override
+                        and self._zone_desired.get("equipment_compensation")):
+                    self._assert_equipment_command(service, data)
             except BaseException:  # Cancellation before dispatch is an unsent intent too.
                 # This intent never reached the service bus. Retire superseded
                 # baselines first so a crash cannot replay a stale user target,
@@ -1949,6 +1990,12 @@ class DaikinHVACAdapter:
                         self._set_coupled_zone_feedback_expected(None, None, None)
 
         observed = self._state(entity_id) or observed
+        if (desired_temperature is not None and respect_manual_override
+                and self._zone_desired.get("equipment_compensation")
+                and not await self._async_wait_for_climate(
+                    entity_id, lambda state: self._equipment_target_available(entity_id, desired_temperature),
+                )):
+            raise _HVACStateConfirmationError("equipment target bounds were not confirmed")
         if desired_temperature is not None and (force or not _temperature_matches(observed, desired_temperature)):
             command_sent = True
             await self._async_command(

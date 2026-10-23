@@ -366,7 +366,8 @@ def _preparation(desired: dict[str, Any]) -> dict[str, Any] | None:
     """Describe a legacy preparation without changing the control lifecycle ID."""
     configuration = desired.get("configuration_identity")
     mode = desired.get("hvac_mode", desired.get("mode"))
-    target = finite(desired.get("target_temperature", desired.get("precondition_target")))
+    target = finite(desired.get("precondition_target") if desired.get("equipment_compensation")
+                    else desired.get("target_temperature", desired.get("precondition_target")))
     peak = instant(desired.get("period_start"))
     deadline = instant(desired.get("precondition_end"))
     if (
