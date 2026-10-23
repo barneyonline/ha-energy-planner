@@ -92,6 +92,13 @@ def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, An
                               or room.get("temperature_source", {}).get("fresh") is not True for room in mapped)
                 or len({(room["temperature_entity"], *bounds(context, room)) for room in mapped}) != 1):
             return {"supported": False, "reason": "zone_mapping_missing_or_ambiguous"}
+        offsets = {finite(room["cooling_equipment_offset_c"]) for room in mapped
+                   if "cooling_equipment_offset_c" in room}
+        if (len(offsets) > 1 or None in offsets
+                or any(value is not None and (not -2 <= value <= 0 or value * 2 != int(value * 2))
+                       for value in offsets)):
+            return {"supported": False, "reason": "zone_equipment_offset_invalid"}
+        offset = next(iter(offsets), 0) or 0
         room = mapped[0]
         low, high = bounds(context, room)
         if low is None or high is None or low >= high:
@@ -113,11 +120,12 @@ def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, An
                        else "hysteresis" if not margin else None)
         stopped = reached or bool(blocker)
         power[actuator] = "off" if stopped else "on"
-        targets[climate] = limit
+        targets[climate] = limit + offset if mode == "cool" else limit
         rows[actuator] = {
             "status": "paused" if stopped else "active", "thermostat": climate,
             "temperature_entity": room["temperature_entity"], "temperature": value,
             "temperature_source": room["temperature_source"], "target": limit,
+            "equipment_target": targets[climate], "cooling_equipment_offset_c": offset,
             "hysteresis_c": HYSTERESIS_C, "restart_blocker": blocker,
             "paused_at": (paused_at or context.created_at).isoformat() if stopped else None,
             "restart_not_before": restart_at.isoformat() if restart_at else None,
@@ -148,8 +156,18 @@ def desired_fields(context: DecisionContext, mode: str, target: float, phase: st
         # restore/release still owns every original target and power baseline.
         return {"zone_intent": intent, "zone_stop": True, "hvac_mode": "off", "power": "off",
                 "enable_zones": False, "target_temperature": None}
+    equipment = {}
+    if mode == "cool" and any(row["cooling_equipment_offset_c"] for row in intent["zones"].values()):
+        active_targets = [intent["targets"][intent["pairs"][actuator]]
+                          for actuator, power in intent["power"].items() if power == "on"]
+        # Keep the shared head demanding at the lowest equipment target.
+        # Every active subordinate must fit Daikin's head +/-2 C range.
+        head_target = min(active_targets)
+        if max(active_targets) - head_target > 2:
+            return {"zone_control_blocked": "zone_equipment_range_incompatible"}
+        equipment = {"target_temperature": head_target, "equipment_compensation": True}
     return {"zone_intent": intent, "zone_power": intent["power"], "zone_targets": intent["targets"],
-            "configured_zones_only": True}
+            "configured_zones_only": True, **equipment}
 
 
 def live_rejection(hass: Any, data: dict[str, Any], options: dict[str, Any], desired: dict[str, Any],
@@ -159,6 +177,10 @@ def live_rejection(hass: Any, data: dict[str, Any], options: dict[str, Any], des
 
     if desired.get("zone_control_blocked"):
         return str(desired["zone_control_blocked"])
+    if desired.get("equipment_compensation") and (
+        not desired.get("zone_intent") or desired.get("zone_stop") or desired.get("mode") != "cool"
+    ):
+        return "zone_equipment_intent_invalid"
     if not desired.get("zone_intent") or desired.get("zone_stop"):
         return None
     inputs = read_climate_inputs(hass, data, options, now, now + timedelta(hours=12), {})
@@ -176,4 +198,12 @@ def live_rejection(hass: Any, data: dict[str, Any], options: dict[str, Any], des
         return str(current["reason"])
     if any(current.get(key) != desired["zone_intent"].get(key) for key in ("power", "targets", "pairs")):
         return "zone_intent_superseded"
+    fields = desired_fields(context, str(desired.get("mode")), float(desired["precondition_target"]),
+                            "preconditioning")
+    if fields.get("zone_control_blocked"):
+        return str(fields["zone_control_blocked"])
+    if fields.get("equipment_compensation") and any(
+        desired.get(key) != fields.get(key) for key in ("target_temperature", "equipment_compensation")
+    ):
+        return "zone_equipment_target_superseded"
     return None

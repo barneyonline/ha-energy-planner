@@ -168,6 +168,9 @@ def action_sentence(action: PlanAction) -> str:
         mode = display_state(desired.get("hvac_mode", "climate"))
         target = desired.get("target_temperature")
         if target is not None:
+            if desired.get("equipment_compensation") and desired.get("precondition_target") is not None:
+                return (f"Cool with a room preparation target of {float(desired['precondition_target']):g} C "
+                        f"and shared equipment at {float(target):g} C.")
             return f"Set climate to {mode} at {target} C."
         return f"Set climate to {mode}."
     if action.kind == ActionKind.RELEASE_HVAC:

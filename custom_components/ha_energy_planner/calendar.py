@@ -498,7 +498,9 @@ def _calendar_event(action: PlanAction, coordinator: EnergyPlannerCoordinator) -
             boundary = _calendar_datetime(action.desired_state.get(phase_end))
             if boundary is not None and boundary > start:
                 end = boundary
-            target = action.desired_state.get("target_temperature")
+            target = (action.desired_state.get("precondition_target")
+                      if phase == "preconditioning" and action.desired_state.get("equipment_compensation")
+                      else action.desired_state.get("target_temperature"))
             if target is not None:
                 label = ("Pre-heat" if action.desired_state.get("hvac_mode") == "heat" else "Pre-cool"
                          ) if phase == "preconditioning" else "Coast"

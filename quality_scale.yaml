@@ -754,3 +754,21 @@ rules:
 # Manual head supersession: deferred pair recovery under an already-active head preserves its current mode/target and emits only explicitly owned zone commands (tests/test_zone_control.py).
 # Bounded pair exposure: tests/test_zone_control.py verifies that invalid/incompatible targets and already-restored targets do not reopen closed actuators, including mixed eligible/blocked pairs and later compatible readback.
 # Subset fallback eligibility: tests/test_zone_control.py rejects new away-preconditioning candidates after economic activation in Automatic/Observe while preserving initial fallback, existing tariff cycles and explicit Legacy policy.
+
+# Equipment compensation and retained thermal evidence: config_flow.py/climate_inputs.py
+# validate paired bounded offsets; zone_control.py separates room/equipment goals and
+# compatible shared-head targets; constraints.py verifies room authority; hvac_adapter.py
+# rechecks live mode/bounds/step before confirmed sequential writes and after persistence.
+# thermal_learning.py retains bounded source evidence across transitions/reload while
+# selecting matching physical regimes. tests/test_hvac_equipment_learning.py proves
+# Main 19 equipment vs 21 room, unchanged Bedrooms/heating, pause/restart, hidden targets,
+# restore/manual boundaries and real PlannerStore save/load, regime reuse and invalidation.
+# Existing threshold/expiry and full scripts/docker-validate.sh gates remain unchanged.
+
+# Review evidence: tests/test_hvac_equipment_learning.py exercises offset read/save
+# from either paired alias and room-goal/equipment-target separation in calendar.py
+# and plan_presentation.py, with no changes to commands or comfort bounds.
+
+# Mode-specific compensation limits: tests/test_hvac_equipment_learning.py verifies
+# heat/off-to-cool transitions validate the exact target after mode confirmation,
+# reject invalid cooling bounds before the target write and preserve restoration.

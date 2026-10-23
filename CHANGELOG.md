@@ -9,10 +9,14 @@
 ### ✨ New features
 
 - Support a four-hour base HVAC preconditioning lead through the normal options form. Both base and learned-maximum leads accept 0–360 minutes, with the maximum at least the base. Preserve the 90/180-minute defaults, saved values, zero disabling, and all existing tariff, comfort and execution gates.
+- Add bounded per-zone cooling equipment compensation for explicitly verified independent zones. Keep room comfort goals separate from equipment targets, derive a compatible shared-head target, and confirm live capabilities and sequential target writes before applying compensation.
 
 ### 🐛 Bug fixes
 
 - Keep future preconditioning replacements pending and remove cancelled future windows without reporting a missed execution. Clear persisted premature replacement reports only when later, untimed or matching acquisition evidence is absent; preserve actual failures across older planning snapshots, rollback and reloads. Acquisition-start reporting persists with provisional ownership until the outcome arrives without proving fulfillment. Execution confirmation and genuine missed-window evidence remain required.
+- Validate compensated cooling targets against confirmed cooling-mode bounds and steps, allowing supported mode changes or an off head's remembered mode without applying the previous mode's limits to the new target.
+- Preserve an equipment offset stored on either paired zone alias when opening and saving the compensation form, and keep room goals separate from equipment targets in calendar and action descriptions.
+- Preserve compatible thermal-learning evidence across normal zone closures, reopenings and reloads. Separate static source identity from stable airflow/equipment regimes; reject windows spanning a transition without deleting previous evidence, and select only evidence for the current regime.
 
 ### 🔧 Improvements
 
