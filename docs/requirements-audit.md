@@ -84,6 +84,11 @@ use throughout; the Docker and pull-request gates enforce that result.
   `tests/test_config_flow.py` covers both marker paths, independent toggle
   conditions, omitted values, repeated disable/enable edits, and new-API
   serialization/validation (the latter requires a supporting HA runtime).
+  `tests/test_conditional_ev_options_runtime.py` exercises complete forms through
+  HA's options manager, including default injection, stale hidden submissions,
+  persisted values on reopen, independent thresholds and the fallback schema.
+  These runtime checks await a permitted environment; source-contract checks
+  alone do not verify the options manager or browser behavior.
   The manifest classifies Energy Planner as a service integration so configured
   entries remain visible on the main Devices & services integration page rather
   than being routed to the Helpers-only experience.
