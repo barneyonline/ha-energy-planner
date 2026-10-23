@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import probatio as vol
-from homeassistant import config_entries
+from homeassistant import config_entries, data_entry_flow
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import SectionConfig, section
 from homeassistant.helpers import config_validation as cv
@@ -531,6 +531,11 @@ _SETTINGS_SECTION_OPTION_FIELDS = {
 
 _SETTINGS_SECTION_ORDER = tuple(_SETTINGS_SECTION_INPUT_TYPES)
 
+_OPTION_VISIBLE_WHEN_ENABLED = {
+    CONF_EV_MAX_IMPORT_PRICE: CONF_EV_PRICE_LIMIT_ENABLED,
+    CONF_EV_LOW_PRICE_THRESHOLD: CONF_EV_LOW_PRICE_CHARGING_ENABLED,
+}
+
 
 def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) -> vol.Schema:
     """Return an options schema for a policy section."""
@@ -543,7 +548,17 @@ def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) ->
             index = _PRIORITY_FORM_FIELDS.index(field)
             schema[vol.Required(field, default=priority_values[index])] = _priority_selector()
             continue
-        schema[vol.Required(field, default=merged[field])] = _option_selector(field)
+        marker = vol.Required(field, default=merged[field])
+        required = getattr(data_entry_flow, "Required", None)
+        # Before HA 2026.11 this name may be absent or refer to typing.Required.
+        if (field in _OPTION_VISIBLE_WHEN_ENABLED
+                and isinstance(required, type) and issubclass(required, vol.Required)):
+            marker = required(
+                field,
+                default=merged[field],
+                visible={"field": _OPTION_VISIBLE_WHEN_ENABLED[field], "value": True},
+            )
+        schema[marker] = _option_selector(field)
     return vol.Schema(schema)
 
 
