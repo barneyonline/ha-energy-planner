@@ -232,7 +232,7 @@
               "hvac_maximum_humidity": "Optional humidity ceiling in percent; requires a validated humidity model.",
               "hvac_irradiance_entity": "Optional irradiance sensor in W/m² for thermal learning.",
               "hvac_irradiance_forecast_entity": "Optional forecast sensor with issued_at and timestamped valid_at/irradiance points in W/m².",
-              "hvac_zone_mappings": "Map configured zone entity IDs to temperature, humidity, presence, low/high helper IDs and optional maximum_humidity.",
+              "hvac_zone_mappings": "Map configured zone entity IDs to temperature, humidity, presence, low/high helper IDs and optional maximum_humidity. Optional cooling_equipment_offset_c (−2 to 0 in 0.5°C steps) compensates equipment feedback without changing room goals; requires independent zone control.",
               "hvac_zone_control": "Optional object with explicit switch-to-thermostat pairs and safe_open_sets verified against manufacturer or installer minimum airflow. Every configured zone must be paired on the same registered controller. See the climate documentation before enabling.",
               "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration.",
               "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated.",
@@ -427,7 +427,8 @@
           "add_vehicle": "Add vehicle",
           "edit_vehicle": "Edit vehicle",
           "remove_vehicle": "Remove vehicle",
-          "zone_temperatures": "Zone temperatures"
+          "zone_temperatures": "Zone temperatures",
+          "zone_equipment": "Cooling equipment compensation"
         }
       },
       "add_vehicle": {
@@ -504,6 +505,10 @@
       "zone_temperatures": {
         "title": "Zone temperatures",
         "description": "Choose one temperature sensor for each zone. An existing average helper can represent several rooms. Leave empty to retain Daikin feedback. Selecting a sensor does not turn the zone on."
+      },
+      "zone_equipment": {
+        "title": "Cooling equipment compensation",
+        "description": "Equipment offset in °C (−2 to 0; default 0) for each physical zone. Room comfort goals and heating stay unchanged. Requires verified independent zone pairs and safe airflow. Main −2 with a 21°C room goal commands 19°C equipment; Bedrooms 0 commands 21°C. Paired aliases are updated together. Incompatible live bounds, steps or modes block control. This does not guarantee the room will reach its goal."
       }
     },
     "error": {

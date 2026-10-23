@@ -131,16 +131,29 @@ def validate_climate_config(data: dict[str, Any]) -> dict[str, str]:
             if (
                 entity not in configured
                 or not isinstance(mapping, dict)
-                or set(mapping) - {*domains, "maximum_humidity"}
+                or set(mapping) - {*domains, "maximum_humidity", "cooling_equipment_offset_c"}
             ):
                 errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
                 continue
             for key, value in mapping.items():
-                if key == "maximum_humidity":
+                if key == "cooling_equipment_offset_c":
+                    offset = finite(value)
+                    if (isinstance(value, bool) or offset is None or not -2 <= offset <= 0
+                            or offset * 2 != int(offset * 2)):
+                        errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
+                elif key == "maximum_humidity":
                     if finite(value) is None or not 0 < float(value) <= 100:
                         errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
                 elif not isinstance(value, str) or value.split(".")[0] not in domains[key]:
                     errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
+        offsets = {key: row["cooling_equipment_offset_c"] for key, row in zones.items()
+                   if isinstance(row, dict) and "cooling_equipment_offset_c" in row}
+        config = topology(data)
+        if any(finite(value) != 0 for value in offsets.values()) and not config.get("supported"):
+            errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
+        for actuator, climate in config.get("pairs", {}).items():
+            if actuator in offsets and climate in offsets and offsets[actuator] != offsets[climate]:
+                errors[CONF_HVAC_ZONE_MAPPINGS] = "invalid_climate_configuration"
     return errors
 
 
@@ -258,6 +271,8 @@ def read_climate_inputs(
                 "high_entity": mapping.get("high"),
                 "occupied": (presence.state == "on") if presence and presence.state in {"on", "off"} else None,
                 "maximum_humidity": finite(mapping.get("maximum_humidity")),
+                **({"cooling_equipment_offset_c": finite(mapping["cooling_equipment_offset_c"])}
+                   if "cooling_equipment_offset_c" in mapping else {}),
                 "enabled": bool(zone and zone.state not in {"off", "unknown", "unavailable"}),
             }
     forecast: list[dict[str, Any]] = []

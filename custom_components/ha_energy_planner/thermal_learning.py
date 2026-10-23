@@ -37,13 +37,21 @@ def sample(context: DecisionContext, options: dict[str, Any], states: Any, head:
         reported = getattr(state, "last_reported", getattr(state, "last_updated", None))
         topology = context.climate_inputs.get("zone_topology", {})
         transition = instant(context.hvac_control.get("zone_transition_at"))
-        regime = ({"power": {key: getattr(states.get(key), "state", None) for key in sorted(topology.get("pairs", {}))},
-                   "transition_at": transition.isoformat() if transition is not None else None}
-                  if topology.get("supported") else None)
+        # Static source identity must survive normal damper cycling and reload.
+        # Old transient identities cannot be safely migrated to a stable regime.
+        static = (sorted(topology.get("pairs", {}).items()),
+                  sorted(tuple(sorted(row)) for row in topology.get("safe_open_sets", [])))
         source_identity = (entity, head, sorted(context.climate_zone_entities))
-        identity = sha256(str(
-            (*source_identity, regime) if regime is not None else source_identity
-        ).encode()).hexdigest()[:24]
+        identity = sha256(str((*source_identity, static) if topology.get("supported")
+                              else source_identity).encode()).hexdigest()[:24]
+        regime = None
+        if topology.get("supported"):
+            controls = [head, *sorted(topology["pairs"]), *sorted(
+                climate for actuator, climate in topology["pairs"].items()
+                if getattr(states.get(actuator), "state", None) == "on")]
+            regime = sha256(str([(key, getattr(states.get(key), "state", None),
+                                  finite(getattr(states.get(key), "attributes", {}).get("temperature")))
+                                 for key in controls]).encode()).hexdigest()[:24]
         actuator = states.get(zone) if zone != "head" else states.get(head)
         actuator_state = getattr(actuator, "state", "unknown")
         zone_mode = context.current_hvac_mode
@@ -55,7 +63,9 @@ def sample(context: DecisionContext, options: dict[str, Any], states: Any, head:
               and context.current_hvac_power_kw is not None and context.current_hvac_power_kw < 0.1):
             zone_mode = "idle"
         readings[zone] = {
-            "identity": identity, "sensor": entity, "temperature": room.get("temperature"),
+            "identity": identity, "regime": regime,
+            "transition_at": transition.isoformat() if transition is not None else None,
+            "sensor": entity, "temperature": room.get("temperature"),
             "input_status": room.get("temperature_source", {}).get("status"), "mode": zone_mode,
             "reported_at": reported.isoformat() if reported else None,
         }
@@ -88,7 +98,7 @@ def update(model: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
         item = result["sources"].setdefault(zone, {})
         if item.get("identity") != reading["identity"]:
             item = result["sources"][zone] = {"identity": reading["identity"], "buckets": {}, "rejected": {}}
-        item.update(sensor=reading.get("sensor"), temperature=reading.get("temperature"),
+        item.update(regime=reading.get("regime"), sensor=reading.get("sensor"), temperature=reading.get("temperature"),
                     reported_at=reading.get("reported_at"), input_status=reading.get("input_status"))
         point = {**current, **reading, "observed_at": current.get("at")}
         point.pop("sources", None)
@@ -109,7 +119,7 @@ def update(model: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
             elapsed = (now - observed_before).total_seconds() / 60
             if elapsed <= 0 or elapsed > 30.5:
                 reason = "sampling_gap"
-            elif any(previous.get(key) != point.get(key) for key in ("mode", "zones")):
+            elif any(previous.get(key) != point.get(key) for key in ("mode", "zones", "regime", "transition_at")):
                 reason = "operating_transition"
             elif (finite(previous.get("power")) is not None and finite(current.get("power")) is not None
                   and (float(previous["power"]) >= 0.1) != (float(current["power"]) >= 0.1)):
@@ -141,6 +151,7 @@ def update(model: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
                     signed_rate = -observed_rate if mode == "cool" else observed_rate
                     values = _recent_windows([*bucket.get("windows", []), {
                         "rate": signed_rate, "minutes": elapsed, "at": current["at"],
+                        **({"regime": point["regime"]} if point.get("regime") is not None else {}),
                     }], now)[-MAX_WINDOWS:]
                     bucket.update(windows=values, rate_c_per_hour=median(row["rate"] for row in values),
                                   minutes=sum(row["minutes"] for row in values),
@@ -149,6 +160,7 @@ def update(model: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
                     if mode in {"heat", "cool"} and current.get("power_source_type") == "measured" and power:
                         loads = _recent_windows([*item.get("loads_kw", []), {
                             "power": power, "at": current["at"],
+                            **({"regime": point["regime"]} if point.get("regime") is not None else {}),
                         }], now)[-MAX_WINDOWS:]
                         item["loads_kw"] = loads
         if reason:
@@ -190,7 +202,7 @@ def _load_windows(model: dict[str, Any], now: Any) -> list[dict[str, Any]]:
     """Combine shared-unit measurements without room-order bias or duplicate credit."""
     by_time: dict[datetime, dict[str, Any]] = {}
     for item in model.get("sources", {}).values():
-        for row in _recent_windows(item.get("loads_kw", []), now):
+        for row in _regime_windows(item, item.get("loads_kw", []), now):
             at = instant(row["at"])
             assert at is not None  # The same timestamp passed the freshness filter.
             by_time[at] = row
@@ -205,11 +217,16 @@ def _load_windows(model: dict[str, Any], now: Any) -> list[dict[str, Any]]:
     return selected[::-1]
 
 
-def _bucket_summary(bucket: dict[str, Any], now: Any) -> dict[str, Any]:
+def _regime_windows(item: dict[str, Any], rows: list[Any], now: Any) -> list[dict[str, Any]]:
+    """Retain bounded history, selecting only the currently observed stable regime."""
+    return [row for row in _recent_windows(rows, now) if row.get("regime") == item.get("regime")]
+
+
+def _bucket_summary(bucket: dict[str, Any], now: Any, item: dict[str, Any] | None = None) -> dict[str, Any]:
     """Recompute readiness from the dated evidence, including between updates."""
     if "windows" not in bucket:
         return bucket
-    rows = _recent_windows(bucket["windows"], now)
+    rows = _regime_windows(item or {}, bucket["windows"], now)
     return {"count": len(rows), "minutes": sum(row["minutes"] for row in rows),
             "rate_c_per_hour": median(row["rate"] for row in rows) if rows else None,
             "last_at": rows[-1]["at"] if rows else None}
@@ -217,7 +234,8 @@ def _bucket_summary(bucket: dict[str, Any], now: Any) -> dict[str, Any]:
 
 def rate(model: dict[str, Any], zone: str, mode: str, now: Any) -> float | None:
     """Readiness belongs to each source/mode and expires independently."""
-    bucket = _bucket_summary(model.get("sources", {}).get(zone, {}).get("buckets", {}).get(mode, {}), now)
+    item = model.get("sources", {}).get(zone, {})
+    bucket = _bucket_summary(item.get("buckets", {}).get(mode, {}), now, item)
     last = instant(bucket.get("last_at"))
     value = finite(bucket.get("rate_c_per_hour"))
     if (not model.get("learning_enabled", True) or value is None or last is None
@@ -307,8 +325,11 @@ def summary(model: dict[str, Any], now: Any) -> dict[str, Any]:
                 **{key: item.get(key) for key in (
                     "sensor", "temperature", "reported_at", "input_status", "rejected", "last_rejection",
                 )},
+                "operating_regime": item.get("regime"),
+                "retained_windows": {mode: len(_recent_windows(bucket.get("windows", []), now))
+                                     for mode, bucket in item.get("buckets", {}).items()},
                 "modes": {mode: {"ready": rate(model, zone, mode, now) is not None,
                                  **{key: bucket.get(key) for key in ("rate_c_per_hour", "count", "minutes", "last_at")}}
                           for mode in ("heat", "cool", "passive")
-                          for bucket in [_bucket_summary(item.get("buckets", {}).get(mode, {}), now)]},
+                          for bucket in [_bucket_summary(item.get("buckets", {}).get(mode, {}), now, item)]},
             } for zone, item in model.get("sources", {}).items()}}

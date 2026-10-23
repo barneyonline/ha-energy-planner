@@ -832,7 +832,7 @@ class OptionsFlow(config_entries.OptionsFlow):
         """Choose central settings or vehicle profile management."""
         return self.async_show_menu(
             step_id="init", menu_options=[
-                "settings", "zone_temperatures", "add_vehicle", "edit_vehicle", "remove_vehicle",
+                "settings", "zone_temperatures", "zone_equipment", "add_vehicle", "edit_vehicle", "remove_vehicle",
             ],
         )
 
@@ -870,6 +870,41 @@ class OptionsFlow(config_entries.OptionsFlow):
             step_id="zone_temperatures",
             data_schema=self.add_suggested_values_to_schema(vol.Schema(fields), {
                 zone: mapping["temperature"] for zone, mapping in mappings.items() if "temperature" in mapping
+            }), errors=errors,
+        )
+
+    async def async_step_zone_equipment(
+        self, user_input: dict[str, Any] | None = None,
+    ) -> config_entries.ConfigFlowResult:
+        """Compensate equipment feedback separately from room comfort helpers."""
+        from .zone_control import topology
+        configured = _entity_values(self._data.get(CONF_CLIMATE_ZONES, []))
+        pairs = topology(self._data).get("pairs", {})
+        zones = [zone for zone in configured if zone not in pairs.values()]
+        if not zones:
+            return self.async_abort(reason="no_climate_zones")
+        mappings = {key: dict(value) for key, value in self._data.get(CONF_HVAC_ZONE_MAPPINGS, {}).items()}
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            for zone in zones:
+                if zone in user_input:
+                    aliases = [entity for entity in (zone, pairs.get(zone)) if entity in mappings] or [zone]
+                    for entity in aliases:
+                        mappings.setdefault(entity, {})["cooling_equipment_offset_c"] = user_input[zone]
+            if validate_climate_config({**self._data, CONF_HVAC_ZONE_MAPPINGS: mappings}):
+                errors["base"] = "invalid_climate_configuration"
+            else:
+                self._async_save_entry_data({**self._data, CONF_HVAC_ZONE_MAPPINGS: mappings})
+                return self.async_create_entry(title="", data=dict(self._options))
+        fields = {vol.Optional(zone): NumberSelector(NumberSelectorConfig(
+            min=-2, max=0, step=0.5, mode=NumberSelectorMode.BOX,
+        )) for zone in zones}
+        return self.async_show_form(
+            step_id="zone_equipment",
+            data_schema=self.add_suggested_values_to_schema(vol.Schema(fields), {
+                zone: mappings.get(zone, {}).get("cooling_equipment_offset_c",
+                    mappings.get(pairs.get(zone), {}).get("cooling_equipment_offset_c", 0))
+                for zone in zones
             }), errors=errors,
         )
 
