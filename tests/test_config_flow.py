@@ -8,7 +8,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Required
 from unittest.mock import AsyncMock, Mock
 
 import probatio as vol
@@ -80,8 +80,10 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_KEEP_CHARGER_ON,
     CONF_EV_LOW_PRICE_CHARGING_ENABLED,
     CONF_EV_LOW_PRICE_THRESHOLD,
+    CONF_EV_MAX_IMPORT_PRICE,
     CONF_EV_MAX_SOC_PERCENT,
     CONF_EV_MIN_SOC_PERCENT,
+    CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SMART_CHARGING,
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_START,
@@ -1086,6 +1088,129 @@ def test_options_flow_sections_prefill_saved_policy_values() -> None:
 
     assert fields[CONF_PLANNING_HORIZON_HOURS].default() == 36
     assert fields[CONF_PLANNING_INTERVAL_MINUTES].default() == 10
+
+
+_CONDITIONAL_EV_FIELDS = (
+    (CONF_EV_PRICE_LIMIT_ENABLED, CONF_EV_MAX_IMPORT_PRICE),
+    (CONF_EV_LOW_PRICE_CHARGING_ENABLED, CONF_EV_LOW_PRICE_THRESHOLD),
+)
+
+
+@pytest.fixture
+def conditional_required(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise marker selection even on an older HA test runtime."""
+    class VisibleRequired(vol.Required):
+        def __init__(self, *args: Any, visible: Any = None, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self.visible = visible
+
+    monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", VisibleRequired, raising=False)
+
+
+@pytest.mark.usefixtures("conditional_required")
+def test_ev_threshold_visibility_is_scoped_to_its_own_toggle() -> None:
+    """Only the two dependent thresholds receive section-local conditions."""
+    saved = {CONF_EV_MAX_IMPORT_PRICE: 0.37, CONF_EV_LOW_PRICE_THRESHOLD: -0.05}
+    flow = OptionsFlow(SimpleNamespace(data={}, options=saved))
+    groups = flow._settings_schema().schema
+    ev = next(group for marker, group in groups.items() if marker.schema == INPUT_STEP_EV)
+    markers = {marker.schema: marker for marker in ev.schema.schema}
+    visible = {field: marker.visible for field, marker in markers.items() if hasattr(marker, "visible")}
+    assert visible == {field: {"field": toggle, "value": True} for toggle, field in _CONDITIONAL_EV_FIELDS}
+    for toggle, field in _CONDITIONAL_EV_FIELDS:
+        assert markers[toggle].default() is DEFAULT_OPTIONS[toggle]
+        assert markers[field].default() == saved[field]
+        assert ev.schema.schema[markers[field]].serialize() == config_flow_module._option_selector(field).serialize()
+
+
+@pytest.mark.parametrize("legacy_required", [None, Required])
+def test_ev_threshold_visibility_falls_back_on_older_ha(
+    monkeypatch: pytest.MonkeyPatch, legacy_required: Any,
+) -> None:
+    """Older HA can expose typing.Required rather than the new schema marker."""
+    monkeypatch.delattr(config_flow_module.data_entry_flow, "Required", raising=False)
+    if legacy_required is not None:
+        monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", legacy_required, raising=False)
+    fields = tuple(field for pair in _CONDITIONAL_EV_FIELDS for field in pair)
+    schema = config_flow_module._options_section_schema({}, fields)
+    for marker in schema.schema:
+        assert type(marker) is vol.Required
+        assert not hasattr(marker, "visible")
+    assert schema({}) == {field: DEFAULT_OPTIONS[field] for field in fields}
+
+
+@pytest.mark.parametrize("toggle,field", _CONDITIONAL_EV_FIELDS)
+@pytest.mark.parametrize("saved", [None, -0.05, 0.0, 0.37])
+@pytest.mark.parametrize("use_visibility", [False, True])
+def test_ev_threshold_survives_omission_and_repeated_edits(
+    monkeypatch: pytest.MonkeyPatch, toggle: str, field: str, saved: float | None, use_visibility: bool,
+    request: pytest.FixtureRequest,
+) -> None:
+    """Hidden/omitted thresholds retain saved values or the established default."""
+    if use_visibility:
+        request.getfixturevalue("conditional_required")
+    else:
+        monkeypatch.setattr(config_flow_module.data_entry_flow, "Required", Required, raising=False)
+    entry = SimpleNamespace(data={}, options={toggle: True, **({field: saved} if saved is not None else {})})
+    expected = DEFAULT_OPTIONS[field] if saved is None else saved
+    # Reopen after each save, including disabling, unrelated edits, and enabling.
+    edits = (
+        {toggle: False}, {CONF_EV_EARLIEST_START: "01:00"}, {},
+        {toggle: True}, {field: 0.42}, {toggle: False}, {toggle: True},
+    )
+    for submitted in edits:
+        flow = OptionsFlow(entry)
+        flow.hass = SimpleNamespace(config_entries=SimpleNamespace())
+        result = asyncio.run(flow.async_step_settings({INPUT_STEP_EV: submitted}))
+        assert result["type"] == "create_entry"
+        if field in submitted:
+            expected = submitted[field]
+        assert result["data"][field] == expected
+        assert result["data"][toggle] is submitted.get(toggle, entry.options[toggle])
+        entry.options = result["data"]
+        reopened = OptionsFlow(entry)
+        ev = next(group for marker, group in reopened._settings_schema().schema.items()
+                  if marker.schema == INPUT_STEP_EV)
+        marker = next(marker for marker in ev.schema.schema if marker.schema == field)
+        assert marker.default() == expected
+
+
+def test_ev_threshold_visibility_with_real_ha_api() -> None:
+    """Check serialization and hidden-field handling on a supporting HA runtime."""
+    required = getattr(config_flow_module.data_entry_flow, "Required", None)
+    if not (isinstance(required, type) and issubclass(required, vol.Required)):
+        pytest.skip("Conditional form-field runtime requires HA 2026.11 or newer")
+    strip_hidden = getattr(config_flow_module.data_entry_flow, "_strip_hidden_fields", None)
+    serialize_visibility = getattr(
+        config_flow_module.data_entry_flow, "add_visible_conditions_to_serialized_schema", None,
+    )
+    assert strip_hidden is not None
+    assert serialize_visibility is not None
+    flow = OptionsFlow(SimpleNamespace(data={}, options={CONF_EV_MAX_IMPORT_PRICE: 0.37}))
+    schema = flow._settings_schema()
+    serialized = vol.to_field_list(schema, custom_serializer=config_flow_module.cv.custom_serializer)
+    serialize_visibility(schema, serialized)
+    ev = next(group for group in serialized if group["name"] == INPUT_STEP_EV)
+    for toggle, field in _CONDITIONAL_EV_FIELDS:
+        assert next(item for item in ev["schema"] if item["name"] == field)["visible"] == {
+            "field": toggle, "value": True,
+        }
+        for enabled in (False, True, False):
+            filtered_schema, filtered_input = strip_hidden(
+                schema, {INPUT_STEP_EV: {toggle: enabled, field: 0.42}},
+            )
+            group = next(group for marker, group in filtered_schema.schema.items() if marker.schema == INPUT_STEP_EV)
+            submitted = group(filtered_input[INPUT_STEP_EV])
+            assert (field in submitted) is enabled
+            if enabled:
+                assert submitted[field] == 0.42
+            # Omitted fields use their saved/default value only while visible.
+            filtered_schema, filtered_input = strip_hidden(schema, {INPUT_STEP_EV: {toggle: enabled}})
+            group = next(group for marker, group in filtered_schema.schema.items() if marker.schema == INPUT_STEP_EV)
+            submitted = group(filtered_input[INPUT_STEP_EV])
+            assert (field in submitted) is enabled
+            if enabled:
+                assert submitted[field] == (0.37 if field == CONF_EV_MAX_IMPORT_PRICE else DEFAULT_OPTIONS[field])
 
 
 def test_options_flow_discards_legacy_ev_soc_limits() -> None:
