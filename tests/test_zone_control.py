@@ -363,7 +363,8 @@ def test_learning_breaks_at_subset_transition_and_does_not_reuse_full_topology_r
     hass.states.values[BED] = "off"
     c.created_at += timedelta(minutes=5)
     second = sample(c, DEFAULT_OPTIONS, hass.states, "climate.head")
-    assert first["sources"][MAIN]["identity"] != second["sources"][MAIN]["identity"]
+    assert first["sources"][MAIN]["identity"] == second["sources"][MAIN]["identity"]
+    assert first["sources"][MAIN]["regime"] != second["sources"][MAIN]["regime"]
     model = update(model, second)
     assert not model["sources"][MAIN]["buckets"]
     read = read_climate_inputs(hass, data(), DEFAULT_OPTIONS, NOW, NOW + timedelta(hours=12), {})

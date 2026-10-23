@@ -60,7 +60,19 @@ reading from before the observed operating regime cannot become a recent change.
 Each mode needs 12 accepted windows covering at
 least 60 minutes from the last 14 days. Individual dated windows and measured-load
 evidence expire, so one new observation cannot revive old readiness.
-Sensor or topology changes reset incompatible statistics.
+Sensor or topology changes reset incompatible statistics. Static source identity is separate
+from transient zone power and transition timestamps. Normal zone closures/reopens
+and reloads preserve compatible history. Each dated window is tagged with its stable
+physical airflow/equipment regime (including head and active zone setpoints); only
+matching-regime windows qualify the current source/mode. A transition timestamp
+breaks a cross-transition interval, including a close/reopen between samples, but
+never creates a new storage identity. Each source/mode retains at most 96 windows
+across regimes, not an unbounded list of regime models. Measured-load evidence
+also selects the matching regime. Missing matching evidence uses fallback timing;
+no readiness threshold is lowered. Old transient-key evidence cannot be attributed
+safely to the new regime keys and requalifies once on upgrade. Changing one room's
+sensor does not erase other rooms' evidence; shared topology/controller changes
+invalidate incompatible shared airflow evidence.
 
 **Base preconditioning lead** accepts **0–360 minutes** and defaults to **90 minutes**.
 Existing saved values are preserved. The base is the fallback duration when the
@@ -96,8 +108,60 @@ evidence combines qualifying measurements from every mapped room, irrespective
 of room order or availability. Duplicate timestamps count once, retained
 measurements stay at least five minutes apart, and the shared series retains at
 most 96 measurements from the last 14 days.
-Decision diagnostics expose sensors, rates, learning rejections,
+Decision diagnostics expose sensors, matching-regime rates, retained-window counts, learning rejections,
 effective lead and finishing-temperature estimates.
+
+## Cooling equipment compensation
+
+Configure → **Cooling equipment compensation** sets `cooling_equipment_offset_c`
+within `hvac_zone_mappings` for each physical zone. Values are −2 to 0°C in 0.5°C
+steps, default 0. The UI presents a paired zone once and updates its existing
+switch/climate mapping aliases together, preserving sensors and other mappings.
+Direct mapping edits must give both aliases the same offset if both specify one.
+The form reads an existing offset from either alias, including when the switch has
+other mappings but only the thermostat carries the offset. Accepting the displayed
+setting preserves it. Calendar preparation titles show the room goal; action
+sentences show both the room goal and the shared equipment setpoint.
+Nonzero compensation requires the explicit independently controlled topology below.
+
+Room targets and equipment targets have different jobs. With household low/high
+comfort helpers at 21/24°C, Main −2 and Bedrooms 0 produce:
+
+| Control | Cooling equipment target | Room completion target |
+| --- | --- | --- |
+| Main | 19°C | 21°C |
+| Bedrooms | 21°C | 21°C |
+| Shared head, both rooms active | 19°C | Each mapped room must complete |
+
+The shared head follows the lowest active cooling equipment target so it can still
+demand while the compensated room prepares. Every active zone target must fit the
+head's ±2°C range. Incompatible combinations block control; offsets are never
+silently rounded or clamped. The adapter requires live head mode availability,
+finite ordered min/max bounds and a positive target step, confirms the head first,
+then waits for each active zone's live range/step before sequential target writes.
+It rechecks after persistence yields. Cooling mode availability is required before
+activation; the cooling target range and step are checked after that mode is
+confirmed, allowing a supported change from heating or an off head's remembered
+mode. Unavailable or incompatible cooling limits still block the temperature
+write and retain the original restoration baseline. A head whose mode or target feedback cannot
+support the exact requested setpoints cannot acquire compensated control.
+
+Room completion, 0.3°C restart hysteresis, ten-minute pause dwell, early coast and
+comfort handoff continue to use room sensors and room targets. When Main completes,
+its damper pauses; a still-active Bedrooms zone uses head/equipment 21°C. Paused,
+manual or deferred hidden-target zones retain the existing command exclusions.
+Missing sensor feedback fails closed. Original head/zone targets and powers remain
+the restoration baseline across coast, failure, manual overrides and restart.
+Heating is unchanged. Legacy and pre-activation Automatic/Observe fallback use the
+same command path. The economic engine continues to refuse unvalidated independently
+changing subsets; compensation does not qualify an economic model or imply savings.
+
+The observed Daikin head temperature reaching 21°C while the living-area room sensor
+remained warmer is consistent with a feedback mismatch, but does not establish
+continuous compressor operation. HA `hvac_action` can be inferred from mode when
+compressor-frequency feedback is absent. Neither compensation nor more preparation
+time guarantees the room will reach 21°C. Installation, configuration, actual room
+response, cycling, airflow and measured energy need separate physical verification.
 
 ## Optional inputs
 

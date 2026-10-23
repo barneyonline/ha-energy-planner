@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 from math import isfinite
 from typing import Any
 
+from .climate_inputs import finite
 from .const import (
     CONF_BATTERY_MIN_SOC_PERCENT,
     CONF_DRY_RUN,
@@ -321,6 +322,23 @@ class ConstraintValidator:
                 )
             )
         target = action.desired_state.get("target_temperature")
+        if action.desired_state.get("equipment_compensation"):
+            from .zone_control import desired_fields
+            room_target = finite(action.desired_state.get("precondition_target"))
+            fields = (desired_fields(context, str(desired_mode), room_target, "preconditioning")
+                      if room_target is not None else {})
+            if (desired_mode != "cool" or action.desired_state.get("phase") != "preconditioning"
+                    or fields.get("equipment_compensation") is not True
+                    or not action.desired_state.get("zone_intent")
+                    or any(action.desired_state.get(key) != fields.get(key) for key in (
+                        "target_temperature", "zone_targets", "zone_power", "configured_zones_only", "zone_stop",
+                    ))):
+                violations.append(_action_violation(
+                    action, "hvac_equipment_compensation_invalid",
+                    "Equipment compensation requires current bounded room and airflow intent.",
+                ))
+            else:
+                target = room_target
         if (context.occupancy_state == OccupancyState.OCCUPIED or away_preconditioning_allowed) and target is not None:
             if context.occupied_temperature_low_c is None or context.occupied_temperature_high_c is None:
                 violations.append(
