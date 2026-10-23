@@ -8,6 +8,28 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.6 - 2026-10-23
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Support a four-hour base HVAC preconditioning lead through the normal options form. Both base and learned-maximum leads accept 0–360 minutes, with the maximum at least the base. Preserve the 90/180-minute defaults, saved values, zero disabling, and all existing tariff, comfort and execution gates.
 - Add bounded per-zone cooling equipment compensation for explicitly verified independent zones. Keep room comfort goals separate from equipment targets, derive a compatible shared-head target, and confirm live capabilities and sequential target writes before applying compensation.
 
