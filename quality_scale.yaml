@@ -174,12 +174,14 @@ rules:
     # Conditional EV thresholds: guarded HA 2026.11 markers, older-API fallback,
     # omitted saved/default values and repeated edits are covered in test_config_flow.py.
     # New-API runtime coverage requires HA 2026.11+; the minimum remains unchanged.
+    # Full validated-save/reopen cases: test_conditional_ev_options_runtime.py (runtime verification pending).
     comment: The central Configure flow covers all input mappings and policy constraints, including the required vehicle SOC, charging-feedback, and authoritative target-SOC mappings plus settings-only ready-by, opportunistic, and daylight lowest-cost EV controls; EV SOC-per-kWh copy documents automatic Recorder calibration and its conservative bootstrap value, and regression coverage verifies that Add device subentry flows are not exposed.
     references:
       code:
         - custom_components/ha_energy_planner/config_flow.py
       tests:
         - tests/test_config_flow.py
+        - tests/test_conditional_ev_options_runtime.py
   config-flow:
     status: done
     references:

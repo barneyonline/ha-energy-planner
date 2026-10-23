@@ -1177,12 +1177,15 @@ def test_ev_threshold_survives_omission_and_repeated_edits(
 
 def test_ev_threshold_visibility_with_real_ha_api() -> None:
     """Check serialization and hidden-field handling on a supporting HA runtime."""
+    required = getattr(config_flow_module.data_entry_flow, "Required", None)
+    if not (isinstance(required, type) and issubclass(required, vol.Required)):
+        pytest.skip("Conditional form-field runtime requires HA 2026.11 or newer")
     strip_hidden = getattr(config_flow_module.data_entry_flow, "_strip_hidden_fields", None)
     serialize_visibility = getattr(
         config_flow_module.data_entry_flow, "add_visible_conditions_to_serialized_schema", None,
     )
-    if strip_hidden is None or serialize_visibility is None:
-        pytest.skip("Conditional form-field runtime requires HA 2026.11 or newer")
+    assert strip_hidden is not None
+    assert serialize_visibility is not None
     flow = OptionsFlow(SimpleNamespace(data={}, options={CONF_EV_MAX_IMPORT_PRICE: 0.37}))
     schema = flow._settings_schema()
     serialized = vol.to_field_list(schema, custom_serializer=config_flow_module.cv.custom_serializer)
