@@ -71,6 +71,15 @@ def planning_status(
     if controls and thermal and not thermal.get("rates_ready"):
         reason = (f"Scheduled using the {thermal['base_lead_minutes']:g}-minute fallback; "
                   "finishing temperature is unknown. Execution gates still apply.")
+    explaining_fallback = (
+        not economic.get("summary") or economic.get("legacy_fallback")
+        or (economic.get("reason") == "zone_subset_economic_model_unvalidated"
+            and not context.climate_engine.get("ever_active"))
+    )
+    if explaining_fallback and not controls and legacy.get("reason") in {
+        "room_demand_unproven", "conflicting_room_demand", "room_target_reached", "preconditioning_mode_not_allowed",
+    }:
+        status, code, reason = "no_opportunity", legacy["reason"], legacy["summary"]
     if _hvac_rollback_capability_unavailable(context):
         status, code, reason = (
             "blocked",
@@ -92,6 +101,7 @@ def planning_status(
         "evaluated_at": context.created_at.isoformat(),
         "next_start": to_jsonable(next_start),
         "thermal_timing": thermal,
+        "direction": legacy.get("direction", {}),
         "legacy_rejections": [
             {"reason": key, "count": item["count"], **item["evidence"]}
             for key, item in legacy.get("rejected", {}).items()

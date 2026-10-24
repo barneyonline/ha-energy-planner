@@ -104,6 +104,7 @@ CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA = "hvac_precondition_min_price_delta"
 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY = "hvac_precondition_configured_zones_only"
 CONF_HVAC_PRECONDITION_WHILE_AWAY = "hvac_precondition_while_away"
 CONF_HVAC_POLICY = "hvac_decision_policy"
+CONF_HVAC_PRECONDITIONING_MODE = "hvac_preconditioning_mode"
 CONF_HVAC_MIN_SAVING = "hvac_minimum_saving"
 CONF_HVAC_OBSERVATION_CADENCE = "hvac_observation_cadence"
 CONF_HVAC_ARRIVAL = "hvac_arrival_entity"
@@ -178,6 +179,7 @@ DEFAULT_OPTIONS = {
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False,
     CONF_HVAC_PRECONDITION_WHILE_AWAY: False,
     CONF_HVAC_POLICY: "automatic",
+    CONF_HVAC_PRECONDITIONING_MODE: "automatic",
     CONF_HVAC_MIN_SAVING: 0.25,
     CONF_HVAC_OBSERVATION_CADENCE: 10,
     CONF_HVAC_MIN_CYCLE_MINUTES: 20,

@@ -538,8 +538,9 @@ def test_compensated_calendar_and_action_describe_room_goal_separately_from_equi
 def test_compensation_checks_target_capabilities_after_confirming_cooling_mode(initial_mode, cooling_target_valid):
     c, config = compensated()
     c.current_hvac_mode = "heat"
-    # Forecast weather can request cooling while the head is heating or off.
-    assert HVACPlanningPolicy(DEFAULT_OPTIONS, {})._next_hvac_period(c)["mode"] == "cool"
+    # Explicit cooling permission can request a mode change; weather alone must not reverse a running head.
+    cooling = HVACPlanningPolicy({**DEFAULT_OPTIONS, "hvac_preconditioning_mode": "cooling_only"}, {})
+    assert cooling._next_hvac_period(c)["mode"] == "cool"
     hass = compensated_device(c)
     head = hass.states.get("climate.head")
     head.state = initial_mode

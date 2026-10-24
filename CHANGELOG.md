@@ -8,11 +8,11 @@
 
 ### ✨ New features
 
-- None
+- Add a preconditioning direction setting: Automatic, Cooling only or Heating only, enforced in both planning paths and before execution while preserving original-state restoration.
 
 ### 🐛 Bug fixes
 
-- None
+- Prevent cold weather alone from selecting fallback heating of comfortable mapped rooms. Respect existing equipment direction, require room demand or recent qualified passive evidence from idle, and leave conflicting room needs with normal comfort controls. Diagnostics explain the direction evidence and unknown projections.
 
 ### 🔧 Improvements
 

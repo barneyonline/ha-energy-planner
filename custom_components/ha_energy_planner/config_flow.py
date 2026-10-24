@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 import probatio as vol
@@ -112,6 +112,7 @@ from .const import (
     CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
+    CONF_HVAC_PRECONDITIONING_MODE,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_HVAC_THERMAL_LEARNING_ENABLED,
     CONF_HVAC_ZONE_CONTROL,
@@ -423,6 +424,7 @@ _POLICY_SECTION_FIELDS = {
     ),
     POLICY_STEP_CLIMATE: (
         CONF_HVAC_POLICY,
+        CONF_HVAC_PRECONDITIONING_MODE,
         CONF_HVAC_MIN_SAVING,
         CONF_HVAC_OBSERVATION_CADENCE,
         CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
@@ -553,7 +555,8 @@ def _options_section_schema(options: dict[str, Any], fields: tuple[str, ...]) ->
         # Before HA 2026.11 this name may be absent or refer to typing.Required.
         if (field in _OPTION_VISIBLE_WHEN_ENABLED
                 and isinstance(required, type) and issubclass(required, vol.Required)):
-            marker = required(
+            # The feature-detected constructor extends the pinned baseline signature.
+            marker = cast(Any, required)(
                 field,
                 default=merged[field],
                 visible={"field": _OPTION_VISIBLE_WHEN_ENABLED[field], "value": True},
@@ -649,6 +652,9 @@ def _option_selector(field: str) -> Any:
             NumberSelectorConfig(min=0, max=50, step=1, mode=NumberSelectorMode.BOX)
         ),
         CONF_HVAC_POLICY: SelectSelector(SelectSelectorConfig(options=["automatic", "observe", "legacy"])),
+        CONF_HVAC_PRECONDITIONING_MODE: SelectSelector(SelectSelectorConfig(
+            options=["automatic", "cooling_only", "heating_only"], translation_key="hvac_preconditioning_mode",
+        )),
         CONF_HVAC_MIN_SAVING: NumberSelector(NumberSelectorConfig(min=0, max=100, step=0.01)),
         CONF_HVAC_OBSERVATION_CADENCE: NumberSelector(NumberSelectorConfig(min=1, max=100, step=1)),
         CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA: NumberSelector(
@@ -1265,6 +1271,10 @@ def _normalize_options_input(user_input: dict[str, Any]) -> dict[str, Any]:
 def _validate_options(user_input: dict[str, Any]) -> dict[str, str]:
     """Validate policy options that selectors alone cannot prove."""
     errors: dict[str, str] = {}
+    if user_input.get(CONF_HVAC_PRECONDITIONING_MODE, "automatic") not in {
+        "automatic", "cooling_only", "heating_only",
+    }:
+        errors[CONF_HVAC_PRECONDITIONING_MODE] = "invalid_preconditioning_mode"
     if not _ready_by_valid(str(user_input[CONF_DEFAULT_READY_BY])):
         errors[CONF_DEFAULT_READY_BY] = "invalid_ready_by"
     earliest_start = str(user_input[CONF_EV_EARLIEST_START])
