@@ -33,7 +33,9 @@ Automatic fallback with mapped room sensors respects an existing equipment mode;
 from idle, cold weather alone cannot justify heating comfortable rooms. Recent
 qualified passive room trends or actual room-boundary demand must support the
 direction. Conflicting room needs remain with normal comfort controls. Original
-state restoration and safe stops are still allowed. See [climate decisions](docs/climate-decisions.md).
+state restoration and safe stops are still allowed. Zones with only humidity,
+presence or comfort mappings retain Daikin temperature feedback. Diagnostics prioritise safety
+blockers over no-demand explanations. See [climate decisions](docs/climate-decisions.md).
 
 Future preconditioning windows stay pending when a tariff tail changes. Rescheduling updates the pending window; cancellation removes it. Neither is reported as a missed execution before the episode starts. Refresh also clears older replacement reports demonstrably recorded before their saved episode start, without claiming that preparation ran. Saved attempts at or after the start, or with unknown timing, remain preserved even when a planning snapshot predates them. Matching provisional ownership retains history until its command outcome arrives and remains unconfirmed throughout that wait. Attempt history survives rollback and reload before that outcome is saved.
 

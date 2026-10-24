@@ -37,6 +37,7 @@ from .models import (
 )
 from .ownership import EnphaseProfileGuard, OwnershipState
 from .safety import strict_bool
+from .zone_temperature import temperatures
 
 
 class ConstraintValidator:
@@ -300,7 +301,7 @@ class ConstraintValidator:
         if (desired_mode == "heat" and not lifecycle_continuation
                 and action.desired_state.get("phase") == "preconditioning"
                 and not action.desired_state.get("economic_policy_version")
-                and context.climate_inputs.get("zones")):
+                and temperatures(context)):
             deadline = action.desired_state.get("period_start")
             if not isinstance(deadline, datetime) or deadline.tzinfo is None:
                 deadline = now

@@ -17,10 +17,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   `climate_optimizer.py`, `climate_runtime.py` and `constraints.py` enforce the
   direction through candidate generation, incumbent revalidation, incompatible
   ownership release and execution of queued actions, preserving safe stops and
-  original restoration. `preconditioning.py` exposes the reason and room inputs.
+  original restoration. `preconditioning.py` exposes the reason and room inputs,
+  retaining confidence, manual override, occupancy and missing-input blockers
+  ahead of no-demand explanations in ordinary and independent-zone fallback.
   `tests/test_hvac_direction.py` includes sanitized 24 October snapshots, recent
   versus stale/unqualified drift, cooling-only preparation from idle, invalid
-  settings, both planning paths and stale-plan rejection. See the decision
+  settings, both planning paths and stale-plan rejection. Metadata-only zones
+  retain Daikin-based heating through execution, while explicitly configured
+  temperature-sensor loss still blocks acquisition. See the decision
   assessment in `docs/climate-decisions.md` for evidence limits; full acceptance
   remains `scripts/docker-validate.sh` and no live benefit is claimed from tests.
 

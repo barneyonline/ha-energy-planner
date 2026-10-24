@@ -14,6 +14,10 @@
 
 - Prevent cold weather alone from selecting fallback heating of comfortable mapped rooms. Respect existing equipment direction, require room demand or recent qualified passive evidence from idle, and leave conflicting room needs with normal comfort controls. Diagnostics explain the direction evidence and unknown projections.
 
+- Preserve safety-blocker reporting when room direction evidence finds no demand, including low confidence, manual overrides, occupancy and missing inputs during independent-zone fallback.
+
+- Preserve Daikin-based fallback heating when zone mappings contain only humidity, presence or comfort settings; continue blocking acquisition when an explicitly configured room temperature sensor fails.
+
 ### 🔧 Improvements
 
 - None

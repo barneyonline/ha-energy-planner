@@ -319,3 +319,68 @@ def test_direction_reason_does_not_hide_economic_safety_or_learning_state(econom
         }
     status = planning_status(c, [], PlannerMode.ACTIVE_HEALTHY, "", opts)
     assert status["reason"] == ("model_degraded" if economic_reason == "model_degraded" else "room_demand_unproven")
+
+
+@pytest.mark.parametrize("policy", ["legacy", "automatic"])
+def test_complete_plan_preserves_confidence_blocker_when_room_demand_is_unproven(policy):
+    from custom_components.ha_energy_planner.planner import DryRunPlanner
+
+    c = replay(FIXTURE["cases"][0])
+    c.forecast_confidence = 0.1
+    opts = options(planner_enabled=True, dry_run=False, climate_control_enabled=True, hvac_decision_policy=policy)
+    plan = DryRunPlanner(opts).create_plan(c)
+    status = plan.device_plans["climate"]["preconditioning"]
+    assert c.climate_legacy_decision["reason"] == "room_demand_unproven"
+    assert status["status"] == "blocked"
+    assert status["reason"] == "insufficient_confidence"
+    assert "confidence" in status["summary"].lower()
+    assert not [a for a in plan.actions if a.asset == ActionAsset.DAIKIN]
+
+
+@pytest.mark.parametrize("subset", [False, True])
+@pytest.mark.parametrize("blocker", ["confidence", "manual", "away", "unknown", "temperature"])
+def test_direction_explanation_never_overrides_fallback_safety_blockers(subset, blocker):
+    from custom_components.ha_energy_planner.models import OccupancyState, Override, PlannerMode
+
+    c = replay(FIXTURE["cases"][0])
+    opts = options(climate_control_enabled=True)
+    HVACPlanningPolicy(opts, {})._next_hvac_period(c)
+    expected = {
+        "confidence": "insufficient_confidence", "manual": "manual_hvac_override", "away": "occupancy_away",
+        "unknown": "occupancy_unknown", "temperature": "comfort_inputs_missing",
+    }[blocker]
+    if subset:
+        economic_actions(c, opts, [])
+        assert c.climate_decision["reason"] == "zone_subset_economic_model_unvalidated"
+    if blocker == "confidence":
+        c.forecast_confidence = 0.1
+    elif blocker == "manual":
+        c.active_overrides = [Override("manual_hvac", "test", c.created_at + timedelta(hours=1), "manual")]
+    elif blocker == "temperature":
+        c.climate_inputs["zones"][MAIN]["temperature"] = None
+    else:
+        c.occupancy_state = OccupancyState.AWAY if blocker == "away" else OccupancyState.UNKNOWN
+    status = planning_status(c, [], PlannerMode.ACTIVE_HEALTHY, "Safety check withheld control.", opts)
+    assert status["status"] == "blocked"
+    assert status["reason"] == expected
+    assert status["direction"]["reason"] == "room_demand_unproven"
+    assert status["next_step"].startswith("Resolve")
+
+
+@pytest.mark.parametrize("metadata", [{"humidity": 50}, {"occupied": True}, {"low": 21, "high": 24}])
+def test_metadata_only_zones_retain_daikin_heating_and_configured_sensor_loss_blocks(metadata):
+    c = replay(FIXTURE["cases"][0])
+    c.climate_inputs = {"zones": {MAIN: {"temperature_entity": None, "temperature": None, **metadata}}}
+    opts = options(planner_enabled=True, dry_run=False)
+    actions = HVACPlanningPolicy(opts, {})._hvac_lifecycle_actions(c, c.created_at, c.slots[1].valid_at)
+    action = actions[0]
+    assert action.kind == ActionKind.SET_HVAC
+    assert action.desired_state["phase"] == "preconditioning"
+    assert action.desired_state["hvac_mode"] == "heat"
+    validator = ConstraintValidator(opts)
+    assert not validator.validate_action(c, _plan(c.created_at, action), action, now=c.created_at)
+    # An explicitly mapped but missing sensor remains different from no mapping.
+    c.climate_inputs["zones"][MAIN]["temperature_entity"] = "sensor.missing"
+    assert "hvac_heating_need_unproven" in validator.validate_action(
+        c, _plan(c.created_at, action), action, now=c.created_at
+    )
