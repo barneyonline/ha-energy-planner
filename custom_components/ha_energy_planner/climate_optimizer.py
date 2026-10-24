@@ -19,6 +19,7 @@ from .climate_learning import (
 )
 from .climate_models import RECOVERY_TOLERANCE_C, TERMINAL_BATTERY_TOLERANCE_KWH, ClimateCandidate, ClimateTrajectory
 from .const import CONF_HVAC_MIN_SAVING, CONF_PLANNING_INTERVAL_MINUTES
+from .hvac_direction import mode_allowed
 from .models import DecisionContext, DecisionSlot, OccupancyState
 from .planning_grid import slot_end as interval_end
 from .thermal_learning import bounded_lead_slots, timing
@@ -360,11 +361,15 @@ def optimise(
     best_key: tuple[float, float, int, int] | None = None
     cache: dict[Any, Any] = {}
     ready_modes = sum(
-        not model.get("validation", {}).get(mode, {}).get("blockers", ["model_unavailable"])
+        mode_allowed(options, mode)
+        and not model.get("validation", {}).get(mode, {}).get("blockers", ["model_unavailable"])
         for mode in ("heat", "cool")
     )
     candidate_limit = MAX_SEARCH_SLOT_EVALUATIONS // max(3 * len(context.slots) * ready_modes, 1)
     for mode in ("heat", "cool"):
+        if not mode_allowed(options, mode):
+            reject("preconditioning_mode_not_allowed")
+            continue
         evidence = model.get("validation", {}).get(mode, {})
         if evidence.get("blockers", ["model_unavailable"]):
             reject(f"{mode}_model_not_ready")
@@ -553,6 +558,8 @@ def revalidate_schedule(
     context: DecisionContext, options: dict[str, Any], model: dict[str, Any], scheduled: dict[str, Any]
 ) -> ClimateCandidate | None:
     """Reprice the exact remaining incumbent, excluding sunk energy costs."""
+    if not mode_allowed(options, scheduled.get("mode")):
+        return None
     start, stop, end = (instant(scheduled.get(key)) for key in ("start", "stop", "release"))
     if start is None or stop is None or end is None or not context.slots or end <= context.created_at:
         return None

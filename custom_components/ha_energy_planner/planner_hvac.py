@@ -14,9 +14,11 @@ from .const import (
     CONF_HVAC_PRECONDITION_LEAD_MINUTES,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
+    CONF_HVAC_PRECONDITIONING_MODE,
     CONF_HVAC_SUPPRESSION_MIN_PRICE_DELTA,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
+from .hvac_direction import mapped_direction, mode_allowed
 from .models import (
     ActionAsset,
     ActionKind,
@@ -90,6 +92,11 @@ class HVACPlanningPolicy:
         if active.get("economic_policy_version"):
             return []
         now = context.created_at
+        if active.get("mode") in {"heat", "cool"} and not mode_allowed(self.options, active["mode"]):
+            return [self._hvac_release_action(
+                context, now, now + timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES])),
+                "hvac_preconditioning_mode_changed",
+            )]
         if feedback_missing(context):
             _hvac_reject(context, "zone_temperature_unavailable", {})
             return [self._hvac_release_action(context, now, now + timedelta(minutes=int(
@@ -472,7 +479,14 @@ class HVACPlanningPolicy:
             # candidate generation, including newly available earlier cheap slots.
             current = control_temperature(context)
             assert current is not None
-            mode = _future_hvac_mode(context, slot, current, low, high)
+            mode = (mapped_direction(context, self.options, self.thermal_model, slot.valid_at)
+                    if temperatures(context) else _future_hvac_mode(context, slot, current, low, high))
+            if not temperatures(context) and self.options.get(CONF_HVAC_PRECONDITIONING_MODE) == "cooling_only":
+                mode = "cool" if current > low else None
+            if mode is not None and not mode_allowed(self.options, mode):
+                _hvac_reject(context, "preconditioning_mode_not_allowed", {})
+                index += 1
+                continue
             thermal_timing = timing(
                 context, self.options, mode or "cool", self.thermal_model,
                 deadline_minutes=max((slot.valid_at - context.created_at).total_seconds() / 60, 0),
@@ -508,7 +522,8 @@ class HVACPlanningPolicy:
             ):
                 end_index += 1
             if mode is None:
-                _hvac_reject(context, "thermal_direction",
+                _hvac_reject(context, context.climate_legacy_decision.get("direction", {}).get(
+                    "reason", "thermal_direction"),
                     {"current_temperature": current, "comfort_low": low, "comfort_high": high}
                 )
                 index = end_index
@@ -1111,6 +1126,10 @@ _LEGACY_REASONS = {
     "zone_temperature_unavailable": "A configured zone temperature or comfort input is missing, invalid or stale.",
     "price_difference": "The forecast price difference is below the configured minimum.",
     "thermal_direction": "The temperature forecast does not support heating or cooling preconditioning.",
+    "room_demand_unproven": "Room feedback does not establish a need for automatic preconditioning from idle.",
+    "conflicting_room_demand": "Rooms have different heating needs; normal comfort controls retain authority.",
+    "room_target_reached": "The participating rooms already meet the requested preparation target.",
+    "preconditioning_mode_not_allowed": "The selected preconditioning mode does not permit this HVAC direction.",
     "preparation_time": "The candidate leaves insufficient time to reach the preconditioning target.",
     "thermal_coast": "The candidate cannot coast to the peak within the thermal limits.",
     "comfort_target_reached": "The projected temperature already reaches the preconditioning target.",

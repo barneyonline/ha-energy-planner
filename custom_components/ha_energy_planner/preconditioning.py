@@ -35,20 +35,28 @@ def planning_status(
             "An opportunity was evaluated, but no preconditioning command was selected; "
             "review policy and existing ownership.",
         )
-    if not economic.get("summary") or economic.get("legacy_fallback"):
-        if _confidence_rejection_reason(ActionAsset.DAIKIN, context, options) is not None:
-            status, code = "blocked", "insufficient_confidence"
+    explaining_fallback = (
+        not economic.get("summary") or economic.get("legacy_fallback")
+        or (economic.get("reason") == "zone_subset_economic_model_unvalidated"
+            and not context.climate_engine.get("ever_active"))
+    )
+    if explaining_fallback:
+        confidence_rejection = _confidence_rejection_reason(ActionAsset.DAIKIN, context, options)
+        if confidence_rejection is not None:
+            status, code, reason = "blocked", "insufficient_confidence", confidence_rejection
         elif any(
             o.kind == "manual_hvac" and (o.expires_at is None or context.created_at < o.expires_at)
             for o in context.active_overrides
         ):
-            status, code = "blocked", "manual_hvac_override"
+            status, code, reason = "blocked", "manual_hvac_override", "A manual climate override is active."
         elif context.occupancy_state == OccupancyState.UNKNOWN:
             status, code, reason = "blocked", "occupancy_unknown", "Occupancy is unknown; preconditioning is withheld."
         elif context.occupancy_state == OccupancyState.AWAY and not strict_bool(
             options.get("hvac_precondition_while_away"), default=False
         ):
-            status, code = "blocked", "occupancy_away"
+            status, code, reason = (
+                "blocked", "occupancy_away", "Away preconditioning is disabled and nobody is currently home."
+            )
         elif any(
             value is None
             for value in (
@@ -57,7 +65,7 @@ def planning_status(
                 context.occupied_temperature_high_c,
             )
         ):
-            status, code = "blocked", "comfort_inputs_missing"
+            status, code, reason = "blocked", "comfort_inputs_missing", "Required room comfort inputs are unavailable."
         elif code in {"forecast_gap", "forecast_too_short", "release_hold", "minimum_cycle", "lead_time_disabled",
                       "zone_temperature_unavailable", "zone_comfort_boundary"}:
             status = "blocked"
@@ -71,6 +79,10 @@ def planning_status(
     if controls and thermal and not thermal.get("rates_ready"):
         reason = (f"Scheduled using the {thermal['base_lead_minutes']:g}-minute fallback; "
                   "finishing temperature is unknown. Execution gates still apply.")
+    if explaining_fallback and status != "blocked" and not controls and legacy.get("reason") in {
+        "room_demand_unproven", "conflicting_room_demand", "room_target_reached", "preconditioning_mode_not_allowed",
+    }:
+        status, code, reason = "no_opportunity", legacy["reason"], legacy["summary"]
     if _hvac_rollback_capability_unavailable(context):
         status, code, reason = (
             "blocked",
@@ -92,6 +104,7 @@ def planning_status(
         "evaluated_at": context.created_at.isoformat(),
         "next_start": to_jsonable(next_start),
         "thermal_timing": thermal,
+        "direction": legacy.get("direction", {}),
         "legacy_rejections": [
             {"reason": key, "count": item["count"], **item["evidence"]}
             for key, item in legacy.get("rejected", {}).items()

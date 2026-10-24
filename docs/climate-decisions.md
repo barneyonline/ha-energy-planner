@@ -21,6 +21,76 @@ manual overrides, confidence, minimum-cycle or rollback checks. After economic
 activation, degraded evidence returns control to normal climate automations.
 Select Legacy explicitly to restore the old policy.
 
+### Direction permission and fallback evidence
+
+**Preconditioning mode** is separate from the Automatic/Observe/Legacy decision
+policy. Its default, **Automatic**, permits either direction. **Cooling only**
+and **Heating only** restrict acquisition by both tariff and economic planning,
+revalidation of an incumbent economic schedule and execution of an older queued
+action. An incompatible owned cycle releases through the existing restoration
+transaction. A safe stop or restoration to the original user/automation baseline
+is not a new preconditioning acquisition and remains allowed. These restrictions
+do not change the room goals or equipment offsets and do not disable external
+Home Assistant climate automations.
+
+For mapped rooms, tariff fallback gives an existing heating/cooling equipment
+mode priority over weather-based direction inference. From an idle head, heating
+requires every mapped participating room to need heat: a current reading below
+its lower comfort boundary, or a recent qualified passive trend predicting a
+crossing of that boundary by the proposed peak. A single colder bedroom does not
+justify raising the other comfortable rooms to their upper boundary. Conflicting
+needs leave normal comfort controls in charge; no acquisition is preferable to an
+unsupported whole-unit intervention. Cooling is supported by a room above its
+upper boundary or a qualified trend predicting that crossing. Cooling only also
+explicitly permits preparation toward the lower room goal while the head is idle.
+
+Direction inference uses only source/mode/regime-compatible passive evidence that
+already qualifies for temperature learning. In addition, it requires 12 accepted
+windows covering at least 60 minutes within the preceding two hours, with the
+latest at most 30 minutes old. It takes the median of those recent windows; an
+overnight median, stale observations, old whole-degree steps or cold outdoor air
+alone cannot establish daytime heating need. Disabling temperature learning
+disables this predictive path. Existing equipment-mode intent and actual room
+boundary demand remain available. Weather still participates in validated
+economic simulation; its savings/recovery/readiness requirements are unchanged.
+Installations without mapped room inputs retain legacy automatic direction
+inference, but the explicit direction restrictions still apply. Humidity,
+presence or comfort-only zone mappings do not count as room temperature inputs:
+Daikin-based heating remains eligible through execution. An explicitly mapped
+temperature sensor that loses its reading still blocks new acquisition.
+
+Preconditioning diagnostics expose `direction`: the permission, chosen mode,
+reason and per-room measured temperatures, bounds, usable recent passive rates
+and projected peak temperatures. Safety blockers such as low confidence, manual
+HVAC overrides, away policy and missing comfort inputs take precedence over a
+no-demand explanation, including during independent-zone fallback. A missing
+projection remains unknown. These
+linear direction checks do not establish predicted finishing temperatures,
+economic readiness, measured energy or savings.
+
+### 24 October 2026 decision assessment
+
+The deployed 1.4.6 fallback selected heat to 24°C at noon before a 16:00 peak.
+Main was 22.18°C and Bedrooms 21.84°C within the 21–24°C band. Between 09:00 and
+12:00, 15-minute sampled room history showed robust trends of about −0.05°C/hour
+for each room. Extending that rate to 16:00 would leave them about 21.98°C and
+21.63°C. This is an illustrative extrapolation, not a validated counterfactual:
+the exact hourly forecast at decision time was not retained, daytime conditions
+can change, and HVAC electrical power was estimated rather than measured. The
+economic model had no qualified validation windows. A tariff spread and colder
+outside air did not establish that heating comfortable rooms to 24°C was useful.
+Observed heating coincided with Main reaching 24°C at 13:15 and 24.62°C at 13:41.
+
+The later 15:50 snapshot was different: Main was 22.43°C and Bedrooms 20.32°C.
+Some bedroom warming was reasonable comfort control; that snapshot did not prove
+that both rooms should be preheated to 24°C. The new fallback leaves that conflict
+with normal controls. The 14:41 cooling snapshot (Main23.70°C, Bedrooms20.12°C)
+retains its already-active cooling direction and existing independent-zone
+completion safeguards despite a cold forecast. `tests/test_hvac_direction.py`
+replays these sanitized inputs with explicitly synthetic forecasts and tariffs.
+Neither these tests nor the historical observations prove a full uninterrupted
+cooling outcome or a monetary saving.
+
 Readiness is separate for heating and cooling. It requires 14 days of usable
 normal-operation history, 20 complete chronological validation windows, five
 active episodes, temperature MAE no greater than 0.5°C, temperature 90th-percentile

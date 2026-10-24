@@ -23,6 +23,7 @@ from .const import (
     CONF_PLANNER_ENABLED,
 )
 from .export_limit_policy import area_safe
+from .hvac_direction import mapped_direction, mode_allowed
 from .models import (
     ActionAsset,
     ActionKind,
@@ -36,6 +37,7 @@ from .models import (
 )
 from .ownership import EnphaseProfileGuard, OwnershipState
 from .safety import strict_bool
+from .zone_temperature import temperatures
 
 
 class ConstraintValidator:
@@ -257,6 +259,11 @@ class ConstraintValidator:
     ) -> list[ConstraintViolation]:
         violations: list[ConstraintViolation] = []
         desired_mode = action.desired_state.get("hvac_mode")
+        if desired_mode in {"heat", "cool"} and not mode_allowed(self.options, desired_mode):
+            violations.append(_action_violation(
+                action, "preconditioning_mode_not_allowed",
+                "The current preconditioning mode does not permit this HVAC direction.",
+            ))
         if context.occupancy_state == OccupancyState.UNKNOWN:
             return [
                 _action_violation(
@@ -291,6 +298,20 @@ class ConstraintValidator:
                 )
             )
         lifecycle_continuation = _is_same_hvac_lifecycle(context, action, ownership)
+        if (desired_mode == "heat" and not lifecycle_continuation
+                and action.desired_state.get("phase") == "preconditioning"
+                and not action.desired_state.get("economic_policy_version")
+                and temperatures(context)):
+            deadline = action.desired_state.get("period_start")
+            if not isinstance(deadline, datetime) or deadline.tzinfo is None:
+                deadline = now
+            direction = mapped_direction(context, self.options, context.climate_inputs.get("thermal_model", {}),
+                                         deadline)
+            if direction != "heat":
+                violations.append(_action_violation(
+                    action, "hvac_heating_need_unproven",
+                    "Current room evidence does not justify fallback heating acquisition.",
+                ))
         zone_coast_stop = bool(
             lifecycle_continuation and desired_mode == "off" and action.desired_state.get("zone_stop")
             and action.desired_state.get("phase") in {"pre_peak_coast", "peak_coast"}
