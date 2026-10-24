@@ -26,6 +26,17 @@ EV charging waits when the vehicle reports `SUSPENDED_EV` / `SuspendedEV`, inclu
 
 Tariff plans retain the provider's UTC boundaries across refreshes, including partial current intervals. Climate calendar entries show planned preconditioning and coast phases; command deadlines appear in their details. Base preconditioning lead accepts 0–360 minutes (default 90); a four-hour fallback uses base 240 and a learned maximum of at least 240. Raising the learned maximum alone does not extend the fallback. Zero base lead disables preconditioning. Finishing temperatures remain unknown until the relevant heating or cooling rate is ready. HVAC timing and room-feedback edits preserve unrelated controls; changing actuators or global safety settings retains guarded restoration.
 
+**Preconditioning mode** separately permits Automatic, Cooling only or Heating only.
+Cooling only keeps the configured room goal and equipment compensation while
+preventing planner heating acquisition in both planning paths and at execution.
+Automatic fallback with mapped room sensors respects an existing equipment mode;
+from idle, cold weather alone cannot justify heating comfortable rooms. Recent
+qualified passive room trends or actual room-boundary demand must support the
+direction. Conflicting room needs remain with normal comfort controls. Original
+state restoration and safe stops are still allowed. Zones with only humidity,
+presence or comfort mappings retain Daikin temperature feedback. Diagnostics prioritise safety
+blockers over no-demand explanations. See [climate decisions](docs/climate-decisions.md).
+
 Future preconditioning windows stay pending when a tariff tail changes. Rescheduling updates the pending window; cancellation removes it. Neither is reported as a missed execution before the episode starts. Refresh also clears older replacement reports demonstrably recorded before their saved episode start, without claiming that preparation ran. Saved attempts at or after the start, or with unknown timing, remain preserved even when a planning snapshot predates them. Matching provisional ownership retains history until its command outcome arrives and remains unconfirmed throughout that wait. Attempt history survives rollback and reload before that outcome is saved.
 
 Missed-preconditioning diagnostics reconcile a changed tariff tail with confirmed execution of the same preparation episode. Matching requires the same configuration, mode, target, peak and preparation deadline. Confirmed evidence retains its original execution time and window across overlapping replacements whose regenerated starts differ; a replacement plan alone does not prove success. Older history or coasting ownership without this correlation evidence retains strict lifecycle matching.
