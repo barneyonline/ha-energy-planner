@@ -4118,6 +4118,7 @@ def test_configured_base_lead_schedules_full_fallback_before_tariff_boundary(lea
     ) for i in range(48)]
     options = {**DEFAULT_OPTIONS, "planner_enabled": True, "dry_run": False,
                "climate_control_enabled": True, "planning_interval_minutes": 15,
+               "hvac_preconditioning_mode": "cooling_only",
                "hvac_precondition_lead_minutes": lead_minutes,
                "hvac_precondition_max_lead_minutes": max(lead_minutes, 180),
                "hvac_thermal_learning_enabled": learning_enabled}

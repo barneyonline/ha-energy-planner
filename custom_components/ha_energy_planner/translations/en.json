@@ -202,7 +202,8 @@
               "hvac_cop_table": "Equipment efficiency curve",
               "hvac_power_source_type": "HVAC power source type",
               "hvac_precondition_max_lead_minutes": "Maximum learned preconditioning lead (minutes)",
-              "hvac_thermal_learning_enabled": "Learn heating and cooling rates"
+              "hvac_thermal_learning_enabled": "Learn heating and cooling rates",
+              "hvac_preconditioning_mode": "Preconditioning mode"
             },
             "data_description": {
               "daikin_climate_entity": "Climate entity the planner may control after active mode is enabled.",
@@ -237,7 +238,8 @@
               "hvac_cop_table": "Optional heat/cool lists of temperature and cop pairs, ordered by outdoor temperature; used only after calibration.",
               "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated.",
               "hvac_precondition_max_lead_minutes": "Allow ready heating/cooling rates to extend the base lead up to this limit (0–360 minutes). Must be at least the base lead; defaults to 180. Raising only this maximum does not extend the fallback duration.",
-              "hvac_thermal_learning_enabled": "Collect room temperature trends and use qualified heating/cooling rates for timing. This does not enable measured-energy savings."
+              "hvac_thermal_learning_enabled": "Collect room temperature trends and use qualified heating/cooling rates for timing. This does not enable measured-energy savings.",
+              "hvac_preconditioning_mode": "Restrict planner acquisition to cooling, heating, or automatic direction. Automatic mapped-room fallback uses room demand and recent qualified passive trends; cold weather alone cannot start heating from idle. Stops and original-state restoration remain allowed."
             }
           },
           "enphase_inputs": {
@@ -527,7 +529,8 @@
       "invalid_load_recovery_age": "Recovery sample age must be between 1 and 30 minutes.",
       "invalid_export_limit_entity": "Select the Export Limit Select entity supplied by the Enphase integration. Previously mapped Export Limit sensors are also supported.",
       "invalid_unit": "Select an existing Celsius or Fahrenheit temperature sensor.",
-      "invalid_precondition_lead": "Both preconditioning leads must be finite values from 0 to 360 minutes, and the maximum learned lead must be at least the base lead."
+      "invalid_precondition_lead": "Both preconditioning leads must be finite values from 0 to 360 minutes, and the maximum learned lead must be at least the base lead.",
+      "invalid_preconditioning_mode": "Select Automatic, Cooling only, or Heating only."
     },
     "abort": {
       "no_vehicles": "No tracked vehicles are configured. Choose Add vehicle first.",
@@ -741,6 +744,15 @@
           "entry_disabled": "Enable this Energy Planner configuration, then open Repairs again.",
           "unsupported_version": "This configuration was created by a newer Energy Planner version. Update Energy Planner before changing it."
         }
+      }
+    }
+  },
+  "selector": {
+    "hvac_preconditioning_mode": {
+      "options": {
+        "automatic": "Automatic",
+        "cooling_only": "Cooling only",
+        "heating_only": "Heating only"
       }
     }
   }

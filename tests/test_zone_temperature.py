@@ -360,6 +360,7 @@ def test_owned_cycle_uses_room_completion_instead_of_cold_head_feedback():
 @pytest.mark.parametrize('mode', ['heat','cool'])
 def test_future_passive_drift_can_extend_preparation_within_the_maximum(mode):
     c = context()
+    c.current_hvac_mode = mode
     c.climate_inputs['zones'][ZONE]['temperature'] = 24 if mode == 'cool' else 20
     model = mature(mode=mode,value=2)
     model['sources'][ZONE]['buckets']['passive'] = {
@@ -392,6 +393,7 @@ def test_passive_gain_as_fast_as_active_does_not_divide_by_zero():
 @pytest.mark.parametrize('mode', ['heat','cool'])
 def test_review_blocks_takeover_at_an_opposite_room_comfort_boundary(mode):
     c = context()
+    c.current_hvac_mode = mode
     c.climate_inputs['zones'][ZONE]['temperature'] = 24 if mode == 'cool' else 20
     c.climate_inputs['zones']['climate.other'] = {
         'temperature_entity':'sensor.other', 'temperature':18 if mode == 'cool' else 26,
@@ -450,6 +452,7 @@ def test_review_grid_rounding_never_exceeds_the_maximum_lead(interval,maximum):
 @pytest.mark.parametrize('room_target', [False,True])
 def test_review_qualified_rates_do_not_start_a_cycle_when_every_room_is_at_target(mode,room_target):
     c = context()
+    c.current_hvac_mode = mode
     target = (23 if mode == 'cool' else 21) if room_target else (19 if mode == 'cool' else 25)
     c.climate_inputs['zones'][ZONE]['temperature'] = target
     if room_target:

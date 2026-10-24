@@ -23,6 +23,7 @@ from .const import (
     CONF_PLANNING_HORIZON_HOURS,
     CONF_PLANNING_INTERVAL_MINUTES,
 )
+from .hvac_direction import mode_allowed
 from .models import ActionAsset, ActionKind, DecisionContext, PlanAction
 from .safety import strict_bool
 from .thermal_learning import timing
@@ -120,6 +121,16 @@ def update_readiness(
 
 def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: list[PlanAction]) -> list[PlanAction]:
     """Return one policy's actions; authority still belongs to the existing executor."""
+    if (context.hvac_control.get("economic_policy_version")
+            and context.hvac_control.get("mode") in {"heat", "cool"}
+            and not mode_allowed(options, context.hvac_control["mode"])):
+        context.climate_decision = {
+            "reason": "hvac_preconditioning_mode_changed", "preconditioning_status": "restoring",
+            "summary": "The active cycle is no longer permitted by the preconditioning mode; releasing control.",
+        }
+        return [release_action(context, "hvac_preconditioning_mode_changed", timedelta(minutes=int(
+            options[CONF_PLANNING_INTERVAL_MINUTES]
+        ))) ]
     if feedback_missing(context):
         context.climate_decision = {
             "reason": "zone_temperature_unavailable", "preconditioning_status": "blocked",

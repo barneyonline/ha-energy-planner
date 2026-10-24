@@ -9,6 +9,21 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- `hvac_direction.py` separates acquisition permission from decision policy,
+  respects current equipment direction for mapped rooms and requires actual or
+  recent qualified passive room demand before selecting an idle fallback mode.
+  Weather alone cannot preheat comfortable rooms to the upper boundary. Mixed
+  room needs retain normal comfort authority. `planner_hvac.py`,
+  `climate_optimizer.py`, `climate_runtime.py` and `constraints.py` enforce the
+  direction through candidate generation, incumbent revalidation, incompatible
+  ownership release and execution of queued actions, preserving safe stops and
+  original restoration. `preconditioning.py` exposes the reason and room inputs.
+  `tests/test_hvac_direction.py` includes sanitized 24 October snapshots, recent
+  versus stale/unqualified drift, cooling-only preparation from idle, invalid
+  settings, both planning paths and stale-plan rejection. See the decision
+  assessment in `docs/climate-decisions.md` for evidence limits; full acceptance
+  remains `scripts/docker-validate.sh` and no live benefit is claimed from tests.
+
 - Release 1.4.0 synchronizes the manifest and project version and requires Home
   Assistant 2026.10.0. The README follows a short overview/features/install/
   compatibility/documentation structure. Detailed operator material is retained
