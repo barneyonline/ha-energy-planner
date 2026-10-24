@@ -54,11 +54,17 @@ disables this predictive path. Existing equipment-mode intent and actual room
 boundary demand remain available. Weather still participates in validated
 economic simulation; its savings/recovery/readiness requirements are unchanged.
 Installations without mapped room inputs retain legacy automatic direction
-inference, but the explicit direction restrictions still apply.
+inference, but the explicit direction restrictions still apply. Humidity,
+presence or comfort-only zone mappings do not count as room temperature inputs:
+Daikin-based heating remains eligible through execution. An explicitly mapped
+temperature sensor that loses its reading still blocks new acquisition.
 
 Preconditioning diagnostics expose `direction`: the permission, chosen mode,
 reason and per-room measured temperatures, bounds, usable recent passive rates
-and projected peak temperatures. A missing projection remains unknown. These
+and projected peak temperatures. Safety blockers such as low confidence, manual
+HVAC overrides, away policy and missing comfort inputs take precedence over a
+no-demand explanation, including during independent-zone fallback. A missing
+projection remains unknown. These
 linear direction checks do not establish predicted finishing temperatures,
 economic readiness, measured energy or savings.
 
