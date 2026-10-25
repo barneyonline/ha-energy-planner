@@ -913,6 +913,35 @@ use throughout; the Docker and pull-request gates enforce that result.
   timestamps. Malformed legacy away-off start evidence uses a valid takeover
   timestamp as its conservative fallback. An active lifecycle releases
   ownership when its relevant confidence falls below threshold.
+- HVAC mode timing persists separately from actuator ownership in `hvac_cycle`.
+  Confirmed planner stops retain their feedback boundary through completed release,
+  rollback, persistence and reload; new lifecycle acquisition cannot bypass the
+  configured rest interval. Both fallback and economic candidates are withheld
+  as a complete schedule until a mode-changing start is eligible. Execution reads
+  current timing and mode again, including immediately before command dispatch.
+  No-op commands, targets and zone continuations do not extend dwell. Safe stops,
+  original-baseline restoration, sensor-loss recovery and manual handoff remain
+  immediate. An unresolved mode intent continues to block automatic starts
+  after its 180-second readback deadline. Only feedback matching that command's
+  requested mode can reconcile it. Fresh but contradictory baseline feedback
+  does not prove that a delayed command cannot still act. Restoration issues and
+  confirms an explicit compensating mode command when uncertainty survives,
+  including when the original baseline is already displayed. Compensation
+  reserves a full conservative rest when its mode-change time is unproven;
+  ordinary target/zone/no-op refreshes do not. Persisted confirmation of the
+  exact head command retires an obsolete legacy readback lease without another
+  compensation or timer reset, including after reload. Other entity/context
+  records and newer unresolved intents retain their recovery requirements.
+  Passive feedback cannot confirm
+  an unsent compensation. Legacy pending mode-command records also require
+  compensation even when no independent cycle record exists yet. Known unsent intents are retired,
+  preserving any older unresolved intent they temporarily superseded. Blocked
+  fallback candidates release their speculative HVAC load before EV scheduling,
+  so readiness, capacity and cost use the retained baseline. Older stores start with no new timing
+  evidence and retain their existing ownership-based guard. Evidence:
+  `hvac_cycle.py`, `hvac_adapter.py`, `executor.py`, `planner.py`, `coordinator.py`,
+  `storage.py`, and `tests/test_hvac_cycle.py`, alongside the original constraint,
+  airflow, restoration and manual-override regressions.
 - Every integration-owned sensor and binary-sensor attribute payload passes
   through a shared UTF-8 byte budget below Recorder's hard state-attribute
   limit. Oversized nested evidence is compacted deterministically while

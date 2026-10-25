@@ -64,6 +64,7 @@ from .ev_telemetry import measured, reported_at, sample_ev, suspension_identity,
 from .export_limit_policy import EXPORT_ASSET
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
 from .hvac_control import HVACOwnershipTransaction, copy_pending_confirmation
+from .hvac_cycle import cycle_active, reconcile_cycle, record_cycle
 from .models import (
     ActionAsset,
     ActionKind,
@@ -790,10 +791,26 @@ class Executor:
                 await self.store.async_add_outcome(self._action_outcome(
                     action, now, result=result, reason=reason, pre_state={}, post_state={}, plan_id=plan.plan_id))
             return None
+        if action.asset == ActionAsset.DAIKIN and action.desired_state.get("hvac_mode") not in {None, "off"}:
+            await self.async_reconcile_hvac_cycle()
+        if action.asset == ActionAsset.DAIKIN and self._hvac_cycle_active(action.desired_state.get("hvac_mode"), now):
+            await self.store.async_add_outcome(self._action_outcome(
+                action, now, result=OutcomeResult.REJECTED, reason="hvac_min_cycle_active",
+                pre_state={}, post_state={}, plan_id=plan.plan_id))
+            return None
         ownership = self._ownership_from_store()
         if context is not None and self.options and not safety_ev_stop:
+            validation_context = context
+            if action.asset == ActionAsset.DAIKIN:
+                entity = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+                live = self.hass.states.get(entity) if self.hass is not None and entity else None
+                cycle = self.store.data.get("hvac_cycle", {})
+                validation_context = replace(
+                    context, hvac_cycle=cycle if cycle.get("entity_id") == entity else {},
+                    current_hvac_mode=live.state if live is not None else context.current_hvac_mode,
+                )
             violations = ConstraintValidator(self.options).validate_action(
-                context,
+                validation_context,
                 plan,
                 action,
                 now=now,
@@ -2946,8 +2963,77 @@ class Executor:
         if not restoration:
             await self._async_flush_provisional_state()
 
+    async def async_reconcile_hvac_cycle(self) -> None:
+        """Retain late or reloaded mode feedback before planning or acquisition."""
+        cycle = self.store.data.get("hvac_cycle", {})
+        entity = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        if cycle.get("entity_id") != entity or self.hass is None or not entity:
+            return
+        state = self.hass.states.get(entity)
+        if state is None:
+            return
+        updated = reconcile_cycle(cycle, dt_util.utcnow(), state.state, getattr(state, "last_changed", None),
+                                  getattr(state, "last_reported", getattr(state, "last_updated", None)))
+        if updated != cycle:
+            await self.store.async_save_hvac_cycle(updated)
+            await self.store.async_flush()
+
+    def _hvac_cycle_active(self, desired_mode: str | None, now: datetime) -> bool:
+        cycle = self.store.data.get("hvac_cycle", {})
+        entity = self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        if cycle.get("entity_id") != entity:
+            return False
+        state = self.hass.states.get(entity) if self.hass is not None and entity else None
+        return cycle_active(cycle, now, int(self.options.get("hvac_min_cycle_minutes", 20)),
+                            desired_mode, state.state if state is not None else None)
+
     def _configure_pending_hvac_adapter(self, adapter: DaikinHVACAdapter, pending: dict[str, Any]) -> None:
         """Wire one adapter to the shared pending-transaction protocol."""
+        cycle_callback = getattr(adapter, "set_cycle_callback", None)
+        if callable(cycle_callback) and getattr(self, "store", None) is not None:
+            cycle_transaction_contexts: set[str] = set()
+            previous_intents: dict[str, dict[str, Any]] = {}
+
+            async def persist_cycle(record: dict[str, Any]) -> None:
+                now = dt_util.utcnow()
+                restoration = record.get("restoration") or "restore_main" in pending or "restore_zones" in pending
+                mandatory = restoration or record["service"] == "turn_off" or (
+                    record["service"] == "set_hvac_mode" and record.get("requested", {}).get("hvac_mode") == "off")
+                if record["stage"] in {"intent", "dispatch"}:
+                    desired_mode = ("off" if record["service"] == "turn_off" else
+                                    record.get("requested", {}).get("hvac_mode") or pending.get("hvac_mode"))
+                    current_cycle = self.store.data.get("hvac_cycle", {})
+                    own_cycle = (current_cycle.get("pending", {}).get("context_id") in cycle_transaction_contexts
+                                 or current_cycle.get("confirmed_context_id") in cycle_transaction_contexts)
+                    if not restoration and not own_cycle and self._hvac_cycle_active(desired_mode, now):
+                        raise RuntimeError("hvac_min_cycle_active")
+                    cycle_transaction_contexts.add(record["context_id"])
+                current = self.store.data.get("hvac_cycle", {})
+                if current.get("entity_id") != record["entity_id"]:
+                    current = {}
+                if record["stage"] == "intent":
+                    prior = current.get("pending")
+                    if not prior and record.get("prior_mode_intent"):
+                        prior = record_cycle({}, {**record["prior_mode_intent"], "stage": "intent"}, now).get("pending")
+                    previous_intents[record["context_id"]] = deepcopy(prior or {})
+                updated = record_cycle(current, record, now)
+                if (record["stage"] == "not_dispatched" and updated != current
+                        and previous_intents.get(record["context_id"])):
+                    updated["pending"] = previous_intents[record["context_id"]]
+                if updated != current:
+                    try:
+                        await self.store.async_save_hvac_cycle(updated)
+                        if not mandatory:
+                            await self.store.async_flush()
+                    except Exception:  # noqa: BLE001 - persistence cannot prevent mandatory restoration.
+                        if not mandatory:
+                            raise
+                        self.store.data["hvac_cycle"] = updated
+
+            cycle = self.store.data.get("hvac_cycle", {})
+            cycle_callback(persist_cycle, unresolved_mode=bool(
+                cycle.get("entity_id") == getattr(adapter, "entry_data", {}).get(CONF_DAIKIN_CLIMATE)
+                and isinstance(cycle.get("pending"), dict)))
         pending["deferred_zone_entities"] = adapter.deferred_zone_entities
         pending.setdefault("transaction_id", Context().id)
         baseline = getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {})
@@ -2969,7 +3055,17 @@ class Executor:
                         }
                     await self._async_persist_hvac_confirmation(record, restoration=restoration)
 
-                confirmation_callback(persist_confirmation, baseline.get("command_confirmation"))
+                recovery = baseline.get("command_confirmation")
+                cycle = self.store.data.get("hvac_cycle", {})
+                head = getattr(adapter, "entry_data", {}).get(CONF_DAIKIN_CLIMATE)
+                if (head and isinstance(recovery, dict) and recovery.get("context_id")
+                        and recovery.get("entity_id") == cycle.get("entity_id") == head
+                        and cycle.get("confirmed_context_id") == recovery["context_id"]
+                        and not isinstance(cycle.get("pending"), dict)):
+                    # This exact head command already has durable mode proof.
+                    # An expired legacy lease must not resurrect uncertainty.
+                    recovery = None
+                confirmation_callback(persist_confirmation, recovery)
             abort_callback = getattr(adapter, "set_abort_main_state", None)
             if callable(abort_callback):
                 abort_callback(dict(baseline.get("main_state", {})))
