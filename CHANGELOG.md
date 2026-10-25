@@ -12,6 +12,8 @@
 
 ### 🐛 Bug fixes
 
+- Preserve HVAC minimum cycle/rest timing after confirmed planner stops across restoration, tariff lifecycles and reload. Enforce automatic restart and direction-change deadlines in both planning paths and before service dispatch, without delaying safe restoration or extending dwell for target/zone continuations. Retire cancelled unsent commands, require matching mode feedback or confirmed baseline compensation for unresolved writes, reuse persisted confirmation without repeating compensation, and remove blocked fallback load before EV scheduling.
+
 - Prevent cold weather alone from selecting fallback heating of comfortable mapped rooms. Respect existing equipment direction, require room demand or recent qualified passive evidence from idle, and leave conflicting room needs with normal comfort controls. Diagnostics explain the direction evidence and unknown projections.
 
 - Preserve safety-blocker reporting when room direction evidence finds no demand, including low confidence, manual overrides, occupancy and missing inputs during independent-zone fallback.

@@ -4712,7 +4712,10 @@ def test_expired_manual_hvac_state_handles_malformed_and_active_overrides() -> N
 
 
 @pytest.mark.parametrize("mapped_power", [False, True])
-def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapped_power: bool) -> None:
+@pytest.mark.parametrize("cycle_entity", ["climate.daikin", "climate.previous", None])
+def test_update_data_locked_records_dry_run_comparison(
+    monkeypatch: object, mapped_power: bool, cycle_entity: str | None,
+) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)
     context = SimpleNamespace(
         created_at=now,
@@ -4818,8 +4821,10 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.data = None
     coordinator.hass = FakeHass()
-    coordinator.entry = FakeEntry({"ev_power_limit_entity": "number.unavailable"} if mapped_power else {},
-                                  {"ai_enabled": False})
+    coordinator.entry = FakeEntry(
+        {CONF_DAIKIN_CLIMATE: "climate.daikin", **(
+            {"ev_power_limit_entity": "number.unavailable"} if mapped_power else {})},
+        {"ai_enabled": False})
     coordinator.store = FakeStore(
         {
             "ev_charge_calibration": {},
@@ -4828,6 +4833,7 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
             "forecast_snapshots": [],
             "overrides": [{"kind": "other"}],
             "ownership": {"hvac_control": {"phase": "preconditioning"}},
+            "hvac_cycle": {"entity_id": cycle_entity, "changed_at": now.isoformat(), "mode": "off"},
         }
     )
     coordinator.executor = FakeExecutor()
@@ -4854,6 +4860,9 @@ def test_update_data_locked_records_dry_run_comparison(monkeypatch: object, mapp
 
     result = asyncio.run(refresh_and_train())
 
+    expected_cycle = coordinator.store.data["hvac_cycle"] if cycle_entity == "climate.daikin" else {}
+    assert getattr(context, "hvac_cycle", {}) == expected_cycle
+    assert "hvac_cycle" not in context.hvac_control
     if mapped_power:
         assert "ev_power_feedback_unavailable" in context.input_issues
         assert coordinator.store.data["ev_telemetry"]["version"] == 1

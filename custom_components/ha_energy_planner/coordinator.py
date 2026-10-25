@@ -1409,6 +1409,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         stored_ownership = self.store.data.get("ownership", {})
         if isinstance(stored_ownership, dict):
             context.hvac_control = _hvac_control_from_ownership(stored_ownership)
+        reconcile_cycle = getattr(self.executor, "async_reconcile_hvac_cycle", None)
+        if callable(reconcile_cycle):
+            await reconcile_cycle()
+        cycle = self.store.data.get("hvac_cycle", {})
+        if isinstance(cycle, dict) and cycle.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE):
+            context.hvac_cycle = dict(cycle)
         context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
         if context.hvac_control and climate_issues:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)

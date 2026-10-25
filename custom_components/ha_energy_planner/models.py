@@ -151,6 +151,7 @@ class DecisionContext:
     occupied_temperature_high_c: float | None = None
     active_overrides: list[Override] = field(default_factory=list)
     hvac_control: dict[str, Any] = field(default_factory=dict)
+    hvac_cycle: dict[str, Any] = field(default_factory=dict)
     hvac_tariff_slots: list[DecisionSlot] | None = None
     climate_zone_entities: list[str] = field(default_factory=list)
     input_issues: list[str] = field(default_factory=list)
