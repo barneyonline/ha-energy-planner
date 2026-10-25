@@ -24,6 +24,7 @@ from .const import (
     CONF_EV_MAX_IMPORT_PRICE,
     CONF_EV_PRICE_LIMIT_ENABLED,
     CONF_EV_SOC_PER_KWH,
+    CONF_HVAC_MIN_CYCLE_MINUTES,
     CONF_HVAC_PRECONDITION_WHILE_AWAY,
     CONF_OCCUPIED_TEMP_TOLERANCE_PERCENT,
     CONF_PLANNER_ENABLED,
@@ -35,6 +36,7 @@ from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
 from .ev_optimization import optimise_ev
 from .ev_policy import strategy
 from .export_limit_policy import EXPORT_ASSET, assumed_zero_export, build_actions, curtailment_preview
+from .hvac_cycle import cycle_active
 from .models import (
     ActionAsset,
     ActionKind,
@@ -235,6 +237,7 @@ class DryRunPlanner:
                     )
                 ]
             return []
+        baseline_hvac_loads = [slot.projected_hvac_load_kw for slot in context.slots]
         actions: list[PlanAction] = []
         execute_not_before = context.created_at
         execute_not_after = context.created_at + timedelta(minutes=int(self.options[CONF_PLANNING_INTERVAL_MINUTES]))
@@ -304,6 +307,20 @@ class DryRunPlanner:
                     execute_not_after,
                 )
             )
+        fallback_cycle_blocked = any(
+            action.asset == ActionAsset.DAIKIN and action.kind != ActionKind.RELEASE_HVAC
+            and cycle_active(context.hvac_cycle, action.execute_not_before,
+                             int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES]),
+                             action.desired_state.get("hvac_mode"), context.current_hvac_mode)
+            for action in actions
+        )
+        if fallback_cycle_blocked:
+            actions = [action for action in actions if action.kind == ActionKind.RELEASE_HVAC
+                       or _is_hvac_away_off_action(action)]
+            for slot, power in zip(context.slots, baseline_hvac_loads, strict=True):
+                slot.projected_hvac_load_kw = power
+            context.climate_legacy_decision.update(
+                reason="hvac_min_cycle_active", summary="HVAC minimum cycle/rest period has not elapsed.")
         legacy_hvac_loads = [slot.projected_hvac_load_kw for slot in context.slots]
         if context.climate_inputs and self.options.get("hvac_decision_policy", "automatic") != "legacy":
             for slot in context.slots:
@@ -579,6 +596,26 @@ class DryRunPlanner:
         legacy_climate = [action for action in actions if action.asset == ActionAsset.DAIKIN]
         actions = [action for action in actions if action.asset != ActionAsset.DAIKIN]
         actions.extend(economic_actions(context, dict(self.options), legacy_climate))
+        blocked = [action for action in actions if action.asset == ActionAsset.DAIKIN
+                   and action.kind != ActionKind.RELEASE_HVAC
+                   and cycle_active(context.hvac_cycle, action.execute_not_before,
+                                    int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES]),
+                                    action.desired_state.get("hvac_mode"), context.current_hvac_mode)]
+        if blocked:
+            # Never leave a future coast/start tail whose preparation was withheld.
+            # The next refresh must qualify the complete candidate after expiry.
+            actions = [action for action in actions if action.asset != ActionAsset.DAIKIN
+                       or action.kind == ActionKind.RELEASE_HVAC or action.desired_state.get("hvac_mode") == "off"]
+            context.climate_decision.update(reason="hvac_min_cycle_active", commands_selected=False,
+                                            preconditioning_status="no_opportunity",
+                                            summary="HVAC minimum cycle/rest period has not elapsed.")
+            context.climate_engine.pop("scheduled", None)
+            baseline_powers = context.climate_decision.get("baseline_powers_kw") or legacy_hvac_loads
+            for slot, power in zip(context.slots, baseline_powers, strict=True):
+                slot.projected_hvac_load_kw = power
+        elif fallback_cycle_blocked and not context.climate_decision.get("commands_selected"):
+            context.climate_decision.setdefault("reason", "hvac_min_cycle_active")
+            context.climate_decision.setdefault("summary", "HVAC minimum cycle/rest period has not elapsed.")
         context.climate_decision["temperature_feedback"] = context.climate_inputs.get("zones", {})
         context.climate_decision["zone_control"] = context.climate_legacy_decision.get("zone_control", {
             **context.climate_inputs.get("zone_topology", {}),

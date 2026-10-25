@@ -41,6 +41,7 @@ _DICT_FIELDS = {
     "built_in_load_forecast",
     "load_source_outage",
     "ownership",
+    "hvac_cycle",
     "restore_notification_failures",
     "control_pause",
     "production",
@@ -372,6 +373,10 @@ class PlannerStore:
         """Durably save provenance and decision authority before execution."""
         await self._async_set_if_changed("climate_engine", state)
 
+    async def async_save_hvac_cycle(self, cycle: dict[str, Any]) -> None:
+        """Persist mode timing without claiming any actuator ownership."""
+        await self._async_set_if_changed("hvac_cycle", cycle)
+
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         """Persist planner ownership state."""
         history = record_acquisition(self.data.get("preconditioning_history", {}), ownership.get("hvac_control"))
@@ -482,6 +487,7 @@ def _default_data() -> dict[str, Any]:
         "audit_history_version": 1,
         "action_attempts": [],
         "ownership": {},
+        "hvac_cycle": {},
         "restore_notification_failures": {},
         "overrides": [],
         "forecast_snapshots": [],
