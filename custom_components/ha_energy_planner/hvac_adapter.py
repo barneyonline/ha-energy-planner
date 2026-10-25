@@ -23,6 +23,7 @@ from .const import (
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
 )
+from .hvac_cycle import mode_feedback_matches, mode_intent
 from .models import ActionKind, PlanAction
 
 _STATE_CONFIRMATION_TIMEOUT_SECONDS = 30.0
@@ -80,6 +81,10 @@ class DaikinHVACAdapter:
         self._set_coupled_zone_feedback_expected: Callable[[str | None, str | None, str | None], None] | None = None
         self._set_pending_main_restore: Callable[[dict[str, Any]], None] | None = None
         self._set_pending_zone_restore: Callable[[dict[str, Any]], None] | None = None
+        self._restoring_main_state = False
+        self._unconfirmed_main_mode = False
+        self._prior_mode_intent: dict[str, Any] | None = None
+        self._async_cycle_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None
         self._command_callback: Callable[[dict[str, Any]], None] | None = None
         self._last_commands: dict[str, dict[str, Any]] = {}
         self._abort_main_state: dict[str, Any] = {}
@@ -172,11 +177,24 @@ class DaikinHVACAdapter:
         """Retain an uncertain command and its original deadline across reloads."""
         self._async_persist_confirmation = callback
         self._recovery_confirmation = recovery
+        if (self._async_cycle_callback is not None and recovery is not None
+                and recovery.get("entity_id") == getattr(self, "entry_data", {}).get(CONF_DAIKIN_CLIMATE)
+                and mode_intent(recovery)):
+            self._unconfirmed_main_mode = True
+            self._prior_mode_intent = dict(recovery)
 
     async def _async_save_confirmation(self, record: dict[str, Any] | None) -> None:
         if self._async_persist_confirmation is not None:
             await self._async_persist_confirmation(record)
         self._recovery_confirmation = record
+
+    def set_cycle_callback(
+        self, callback: Callable[[dict[str, Any]], Awaitable[None]], *, unresolved_mode: bool = False,
+    ) -> None:
+        """Persist head mode timing independently of transaction ownership."""
+        self._async_cycle_callback = callback
+        self._unconfirmed_main_mode = unresolved_mode
+        self._prior_mode_intent = None
 
     def set_command_callback(self, callback: Callable[[dict[str, Any]], None]) -> None:
         """Record the exact issued service and its bounded feedback expectation."""
@@ -216,6 +234,9 @@ class DaikinHVACAdapter:
         observed = self._state(str(data.get(ATTR_ENTITY_ID)))
         record = {
             "entity_id": data.get(ATTR_ENTITY_ID),
+            "previous_mode": observed.state if observed is not None else None,
+            "restoration": self._restoring_main_state,
+            "uncertainty_compensation": self._restoring_main_state and self._unconfirmed_main_mode,
             "domain": domain,
             "service": service,
             "context_id": context.id,
@@ -254,7 +275,13 @@ class DaikinHVACAdapter:
             # Apply the same acquisition/restoration policy immediately before
             # dispatch, rather than overwriting the user's new target first.
             await asyncio.sleep(0)
+            unconfirmed_before = self._unconfirmed_main_mode
             try:
+                if (self._async_cycle_callback is not None
+                        and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
+                    self._unconfirmed_main_mode = True
+                    await self._async_cycle_callback({**record, "stage": "intent",
+                                                       "prior_mode_intent": self._prior_mode_intent})
                 self._raise_if_climate_override_requested(entity_id)
                 # Existing exception cleanup must still shut down a head whose
                 # original baseline was off when classifier helpers are broken.
@@ -270,12 +297,20 @@ class DaikinHVACAdapter:
                 if (domain == "climate" and respect_manual_override
                         and self._zone_desired.get("equipment_compensation")):
                     self._assert_equipment_command(service, data)
+                if (self._async_cycle_callback is not None
+                        and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
+                    # Read-only: recheck after all persistence and guard awaits.
+                    await self._async_cycle_callback({**record, "stage": "dispatch"})
             except BaseException:  # Cancellation before dispatch is an unsent intent too.
+                self._unconfirmed_main_mode = unconfirmed_before
                 # This intent never reached the service bus. Retire superseded
                 # baselines first so a crash cannot replay a stale user target,
                 # then remove the unsent intent rather than reconciling it as
                 # though its apparent state were authoritative device feedback.
                 await self._async_persist_requested_manual_supersessions()
+                if (self._async_cycle_callback is not None
+                        and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE) and mode_intent(record)):
+                    await self._async_cycle_callback({**record, "stage": "not_dispatched"})
                 await self._async_save_confirmation(None)
                 self._last_commands.pop(entity_id, None)
                 self._command_started.pop(entity_id, None)
@@ -296,10 +331,10 @@ class DaikinHVACAdapter:
                 self._command_callback({**record, "stage": "service_failed", "failure_category": type(error).__name__})
             raise
 
-    def _record_confirmation(self, entity_id: str, confirmed: bool) -> None:
+    async def _record_confirmation(self, entity_id: str, confirmed: bool) -> None:
         """Publish authoritative readback or a sanitized timeout stage."""
         record = self._last_commands.get(entity_id)
-        if self._command_callback is None or record is None:
+        if record is None:
             return
         observed = self._state(entity_id)
         values = (
@@ -307,14 +342,20 @@ class DaikinHVACAdapter:
             if observed is not None and entity_id.startswith("climate.")
             else {"mode": observed.state if observed is not None else None}
         )
-        self._command_callback(
-            {
-                **record,
-                "stage": "confirmed" if confirmed else "readback_failed",
-                "observed": values,
-                "failure_category": None if confirmed else "ConfirmationTimeout",
-            }
-        )
+        evidence = {
+            **record,
+            "stage": "confirmed" if confirmed else "readback_failed",
+            "observed": values,
+            "feedback_changed_at": getattr(observed, "last_changed", None),
+            "failure_category": None if confirmed else "ConfirmationTimeout",
+        }
+        if self._async_cycle_callback is not None and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE):
+            if confirmed and mode_feedback_matches(record, values.get("hvac_mode")):
+                self._unconfirmed_main_mode = False
+                self._prior_mode_intent = None
+            await self._async_cycle_callback(evidence)
+        if self._command_callback is not None:
+            self._command_callback(evidence)
 
     def set_abort_main_state(self, baseline: dict[str, Any]) -> None:
         """Preserve the owned original baseline across cancellation of a refresh."""
@@ -945,6 +986,7 @@ class DaikinHVACAdapter:
             and _main_hvac_desired_state(main_state)
             and main_observed is not None
             and _already_in_desired_state(main_observed, main_state)
+            and not self._unconfirmed_main_mode
             and (not main_state.get(_ROLLBACK_HVAC_MODE_CHANGED) or deferred_recovery)
         ):
             # Verify dependent targets before deciding whether the head needs
@@ -1584,6 +1626,14 @@ class DaikinHVACAdapter:
         entity_id: str,
         saved_state: dict[str, Any],
     ) -> bool:
+        """Restore original state immediately, including acquisition rollback."""
+        self._restoring_main_state = True
+        try:
+            return await self._async_restore_main_state_impl(entity_id, saved_state)
+        finally:
+            self._restoring_main_state = False
+
+    async def _async_restore_main_state_impl(self, entity_id: str, saved_state: dict[str, Any]) -> bool:
         """Restore and confirm the complete main state changed during takeover."""
         desired_state = _main_hvac_desired_state(saved_state)
         if not desired_state:
@@ -1626,6 +1676,7 @@ class DaikinHVACAdapter:
                     entity_id,
                     {"hvac_mode": "off"},
                     respect_zone_manual_override=False,
+                    force=self._unconfirmed_main_mode,
                 )
             except _HVACManualOverrideError:
                 raise
@@ -1642,6 +1693,7 @@ class DaikinHVACAdapter:
                 entity_id,
                 desired_state,
                 respect_zone_manual_override=False,
+                force=self._unconfirmed_main_mode,
             )
         except _HVACManualOverrideError:
             raise
@@ -1667,11 +1719,11 @@ class DaikinHVACAdapter:
         while True:
             observed = self._state(entity_id)
             if observed is not None and observed.state == expected_state:
-                self._record_confirmation(entity_id, True)
+                await self._record_confirmation(entity_id, True)
                 return True
             remaining = deadline - loop.time()
             if remaining <= 0:
-                self._record_confirmation(entity_id, False)
+                await self._record_confirmation(entity_id, False)
                 return False
             await asyncio.sleep(min(_STATE_CONFIRMATION_POLL_SECONDS, remaining))
 
@@ -1765,7 +1817,7 @@ class DaikinHVACAdapter:
             while True:
                 observed = self._state(entity_id)
                 if observed is not None and matches(observed):
-                    self._record_confirmation(entity_id, True)
+                    await self._record_confirmation(entity_id, True)
                     if (self._recovery_confirmation is not None
                             and self._recovery_confirmation["entity_id"] == entity_id):
                         await self._async_save_confirmation(None)
@@ -1775,7 +1827,7 @@ class DaikinHVACAdapter:
                 self._raise_if_climate_override_requested(entity_id)
                 now = loop.time()
                 if now >= deadline:
-                    self._record_confirmation(entity_id, False)
+                    await self._record_confirmation(entity_id, False)
                     if (self._recovery_confirmation is not None
                             and self._recovery_confirmation["entity_id"] == entity_id):
                         await self._async_save_confirmation(None)

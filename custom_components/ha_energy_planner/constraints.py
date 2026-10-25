@@ -23,6 +23,8 @@ from .const import (
     CONF_PLANNER_ENABLED,
 )
 from .export_limit_policy import area_safe
+from .hvac_cycle import cycle_active
+from .hvac_cycle import instant as cycle_instant
 from .hvac_direction import mapped_direction, mode_allowed
 from .models import (
     ActionAsset,
@@ -316,10 +318,14 @@ class ConstraintValidator:
             lifecycle_continuation and desired_mode == "off" and action.desired_state.get("zone_stop")
             and action.desired_state.get("phase") in {"pre_peak_coast", "peak_coast"}
         )
-        if desired_mode != "off" and not lifecycle_continuation and _hvac_min_cycle_active(
-            now,
-            ownership,
-            timedelta(minutes=int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES])),
+        if cycle_active(context.hvac_cycle, now, int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES]),
+                        desired_mode, context.current_hvac_mode) or (
+            cycle_instant(context.hvac_cycle.get("changed_at")) is None
+            and not isinstance(context.hvac_cycle.get("pending"), dict)
+            and desired_mode not in {None, "off", context.current_hvac_mode}
+            and not lifecycle_continuation and _hvac_min_cycle_active(
+                now, ownership, timedelta(minutes=int(self.options[CONF_HVAC_MIN_CYCLE_MINUTES])),
+            )
         ):
             violations.append(
                 _action_violation(

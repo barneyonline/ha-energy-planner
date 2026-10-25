@@ -283,6 +283,9 @@ class FakeStore:
     async def async_save_ev_telemetry(self, telemetry: dict[str, Any]) -> None:
         self.data["ev_telemetry"] = telemetry
 
+    async def async_save_hvac_cycle(self, cycle: dict[str, Any]) -> None:
+        self.data["hvac_cycle"] = cycle
+
     async def async_save_ownership(self, ownership: dict[str, Any]) -> None:
         self.data["ownership"] = ownership
 
