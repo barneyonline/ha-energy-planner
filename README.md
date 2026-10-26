@@ -50,6 +50,8 @@ The configured HVAC minimum cycle/rest interval survives completed restoration a
 
 Thermal learning retains bounded evidence through normal zone cycles and reloads. Transitions break observation windows; each airflow/equipment regime uses its own qualifying evidence. Future preparation can select retained evidence for the exact proposed sensor, controller, topology, open subset and equipment targets while the head is idle. Unknown or incompatible candidate evidence uses the configured lead; older opaque windows remain retained but need new structured observations before qualifying a future regime. Sensor changes invalidate the affected source; shared controller/topology changes invalidate the affected shared evidence.
 
+For a matching partial-zone candidate, only rooms whose dampers will open need qualified active rates. Closed rooms contribute no active preparation time; their finishing temperatures remain unknown, separately from active-rate readiness. Unknown or blocked airflow intent still uses fallback timing.
+
 Independent room control preserves the economic degradation guard: away-off ownership cannot start a new fallback cycle after economic control has activated. Existing tariff cycles can finish; explicit Legacy policy keeps its fallback behavior.
 
 Unfinished room targets retain their paired actuator baselines through deferred recovery and reloads. Recovery under a manually controlled head waits for compatible room bounds before reopening a zone.

@@ -201,6 +201,14 @@ Decision diagnostics label current observed-regime readiness separately from ret
 qualified regimes (counts, minutes, rates and structured-window counts). Candidate
 timing reports its proposed conditions and compatible qualified rate separately,
 with effective lead, learning rejections and finishing-temperature estimates.
+For a proven partial-zone intent, `preparation_active` identifies the open rooms
+that require matching active-mode rates. Closed rooms need no active preparation
+time and cannot veto those rates merely because their observations are passive.
+Their active-rate compatibility and finishing-temperature predictions remain
+unknown; `rates_ready` can therefore be true while `finishing_temperature_known`
+is false. Unknown or blocked intent never receives this closed-room exemption.
+Lifecycle finishing estimates and coast reserve also remain unknown when a
+closed room has no finishing prediction; they cannot substitute the shared target.
 Retained qualification alone does not prove compatibility with any particular
 future candidate; it remains separate from electrical/economic readiness.
 
