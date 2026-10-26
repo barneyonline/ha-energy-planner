@@ -9,9 +9,24 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Mode-independent HVAC demand: `hvac_direction.py` records equipment state and
+  evaluated peak time for diagnostics without granting it demand authority.
+  `planner_hvac.py` keeps mapped-room passive drift/coast unknown without qualified
+  per-room evidence; current outdoor weather cannot invent a 0.5°C/hour room
+  trend. `constraints.py` rechecks both heating and cooling for new fallback
+  acquisition while preserving confirmed lifecycle continuation.
+  `tests/test_hvac_demand.py` replays the sanitized 26 October decision/tariff
+  snapshot, varies mode, weather, energy opportunity and qualified drift, and
+  checks stale queued actions, manual override and occupancy. Existing timing,
+  equipment-compensation and independent-zone tests retain explicit demand or
+  ownership evidence. `docs/hvac-demand-assessment-2026-10-26.md` inventories
+  available/unconfigured inputs and separates decision-time evidence from later
+  observations. Economic validation and measured-energy requirements are unchanged.
+  Full acceptance remains `scripts/docker-validate.sh`; no live controls are changed.
+
 - `hvac_direction.py` separates acquisition permission from decision policy,
-  respects current equipment direction for mapped rooms and requires actual or
-  recent qualified passive room demand before selecting an idle fallback mode.
+  requires actual or recent qualified passive room demand for new mapped-room
+  fallback acquisition, irrespective of equipment mode.
   Weather alone cannot preheat comfortable rooms to the upper boundary. Mixed
   room needs retain normal comfort authority. `planner_hvac.py`,
   `climate_optimizer.py`, `climate_runtime.py` and `constraints.py` enforce the
