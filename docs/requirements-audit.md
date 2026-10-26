@@ -9,6 +9,12 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Prospective thermal timing retains the room-demand gate introduced by PR #145.
+  Qualified active heating rates alone cannot acquire comfortable rooms; the
+  joint regression in `tests/test_prospective_thermal.py` requires separate room
+  demand before testing fallback timing. Source, topology, setpoint and subset
+  compatibility remain required, with no change to electrical/economic readiness.
+
 - Mode-independent HVAC demand: `hvac_direction.py` records equipment state and
   evaluated peak time for diagnostics without granting it demand authority.
   `planner_hvac.py` keeps mapped-room passive drift/coast unknown without qualified
@@ -1561,3 +1567,11 @@ Valid charging evidence at or after the refusal remains an allowed reset.
 - Review regressions in `tests/test_hvac_equipment_learning.py` preserve thermostat-only alias offsets through a form save and verify compensated calendar/action text distinguishes the 21°C room goal from the 19°C shared equipment setpoint (`config_flow.py`, `calendar.py`, `plan_presentation.py`).
 
 - Second-review mode-transition regressions in `tests/test_hvac_equipment_learning.py` verify cooling can be selected from heating or an off head despite different prior-mode bounds/steps, reject a target invalid in confirmed cooling feedback before dispatch, and restore the original mode and target (`hvac_adapter.py`).
+
+
+## Prospective thermal-regime selection
+
+- `thermal_learning.py` preserves version-3 histories and records versioned structured operating conditions on new windows. Candidate selection binds the mapped sensor and head controller to the current explicit topology, exact open subset, mode, shared-head target and active-zone equipment targets. It uses `zone_control.desired_fields(record=False)` to evaluate the same intent without changing ownership, diagnostics or equipment. `climate_inputs.py` carries the configured head identity; `climate_optimizer.py` evaluates timing separately for each candidate target and deadline. Fallback uses the same selector and cannot recover an incompatible current-regime aggregate after candidate qualification fails.
+- Current observed-regime readiness and measured electrical evidence retain their existing selection. Retained qualified regimes are reported separately with structured-window counts; candidate timing reports proposed conditions and compatible rates. Opaque older windows are retained and can describe the observed regime, but only new structured matching windows can grant prospective authority. There is no relabelling or pooling across incompatible regimes, and no manifest version bump.
+- `tests/test_prospective_thermal.py` trains deterministic distinct sensor observations, serializes the model, then verifies heating/cooling candidates while the head is off, aliases, compensated equipment targets, fallback planning and target-specific economic search. It rejects incompatible sources/controllers/topology/subsets/setpoints, unsupported or blocked intent, missing/legacy/unknown metadata, disabled learning, expired/future/mixed and insufficient evidence. Existing transition, 12-window/60-minute, 14-day expiry, 96-window retention, manual override, restoration, airflow, confirmation and minimum-cycle regressions remain required in `scripts/docker-validate.sh`.
+- This follows the 24 October 2026 offline audit reproduction; it does not establish a historical counterfactual or physical-device acceptance. The audited live base/maximum were 240/240 minutes, so no changed start time that day is claimed. No live Home Assistant or credentials are needed by these regressions. Legacy opaque evidence must acquire structured observations before prospective adaptation becomes ready.

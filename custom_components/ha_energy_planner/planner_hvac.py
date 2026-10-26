@@ -537,6 +537,10 @@ class HVACPlanningPolicy:
             context.climate_legacy_decision["thermal_timing"] = thermal_timing
             target = high if mode == "heat" else low
             rate = thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode)
+            if any(row["evidence_selection"] == "candidate_regime" for row in thermal_timing["zones"].values()):
+                # Current-regime aggregates cannot bypass prospective qualification.
+                rate = (min(row["rate_c_per_hour"] for row in thermal_timing["zones"].values())
+                        if thermal_timing["rates_ready"] else None)
             best_start: int | None = None
             best_required_slots: int | None = None
             best_projected_end_temperature = target
