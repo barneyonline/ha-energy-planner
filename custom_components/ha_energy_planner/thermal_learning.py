@@ -311,13 +311,18 @@ def timing(context: DecisionContext, options: Mapping[str, Any], mode: str,
         # selection when topology, metadata or the proposed airflow is unknown.
         prospective = bool(candidate is not None or item.get("regime") is not None
                            or context.climate_inputs.get("zone_topology", {}).get("supported"))
+        pairs = context.climate_inputs.get("zone_topology", {}).get("pairs", {})
+        actuator = next((key for key, climate in pairs.items() if zone in (key, climate)), zone)
+        # Only proven closed paths may omit an active rate. Unknown/blocked
+        # intent still requires qualification and cannot gain authority here.
+        active = candidate is None or [actuator, "off", None] not in candidate["controls"]
         learned = (rate(model, zone, mode, context.created_at, candidate=candidate)
-                   if candidate is not None or not prospective else None)
+                   if active and (candidate is not None or not prospective) else None)
         drift = rate(model, zone, "passive", context.created_at)
         projected_start = current + (drift or 0) * delay_minutes / 60 if current is not None else None
         usable = projected_start is not None and target is not None and learned is not None and learned > 0
-        ready = ready and usable
-        minutes = None
+        ready = ready and (not active or usable)
+        minutes = None if active else 0.0
         if usable:
             assert current is not None and target is not None and learned is not None
             assert projected_start is not None
@@ -337,7 +342,8 @@ def timing(context: DecisionContext, options: Mapping[str, Any], mode: str,
                              "target": target, "rate_c_per_hour": learned,
                              "evidence_selection": "candidate_regime" if prospective else "current_regime",
                              "candidate_conditions": candidate,
-                             "candidate_compatible": learned is not None if prospective else None,
+                             "preparation_active": active,
+                             "candidate_compatible": learned is not None if prospective and active else None,
                              "passive_drift_c_per_hour": drift, "required_minutes": minutes}
     lead = min(maximum, max(base, ceil(required))) if ready and base > 0 else base
     duration = min(lead, max(0, available_minutes)) if available_minutes is not None else lead
@@ -357,7 +363,8 @@ def timing(context: DecisionContext, options: Mapping[str, Any], mode: str,
     return {"effective_lead_minutes": lead, "base_lead_minutes": base, "maximum_lead_minutes": maximum,
             "rates_ready": ready, "required_minutes": required if ready else None,
             "preparation_basis": "learned_rates" if ready else "configured_fallback",
-            "finishing_temperature_known": ready,
+            "finishing_temperature_known": ready and all(
+                row["predicted_finishing_temperature"] is not None for row in predictions.values()),
             "available_run_minutes": duration,
             "partial_preconditioning": bool(ready and required > duration), "zones": predictions}
 

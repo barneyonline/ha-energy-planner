@@ -18,7 +18,7 @@ from custom_components.ha_energy_planner.planner_hvac import HVACPlanningPolicy
 from custom_components.ha_energy_planner.thermal_learning import rate, sample, summary, timing, update
 
 
-def trained_idle(mode="heat", *, offset=0, aliases=False, equipment_target=None):
+def trained_idle(mode="heat", *, offset=0, aliases=False, equipment_target=None, closed_bed=False):
     c = room_context(mode, main=22, bed=22)
     c.climate_inputs["head_entity"] = "climate.head"
     if offset:
@@ -27,6 +27,9 @@ def trained_idle(mode="heat", *, offset=0, aliases=False, equipment_target=None)
         for actuator, climate in PAIRS.items():
             c.climate_inputs["zones"][climate] = deepcopy(c.climate_inputs["zones"][actuator])
     hass = device(c)
+    if closed_bed:
+        hass.states.values[BED] = "off"
+        hass.states.get(PAIRS[BED]).state = "off"
     target = equipment_target if equipment_target is not None else (24 if mode == "heat" else 21)
     hass.states.get("climate.head").attributes["temperature"] = target + offset
     for climate in PAIRS.values():
@@ -34,16 +37,20 @@ def trained_idle(mode="heat", *, offset=0, aliases=False, equipment_target=None)
     model = {}
     for index in range(13):
         c.created_at = NOW + timedelta(minutes=index * 5)
-        for room in c.climate_inputs["zones"].values():
+        for zone, room in c.climate_inputs["zones"].items():
             room["temperature"] = (20 + index * .1) if mode == "heat" else (26 - index * .1)
+            if closed_bed and zone in {BED, PAIRS[BED]}:
+                room["temperature"] = 24 if mode == "heat" else 20.5
             hass.states.get(room["temperature_entity"]).last_updated = c.created_at
         model = update(model, sample(c, DEFAULT_OPTIONS, hass.states, "climate.head"))
     c.created_at += timedelta(minutes=5)
     c.current_hvac_mode = "off"
     hass.states.get("climate.head").state = "off"
     hass.states.values[BED] = "off"
-    for room in c.climate_inputs["zones"].values():
+    for zone, room in c.climate_inputs["zones"].items():
         room["temperature"] = 22 if mode == "heat" else 23
+        if closed_bed and zone in {BED, PAIRS[BED]}:
+            room["temperature"] = 24 if mode == "heat" else 20.5
         hass.states.get(room["temperature_entity"]).last_updated = c.created_at
     model = update(model, sample(c, DEFAULT_OPTIONS, hass.states, "climate.head"))
     # Round-trip through the actual persisted JSON representation.
@@ -309,3 +316,60 @@ def test_prospective_heating_rates_do_not_create_demand_for_comfortable_rooms():
     assert HVACPlanningPolicy(DEFAULT_OPTIONS, model)._next_hvac_period(c) is None
     assert c.climate_legacy_decision["reason"] == "room_demand_unproven"
     assert hass.states.get("climate.head").state == "off" and not c.hvac_control
+
+
+@pytest.mark.parametrize("mode", ["heat", "cool"])
+@pytest.mark.parametrize("aliases", [False, True])
+def test_matching_subset_needs_active_rates_only_for_open_rooms(mode, aliases):
+    c, hass, model = trained_idle(mode, aliases=aliases, closed_bed=True)
+    before = deepcopy(model)
+    assert mode not in model["sources"][BED]["buckets"]
+    details = timing(c, DEFAULT_OPTIONS, mode, model)
+    assert details["rates_ready"] and details["preparation_basis"] == "learned_rates"
+    assert 100 <= details["effective_lead_minutes"] <= 101
+    for zone, row in details["zones"].items():
+        active = zone in {MAIN, MAIN_CLIMATE}
+        assert row["preparation_active"] is active
+        if active:
+            assert row["candidate_compatible"]
+            assert row["rate_c_per_hour"] == pytest.approx(1.2)
+            assert row["predicted_finishing_temperature"] == (24 if mode == "heat" else 21)
+        else:
+            assert row["rate_c_per_hour"] is None
+            assert row["candidate_compatible"] is None
+            assert row["required_minutes"] == 0
+            assert row["predicted_finishing_temperature"] is None
+            assert row["shortfall_c"] is None
+    assert not details["finishing_temperature_known"]
+    assert model == before and hass.states.get("climate.head").state == "off" and not c.hvac_control
+    # Opening the previously closed room invalidates the retained subset.
+    for zone in (BED, PAIRS[BED]):
+        if zone in c.climate_inputs["zones"]:
+            c.climate_inputs["zones"][zone]["temperature"] = 22 if mode == "heat" else 23
+    assert not timing(c, DEFAULT_OPTIONS, mode, model)["rates_ready"]
+
+
+@pytest.mark.parametrize("aliases", [False, True])
+def test_matching_cooling_subset_extends_fallback_preparation_without_closed_room_forecast(aliases):
+    c, hass, model = trained_idle("cool", aliases=aliases, closed_bed=True)
+    for zone in (MAIN, MAIN_CLIMATE):
+        if zone in c.climate_inputs["zones"]:
+            c.climate_inputs["zones"][zone]["temperature"] = 24.5
+    c.slots = [DecisionSlot(c.created_at + timedelta(minutes=i * 5), .1 if i < 36 else .5,
+                           .05, 0, 1, outdoor_temperature_forecast_c=30) for i in range(60)]
+    options = {**DEFAULT_OPTIONS, "hvac_preconditioning_mode": "cooling_only"}
+    period = HVACPlanningPolicy(options, model)._next_hvac_period(c)
+    assert period is not None
+    duration = (period["precondition_end"] - period["precondition_start"]).total_seconds() / 60
+    assert 175 <= duration <= 180
+    details = c.climate_legacy_decision["thermal_timing"]
+    assert details["rates_ready"] and not details["finishing_temperature_known"]
+    assert details["zones"][BED]["predicted_finishing_temperature"] is None
+    assert period["projected_precondition_end_temperature"] is None
+    assert hass.states.get("climate.head").state == "off" and not c.hvac_control
+    c.hvac_control = {**period, "phase": "preconditioning", "main_state_committed": True,
+                      "projected_precondition_end_temperature": 21}
+    actions = HVACPlanningPolicy(options, model)._hvac_lifecycle_actions(
+        c, c.created_at, c.created_at + timedelta(minutes=5),
+    )
+    assert actions[0].desired_state["projected_precondition_end_temperature"] is None
