@@ -106,6 +106,13 @@ def test_outdoor_weather_cannot_fabricate_mapped_indoor_coast(mode, outdoor):
     assert _effective_passive_drift_c_per_hour(c, mode, {"passive_indoor_drift_c_per_hour": -0.5}) is None
     model = passive(c, -0.5 if mode == "heat" else 0.5)
     assert _room_coast_hours(c, model, mode, start, boundary) == 6
+    unknown_closed_room = {MAIN: start, BED: None}
+    assert _room_coast_hours(c, model, mode, start, boundary, unknown_closed_room) is None
+    HVACPlanningPolicy(options(), model)._project_hvac_coast_slots(
+        c, mode=mode, coast_started_at=c.created_at, active_until=c.slots[1].valid_at,
+        starting_temperature=start, comfort_boundary=boundary, room_temperatures=unknown_closed_room,
+    )
+    assert c.slots[0].projected_hvac_load_kw > 0
     model["sources"][BED]["buckets"].clear()
     assert _room_coast_hours(c, model, mode, start, boundary) is None
 
