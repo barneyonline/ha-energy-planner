@@ -398,10 +398,12 @@ def optimise(
             continue
         # A distant end-of-horizon deadline cannot bound nearer opportunities.
         # Search the union of their leads, then enforce each stop's own bound.
-        timings = {stop: timing(
-            context, options, mode,
+        prospective_timing = bool(context.climate_inputs.get("zone_topology", {}).get("supported"))
+        timing_targets: list[float | None] = [*targets] if prospective_timing else [None]
+        timings = {(stop, target): timing(
+            context, options, mode, target=target,
             deadline_minutes=max((context.slots[stop].valid_at - context.created_at).total_seconds() / 60, 0),
-        ) for stop in range(1, len(context.slots) - 1)}
+        ) for stop in range(1, len(context.slots) - 1) for target in timing_targets}
         thermal_timing = max(timings.values(), key=lambda row: row["effective_lead_minutes"],
                              default=timing(context, options, mode))
         decision.setdefault("thermal_timing", {})[mode] = thermal_timing
@@ -418,8 +420,9 @@ def optimise(
             return None, decision
         decision["search"] = "bounded_deterministic_candidates"
         for start, stop, release, target in schedules:
+            candidate_timing = timings[stop, target if prospective_timing else None]
             if (context.slots[stop].valid_at - context.slots[start].valid_at).total_seconds() > (
-                bounded_lead_slots(timings[stop], options) * float(options[CONF_PLANNING_INTERVAL_MINUTES]) * 60
+                bounded_lead_slots(candidate_timing, options) * float(options[CONF_PLANNING_INTERVAL_MINUTES]) * 60
             ):
                 reject("adaptive_lead_limit")
                 continue
@@ -512,7 +515,7 @@ def optimise(
                 best = candidate
                 best_key = key
                 decision["thermal_timing"][mode] = timing(
-                    context, options, mode,
+                    context, options, mode, target=target,
                     delay_minutes=max((context.slots[start].valid_at - context.created_at).total_seconds() / 60, 0),
                     available_minutes=(
                         context.slots[stop].valid_at - context.slots[start].valid_at

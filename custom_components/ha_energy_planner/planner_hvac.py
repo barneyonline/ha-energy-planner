@@ -313,7 +313,8 @@ class HVACPlanningPolicy:
                 "precondition_target": _finite_number(active.get("precondition_target")) or precondition_target,
                 "coast_target": _finite_number(active.get("coast_target")) or coast_target,
                 "projected_precondition_end_temperature": (projected_precondition_end_temperature
-                    if context.climate_legacy_decision.get("thermal_timing", {}).get("rates_ready") else None),
+                    if context.climate_legacy_decision.get("thermal_timing", {}).get("finishing_temperature_known")
+                    else None),
             }
             actions = [
                 self._hvac_control_action(
@@ -537,6 +538,11 @@ class HVACPlanningPolicy:
             context.climate_legacy_decision["thermal_timing"] = thermal_timing
             target = high if mode == "heat" else low
             rate = thermal_active_temperature_rate_c_per_hour(self.thermal_model, mode)
+            if any(row["evidence_selection"] == "candidate_regime" for row in thermal_timing["zones"].values()):
+                # Current-regime aggregates cannot bypass prospective qualification.
+                rate = (min((row["rate_c_per_hour"] for row in thermal_timing["zones"].values()
+                             if row["preparation_active"] and row["rate_c_per_hour"] is not None), default=None)
+                        if thermal_timing["rates_ready"] else None)
             best_start: int | None = None
             best_required_slots: int | None = None
             best_projected_end_temperature = target
@@ -756,7 +762,7 @@ class HVACPlanningPolicy:
                 "suppression_min_price_delta": suppression_delta,
                 "mode": mode,
                 "projected_precondition_end_temperature": (
-                    best_projected_end_temperature if selected_timing["rates_ready"] else None
+                    best_projected_end_temperature if selected_timing["finishing_temperature_known"] else None
                 ),
             }
         return None
@@ -1061,6 +1067,8 @@ def _room_coast_hours(
         if boundary is None:
             return None
         initial = _finite_number((room_temperatures or {}).get(zone))
+        if room_temperatures is not None and zone in room_temperatures and initial is None:
+            return None  # An explicitly unknown room cannot inherit a shared target.
         initial = starting_temperature if initial is None else initial
         drift = learned_rate(dict(model), zone, "passive", context.created_at)
         hours = _thermal_coast_hours(

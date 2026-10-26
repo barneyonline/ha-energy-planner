@@ -302,6 +302,7 @@ def read_climate_inputs(
         currency = tariff.attributes.get("currency") or getattr(getattr(hass, "config", None), "currency", None)
     return {
         "identity": climate_identity(data, options),
+        "head_entity": data.get(CONF_DAIKIN_CLIMATE),
         **power_provenance(hass, data),
         "tariff_intervals": tariff_source_intervals(tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5))),
         "target": finite(attrs.get("temperature")),

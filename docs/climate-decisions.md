@@ -144,7 +144,16 @@ Sensor or topology changes reset incompatible statistics. Static source identity
 from transient zone power and transition timestamps. Normal zone closures/reopens
 and reloads preserve compatible history. Each dated window is tagged with its stable
 physical airflow/equipment regime (including head and active zone setpoints); only
-matching-regime windows qualify the current source/mode. A transition timestamp
+matching-regime windows qualify the current source/mode. Future preparation selects
+structured evidence for the exact proposed sensor, controller, topology, open subset,
+mode and head/active-zone equipment targets, using the same zone-control intent as
+the proposed command. It can use qualified retained windows while the head is off,
+without starting equipment to establish compatibility. Economic candidates use their
+own proposed target; temperature qualification does not authorize an economic model
+or measured-energy claim. Opaque legacy windows remain retained and usable for
+current-regime reporting, but cannot qualify a future regime until 12 structured
+matching windows covering 60 minutes have accumulated. Unknown topology, blocked
+airflow intent, missing metadata and incompatible targets use configured fallback. A transition timestamp
 breaks a cross-transition interval, including a close/reopen between samples, but
 never creates a new storage identity. Each source/mode retains at most 96 windows
 across regimes, not an unbounded list of regime models. Measured-load evidence
@@ -188,8 +197,20 @@ evidence combines qualifying measurements from every mapped room, irrespective
 of room order or availability. Duplicate timestamps count once, retained
 measurements stay at least five minutes apart, and the shared series retains at
 most 96 measurements from the last 14 days.
-Decision diagnostics expose sensors, matching-regime rates, retained-window counts, learning rejections,
-effective lead and finishing-temperature estimates.
+Decision diagnostics label current observed-regime readiness separately from retained
+qualified regimes (counts, minutes, rates and structured-window counts). Candidate
+timing reports its proposed conditions and compatible qualified rate separately,
+with effective lead, learning rejections and finishing-temperature estimates.
+For a proven partial-zone intent, `preparation_active` identifies the open rooms
+that require matching active-mode rates. Closed rooms need no active preparation
+time and cannot veto those rates merely because their observations are passive.
+Their active-rate compatibility and finishing-temperature predictions remain
+unknown; `rates_ready` can therefore be true while `finishing_temperature_known`
+is false. Unknown or blocked intent never receives this closed-room exemption.
+Lifecycle finishing estimates and coast reserve also remain unknown when a
+closed room has no finishing prediction; they cannot substitute the shared target.
+Retained qualification alone does not prove compatibility with any particular
+future candidate; it remains separate from electrical/economic readiness.
 
 ## Cooling equipment compensation
 
@@ -515,8 +536,8 @@ only an existing tariff preparation/coast lifecycle may continue. Explicit Legac
 policy retains its configured fallback behavior.
 Thermal observations reset their source regime when physical zone power changes;
 starts, stops and uncertain commands cannot train across that transition.
-Finishing-temperature estimates require newly qualified observations for the
-actual open-zone regime. Configured fallback timing remains explicitly uncertain.
+Finishing-temperature estimates require qualified structured observations compatible
+with the explicitly proposed open-zone regime, even before physical acquisition. Configured fallback timing remains explicitly uncertain.
 
 Repository tests cannot establish real damper movement, sufficient airflow,
 upstream mode/target coupling or compressor behavior. Live acceptance requires

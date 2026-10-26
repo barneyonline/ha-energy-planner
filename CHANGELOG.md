@@ -14,6 +14,8 @@
 
 - Require room demand or qualified recent passive trends before new fallback preconditioning, regardless of the current equipment mode. A running heater cannot justify preheating comfortable rooms to 24°C. Recheck both heating and cooling demand before executing queued acquisitions, while preserving owned lifecycle continuation and normal comfort control.
 - Keep mapped-room drift and coast predictions unknown without qualified per-room evidence instead of inventing a 0.5°C/hour trend from outdoor temperature.
+- Select qualified retained thermal evidence for an explicitly proposed HVAC preparation regime while equipment is idle. Match sensor, controller, topology, open subset and equipment setpoints in fallback and economic candidate timing; retain legacy windows without giving opaque metadata prospective authority. Distinguish retained qualification, current readiness and candidate compatibility in diagnostics.
+- Qualify matching partial-zone preparation using active rates only for rooms whose dampers will open. Satisfied closed rooms no longer force configured fallback timing; their finishing temperatures remain unknown.
 
 ### 🔧 Improvements
 
