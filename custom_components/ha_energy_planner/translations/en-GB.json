@@ -316,7 +316,7 @@
               "hvac_power_source_type": "Auto requires provenance; measured declares a physical source; estimated remains available for legacy planning. Known synthetic sources always remain estimated.",
               "hvac_precondition_max_lead_minutes": "Allow ready heating/cooling rates to extend the base lead up to this limit (0–360 minutes). Must be at least the base lead; defaults to 180. Raising only this maximum does not extend the fallback duration.",
               "hvac_thermal_learning_enabled": "Collect room temperature trends and use qualified heating/cooling rates for timing. This does not enable measured-energy savings.",
-              "hvac_preconditioning_mode": "Restrict planner acquisition to cooling, heating, or automatic direction. Automatic mapped-room fallback uses room demand and recent qualified passive trends; cold weather alone cannot start heating from idle. Stops and original-state restoration remain allowed."
+              "hvac_preconditioning_mode": "Restrict planner acquisition to cooling, heating, or automatic direction. Automatic mapped-room fallback requires room demand or recent qualified passive trends, regardless of equipment mode. Cold weather alone cannot justify heating comfortable rooms. Stops and original-state restoration remain allowed."
             }
           },
           "enphase_inputs": {

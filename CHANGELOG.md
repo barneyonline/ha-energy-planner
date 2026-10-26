@@ -12,11 +12,12 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Require room demand or qualified recent passive trends before new fallback preconditioning, regardless of the current equipment mode. A running heater cannot justify preheating comfortable rooms to 24°C. Recheck both heating and cooling demand before executing queued acquisitions, while preserving owned lifecycle continuation and normal comfort control.
+- Keep mapped-room drift and coast predictions unknown without qualified per-room evidence instead of inventing a 0.5°C/hour trend from outdoor temperature.
 
 ### 🔧 Improvements
 
-- None
+- Include observed equipment mode and evaluated peak time in direction diagnostics. Document the 26 October live input assessment and evidence limits.
 
 ### 🔄 Other changes
 

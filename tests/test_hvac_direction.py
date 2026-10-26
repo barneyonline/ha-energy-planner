@@ -154,7 +154,7 @@ def test_drift_filter_rejects_incompatible_future_and_malformed_windows():
 def test_current_mode_needs_no_weather_switch_and_idle_hot_rooms_can_cool():
     c = replay(FIXTURE["cases"][0])
     c.current_hvac_mode = "heat"
-    assert mapped_direction(c, options(), {}, c.slots[16].valid_at) == "heat"
+    assert mapped_direction(c, options(), {}, c.slots[16].valid_at) is None
     c.current_hvac_mode = "off"
     for room in c.climate_inputs["zones"].values():
         room["temperature"] = 20
