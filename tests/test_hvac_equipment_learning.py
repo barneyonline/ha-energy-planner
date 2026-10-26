@@ -377,7 +377,10 @@ def test_room_comfort_constraint_verifies_compensation_without_weakening_bounds(
         action.desired_state["zone_stop"] = True
     options = {**DEFAULT_OPTIONS, "occupied_temperature_tolerance_percent": 0,
                "planner_enabled": True, "dry_run": False}
-    result = ConstraintValidator(options).validate_action(c, _plan(NOW, action), action, now=NOW)
+    from custom_components.ha_energy_planner.ownership import OwnershipState
+    owned = OwnershipState(planner_takeover_started_at=NOW-timedelta(minutes=30),
+                           hvac_control_phase='preconditioning')
+    result = ConstraintValidator(options).validate_action(c, _plan(NOW, action), action, now=NOW, ownership=owned)
     if change:
         expected = "hvac_target_outside_comfort_bounds" if change == "goal" else "hvac_equipment_compensation_invalid"
         assert expected in result

@@ -621,7 +621,8 @@ template:
           nativeTemperature: "{{ 21 }}"
           temperatureUnit: "C"
           confidence: "{{ 0.90 }}"
-          detailedForecast: "{{ ([{'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}, {'nativeTemperature': 23.0}, {'nativeTemperature': 24.0}] * 48) }}"
+          # Peak weather below the 18 C lower bound supplies legacy direction evidence.
+          detailedForecast: "{{ ([{'nativeTemperature': 17.0}, {'nativeTemperature': 18.0}, {'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}] * 48) }}"
 
 automation:
   - alias: Fake EV charger start feedback
@@ -1540,7 +1541,7 @@ if not any(
 ):
     raise SystemExit("Forecast preview did not use HA template Amber price forecast attributes")
 weather_preview = [slot.get("outdoor_temperature_forecast_c") for slot in latest_snapshot.get("preview", [])[:4]]
-if weather_preview != [19.0, 20.0, 21.0, 22.0]:
+if weather_preview != [17.0, 18.0, 19.0, 20.0]:
     raise SystemExit(f"Forecast preview did not use HA template weather forecast attributes: {weather_preview}")
 if "forecast_calibration" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include calibration metadata")

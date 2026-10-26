@@ -3,8 +3,35 @@
   "comfort_low": 21,
   "comfort_high": 24,
   "cases": [
-    {"name": "comfortable_noon_rooms", "at": "2026-10-24T01:00:10+00:00", "head_mode": "off", "head_temperature": 19, "main": 22.18, "bedrooms": 21.84, "expected_mode": null, "reason": "room_demand_unproven"},
-    {"name": "later_conflicting_room_needs", "at": "2026-10-24T04:50:02+00:00", "head_mode": "off", "head_temperature": 18, "main": 22.43, "bedrooms": 20.32, "expected_mode": null, "reason": "conflicting_room_demand"},
-    {"name": "existing_cooling_intent", "at": "2026-10-24T03:41:45+00:00", "head_mode": "cool", "head_temperature": 21, "main": 23.70, "bedrooms": 20.12, "expected_mode": "cool", "reason": "existing_equipment_mode"}
+    {
+      "name": "comfortable_noon_rooms",
+      "at": "2026-10-24T01:00:10+00:00",
+      "head_mode": "off",
+      "head_temperature": 19,
+      "main": 22.18,
+      "bedrooms": 21.84,
+      "expected_mode": null,
+      "reason": "room_demand_unproven"
+    },
+    {
+      "name": "later_conflicting_room_needs",
+      "at": "2026-10-24T04:50:02+00:00",
+      "head_mode": "off",
+      "head_temperature": 18,
+      "main": 22.43,
+      "bedrooms": 20.32,
+      "expected_mode": null,
+      "reason": "conflicting_room_demand"
+    },
+    {
+      "name": "conflicting_rooms_while_equipment_cooling",
+      "at": "2026-10-24T03:41:45+00:00",
+      "head_mode": "cool",
+      "head_temperature": 21,
+      "main": 23.7,
+      "bedrooms": 20.12,
+      "expected_mode": null,
+      "reason": "conflicting_room_demand"
+    }
   ]
 }

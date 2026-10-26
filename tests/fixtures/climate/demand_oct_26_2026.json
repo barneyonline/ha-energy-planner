@@ -1,0 +1,74 @@
+{
+  "provenance": "Decision and room snapshot from authenticated read-only Home Assistant inspection on 26 October 2026. Tariffs are the Recorder state at the 14:44 AEDT query boundary, not a claimed publication timestamp. The exact decision-time hourly weather forecast was not retained. No measured savings or physical outcome is implied. The replay supplies synthetic unmapped head feedback and energy forecasts; only the mapped room temperatures, mode, comfort bounds and recorded import tariff values are decision-time evidence.",
+  "case": {
+    "at": "2026-10-26T03:45:08.414337+00:00",
+    "head_mode": "heat",
+    "main": 21.52,
+    "bedrooms": 19.48,
+    "head_setpoint": 19
+  },
+  "comfort_low": 21,
+  "comfort_high": 24,
+  "tariffs": [
+    {
+      "time": "2026-10-26T15:00:00+11:00",
+      "value": 0.0469
+    },
+    {
+      "time": "2026-10-26T15:30:00+11:00",
+      "value": 0.0469
+    },
+    {
+      "time": "2026-10-26T16:00:00+11:00",
+      "value": 0.258
+    },
+    {
+      "time": "2026-10-26T16:30:00+11:00",
+      "value": 0.2598
+    },
+    {
+      "time": "2026-10-26T17:00:00+11:00",
+      "value": 0.2642
+    },
+    {
+      "time": "2026-10-26T17:30:00+11:00",
+      "value": 0.2842
+    },
+    {
+      "time": "2026-10-26T18:00:00+11:00",
+      "value": 0.333
+    },
+    {
+      "time": "2026-10-26T18:30:00+11:00",
+      "value": 0.3765
+    },
+    {
+      "time": "2026-10-26T19:00:00+11:00",
+      "value": 0.3939
+    },
+    {
+      "time": "2026-10-26T19:30:00+11:00",
+      "value": 0.3987
+    },
+    {
+      "time": "2026-10-26T20:00:00+11:00",
+      "value": 0.3986
+    },
+    {
+      "time": "2026-10-26T20:30:00+11:00",
+      "value": 0.3957
+    },
+    {
+      "time": "2026-10-26T21:00:00+11:00",
+      "value": 0.2176
+    }
+  ],
+  "deployed_selection": {
+    "version": "v1.4.7",
+    "mode": "heat",
+    "target_c": 24,
+    "reason": "existing_equipment_mode"
+  },
+  "expected_mode": null,
+  "expected_reason": "conflicting_room_demand"
+}

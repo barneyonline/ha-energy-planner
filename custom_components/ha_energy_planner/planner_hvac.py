@@ -1021,16 +1021,13 @@ def _future_hvac_mode(
     low: float,
     high: float,
 ) -> str | None:
-    """Infer heat or cool from peak weather before using current-state fallbacks."""
+    """Infer equipment-only demand from weather and temperature, never device mode."""
     future_outdoor = _finite_number(getattr(peak_slot, "outdoor_temperature_forecast_c", None))
     if future_outdoor is not None:
         if future_outdoor < low:
             return "heat"
         if future_outdoor > high:
             return "cool"
-    current_mode = str(context.current_hvac_mode or "").lower()
-    if current_mode in {"heat", "cool"}:
-        return current_mode
     current_outdoor = _finite_number(context.current_outdoor_temperature_c)
     if current_outdoor is not None:
         if current_outdoor < low:
@@ -1066,14 +1063,6 @@ def _room_coast_hours(
         initial = _finite_number((room_temperatures or {}).get(zone))
         initial = starting_temperature if initial is None else initial
         drift = learned_rate(dict(model), zone, "passive", context.created_at)
-        if drift is None:
-            outdoor = context.current_outdoor_temperature_c
-            room_temperature = _finite_number(room.get("temperature"))
-            if outdoor is not None and room_temperature is not None:
-                if mode == "heat" and outdoor < room_temperature - 0.5:
-                    drift = -THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
-                elif mode == "cool" and outdoor > room_temperature + 0.5:
-                    drift = THERMAL_SHIFT_FALLBACK_DRIFT_C_PER_HOUR
         hours = _thermal_coast_hours(
             mode=mode, target_temperature=initial, comfort_boundary=boundary,
             passive_drift_c_per_hour=drift,
@@ -1089,7 +1078,9 @@ def _effective_passive_drift_c_per_hour(
     mode: str,
     thermal_model: Mapping[str, Any],
 ) -> float | None:
-    """Return learned or inferred passive indoor temperature drift."""
+    """Retain equipment-only heuristics without inventing mapped room trends."""
+    if temperatures(context):
+        return None  # Per-room qualified evidence belongs to timing() and _room_coast_hours().
     summary = thermal_model_summary(thermal_model)
     drift = summary.get("passive_indoor_drift_c_per_hour")
     if isinstance(drift, int | float) and isfinite(float(drift)):
@@ -1126,7 +1117,7 @@ _LEGACY_REASONS = {
     "zone_temperature_unavailable": "A configured zone temperature or comfort input is missing, invalid or stale.",
     "price_difference": "The forecast price difference is below the configured minimum.",
     "thermal_direction": "The temperature forecast does not support heating or cooling preconditioning.",
-    "room_demand_unproven": "Room feedback does not establish a need for automatic preconditioning from idle.",
+    "room_demand_unproven": "Room feedback does not establish a need for automatic preconditioning.",
     "conflicting_room_demand": "Rooms have different heating needs; normal comfort controls retain authority.",
     "room_target_reached": "The participating rooms already meet the requested preparation target.",
     "preconditioning_mode_not_allowed": "The selected preconditioning mode does not permit this HVAC direction.",

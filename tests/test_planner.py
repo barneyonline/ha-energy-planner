@@ -1801,6 +1801,7 @@ def test_degraded_ev_issue_does_not_block_asset_eligible_hvac_preconditioning() 
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [(0, 0.10), (15, 0.10), (30, 0.50)]
     ]
@@ -2002,6 +2003,7 @@ def test_future_away_preconditioning_keeps_hvac_off_until_window_starts() -> Non
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [
             (0, 0.10),
@@ -2059,6 +2061,7 @@ def test_future_away_preconditioning_can_start_immediately_without_away_off_take
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [(0, 0.30), (5, 0.20), (10, 0.10), (15, 0.45), (20, 0.10)]
     ]
@@ -2194,6 +2197,7 @@ def test_active_plan_does_not_precondition_further_past_mode_target_boundary() -
                 export_price=0.05,
                 pv_forecast_kw=1.0,
                 baseline_load_forecast_kw=2.0,
+                outdoor_temperature_forecast_c=5 if mode == "heat" else 30,
             )
             for offset, price in [
                 (0, 0.10),
@@ -2546,6 +2550,7 @@ def test_active_plan_discovers_peak_beyond_immediate_lead_window() -> None:
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [(0, 0.10), (5, 0.12), (10, 0.15), (15, 0.45)]
     ]
@@ -2580,6 +2585,7 @@ def test_hvac_precondition_lead_window_does_not_include_partial_next_slot() -> N
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [(0, 0.10), (15, 0.45), (30, 0.50)]
     ]
@@ -2645,6 +2651,7 @@ def test_fallback_hvac_preconditioning_catches_up_with_remaining_lead_window(old
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [(0, 0.10), (5, 0.10), (10, 0.50), (15, 0.50)]
     ]
@@ -2705,6 +2712,7 @@ def test_fallback_hvac_preconditioning_scans_past_a_tariff_gap() -> None:
             export_price=0.05,
             pv_forecast_kw=1.0,
             baseline_load_forecast_kw=2.0,
+            outdoor_temperature_forecast_c=5,
         )
         for offset, price in [
             (0, 0.10),
