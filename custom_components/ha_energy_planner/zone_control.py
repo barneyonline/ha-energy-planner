@@ -143,10 +143,12 @@ def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, An
             "reason": "all_zones_complete" if complete else "independent_zone_preparation"}
 
 
-def desired_fields(context: DecisionContext, mode: str, target: float, phase: str) -> dict[str, Any]:
+def desired_fields(context: DecisionContext, mode: str, target: float, phase: str, *,
+                   record: bool = True) -> dict[str, Any]:
     """Keep a confirmed airflow path through coast; stop the head before any closure."""
     intent = evaluate(context, mode, target)
-    context.climate_legacy_decision["zone_control"] = intent
+    if record:
+        context.climate_legacy_decision["zone_control"] = intent
     if not intent.get("supported"):
         return {"zone_control_blocked": intent["reason"]} if (
             context.climate_inputs.get("zone_topology", {}).get("supported") or context.hvac_control.get("zone_intent")
