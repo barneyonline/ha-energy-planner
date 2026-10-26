@@ -8,21 +8,40 @@
 
 ### ✨ New features
 
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.7 - 2026-10-26
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
 - Add a preconditioning direction setting: Automatic, Cooling only or Heating only, enforced in both planning paths and before execution while preserving original-state restoration.
 
 ### 🐛 Bug fixes
 
 - Preserve HVAC minimum cycle/rest timing after confirmed planner stops across restoration, tariff lifecycles and reload. Enforce automatic restart and direction-change deadlines in both planning paths and before service dispatch, without delaying safe restoration or extending dwell for target/zone continuations. Retire cancelled unsent commands, require matching mode feedback or confirmed baseline compensation for unresolved writes, reuse persisted confirmation without repeating compensation, and remove blocked fallback load before EV scheduling.
-
 - Prevent cold weather alone from selecting fallback heating of comfortable mapped rooms. Respect existing equipment direction, require room demand or recent qualified passive evidence from idle, and leave conflicting room needs with normal comfort controls. Diagnostics explain the direction evidence and unknown projections.
-
 - Preserve safety-blocker reporting when room direction evidence finds no demand, including low confidence, manual overrides, occupancy and missing inputs during independent-zone fallback.
-
 - Preserve Daikin-based fallback heating when zone mappings contain only humidity, presence or comfort settings; continue blocking acquisition when an explicitly configured room temperature sensor fails.
 
 ### 🔧 Improvements
 
-- None
+- On Home Assistant 2026.11 or newer, show EV maximum import price and low-price charging thresholds only when their respective toggles are enabled. Retain saved thresholds while hidden; older supported versions continue to show both fields.
 
 ### 🔄 Other changes
 
