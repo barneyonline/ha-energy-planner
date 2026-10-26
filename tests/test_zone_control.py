@@ -166,7 +166,10 @@ def test_active_and_initial_satisfied_room_fallback_and_economic_guard():
     assert actions[0].desired_state["zone_power"] == {MAIN: "on", BED: "off"}
     assert actions[0].desired_state["phase"] == "preconditioning"
     c.hvac_control = {}
-    assert HVACPlanningPolicy(DEFAULT_OPTIONS, {})._next_hvac_period(c) is not None
+    # A running cooler cannot justify a new Automatic takeover of mixed rooms.
+    assert HVACPlanningPolicy(DEFAULT_OPTIONS, {})._next_hvac_period(c) is None
+    cooling = {**DEFAULT_OPTIONS, "hvac_preconditioning_mode": "cooling_only"}
+    assert HVACPlanningPolicy(cooling, {})._next_hvac_period(c) is not None
     assert economic_actions(c, DEFAULT_OPTIONS, actions) == actions
     assert c.climate_decision["reason"] == "zone_subset_economic_model_unvalidated"
     assert "expected_saving" not in c.climate_decision
@@ -935,7 +938,9 @@ def test_away_off_ownership_cannot_authorize_new_subset_fallback_after_activatio
     c.hvac_control = {"phase": "away_off", "started_at": NOW - timedelta(minutes=30)}
     c.climate_engine = {"ever_active": ever_active, "status": "degraded" if ever_active else "learning"}
     c.climate_inputs["power_source_type"] = "measured"
-    options = {**DEFAULT_OPTIONS, CONF_HVAC_POLICY: policy, "hvac_precondition_while_away": True}
+    # Explicit cooling demand isolates the away-ownership/economic guard under test.
+    options = {**DEFAULT_OPTIONS, CONF_HVAC_POLICY: policy, "hvac_precondition_while_away": True,
+               "hvac_preconditioning_mode": "cooling_only"}
     actions = HVACPlanningPolicy(options, {})._hvac_lifecycle_actions(c, NOW, NOW + timedelta(minutes=5))
     assert any(action.desired_state.get("phase") == "preconditioning" for action in actions)
     releases = [action for action in actions if action.kind == "release_hvac"]

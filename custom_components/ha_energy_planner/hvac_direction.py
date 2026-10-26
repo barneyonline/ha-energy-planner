@@ -58,14 +58,16 @@ def mapped_direction(
 ) -> str | None:
     """Forecast weather alone cannot justify heating comfortable mapped rooms.
 
-    Keep an active device direction instead of reversing it from weather. From idle, speculative heating of
-    the shared unit requires every participating room to need heat; otherwise
+    Equipment mode describes actuator state, never future thermal demand.
+    Speculative heating of the shared unit requires every participating room to need heat; otherwise
     normal comfort controls retain authority over conflicting room needs.
     """
     rooms = temperatures(context)
     evidence: dict[str, Any] = {
         "policy": options.get(CONF_HVAC_PRECONDITIONING_MODE, "automatic"),
         "mode": None,
+        "equipment_mode": context.current_hvac_mode,
+        "evaluated_peak_at": peak_at.isoformat(),
         "reason": "room_demand_unproven",
         "rooms": {},
     }
@@ -95,11 +97,8 @@ def mapped_direction(
             "projected_peak_temperature": projected,
         }
     policy = evidence["policy"]
-    current = context.current_hvac_mode
     if policy == "cooling_only":
         mode, reason = ("cool", "operator_cooling_only") if any(cooling_reserve) else (None, "room_target_reached")
-    elif current in {"heat", "cool"} and mode_allowed(options, current):
-        mode, reason = current, "existing_equipment_mode"
     elif all(heat_needs) and not any(cool_needs):
         mode, reason = "heat", "all_rooms_need_heating"
     elif any(cool_needs) and not any(heat_needs):

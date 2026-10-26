@@ -218,7 +218,9 @@ def test_adaptive_lead_and_partial_progress():
     assert timing(c, disabled, 'cool', model)['effective_lead_minutes'] == 0
     assert timing(c, DEFAULT_OPTIONS, 'cool', {})['effective_lead_minutes'] == 90
     c.climate_inputs['thermal_model'] = model
-    candidate = HVACPlanningPolicy(DEFAULT_OPTIONS, model)._next_hvac_period(c)
+    candidate = HVACPlanningPolicy(
+        {**DEFAULT_OPTIONS, 'hvac_preconditioning_mode': 'cooling_only'}, model
+    )._next_hvac_period(c)
     assert candidate is not None
     assert candidate['precondition_start'] == NOW
     assert candidate['precondition_end'] == NOW + timedelta(hours=3)
@@ -343,7 +345,7 @@ def test_source_change_preserves_unaffected_room_history_and_passive_projection(
 
 def test_owned_cycle_uses_room_completion_instead_of_cold_head_feedback():
     c = context()
-    policy = HVACPlanningPolicy(DEFAULT_OPTIONS, {})
+    policy = HVACPlanningPolicy({**DEFAULT_OPTIONS, 'hvac_preconditioning_mode':'cooling_only'}, {})
     actions = policy._hvac_lifecycle_actions(c, NOW, NOW + timedelta(minutes=5))
     c.hvac_control = {**actions[0].desired_state, 'main_state_committed':True}
     assert c.current_hvac_temperature_c == 19  # Head has reached the target; room has not.
@@ -366,6 +368,10 @@ def test_future_passive_drift_can_extend_preparation_within_the_maximum(mode):
     model['sources'][ZONE]['buckets']['passive'] = {
         'count':12,'minutes':60,'last_at':NOW.isoformat(),'rate_c_per_hour':1 if mode == 'cool' else -1,
     }
+    # Direction needs accepted passive observations, not the device's current mode.
+    model['sources'][ZONE]['buckets']['passive']['windows'] = [
+        {'at':(NOW-timedelta(minutes=5*i)).isoformat(), 'minutes':5,
+         'rate':1 if mode == 'cool' else -1} for i in range(11,-1,-1)]
     result = timing(c, DEFAULT_OPTIONS, mode, model, deadline_minutes=240)
     assert result['effective_lead_minutes'] == 180
     assert result['zones'][ZONE]['predicted_finishing_temperature'] == (19 if mode == 'cool' else 25)
@@ -400,8 +406,10 @@ def test_review_blocks_takeover_at_an_opposite_room_comfort_boundary(mode):
     }
     for slot in c.slots:
         slot.outdoor_temperature_forecast_c = 30 if mode == 'cool' else 10
-    assert HVACPlanningPolicy(DEFAULT_OPTIONS, {})._next_hvac_period(c) is None
-    assert c.climate_legacy_decision['reason'] == 'zone_comfort_boundary'
+    opts = {**DEFAULT_OPTIONS, 'hvac_preconditioning_mode':'heating_only' if mode == 'heat' else 'cooling_only'}
+    assert HVACPlanningPolicy(opts, {})._next_hvac_period(c) is None
+    assert c.climate_legacy_decision['reason'] == (
+        'preconditioning_mode_not_allowed' if mode == 'heat' else 'zone_comfort_boundary')
 
 
 @pytest.mark.parametrize('helper', ['low','high'])
@@ -426,7 +434,9 @@ def test_review_extended_lead_qualifies_against_the_extended_price_window():
     c = context()
     for i, slot in enumerate(c.slots):
         slot.import_price = .1 if i < 18 else .2 if i < 36 else .35
-    candidate = HVACPlanningPolicy(DEFAULT_OPTIONS,mature(value=1))._next_hvac_period(c)
+    candidate = HVACPlanningPolicy(
+        {**DEFAULT_OPTIONS, 'hvac_preconditioning_mode': 'cooling_only'}, mature(value=1)
+    )._next_hvac_period(c)
     assert candidate is not None
     assert candidate['precondition_start'] == NOW
     assert candidate['period_start'] == NOW+timedelta(hours=3)
@@ -437,7 +447,7 @@ def test_review_grid_rounding_never_exceeds_the_maximum_lead(interval,maximum):
     c = context()
     c.slots = [DecisionSlot(NOW+timedelta(minutes=interval*i),.1 if i < 8 else .5,.05,0,1,
                             outdoor_temperature_forecast_c=30) for i in range(20)]
-    options = {**DEFAULT_OPTIONS,'planning_interval_minutes':interval,
+    options = {**DEFAULT_OPTIONS,'hvac_preconditioning_mode':'cooling_only','planning_interval_minutes':interval,
                'hvac_precondition_lead_minutes':min(90,maximum),'hvac_precondition_max_lead_minutes':maximum}
     candidate = HVACPlanningPolicy(options,mature(value=.5))._next_hvac_period(c)
     if maximum < interval:
@@ -578,7 +588,7 @@ def test_second_review_coast_uses_each_rooms_drift_and_bounds():
     model['sources'][other]['buckets']['passive']['rate_c_per_hour'] = 3
     for i,slot in enumerate(c.slots):
         slot.import_price = .05 if i < 25 else .1 if i < 36 else .5
-    policy = HVACPlanningPolicy(DEFAULT_OPTIONS,model)
+    policy = HVACPlanningPolicy({**DEFAULT_OPTIONS, 'hvac_preconditioning_mode':'cooling_only'},model)
     candidate = policy._next_hvac_period(c)
     assert candidate is not None
     assert (candidate['period_start']-candidate['precondition_end']).total_seconds()/3600 <= 1/3

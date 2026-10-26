@@ -300,7 +300,7 @@ class ConstraintValidator:
                 )
             )
         lifecycle_continuation = _is_same_hvac_lifecycle(context, action, ownership)
-        if (desired_mode == "heat" and not lifecycle_continuation
+        if (desired_mode in {"heat", "cool"} and not lifecycle_continuation
                 and action.desired_state.get("phase") == "preconditioning"
                 and not action.desired_state.get("economic_policy_version")
                 and temperatures(context)):
@@ -309,10 +309,11 @@ class ConstraintValidator:
                 deadline = now
             direction = mapped_direction(context, self.options, context.climate_inputs.get("thermal_model", {}),
                                          deadline)
-            if direction != "heat":
+            if direction != desired_mode:
+                label = "heating" if desired_mode == "heat" else "cooling"
                 violations.append(_action_violation(
-                    action, "hvac_heating_need_unproven",
-                    "Current room evidence does not justify fallback heating acquisition.",
+                    action, f"hvac_{label}_need_unproven",
+                    f"Current room evidence does not justify fallback {label} acquisition.",
                 ))
         zone_coast_stop = bool(
             lifecycle_continuation and desired_mode == "off" and action.desired_state.get("zone_stop")

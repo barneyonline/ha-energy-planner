@@ -33,9 +33,9 @@ is not a new preconditioning acquisition and remains allowed. These restrictions
 do not change the room goals or equipment offsets and do not disable external
 Home Assistant climate automations.
 
-For mapped rooms, tariff fallback gives an existing heating/cooling equipment
-mode priority over weather-based direction inference. From an idle head, heating
-requires every mapped participating room to need heat: a current reading below
+For mapped rooms, tariff fallback never treats the current equipment mode as
+evidence of future demand. New heating acquisition, whether the head is running
+or idle, requires every mapped participating room to need heat: a current reading below
 its lower comfort boundary, or a recent qualified passive trend predicting a
 crossing of that boundary by the proposed peak. A single colder bedroom does not
 justify raising the other comfortable rooms to their upper boundary. Conflicting
@@ -50,23 +50,32 @@ windows covering at least 60 minutes within the preceding two hours, with the
 latest at most 30 minutes old. It takes the median of those recent windows; an
 overnight median, stale observations, old whole-degree steps or cold outdoor air
 alone cannot establish daytime heating need. Disabling temperature learning
-disables this predictive path. Existing equipment-mode intent and actual room
-boundary demand remain available. Weather still participates in validated
+disables this predictive path. Actual room-boundary demand remains available.
+Outdoor temperature differences never supply a synthetic indoor drift or coast
+prediction for mapped rooms; missing per-room evidence stays unknown. Weather still participates in validated
 economic simulation; its savings/recovery/readiness requirements are unchanged.
-Installations without mapped room inputs retain legacy automatic direction
-inference, but the explicit direction restrictions still apply. Humidity,
+Installations without mapped room inputs retain weather/temperature direction
+inference, without a current-equipment-mode fallback. Explicit direction
+restrictions still apply. Humidity,
 presence or comfort-only zone mappings do not count as room temperature inputs:
 Daikin-based heating remains eligible through execution. An explicitly mapped
 temperature sensor that loses its reading still blocks new acquisition.
 
 Preconditioning diagnostics expose `direction`: the permission, chosen mode,
-reason and per-room measured temperatures, bounds, usable recent passive rates
+reason, observed equipment mode, evaluated peak time and per-room measured
+temperatures, bounds, usable recent passive rates
 and projected peak temperatures. Safety blockers such as low confidence, manual
 HVAC overrides, away policy and missing comfort inputs take precedence over a
 no-demand explanation, including during independent-zone fallback. A missing
 projection remains unknown. These
 linear direction checks do not establish predicted finishing temperatures,
-economic readiness, measured energy or savings.
+economic readiness, measured energy or savings. Queued fallback heating and
+cooling acquisitions recheck current room demand immediately before execution.
+A confirmed continuation of the same owned lifecycle retains its completion and
+comfort rules; it does not reacquire merely because a tariff refresh occurred.
+
+See the [26 October all-input assessment](hvac-demand-assessment-2026-10-26.md)
+for the mode-priority defect, independent recommendation and replay evidence.
 
 ### 24 October 2026 decision assessment
 
@@ -84,9 +93,10 @@ Observed heating coincided with Main reaching 24°C at 13:15 and 24.62°C at 13:
 The later 15:50 snapshot was different: Main was 22.43°C and Bedrooms 20.32°C.
 Some bedroom warming was reasonable comfort control; that snapshot did not prove
 that both rooms should be preheated to 24°C. The new fallback leaves that conflict
-with normal controls. The 14:41 cooling snapshot (Main23.70°C, Bedrooms20.12°C)
-retains its already-active cooling direction and existing independent-zone
-completion safeguards despite a cold forecast. `tests/test_hvac_direction.py`
+with normal controls. The 14:41 cooling snapshot (Main 23.70°C, Bedrooms 20.12°C)
+also leaves conflicting needs with normal controls for a new Automatic acquisition;
+already-running cooling is not evidence for a fresh tariff takeover. Explicit
+Cooling only remains an operator-selected preparation policy. `tests/test_hvac_direction.py`
 replays these sanitized inputs with explicitly synthetic forecasts and tariffs.
 Neither these tests nor the historical observations prove a full uninterrupted
 cooling outcome or a monetary saving.
