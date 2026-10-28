@@ -3447,7 +3447,10 @@ def test_unlinked_main_startup_feedback_rejects_unexpected_changes(change: str) 
     assert not _is_planner_owned_control_feedback(
         entry_data, {}, event, datetime.now(UTC), pending_hvac_desired_state=pending,
     )
-    if change != "other_zone":
+    if change == "inactive_mode":
+        # Unavailable readback confirms neither the command nor manual intent.
+        assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) is None
+    elif change != "other_zone":
         assert _pending_zone_hvac_manual_change_entity_id(entry_data, event, pending) == zone
 
 
