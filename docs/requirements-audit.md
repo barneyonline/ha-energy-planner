@@ -434,6 +434,35 @@ use throughout; the Docker and pull-request gates enforce that result.
   enabled manual-override helper uses the same configured timeout; legacy
   indefinite helper state is bounded during startup, and helper feedback from
   integration-created timed overrides is guarded.
+- Availability loss/recovery for configured HVAC heads, zone climates and zone
+  switches is health evidence, not manual intent or command confirmation.
+  `coordinator.py` forces a health refresh and records `availability_feedback`
+  before startup, ownership and pending-command classification. Missing states,
+  unknown/unavailable modes and removed/recovered attributes cannot start or
+  extend an override, toggle its helper or supersede restoration baselines.
+  Explicitly attributed changes between concrete control attribute values and
+  direct helper/service overrides retain priority; subsequent observed mode,
+  target and zone changes keep existing protection. Recovery across a gap does
+  not establish who changed settings. `tests/test_coordinator.py` covers released,
+  owned, pending and restoring lifecycles during startup and normal operation,
+  existing override preservation, all sentinel/missing states and concrete
+  user/service evidence. A temporary classification snapshot of the last valid
+  state also protects a recovery control change with a fresh user context,
+  including mode-only and zone-power changes with unchanged target attributes.
+  A fresh user context may first appear on failed or intermediate unavailable
+  feedback and remain attached to the eventual control readback; it retains
+  eligibility until actual control differences are observed on recovery.
+  Inherited pre-outage/outage contexts and unchanged controls grant no manual
+  authority. The snapshot is retired on first recovery and never supplies a
+  device baseline or command confirmation. `tests/test_control_runtime.py`
+  verifies real HA user contexts synchronously stop a pending adapter command
+  for the head, zone climate and switch; diagnostics record `manual_recovery`.
+  `tests/fixtures/climate_feedback/unavailable_recovery.json`
+  replays the sanitized 28 October outage and independently classifies its later
+  target change. Adapter/executor/zone regressions retain unavailable-target
+  rejection, uncertain-command reconciliation and restoration retry safety.
+  Required validation is `scripts/docker-validate.sh`; no live-device validation
+  or attribution of the later target change is claimed.
 - Automatic notifications are limited to conditions that normally require user
   action: broken required mappings/capabilities, failed safe-state restoration,
   infeasible EV readiness, and configured grid hard-limit conflicts. Explicitly
