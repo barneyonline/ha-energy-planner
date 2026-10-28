@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -10112,7 +10113,17 @@ def test_confirmed_zone_settling_requires_captured_and_current_evidence(monkeypa
                 "head_activation_parent",
                 "current_activation_parent", "unavailable_clamped", "early_loss",
                 "head_activation", "switch_activation", "measurement_update"}
-    if scenario in accepted:
+    if scenario in {"unknown_before_issue", "unavailable_conflict"}:
+        # An unattributed gap is neither manual intent nor proof of a command.
+        assert not coordinator_module._matches_climate_transaction(
+            coordinator.entry_data, executor.hvac_feedback_commands, event, clock[0], coordinator.hass,
+        )
+        coordinator._async_handle_manual_hvac_change.assert_not_called()
+        coordinator._schedule_debounced_refresh.assert_called_with(
+            "hvac_availability", debounce_seconds=0, force=True,
+        )
+        assert coordinator.store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 19
+    elif scenario in accepted:
         coordinator._async_handle_manual_hvac_change.assert_not_called()
         assert coordinator.store.data["ownership"]["hvac_control"]["main_state"]["target_temperature"] == 19
     else:
@@ -10461,3 +10472,327 @@ def test_zone_mapping_refresh_rebinds_new_sensor_and_matching_production_evidenc
     assert ('sensor.export_feedback' in tracked[-1]) is feedback_available
     assert coordinator.store.data['production']['dry_run_evidence_fingerprint'] == production_evidence_fingerprint(
         coordinator.entry_data, coordinator.options)
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone", "switch.zone"])
+@pytest.mark.parametrize("missing", [None, "unknown", "unavailable"])
+@pytest.mark.parametrize("lifecycle", ["released", "owned", "pending", "restoring"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("override_active", [False, True])
+def test_hvac_availability_sequence_preserves_manual_and_recovery_state(
+    monkeypatch, entity, missing, lifecycle, startup, override_active,
+):
+    """The sanitized 28 October outage must not become an operator command."""
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+
+    async def run():
+        baseline = {"hvac_mode": "off", "target_temperature": 19}
+        ownership = {} if lifecycle == "released" else {"hvac_control": {
+            "phase": "restoring" if lifecycle == "restoring" else "preconditioning",
+            "main_state": baseline, "zone_states": {entity: {"target_temperature": 20}},
+            "pending_command": {"service": "set_temperature", "requested": {"temperature": 23}},
+        }}
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin",
+                        CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"],
+                        CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
+                        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.guard"},
+            hass=FakeHass({"input_boolean.guard": "off", "input_boolean.override": "off"}),
+            store_data={"ownership": ownership},
+        )
+        coordinator.hass.is_running = not startup
+        pending = {"restore_main": baseline, "restore_zones": {entity: "off"},
+                   "uncertain_command": {"service": "set_temperature"}} if lifecycle in {
+                       "pending", "restoring",
+                   } else None
+        coordinator.executor.pending_hvac_desired_state = pending
+        commands = [{"entity_id": "climate.daikin", "service": "set_temperature",
+                     "requested": {"temperature": 23}, "context_id": "planner-command",
+                     "issued_at": dt_util.utcnow() - timedelta(seconds=5),
+                     "deadline": dt_util.utcnow() + timedelta(minutes=2)}]
+        coordinator.executor.hvac_feedback_commands = deepcopy(commands)
+        existing = Override("manual_hvac", "service", dt_util.utcnow() + timedelta(minutes=30), "earlier_user")
+        original_overrides = [existing] if override_active else []
+        coordinator.overrides = list(original_overrides)
+        original_ownership, original_pending = deepcopy(ownership), deepcopy(pending)
+        coordinator.store.record_climate_event = Mock()
+        coordinator._schedule_debounced_refresh = Mock()
+        tasks = []
+        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+        coordinator.async_start_listeners()
+        valid = "on" if entity.startswith("switch.") else "off"
+        attrs = {} if entity.startswith("switch.") else {"temperature": 23}
+        loss = FakeEvent(entity, valid, missing, old_attributes=attrs)
+        # Recovered settings may differ from before the gap. No continuous
+        # observation exists to attribute that difference to an operator.
+        recovery = FakeEvent(entity, missing, "off" if entity.startswith("switch.") else "heat",
+                             new_attributes=attrs)
+        if missing is None:
+            loss.data["new_state"] = None
+            recovery.data["old_state"] = None
+        for event in (loss, recovery):
+            coordinator.hass.states.values[entity] = event.data["new_state"]
+            callbacks[0](event)
+            if tasks:
+                await asyncio.gather(*tasks)
+            assert coordinator.overrides == original_overrides
+            assert coordinator.store.data["ownership"] == original_ownership
+            assert coordinator.executor.pending_hvac_desired_state == original_pending
+            assert not coordinator.hass.services.calls
+            assert not coordinator.executor.hvac_releases
+            assert coordinator.executor.pending_hvac_manual_overrides == 0
+            assert coordinator.executor.pending_hvac_manual_zone_overrides == []
+            assert coordinator.executor.hvac_feedback_commands == commands
+            if event is loss and entity == "climate.daikin":
+                action = _coordinated_action(_plan("outage"), "acquire", ActionAsset.DAIKIN, ActionKind.SET_HVAC)
+                action.desired_state = {"hvac_mode": "heat", "target_temperature": 23}
+                result = await DaikinHVACAdapter(coordinator.hass, coordinator.entry_data).async_execute(action)
+                assert not result.applied
+                assert result.reason == "daikin_climate_unavailable"
+                assert coordinator.hass.services.calls == []
+        assert coordinator._schedule_debounced_refresh.call_count == 2
+        assert [call.args[0]["stage"] for call in coordinator.store.record_climate_event.call_args_list] == [
+            "availability_feedback", "availability_feedback",
+        ]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone", "switch.zone"])
+@pytest.mark.parametrize("recovery", [False, True])
+@pytest.mark.parametrize("attribution", [None, "user", "parent"])
+def test_hvac_availability_is_not_manual_in_any_classifier(entity, recovery, attribution):
+    """Availability alone grants no manual intent, even with a context."""
+    valid = "on" if entity.startswith("switch.") else "heat"
+    event = FakeEvent(entity, "unavailable" if recovery else valid, valid if recovery else "unknown",
+                      old_attributes={} if recovery else {"temperature": 21},
+                      new_attributes={"temperature": 21} if recovery else {},
+                      context_user_id="user" if attribution == "user" else None,
+                      parent_context_id="external" if attribution == "parent" else None)
+    entry = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"]}
+    store = {"ownership": {"hvac_control": {"phase": "preconditioning"}}}
+    assert not _is_manual_hvac_change(FakeHass(), entry, store, event, dt_util.utcnow())
+    assert not _is_manual_hvac_zone_change(FakeHass(), entry, store, event)
+    assert not _is_pending_main_hvac_manual_change(entry, event, {"target_temperature": 23})
+    assert _pending_zone_hvac_manual_change_entity_id(entry, event, {"target_temperature": 23}) is None
+    assert not coordinator_module._is_explicit_startup_hvac_change(event)
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone"])
+@pytest.mark.parametrize("attribution", [None, "user", "state_user", "parent"])
+@pytest.mark.parametrize("attribute,old_value,new_value", [
+    ("temperature", 21, 23), ("fan_mode", "low", "high"),
+    ("temperature", 21, "unknown"), ("temperature", 21, float("nan")),
+])
+def test_explicit_concrete_controls_remain_manual_during_hvac_outage(
+    entity, attribution, attribute, old_value, new_value,
+):
+    event = FakeEvent(entity, "heat", "unavailable",
+                      old_attributes={attribute: old_value}, new_attributes={attribute: new_value},
+                      context_user_id="operator" if attribution == "user" else None,
+                      parent_context_id="service" if attribution == "parent" else None)
+    if attribution == "state_user":
+        event.data["new_state"] = SimpleNamespace(
+            state="unavailable", attributes={attribute: new_value}, context=SimpleNamespace(user_id="operator"),
+        )
+    entry = {CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"]}
+    store = {"ownership": {"hvac_control": {"phase": "preconditioning"}}}
+    expected = attribution is not None and (attribute == "fan_mode" or new_value == 23)
+    assert _is_manual_hvac_change(FakeHass(), entry, store, event, dt_util.utcnow()) == (
+        expected and entity == "climate.daikin"
+    )
+    assert _is_manual_hvac_zone_change(FakeHass(), entry, store, event) == (
+        expected and entity == "climate.zone"
+    )
+    assert _is_pending_main_hvac_manual_change(entry, event, {"target_temperature": 20}) == (
+        expected and entity == "climate.daikin"
+    )
+    assert _pending_zone_hvac_manual_change_entity_id(entry, event, {"target_temperature": 20}) == (
+        entity if expected and entity == "climate.zone" else None
+    )
+
+
+def test_sanitized_hvac_outage_replay_keeps_later_control_change_authoritative(monkeypatch):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+    fixture = json.loads((Path(__file__).parent / "fixtures/climate_feedback/unavailable_recovery.json").read_text())
+
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin",
+                        CONF_CLIMATE_ZONES: ["climate.zone_main", "climate.zone_other",
+                                             "switch.zone_main", "switch.zone_other"],
+                        CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override",
+                        CONF_CLIMATE_CHANGE_FROM_SCHEDULER: "input_boolean.guard"},
+            hass=FakeHass({"input_boolean.override": "off", "input_boolean.guard": "off"}),
+            store_data={"ownership": {}},
+        )
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator.store.record_climate_event = Mock()
+        tasks = []
+        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+        coordinator.async_start_listeners()
+        for row in fixture["events"]:
+            now = datetime.fromisoformat(f'{fixture["date"]}T{row["at"]}+11:00').astimezone(UTC)
+            monkeypatch.setattr(dt_util, "utcnow", lambda now=now: now)
+            callbacks[0](FakeEvent(row["entity"], row["old"], row["new"],
+                                   old_attributes={"temperature": row["old_target"]} if "old_target" in row else {},
+                                   new_attributes={"temperature": row["target"]} if "target" in row else {}))
+            if tasks:
+                await asyncio.gather(*tasks)
+            assert len(coordinator.overrides) == int(row.get("manual", False))
+            assert len(coordinator.hass.services.calls) == int(row.get("manual", False))
+            if not row.get("manual"):
+                assert coordinator.store.data["ownership"] == {}
+                assert not coordinator.executor.hvac_releases
+        assert coordinator.hass.services.calls[0][:3] == (
+            "input_boolean", "turn_on", {"entity_id": "input_boolean.override"},
+        )
+        assert coordinator.executor.hvac_releases == ["daikin_state_changed"]
+        stages = [call.args[0]["stage"] for call in coordinator.store.record_climate_event.call_args_list]
+        assert stages == ["availability_feedback"] * 10 + ["unmatched_feedback"]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("control", ["helper", "service", "head_target", "zone_target"])
+@pytest.mark.parametrize("startup", [False, True])
+def test_explicit_override_during_hvac_outage_still_releases_control(monkeypatch, control, startup):
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone"],
+                        CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+            hass=FakeHass({"input_boolean.override": "off", "climate.daikin": "unavailable"}),
+            store_data={"ownership": {"hvac_control": {"phase": "preconditioning"}}},
+        )
+        coordinator.hass.is_running = not startup
+        coordinator.executor.pending_hvac_desired_state = {"target_temperature": 20}
+        coordinator._schedule_debounced_refresh = Mock()
+        tasks = []
+        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+        coordinator.async_start_listeners()
+        callbacks[0](FakeEvent("climate.daikin", "heat", "unavailable", old_attributes={"temperature": 21}))
+        assert not coordinator.overrides and not tasks
+        if control == "service":
+            await coordinator.async_set_manual_hvac_override(30, "operator_request")
+        else:
+            event = FakeEvent("input_boolean.override", "off", "on") if control == "helper" else FakeEvent(
+                "climate.daikin" if control == "head_target" else "climate.zone", "unavailable", "unavailable",
+                old_attributes={"temperature": 21}, new_attributes={"temperature": 23}, context_user_id="operator",
+            )
+            callbacks[0](event)
+            if control in {"head_target", "zone_target"}:
+                assert coordinator.executor.pending_hvac_manual_overrides == int(control == "head_target")
+                assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+                    ["climate.zone"] if control == "zone_target" else []
+                )
+            await asyncio.gather(*tasks)
+        assert len(coordinator.overrides) == 1
+        assert len(coordinator.executor.hvac_releases) == 1
+        assert len(coordinator.hass.services.calls) == int(control != "helper")
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("entity", ["climate.daikin", "climate.zone", "switch.zone"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("source", [
+    "fresh_user", "state_user", "target_user", "inherited_user", "outage_context",
+    "unattributed", "same_mode", "no_baseline", "missing_context_id", "inherited_target",
+])
+@pytest.mark.parametrize("sentinel", [None, "unknown", "unavailable"])
+@pytest.mark.parametrize("owned", [False, True])
+def test_fresh_user_recovery_controls_supersede_pending_hvac(
+    monkeypatch, entity, startup, pending, source, sentinel, owned,
+):
+    """A user stopping an offline head/zone must not be lost as recovery noise."""
+    callbacks = []
+    monkeypatch.setattr(coordinator_module, "async_track_state_change_event",
+                        lambda hass, entities, callback: callbacks.append(callback) or (lambda: None))
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={CONF_DAIKIN_CLIMATE: "climate.daikin", CONF_CLIMATE_ZONES: ["climate.zone", "switch.zone"],
+                        CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.override"},
+            hass=FakeHass({"input_boolean.override": "off"}),
+            store_data={"ownership": {"hvac_control": {"phase": "preconditioning"}} if owned else {}},
+        )
+        coordinator.hass.is_running = not startup
+        coordinator.executor.pending_hvac_desired_state = {
+            "hvac_mode": "heat", "target_temperature": 21, "enable_zones": True,
+        } if pending else None
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator.store.record_climate_event = Mock()
+        tasks = []
+        coordinator._async_create_listener_task = lambda coroutine: tasks.append(asyncio.create_task(coroutine))
+        coordinator.async_start_listeners()
+        mode = "on" if entity.startswith("switch.") else "heat"
+        attrs = {} if entity.startswith("switch.") else {"temperature": 21}
+        loss = FakeEvent(entity, mode, sentinel, old_attributes=attrs, new_attributes=attrs,
+                         context_id="outage")
+        loss.data["old_state"] = SimpleNamespace(
+            state=mode, attributes=attrs, context=SimpleNamespace(id="old-user", user_id="operator"),
+        )
+        if sentinel is None:
+            loss.data["new_state"] = None
+        if source != "no_baseline":
+            callbacks[0](loss)
+        assert not tasks
+        context_id = {
+            "inherited_user": "old-user", "inherited_target": "old-user", "outage_context": "outage",
+        }.get(source, "fresh-user")
+        if source == "missing_context_id":
+            context_id = None
+        recovered = FakeEvent(entity, sentinel, mode if source in {"same_mode", "target_user"} else "off",
+                              old_attributes=attrs, new_attributes=attrs, context_id=context_id,
+                              context_user_id=None if source == "unattributed" else "operator")
+        recovered.data["old_state"] = SimpleNamespace(
+            state=sentinel, attributes=attrs, context=loss.context,
+        )
+        if sentinel is None:
+            recovered.data["old_state"] = None
+        if source == "state_user":
+            recovered.data["new_state"] = SimpleNamespace(
+                state="off", attributes=attrs, context=recovered.context,
+            )
+            recovered.context = None
+        if source == "target_user" and entity.startswith("climate."):
+            recovered.data["new_state"].attributes = {"temperature": 23}
+            recovered.data["old_state"] = None if sentinel is None else FakeState(sentinel)
+        if source == "inherited_target" and entity.startswith("climate."):
+            recovered.data["new_state"].attributes = {"temperature": 23}
+        callbacks[0](recovered)
+        explicit = source in {"fresh_user", "state_user"} or (source == "target_user" and entity.startswith("climate."))
+        explicit = explicit and (owned or startup or pending or entity == "climate.daikin")
+        assert coordinator.executor.pending_hvac_manual_overrides == int(
+            explicit and pending and entity == "climate.daikin"
+        )
+        assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+            [entity] if explicit and pending and entity != "climate.daikin" else []
+        )
+        if tasks:
+            await asyncio.gather(*tasks)
+        assert len(coordinator.overrides) == int(explicit)
+        assert len(coordinator.hass.services.calls) == int(explicit)
+        assert len(coordinator.executor.hvac_releases) == int(explicit)
+        if explicit:
+            assert coordinator.store.record_climate_event.call_args.args[0]["stage"] == "manual_recovery"
+
+    asyncio.run(run())
+
+
+def test_explicit_hvac_recovery_classifier_rejects_continuous_available_events():
+    event = FakeEvent("climate.daikin", "heat", "off", context_id="user-command", context_user_id="operator")
+    assert not coordinator_module._is_explicit_hvac_recovery_change(event, event.data["old_state"], "outage")

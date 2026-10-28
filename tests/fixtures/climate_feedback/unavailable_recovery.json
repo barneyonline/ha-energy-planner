@@ -1,0 +1,18 @@
+{
+  "description": "Reproduction based on the sanitized 28 October 2026 handoff: released ownership, dropped attributes, recovery, then a separately classified target change. Entity IDs and stable pre-outage zone settings are synthetic; recovery values and event times follow the handoff. The cause of the later target change is unknown.",
+  "date": "2026-10-28",
+  "timezone": "Australia/Melbourne",
+  "events": [
+    {"at": "17:30:31.455269", "entity": "climate.daikin", "old": "off", "new": "unavailable", "old_target": 23},
+    {"at": "17:30:31.459653", "entity": "climate.zone_main", "old": "heat", "new": "unavailable", "old_target": 23},
+    {"at": "17:30:31.460383", "entity": "climate.zone_other", "old": "off", "new": "unavailable", "old_target": 21},
+    {"at": "17:30:31.460795", "entity": "switch.zone_main", "old": "on", "new": "unavailable"},
+    {"at": "17:30:31.461898", "entity": "switch.zone_other", "old": "off", "new": "unavailable"},
+    {"at": "17:32:31.940367", "entity": "climate.daikin", "old": "unavailable", "new": "heat", "target": 23},
+    {"at": "17:32:31.946062", "entity": "climate.zone_main", "old": "unavailable", "new": "heat", "target": 23},
+    {"at": "17:32:31.946681", "entity": "climate.zone_other", "old": "unavailable", "new": "off", "target": 21},
+    {"at": "17:32:31.947162", "entity": "switch.zone_main", "old": "unavailable", "new": "on"},
+    {"at": "17:32:31.948630", "entity": "switch.zone_other", "old": "unavailable", "new": "off"},
+    {"at": "17:40:32.982604", "entity": "climate.daikin", "old": "heat", "new": "heat", "old_target": 23, "target": 21, "manual": true}
+  ]
+}

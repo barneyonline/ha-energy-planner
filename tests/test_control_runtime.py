@@ -1455,3 +1455,77 @@ def test_extended_preconditioning_options_survive_home_assistant_restart(tmp_pat
         finally:
             await restarted.async_stop(force=True)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("entity", ["climate.home", "climate.zone", "switch.zone"])
+@pytest.mark.parametrize("feedback", ["direct", "intermediate", "user_loss"])
+@pytest.mark.parametrize("inherited", [False, True])
+def test_real_user_stop_after_outage_aborts_pending_hvac(tmp_path, monkeypatch, entity, feedback, inherited):
+    """Real HA contexts distinguish a user stop from source recovery."""
+    from unittest.mock import AsyncMock
+
+    from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter, _HVACManualOverrideError
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        mode = "on" if entity.startswith("switch.") else "heat"
+        attrs = {} if entity.startswith("switch.") else {"temperature": 21}
+        baseline_context = Context(user_id="earlier-operator")
+        user_context = baseline_context if inherited else Context(user_id="operator")
+        hass.states.async_set(entity, mode, attrs, context=baseline_context)
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data[CONF_CLIMATE_ZONES] = ["climate.zone", "switch.zone"]
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Outage user control", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        manual = AsyncMock()
+        monkeypatch.setattr(coordinator, "_async_handle_manual_hvac_change", manual)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        pending = {"hvac_mode": "heat", "target_temperature": 21, "enable_zones": True}
+        coordinator.executor.pending_hvac_desired_state = pending
+        adapter = DaikinHVACAdapter(hass, coordinator.entry_data)
+        coordinator.executor._configure_pending_hvac_adapter(adapter, pending)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            hass.states.async_set(
+                entity, "unknown" if feedback == "intermediate" else "unavailable", attrs,
+                context=user_context if feedback == "user_loss" else Context(),
+            )
+            await hass.async_block_till_done()
+            adapter._raise_if_manual_override_requested()
+            manual.assert_not_awaited()
+            if feedback == "intermediate":
+                hass.states.async_set(entity, "unavailable", attrs, context=user_context)
+                await hass.async_block_till_done()
+                adapter._raise_if_manual_override_requested()
+                manual.assert_not_awaited()
+            hass.states.async_set(entity, "off", attrs, context=user_context)
+            await hass.async_block_till_done()
+            if inherited:
+                adapter._raise_if_manual_override_requested()
+                manual.assert_not_awaited()
+                assert store.data["climate_audit"][-1]["stage"] == "availability_feedback"
+                assert calls == []
+                return
+            with pytest.raises(_HVACManualOverrideError):
+                adapter._raise_if_manual_override_requested()
+            main = entity == "climate.home"
+            manual.assert_awaited_once_with(
+                "daikin_state_changed" if main else "climate_zone_changed",
+                preserve_main_state=main, preserve_zone_entity_id=None if main else entity,
+            )
+            assert store.data["climate_audit"][-1]["stage"] == "manual_recovery"
+            assert calls == []
+        finally:
+            coordinator.executor.pending_hvac_desired_state = None
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())

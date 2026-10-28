@@ -614,6 +614,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             entity_ids.append(export_feedback_entity)
         if not entity_ids:
             return
+        unavailable_hvac_baselines: dict[str, tuple[Any, str | None]] = {}
 
         @callback
         def _handle_state_change(event: Any) -> None:
@@ -742,28 +743,83 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
                 return
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
-            if not getattr(self.hass, "is_running", True) and (
-                is_main_climate
-                or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
-            ):
-                # Startup restoration is not evidence of manual intent. Check
-                # before pending-command detection, which deliberately bypasses
-                # the scheduler guard to protect user changes during commands.
-                if _is_explicit_startup_hvac_change(event):
-                    feedback_commands.clear()
-                    if pending_hvac_desired_state is not None:
-                        if is_main_climate:
-                            self.executor.mark_pending_hvac_manual_override()
-                        else:
-                            self.executor.mark_pending_hvac_zone_manual_override(entity_id)
-                    self._async_create_listener_task(
-                        self._async_handle_manual_hvac_change(
-                            "daikin_state_changed" if is_main_climate else "climate_zone_changed",
-                            preserve_main_state=is_main_climate,
-                            preserve_zone_entity_id=None if is_main_climate else entity_id,
-                        )
+            is_hvac = is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
+            startup = not getattr(self.hass, "is_running", True)
+            manual_recovery = False
+            recovery_baseline = None
+            inherited_recovery_context_ids: set[str] = set()
+            if is_hvac:
+                old, new = event.data.get("old_state"), event.data.get("new_state")
+                if (
+                    old is not None and old.state not in STATE_UNKNOWN_VALUES
+                    and (new is None or new.state in STATE_UNKNOWN_VALUES)
+                ):
+                    # This is classification evidence only, never a control or
+                    # restoration snapshot. Retire it on the first recovery.
+                    # A fresh user request may first publish failed telemetry;
+                    # its context remains eligible when actual controls arrive.
+                    loss_context = getattr(event, "context", None)
+                    unavailable_hvac_baselines[entity_id] = (
+                        old, None if getattr(loss_context, "user_id", None) else getattr(loss_context, "id", None),
                     )
+                recovery_baseline, outage_context_id = unavailable_hvac_baselines.get(entity_id, (None, None))
+                manual_recovery = _is_explicit_hvac_recovery_change(
+                    event, recovery_baseline, outage_context_id,
+                ) and bool(
+                    is_main_climate or startup or pending_hvac_desired_state is not None
+                    or self.store.data.get("ownership", {}).get("hvac_control")
+                )
+                if new is not None and new.state not in STATE_UNKNOWN_VALUES:
+                    inherited_recovery_context_ids = {
+                        context_id for context_id in (
+                            outage_context_id, getattr(getattr(recovery_baseline, "context", None), "id", None),
+                        ) if context_id is not None
+                    }
+                    unavailable_hvac_baselines.pop(entity_id, None)
+            if is_hvac and (manual_recovery or _is_hvac_availability_feedback(
+                event, inherited_context_ids=inherited_recovery_context_ids,
+            )):
+                # Availability alone preserves pending work and its baselines.
+                # Audit fresh recovery controls separately before they
+                # synchronously supersede that work below.
+                audit = getattr(self.store, "record_climate_event", None)
+                if callable(audit):
+                    new = event.data.get("new_state")
+                    audit({
+                        "stage": "manual_recovery" if manual_recovery else "availability_feedback",
+                        "entity_id": entity_id,
+                        "override_source": "user" if manual_recovery else None,
+                        "user_attributed": manual_recovery,
+                        "context_id": getattr(getattr(event, "context", None), "id", None),
+                        "expected": {"mode": getattr(recovery_baseline, "state", None)} if manual_recovery else None,
+                        "observed": {
+                            "mode": getattr(new, "state", None),
+                            **{key: (getattr(new, "attributes", {}) or {}).get(key)
+                               for key in _HVAC_CONTROL_ATTRIBUTE_KEYS},
+                        },
+                    }, now=now)
+                if not manual_recovery:
+                    self._schedule_debounced_refresh("hvac_availability", debounce_seconds=0, force=True)
                     return
+            if manual_recovery or (startup and is_hvac and _is_explicit_startup_hvac_change(event)):
+                # Explicit control evidence takes priority even during startup
+                # or recovery, before expected/pending-command matching.
+                feedback_commands.clear()
+                if pending_hvac_desired_state is not None:
+                    if is_main_climate:
+                        self.executor.mark_pending_hvac_manual_override()
+                    else:
+                        self.executor.mark_pending_hvac_zone_manual_override(entity_id)
+                self._async_create_listener_task(
+                    self._async_handle_manual_hvac_change(
+                        "daikin_state_changed" if is_main_climate else "climate_zone_changed",
+                        preserve_main_state=is_main_climate,
+                        preserve_zone_entity_id=None if is_main_climate else entity_id,
+                    )
+                )
+                return
+            if startup and is_hvac:
+                # Startup restoration alone is not evidence of manual intent.
                 if not _is_planner_owned_control_feedback(
                     entry_data,
                     self.store.data,
@@ -3267,11 +3323,65 @@ def _split_entity_values(value: Any) -> list[str]:
     return []
 
 
+def _has_concrete_hvac_attribute_change(old: Any, new: Any) -> bool:
+    """Require two known settings rather than disappearing target telemetry."""
+    old_attributes, new_attributes = old.attributes or {}, new.attributes or {}
+    for key in _HVAC_CONTROL_ATTRIBUTE_KEYS:
+        before, after = old_attributes.get(key), new_attributes.get(key)
+        if key in {"temperature", "target_temp_low", "target_temp_high"}:
+            before, after = finite(before), finite(after)
+        if before not in STATE_UNKNOWN_VALUES and after not in STATE_UNKNOWN_VALUES and before != after:
+            return True
+    return False
+
+
+def _is_explicit_hvac_recovery_change(event: Any, baseline: Any, outage_context_id: str | None) -> bool:
+    """Protect fresh user controls without inferring intent from a telemetry gap."""
+    old, new = event.data.get("old_state"), event.data.get("new_state")
+    if (
+        baseline is None or new is None or new.state in STATE_UNKNOWN_VALUES
+        or (old is not None and old.state not in STATE_UNKNOWN_VALUES)
+    ):
+        return False
+    previous_context_ids = {
+        outage_context_id, getattr(getattr(baseline, "context", None), "id", None),
+    }
+    if not any(
+        getattr(context, "user_id", None) and getattr(context, "id", None)
+        and getattr(context, "id", None) not in previous_context_ids
+        for context in (getattr(event, "context", None), getattr(new, "context", None))
+    ):
+        return False
+    return baseline.state != new.state or _has_concrete_hvac_attribute_change(baseline, new)
+
+
+def _is_hvac_availability_feedback(event: Any, *, inherited_context_ids: set[str] | None = None) -> bool:
+    """Separate lost/restored telemetry from evidence of a control change.
+
+    Sentinel modes and disappearing/reappearing attributes cannot establish
+    intent. An explicitly attributed change to two concrete control values can
+    still supersede pending work during an outage; a context alone cannot.
+    """
+    old, new = event.data.get("old_state"), event.data.get("new_state")
+    if old is None or new is None:
+        return True
+    if old.state not in STATE_UNKNOWN_VALUES and new.state not in STATE_UNKNOWN_VALUES:
+        return False
+    contexts = (getattr(event, "context", None), getattr(new, "context", None))
+    if not any(
+        (getattr(context, "user_id", None) or getattr(context, "parent_id", None))
+        and getattr(context, "id", None) not in (inherited_context_ids or set())
+        for context in contexts
+    ):
+        return True
+    return not _has_concrete_hvac_attribute_change(old, new)
+
+
 def _is_explicit_startup_hvac_change(event: Any) -> bool:
     """Require user attribution and a material control change during HA startup."""
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None:
+    if old_state is None or new_state is None or _is_hvac_availability_feedback(event):
         return False
     if not any(
         getattr(context, "user_id", None)
@@ -3299,7 +3409,7 @@ def _is_manual_hvac_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None:
+    if old_state is None or new_state is None or _is_hvac_availability_feedback(event):
         return False
     state_changed = old_state.state != new_state.state
     old_attributes = getattr(old_state, "attributes", {}) or {}
@@ -3370,7 +3480,7 @@ def _is_manual_hvac_zone_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None:
+    if old_state is None or new_state is None or _is_hvac_availability_feedback(event):
         return False
     state_changed = old_state.state != new_state.state
     control_attribute_changed = False
@@ -3809,7 +3919,7 @@ def _is_pending_main_hvac_manual_change(
         return False
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None:
+    if old_state is None or new_state is None or _is_hvac_availability_feedback(event):
         return False
     old_attributes = getattr(old_state, "attributes", {}) or {}
     new_attributes = getattr(new_state, "attributes", {}) or {}
@@ -4045,7 +4155,7 @@ def _pending_zone_hvac_manual_change_entity_id(
         return None
     old_state = event.data.get("old_state")
     new_state = event.data.get("new_state")
-    if old_state is None or new_state is None:
+    if old_state is None or new_state is None or _is_hvac_availability_feedback(event):
         return None
     old_attributes = getattr(old_state, "attributes", {}) or {}
     new_attributes = getattr(new_state, "attributes", {}) or {}
