@@ -89,6 +89,14 @@ class HVACOwnershipTransaction:
             or self.previous.get("planner_hvac_action_expires_at")
         )
 
+    def _can_add_zone_baseline(self, entity_id: str) -> bool:
+        """Never fill a lifecycle's missing target from planner-exposed feedback."""
+        previous_control = self.previous.get("hvac_control", {})
+        return not (
+            entity_id.startswith("climate.") and previous_control.get("main_state")
+            and entity_id not in previous_control.get("zone_states", {})
+        )
+
     def prepare(
         self,
         desired: dict[str, Any],
@@ -105,7 +113,8 @@ class HVACOwnershipTransaction:
         provisional_hvac_control = dict(provisional_ownership_data.get("hvac_control", {}))
         provisional_zone_states = dict(provisional_hvac_control.get("zone_states", {}))
         for entity_id, state in zone_snapshot.items():
-            provisional_zone_states.setdefault(entity_id, state)
+            if self._can_add_zone_baseline(entity_id):
+                provisional_zone_states.setdefault(entity_id, state)
         provisional_hvac_control["zone_states"] = provisional_zone_states
         provisional_hvac_control.pop("main_state_committed", None)
         if main_snapshot:
@@ -172,7 +181,7 @@ class HVACOwnershipTransaction:
                 for entity_id in superseded_zone_entity_ids:
                     zone_states.pop(entity_id, None)
                 for entity_id, state in hvac_result.saved_zone_states.items():
-                    if entity_id in superseded_zone_entity_ids:
+                    if entity_id in superseded_zone_entity_ids or not self._can_add_zone_baseline(entity_id):
                         continue
                     zone_states.setdefault(entity_id, state)
                 hvac_control["zone_states"] = zone_states
@@ -196,7 +205,7 @@ class HVACOwnershipTransaction:
                             **original_main_state,
                             **{
                                 key: unresolved_main_state[key]
-                                for key in ("zone_recovery_attempted", "recovery_version")
+                                for key in ("zone_recovery_attempted", "recovery_version", "zone_recovery_blocker")
                                 if key in unresolved_main_state
                             },
                         }
@@ -222,7 +231,8 @@ class HVACOwnershipTransaction:
                 hvac_control["zone_transition_at"] = confirmed_at or self.now
             saved_zones = dict(hvac_control.get("zone_states", {}))
             for entity_id, state in hvac_result.saved_zone_states.items():
-                saved_zones.setdefault(entity_id, state)
+                if self._can_add_zone_baseline(entity_id):
+                    saved_zones.setdefault(entity_id, state)
             hvac_control["zone_states"] = saved_zones
             # Successful acquisition still owns the original thermostat baseline.
             # Mark it as lifecycle ownership, distinct from failed recovery.

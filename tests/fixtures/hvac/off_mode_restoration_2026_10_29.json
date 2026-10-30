@@ -1,0 +1,18 @@
+{
+  "description": "Minimal synthetic controller replay of the sanitized 29 October mode-dependent restoration failure",
+  "initial_mode": "off",
+  "remembered_mode": "heat",
+  "head_targets": {"heat": 19, "cool": 23},
+  "zone_targets": {"heat": [20, 20], "cool": [24, 24]},
+  "original_power": ["on", "off"],
+  "planner_head_target": 17,
+  "planner_zone_targets": [17, 19],
+  "legacy_main": {
+    "hvac_mode": "off",
+    "target_temperature": 19,
+    "rollback_active_hvac_mode": "heat",
+    "rollback_hvac_mode_changed": true,
+    "zone_recovery_attempted": true,
+    "recovery_version": 1
+  }
+}

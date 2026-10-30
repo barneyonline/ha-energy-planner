@@ -316,8 +316,11 @@ def _pending_hvac_restore(coordinator: EnergyPlannerCoordinator) -> dict[str, An
     control = ownership.get("hvac_control", {})
     if not isinstance(control, dict) or control.get("required_evidence_lost") != "hvac_release_failed":
         return {}
+    main_state = control.get("main_state")
+    recovery_blocker = main_state.get("zone_recovery_blocker") if isinstance(main_state, dict) else None
     return {
         "reason": "hvac_release_failed",
+        **({"recovery_blocker": recovery_blocker} if recovery_blocker else {}),
         "zone_targets": to_jsonable(control.get("zone_states", {})),
         "main_target": to_jsonable(control.get("main_state", {})),
         "automations": to_jsonable(ownership.get("climate_automations", {})),

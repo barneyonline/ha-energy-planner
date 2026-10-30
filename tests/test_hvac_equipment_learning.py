@@ -118,7 +118,12 @@ def test_equipment_and_room_targets_stay_separate_through_both_policies(policy, 
     adapter.set_zone_control_context(options, c.hvac_control)
     baseline = adapter.main_takeover_snapshot()
     automations, zones = adapter.takeover_snapshot()
-    assert asyncio.run(adapter.async_execute(command)).applied
+    result = asyncio.run(adapter.async_execute(command))
+    if initial_mode == "off":
+        assert not result.applied and result.reason == "climate_zone_baseline_mode_mismatch"
+        assert not hass.services.calls
+        return
+    assert result.applied
     assert hass.states.get("climate.head").attributes["temperature"] == 19
     assert hass.states.get(MAIN_CLIMATE).attributes["temperature"] == 19
     assert hass.states.get(BED_CLIMATE).attributes["temperature"] == 21
@@ -538,7 +543,7 @@ def test_compensated_calendar_and_action_describe_room_goal_separately_from_equi
 
 @pytest.mark.parametrize("initial_mode", ["heat", "off"])
 @pytest.mark.parametrize("cooling_target_valid", [True, False])
-def test_compensation_checks_target_capabilities_after_confirming_cooling_mode(initial_mode, cooling_target_valid):
+def test_compensation_rejects_unproven_mode_restoration_before_selecting_cooling(initial_mode, cooling_target_valid):
     c, config = compensated()
     c.current_hvac_mode = "heat"
     # Explicit cooling permission can request a mode change; weather alone must not reverse a running head.
@@ -566,21 +571,8 @@ def test_compensation_checks_target_capabilities_after_confirming_cooling_mode(i
     hass.services.async_call = call
     adapter = DaikinHVACAdapter(hass, config)
     adapter.set_zone_control_context(DEFAULT_OPTIONS, {})
-    main = adapter.main_takeover_snapshot()
-    automations, zones = adapter.takeover_snapshot()
     result = asyncio.run(adapter.async_execute(_action(desired(c))))
-    assert result.applied is cooling_target_valid
-    # A current-mode target range cannot veto the supported cooling transition.
-    mode_index = next(i for i, (_, service, payload) in enumerate(hass.services.calls)
-                      if service == "set_hvac_mode" and payload.get("hvac_mode") == "cool")
-    targets = [(i, payload) for i, (_, service, payload) in enumerate(hass.services.calls)
-               if service == "set_temperature" and payload["entity_id"] == "climate.head"]
-    if cooling_target_valid:
-        assert targets and mode_index < targets[0][0] and targets[0][1]["temperature"] == 19
-    else:
-        assert not targets
-        assert result.saved_main_state["target_temperature"] == 24
-    restored = asyncio.run(DaikinHVACAdapter(hass, config).async_restore(automations, zones, main))
-    assert restored.applied
+    assert not result.applied and result.reason == "climate_zone_baseline_mode_mismatch"
+    assert result.rollback_succeeded and not hass.services.calls
     assert hass.states.get("climate.head").state == initial_mode
     assert hass.states.get("climate.head").attributes["temperature"] == 24

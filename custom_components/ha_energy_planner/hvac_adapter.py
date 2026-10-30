@@ -361,6 +361,28 @@ class DaikinHVACAdapter:
         """Preserve the owned original baseline across cancellation of a refresh."""
         self._abort_main_state = dict(baseline)
 
+    def _zone_restore_needs_operator(self, zones: dict[str, Any], main_state: dict[str, Any]) -> bool:
+        """Identify incompatible saved targets after an already-confirmed shutdown.
+
+        Off-state bounds cannot establish another mode's original intent. Keep
+        the record intact and wait for explicit operator supersession or usable
+        feedback, without probing remembered modes by waking the equipment.
+        """
+        head = self._state(str(self.entry_data.get(CONF_DAIKIN_CLIMATE)))
+        if (not main_state.get("zone_recovery_attempted") or main_state.get("hvac_mode") != "off"
+                or head is None or head.state != "off"):
+            return False
+        for entity, target in zones.items():
+            observed = self._state(entity)
+            if not entity.startswith("climate.") or observed is None or not isinstance(target, dict):
+                continue
+            low, high = finite(observed.attributes.get("min_temp")), finite(observed.attributes.get("max_temp"))
+            values = list(_temperature_desired_state(target).values())
+            if (low is not None and high is not None and low <= high and values
+                    and any((value := finite(item)) is not None and not low <= value <= high for item in values)):
+                return True
+        return False
+
     def _record_zone_deferred(self, entity_id: str, target: Any) -> None:
         """Retain the unavailable target/bounds step without issuing another command."""
         if self._command_callback is None:
@@ -523,8 +545,13 @@ class DaikinHVACAdapter:
             self._deferred_zone_entities = {
                 entity_id
                 for entity_id in self._zone_climate_entities()
-                if zone_temperature_sync_deferred(self._state(entity_id))
-                and not self._zone_baseline.get("zone_states", {}).get(entity_id)
+                if (
+                    zone_temperature_sync_deferred(self._state(entity_id))
+                    and not self._zone_baseline.get("zone_states", {}).get(entity_id)
+                ) or (
+                    self._zone_baseline.get("main_state")
+                    and entity_id not in self._zone_baseline.get("zone_states", {})
+                )
             }
         return self._enabled_automation_states(), {
             entity_id: state
@@ -662,14 +689,20 @@ class DaikinHVACAdapter:
                 True,
                 saved_zone_states,
             )
-        if (
-            action.desired_state.get("enable_zones")
-            and synchronize_zone_temperatures
-            and _temperature_desired_state(action.desired_state)
-            and any(
-                not _has_restorable_temperature_target(dict(saved_zone_states.get(entity_id, {})))
-                for entity_id in self._synchronized_zone_climate_entities()
-            )
+        zone_target_work = bool(
+            action.desired_state.get("enable_zones") and synchronize_zone_temperatures
+            and (_temperature_desired_state(action.desired_state) or action.desired_state.get("zone_targets"))
+        )
+        requested_zones = [
+            entity for entity in self._zone_climate_entities()
+            if entity not in {
+                climate for actuator, climate in action.desired_state.get("zone_intent", {}).get("pairs", {}).items()
+                if action.desired_state.get("zone_power", {}).get(actuator) == "off"
+            }
+        ]
+        if zone_target_work and any(
+            not _has_restorable_temperature_target(dict(saved_zone_states.get(entity_id, {})))
+            for entity_id in requested_zones
         ):
             # Every subordinate target that will be replaced needs a usable
             # rollback snapshot. An empty climate snapshot otherwise makes both
@@ -682,6 +715,21 @@ class DaikinHVACAdapter:
                 {},
                 True,
             )
+        if zone_target_work:
+            # A target exposed by selecting another mode is that mode's memory,
+            # not the original baseline. Until we can durably restore every
+            # affected mode, refuse the transition before any device writes.
+            original_main = self._zone_baseline.get("main_state") or saved_main_state
+            original_mode = original_main.get("hvac_mode")
+            desired_mode = action.desired_state.get("hvac_mode") or climate_state.state
+            if (original_mode not in _ACTIVE_HVAC_MODES or desired_mode != original_mode
+                    or (not self._zone_baseline.get("main_state") and any(
+                        (zone := self._state(entity)) is None or zone.state != original_mode
+                        for entity in requested_zones
+                    ))):
+                return HVACCommandResult(
+                    False, "climate_zone_baseline_mode_mismatch", pre_state, self._snapshot(), {}, True,
+                )
         guard_work = bool(
             automation_work
             or not _already_in_desired_state(climate_state, _main_hvac_desired_state(action.desired_state))
@@ -1038,9 +1086,16 @@ class DaikinHVACAdapter:
         if deferred_only and not states and not actionable_zones:
             for entity_id, target in zones.items():
                 self._record_zone_deferred(entity_id, target)
+            operator_required = self._zone_restore_needs_operator(zones, main_state)
+            if operator_required:
+                main_state["zone_recovery_blocker"] = "saved_zone_targets_incompatible_with_off_baseline"
+            else:
+                main_state.pop("zone_recovery_blocker", None)
             return HVACCommandResult(
                 not zones and not deferred_automations,
-                "hvac_zone_restore_pending" if zones or deferred_automations else "hvac_control_released",
+                "hvac_zone_restore_operator_required" if operator_required else (
+                    "hvac_zone_restore_pending" if zones or deferred_automations else "hvac_control_released"
+                ),
                 pre_state,
                 self._snapshot(),
                 deferred_automations,
@@ -1096,6 +1151,11 @@ class DaikinHVACAdapter:
         reason = "no_hvac_automation_state_saved"
         if not main_restored or not restored or not zones_restored:
             reason = "hvac_release_failed"
+            if self._zone_restore_needs_operator(unresolved_zones, unresolved_main_state):
+                unresolved_main_state["zone_recovery_blocker"] = "saved_zone_targets_incompatible_with_off_baseline"
+                reason = "hvac_zone_restore_operator_required"
+            else:
+                unresolved_main_state.pop("zone_recovery_blocker", None)
         elif had_saved_settings or self._automation_entities():
             reason = "hvac_control_released"
         return HVACCommandResult(
@@ -2174,6 +2234,9 @@ class DaikinHVACAdapter:
             if state is None:
                 continue
             if entity_id.split(".", 1)[0] == "climate":
+                # Compensate this attempt against its pre-command head/zone
+                # settings. Ownership merging separately preserves the original
+                # lifecycle targets for final release.
                 states[entity_id] = (_climate_target_snapshot(state)
                                      or self._zone_baseline.get("zone_states", {}).get(entity_id, {}))
             else:
