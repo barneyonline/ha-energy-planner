@@ -7,15 +7,18 @@ import importlib
 import json
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import pytest
 from homeassistant import loader
 from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntryState
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.icon import async_get_icons
 from homeassistant.util import dt as dt_util
 
-from custom_components.ha_energy_planner import async_setup_entry
+from custom_components.ha_energy_planner import CONFIG_SCHEMA, async_setup_entry
 from custom_components.ha_energy_planner.ai_advisor import LocalAIAdvisor
 from custom_components.ha_energy_planner.const import CONF_AI_TASK_ENTITY, DOMAIN
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
@@ -27,6 +30,33 @@ from custom_components.ha_energy_planner.models import (
     PlannerMode,
 )
 from custom_components.ha_energy_planner.storage import PlannerStore
+
+
+@pytest.mark.parametrize("yaml_configured", [False, True])
+def test_config_schema_reports_unsupported_yaml(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, yaml_configured: bool,
+) -> None:
+    """Preserve other configuration and direct domain YAML users to UI setup."""
+    async def run() -> None:
+        hass = HomeAssistant(str(tmp_path))
+        config: dict[str, Any] = {"logger": {"default": "warning"}}
+        if yaml_configured:
+            config[DOMAIN] = {}
+        try:
+            assert await cv.async_validate(hass, CONFIG_SCHEMA, config) is config
+            issue = ir.async_get(hass).async_get_issue("homeassistant", f"config_entry_only_{DOMAIN}")
+            if yaml_configured:
+                assert issue is not None
+                assert issue.translation_key == "config_entry_only"
+                assert issue.translation_placeholders["add_integration"].endswith(f"domain={DOMAIN}")
+                assert "does not support YAML setup" in caplog.text
+            else:
+                assert issue is None
+                assert "does not support YAML setup" not in caplog.text
+        finally:
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
 
 
 def test_every_integration_module_imports_on_supported_home_assistant() -> None:

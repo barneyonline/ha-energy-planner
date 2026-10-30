@@ -60,6 +60,15 @@ if TYPE_CHECKING:
 
     from .coordinator import EnergyPlannerCoordinator
 
+def _config_schema(config: dict[str, Any]) -> dict[str, Any]:
+    """Declare UI-only setup while keeping standalone planner tools importable."""
+    from homeassistant.helpers import config_validation as cv
+
+    return cv.config_entry_only_config_schema(DOMAIN)(config)
+
+
+CONFIG_SCHEMA = _config_schema
+
 _LOGGER = logging.getLogger(__name__)
 
 _REASON_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,80}$")
