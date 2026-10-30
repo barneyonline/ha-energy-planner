@@ -1529,3 +1529,124 @@ def test_real_user_stop_after_outage_aborts_pending_hvac(tmp_path, monkeypatch, 
             await hass.async_stop(force=True)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("intervention", ["none", "zone_target", "zone_mode", "head_target", "automation"])
+def test_owned_release_recalls_disabled_zone_without_manual_override(tmp_path, monkeypatch, intervention):
+    """Replay mode recall through real HA events, adapter dispatch and executor release."""
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        calls = _devices(hass)
+        hass.states.async_set("climate.home", "cool", {"temperature": 17, "min_temp": 7, "max_temp": 35})
+        hass.states.async_set("climate.bedrooms", "off", {"temperature": 19})
+        hass.states.async_set("climate.main_zone", "cool", {"temperature": 17})
+        hass.states.async_set("switch.zone", "on")
+        hass.states.async_set("automation.climate", "off")
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "runtime")
+        configured = _executor(hass, store)
+        configured.entry_data[CONF_CLIMATE_ZONES] = ["climate.bedrooms", "climate.main_zone", "switch.zone"]
+        entry = ConfigEntry(
+            domain=DOMAIN, title="Disabled zone restoration feedback", data=configured.entry_data,
+            options=configured.options, source="user", unique_id=None, version=5, minor_version=1,
+            discovery_keys=MappingProxyType({}), subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        baseline = {"phase": "restoration", "lifecycle_id": "owned-release",
+                    "main_state": {"hvac_mode": "off", "target_temperature": 19,
+                                   "rollback_active_hvac_mode": "heat", "rollback_hvac_mode_changed": True},
+                    "zone_states": {"switch.zone": "off", "climate.main_zone": {"target_temperature": 17}}}
+        await store.async_save_ownership({"hvac_control": deepcopy(baseline),
+                                          "climate_automations": {"automation.climate": "on"}})
+        manual = AsyncMock()
+        monkeypatch.setattr(coordinator, "_async_handle_manual_hvac_change", manual)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        captured = []
+
+        async def actuate(call):
+            entity = call.data["entity_id"]
+            calls.append((call.domain, call.service, dict(call.data)))
+            old = hass.states.get(entity)
+            attrs = dict(old.attributes)
+            mode = old.state
+            if call.service == "set_hvac_mode":
+                mode, attrs = call.data["hvac_mode"], {"temperature": 19}
+            elif call.service == "set_temperature":
+                attrs["temperature"] = call.data["temperature"]
+            elif call.service == "turn_off":
+                mode = "off"
+            elif call.service == "turn_on":
+                mode = "on"
+            hass.states.async_set(entity, mode, attrs, context=call.context)
+            if entity == "climate.home" and call.service == "set_hvac_mode":
+                # Deliver head first, then a separate unattributed vendor poll.
+                await hass.async_block_till_done()
+                hass.states.async_set("climate.main_zone", "heat", {"temperature": 19})
+                hass.states.async_set("climate.bedrooms", "off", {"temperature": 20})
+                await hass.async_block_till_done()
+                manual.assert_not_awaited()
+                pending = coordinator.executor.pending_hvac_desired_state
+                command = next(item for item in pending["feedback_commands"] if item["context_id"] == call.context.id)
+                captured.append(deepcopy(command))
+                assert command["restoration"] is True
+                assert command["observed"] == {"hvac_mode": "cool", "target_temperature": 17}
+                assert command["coupled_zones"]["climate.bedrooms"]["target_temperature"] == 19
+                control = store.data["ownership"]["hvac_control"]
+                assert control["main_state"] == baseline["main_state"]
+                assert control["zone_states"] == baseline["zone_states"]
+                if intervention != "none":
+                    entity = "climate.home" if intervention == "head_target" else "climate.bedrooms"
+                    hass.states.async_set(entity, "cool" if intervention == "zone_mode" else
+                                          "heat" if intervention == "head_target" else "off",
+                                          {"temperature": 21}, context=Context(
+                                              parent_id="external-automation" if intervention == "automation" else None,
+                                              user_id=None if intervention == "automation" else "operator"))
+                    await hass.async_block_till_done()
+            if entity == "climate.home" and call.service == "turn_off":
+                hass.states.async_set("climate.bedrooms", "off", {"temperature": None})
+                hass.states.async_set("climate.main_zone", "off", {"temperature": None})
+
+        for domain, services in {"climate": ("set_hvac_mode", "set_temperature", "turn_off"),
+                                 "switch": ("turn_off",), "automation": ("turn_on",)}.items():
+            for service in services:
+                hass.services.async_register(domain, service, actuate)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            outcome = await coordinator.executor.async_release_hvac_control(
+                "hvac_expensive_period_ended", plan_id="scheduled-release")
+            await hass.async_block_till_done()
+            assert captured, (outcome, calls, store.data.get("climate_audit"))
+            assert not coordinator.overrides
+            assert coordinator.executor.pending_hvac_desired_state is None
+            if intervention == "none":
+                manual.assert_not_awaited()
+                assert outcome.result == OutcomeResult.RESTORED
+                assert "hvac_control" not in store.data["ownership"]
+                assert hass.states.get("climate.home").state == "off"
+                assert hass.states.get("switch.zone").state == "off"
+                assert hass.states.get("automation.climate").state == "on"
+                assert not any(row["stage"] == "unmatched_feedback" for row in store.data["climate_audit"])
+                # A later safe off request must still pass the executor gate.
+                plan, _ = _command("hvac")
+                plan.actions[0].desired_state = {"hvac_mode": "off"}
+                await coordinator.executor.async_evaluate(plan)
+                assert store.data["execution_audit"][-1]["reason"] != "manual_hvac_override_active"
+            else:
+                main = intervention == "head_target"
+                manual.assert_awaited_once_with(
+                    "daikin_state_changed" if main else "climate_zone_changed",
+                    **({"preserve_main_state": True} if main else {"preserve_zone_entity_id": "climate.bedrooms"}),
+                )
+                assert not coordinator.executor.hvac_feedback_commands or all(
+                    item["context_id"] != captured[0]["context_id"]
+                    for item in coordinator.executor.hvac_feedback_commands)
+        finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
