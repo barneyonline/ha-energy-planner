@@ -35,7 +35,7 @@ from .const import (
 from .ev import allocate_least_cost_charging, effective_ev_soc_per_kwh
 from .ev_optimization import optimise_ev
 from .ev_policy import strategy
-from .export_limit_policy import EXPORT_ASSET, assumed_zero_export, build_actions, curtailment_preview
+from .export_limit_policy import EXPORT_ASSET, assumed_export_limit_watts, build_actions, curtailment_preview
 from .hvac_cycle import cycle_active
 from .models import (
     ActionAsset,
@@ -764,8 +764,10 @@ class DryRunPlanner:
             net_kw = load_kw - (slot.pv_forecast_kw or 0.0)
             if net_kw >= 0:
                 total += net_kw * interval_hours * slot.import_price
-            elif slot.export_price is not None and not assumed_zero_export(context, slot.valid_at):
-                total += net_kw * interval_hours * slot.export_price
+            elif slot.export_price is not None:
+                limit = assumed_export_limit_watts(context, slot.valid_at)
+                exported_kw = -net_kw if limit is None else min(-net_kw, limit / 1000)
+                total -= exported_kw * interval_hours * slot.export_price
             has_data = True
         return round(total, 4) if has_data else None
 

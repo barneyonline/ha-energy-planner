@@ -28,13 +28,14 @@ from .entity import (
     recorder_safe_text,
 )
 from .ev import ev_charging_state
-from .export_limit_policy import EXPORT_ASSET, block_time
+from .export_limit_policy import block_time
 from .models import ActionAsset, ActionKind, EnergyPlan, PlanAction
 from .plan_presentation import (
     action_load_forecast_attrs,
     action_sentence,
     asset_name,
     decision_data_quality_attrs,
+    export_limit_status,
     plain_action,
 )
 from .safety import strict_bool
@@ -199,7 +200,7 @@ def _calendar_windows(
                 )
             events.append((event, confirmed_start))
     if _calendar_control_enabled(coordinator, ActionAsset.ENPHASE_EXPORT_LIMIT):
-        export = plan.device_plans.get(EXPORT_ASSET, {})
+        export = export_limit_status(coordinator)
         windows: list[list[dict[str, Any]]] = []
         for block in export.get("blocks", []):
             if (windows and windows[-1][-1]["watts"] == block["watts"]
@@ -221,12 +222,14 @@ def _calendar_windows(
                 f"Confirmed setting: {export.get('confirmed_setting', 'Unknown')}.\n"
                 f"Request/status: {export.get('current_state_label', 'Unknown')}.\n"
                 f"Last readback: {export.get('feedback', {}).get('last_readback')}.\n"
+                f"Control blocker: {export.get('reason')}.\n"
+                f"Next eligible setting change: {export.get('next_eligible_change_at')}.\n"
                 f"Ownership baseline: {ownership.get('baseline')}.\nPause: {ownership.get('pause')}.\n"
                 f"Restoration outstanding: {bool(ownership.get('restoring'))}."
             )
             events.append((CalendarEvent(
                 start=block_time(first["start"]), end=block_time(last["end"]),
-                summary=f"Enphase Export Limit: {desired} (planned)",
+                summary=f"Enphase Export Limit: {desired} ({'deferred' if export.get('deferred') else 'planned'})",
                 description=recorder_safe_text(description, max_bytes=4_096), location="Enphase Export Limit",
                 uid=recorder_safe_identifier(
                     f"{coordinator.entry.entry_id}-export-limit-{first['start']}", max_bytes=255),
