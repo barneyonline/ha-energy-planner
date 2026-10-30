@@ -56,7 +56,7 @@ For a matching partial-zone candidate, only rooms whose dampers will open need q
 
 Independent room control preserves the economic degradation guard: away-off ownership cannot start a new fallback cycle after economic control has activated. Existing tariff cycles can finish; explicit Legacy policy keeps its fallback behavior.
 
-Unfinished room targets retain their paired actuator baselines through deferred recovery and reloads. Recovery under a manually controlled head waits for compatible room bounds before reopening a zone.
+Unfinished room targets retain their paired actuator baselines through deferred recovery and reloads. Recovery under a manually controlled head waits for compatible room bounds before reopening a zone. Synchronized zone takeover now requires visible original targets and a matching active original head mode; hidden off-state targets and unproven mode changes are rejected before device writes. Later refreshes cannot adopt newly exposed mode memories as original settings. Incompatible targets after confirmed shutdown retain ownership and expose an operator recovery blocker without waking the head. See [HVAC restoration recovery](docs/hvac-restoration-recovery.md) for the conservative acquisition limitation and a bounded manual handoff for legacy pending records.
 
 EV daylight and continuous charging, PV calibration lead times and climate observation comparisons also use actual interval boundaries.
 Daylight preference never authorises a higher-cost charging candidate when a cheaper schedule meets the same readiness requirements. After safety, readiness and dwell checks, estimated cost takes precedence; daylight breaks economic ties. Forecast solar is valued at its export opportunity cost rather than treated as free energy.

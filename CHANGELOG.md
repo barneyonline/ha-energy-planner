@@ -12,6 +12,7 @@
 
 ### 🐛 Bug fixes
 
+- Prevent newly exposed mode-specific zone targets from becoming original HVAC restoration baselines across refresh/reload. Reject synchronized takeover before device writes when targets are hidden or the original head mode cannot establish reversible zone control. Preserve incompatible legacy pending settings after confirmed shutdown, expose an operator recovery blocker, and document a bounded manual handoff without automatic mode probing or clamping. This conservatively blocks new synchronized starts from off and changes between heating and cooling. Keep per-refresh rollback targets separate from original lifecycle settings, and retain health diagnostics for legacy non-mapping main snapshots.
 - Keep missing, unknown or unavailable HVAC head and zone feedback, and availability recovery, from starting or extending manual override. Preserve original restoration settings and uncertain-command recovery, refresh control health, and retain protection for actual control changes and explicit overrides, including fresh user mode or zone-power commands across intermediate outage feedback and recovery.
 
 ### 🔧 Improvements
