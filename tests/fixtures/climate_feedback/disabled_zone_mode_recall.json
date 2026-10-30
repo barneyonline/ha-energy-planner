@@ -1,0 +1,12 @@
+{
+  "description": "Sanitized 30 October release: owned cool-to-heat restoration recalls a disabled zone target before final shutdown",
+  "issued_at": "2026-10-30T05:00:10.449066+00:00",
+  "head_feedback_at": "2026-10-30T05:00:11.097532+00:00",
+  "zone_feedback_at": "2026-10-30T05:00:11.107465+00:00",
+  "release_reason": "hvac_expensive_period_ended",
+  "head_before": {"mode": "cool", "temperature": 17},
+  "head_after": {"mode": "heat", "temperature": 19},
+  "zone_before": {"mode": "off", "temperature": 19},
+  "zone_after": {"mode": "off", "temperature": 20},
+  "limits": "Release timing, physical control and energy savings are not established by this sequence."
+}

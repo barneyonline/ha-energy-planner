@@ -3104,6 +3104,15 @@ class Executor:
             if callable(audit):
                 audit(evidence, now=now)
             if record["stage"] == "issued":
+                # Remember superseding entities on older head-mode evidence.
+                # Failed commands leave the live cache, but must never revive
+                # an earlier mode recall for their head/zone/actuator alias.
+                for command in self.hvac_feedback_commands:
+                    if (command.get("entity_id") == adapter.entry_data.get(CONF_DAIKIN_CLIMATE)
+                            and command.get("service") == "set_hvac_mode"):
+                        retired = command.setdefault("recall_superseding_entities", [])
+                        if record["entity_id"] not in retired:
+                            retired.append(record["entity_id"])
                 effect = "target" if record["service"] == "set_temperature" else "mode"
                 self.hvac_feedback_commands[:] = [
                     item
@@ -3148,6 +3157,7 @@ class Executor:
                         # confirmed direct feedback still expires two minutes from issue.
                         command["confirmed_at"] = now
                         command["confirmed_mode"] = record.get("observed", {}).get("hvac_mode")
+                        command["confirmed_observed"] = dict(record.get("observed", {}))
                         if (
                             command["entity_id"] == adapter.entry_data.get(CONF_DAIKIN_CLIMATE)
                             and command["service"] == "set_temperature"

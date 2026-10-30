@@ -1605,3 +1605,49 @@ Valid charging evidence at or after the refusal remains an allowed reset.
 - Current observed-regime readiness and measured electrical evidence retain their existing selection. Retained qualified regimes are reported separately with structured-window counts; candidate timing reports proposed conditions and compatible rates. Opaque older windows are retained and can describe the observed regime, but only new structured matching windows can grant prospective authority. There is no relabelling or pooling across incompatible regimes, and no manifest version bump.
 - `tests/test_prospective_thermal.py` trains deterministic distinct sensor observations, serializes the model, then verifies heating/cooling candidates while the head is off, aliases, compensated equipment targets, fallback planning and target-specific economic search. It rejects incompatible sources/controllers/topology/subsets/setpoints, unsupported or blocked intent, missing/legacy/unknown metadata, disabled learning, expired/future/mixed and insufficient evidence. Existing transition, 12-window/60-minute, 14-day expiry, 96-window retention, manual override, restoration, airflow, confirmation and minimum-cycle regressions remain required in `scripts/docker-validate.sh`.
 - This follows the 24 October 2026 offline audit reproduction; it does not establish a historical counterfactual or physical-device acceptance. The audited live base/maximum were 240/240 minutes, so no changed start time that day is claimed. No live Home Assistant or credentials are needed by these regressions. Legacy opaque evidence must acquire structured observations before prospective adaptation becomes ready.
+
+
+### Disabled-zone target recall during owned restoration (30 October evidence)
+
+- The sanitized `tests/fixtures/climate_feedback/disabled_zone_mode_recall.json`
+  records head cool/17 to heat/19 followed by Bedrooms off/19 to off/20.
+  The release trigger was `hvac_expensive_period_ended`; archived forecast data
+  does not establish that release timing itself was defective.
+- `coordinator.py::_matches_disabled_zone_mode_recall` classifies this concrete
+  target change separately from availability feedback. It requires an issued,
+  transaction-scoped heat/cool restoration, a different captured prior head mode,
+  a captured off zone with the exact previous numeric target, live head mode and
+  target, current zone feedback, and the existing Daikin head +/-2 C bounds.
+  Confirmed head readback must still match. The maximum window is 120 seconds
+  from original issue (also capped by the command deadline), including reload
+  reconciliation. A refresh or repeated confirmation cannot renew it.
+- Only one recalled target per zone/command is recognized. A new target, zone
+  power/mode or auxiliary-setting change, unrelated parent/user context on the
+  event or current states, failed/cancelled command, uncertainty compensation,
+  missing/contradictory readback, or superseding head/zone/alias command cannot
+  gain this authority. Superseding entity IDs are retained on older head-mode
+  evidence even when the later command fails and leaves the live command cache;
+  failure, a refresh or a new transaction cannot revive that zone/alias recall.
+  Unrelated zones retain their own recognition. Without a changed live head mode,
+  causal proof is absent.
+  Unattributed matching feedback inside this bounded window remains an inference;
+  telemetry alone cannot distinguish every simultaneous physical intervention.
+- `tests/test_coordinator.py::test_disabled_zone_remembered_target_during_owned_restoration`
+  covers pending/completed release, delayed polls, both modes, JSON reload,
+  attribution, expiry, repeated samples/edits, failures and retirement (including
+  failed later head-target/zone-target/zone-mode/alias commands, refresh and
+  cross-transaction retirement). The real
+  HA event/service regression
+  `tests/test_control_runtime.py::test_owned_release_recalls_disabled_zone_without_manual_override`
+  runs the adapter/executor release, verifies captured head/zone targets and
+  unchanged baselines, completes shutdown/zone/schedule restoration, and checks
+  subsequent execution remains free of the false manual-override blocker.
+  Simultaneous explicit zone mode/target, head target and automation changes
+  still supersede pending work.
+- This patch changes classification and retains sanitized confirmed readback in
+  the in-memory command cache. It grants no device-control authority and makes
+  no change to room demand, topology, airflow, minimum-cycle, completion or
+  restoration gates. It retains PR #148 availability behavior and is separate
+  from PR #149 mode-specific restoration-baseline reversibility. The full gate
+  remains `scripts/docker-validate.sh`. Repository simulation does not establish
+  deployed behavior, physical actuation, blocked cooling duration or savings.
