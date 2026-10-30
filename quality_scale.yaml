@@ -107,7 +107,7 @@ levels:
 rules:
   action-setup:
     status: done
-    comment: Integration services are registered from async_setup and are covered by service tests and Docker smoke automation.
+    comment: Integration services are registered from async_setup with an explicit config-entry-only CONFIG_SCHEMA and are covered by service tests and Docker smoke automation.
     references:
       code:
         - custom_components/ha_energy_planner/__init__.py
