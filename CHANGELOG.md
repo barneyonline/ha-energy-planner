@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Enforce at least five minutes between Export Limit setting changes, including restoration and resumed retries. Start a full wait when Planner observes matching confirmed readback, retain dispatch reservations across restart/reload and entity aliases, and re-evaluate the latest tariff when eligible. Diagnostics, next actions and planned calendar entries show the cooldown and next eligible time. Preserve restoration event identity through clock recovery and crash replay, and account for confirmed limits in export and cost projections while changes are deferred.
 
 ### 🔧 Improvements
 

@@ -295,6 +295,8 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
     async def assert_export_limit_control(call: ServiceCall) -> None:
         """Exercise public Enphase services, durable ownership and sign transitions in HA."""
+        from datetime import datetime
+        from unittest.mock import patch
         from homeassistant.helpers import entity_registry as er
         from custom_components.ha_energy_planner.enphase_export_limit import ExportLimitControl, evidence
         from custom_components.ha_energy_planner.export_limit_policy import build_actions, EXPORT_ASSET
@@ -313,11 +315,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         store = PlannerStore(hass, "smoke_export_limit")
         calls = []
         slew = 77
+        clock = dt_util.utcnow()
+
+        class ExportClock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock
 
         def readback(watts):
             hass.states.async_set(sensor, "disabled" if watts is None else "zero_export" if watts == 0 else "limited",
                 {"confirmed_watts": watts, "slew_rate": slew, "pending": False,
-                 "last_successful_readback": dt_util.utcnow().timestamp(), "request_status": "confirmed"})
+                 "last_successful_readback": clock.timestamp(), "request_status": "confirmed"})
 
         async def command(request: ServiceCall):
             assert request.data["entity_id"] == entity
@@ -329,27 +337,48 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         hass.services.async_register("enphase_ev", "disable_export_limit", command)
         readback(3000)
         options = {**DEFAULT_OPTIONS, "enphase_export_limit_control_enabled": True}
-        for price in (-10, 0, 20):
-            now = dt_util.utcnow()
+        def intent(price):
+            now = clock
             start = now.replace(minute=0 if now.minute < 30 else 30, second=0, microsecond=0)
             hass.states.async_set("sensor.smoke_export_tariff", price, {"unit_of_measurement": "c/kWh", "issued_at": now.isoformat(),
                 "forecasts": [{"start_time": start.isoformat(), "end_time": (start+timedelta(minutes=30)).isoformat(),
                                "per_kwh": price}]})
-            ctx = DecisionContext(now, "export-smoke", [], None, None, OccupancyState.UNKNOWN, InputHealth.UNSAFE,
-                                  export_limit=evidence(hass, mapping, options, now))
-            for action in build_actions(ctx):
-                await ExportLimitControl(hass, store, mapping).execute(action, now)
-            assert hass.states.get(sensor).attributes["confirmed_watts"] == (0 if price < 0 else None)
-        assert len(calls) == 2  # Positive follows zero without a redundant write.
-        await store.async_flush()
-        recovered = PlannerStore(hass, "smoke_export_limit")
-        await recovered.async_load()
-        assert recovered.data["ownership"][EXPORT_ASSET]["baseline"] == {"watts": 3000, "slew_rate": slew}
-        await ExportLimitControl(hass, recovered, mapping).restore(dt_util.utcnow())
-        assert hass.states.get(sensor).attributes["confirmed_watts"] == 3000
-        assert calls[-1]["slew_rate"] == slew
-        assert EXPORT_ASSET not in recovered.data["ownership"]
-        Path(hass.config.config_dir, ".export_limit_smoke_complete").touch()
+            return DecisionContext(now, "export-smoke", [], None, None, OccupancyState.UNKNOWN, InputHealth.UNSAFE,
+                                   export_limit=evidence(hass, mapping, options, now))
+
+        # Advance only this isolated controller's clock; production keeps its
+        # fixed 300-second ceiling and the full smoke gate need not sleep.
+        with patch("custom_components.ha_energy_planner.enphase_export_limit.datetime", ExportClock):
+            for price in (-10, 0, 20):
+                for action in build_actions(intent(price)):
+                    control = ExportLimitControl(hass, store, mapping)
+                    if calls:
+                        before = len(calls)
+                        result = await control.execute(action, clock)
+                        assert result[1:] == ("export_limit_change_rate_limited", False)
+                        assert len(calls) == before and not control.state.get("pending")
+                        clock += timedelta(seconds=300)
+                        readback(hass.states.get(sensor).attributes["confirmed_watts"])
+                        action = build_actions(intent(price))[0]
+                    await control.execute(action, clock)
+                assert hass.states.get(sensor).attributes["confirmed_watts"] == (0 if price < 0 else None)
+            assert len(calls) == 2  # Positive follows zero without a redundant write.
+            await store.async_flush()
+            recovered = PlannerStore(hass, "smoke_export_limit")
+            await recovered.async_load()
+            assert recovered.data["ownership"][EXPORT_ASSET]["baseline"] == {"watts": 3000, "slew_rate": slew}
+            control = ExportLimitControl(hass, recovered, mapping)
+            result = await control.restore(clock)
+            assert result[1:] == ("export_limit_change_rate_limited", False)
+            assert len(calls) == 2 and control.state["restoring"]
+            assert control.state["baseline"] == {"watts": 3000, "slew_rate": slew}
+            clock += timedelta(seconds=300)
+            readback(None)
+            await control.restore(clock)
+            assert hass.states.get(sensor).attributes["confirmed_watts"] == 3000
+            assert calls[-1]["slew_rate"] == slew
+            assert EXPORT_ASSET not in recovered.data["ownership"]
+            Path(hass.config.config_dir, ".export_limit_smoke_complete").touch()
 
     async def mark_smoke_complete(call: ServiceCall) -> None:
         """Write a completion marker before Home Assistant shuts down."""

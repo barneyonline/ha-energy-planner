@@ -7,7 +7,9 @@ from typing import TYPE_CHECKING, Any
 
 from homeassistant.util import dt as dt_util
 
-from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
+from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
+from .enphase_export_limit import target_identity
+from .export_limit_cooldown import cooldown_status
 from .models import ActionAsset, ActionKind, InputHealth, PlanAction, to_jsonable
 from .preflight import _current_plan_report
 from .safety import control_pause_reason
@@ -54,6 +56,19 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
                                      asset="enphase_export_limit")
         if pause:
             status.update(ready=False, reason=pause)
+    hass = getattr(coordinator, "hass", None)
+    entity = getattr(coordinator, "entry_data", {}).get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+    identity = target_identity(hass, entity) if hass is not None and entity else None
+    if identity is None and isinstance(ownership, dict):
+        identity = ownership.get("identity")
+    timing = cooldown_status(coordinator.store.data, identity,
+                             getattr(coordinator, "options", {}), dt_util.utcnow())
+    status.update(timing)
+    if timing.get("deferred"):
+        status.update(ready=False, reason=(timing["cooldown_reason"]
+            if status.get("reason") in {None, "export_limit_restoration_pending"} else status["reason"]))
+        status["summary"] = ("Export setting changes are deferred until "
+                             f"{timing['next_eligible_change_at']}; latest tariff and feedback will be rechecked.")
     if status.get("reason") in {"export_limit_pending", "export_limit_restoration_pending"}:
         status["summary"] = "Waiting for gateway confirmation; the planned setting is not yet confirmed."
     return status

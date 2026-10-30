@@ -213,12 +213,34 @@ def build_actions(context: DecisionContext) -> list[PlanAction]:
     return actions
 
 
+def assumed_export_limit_watts(context: DecisionContext, at: datetime) -> int | None:
+    """Project settled settings during a bounded hold, then eligible tariff intent."""
+    evidence = context.export_limit
+    ready = evidence.get("ready") is True
+    if (evidence.get("deferred") is True and evidence.get("feedback_ready") is True
+            and not evidence.get("ownership", {}).get("pending")):
+        eligible = aware_time(evidence.get("next_eligible_change_at"))
+        if eligible is not None and at < eligible:
+            # Feedback readiness validates confirmed watts independently of
+            # whether another setting change can currently be issued.
+            watts = evidence["feedback"]["watts"]
+            return None if watts is None else int(watts)
+        if eligible is not None and at >= eligible:
+            # A timing-only deferral can project eligible future tariff intent.
+            # An outstanding restoration keeps authority over that intent.
+            ready = ready or (evidence.get("reason") == "export_limit_change_rate_limited"
+                              and not evidence.get("ownership", {}).get("restoring"))
+    if ready:
+        for block in evidence.get("blocks", []):
+            if block_time(block["start"]) <= at < block_time(block["end"]):
+                watts = block["watts"]
+                return None if watts is None else int(watts)
+    return None
+
+
 def assumed_zero_export(context: DecisionContext, at: datetime) -> bool:
-    """Apply planned curtailment only to covered, eligible tariff intervals."""
-    return context.export_limit.get("ready") is True and any(
-        block_time(block["start"]) <= at < block_time(block["end"]) and block["watts"] == 0
-        for block in context.export_limit.get("blocks", [])
-    )
+    """Distinguish projected zero export from unrestricted or partially capped export."""
+    return assumed_export_limit_watts(context, at) == 0
 
 
 def area_safe(plan: Any) -> bool:
@@ -228,10 +250,12 @@ def area_safe(plan: Any) -> bool:
 
 def curtailment_preview(context: DecisionContext, slot: DecisionSlot) -> dict[str, Any]:
     """Keep production intact while distinguishing assumed grid curtailment."""
-    zero_export = assumed_zero_export(context, slot.valid_at)
+    limit = assumed_export_limit_watts(context, slot.valid_at)
     net_export = (None if slot.pv_forecast_kw is None or slot.baseline_load_forecast_kw is None else
                   max(slot.pv_forecast_kw - slot.baseline_load_forecast_kw
                       - slot.projected_ev_load_kw - slot.projected_hvac_load_kw, 0.0))
-    return {"assumed_zero_export": zero_export,
-            "projected_grid_export_kw": None if net_export is None else 0.0 if zero_export else net_export,
+    if net_export is not None and limit is not None:
+        net_export = min(net_export, limit / 1000)
+    return {"assumed_zero_export": limit == 0,
+            "projected_grid_export_kw": net_export,
             "export_limit_confirmation": context.export_limit.get("feedback", {}).get("state", "unknown")}

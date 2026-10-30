@@ -13,12 +13,23 @@ from homeassistant.helpers import entity_registry as er
 
 from .adapter_helpers import DeviceTargetUnavailable, async_call_device_service
 from .const import CONF_AMBER_EXPORT_PRICE, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
+from .export_limit_cooldown import (
+    control_key,
+    cooldown_status,
+    interval,
+    next_eligible,
+    normalized_record,
+    same_control,
+    valid_stamp,
+)
 from .export_limit_policy import EXPORT_ASSET, READBACK_MAX_AGE, confirmed_feedback, tariff_blocks
 from .models import ActionAsset, ActionKind, ActionOutcome, OutcomeResult, PlanAction
 
 
 def target_identity(hass: HomeAssistant, entity: str) -> dict[str, str] | None:
     """Require the upstream Export Limit identity, never a default site."""
+    if not entity:
+        return None
     registered = er.async_get(hass).async_get(entity)
     if (
         registered is None
@@ -72,6 +83,7 @@ def feedback(hass: HomeAssistant, entity: str | None, now: datetime) -> tuple[di
 def evidence(hass: HomeAssistant, data: dict[str, Any], options: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Build price-only readiness without depending on the energy optimizer."""
     observed, issue = feedback(hass, data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+    feedback_ready = issue is None and not observed.get("pending")
     state = hass.states.get(str(data[CONF_AMBER_EXPORT_PRICE])) if data.get(CONF_AMBER_EXPORT_PRICE) else None
     blocks, tariff_issue = tariff_blocks(state, now, options)
     service_issue = None
@@ -80,7 +92,8 @@ def evidence(hass: HomeAssistant, data: dict[str, Any], options: dict[str, Any],
     issue = issue or tariff_issue or service_issue
     if observed.get("pending"):
         issue = issue or "export_limit_pending"
-    return {"ready": issue is None, "reason": issue, "feedback": observed, "blocks": blocks}
+    return {"ready": issue is None, "reason": issue, "feedback": observed,
+            "feedback_ready": feedback_ready, "blocks": blocks}
 
 
 class ExportLimitControl:
@@ -89,9 +102,11 @@ class ExportLimitControl:
     def __init__(
         self, hass: HomeAssistant, store: Any, data: dict[str, Any],
         before_dispatch: Callable[[], str | None] | None = None,
+        *, options: dict[str, Any] | None = None,
     ) -> None:
         self.hass, self.store, self.data = hass, store, data
         self.before_dispatch = before_dispatch
+        self.options = options or {}
 
     @property
     def state(self) -> dict[str, Any]:
@@ -106,6 +121,28 @@ class ExportLimitControl:
             ownership.pop(EXPORT_ASSET, None)
         await self.store.async_save_ownership(ownership)
 
+    async def prepare_cooldown(self, now: datetime) -> dict[str, Any] | None:
+        """Persist migration/clock recovery even when control is otherwise blocked."""
+        identity = target_identity(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""))
+        if identity is None:
+            return None
+        limits = dict(self.store.data.get("command_rate_limits", {}))
+        record = normalized_record(limits, identity, self.state, now)
+        limits[control_key(identity)] = record
+        await self.store.async_save_command_rate_limits(limits)
+        return record
+
+    async def save_timing(self, identity: dict[str, str], record: dict[str, Any], *, flush: bool = True) -> None:
+        limits = dict(self.store.data.get("command_rate_limits", {}))
+        limits[control_key(identity)] = record
+        await self.store.async_save_command_rate_limits(limits)
+        if flush:
+            await self.store.async_flush()
+
+    def cooldown(self, now: datetime) -> dict[str, Any]:
+        return cooldown_status(self.store.data, target_identity(
+            self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, "")), self.options, now)
+
     async def audit(
         self, pending: dict[str, Any], result: OutcomeResult, reason: str, now: datetime, observed: dict[str, Any]
     ) -> None:
@@ -113,9 +150,10 @@ class ExportLimitControl:
             ActionOutcome(
                 # Manual restorations share a lifecycle label. The persisted
                 # request time distinguishes cycles, including legacy pending
-                # requests, and stays stable across feedback retries/reloads.
-                action_id=(f"{pending['action_id']}-{pending['sent_at']}"
-                           if pending["restore"] else pending["action_id"]),
+                # requests. Clock repair freezes that identity before changing
+                # the request's reconciliation timing.
+                action_id=pending.get("audit_action_id") or (
+                    f"{pending['action_id']}-{pending['sent_at']}" if pending["restore"] else pending["action_id"]),
                 attempted_at=now,
                 result=result,
                 reason=reason,
@@ -132,6 +170,16 @@ class ExportLimitControl:
     async def adopt_external_feedback(self, observed: dict[str, Any], now: datetime) -> None:
         """Retire superseded ownership without clearing unrelated failure pauses."""
         previous = self.state
+        pending = previous.get("pending")
+        if pending and pending.get("confirmation_not_before") is not None:
+            # An intervening writer can retire ownership without proving when
+            # our uncertain watts request took effect. Keep a separate safety
+            # wait, never an APPLIED/RESTORED outcome or Planner confirmation.
+            record = await self.prepare_cooldown(now)
+            assert record is not None
+            if record.get("external_settlement_request") != pending["sent_at"]:
+                record.update(external_settled_at=now.timestamp(), external_settlement_request=pending["sent_at"])
+                await self.save_timing(observed["identity"], record)
         adopted: dict[str, Any] = {
             "identity": observed["identity"],
             "expected": {"watts": observed["watts"], "slew_rate": observed["slew_rate"]},
@@ -148,9 +196,25 @@ class ExportLimitControl:
 
     async def reconcile(self, now: datetime) -> str | None:
         """Resolve durable commands and reconcile external changes without latching a pause."""
+        await self.prepare_cooldown(now)
         state = self.state
         if not state:
             return None
+        pending = state.get("pending")
+        if pending and not valid_stamp(pending.get("sent_at"), now):
+            # A clock rollback or corrupt old request time cannot grant another
+            # write. Retain uncertainty, requiring a new matching read first.
+            audit_action_id = pending.get("audit_action_id") or (
+                f"{pending['action_id']}-{pending.get('sent_at')}" if pending["restore"] else pending["action_id"])
+            pending = {**pending, "audit_action_id": audit_action_id,
+                       "sent_at": now.timestamp(), "request_clock_recovered": True}
+            state["pending"] = pending
+            await self.save(state)
+        if pending and (pending.get("confirmation_not_before") is None
+                        or not valid_stamp(pending["confirmation_not_before"], now)):
+            pending = {**pending, "confirmation_not_before": now.timestamp()}
+            state["pending"] = pending
+            await self.save(state)
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
         if issue:
             pending = state.get("pending")
@@ -161,8 +225,11 @@ class ExportLimitControl:
                 state["pause"] = issue
                 await self.save(state)
             return issue
-        if observed["identity"] != state["identity"]:
+        if not same_control(observed["identity"], state["identity"]):
             return "export_limit_target_changed"
+        if state["identity"] != observed["identity"]:
+            state["identity"] = observed["identity"]
+            await self.save(state)
         pending = state.get("pending")
         if state.get("pause") == "external_export_limit_conflict" and not pending:
             if observed["pending"]:
@@ -173,7 +240,7 @@ class ExportLimitControl:
             matches = (
                 not observed["pending"]
                 and observed["watts"] == pending["watts"]
-                and observed["last_readback"] >= pending["sent_at"]
+                and observed["last_readback"] >= max(pending["sent_at"], pending["confirmation_not_before"])
                 and (pending.get("slew_rate") is None or observed["slew_rate"] == pending["slew_rate"])
             )
             if matches:
@@ -181,6 +248,13 @@ class ExportLimitControl:
                     await self.audit(pending, OutcomeResult.REJECTED, "external_export_limit_changed", now, observed)
                     await self.adopt_external_feedback(observed, now)
                     return self.state.get("pause")
+                record = await self.prepare_cooldown(now)
+                assert record is not None
+                if record.get("confirmation_request") != pending["sent_at"]:
+                    # API time is a read completion, not physical change time.
+                    # Start at our first observation, once per request.
+                    record.update(confirmed_at=now.timestamp(), confirmation_request=pending["sent_at"])
+                    await self.save_timing(observed["identity"], record)
                 await self.audit(
                     pending,
                     OutcomeResult.RESTORED if pending["restore"] else OutcomeResult.APPLIED,
@@ -253,6 +327,11 @@ class ExportLimitControl:
         restore: bool = False,
     ) -> tuple[OutcomeResult, str, bool]:
         """Durability precedes the service boundary, including compensation."""
+        timing = await self.prepare_cooldown(now)
+        assert timing is not None
+        deadline = next_eligible(timing, self.options)
+        if deadline is not None and now < deadline:
+            return OutcomeResult.REJECTED, "export_limit_change_rate_limited", False
         previous = self.state
         pending = {
             "action_id": action.action_id,
@@ -261,22 +340,33 @@ class ExportLimitControl:
             "identity": state["identity"],
             "watts": watts,
             "sent_at": now.timestamp(),
+            # None on disk means the process may have died before dispatch.
+            # Recovery then requires a new settings read after reconciliation.
+            "confirmation_not_before": None,
             "restore": restore,
             "pre_state": observed,
             "slew_rate": state["baseline"]["slew_rate"] if restore else None,
         }
         state["pending"] = pending
+        reservation = {**timing, "attempted_at": now.timestamp(), "checked_at": now.timestamp(),
+                       "interval_seconds": interval(self.options)}
         try:
             await self.save(state)
-            await self.store.async_flush()
+            await self.save_timing(state["identity"], reservation)
         except BaseException:
             # The service boundary has not been entered. A failed/cancelled
             # persistence attempt cannot create an uncertain gateway request.
             await self.save(previous)
+            limits = dict(self.store.data.get("command_rate_limits", {}))
+            limits[control_key(state["identity"])] = timing
+            await self.store.async_save_command_rate_limits(limits)
             raise
         dispatch_now = datetime.now(UTC)
         latest, blocked = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), dispatch_now)
-        if not blocked and latest["identity"] != state["identity"]:
+        deadline = next_eligible(timing, self.options)
+        if not blocked and deadline is not None and dispatch_now < deadline:
+            blocked = "export_limit_change_rate_limited"
+        if not blocked and not same_control(latest["identity"], state["identity"]):
             blocked = "export_limit_target_changed"
         if not blocked and latest["pending"]:
             blocked = "export_limit_pending"
@@ -288,6 +378,7 @@ class ExportLimitControl:
             if self.before_dispatch:
                 blocked = blocked or self.before_dispatch()
         if blocked:
+            await self.save_timing(state["identity"], timing, flush=False)
             if blocked == "external_export_limit_changed":
                 await self.adopt_external_feedback(latest, dispatch_now)
             else:
@@ -301,17 +392,22 @@ class ExportLimitControl:
             data["limit_watts"] = watts
         if restore:
             data["slew_rate"] = pending["slew_rate"]
+        pending["confirmation_not_before"] = dispatch_now.timestamp()
         try:
             await async_call_device_service(self.hass, "enphase_ev", service, data)
         except DeviceTargetUnavailable:
+            await self.save_timing(state["identity"], timing, flush=False)
             await self.save(previous)
             if restore:
                 await self.audit(pending, OutcomeResult.REJECTED, "export_limit_entity_unavailable", now, {})
             return OutcomeResult.REJECTED, "export_limit_entity_unavailable", False
         except asyncio.CancelledError:
+            await self.save(state)
             await self.audit(pending, OutcomeResult.PENDING, "export_limit_pending", now, observed)
             raise
         except ServiceValidationError as err:
+            reservation.update(attempted_at=datetime.now(UTC).timestamp(), checked_at=datetime.now(UTC).timestamp())
+            await self.save_timing(state["identity"], reservation)
             state.pop("pending")
             reason = {
                 "export_limit_disabled": "export_limit_service_rejected:controls_disabled",
@@ -325,6 +421,7 @@ class ExportLimitControl:
             return OutcomeResult.FAILED, reason, True
         except Exception:  # An accepted but timed-out write remains uncertain.
             pass
+        await self.save(state)
         await self.audit(pending, OutcomeResult.PENDING, "export_limit_pending", now, observed)
         await self.reconcile(datetime.now(UTC))
         return OutcomeResult.PENDING, "export_limit_pending", True
