@@ -3589,6 +3589,76 @@ def _matches_confirmed_zone_feedback(
     )
 
 
+def _matches_disabled_zone_mode_recall(
+    entry_data: dict[str, Any], command: dict[str, Any], later_commands: list[dict[str, Any]],
+    event: Any, now: datetime, hass: HomeAssistant | None, changed: set[str],
+) -> bool:
+    """Recognize one bounded off-zone recall caused by an owned head restoration.
+
+    Mode-specific remembered targets are not rollback baselines. This evidence
+    lives only on the issued command and cannot renew its original deadline.
+    """
+    issued = _parse_datetime_or_none(command.get("issued_at"))
+    deadline = _parse_datetime_or_none(command.get("deadline"))
+    mode = command.get("requested", {}).get("hvac_mode")
+    previous_mode = command.get("observed", {}).get("hvac_mode")
+    if (
+        hass is None or issued is None or deadline is None
+        or not issued <= now < min(deadline, issued + timedelta(seconds=120))
+        or command.get("entity_id") != entry_data.get(CONF_DAIKIN_CLIMATE)
+        or command.get("service") != "set_hvac_mode" or not command.get("transaction_id")
+        or command.get("restoration") is not True or command.get("uncertainty_compensation")
+        or command.get("stage") == "service_failed"
+        or mode not in {"heat", "cool"} or previous_mode not in {"heat", "cool"} or mode == previous_mode
+        or changed != {"temperature"}
+    ):
+        return False
+    entity = event.data["entity_id"]
+    old, new = event.data["old_state"], event.data["new_state"]
+    captured = command.get("coupled_zones", {}).get(entity, {})
+    previous, target = finite(captured.get("target_temperature")), finite(new.attributes.get("temperature"))
+    if (
+        old.state != "off" or new.state != "off" or captured.get("mode") != "off"
+        or previous is None or target is None
+        or not _matching_hvac_target(old.attributes.get("temperature"), previous)
+        or any(
+            later_entity in {entity, command["entity_id"]}
+            or _unambiguous_coupled_zone_entity_ids_match(entry_data, later_entity, entity)
+            for later_entity in [
+                *(later.get("entity_id") for later in later_commands),
+                *command.get("recall_superseding_entities", []),
+            ]
+        )
+    ):
+        return False
+    head, current = hass.states.get(command["entity_id"]), hass.states.get(entity)
+    center = finite(head.attributes.get("temperature")) if head is not None else None
+    if (
+        head is None or head.state != mode or center is None or not center - 2 <= target <= center + 2
+        or current is None or current.state != new.state
+        or any(current.attributes.get(key) != new.attributes.get(key) for key in _HVAC_CONTROL_ATTRIBUTE_KEYS)
+        or (command.get("confirmed_at") is not None and not _matching_hvac_target(
+            center, command.get("confirmed_observed", {}).get("target_temperature"),
+        ))
+        or any(
+            getattr(context, "user_id", None)
+            or getattr(context, "parent_id", None) not in {None, command.get("context_id")}
+            for context in (
+                getattr(event, "context", None), getattr(new, "context", None),
+                getattr(current, "context", None), getattr(head, "context", None),
+            )
+        )
+    ):
+        return False
+    # Repeated samples may confirm the same recall; a second target is a new
+    # intervention even if it still falls inside the head's supported bounds.
+    recalled = command.setdefault("disabled_zone_recalls", {})
+    if entity in recalled and not _matching_hvac_target(target, recalled[entity]):
+        return False
+    recalled[entity] = target
+    return True
+
+
 def _matches_climate_transaction(
     entry_data: dict[str, Any], commands: list[dict[str, Any]], event: Any, now: datetime,
     hass: HomeAssistant | None = None,
@@ -3617,6 +3687,10 @@ def _matches_climate_transaction(
         if not same and not coupled:
             continue
         requested, service = command.get("requested", {}), command.get("service")
+        if coupled and not same and _matches_disabled_zone_mode_recall(
+            entry_data, command, commands[commands.index(command) + 1:], event, now, hass, changed,
+        ):
+            return True
         delayed_or_recovering = (
             now >= issued + timedelta(minutes=2)
             or old.state != new.state

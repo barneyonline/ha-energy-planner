@@ -786,3 +786,5 @@ rules:
 # Mode-specific compensation limits: tests/test_hvac_equipment_learning.py verifies
 # heat/off-to-cool transitions validate the exact target after mode confirmation,
 # reject invalid cooling bounds before the target write and preserve restoration.
+
+# Disabled-zone mode recall: coordinator.py::_matches_disabled_zone_mode_recall and executor.py retain bounded issued/confirmed command evidence without altering restoration baselines; tests/test_coordinator.py::test_disabled_zone_remembered_target_during_owned_restoration and tests/test_control_runtime.py::test_owned_release_recalls_disabled_zone_without_manual_override cover numeric off-zone recall, real HA release dispatch, explicit interventions, failures, reload and original-issue expiry, including permanent retirement after later failed head/zone/alias commands without retiring unrelated zones. Sanitized fixture: tests/fixtures/climate_feedback/disabled_zone_mode_recall.json. README.md and docs/requirements-audit.md describe limits; scripts/docker-validate.sh remains the full gate.

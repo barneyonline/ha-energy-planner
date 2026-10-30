@@ -13,6 +13,7 @@
 ### 🐛 Bug fixes
 
 - Keep missing, unknown or unavailable HVAC head and zone feedback, and availability recovery, from starting or extending manual override. Preserve original restoration settings and uncertain-command recovery, refresh control health, and retain protection for actual control changes and explicit overrides, including fresh user mode or zone-power commands across intermediate outage feedback and recovery.
+- Prevent an owned head-mode restoration from mistaking a disabled zone’s valid remembered-target feedback for a manual override. Recognition requires captured command evidence and matching live readback, expires from the original issue time, and preserves explicit user/automation changes and original restoration baselines.
 
 ### 🔧 Improvements
 
