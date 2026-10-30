@@ -74,6 +74,8 @@ Coverage thresholds retain exact elapsed durations when tariff timestamps differ
 3. Go to **Settings → Devices & services → Add integration → Energy Planner**.
 4. Open **Configure → Planner settings** to map inputs. Keep **Automatic control** off while reviewing plans and the safety check.
 
+Energy Planner is configured through the UI; a `ha_energy_planner:` entry in `configuration.yaml` is unsupported.
+
 On Home Assistant 2026.11 or newer, EV maximum import price and low-price charging threshold appear only when their respective toggles are enabled. Disabling a toggle retains its saved threshold for later use. Older supported versions continue to show both thresholds.
 
 [Open in HACS](https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&repository=ha-energy-planner&category=integration). Manual installation and removal: see [Installation](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
