@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+import pytest
 from homeassistant.components.sensor import SensorDeviceClass
 from homeassistant.const import EntityCategory, UnitOfPower, UnitOfTime
 from homeassistant.core import CoreState
@@ -1628,3 +1629,35 @@ def test_explicit_export_pause_is_visible_and_unrelated_pause_does_not_block_exp
     assert presentation_module.export_limit_status(coordinator)["reason"] == "enphase_export_limit_control_paused"
     coordinator.store.data["control_pause"]["assets"] = ["daikin"]
     assert not presentation_module.export_limit_status(coordinator)
+
+
+def test_plan_health_exposes_incompatible_zone_operator_recovery_blocker():
+    coordinator = _coordinator(_plan(), store_data={"ownership": {"hvac_control": {
+        "required_evidence_lost": "hvac_release_failed",
+        "main_state": {"hvac_mode": "off",
+                       "zone_recovery_blocker": "saved_zone_targets_incompatible_with_off_baseline"},
+        "zone_states": {"climate.zone": {"target_temperature": 24}},
+    }}})
+    health = next(item for item in SENSORS if item.key == "plan_health")
+    attrs = health.attrs_fn(coordinator)
+    assert health.value_fn(coordinator) == "degraded" and attrs["input_health"] == "healthy"
+    assert attrs["pending_hvac_restore"]["recovery_blocker"] == "saved_zone_targets_incompatible_with_off_baseline"
+    assert attrs["pending_hvac_restore"]["zone_targets"] == {"climate.zone": {"target_temperature": 24}}
+
+
+@pytest.mark.parametrize("main_snapshot", [None, [], "legacy", 0])
+def test_pending_restore_health_preserves_legacy_non_mapping_main_snapshots(main_snapshot):
+    from custom_components.ha_energy_planner.storage import _normalize_loaded_data
+
+    stored = _normalize_loaded_data({"ownership": {"hvac_control": {
+        "required_evidence_lost": "hvac_release_failed",
+        "main_state": main_snapshot,
+        "zone_states": {"climate.zone": {"target_temperature": 24}},
+    }}})
+    coordinator = _coordinator(_plan(), store_data=stored)
+    health = next(item for item in SENSORS if item.key == "plan_health")
+    attrs = health.attrs_fn(coordinator)
+    assert health.value_fn(coordinator) == "degraded" and attrs["input_health"] == "healthy"
+    assert attrs["pending_hvac_restore"]["main_target"] == main_snapshot
+    assert attrs["pending_hvac_restore"]["zone_targets"] == {"climate.zone": {"target_temperature": 24}}
+    assert "recovery_blocker" not in attrs["pending_hvac_restore"]

@@ -475,7 +475,8 @@ def test_paused_alias_reopen_uses_original_target_snapshot(monkeypatch):
     c.created_at = NOW + timedelta(minutes=11)
     previous_context = room_context()
     previous = {"zone_intent": evaluate(previous_context, "cool", 21),
-                "zone_states": {BED_CLIMATE: {"target_temperature": 23}}}
+                "main_state": {"hvac_mode": "cool", "target_temperature": 24},
+                "zone_states": {climate: {"target_temperature": 23} for climate in PAIRS.values()}}
     c.hvac_control = previous
     hass = device(c)
     hass.states.values[BED] = "off"
