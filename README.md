@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/barneyonline/ha-energy-planner/releases"><img src="https://img.shields.io/github/v/release/barneyonline/ha-energy-planner?display_name=tag&amp;sort=semver" alt="Latest release"></a>
+  <a href="https://codecov.io/gh/barneyonline/ha-energy-planner"><img src="https://codecov.io/gh/barneyonline/ha-energy-planner/branch/main/graph/badge.svg" alt="Codecov coverage"></a>
   <a href="https://my.home-assistant.io/redirect/hacs_repository/?owner=barneyonline&amp;repository=ha-energy-planner&amp;category=integration"><img src="https://img.shields.io/badge/HACS-Open_repository-41BDF5.svg" alt="Open Energy Planner in HACS"></a>
 </p>
 
@@ -83,7 +84,7 @@ The calendar distinguishes upcoming plan windows from retained confirmed activit
 2. Restart Home Assistant, then add **Energy Planner** under **Settings → Devices & services → Add integration**.
 3. Map your inputs in **Configure → Planner settings**. Keep **Automatic control** off while reviewing plans and the safety check.
 
-Enter your Home Assistant URL if prompted by the HACS link. If adding the repository manually, use `https://github.com/barneyonline/ha-energy-planner` as an **Integration** under **HACS → Custom repositories**. [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
+Enter your Home Assistant URL if prompted by the HACS link. [Manual installation and removal](https://github.com/barneyonline/ha-energy-planner/wiki/Installation).
 
 Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
 
@@ -114,8 +115,6 @@ Configured through the Home Assistant UI. No separate vendor credentials or thir
 </details>
 
 [Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
-
-The Platinum quality-scale claim is a repository self-assessment. This custom integration is not reviewed, security audited, maintained or supported by the Home Assistant project.
 
 ---
 
