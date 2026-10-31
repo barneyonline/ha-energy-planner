@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="280"
+  viewBox="0 0 1280 280" role="img" aria-labelledby="banner-title banner-description">
+  <title id="banner-title">Energy Planner</title>
+  <desc id="banner-description">Plan locally. Review clearly. Control with confidence.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1280" y2="280" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#edf8fa"/><stop offset="1" stop-color="#e7f3e9"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1280" y2="0" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#00a9ce"/><stop offset="1" stop-color="#43a047"/>
+    </linearGradient>
+    <linearGradient xmlns="http://www.w3.org/2000/svg" id="badge" x1="48" y1="32" x2="208" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#00a9ce" />
+      <stop offset="1" stop-color="#43a047" />
+    </linearGradient>
+
+    <clipPath id="frame"><rect width="1280" height="280" rx="20"/></clipPath>
+  </defs>
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="280" fill="url(#background)"/>
+    <circle cx="1114" cy="140" r="199" fill="none" stroke="#8cbaaa" stroke-opacity=".24"/>
+    <circle cx="1114" cy="140" r="164" fill="none" stroke="#8cbaaa" stroke-opacity=".35"/>
+    <path d="M885 280v-31a28 28 0 0 1 28-28h28M1280 46h-36a26 26 0 0 0-26 26v19"
+      fill="none" stroke="#6fa58e" stroke-opacity=".4" stroke-width="2"/>
+    <circle cx="941" cy="221" r="4" fill="#69b991"/>
+    <circle cx="1218" cy="91" r="4" fill="#00a9ce"/>
+    <rect y="275" width="1280" height="5" fill="url(#accent)"/>
+    <g transform="translate(60 33) scale(.14)"><circle xmlns="http://www.w3.org/2000/svg" cx="128" cy="128" r="112" fill="url(#badge)" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M82 133h92" stroke="#ffffff" stroke-width="16" stroke-linecap="round" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M85 169c25 20 61 22 89 5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M89 89c25-20 61-22 89-5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" />
+  <circle xmlns="http://www.w3.org/2000/svg" cx="64" cy="128" r="16" fill="#fdd835" />
+  <circle xmlns="http://www.w3.org/2000/svg" cx="192" cy="128" r="16" fill="#fdd835" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M135 56l-42 82h34l-12 62 50-88h-36z" fill="#ffffff" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M135 56l-42 82h34l-12 62 50-88h-36z" fill="#fdd835" opacity=".92" />
+</g>
+    <g font-family="Arial, Helvetica, sans-serif">
+      <text x="111" y="57" fill="#3d7063" font-size="18" font-weight="700" letter-spacing="2">HOME ASSISTANT INTEGRATION</text>
+      <text x="64" y="143" fill="#15352f" font-size="52" font-weight="700" letter-spacing="-1">Energy Planner</text>
+      <text x="66" y="193" fill="#345c52" font-size="27">Plan locally. Review clearly. Control with confidence.</text>
+    </g>
+    <rect x="66" y="225" width="48" height="4" rx="2" fill="#00a9ce"/>
+    <rect x="120" y="225" width="24" height="4" rx="2" fill="#43a047"/>
+    <g transform="translate(1008 35) scale(.82)"><circle xmlns="http://www.w3.org/2000/svg" cx="128" cy="128" r="112" fill="url(#badge)" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M82 133h92" stroke="#ffffff" stroke-width="16" stroke-linecap="round" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M85 169c25 20 61 22 89 5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M89 89c25-20 61-22 89-5" fill="none" stroke="#ffffff" stroke-width="12" stroke-linecap="round" />
+  <circle xmlns="http://www.w3.org/2000/svg" cx="64" cy="128" r="16" fill="#fdd835" />
+  <circle xmlns="http://www.w3.org/2000/svg" cx="192" cy="128" r="16" fill="#fdd835" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M135 56l-42 82h34l-12 62 50-88h-36z" fill="#ffffff" />
+  <path xmlns="http://www.w3.org/2000/svg" d="M135 56l-42 82h34l-12 62 50-88h-36z" fill="#fdd835" opacity=".92" />
+</g>
+  </g>
+</svg>
