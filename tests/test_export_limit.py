@@ -184,7 +184,7 @@ def setup(monkeypatch):
             return clock["now"]
 
     monkeypatch.setattr(runtime, "datetime", Clock)
-    monkeypatch.setattr("homeassistant.util.dt.utcnow", lambda: NOW)
+    monkeypatch.setattr("homeassistant.util.dt.utcnow", lambda: clock["now"])
     return SimpleNamespace(
         hass=hass,
         store=store,
@@ -195,6 +195,16 @@ def setup(monkeypatch):
         clock=clock,
         control=runtime.ExportLimitControl(hass, store, DATA),
     )
+
+
+def advance_clock(setup, seconds=300):
+    """Publish fresh feedback after the mandatory export change interval."""
+    setup.clock["now"] += timedelta(seconds=seconds)
+    for state in setup.states.values():
+        if "last_successful_readback" in state.attributes:
+            state.attributes["last_successful_readback"] = setup.clock["now"].timestamp()
+    setup.states["sensor.export_price"].last_updated = setup.clock["now"]
+    return setup.clock["now"]
 
 
 def context(evidence):
@@ -211,7 +221,7 @@ def context(evidence):
 
 
 def action(setup):
-    return build_actions(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))[0]
+    return build_actions(context(runtime.evidence(setup.hass, DATA, OPTIONS, setup.clock["now"])))[0]
 
 
 @pytest.mark.parametrize(
@@ -515,7 +525,7 @@ def test_select_export_only_execution_never_changes_profile(select_setup, mapped
         assert await setup.control.reconcile(NOW) is None
         assert not setup.control.state.get("pending")
         setup.mode["value"] = "confirm"
-        assert (await setup.control.restore(NOW))[0] == OutcomeResult.RESTORED
+        assert (await setup.control.restore(advance_clock(setup)))[0] == OutcomeResult.RESTORED
         assert setup.calls[-1] == ("enphase_ev", "disable_export_limit", {
             "entity_id": setup.select, "slew_rate": 100.0,
         })
@@ -671,7 +681,7 @@ def test_exact_baseline_restoration(setup, baseline):
         setup.states[ENTITY] = limit_state(a.desired_state["watts"], slew=77, readback=NOW.timestamp())
         assert await setup.control.reconcile(NOW + timedelta(seconds=1)) is None
         setup.mode["value"] = "confirm"
-        assert (await setup.control.restore(NOW))[2] is True
+        assert (await setup.control.restore(advance_clock(setup, 301)))[2] is True
         assert setup.calls[-1][2]["slew_rate"] == 77
         # Readback must confirm the original slew as well as its enabled/watts state.
         assert not setup.control.state
@@ -691,7 +701,7 @@ def test_manual_change_reconciles_automatically_with_new_baseline(setup):
         assert len(setup.calls) == 1
         assert "pause" not in setup.control.state
         assert setup.control.state["expected"]["watts"] == 5000
-        await setup.control.execute(action(setup), NOW)
+        await setup.control.execute(action(setup), advance_clock(setup))
         assert setup.control.state["baseline"]["watts"] == 5000
         assert len(setup.calls) == 2
 
@@ -777,13 +787,14 @@ def test_readback_timeout_without_fresh_feedback_and_restore_retry(setup):
         setup.states[ENTITY] = limit_state(0, readback=(NOW + timedelta(minutes=11)).timestamp())
         await setup.control.reconcile(NOW + timedelta(minutes=11))
         await setup.control.resume()
-        setup.states[ENTITY] = limit_state(0)
+        setup.clock["now"] = NOW + timedelta(minutes=11)
+        setup.states[ENTITY] = limit_state(0, readback=setup.clock["now"].timestamp())
         setup.mode["value"] = "reject"
-        assert (await setup.control.restore(NOW))[0] == OutcomeResult.FAILED
+        assert (await setup.control.restore(advance_clock(setup)))[0] == OutcomeResult.FAILED
         assert setup.control.state["restoring"]
         await setup.control.resume()
         setup.mode["value"] = "confirm"
-        await setup.control.restore(NOW)
+        await setup.control.restore(advance_clock(setup))
         assert not setup.control.state
 
     asyncio.run(run())
@@ -1114,12 +1125,14 @@ def test_delayed_restoration_confirmation_and_readback_recheck(setup, monkeypatc
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
         setup.mode["value"] = "pending"
-        await setup.control.restore(NOW)
-        setup.states[ENTITY] = limit_state()
-        assert (await setup.control.restore(NOW))[0] == OutcomeResult.RESTORED
+        now = advance_clock(setup)
+        await setup.control.restore(now)
+        setup.states[ENTITY] = limit_state(readback=now.timestamp())
+        assert (await setup.control.restore(now))[0] == OutcomeResult.RESTORED
         setup.states[ENTITY] = limit_state(3000)
         setup.mode["value"] = "confirm"
-        await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup)
+        await setup.control.execute(action(setup), now)
         original = setup.control.reconcile
 
         async def disappearing(now):
@@ -1128,7 +1141,7 @@ def test_delayed_restoration_confirmation_and_readback_recheck(setup, monkeypatc
             return result
 
         monkeypatch.setattr(setup.control, "reconcile", disappearing)
-        assert (await setup.control.restore(NOW))[1] == "export_limit_entity_unavailable"
+        assert (await setup.control.restore(now))[1] == "export_limit_entity_unavailable"
 
     asyncio.run(run())
 
@@ -1549,7 +1562,7 @@ def test_external_slew_change_during_pending_surrenders_ownership(setup):
         assert len(setup.calls) == 1
         assert "pause" not in setup.control.state
         setup.states["sensor.export_price"] = price_state((0, 1, 1))
-        await setup.control.execute(action(setup), NOW)
+        await setup.control.execute(action(setup), advance_clock(setup))
         assert setup.control.state["baseline"] == {"watts": 0, "slew_rate": 77}
 
     asyncio.run(run())
@@ -1642,6 +1655,7 @@ def test_pending_export_restoration_does_not_mask_failed_profile_restore(setup):
     async def run():
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
+        advance_clock(setup)
         setup.store.data["ownership"]["enphase_profile"] = "Full Backup"
         setup.mode["value"] = "pending"
         executor = Executor(setup.store, hass=setup.hass,
@@ -1663,6 +1677,7 @@ def test_unsent_restoration_remains_outstanding_after_target_race(setup, monkeyp
     async def run():
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
+        advance_clock(setup)
         original_flush = setup.store.async_flush
 
         async def change_target():
@@ -1698,6 +1713,7 @@ def test_restoration_reports_matching_readback_and_identifies_rejected_action(se
     async def run():
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
+        advance_clock(setup)
         setup.mode["value"] = mode
         executor = Executor(setup.store, hass=setup.hass, entry_data=DATA, options=OPTIONS)
         result = await executor.async_restore_device_control(EXPORT_ASSET, "operator_stop")
@@ -1742,7 +1758,7 @@ def test_external_request_is_observed_without_conflict_pause_or_duplicate_comman
         assert len(setup.calls) == 1
         setup.states[ENTITY] = limit_state()
         assert await setup.control.reconcile(NOW) is None
-        await setup.control.execute(action(setup), NOW)
+        await setup.control.execute(action(setup), advance_clock(setup))
         assert len(setup.calls) == 2
     asyncio.run(run())
 
@@ -1769,13 +1785,13 @@ def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, 
             if failure == "rejected":
                 setup.mode["value"] = "reject"
                 setup.states["sensor.export_price"] = price_state((0, 1, 1))
-                await setup.control.execute(action(setup), NOW)
+                await setup.control.execute(action(setup), advance_clock(setup))
                 reason = "export_limit_service_rejected"
             else:
                 setup.states[ENTITY].state = "unsupported"
                 reason = "export_limit_unsupported"
                 assert await setup.control.reconcile(NOW) == reason
-            now = NOW
+            now = setup.clock["now"]
             setup.states[ENTITY] = limit_state(5000, slew=77)
         else:
             await setup.control.execute(action(setup), NOW)
@@ -1799,7 +1815,8 @@ def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, 
         setup.mode["value"] = "confirm"
         setup.states["sensor.export_price"] = price_state((-1, 0, 1))
         setup.states[ENTITY] = limit_state(5000, slew=77)
-        await setup.control.execute(action(setup), NOW)
+        setup.clock["now"] = now
+        await setup.control.execute(action(setup), advance_clock(setup))
         assert len(setup.calls) == writes + 1
         assert setup.control.state["baseline"] == {"watts": 5000, "slew_rate": 77}
     asyncio.run(run())
@@ -1874,7 +1891,7 @@ def test_calendar_retains_confirmed_restoration_between_tariff_actions_after_rel
         original_baseline = {"watts": baseline, "slew_rate": 77}
         assert setup.control.state["baseline"] == original_baseline
 
-        requested = NOW + timedelta(seconds=10)
+        requested = advance_clock(setup)
         setup.clock["now"] = requested
         setup.mode["value"] = "pending"
         assert await setup.control.restore(requested) == (OutcomeResult.PENDING, "export_limit_pending", True)
@@ -1921,7 +1938,7 @@ def test_calendar_retains_confirmed_restoration_between_tariff_actions_after_rel
         setup.mode["value"] = "confirm"
         second = deepcopy(first)
         second.action_id, second.plan_id = "next-tariff-action", "next-plan"
-        await control.execute(second, confirmed)
+        await control.execute(second, advance_clock(setup))
         history = reloaded.data["calendar_history"]["history"]
         assert len(history) == 3
         assert history[0]["summary"] == history[2]["summary"]
@@ -1929,7 +1946,7 @@ def test_calendar_retains_confirmed_restoration_between_tariff_actions_after_rel
         assert control.state["baseline"] == original_baseline
 
         # A later restoration to the same baseline is a distinct real action.
-        later = confirmed + timedelta(seconds=10)
+        later = advance_clock(setup)
         setup.clock["now"] = later
         assert (await control.restore(later))[0] == OutcomeResult.RESTORED
         history = reloaded.data["calendar_history"]["history"]
@@ -1946,15 +1963,16 @@ def test_unconfirmed_restoration_never_creates_calendar_activity(setup, mode):
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
         history = deepcopy(setup.store.data["calendar_history"]["history"])
+        now = advance_clock(setup)
         setup.mode["value"] = mode
         if mode == "cancel":
             with pytest.raises(asyncio.CancelledError):
-                await setup.control.restore(NOW)
+                await setup.control.restore(now)
         else:
-            await setup.control.restore(NOW)
+            await setup.control.restore(now)
         assert setup.store.data["calendar_history"]["history"] == history
         assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
-        assert (await setup.control.restore(NOW + timedelta(seconds=1)))[2] is False
+        assert (await setup.control.restore(now + timedelta(seconds=1)))[2] is False
         assert len(setup.calls) == 2
 
     asyncio.run(run())
@@ -1970,10 +1988,11 @@ def test_restoration_already_at_original_baseline_does_not_fabricate_calendar_ac
         second = deepcopy(first)
         second.action_id, second.kind = "return-to-baseline", ActionKind.DISABLE_EXPORT_LIMIT
         second.desired_state["watts"] = None
-        await setup.control.execute(second, NOW)
+        await setup.control.execute(second, advance_clock(setup))
         history = deepcopy(setup.store.data["calendar_history"]["history"])
         assert len(history) == 2
-        assert await setup.control.restore(NOW) == (OutcomeResult.RESTORED, "export_limit_restored", False)
+        assert await setup.control.restore(setup.clock["now"]) == (
+            OutcomeResult.RESTORED, "export_limit_restored", False)
         assert not setup.control.state and len(setup.calls) == 2
         assert setup.store.data["calendar_history"]["history"] == history
 
