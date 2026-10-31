@@ -12,6 +12,14 @@ mypy = "1.19.1"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Home Assistant 2026.10's HTTP implementation emits these aiohttp warnings.
+# Keep only these upstream exceptions; new warnings still fail validation.
+# See docs/validation-warnings.md for ownership and removal criteria.
+filterwarnings = [
+    "error",
+    'ignore:^Inheritance class HomeAssistantApplication from web\.Application is discouraged$:DeprecationWarning:homeassistant\.components\.http\.server',
+    'ignore:^It is recommended to use web\.AppKey instances for keys\.:aiohttp.web_exceptions.NotAppKeyWarning:homeassistant\.components\.http\.server',
+]
 
 [tool.coverage.run]
 source = ["custom_components/ha_energy_planner"]

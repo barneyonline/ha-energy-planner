@@ -12,6 +12,7 @@ on:
       - "hacs.json"
       - "pyproject.toml"
       - "quality_scale.yaml"
+      - "codecov.yml"
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
       - ".github/workflows/quality-scale.yml"
@@ -36,7 +37,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       pytest: ${{ steps.select.outputs.pytest }}
       quality_scale: ${{ steps.select.outputs.quality_scale }}
@@ -65,7 +66,7 @@ jobs:
   pytest-coverage:
     needs: changes
     if: needs.changes.outputs.pytest == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       checks: write
@@ -90,11 +91,12 @@ jobs:
           python3 -m coverage xml --fail-under=0 -o coverage.xml &&
           python3 -m coverage report -m --fail-under=0 &&
           python3 scripts/check_coverage.py coverage.json'
-      - name: Preserve statement and branch evidence
-        if: ${{ always() && hashFiles('coverage.json') != '' }}
-        uses: actions/upload-artifact@v4
+      - name: Preserve test and coverage evidence
+        if: ${{ always() && (hashFiles('coverage.json') != '' || hashFiles('junit.xml') != '') }}
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-evidence
+          if-no-files-found: error
           path: |
             coverage.json
             coverage.xml
@@ -105,6 +107,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./coverage.xml
+          plugins: noop
+          disable_search: true
           fail_ci_if_error: true
       - name: Upload test results to Codecov
         if: ${{ always() && hashFiles('junit.xml') != '' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
@@ -112,6 +116,8 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: ./junit.xml
+          plugins: noop
+          disable_search: true
           report_type: test_results
       - name: Fail if tests failed
         if: ${{ steps.pytest.outcome == 'failure' }}
@@ -122,7 +128,7 @@ jobs:
     if: >-
       needs.changes.outputs.quality_scale == 'true' &&
       (github.event_name != 'pull_request' || needs.changes.outputs.dedicated_quality_scale != 'true')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -147,7 +153,7 @@ jobs:
   validation-extras:
     needs: changes
     if: needs.changes.outputs.validation_extras == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
     steps:
@@ -162,7 +168,7 @@ jobs:
   runtime-compatibility:
     needs: changes
     if: needs.changes.outputs.pytest == 'true' || needs.changes.outputs.validation_extras == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     strategy:
       fail-fast: false
       matrix:
@@ -178,12 +184,23 @@ jobs:
       - name: Exercise real platforms, services and storage
         env:
           HEP_HA_IMAGE: ghcr.io/home-assistant/home-assistant:${{ matrix.version }}
+          HEP_VALIDATION_ARTIFACTS_DIR: ${{ runner.temp }}/ha-energy-planner-smoke
         run: scripts/docker-package-smoke.sh
+      - name: Preserve smoke console and warning evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ha-smoke-${{ matrix.version }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ha-energy-planner-smoke/docker-console.log
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.json
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.txt
 
   release-package:
     needs: changes
     if: needs.changes.outputs.pytest == 'true' || needs.changes.outputs.validation_extras == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
       - name: Build deterministic release artifact
@@ -192,7 +209,7 @@ jobs:
         run: |
           docker pull "$(python3 scripts/support_policy.py image)"
           scripts/validation-environment.sh > validation-environment.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-package
           path: |

@@ -19,3 +19,4 @@ dist/
 .package-smoke.*/
 validation-environment.txt
 release-evidence.json
+.validation-artifacts/

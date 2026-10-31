@@ -84,16 +84,17 @@ def update_calendar_history(
                 else record.get("location") not in observed_locations
             )
         ]
-    pending = [record for record in current if not any(
-        archived["uid"] == record["uid"] and not _confirmed_start(record) for archived in history
-    )]
+    archived_ids = {record["uid"] for record in history}
+    pending = [record for record in current if _confirmed_start(record) or record["uid"] not in archived_ids]
     # A confirmed phase may outlast its forecast end. Keep one entry for that
     # phase when a later plan extends it, even if an earlier end was archived.
+    # History was filtered to confirmed records above; provisional pending
+    # windows cannot supersede it and need not be compared with every record.
+    confirmed_pending = [record for record in pending if _confirmed_start(record)]
     history = [record for record in history if not any(
-        _confirmed_start(record) and _confirmed_start(candidate)
-        and record["start"] == candidate["start"]
+        record["start"] == candidate["start"]
         and _same_running_window(record, candidate, now)
-        for candidate in pending
+        for candidate in confirmed_pending
     )]
     for previous in calendar_records(saved.get("pending")):
         start, end = datetime.fromisoformat(previous["start"]), datetime.fromisoformat(previous["end"])
