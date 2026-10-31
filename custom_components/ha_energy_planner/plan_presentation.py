@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from itertools import islice
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.util import dt as dt_util
@@ -736,15 +737,17 @@ def display_state(value: Any) -> str:
 
 
 def bounded_json(value: Any, *, depth: int = 0) -> Any:
-    """Convert values to bounded JSON-friendly attributes."""
+    """Convert retained evidence without walking the discarded payload."""
     if depth >= 4:
         return "<truncated>"
-    value = to_jsonable(value)
     if isinstance(value, dict):
-        return {str(key): bounded_json(item, depth=depth + 1) for key, item in list(value.items())[:16]}
+        return {str(key): bounded_json(item, depth=depth + 1) for key, item in islice(value.items(), 16)}
     if isinstance(value, list):
         items = [bounded_json(item, depth=depth + 1) for item in value[:12]]
         if len(value) > 12:
             items.append({"truncated_count": len(value) - 12})
         return items
-    return value
+    normalized = to_jsonable(value)
+    if isinstance(normalized, dict | list):
+        return bounded_json(normalized, depth=depth)
+    return normalized

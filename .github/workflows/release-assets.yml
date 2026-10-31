@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   package-component:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
@@ -27,7 +27,19 @@ jobs:
       - name: Build validated component and checksum
         run: python3 scripts/package-release.py --version "$RELEASE_TAG"
       - name: Verify packaged runtime before attaching assets
+        env:
+          HEP_VALIDATION_ARTIFACTS_DIR: ${{ runner.temp }}/ha-energy-planner-smoke
         run: scripts/docker-package-smoke.sh
+      - name: Preserve smoke console and warning evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ha-smoke-release
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ha-energy-planner-smoke/docker-console.log
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.json
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.txt
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:

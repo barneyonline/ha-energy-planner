@@ -14,8 +14,20 @@ concurrency:
 
 jobs:
   home-assistant-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
       - name: Run Home Assistant smoke test
+        env:
+          HEP_VALIDATION_ARTIFACTS_DIR: ${{ runner.temp }}/ha-energy-planner-smoke
         run: scripts/docker-ha-smoke.sh
+      - name: Preserve smoke console and warning evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ha-smoke-standalone
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/ha-energy-planner-smoke/docker-console.log
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.json
+            ${{ runner.temp }}/ha-energy-planner-smoke/warnings.txt

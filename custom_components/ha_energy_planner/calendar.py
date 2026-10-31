@@ -323,7 +323,13 @@ def _ev_charging_events(
                     "allocation_source": allocation_source,
                 }
             )
-    return [_ev_charging_event(action, window, index) for index, window in enumerate(windows, start=1)]
+    # The reason/constraint evidence is common to every window. Expanding a
+    # fragmented schedule must not rebuild the entire action payload per slot.
+    presentation = plain_action(action) if windows else {}
+    return [
+        _ev_charging_event(action, window, index, presentation)
+        for index, window in enumerate(windows, start=1)
+    ]
 
 
 def _valid_ev_charging_slots(action: PlanAction) -> list[tuple[datetime, float, str]]:
@@ -351,13 +357,13 @@ def _ev_charging_event(
     action: PlanAction,
     window: dict[str, Any],
     index: int,
+    details: dict[str, Any],
 ) -> CalendarEvent:
     """Render one complete EV charging window."""
     start = window["start"]
     end = window["end"]
     rates = sorted(float(rate) for rate in window["charge_rates"])
     rate_text = f"{rates[0]:g} kW" if len(rates) == 1 else f"{rates[0]:g}-{rates[-1]:g} kW"
-    details = plain_action(action)
     description_lines = ["Planned EV charging window."]
     _append_description_section(
         description_lines,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -738,6 +738,33 @@ def test_next_actions_entity_attributes_stay_below_recorder_budget() -> None:
     assert encoded_size <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES
     assert attrs["attributes_truncated"] is True
     assert attrs["action_count"] == 12
+
+
+def test_bounded_presentation_does_not_normalize_discarded_evidence() -> None:
+    """Large omitted branches must cost no traversal or serialization work."""
+    class DiscardedEvidence:
+        def __getattribute__(self, name: str) -> object:
+            raise AssertionError(f"Discarded evidence was accessed: {name}")
+
+    discarded = DiscardedEvidence()
+    retained = {str(index): index for index in range(16)}
+    assert presentation_module.bounded_json({**retained, "discarded": discarded}) == retained
+    assert presentation_module.bounded_json([*range(12), discarded]) == [*range(12), {"truncated_count": 1}]
+    assert presentation_module.bounded_json({"a": {"b": {"c": {"d": discarded}}}}) == {
+        "a": {"b": {"c": {"d": "<truncated>"}}},
+    }
+
+
+def test_bounded_presentation_retains_dataclass_and_datetime_conversion() -> None:
+    @dataclass
+    class Evidence:
+        timestamp: datetime
+        values: list[int]
+
+    now = datetime(2026, 10, 31, tzinfo=UTC)
+    assert presentation_module.bounded_json(Evidence(now, list(range(13)))) == {
+        "timestamp": now.isoformat(), "values": [*range(12), {"truncated_count": 1}],
+    }
 
 
 def test_existing_status_surfaces_expose_builtin_load_evidence() -> None:

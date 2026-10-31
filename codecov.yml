@@ -1,0 +1,4 @@
+# Keep Codecov's default CI requirement explicit. Coverage thresholds remain
+# enforced locally by scripts/check_coverage.py and its reviewed branch baseline.
+codecov:
+  require_ci_to_pass: true

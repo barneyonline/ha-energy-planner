@@ -99,5 +99,6 @@ See the [Wiki](https://github.com/barneyonline/ha-energy-planner/wiki) for setup
 - [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) and [known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
 - [Releases](https://github.com/barneyonline/ha-energy-planner/releases), [changelog](CHANGELOG.md) and [issues](https://github.com/barneyonline/ha-energy-planner/issues)
 - [Development and validation](https://github.com/barneyonline/ha-energy-planner/wiki/Development), [requirements evidence](docs/requirements-audit.md) and [quality-scale evidence](quality_scale.yaml)
+- [Validation warnings and retained evidence](docs/validation-warnings.md)
 
 The Platinum quality-scale claim is a repository self-assessment. This custom integration is not reviewed, security audited, maintained or supported by the Home Assistant project.
