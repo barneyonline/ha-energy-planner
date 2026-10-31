@@ -102,6 +102,7 @@ def test_tests_workflow_and_unclassified_paths_fail_safe() -> None:
     assert module.select_checks([".github/workflows/tests.yml"]) == dedicated_all_checks
     assert module.select_checks(["pyproject.toml"]) == dedicated_all_checks
     assert module.select_checks([".github/workflows/ci.yml"]) == fallback_all_checks
+    assert module.select_checks(["codecov.yml"]) == fallback_all_checks
     assert module.select_checks(["new-trigger-path.cfg"]) == fallback_all_checks
     assert module.select_checks([], force_all=True) == fallback_all_checks
 

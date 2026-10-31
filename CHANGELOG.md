@@ -16,7 +16,8 @@
 
 ### 🔧 Improvements
 
-- None
+- Retain smoke console and warning reports on success and failure, reject unexpected validation warnings, and use deterministic weather and restored thermostat fixtures. Update CI artifact uploads to Node 24, pin the Ubuntu runner, and upload generated Codecov reports without unrelated collection probes. Document remaining upstream and environment notices without disabling verification or weakening typing and coverage checks.
+- Reduce calendar and next-actions rendering work for fragmented EV schedules and large action evidence. Share action details within each calendar read, avoid traversing evidence that will be omitted, and reduce repeated history comparisons while preserving fresh state and all confirmed history.
 
 ### 🔄 Other changes
 

@@ -18,6 +18,7 @@ INPUTS = {
     "sensor.smoke_import_price_forecast": ("0.1", {}),
     "sensor.smoke_export_price_forecast": ("0.05", {}),
     "sensor.smoke_pv_forecast_series": ("2500", {}),
+    "weather.smoke_weather_forecast": ("sunny", {}),
     "climate.fake_daikin": ("off", {"current_temperature": 21}),
     "automation.fake_climate_conflict": ("on", {}),
 }

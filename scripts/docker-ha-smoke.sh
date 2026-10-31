@@ -5,8 +5,29 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d "$ROOT_DIR/.ha-smoke.XXXXXX")"
 LOG_FILE="$TMP_DIR/docker-console.log"
 HA_IMAGE="${HEP_HA_IMAGE:-$(python3 "$ROOT_DIR/scripts/support_policy.py" image)}"
+ARTIFACTS_DIR="${HEP_VALIDATION_ARTIFACTS_DIR:-$ROOT_DIR/.validation-artifacts/${TMP_DIR##*/}}"
+SMOKE_ASSERTIONS_PASSED=0
 
 cleanup() {
+  local status="$?"
+  # Only synthetic console output and its warning inventory leave the throwaway
+  # config. Never upload HA storage, seeded credentials, or diagnostic payloads.
+  if [[ -f "$LOG_FILE" ]]; then
+    if mkdir -p "$ARTIFACTS_DIR" && cp "$LOG_FILE" "$ARTIFACTS_DIR/docker-console.log"; then
+      if ! python3 "$ROOT_DIR/scripts/report-smoke-warnings.py" \
+        "$LOG_FILE" --output-dir "$ARTIFACTS_DIR"; then
+        if [[ "$status" == "0" ]]; then
+          status=1
+        fi
+      fi
+      echo "Home Assistant smoke evidence: $ARTIFACTS_DIR"
+    else
+      echo "Could not preserve Home Assistant smoke evidence at $ARTIFACTS_DIR" >&2
+      if [[ "$status" == "0" ]]; then
+        status=1
+      fi
+    fi
+  fi
   if [[ "${KEEP_HA_SMOKE:-0}" == "1" ]]; then
     echo "Preserving Home Assistant smoke config at $TMP_DIR"
   else
@@ -20,6 +41,10 @@ cleanup() {
       rm -rf "$TMP_DIR" 2>/dev/null || true
     fi
   fi
+  if [[ "$status" == "0" && "$SMOKE_ASSERTIONS_PASSED" == "1" ]]; then
+    echo "HA Energy Planner Docker smoke test passed"
+  fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -445,6 +470,44 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     return True
 PY
 
+cat > "$TMP_DIR/custom_components/fake_planner_test/weather.py" <<'PY'
+"""Deterministic hourly weather provider for real weather service validation."""
+from datetime import timedelta
+
+from homeassistant.components.weather import WeatherEntity, WeatherEntityFeature
+from homeassistant.const import UnitOfTemperature
+from homeassistant.util import dt as dt_util
+
+
+async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
+    """Load one real weather entity through Home Assistant's platform lifecycle."""
+    async_add_entities([SmokeWeather()])
+
+
+class SmokeWeather(WeatherEntity):
+    """Keep the first tariff peak in a deterministic heating regime."""
+
+    _attr_name = "Smoke weather forecast"
+    _attr_unique_id = "smoke_weather_forecast"
+    _attr_condition = "sunny"
+    _attr_native_temperature = 21.0
+    _attr_native_temperature_unit = UnitOfTemperature.CELSIUS
+    _attr_supported_features = WeatherEntityFeature.FORECAST_HOURLY
+    _attr_should_poll = False
+
+    async def async_forecast_hourly(self):
+        """Cover the planner horizon with timestamped hourly forecast points."""
+        start = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+        # The takeover assertion needs cold weather throughout the first price
+        # peak. A cyclic hourly series changes direction with wall-clock time
+        # and can defer takeover for hours despite healthy device feedback.
+        return [
+            {"datetime": (start + timedelta(hours=index)).isoformat(),
+             "native_temperature": 17.0, "condition": "sunny"}
+            for index in range(73)
+        ]
+PY
+
 cat > "$TMP_DIR/configuration.yaml" <<'YAML'
 default_config:
 
@@ -624,6 +687,9 @@ climate:
     max_temp: 35
     target_temp: 21
 
+weather:
+  - platform: fake_planner_test
+
 template:
   - sensor:
       - name: Smoke import price forecast
@@ -644,14 +710,6 @@ template:
           unitOfMeasurement: "W"
           confidence: "{{ 0.92 }}"
           detailedForecast: "{{ ([{'prediction': {'watts': 2500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 5000}}, {'prediction': {'watts': 4500}}, {'prediction': {'watts': 4000}}, {'prediction': {'watts': 3500}}, {'prediction': {'watts': 3000}}, {'prediction': {'watts': 2500}}, {'prediction': {'watts': 2000}}] * 24) }}"
-      - name: Smoke weather forecast
-        state: "sunny"
-        attributes:
-          nativeTemperature: "{{ 21 }}"
-          temperatureUnit: "C"
-          confidence: "{{ 0.90 }}"
-          # Peak weather below the 18 C lower bound supplies legacy direction evidence.
-          detailedForecast: "{{ ([{'nativeTemperature': 17.0}, {'nativeTemperature': 18.0}, {'nativeTemperature': 19.0}, {'nativeTemperature': 20.0}, {'nativeTemperature': 21.0}, {'nativeTemperature': 22.0}] * 48) }}"
 
 automation:
   - alias: Fake EV charger start feedback
@@ -713,6 +771,7 @@ automation:
           {{ is_number(states('sensor.smoke_import_price_forecast'))
              and is_number(states('sensor.smoke_export_price_forecast'))
              and is_number(states('sensor.smoke_pv_forecast_series'))
+             and states('weather.smoke_weather_forecast') not in ['unknown', 'unavailable']
              and is_number(state_attr('climate.fake_daikin', 'current_temperature'))
              and states('automation.fake_climate_conflict') in ['on', 'off'] }}
         timeout: "00:01:30"
@@ -1225,7 +1284,7 @@ cat > "$TMP_DIR/.storage/core.config_entries" <<'JSON'
               "climate_manual_override_entity": "input_boolean.climate_manual_override",
               "climate_target_low_entity": "input_number.climate_target_low",
               "climate_target_high_entity": "input_number.climate_target_high",
-              "weather_entity": "sensor.smoke_weather_forecast"
+              "weather_entity": "weather.smoke_weather_forecast"
             },
             "subentry_id": "haep_climate",
             "subentry_type": "climate",
@@ -1350,6 +1409,32 @@ payload["data"]["built_in_load_forecast"] = {
     },
 }
 path.write_text(json.dumps(payload, indent=2) + "\n")
+PY
+
+# The fake thermostat represents an installed device with an off/21 C baseline.
+# A realistic restore record avoids the unrelated generic-thermostat first-boot
+# warning; ownership restoration assertions below still exercise planner state.
+python3 - "$TMP_DIR/.storage/core.restore_state" <<'PY'
+from datetime import UTC, datetime
+import json
+from pathlib import Path
+import sys
+
+at = datetime.now(UTC).isoformat()
+Path(sys.argv[1]).write_text(json.dumps({
+    "version": 1,
+    "minor_version": 1,
+    "key": "core.restore_state",
+    "data": [{
+        "state": {
+            "entity_id": "climate.fake_daikin", "state": "off",
+            "attributes": {"temperature": 21.0, "preset_mode": "none"},
+            "last_changed": at, "last_updated": at,
+        },
+        "extra_data": None,
+        "last_seen": at,
+    }],
+}) + "\n")
 PY
 
 report_smoke_failure() {
@@ -1570,8 +1655,8 @@ if not any(
 ):
     raise SystemExit("Forecast preview did not use HA template Amber price forecast attributes")
 weather_preview = [slot.get("outdoor_temperature_forecast_c") for slot in latest_snapshot.get("preview", [])[:4]]
-if weather_preview != [17.0, 18.0, 19.0, 20.0]:
-    raise SystemExit(f"Forecast preview did not use HA template weather forecast attributes: {weather_preview}")
+if weather_preview != [17.0] * 4:
+    raise SystemExit(f"Forecast preview did not use the hourly Weather service forecast: {weather_preview}")
 if "forecast_calibration" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include calibration metadata")
 load_forecast = latest_snapshot.get("built_in_load_forecast", {})
@@ -1848,4 +1933,4 @@ if [[ ! -f "$TMP_DIR/.export_limit_smoke_complete" ]]; then
   exit 1
 fi
 
-echo "HA Energy Planner Docker smoke test passed"
+SMOKE_ASSERTIONS_PASSED=1

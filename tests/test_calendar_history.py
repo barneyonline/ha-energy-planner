@@ -96,6 +96,29 @@ def test_history_deduplicates_elapsed_window_from_current_plan():
     assert len(state["history"]) == 1 and state["history"][0]["uid"] == elapsed["uid"]
 
 
+def test_large_history_preserves_provisional_id_rejection_and_confirmed_extension():
+    history = [
+        record(start=-10_000-index*10, end=-9_995-index*10, uid=f"archive-{index}", actual=True)
+        for index in range(1000)
+    ]
+    elapsed = record(start=-30, end=-20, uid="continuing", actual=True)
+    saved = {"history": [*history, elapsed], "pending": []}
+    # A reused provisional ID cannot recreate an already confirmed activity.
+    provisional = record(start=10, end=20, uid="archive-0")
+    future = record(start=20, end=30, uid="future")
+    state = update_calendar_history(saved, [provisional, future], NOW)
+    assert state["history"] == sorted(saved["history"], key=lambda item: item["start"])
+    assert state["pending"] == [future]
+
+    # Independent confirmation can extend the same phase beyond an archived
+    # estimate. No record count or age limit may discard the unrelated history.
+    extended = record(start=-30, end=10, uid="replanned", actual=True)
+    state = update_calendar_history(saved, [extended, future], NOW)
+    assert len(state["history"]) == 1000
+    assert {item["uid"] for item in state["history"]} == {item["uid"] for item in history}
+    assert state["pending"] == [extended, future]
+
+
 @pytest.mark.parametrize("invalid", [
     None, {}, [None], [{"start": 42}],
     [{**record(), "start": "invalid"}],
