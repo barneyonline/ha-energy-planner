@@ -458,6 +458,42 @@ def test_ev_calendar_includes_factual_readiness_and_physical_power():
     assert "not established" in calendar_module._ev_charging_events(action, 5)[0].description
 
 
+def test_fragmented_ev_calendar_bounds_presentation_work_without_stale_metadata(monkeypatch) -> None:
+    """A full-horizon schedule renders shared evidence once, with fresh reads."""
+    now = datetime(2026, 10, 31, tzinfo=UTC)
+    action = replace(
+        _action("fragmented", now, now + timedelta(minutes=5)),
+        kind=ActionKind.EV_SCHEDULE,
+        desired_state={
+            "target_soc_percent": 80,
+            "allocated_slots": [
+                {"valid_at": (now + timedelta(minutes=index * 5)).isoformat(), "charge_kw": 7 if index % 2 == 0 else 0}
+                for index in range(576)
+            ],
+        },
+    )
+    calls = []
+    original = calendar_module.plain_action
+
+    def presentation(value):
+        calls.append(value.action_id)
+        return original(value)
+
+    monkeypatch.setattr(calendar_module, "plain_action", presentation)
+    events = calendar_module._ev_charging_events(action, 5)
+    assert len(events) == 288
+    assert calls == ["fragmented"]
+    assert all("Target SOC: 80%" in event.description for event in events)
+    assert events[-1].start == now + timedelta(minutes=574 * 5)
+
+    action.desired_state["target_soc_percent"] = 90
+    action.reason_codes = ["history_max_daily_consumption"]
+    refreshed = calendar_module._ev_charging_events(action, 5)
+    assert calls == ["fragmented", "fragmented"]
+    assert all("Target SOC: 90%" in event.description for event in refreshed)
+    assert all("Trip history raised the EV target" in event.description for event in refreshed)
+
+
 def test_partial_ev_slot_calendar_uses_actual_duration_and_energy():
     now = datetime.now(UTC)
     action = _action("ev", now, now + timedelta(minutes=5))

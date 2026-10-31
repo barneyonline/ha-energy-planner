@@ -575,6 +575,24 @@ use throughout; the Docker and pull-request gates enforce that result.
   minimum/pinned HA 2026.10.0 and current stable. Documentation-only
   changes retain scoped quality checks. `scripts/docker-validate.sh` remains the
   complete local gate including minimum/pinned runtime contracts and package smoke.
+  CI pins Ubuntu 26.04 and Node 24 artifact uploads. Smoke runs export synthetic
+  console and classified warning evidence on success and failure; unexpected
+  warnings, errors and slow state writes fail the smoke gate. Its weather fixture
+  uses a deterministic real weather entity, and the thermostat has saved target
+  evidence. Pytest treats warnings as errors, with exact test-only exceptions for
+  two upstream Home Assistant HTTP/aiohttp messages. Codecov uploads the generated
+  coverage and test-result reports without automatic collection plugins or host
+  report searching. [Validation warnings](validation-warnings.md) records the
+  remaining upstream/environment ownership and removal criteria.
+  `scripts/report-smoke-warnings.py` and `tests/scripts/test_smoke_warnings.py`
+  verify exact known-message classification, new diagnostic rejection, failure
+  status preservation and export of only the synthetic console/report files.
+  Calendar/next-actions rendering bounds evidence traversal before conversion,
+  reuses common EV action presentation within one read and indexes archived
+  identifiers without shortening confirmed history. Regression tests in
+  `tests/test_calendar.py`, `tests/test_calendar_history.py` and
+  `tests/test_sensor.py` cover fragmented full-horizon schedules, metadata
+  freshness, retained history and discarded evidence branches.
   Coverage instruments branches, enforces exactly 100% statement coverage with
   `scripts/check_coverage.py`, and rejects per-module branch regressions against the reviewed baseline. The smoke test
   now verifies coordinator refresh, entity

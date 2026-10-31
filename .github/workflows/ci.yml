@@ -20,6 +20,7 @@ on:
       - "hacs.json"
       - "pyproject.toml"
       - "quality_scale.yaml"
+      - "codecov.yml"
       - ".github/workflows/ci.yml"
       - ".github/workflows/tests.yml"
       - ".github/workflows/quality-scale.yml"
