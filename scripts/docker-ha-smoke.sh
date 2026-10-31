@@ -485,7 +485,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
 
 class SmokeWeather(WeatherEntity):
-    """Supply the same bounded temperature regime as the legacy smoke sensor."""
+    """Keep the first tariff peak in a deterministic heating regime."""
 
     _attr_name = "Smoke weather forecast"
     _attr_unique_id = "smoke_weather_forecast"
@@ -498,9 +498,12 @@ class SmokeWeather(WeatherEntity):
     async def async_forecast_hourly(self):
         """Cover the planner horizon with timestamped hourly forecast points."""
         start = dt_util.utcnow().replace(minute=0, second=0, microsecond=0)
+        # The takeover assertion needs cold weather throughout the first price
+        # peak. A cyclic hourly series changes direction with wall-clock time
+        # and can defer takeover for hours despite healthy device feedback.
         return [
             {"datetime": (start + timedelta(hours=index)).isoformat(),
-             "native_temperature": float(17 + index % 6), "condition": "sunny"}
+             "native_temperature": 17.0, "condition": "sunny"}
             for index in range(73)
         ]
 PY

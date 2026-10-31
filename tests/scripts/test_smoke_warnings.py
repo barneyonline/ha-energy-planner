@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import asyncio
 import importlib.util
 import json
 import os
@@ -9,7 +11,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("smoke_warnings", ROOT / "scripts/report-smoke-warnings.py")
@@ -79,6 +83,26 @@ class SmokeWarningTests(unittest.TestCase):
             self.assertEqual(json.loads((root / "warnings.json").read_text())["records"], [])
 
 class SmokeEvidenceContractTests(unittest.TestCase):
+    def test_weather_forecast_keeps_initial_price_peak_in_heating_regime(self):
+        source = (ROOT / "scripts/docker-ha-smoke.sh").read_text()
+        weather = source.split(
+            'cat > "$TMP_DIR/custom_components/fake_planner_test/weather.py" <<\'PY\'\n', 1,
+        )[1].split("\nPY\n", 1)[0]
+        tree = ast.parse(weather)
+        entity = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+        forecast = next(node for node in entity.body if isinstance(node, ast.AsyncFunctionDef))
+        for minute in (0, 59):
+            now = datetime(2026, 10, 31, 5, minute, tzinfo=UTC)
+            namespace = {"dt_util": SimpleNamespace(utcnow=lambda now=now: now), "timedelta": timedelta}
+            exec(compile(ast.Module(body=[forecast], type_ignores=[]), "smoke weather", "exec"), namespace)
+            points = asyncio.run(namespace[forecast.name](None))
+            self.assertEqual(len(points), 73)
+            self.assertLessEqual(datetime.fromisoformat(points[0]["datetime"]), now)
+            self.assertGreater(datetime.fromisoformat(points[-1]["datetime"]), now + timedelta(hours=24))
+            # The smoke comfort lower bound is 18 C. Every forecast point in
+            # the first price peak must establish heat, irrespective of minute.
+            self.assertTrue(all(point["native_temperature"] < 18 for point in points))
+
     def test_docker_failure_preserves_status_and_exports_only_synthetic_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
