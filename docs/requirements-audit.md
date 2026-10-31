@@ -600,7 +600,7 @@ use throughout; the Docker and pull-request gates enforce that result.
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
   forecast snapshot training slots sourced from Home Assistant PV template
   attributes and the persisted built-in household-load model, Amber cent/kWh forecast attributes reflected in compact plan
-  previews, weather camelCase forecast attributes reflected in compact plan previews,
+  previews, official hourly Weather service forecasts reflected in compact plan previews,
   PV forecast calibration updated from a time-aligned observed-power entity,
   built-in load health/evidence stored without raw history, HVAC thermal-model state updated from Home Assistant climate and
   power entity samples, Recorder import metadata, and compact EV charge-rate
