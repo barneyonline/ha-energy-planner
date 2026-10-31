@@ -5,11 +5,14 @@ from __future__ import annotations
 import ast
 import asyncio
 import importlib.util
+import io
 import json
+import logging
 import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -27,6 +30,36 @@ def log(logger, message, level="WARNING"):
 
 
 class SmokeWarningTests(unittest.TestCase):
+    def test_default_worker_thread_diagnostics_fail_the_report(self):
+        stream = io.StringIO()
+        logger = logging.Logger("smoke_worker", level=logging.WARNING)
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)s (%(threadName)s) [%(name)s] %(message)s",
+        ))
+        logger.addHandler(handler)
+
+        def emit():
+            for level in (logging.WARNING, logging.ERROR, logging.CRITICAL):
+                logger.log(level, "Synthetic worker diagnostic")
+
+        worker = threading.Thread(target=emit)
+        worker.start()
+        worker.join()
+        self.assertIn("(emit)", worker.name)
+        records = REPORTER.collect_diagnostics(stream.getvalue())
+        self.assertEqual([item["level"] for item in records], ["WARNING", "ERROR", "CRITICAL"])
+        self.assertTrue(all(item["logger"] == "smoke_worker" and not item["expected"] for item in records))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            console = root / "console.log"
+            console.write_text(stream.getvalue())
+            self.assertFalse(REPORTER.report(console, root))
+            report = json.loads((root / "warnings.json").read_text())
+            self.assertEqual((report["expected"], report["unexpected"]), (0, 3))
+        handler.close()
+        stream.close()
+
     def test_known_upstream_notices_are_preserved(self):
         lines = [
             log("homeassistant.loader", REPORTER._LOADER_MESSAGE.format(domain=domain))

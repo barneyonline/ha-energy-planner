@@ -15,7 +15,9 @@ import re
 from pathlib import Path
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
-_LOG_RECORD = re.compile(r"\b(WARNING|ERROR|CRITICAL)\s+\([^)]*\)\s+\[([^]]+)]\s+(.*)")
+# Default Python worker names include the target, e.g. "Thread-1 (worker)".
+# Match the thread/logger separator rather than stopping at the first ')'.
+_LOG_RECORD = re.compile(r"\b(WARNING|ERROR|CRITICAL)\s+\(.*?\)\s+\[([^]]+)]\s+(.*)")
 _PYTHON_WARNING = re.compile(r"\b\w+Warning:")
 _LOADER_MESSAGE = (
     "We found a custom integration {domain} which has not been tested by Home Assistant. "
