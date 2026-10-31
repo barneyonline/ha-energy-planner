@@ -50,6 +50,8 @@
 # uploads, explicit Codecov reports and pinned Ubuntu runners keep CI tool
 # warnings actionable; docs/validation-warnings.md records exact upstream owners
 # and removal criteria. Statement, branch and typing gates remain unchanged.
+# Warning parser regression tests include real default Python worker-thread
+# names, whose nested parentheses must not hide warnings or errors.
 # Presentation work bounds: calendar.py, calendar_history.py and
 # plan_presentation.py avoid repeated expansion and discarded evidence traversal
 # without persistent caching or history expiry. tests/test_calendar.py,

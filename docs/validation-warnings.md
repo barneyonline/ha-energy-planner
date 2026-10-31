@@ -13,6 +13,8 @@ directory. CI uploads only the console and warning reports, rather than the
 temporary Home Assistant configuration or storage. Known upstream messages stay
 in the raw log. A new warning, an error, or a slow entity-state write fails the
 smoke gate and requires investigation.
+Records from default Python worker names such as `Thread-1 (worker)` are included;
+parentheses in a thread name do not bypass diagnostic classification.
 
 ## Repository fixes
 
