@@ -784,7 +784,7 @@ class Executor:
                         return "export_limit_target_changed"
                     return self._export_limit_rejection_reason(action, dt_util.utcnow())
                 result, reason, sent = await ExportLimitControl(
-                    self.hass, self.store, self.entry_data, recheck).execute(action, now)
+                    self.hass, self.store, self.entry_data, recheck, options=self.options).execute(action, now)
             if sent:
                 await self._async_record_command_attempt(action, now)
             if result != OutcomeResult.PENDING:
@@ -1911,7 +1911,7 @@ class Executor:
         export_result = None
         if restore_export and self.hass is not None and ownership.get(EXPORT_ASSET, {}).get("baseline"):
             export_result, export_reason, _sent = await ExportLimitControl(
-                self.hass, self.store, self.entry_data).restore(now)
+                self.hass, self.store, self.entry_data, options=self.options).restore(now)
             reasons.append(export_reason)
             if export_result == OutcomeResult.FAILED:
                 restore_failed = True
@@ -2017,6 +2017,10 @@ class Executor:
 
     def _rate_limit_reason(self, action: ControlAction, now: datetime) -> str | None:
         """Return a rejection reason when an action is inside the command cooldown."""
+        if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
+            # ExportLimitControl reserves a durable upstream identity budget,
+            # including restoration and observation of delayed confirmations.
+            return None
         cooldown_seconds = int(self.options.get(CONF_COMMAND_RATE_LIMIT_SECONDS, 0) or 0)
         if action.asset == ActionAsset.EV and action.desired_state.get("power_limit"):
             cooldown_seconds = max(cooldown_seconds, 60)

@@ -109,6 +109,7 @@ from .enphase_export_limit import ExportLimitControl
 from .enphase_export_limit import evidence as export_limit_evidence
 from .enphase_export_limit import feedback as export_limit_feedback
 from .enphase_export_limit import feedback_entity_id as export_limit_feedback_entity_id
+from .enphase_export_limit import target_identity as export_target_identity
 from .entry_data import combined_entry_data
 from .ev import ev_charging_state
 from .ev_adapter import EVChargerAdapter, EVCommandResult
@@ -116,6 +117,7 @@ from .ev_control import _ev_action_wants_power
 from .ev_runtime import audit_evidence
 from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
+from .export_limit_cooldown import cooldown_status
 from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .inputs import InputManager
@@ -1177,9 +1179,16 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._export_boundary_cancel()
             self._export_boundary_cancel = None
         blocks = evidence.get("blocks", [])
-        if not blocks:
+        deadlines = [block_time(blocks[0]["end"])] if blocks else []
+        eligible = evidence.get("next_eligible_change_at")
+        if evidence.get("deferred") and eligible:
+            # Input collection can cross eligibility after capturing deferred
+            # evidence. Keep the deadline: the clamped delay below queues one
+            # immediate refresh, whose fresh evidence ends this deferral.
+            deadlines.append(block_time(eligible))
+        if not deadlines:
             return
-        deadline = block_time(blocks[0]["end"])
+        deadline = min(deadlines)
 
         @callback
         def due(_now: Any) -> None:
@@ -1270,7 +1279,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     return
                 options = self.planner_options
                 now = dt_util.utcnow()
-                export_control = ExportLimitControl(self.hass, self.store, entry_data)
+                export_control = ExportLimitControl(self.hass, self.store, entry_data, options=options)
                 was_restoring = bool(export_control.state.get("restoring"))
                 await export_control.reconcile(now)
                 if getattr(self, "_tearing_down", False):
@@ -1406,9 +1415,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True:
                 context.export_limit.update(ready=False, reason="export_limit_control_disabled")
             if runtime.get("pause") or runtime.get("pending") or runtime.get("restoring"):
-                context.export_limit.update(ready=False, reason=runtime.get("pause") or "export_limit_pending")
+                context.export_limit.update(ready=False, reason=runtime.get("pause") or (
+                    "export_limit_pending" if runtime.get("pending") else "export_limit_restoration_pending"))
+            timing = cooldown_status(self.store.data, export_target_identity(
+                self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, "")), options, now)
+            context.export_limit.update(timing)
+            if timing.get("deferred"):
+                context.export_limit.update(ready=False, reason=(timing["cooldown_reason"]
+                    if context.export_limit.get("reason") in {None, "export_limit_restoration_pending"}
+                    else context.export_limit["reason"]))
             self._schedule_export_boundary(context.export_limit
-                if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True else {})
+                if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True or runtime.get("restoring") else {})
         elif getattr(self, "_export_boundary_cancel", None) is not None:
             self._schedule_export_boundary({})
         context.ev_evidence["load_recovery_completed"] = getattr(self, "_load_recovery_pending", False)
