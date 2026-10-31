@@ -52,6 +52,9 @@
 # and removal criteria. Statement, branch and typing gates remain unchanged.
 # Warning parser regression tests include real default Python worker-thread
 # names, whose nested parentheses must not hide warnings or errors.
+# Header-level classification rejects genuine standalone Python warnings while
+# ignoring quoted diagnostic text in DEBUG/INFO payloads; base and custom
+# warning categories are covered by tests/scripts/test_smoke_warnings.py.
 # Presentation work bounds: calendar.py, calendar_history.py and
 # plan_presentation.py avoid repeated expansion and discarded evidence traversal
 # without persistent caching or history expiry. tests/test_calendar.py,

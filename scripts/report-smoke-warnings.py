@@ -17,8 +17,14 @@ from pathlib import Path
 _ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Default Python worker names include the target, e.g. "Thread-1 (worker)".
 # Match the thread/logger separator rather than stopping at the first ')'.
-_LOG_RECORD = re.compile(r"\b(WARNING|ERROR|CRITICAL)\s+\(.*?\)\s+\[([^]]+)]\s+(.*)")
-_PYTHON_WARNING = re.compile(r"\b\w+Warning:")
+_LOG_RECORD = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?\s+)?"
+    r"(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\(.*?\)\s+\[([^]]+)]\s+(.*)"
+)
+# Python's formatted warnings use filename:line:category, including categories
+# named Warning or custom names without a Warning suffix. Interpreter shutdown
+# diagnostics can also print a bare Warning/RuntimeWarning/etc. header.
+_PYTHON_WARNING = re.compile(r"^(?:\S.*:\d+:\s+\w+:|\w*Warning:)")
 _LOADER_MESSAGE = (
     "We found a custom integration {domain} which has not been tested by Home Assistant. "
     "This component might cause stability problems, be sure to disable it if you experience issues with Home Assistant"
@@ -51,14 +57,16 @@ def collect_diagnostics(console: str) -> list[dict[str, str | int | bool]]:
     records = []
     for line_number, raw in enumerate(console.splitlines(), 1):
         line = _ANSI.sub("", raw)
-        matched = _LOG_RECORD.search(line)
+        matched = _LOG_RECORD.match(line)
         if matched is None:
             # Do not lose Python diagnostics printed outside HA's logging bridge.
-            if not _PYTHON_WARNING.search(line):
+            if not _PYTHON_WARNING.match(line):
                 continue
             level, logger, message = "WARNING", "python", line
         else:
             level, logger, message = matched.groups()
+            if level not in {"WARNING", "ERROR", "CRITICAL"}:
+                continue
         known = known_warning(logger, message) if level == "WARNING" else None
         records.append({
             "line": line_number,
