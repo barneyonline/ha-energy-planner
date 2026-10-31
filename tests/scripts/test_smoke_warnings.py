@@ -91,6 +91,15 @@ class SmokeEvidenceContractTests(unittest.TestCase):
         tree = ast.parse(weather)
         entity = next(node for node in tree.body if isinstance(node, ast.ClassDef))
         forecast = next(node for node in entity.body if isinstance(node, ast.AsyncFunctionDef))
+        assertions = ast.parse(source.split('python3 - <<\'PY\' "$TMP_DIR"\n', 1)[1].split("\nPY\n", 1)[0])
+        preview_index = next(index for index, node in enumerate(assertions.body) if (
+            isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "weather_preview" for target in node.targets
+            )
+        ))
+        preview_check = compile(ast.Module(
+            body=assertions.body[preview_index:preview_index + 2], type_ignores=[],
+        ), "smoke weather storage assertion", "exec")
         for minute in (0, 59):
             now = datetime(2026, 10, 31, 5, minute, tzinfo=UTC)
             namespace = {"dt_util": SimpleNamespace(utcnow=lambda now=now: now), "timedelta": timedelta}
@@ -102,6 +111,18 @@ class SmokeEvidenceContractTests(unittest.TestCase):
             # The smoke comfort lower bound is 18 C. Every forecast point in
             # the first price peak must establish heat, irrespective of minute.
             self.assertTrue(all(point["native_temperature"] < 18 for point in points))
+            # Run the actual final smoke consumer assertion against provider
+            # output, so changing the provider cannot leave stale expectations.
+            preview = [{"outdoor_temperature_forecast_c": point["native_temperature"]} for point in points[:4]]
+            exec(preview_check, {"latest_snapshot": {"preview": preview}})
+            for invalid in (
+                [{"outdoor_temperature_forecast_c": 21.0}] * 4,  # Current-state fallback is not hourly evidence.
+                preview[:3], [], [{}] * 4,
+            ):
+                with self.subTest(minute=minute, invalid=invalid), self.assertRaisesRegex(
+                    SystemExit, "hourly Weather service forecast",
+                ):
+                    exec(preview_check, {"latest_snapshot": {"preview": invalid}})
 
     def test_docker_failure_preserves_status_and_exports_only_synthetic_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

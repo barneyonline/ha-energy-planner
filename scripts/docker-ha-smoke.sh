@@ -1655,8 +1655,8 @@ if not any(
 ):
     raise SystemExit("Forecast preview did not use HA template Amber price forecast attributes")
 weather_preview = [slot.get("outdoor_temperature_forecast_c") for slot in latest_snapshot.get("preview", [])[:4]]
-if weather_preview != [17.0, 18.0, 19.0, 20.0]:
-    raise SystemExit(f"Forecast preview did not use HA template weather forecast attributes: {weather_preview}")
+if weather_preview != [17.0] * 4:
+    raise SystemExit(f"Forecast preview did not use the hourly Weather service forecast: {weather_preview}")
 if "forecast_calibration" not in latest_snapshot:
     raise SystemExit("Forecast snapshot did not include calibration metadata")
 load_forecast = latest_snapshot.get("built_in_load_forecast", {})
