@@ -116,8 +116,6 @@ Configured through the Home Assistant UI. No separate vendor credentials or thir
 
 [Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
 
-The Platinum quality-scale claim is a repository self-assessment. This custom integration is not reviewed, security audited, maintained or supported by the Home Assistant project.
-
 ---
 
 [![Tests](https://img.shields.io/github/actions/workflow/status/barneyonline/ha-energy-planner/tests.yml?branch=main&label=tests)](https://github.com/barneyonline/ha-energy-planner/actions/workflows/tests.yml)
