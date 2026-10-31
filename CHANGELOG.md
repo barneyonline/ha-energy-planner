@@ -21,7 +21,7 @@
 
 ### 🔄 Other changes
 
-- Refresh the README with wiki-matched light and dark banners, fresh Home Assistant screenshots in both themes, concise features, a compact expandable gallery, a direct HACS link and visible footer badges. Preserve detailed operating notes in the linked planning and control guide.
+- Refresh the README with Planning Hub light and dark banners, matching social artwork and a renderer for all 18 wiki banners, fresh Home Assistant screenshots in both themes, concise features, a compact expandable gallery, a direct HACS link and visible footer badges. Preserve detailed operating notes in the linked planning and control guide.
 
 ## 1.4.9 - 2026-10-31
 
