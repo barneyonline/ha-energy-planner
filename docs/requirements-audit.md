@@ -9,7 +9,16 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
-- The README presents concise features before a compact light/dark screenshot gallery, links directly to this repository in HACS, and keeps project badges visible outside expandable sections. `docs/planning-and-control.md` preserves the previous README's detailed behavior, compatibility requirements and safety limits, with corrected relative links. `docs/images/README.md` records the wiki-derived banner artwork, screenshot provenance, theme handling and capture limits. This is a documentation change; runtime behavior, configuration and quality-scale claims are unchanged. Full validation remains `scripts/docker-validate.sh`.
+- The approved Planning Hub artwork supplies a 1280 × 640 social preview,
+  light/dark 1200 × 400 README banners and 18 page-specific wiki banners.
+  `scripts/generate-doc-banners.cjs` renders editable SVG headings over shared
+  artwork and checks text widths before PNG export; `docs/images/README.md`
+  records provenance, regeneration and the separate social-preview upload.
+  The imagery is conceptual, with no measured forecast or savings claim.
+  This changes documentation presentation only. Full validation remains
+  `scripts/docker-validate.sh`.
+
+- The README presents concise features before a compact light/dark screenshot gallery, links directly to this repository in HACS, and keeps project badges visible outside expandable sections. `docs/planning-and-control.md` preserves the previous README's detailed behavior, compatibility requirements and safety limits, with corrected relative links. `docs/images/README.md` records the shared Planning Hub banner artwork, screenshot provenance, theme handling and capture limits. This is a documentation change; runtime behavior, configuration and quality-scale claims are unchanged. Full validation remains `scripts/docker-validate.sh`.
 
 - UI-only configuration is declared by `CONFIG_SCHEMA` delegating to `cv.config_entry_only_config_schema(DOMAIN)` in `__init__.py`, as required by hassfest for integrations with `async_setup`. The helper is imported when validation runs so standalone planner tools remain usable without Home Assistant installed. `tests/test_ha_runtime.py` covers normal configuration and unsupported domain YAML. Integration services remain registered in `async_setup`; service tests and the Docker smoke gate cover service registration.
 
