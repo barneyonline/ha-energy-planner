@@ -15,6 +15,9 @@ in the raw log. A new warning, an error, or a slow entity-state write fails the
 smoke gate and requires investigation.
 Records from default Python worker names such as `Thread-1 (worker)` are included;
 parentheses in a thread name do not bypass diagnostic classification.
+The record header determines its severity: quoted diagnostic text inside DEBUG
+or INFO messages does not become a warning. Standalone Python warning headers
+are retained, including the base `Warning` category and custom category names.
 
 ## Repository fixes
 

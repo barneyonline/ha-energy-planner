@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +31,48 @@ def log(logger, message, level="WARNING"):
 
 
 class SmokeWarningTests(unittest.TestCase):
+    def test_low_severity_payloads_cannot_be_promoted_to_diagnostics(self):
+        harmless = [
+            log("example", "Captured RuntimeWarning: example text", "DEBUG"),
+            log("example", "Example: WARNING (MainThread) [example] sample", "INFO"),
+            log("example", "Example: worker.py:12: Warning: sample", "DEBUG"),
+            "Example: WARNING (MainThread) [example] sample",
+        ]
+        self.assertEqual(REPORTER.collect_diagnostics("\n".join(harmless)), [])
+        records = REPORTER.collect_diagnostics("\n".join([
+            *harmless, log("example", "A genuine warning"),
+        ]))
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["message"], "A genuine warning")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            console = root / "console.log"
+            console.write_text("\n".join(harmless))
+            self.assertTrue(REPORTER.report(console, root))
+
+    def test_standalone_python_warnings_keep_base_and_custom_categories(self):
+        class Advisory(Warning):
+            pass
+
+        for category in (Warning, UserWarning, RuntimeWarning, DeprecationWarning, Advisory):
+            for filename in ("worker.py", "<stdin>", r"C:\source\worker.py"):
+                with self.subTest(category=category.__name__, filename=filename):
+                    message = warnings.formatwarning("Synthetic diagnostic", category, filename, 12)
+                    records = REPORTER.collect_diagnostics(message)
+                    self.assertEqual(len(records), 1)
+                    self.assertEqual(records[0]["message"], message.rstrip())
+                    self.assertFalse(records[0]["expected"])
+        for message in ("Warning: Synthetic diagnostic", "RuntimeWarning: Synthetic diagnostic"):
+            with self.subTest(message=message):
+                records = REPORTER.collect_diagnostics(message)
+                self.assertEqual(len(records), 1)
+                self.assertFalse(records[0]["expected"])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            console = root / "console.log"
+            console.write_text(warnings.formatwarning("Synthetic diagnostic", Warning, "worker.py", 12))
+            self.assertFalse(REPORTER.report(console, root))
+
     def test_default_worker_thread_diagnostics_fail_the_report(self):
         stream = io.StringIO()
         logger = logging.Logger("smoke_worker", level=logging.WARNING)
