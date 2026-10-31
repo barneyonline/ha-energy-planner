@@ -1,7 +1,7 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-banner-light.svg">
-  <img src="docs/images/readme-banner-light.svg" alt="Energy Planner — Plan locally. Review clearly. Control with confidence." width="1280">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-banner-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-banner-light.png">
+  <img src="docs/images/readme-banner-light.png" alt="Energy Planner — Smart energy planning for Home Assistant. A glass planning calendar connects solar, batteries, EV charging and climate to a solar home." width="1200">
 </picture>
 
 <p align="center">

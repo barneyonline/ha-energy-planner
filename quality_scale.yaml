@@ -60,7 +60,7 @@
 # without persistent caching or history expiry. tests/test_calendar.py,
 # tests/test_calendar_history.py and tests/test_sensor.py cover freshness,
 # full-horizon fragmentation, large retained history and bounded conversion.
-# README presentation: README.md provides concise features, themed image pairs, a direct HACS link and visible footer badges. docs/planning-and-control.md preserves its detailed operating and compatibility guidance; docs/images/README.md records artwork and capture provenance. Runtime behavior and the self-assessed quality level are unchanged; scripts/docker-validate.sh remains the full gate.
+# README presentation: README.md provides concise features, themed image pairs, a direct HACS link and visible footer badges. docs/planning-and-control.md preserves its detailed operating and compatibility guidance; docs/images/README.md records the approved Planning Hub artwork, 18 wiki banners, social-preview upload and screenshot provenance. scripts/generate-doc-banners.cjs checks heading widths and exports themed PNG banners. Runtime behavior and the self-assessed quality level are unchanged; scripts/docker-validate.sh remains the full gate.
 levels:
   bronze:
     required:
