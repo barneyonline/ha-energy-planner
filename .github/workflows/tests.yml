@@ -24,9 +24,6 @@ on:
     - cron: "0 3 * * 1"
   workflow_dispatch:
   workflow_call:
-    secrets:
-      CODECOV_TOKEN:
-        required: false
 
 permissions:
   contents: read
@@ -47,6 +44,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Select checks for this change set
         id: select
@@ -69,10 +67,10 @@ jobs:
     runs-on: ubuntu-26.04
     permissions:
       contents: read
-      checks: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Run tests with coverage in Home Assistant Docker
         id: pytest
         continue-on-error: true
@@ -132,24 +130,6 @@ jobs:
             coverage.xml
             junit.xml
             coverage.json
-      - name: Upload coverage to Codecov
-        if: ${{ always() && hashFiles('coverage.xml') != '' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./coverage.xml
-          plugins: noop
-          disable_search: true
-          fail_ci_if_error: true
-      - name: Upload test results to Codecov
-        if: ${{ always() && hashFiles('junit.xml') != '' && (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) }}
-        uses: codecov/codecov-action@v6
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: ./junit.xml
-          plugins: noop
-          disable_search: true
-          report_type: test_results
       - name: Fail if tests failed
         if: ${{ steps.pytest.outcome == 'failure' }}
         run: exit 1
@@ -164,6 +144,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Validate quality scale evidence in Home Assistant Docker
         run: >
           docker run --rm
@@ -189,6 +171,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Run lint, fixture, and Home Assistant config validation
         env:
           HEP_SKIP_HA_SMOKE: "1"
@@ -206,6 +190,8 @@ jobs:
         version: ${{ fromJSON(needs.changes.outputs.ha_matrix) }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Refresh runtime image
         run: docker pull ghcr.io/home-assistant/home-assistant:${{ matrix.version }}
       - name: Test Home Assistant runtime contracts
@@ -234,6 +220,8 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Build deterministic release artifact
         run: python3 scripts/package-release.py
       - name: Record release validation environment
