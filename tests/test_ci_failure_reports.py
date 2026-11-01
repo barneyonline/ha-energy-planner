@@ -1,9 +1,9 @@
 """Execute the actual producer program with deterministic process boundaries."""
 
 import os
-from pathlib import Path
 import shlex
 import subprocess
+from pathlib import Path
 
 import pytest
 import yaml
