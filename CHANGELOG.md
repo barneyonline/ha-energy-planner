@@ -8,7 +8,29 @@
 
 ### ✨ New features
 
-- Add opt-in synchronized AirBase preconditioning from Off when fresh vendor readback proves complete heating/cooling head and zone memories. Persist immutable mode-aware restoration and separate attempt snapshots before writes; restore the changed mode before the original remembered mode and Off power. Unsupported or incomplete capability stays blocked, and interrupted restoration retains evidence for bounded operator recovery without repeated mode cycling.
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.10 - 2026-11-01
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- Add opt-in synchronized AirBase preconditioning from Off when fresh vendor readback proves complete heating/cooling head and zone memories. Disabled by default; enable **Allow safe Off starts (AirBase)** in Climate policy settings after upgrading. Persist immutable mode-aware restoration and separate attempt snapshots before writes; restore the changed mode before the original remembered mode and Off power. Unsupported or incomplete capability stays blocked, and interrupted restoration retains evidence for bounded operator recovery without repeated mode cycling.
 
 ### 🐛 Bug fixes
 
@@ -16,6 +38,7 @@
 
 ### 🔧 Improvements
 
+- Declare the config-entry-only schema to resolve the hassfest warning, follow the latest hassfest image explicitly, and classify Energy Planner in the Energy Marketplace category.
 - Retain smoke console and warning reports on success and failure, reject unexpected validation warnings, and use deterministic weather and restored thermostat fixtures. Update CI artifact uploads to Node 24, pin the Ubuntu runner, and upload generated Codecov reports without unrelated collection probes. Document remaining upstream and environment notices without disabling verification or weakening typing and coverage checks.
 - Reduce calendar and next-actions rendering work for fragmented EV schedules and large action evidence. Share action details within each calendar read, avoid traversing evidence that will be omitted, and reduce repeated history comparisons while preserving fresh state and all confirmed history.
 
