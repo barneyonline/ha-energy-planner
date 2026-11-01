@@ -21,7 +21,7 @@
 
 ### 🔄 Other changes
 
-- Add repository controls and templates for HAL-managed issue investigation, complete PR-feedback review, and verified bug-release delivery.
+- Add repository controls and templates for HAL-managed issue investigation, complete PR-feedback review, and verified bug-release delivery. Bind final independent handling verdicts to settled checks in separate PR conversation comments.
 - Refresh the README with Planning Hub light and dark banners, matching social artwork and a renderer for all 18 wiki banners, fresh Home Assistant screenshots in both themes, concise features, a compact expandable gallery, a direct HACS link and visible footer badges. Preserve detailed operating notes in the linked planning and control guide.
 
 ## 1.4.9 - 2026-10-31
