@@ -1147,6 +1147,64 @@ def test_manual_head_release_confirms_owned_inactive_zone_memory_without_wake(sy
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("readback", ["unavailable", "other_controller"])
+def test_manual_head_release_retains_zone_evidence_without_matching_fresh_readback(system, readback):
+    s = system
+
+    async def run():
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        memory = s.adapter.main_takeover_snapshot()[MEMORY_KEY]
+        zones = s.adapter.takeover_snapshot()[1]
+        identity = {key: memory[key] for key in ("entry_id", "controller_fingerprint")}
+        if readback == "unavailable":
+
+            async def timeout(*args, **kwargs):
+                raise TimeoutError("synthetic unavailable vendor readback")
+
+            s.entry.runtime_data.device.update_status = timeout
+        else:
+            identity["controller_fingerprint"] = "previous-controller"
+        restore = DaikinHVACAdapter(s.hass, s.data)
+        restore.set_zone_control_context(
+            {},
+            {"off_start_control_data": memory["control_data"], "off_start_identity": identity},
+        )
+        result = await restore.async_restore({}, zones)
+        assert not result.applied
+        assert result.saved_zone_states == zones
+        assert not s.hass.services.calls
+        assert s.hass.states.get("climate.head").state == "off"
+
+    asyncio.run(run())
+
+
+def test_off_start_rollback_reopens_a_safe_owned_airflow_path_before_restoring_memories(system):
+    s = system
+
+    async def run():
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        main, zones = s.adapter.main_takeover_snapshot(), s.adapter.takeover_snapshot()[1]
+        original = deepcopy(s.modes)
+        assert (await s.adapter.async_execute(_action(s.desired))).applied
+        await s.adapter._async_apply_hvac_state("climate.head", {"hvac_mode": "off"})
+        s.hass.states.values[MAIN] = "off"
+        s.hass.states.values[BED] = "off"
+        s.publish()
+        s.hass.services.calls.clear()
+
+        result = await DaikinHVACAdapter(s.hass, s.data).async_restore({}, zones, main)
+
+        assert result.applied, result
+        assert s.modes == original
+        assert s.hass.states.get("climate.head").state == "off"
+        assert s.hass.states.get(MAIN).state == "on"
+        assert s.hass.states.get(BED).state == "off"
+        opened = [payload["entity_id"] for _, service, payload in s.hass.services.calls if service == "turn_on"]
+        assert opened == [MAIN]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("missing", ["power", "path", "shutdown"])
 def test_restoration_retains_evidence_when_safe_airflow_cannot_be_established(system, missing):
     s = system
