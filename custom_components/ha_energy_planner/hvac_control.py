@@ -55,6 +55,17 @@ def copy_pending_confirmation(control: dict[str, Any], current: Any) -> None:
         control["command_confirmation"] = deepcopy(record)
 
 
+def copy_off_start_recovery(control: dict[str, Any], current: Any) -> None:
+    """Never erase a durably started recovery when an outer exception retains ownership."""
+    saved = control.get("main_state")
+    latest = current.get("main_state") if isinstance(current, dict) else None
+    if (isinstance(saved, dict) and isinstance(latest, dict) and saved.get("off_start_memory")
+            and saved["off_start_memory"] == latest.get("off_start_memory")
+            and latest.get("off_start_restore_attempted")):
+        control["main_state"] = {**saved, "off_start_restore_attempted": True,
+                                 **{key: latest[key] for key in ("zone_recovery_blocker",) if key in latest}}
+
+
 def _zone_intent_pause_times(
     desired: dict[str, Any], previous: dict[str, Any], confirmed_at: datetime | None = None,
 ) -> dict[str, Any]:
@@ -117,6 +128,14 @@ class HVACOwnershipTransaction:
                 provisional_zone_states.setdefault(entity_id, state)
         provisional_hvac_control["zone_states"] = provisional_zone_states
         provisional_hvac_control.pop("main_state_committed", None)
+        if main_snapshot.get("off_start_memory"):
+            provisional_hvac_control.setdefault(
+                "off_start_control_data", deepcopy(main_snapshot["off_start_memory"]["control_data"]))
+            provisional_hvac_control.setdefault("off_start_identity", {
+                key: main_snapshot["off_start_memory"][key] for key in ("entry_id", "controller_fingerprint")})
+            provisional_hvac_control["attempt_snapshot"] = {
+                "main_state": deepcopy(main_snapshot), "zone_states": deepcopy(zone_snapshot),
+            }
         if main_snapshot:
             provisional_hvac_control.setdefault(_HVAC_MAIN_STATE_OWNERSHIP_KEY, main_snapshot)
         for key in HVAC_LIFECYCLE_FIELDS:
@@ -175,6 +194,11 @@ class HVACOwnershipTransaction:
                 if saved_states:
                     ownership_data["climate_automations"] = saved_states
                 hvac_control = dict(ownership_data.get("hvac_control", {})) if self.had_ownership else {}
+                if current.get("hvac_control", {}).get("off_start_control_data"):
+                    hvac_control.setdefault("off_start_control_data", deepcopy(
+                        current["hvac_control"]["off_start_control_data"]))
+                    hvac_control.setdefault("off_start_identity", deepcopy(
+                        current["hvac_control"]["off_start_identity"]))
                 if main_state_superseded:
                     hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
                 zone_states = dict(hvac_control.get("zone_states", {})) if self.had_ownership else {}
@@ -199,17 +223,21 @@ class HVACOwnershipTransaction:
                         "target_temp_high",
                         "rollback_active_hvac_mode",
                         "rollback_hvac_mode_changed",
+                        "off_start_memory",
                     )
                     if all(original_main_state.get(key) == unresolved_main_state.get(key) for key in baseline_keys):
                         hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = {
                             **original_main_state,
                             **{
                                 key: unresolved_main_state[key]
-                                for key in ("zone_recovery_attempted", "recovery_version", "zone_recovery_blocker")
+                                for key in ("zone_recovery_attempted", "recovery_version", "zone_recovery_blocker",
+                                            "off_start_restore_attempted")
                                 if key in unresolved_main_state
                             },
                         }
                 hvac_control.pop("main_state_committed", None)
+                if current.get("hvac_control", {}).get("attempt_snapshot"):
+                    hvac_control["attempt_snapshot"] = deepcopy(current["hvac_control"]["attempt_snapshot"])
                 hvac_control["required_evidence_lost"] = "hvac_acquisition_rollback_failed"
                 copy_pending_confirmation(hvac_control, current.get("hvac_control"))
                 ownership_data["hvac_control"] = hvac_control
@@ -221,6 +249,7 @@ class HVACOwnershipTransaction:
                 saved_automations.setdefault(entity_id, state)
             ownership_data["climate_automations"] = saved_automations
             hvac_control = dict(ownership_data.get("hvac_control", {}))
+            hvac_control.pop("attempt_snapshot", None)
             if desired.get("phase") == "preconditioning":
                 hvac_control["preconditioning_confirmed"] = True
                 if (not hvac_control.get("preconditioning_started_at")

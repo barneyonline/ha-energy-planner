@@ -101,6 +101,7 @@ CONF_HVAC_THERMAL_LEARNING_ENABLED = "hvac_thermal_learning_enabled"
 CONF_HVAC_PRECONDITION_MAX_LEAD_MINUTES = "hvac_precondition_max_lead_minutes"
 CONF_HVAC_PRECONDITION_LEAD_MINUTES = "hvac_precondition_lead_minutes"
 CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA = "hvac_precondition_min_price_delta"
+CONF_HVAC_SAFE_OFF_START = "hvac_safe_off_start"
 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY = "hvac_precondition_configured_zones_only"
 CONF_HVAC_PRECONDITION_WHILE_AWAY = "hvac_precondition_while_away"
 CONF_HVAC_POLICY = "hvac_decision_policy"
@@ -177,6 +178,7 @@ DEFAULT_OPTIONS = {
     CONF_HVAC_THERMAL_LEARNING_ENABLED: True,
     CONF_HVAC_PRECONDITION_MIN_PRICE_DELTA: 0.20,
     CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False,
+    CONF_HVAC_SAFE_OFF_START: False,
     CONF_HVAC_PRECONDITION_WHILE_AWAY: False,
     CONF_HVAC_POLICY: "automatic",
     CONF_HVAC_PRECONDITIONING_MODE: "automatic",

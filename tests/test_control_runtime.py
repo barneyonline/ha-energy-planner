@@ -21,6 +21,7 @@ from custom_components.ha_energy_planner import _rehydrate_ev_grid_reservation, 
 from custom_components.ha_energy_planner.config_flow import INPUT_STEP_CLIMATE, OptionsFlow
 from custom_components.ha_energy_planner.const import (
     CONF_CLIMATE_AUTOMATIONS,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
     CONF_ENPHASE_AI_PROFILE,
@@ -1646,6 +1647,379 @@ def test_owned_release_recalls_disabled_zone_without_manual_override(tmp_path, m
                     item["context_id"] != captured[0]["context_id"]
                     for item in coordinator.executor.hvac_feedback_commands)
         finally:
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("entity", ["climate.home", "climate.bedrooms"])
+def test_off_start_owned_mapping_keeps_manual_feedback_after_reconfiguration(tmp_path, monkeypatch, entity):
+    """Old equipment stays observed until its captured restoration is released."""
+    from unittest.mock import AsyncMock
+
+    from custom_components.ha_energy_planner.daikin_memory import CONTROL_KEYS, MEMORY_KEY
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        hass.states.async_set("climate.home", "cool", {"temperature": 17})
+        hass.states.async_set("climate.bedrooms", "cool", {"temperature": 19})
+        hass.states.async_set("switch.zone", "on")
+        hass.states.async_set("switch.other", "off")
+        hass.states.async_set("climate.other", "off", {"temperature": None})
+        hass.states.async_set("climate.replacement", "off", {"temperature": 25})
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "owned-mapping")
+        configured = _executor(hass, store)
+        old_data = {
+            **configured.entry_data,
+            CONF_DAIKIN_CLIMATE: "climate.home",
+            CONF_CLIMATE_ZONES: ["switch.zone", "switch.other", "climate.bedrooms", "climate.other"],
+            "hvac_zone_control": {
+                "pairs": {"switch.zone": "climate.bedrooms", "switch.other": "climate.other"},
+                "safe_open_sets": [["switch.zone", "switch.other"], ["switch.zone"]],
+            },
+        }
+        new_data = {**configured.entry_data, CONF_DAIKIN_CLIMATE: "climate.replacement", CONF_CLIMATE_ZONES: []}
+        entry = ConfigEntry(
+            domain=DOMAIN,
+            title="Owned Off memory",
+            data=new_data,
+            options=configured.options,
+            source="user",
+            unique_id=None,
+            version=5,
+            minor_version=1,
+            discovery_keys=MappingProxyType({}),
+            subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        main = {
+            "hvac_mode": "off",
+            "target_temperature": 19,
+            MEMORY_KEY: {"version": 1, "control_data": {key: old_data.get(key) for key in CONTROL_KEYS}},
+        }
+        await store.async_save_ownership(
+            {
+                "hvac_control": {
+                    "main_state": main,
+                    "zone_states": {"switch.zone": "on", "climate.bedrooms": {"target_temperature": 24}},
+                }
+            }
+        )
+        manual = AsyncMock()
+        monkeypatch.setattr(coordinator, "_async_handle_manual_hvac_change", manual)
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        coordinator.executor.pending_hvac_desired_state = {
+            "restore_main": main,
+            "restore_zones": {"switch.zone": "on", "climate.bedrooms": {"target_temperature": 24}},
+        }
+        try:
+            hass.states.async_set(entity, "cool", {"temperature": 22}, context=Context(user_id="operator"))
+            await hass.async_block_till_done()
+            main_changed = entity == "climate.home"
+            if main_changed:
+                manual.assert_awaited_once_with("daikin_state_changed", preserve_main_state=True)
+            else:
+                manual.assert_awaited_once_with("climate_zone_changed", preserve_zone_entity_id=entity)
+            if not main_changed:
+                assert set(coordinator.executor.pending_hvac_desired_state["manual_zone_entity_ids"]) == {
+                    "switch.zone",
+                    "climate.bedrooms",
+                }
+        finally:
+            coordinator.executor.pending_hvac_desired_state = None
+            await coordinator.async_shutdown()
+            await hass.async_stop(force=True)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("intervention", [
+    "none", "head", "zone", "release_head", "release_zone", "read_head", "read_zone", "flush_head", "flush_zone",
+    "read_match", "flush_match",
+    "read_helper", "flush_helper", "read_expired", "flush_expired", "read_disarm", "flush_disarm",
+])
+def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatch, intervention):
+    """Full HA event path: a damper wakes Dry, then cooling and Dry null aliases."""
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+    from urllib.parse import unquote
+
+    from test_constraints import _plan
+    from test_hvac_adapter import _action
+    from test_zone_control import BED_CLIMATE, MAIN, MAIN_CLIMATE, PAIRS, data, room_context
+
+    from custom_components.ha_energy_planner import daikin_memory, zone_control
+    from custom_components.ha_energy_planner.zone_control import desired_fields
+
+    monkeypatch.setattr("custom_components.ha_energy_planner.hvac_adapter._STATE_CONFIRMATION_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr("custom_components.ha_energy_planner.hvac_adapter._STATE_RECONCILIATION_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr("custom_components.ha_energy_planner.hvac_adapter._STATE_CONFIRMATION_POLL_SECONDS", 0.001)
+
+    async def run():
+        hass = HomeAssistant(str(tmp_path))
+        _devices(hass)
+        source = json.loads(
+            (Path(__file__).parent / "fixtures/hvac/airbase_off_dry_memory_2026_10_31.json").read_text()
+        )
+        control, model, zones = (deepcopy(source[key]) for key in ("control", "model", "zones"))
+        zones = {key: unquote(value).split(";") for key, value in zones.items()}
+
+        class Values:
+            def values_for_resource(self, resource):
+                return (
+                    control
+                    if resource.endswith("get_control_info")
+                    else model
+                    if resource.endswith("get_model_info")
+                    else {key: ";".join(value) for key, value in zones.items()}
+                )
+
+        async def intervene(phase):
+            nonlocal injected
+            if not injected and intervention in {f"{phase}_head", f"{phase}_match"}:
+                injected = True
+                target = 21 if intervention.endswith("match") else 20
+                control["stemp"] = str(target)
+                head = hass.states.get("climate.head")
+                hass.states.async_set(
+                    "climate.head", "off", {**head.attributes, "temperature": target},
+                    context=Context(user_id="operator"),
+                )
+            elif not injected and intervention == f"{phase}_zone":
+                injected = True
+                zones["zone_onoff"][0] = "0"
+                hass.states.async_set(MAIN, "off", context=Context(user_id="operator"))
+            elif not injected and intervention == f"{phase}_helper":
+                injected = True
+                hass.states.async_set("input_boolean.operator_hold", "on", context=Context(user_id="operator"))
+            elif not injected and intervention == f"{phase}_expired":
+                injected = True
+                monkeypatch.setattr(dt_util, "utcnow", lambda: c.created_at + timedelta(seconds=2))
+            elif not injected and intervention == f"{phase}_disarm":
+                injected = True
+                store.data["production"]["armed"] = False
+            await hass.async_block_till_done()
+
+        async def update(*args, **kwargs):
+            await intervene("read")
+
+        vendor = SimpleNamespace(values=Values(), update_status=update, mac="controller")
+        config = {**data(), CONF_CLIMATE_AUTOMATIONS: "automation.climate",
+                  CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.operator_hold"}
+        hass.states.async_set("input_boolean.operator_hold", "off")
+        monkeypatch.setattr(
+            daikin_memory, "provider", lambda *args: (vendor, {MAIN_CLIMATE: 0, BED_CLIMATE: 1}, "core-daikin")
+        )
+        monkeypatch.setattr(daikin_memory, "read_topology", lambda *args: zone_control.topology(config))
+        monkeypatch.setattr(zone_control, "read_topology", lambda *args: zone_control.topology(config))
+
+        def publish():
+            mode = {"1": "heat", "2": "cool", "7": "dry"}[control["mode"]] if control["pow"] == "1" else "off"
+            target = float(control["stemp"])
+            hass.states.async_set(
+                "climate.head",
+                mode,
+                {
+                    "temperature": target,
+                    "min_temp": 16,
+                    "max_temp": 32,
+                    "target_temp_step": 1,
+                    "hvac_modes": ["off", "heat", "cool", "dry"],
+                },
+            )
+            for index, (actuator, entity) in enumerate(PAIRS.items()):
+                power = zones["zone_onoff"][index]
+                hass.states.async_set(actuator, "on" if power == "1" else "off")
+                value = (
+                    float(zones["lztemp_h" if mode == "heat" else "lztemp_c"][index])
+                    if mode in {"heat", "cool"}
+                    else None
+                )
+                hass.states.async_set(
+                    entity,
+                    mode if power == "1" else "off",
+                    {"temperature": value, "min_temp": target - 2, "max_temp": target + 2, "target_temp_step": 1},
+                )
+
+        publish()
+        for entity in ("sensor.living", "sensor.bed"):
+            hass.states.async_set(entity, 25, {"unit_of_measurement": "°C"})
+        hass.states.async_set("input_number.low", 21)
+        hass.states.async_set("input_number.high", 24)
+        hass.state = CoreState.running
+        store = PlannerStore(hass, "off-dry-runtime")
+        entry = ConfigEntry(
+            domain=DOMAIN,
+            title="Off Dry readback",
+            data=config,
+            options={**DEFAULT_OPTIONS, "dry_run": False, "climate_control_enabled": True, "hvac_safe_off_start": True},
+            source="user",
+            unique_id=None,
+            version=5,
+            minor_version=1,
+            discovery_keys=MappingProxyType({}),
+            subentries_data=[],
+        )
+        coordinator = EnergyPlannerCoordinator(hass, entry, store)
+        _arm(store, coordinator.executor)
+        manual = AsyncMock()
+        monkeypatch.setattr(coordinator, "_async_handle_manual_hvac_change", manual)
+        monkeypatch.setattr(coordinator, "_async_handle_manual_override_helper", AsyncMock())
+        monkeypatch.setattr(coordinator, "_schedule_debounced_refresh", lambda *args, **kwargs: None)
+        injected = False
+        actuations = []
+        original_flush = store.async_flush
+
+        async def flush():
+            await intervene("flush")
+            await original_flush()
+
+        monkeypatch.setattr(store, "async_flush", flush)
+
+        async def actuate(call):
+            nonlocal injected
+            actuations.append((call.domain, call.service, dict(call.data)))
+            entity = call.data["entity_id"]
+            if call.domain == "automation":
+                hass.states.async_set(entity, "off" if call.service == "turn_off" else "on", context=call.context)
+                return
+            if entity in PAIRS:
+                index = list(PAIRS).index(entity)
+                zones["zone_onoff"][index] = "1" if call.service == "turn_on" else "0"
+                if call.service == "turn_on":
+                    control["pow"] = "1"
+            elif entity == "climate.head":
+                if call.service == "turn_off":
+                    control["pow"] = "0"
+                elif call.service == "turn_on":
+                    control["pow"] = "1"
+                elif call.service == "set_hvac_mode":
+                    control["mode"] = {"heat": "1", "cool": "2", "dry": "7"}[call.data["hvac_mode"]]
+                    control["pow"] = "1"
+                    if control["mode"] in {"1", "2"}:
+                        control["stemp"] = control["dt" + control["mode"]]
+                elif call.service == "set_temperature":
+                    control["stemp"] = str(call.data["temperature"])
+                    if control["mode"] in {"1", "2"}:
+                        control["dt" + control["mode"]] = control["stemp"]
+                        key = "lztemp_h" if control["mode"] == "1" else "lztemp_c"
+                        center = float(control["stemp"])
+                        for index in range(2):
+                            zones[key][index] = str(min(center + 2, max(center - 2, float(zones[key][index]))))
+            elif entity in PAIRS.values() and call.service == "set_temperature":
+                index = list(PAIRS.values()).index(entity)
+                zones["lztemp_h" if control["mode"] == "1" else "lztemp_c"][index] = str(call.data["temperature"])
+            publish()
+            await hass.async_block_till_done()
+            if not injected and intervention == "head" and control["mode"] == "7" and control["pow"] == "1":
+                injected = True
+                control["stemp"] = "20"
+                hass.states.async_set("climate.head", "dry", {"temperature": 20}, context=Context(user_id="operator"))
+                await hass.async_block_till_done()
+            elif (not injected and intervention == "release_head" and call.service == "set_hvac_mode"
+                  and control["mode"] == "7"):
+                injected = True
+                control["pow"] = "0"
+                head = hass.states.get("climate.head")
+                hass.states.async_set("climate.head", "off", dict(head.attributes), context=Context(user_id="operator"))
+                await hass.async_block_till_done()
+            elif not injected and intervention == "zone" and call.service == "set_hvac_mode" and control["mode"] == "2":
+                injected = True
+                zones["lztemp_c"][0] = "18"
+                hass.states.async_set(MAIN_CLIMATE, "cool", {"temperature": 18}, context=Context(user_id="operator"))
+                await hass.async_block_till_done()
+
+        for domain, services in {
+            "climate": ("turn_on", "turn_off", "set_hvac_mode", "set_temperature"),
+            "switch": ("turn_on", "turn_off"),
+            "automation": ("turn_on", "turn_off"),
+        }.items():
+            for service in services:
+                hass.services.async_register(domain, service, actuate)
+        await hass.async_block_till_done()
+        coordinator.async_start_listeners()
+        try:
+            c = room_context(main=25, bed=25)
+            c.created_at = dt_util.utcnow()
+            desired = {
+                "mode": "cool",
+                "hvac_mode": "cool",
+                "precondition_target": 21,
+                "target_temperature": 21,
+                "enable_zones": True,
+                **desired_fields(c, "cool", 21, "preconditioning"),
+            }
+            action = _action(desired)
+            action.execute_not_before = c.created_at
+            action.execute_not_after = c.created_at + (
+                timedelta(seconds=1) if intervention.endswith("expired") else timedelta(minutes=5)
+            )
+            await coordinator.executor.async_evaluate(_plan(c.created_at, action))
+            if intervention.startswith(("read_", "flush_")):
+                assert injected and control["pow"] == "0" and control["mode"] == "7"
+                target = 21 if intervention.endswith("match") else 20 if intervention.endswith("head") else 19
+                assert float(control["stemp"]) == target
+                if intervention.endswith("zone"):
+                    assert hass.states.get(MAIN).state == "off"
+                if intervention.endswith("helper"):
+                    assert hass.states.get("input_boolean.operator_hold").state == "on"
+                assert not actuations
+                assert not store.data.get("ownership", {}).get("hvac_control")
+                assert coordinator.executor.pending_hvac_desired_state is None
+                reason = (
+                    "manual_hvac_override_active" if intervention.endswith("helper") else
+                    "hvac_action_outside_execution_window" if intervention.endswith("expired") else
+                    "production_gate_not_armed" if intervention.endswith("disarm") else
+                    "manual_hvac_override_detected"
+                )
+                assert store.data["action_attempts"][-1]["reason"] == reason
+            elif intervention in {"none", "release_head", "release_zone"}:
+                assert hass.states.get("climate.head").state == "cool", (
+                    [(row.get("stage"), row.get("entity_id"), row.get("expected"), row.get("observed"))
+                     for row in store.data.get("climate_audit", []) if row.get("stage") == "unmatched_feedback"],
+                    manual.await_args_list,
+                )
+                if intervention == "release_zone":
+                    # A valid manual target under cool/21 would be clamped by
+                    # the old cool/17 head restoration, despite excluding its
+                    # direct thermostat writes from release ownership.
+                    zones["lztemp_c"][0] = "20"
+                    hass.states.async_set(
+                        MAIN_CLIMATE, "cool", {"temperature": 20}, context=Context(user_id="operator"),
+                    )
+                    await hass.async_block_till_done()
+                result = await coordinator.executor.async_release_hvac_control(
+                    "period_ended", preserve_zone_entity_id=MAIN_CLIMATE if intervention == "release_zone" else None,
+                )
+                if intervention == "release_head":
+                    assert injected and control["pow"] == "0" and float(control["stemp"]) == 17
+                    confirmed = await coordinator.executor.async_release_hvac_control("confirm_owned_zones")
+                    assert confirmed.result is OutcomeResult.RESTORED
+                    assert control["pow"] == "0" and float(control["stemp"]) == 17
+                elif intervention == "release_zone":
+                    assert result.result is OutcomeResult.FAILED
+                    assert float(zones["lztemp_c"][0]) == 20
+                    assert control["pow"] == "0" and float(control["stemp"]) == 21
+                    assert MAIN_CLIMATE not in store.data["ownership"]["hvac_control"]["zone_states"]
+                    assert store.data["ownership"]["hvac_control"]["main_state"]["off_start_restore_attempted"]
+                else:
+                    assert result.result is OutcomeResult.RESTORED, (result, store.data.get("climate_audit"))
+                    assert control["pow"] == "0" and control["mode"] == "7" and float(control["stemp"]) == 19
+                    manual.assert_not_awaited()
+            elif intervention == "head":
+                assert injected and float(control["stemp"]) == 20
+                assert control["mode"] == "7"
+                assert manual.await_count >= 1
+            else:
+                assert injected and float(zones["lztemp_c"][0]) == 18
+                assert manual.await_count >= 1
+        finally:
+            coordinator.executor.pending_hvac_desired_state = None
             await coordinator.async_shutdown()
             await hass.async_stop(force=True)
 
