@@ -20,7 +20,7 @@
 
 ### 🔄 Other changes
 
-- None
+- Add maintenance workflows and merge checks for HAL-managed issues and PR feedback, with shared operating instructions and changelog/release templates maintained in the central HAL plugin. Keep unattended activation gated by verification.
 
 ## 1.4.10 - 2026-11-01
 
