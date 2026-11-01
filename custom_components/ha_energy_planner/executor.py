@@ -20,6 +20,7 @@ from .command_models import ControlAction, ManualControlAction
 from .const import (
     CONF_BYPASS_SAFETY_GATES,
     CONF_CLIMATE_CONTROL_ENABLED,
+    CONF_CLIMATE_MANUAL_OVERRIDE,
     CONF_COMMAND_RATE_LIMIT_SECONDS,
     CONF_DAIKIN_CLIMATE,
     CONF_DRY_RUN,
@@ -63,7 +64,7 @@ from .ev_runtime import allocation_deadline, price_stop_required, settle_spendin
 from .ev_telemetry import measured, reported_at, sample_ev, suspension_identity, vehicle_suspension_evidence
 from .export_limit_policy import EXPORT_ASSET
 from .hvac_adapter import DaikinHVACAdapter, HVACCommandResult
-from .hvac_control import HVACOwnershipTransaction, copy_pending_confirmation
+from .hvac_control import HVACOwnershipTransaction, copy_off_start_recovery, copy_pending_confirmation
 from .hvac_cycle import cycle_active, reconcile_cycle, record_cycle
 from .models import (
     ActionAsset,
@@ -194,6 +195,12 @@ class Executor:
         pending[_PENDING_HVAC_MANUAL_OVERRIDE_KEY] = True
         return True
 
+    def _owned_hvac_entry_data(self) -> dict[str, Any]:
+        """Resolve aliases against durable ownership until the old controller releases."""
+        from .daikin_memory import owned_control_data
+        control = getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {})
+        return owned_control_data(self.entry_data, control)
+
     def mark_pending_hvac_zone_manual_override(self, entity_id: str) -> bool:
         """Synchronously mark an in-flight zone command as user-superseded."""
         if entity_id:
@@ -203,7 +210,8 @@ class Executor:
             return False
         entity_ids = {str(item) for item in pending.get(_PENDING_HVAC_MANUAL_ZONE_IDS_KEY, []) if str(item)}
         entity_ids.add(entity_id)
-        pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(superseded_entities(self.entry_data, entity_ids))
+        pending[_PENDING_HVAC_MANUAL_ZONE_IDS_KEY] = sorted(
+            superseded_entities(self._owned_hvac_entry_data(), entity_ids))
         return True
 
     async def async_release_ev_policy(
@@ -1146,33 +1154,66 @@ class Executor:
             zone_context = getattr(adapter, "set_zone_control_context", None)
             if callable(zone_context):
                 zone_context(dict(self.options), existing_hvac_control)
-            ownership_before = deepcopy(dict(self.store.data.get("ownership", {})))
-            automation_snapshot, zone_snapshot = adapter.takeover_snapshot()
-            main_snapshot = adapter.main_takeover_snapshot()
-            if not action.desired_state.get("enable_zones"):
-                zone_snapshot = {}
-            elif action.desired_state.get("configured_zones_only") is not True:
-                zone_snapshot = {
-                    entity_id: state
-                    for entity_id, state in zone_snapshot.items()
-                    if entity_id.split(".", 1)[0] != "climate"
-                }
-            ownership_transaction = HVACOwnershipTransaction(ownership_before, now)
-            provisional_ownership_data = ownership_transaction.prepare(
-                action.desired_state, automation_snapshot, zone_snapshot, main_snapshot
-            )
-            await self.store.async_save_ownership(provisional_ownership_data)
-            await self._async_flush_provisional_state()
-            adapter.set_main_state_persistence_callback(self._async_persist_provisional_hvac_main_state)
-            pending_hvac_desired_state = dict(action.desired_state)
+            # The native read and ownership flush can yield before any device
+            # write. User feedback must supersede this preparation as well as
+            # the eventual adapter transaction, without a monitoring gap.
+            pending_hvac_desired_state: dict[str, Any] = {}
             self.pending_hvac_desired_state = pending_hvac_desired_state
-            self._configure_pending_hvac_adapter(
-                adapter,
-                pending_hvac_desired_state,
-            )
+
+            def preparation_rejection() -> str | None:
+                if (pending_hvac_desired_state.get(_PENDING_HVAC_MANUAL_OVERRIDE_KEY)
+                        or pending_hvac_desired_state.get(_PENDING_HVAC_MANUAL_ZONE_IDS_KEY)):
+                    return "manual_hvac_override_detected"
+                current = dt_util.utcnow()
+                if not action.execute_not_before <= current <= action.execute_not_after:
+                    return "hvac_action_outside_execution_window"
+                helper_entity = self.entry_data.get(CONF_CLIMATE_MANUAL_OVERRIDE)
+                helper = self.hass.states.get(helper_entity) if self.hass and helper_entity else None
+                if helper is not None and helper.state == "on":
+                    return "manual_hvac_override_active"
+                return self._control_rejection_reason(action, current)
+
             try:
+                prepare_off_start = getattr(adapter, "async_prepare_off_start", None)
+                if self.options.get("hvac_safe_off_start") is True and callable(prepare_off_start):
+                    await prepare_off_start(action)
+                ownership_before = deepcopy(dict(self.store.data.get("ownership", {})))
+                automation_snapshot, zone_snapshot = adapter.takeover_snapshot()
+                main_snapshot = adapter.main_takeover_snapshot()
+                if not action.desired_state.get("enable_zones"):
+                    zone_snapshot = {}
+                elif action.desired_state.get("configured_zones_only") is not True:
+                    zone_snapshot = {
+                        entity_id: state
+                        for entity_id, state in zone_snapshot.items()
+                        if entity_id.split(".", 1)[0] != "climate"
+                    }
+                ownership_transaction = HVACOwnershipTransaction(ownership_before, now)
+                provisional_ownership_data = ownership_transaction.prepare(
+                    action.desired_state, automation_snapshot, zone_snapshot, main_snapshot
+                )
+                preparation_reason = preparation_rejection()
+                if preparation_reason is None:
+                    await self.store.async_save_ownership(provisional_ownership_data)
+                    await self._async_flush_provisional_state()
+                preparation_reason = preparation_reason or preparation_rejection()
+                adapter.set_main_state_persistence_callback(self._async_persist_provisional_hvac_main_state)
+                # Preparation has issued no commands. Only now may requested
+                # controls explain feedback; retain earlier manual markers.
+                pending_hvac_desired_state.update(action.desired_state)
+                self._configure_pending_hvac_adapter(
+                    adapter,
+                    pending_hvac_desired_state,
+                )
                 try:
-                    hvac_result = await adapter.async_execute(action)
+                    if preparation_reason is not None:
+                        # No actuator was dispatched, so only undo provisional
+                        # ownership; physical compensation could undo the user.
+                        hvac_result = HVACCommandResult(
+                            False, preparation_reason, {}, {}, {}, True, command_sent=False,
+                        )
+                    else:
+                        hvac_result = await adapter.async_execute(action)
                 except Exception:  # noqa: BLE001 - preserve manual evidence before the executor boundary re-raises.
                     main_state_superseded = pending_hvac_desired_state.get(_PENDING_HVAC_MANUAL_OVERRIDE_KEY) is True
                     superseded_zone_entity_ids = {
@@ -1480,7 +1521,7 @@ class Executor:
             # A main-entity manual change supersedes any failed acquisition
             # snapshot; a release must not overwrite the user's new state.
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
-        preserved_zone_ids = superseded_entities(self.entry_data, {preserve_zone_entity_id}) if (
+        preserved_zone_ids = superseded_entities(self._owned_hvac_entry_data(), {preserve_zone_entity_id}) if (
             preserve_zone_entity_id
         ) else set()
         zone_state_superseded = bool(preserved_zone_ids & zone_states.keys())
@@ -1516,7 +1557,11 @@ class Executor:
             failed = bool(automation_states or zone_states or hvac_control)
         else:
             try:
-                adapter = DaikinHVACAdapter(self.hass, self.entry_data)
+                from .daikin_memory import owned_control_data
+                restore_data = owned_control_data(self.entry_data, hvac_control)
+                adapter = DaikinHVACAdapter(self.hass, restore_data)
+                adapter.set_zone_control_context(dict(self.options), hvac_control)
+                adapter.set_main_state_persistence_callback(self._async_persist_provisional_hvac_main_state)
                 pending_hvac_desired_state: dict[str, Any] = {
                     "restore_zones": zone_states,
                     "restore_main": main_state,
@@ -1598,6 +1643,7 @@ class Executor:
             hvac_control["required_evidence_lost"] = "hvac_release_failed"
             ownership["hvac_control"] = hvac_control
         if failed:
+            copy_off_start_recovery(hvac_control, self.store.data.get("ownership", {}).get("hvac_control"))
             copy_pending_confirmation(hvac_control, self.store.data.get("ownership", {}).get("hvac_control"))
         await self.store.async_save_ownership(ownership)
         no_change = bool(
@@ -1748,7 +1794,10 @@ class Executor:
 
             if restore_hvac and (hvac_state or hvac_zone_state or hvac_control):
                 try:
-                    adapter = DaikinHVACAdapter(self.hass, self.entry_data)
+                    from .daikin_memory import owned_control_data
+                    adapter = DaikinHVACAdapter(self.hass, owned_control_data(self.entry_data, hvac_control))
+                    adapter.set_zone_control_context(dict(self.options), hvac_control)
+                    adapter.set_main_state_persistence_callback(self._async_persist_provisional_hvac_main_state)
                     pending_hvac_desired_state: dict[str, Any] = {
                         "restore_zones": hvac_zone_state,
                         "restore_main": hvac_main_state,
@@ -1925,6 +1974,9 @@ class Executor:
         if restore_export and not ownership.get(EXPORT_ASSET, {}).get("baseline"):
             remaining_ownership.pop(EXPORT_ASSET, None)
         if restore_hvac and isinstance(remaining_ownership.get("hvac_control"), dict):
+            copy_off_start_recovery(
+                remaining_ownership["hvac_control"], self.store.data.get("ownership", {}).get("hvac_control"),
+            )
             copy_pending_confirmation(
                 remaining_ownership["hvac_control"], self.store.data.get("ownership", {}).get("hvac_control"),
             )
@@ -2906,7 +2958,15 @@ class Executor:
         # Enrich remembered-mode evidence without replacing the original cycle
         # target with a later phase snapshot, including if we stop mid-command.
         baseline = dict(main_state)
+        baseline.pop("off_start_restore_attempted", None)
         baseline.update(hvac_control.get(_HVAC_MAIN_STATE_OWNERSHIP_KEY, {}))
+        if main_state.get("off_start_restore_attempted"):
+            if main_state.get("off_start_memory") == baseline.get("off_start_memory"):
+                baseline["off_start_restore_attempted"] = True
+            else:
+                attempt = deepcopy(hvac_control.get("attempt_snapshot", {}))
+                attempt["main_state"] = deepcopy(main_state)
+                hvac_control["attempt_snapshot"] = attempt
         hvac_control[_HVAC_MAIN_STATE_OWNERSHIP_KEY] = baseline
         ownership["hvac_control"] = hvac_control
         await self.store.async_save_ownership(ownership)
@@ -2932,14 +2992,14 @@ class Executor:
         zone_entity_ids: set[str],
     ) -> None:
         """Atomically discard all user-superseded HVAC baselines."""
-        zone_entity_ids = superseded_entities(self.entry_data, zone_entity_ids)
+        zone_entity_ids = superseded_entities(self._owned_hvac_entry_data(), zone_entity_ids)
         ownership = deepcopy(dict(self.store.data.get("ownership", {})))
         hvac_control = dict(ownership.get("hvac_control", {}))
         if main_superseded:
             hvac_control.pop(_HVAC_MAIN_STATE_OWNERSHIP_KEY, None)
             hvac_control.pop("main_state_committed", None)
         confirmation = hvac_control.get("command_confirmation", {})
-        if (main_superseded and confirmation.get("entity_id") == self.entry_data.get(CONF_DAIKIN_CLIMATE)
+        if (main_superseded and confirmation.get("entity_id") == self._owned_hvac_entry_data().get(CONF_DAIKIN_CLIMATE)
                 or confirmation.get("entity_id") in zone_entity_ids):
             hvac_control.pop("command_confirmation", None)
         zone_states = dict(hvac_control.get("zone_states", {}))

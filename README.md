@@ -24,7 +24,7 @@ Local-first planning through your existing Home Assistant entities and actions.
 ## Key features
 
 - **EV charging:** Tariff-aware schedules, ready-by targets and vehicle profiles for a shared charger.
-- **Climate comfort:** Preconditioning with room feedback, learned thermal rates and guarded restoration.
+- **Climate comfort:** Preconditioning with room feedback, learned thermal rates and guarded restoration. Opt-in [safe AirBase starts from Off](docs/hvac-restoration-recovery.md#opt-in-airbase-starts-from-off) require complete mode-aware readback.
 - **Enphase controls:** Operating profiles and independent Export Limit control where supported.
 - **Load forecasting:** Recorder-trained household demand alongside solar, tariffs and battery reserves.
 - **Review and control:** Current state, next actions, a plan calendar and per-area Automatic control.

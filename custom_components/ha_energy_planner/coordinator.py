@@ -608,7 +608,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._schedule_next_boundary_refresh()
         entry_data = self.entry_data
         self._start_load_forecast_source_listener(entry_data)
-        entity_ids = _configured_entity_ids(entry_data)
+        from .daikin_memory import owned_control_data
+        control_data = owned_control_data(
+            entry_data, getattr(getattr(self, "store", None), "data", {}).get("ownership", {}).get("hvac_control", {}))
+        entity_ids = list(dict.fromkeys([*_configured_entity_ids(entry_data), *_configured_entity_ids(control_data)]))
         export_feedback_entity = export_limit_feedback_entity_id(
             self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
         )
@@ -654,7 +657,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 self._async_create_listener_task(self._async_save_vehicle_session())
             if session_changed:
                 self.async_update_listeners()
-            entry_data = self.entry_data
+            entry_data = owned_control_data(
+                self.entry_data, getattr(getattr(self, "store", None), "data", {}).get(
+                    "ownership", {}).get("hvac_control", {}),
+            )
             now = dt_util.utcnow()
             calendar_plan: EnergyPlan | None = (
                 getattr(self.store, "calendar_plan", None) or getattr(self, "data", None)
@@ -996,7 +1002,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def _refresh_input_subscription() -> None:
             nonlocal unsubscribe_states
-            watched = _configured_entity_ids(self.entry_data)
+            control_data = owned_control_data(
+                self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}))
+            watched = list(dict.fromkeys([*_configured_entity_ids(self.entry_data),
+                                          *_configured_entity_ids(control_data)]))
             sensor = export_limit_feedback_entity_id(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY))
             if sensor and sensor not in watched:
                 watched.append(sensor)
@@ -1016,7 +1025,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 if sensor == export_feedback_entity:
                     return
                 export_feedback_entity = sensor
-                watched_entities = _configured_entity_ids(entry_data)
+                control_data = owned_control_data(
+                    self.entry_data, self.store.data.get("ownership", {}).get("hvac_control", {}))
+                watched_entities = list(dict.fromkeys([*_configured_entity_ids(self.entry_data),
+                                                       *_configured_entity_ids(control_data)]))
                 if sensor and sensor not in watched_entities:
                     watched_entities.append(sensor)
                 unsubscribe_states()
@@ -3696,14 +3708,50 @@ def _matches_climate_transaction(
         if issued is None or deadline is None or now < issued:
             continue
         same = entity == command.get("entity_id")
+        activation = command.get("off_start_head_activation") or {}
+        from .zone_control import topology
+        head = hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE))) if hass is not None else None
+        activation_valid = (
+            activation.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
+            and command.get("entity_id") in topology(entry_data).get("pairs", {})
+            and command.get("service") == "turn_on" and command.get("main_mode") == "off"
+            and activation.get("hvac_mode") in {"heat", "cool", "dry"}
+            and now < min(deadline, issued + timedelta(seconds=120))
+            and head is not None and head.state in {"off", activation.get("hvac_mode")}
+            and _matching_hvac_target(head.attributes.get("temperature"), activation.get("target_temperature"))
+            and not any(later.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
+                        for later in commands[commands.index(command) + 1:])
+        )
         coupled = (
             command.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE)
             and entity in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
             and str(entity).startswith("climate.")
-        ) or _unambiguous_coupled_zone_entity_ids_match(entry_data, command.get("entity_id"), entity)
+        ) or _unambiguous_coupled_zone_entity_ids_match(entry_data, command.get("entity_id"), entity) or (
+            activation_valid and entity in activation.get("zone_climates", []) and old.state == "off"
+        )
         if not same and not coupled:
+            # A declared zone can wake an Off AirBase head. Its fresh vendor
+            # mode/target proof authorizes only this exact issued activation.
+            if (activation_valid and entity == activation["entity_id"]
+                    and old.state == "off" and new.state == activation["hvac_mode"]
+                    and _matching_hvac_target(new_attributes.get("temperature"), activation["target_temperature"])
+                    and all(getattr(context, "parent_id", None) in {None, command["context_id"]}
+                            for context in contexts)):
+                return True
             continue
         requested, service = command.get("requested", {}), command.get("service")
+        if (coupled and not same and entity in command.get("off_start_dry_zones", [])
+                and service == "set_hvac_mode" and requested.get("hvac_mode") == "dry"
+                and now < min(deadline, issued + timedelta(seconds=120))
+                and old.state in {"off", "heat", "cool"} and new.state in {"off", "dry"}
+                and new_attributes.get("temperature") is None
+                and all(new_attributes.get(key) is None for key in changed)
+                and all(getattr(context, "parent_id", None) in {None, command["context_id"]}
+                        for context in contexts)
+                and hass is not None
+                and (head := hass.states.get(str(entry_data.get(CONF_DAIKIN_CLIMATE)))) is not None
+                and head.state == "dry"):
+            return True
         if coupled and not same and _matches_disabled_zone_mode_recall(
             entry_data, command, commands[commands.index(command) + 1:], event, now, hass, changed,
         ):
@@ -3737,7 +3785,8 @@ def _matches_climate_transaction(
             mode_matches = old.state == new.state
         if service == "turn_on" and coupled and command.get("entity_id") != entry_data.get(CONF_DAIKIN_CLIMATE):
             mode = command.get("main_mode")
-            expected_active_mode = mode if mode in _ACTIVE_HVAC_MODES else command.get("requested_hvac_mode")
+            expected_active_mode = (mode if mode in _ACTIVE_HVAC_MODES else activation["hvac_mode"]
+                                    if activation_valid else command.get("requested_hvac_mode"))
             mode_matches = mode_matches and new.state == expected_active_mode
         if not mode_matches:
             continue

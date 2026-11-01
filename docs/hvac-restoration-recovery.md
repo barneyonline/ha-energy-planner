@@ -5,15 +5,117 @@ Switching an off Daikin head into heating can expose different targets from
 switching into cooling. A target first seen after planner acquisition does not
 establish the original user setting.
 
-Synchronized zone takeover now requires complete numeric baselines for every
+Synchronized zone takeover normally requires complete numeric baselines for every
 zone whose target will change, with an active original head mode matching the
-requested mode. It rejects hidden targets with `climate_zone_target_unavailable`
-and off/different-mode baselines with `climate_zone_baseline_mode_mismatch`,
-before schedule suppression, zone activation or head writes. This deliberately
-blocks new synchronized off-to-on and heat-to-cool/cool-to-heat takeovers until
-complete mode-aware restoration is supported. Existing same-mode ownership may
-continue after a planner stop if its original numeric baselines are retained.
-Room goals, equipment offsets, demand gates and cycle/rest protection are unchanged.
+requested mode. Hidden targets produce `climate_zone_target_unavailable` and
+unproven mode transitions produce `climate_zone_baseline_mode_mismatch` before
+schedule suppression, zone activation or head writes.
+
+## Opt-in AirBase starts from Off
+
+In Options → Settings → Climate policy, **Allow safe Off starts (AirBase)** is
+disabled by default. It permits a new synchronized Off start only for the core
+Home Assistant `daikin` integration backed by pydaikin's `DaikinAirBase`, with
+explicit same-controller switch/thermostat pairs and installer-verified airflow.
+It does not enable any zone, change room sensors or equipment offsets, qualify
+an uneconomic plan, establish thermal learning readiness, or make estimated
+power into measured energy. Heating-to-cooling and cooling-to-heating takeovers
+from an active original mode remain blocked.
+
+Before ownership or any device write, the adapter forces read-only refreshes of
+AirBase's `get_control_info`, `get_zone_setting` and `get_model_info` resources.
+Manual control monitoring starts before those reads and remains active through
+the ownership flush. No requested target is treated as issued-command feedback
+during preparation. A head or zone change cancels acquisition without physical
+compensation, including when the user's target matches the planned target.
+Preparation also rechecks the execution window, current manual-hold helper and
+production controls after readback and after ownership persistence. Expiry, a
+new hold or disarming cancels the unissued attempt and rolls back only its
+provisional ownership; release of any earlier ownership remains separate.
+It requires both remembered head targets (`dt1`, `dt2`), both complete zone
+arrays (`lztemp_h`, `lztemp_c`), a proven remembered mode, finite mode-specific
+head limits, published Home Assistant head bounds/step and exact zone targets
+within head ±2°C. Every captured head target must pass the same exact bounds
+and step checks used for restoration. Registered zone indices
+must cover every physical zone reported by `en_zone`; unused fixed-width array
+padding grants no control authority. Each switch and paired thermostat must
+prove the same native zone index. Friendly names do not establish identity.
+Off/Dry is also supported when the vendor's original `mode=7` and `stemp` agree
+with the Off head's numeric target and finite bounds/step. This captures the
+original Dry target directly; it does not invent a `dt7` memory or treat a heat,
+cool or room-comfort target as Dry intent. Auto and fan-only memories remain
+unsupported. Off power, head readback and every zone switch must agree
+with the vendor result. Missing fields, unsupported devices, timeouts, aliases
+from another controller and incomplete topology keep the previous fail-closed
+restriction. No mode is selected to discover hidden values.
+
+The executor flushes the original Off state, exact zone enablement, both mode
+memories, controller identity and acquisition topology before the first write.
+These vendor-read settings are distinct from room comfort goals. The controller
+fingerprint includes the exact registered zone-index bindings and is checked
+again at command boundaries, including after persistence
+and scheduler-guard waits, so a replacement source cannot inherit permission to
+receive an old controller's commands. A refresh's
+compensation snapshot is persisted separately from the immutable lifecycle
+baseline. Restart, reload and later sensor/topology edits cannot replace the
+original settings with targets exposed by planner control. Release uses the
+captured controller mapping and checks its registry identity again.
+Resuming an owned Off/coast phase also checks the original controller before
+reading a fresh attempt snapshot. Every applicable snapshot identity must agree
+at dispatch; a replacement's valid readback cannot supersede old ownership.
+
+Release keeps an already safe open subset and checks airflow before any zone
+opening that could implicitly wake the head. A saved target alone does not
+authorize reopening a closed room. It first restores the acquired mode's head target and zone targets, then
+restores the originally remembered head mode/target and confirms Off before
+closing originally closed dampers. This may briefly select the remembered mode
+as part of restoration. Existing command serialization, confirmation deadlines,
+uncertain-command reconciliation, scheduler ownership and manual supersession
+remain in force. A zone opening can recall the Off head's mode before the
+explicit head command; only the exact freshly read mode/target and its already
+open or opening aliases are recognized as that issued activation. Recognition
+expires from the original issue time and retires after a later head command.
+Dry's null zone targets are scoped to the issued Dry restoration command and
+matching live head readback. Explicit user and external-parent contexts still
+supersede these expectations. An explicit user change supersedes the affected saved controls. Zone snapshots
+also retain their original mode: after a user takes over the head, a cooling
+baseline cannot be written into heating memory even if its number fits the
+published bounds. The captured controller mapping remains with unresolved zone
+ownership after main supersession. Restoring a zone cannot wake a manually
+stopped head; incompatible mode-specific targets remain pending for the operator.
+A fresh read-only vendor check can clear an already matching inactive zone memory
+after manual head takeover without changing the user's mode or waking the unit.
+A manually superseded zone also revokes head mode/target restoration writes: a
+shared head write can clamp that zone even without a direct thermostat write.
+The original Off power is still requested, and unresolved settings remain for
+the operator. The check runs again after persistence and scheduler-guard waits.
+
+A mode-aware restoration gets one durable automatic attempt. Failure or
+interruption retains the original evidence and requests shutdown; subsequent
+retries inspect readback and can confirm an already completed restoration, but
+cannot oscillate between modes to discover or repair unknown settings.
+`hvac_zone_restore_operator_required` and `off_start_restore_operator_required`
+identify incomplete recovery; a changed registry owner reports
+`off_start_provider_identity_changed` and prevents writes to the replacement.
+Use the bounded operator handoff below if readback cannot confirm completion.
+No saved target is silently clamped, invented or discarded. Before reporting
+success, a fresh read-only vendor snapshot must confirm the original remembered
+mode, every owned heating/cooling memory and zone power after shutdown. If a Dry
+write unexpectedly changes an inactive mode memory, the baseline stays pending
+for the operator; visible Off/head feedback alone cannot clear it.
+
+Protocol evidence: HA's [2026.10.4 Daikin climate implementation](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/daikin/climate.py)
+selects the zone array by active mode and hides numeric targets while Off.
+The pinned `pydaikin==2.19.1` implementation provides fresh read-only resource
+updates and AirBase's separate mode memories; see the [AirBase source](https://github.com/fredrike/pydaikin/blob/master/pydaikin/daikin_airbase.py),
+[native zone switch identities](https://github.com/home-assistant/core/blob/2026.10.4/homeassistant/components/daikin/switch.py)
+and [control readback/recall implementation](https://github.com/fredrike/pydaikin/blob/master/pydaikin/daikin_brp069.py).
+This is local fake/replay validation, not physical-device acceptance. No operator
+baseline fallback is inferred for devices that cannot provide these memories.
+A sanitized read-only AirBase sample with two physical zones, eight encoded
+array slots, Off/Dry `stemp` and absent `dt7` is replayed in
+`tests/fixtures/hvac/airbase_off_dry_memory_2026_10_31.json`. It establishes payload
+shape and available readback, not physical rollback acceptance.
 
 Within an owned lifecycle, a previously missing zone baseline stays missing
 across refresh and reload. An existing numeric baseline stays original even if
