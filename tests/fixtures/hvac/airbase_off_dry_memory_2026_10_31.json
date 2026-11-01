@@ -1,0 +1,29 @@
+{
+  "provenance": {
+    "source": "sanitized read-only core Daikin diagnostics",
+    "date": "2026-10-31",
+    "model": "Airbase BRP15B61",
+    "equipment_writes": 0
+  },
+  "control": {
+    "pow": "0",
+    "mode": "7",
+    "operate": "2",
+    "bk_auto": "2",
+    "stemp": "19",
+    "dt1": "19",
+    "dt2": "17"
+  },
+  "model": {
+    "en_zone": "2",
+    "heat_l": "16",
+    "heat_h": "32",
+    "cool_l": "16",
+    "cool_h": "32"
+  },
+  "zones": {
+    "zone_onoff": "1%3b0%3b0%3b0%3b0%3b0%3b0%3b0",
+    "lztemp_h": "17%3b19%3b21%3b21%3b21%3b21%3b21%3b21",
+    "lztemp_c": "17%3b19%3b19%3b19%3b19%3b19%3b19%3b19"
+  }
+}
