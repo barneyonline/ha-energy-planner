@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from math import ceil, isfinite
@@ -23,6 +24,7 @@ from .const import (
     CONF_CLIMATE_ZONES,
     CONF_DAIKIN_CLIMATE,
 )
+from .daikin_memory import MEMORY_KEY, OFF_START_OPTION, memory_matches, read_activation, read_memory, source_matches
 from .hvac_cycle import mode_feedback_matches, mode_intent
 from .models import ActionKind, PlanAction
 
@@ -93,6 +95,11 @@ class DaikinHVACAdapter:
         self._async_persist_confirmation: Callable[[dict[str, Any] | None], Awaitable[None]] | None = None
         self._recovery_confirmation: dict[str, Any] | None = None
         self._zone_desired: dict[str, Any] = {}
+        self._restoring_memory: dict[str, Any] | None = None
+        self._restoring_owned_zone_entities: set[str] = set()
+        self._off_start_activation: dict[str, Any] | None = None
+        self._restoring_off_start = False
+        self._off_start_memory: dict[str, Any] | None = None
         self._zone_options: dict[str, Any] = {}
         self._zone_baseline: dict[str, Any] = {}
 
@@ -100,6 +107,34 @@ class DaikinHVACAdapter:
         """Keep original zone targets available while a planner-paused alias is null."""
         self._zone_options = options
         self._zone_baseline = control
+
+    async def async_prepare_off_start(self, action: PlanAction) -> None:
+        """Read mode memories before the executor flushes any acquisition intent."""
+        self._off_start_memory = None
+        self._off_start_activation = None
+        head = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+        original = self._zone_baseline.get("main_state")
+        if not isinstance(original, dict):
+            original = {}
+        if (self._zone_options.get(OFF_START_OPTION) is True and head is not None and head.state == "off"
+                and action.desired_state.get("configured_zones_only") is True
+                and action.desired_state.get("enable_zones")
+                and (not self._zone_baseline or original.get(MEMORY_KEY))):
+            if original.get(MEMORY_KEY) and not source_matches(self.hass, self.entry_data, original[MEMORY_KEY]):
+                # A new read may compensate this attempt, but it cannot grant
+                # another controller an existing lifecycle's authority.
+                return
+            self._off_start_memory = await read_memory(
+                self.hass, self.entry_data, str(action.desired_state.get("hvac_mode")),
+            )
+            if self._off_start_memory is not None:
+                mode = self._off_start_memory["selected_mode"]
+                self._off_start_activation = {
+                    "entity_id": self._off_start_memory["head"], "entry_id": self._off_start_memory["entry_id"],
+                    "hvac_mode": mode,
+                    "target_temperature": self._off_start_memory["modes"][mode]["target_temperature"],
+                }
+            self._deferred_zone_entities = None
 
     def _zone_control_rejection(self) -> str | None:
         from .zone_control import live_rejection
@@ -134,6 +169,10 @@ class DaikinHVACAdapter:
             service == SERVICE_TURN_ON or service == "set_hvac_mode" and data.get("hvac_mode") != "off"
         )
         head_target = entity_id == head_id and service == "set_temperature"
+        # AirBase zone On can itself wake the head. Mode-aware Off starts
+        # therefore need a verified resulting airflow set on that first write.
+        starts_head = starts_head or bool(switch_change and service == SERVICE_TURN_ON
+            and head is not None and head.state == "off" and self._mode_memory_control())
         if pairs and (switch_change or starts_head or head_target) and (
             starts_head or head is None or head.state != "off"
         ):
@@ -145,6 +184,45 @@ class DaikinHVACAdapter:
                 remaining.add(entity_id)
             if not any(remaining == set(row) for row in config["safe_open_sets"]):
                 raise _HVACStateConfirmationError("remaining airflow is not verified")
+
+    def _mode_memory_control(self) -> bool:
+        main = self._zone_baseline.get("main_state")
+        return bool(self._off_start_memory or self._restoring_off_start
+                    or isinstance(main, dict) and main.get(MEMORY_KEY)
+                    or self._zone_baseline.get("off_start_control_data"))
+
+    def _assert_memory_identity(self) -> None:
+        main = self._zone_baseline.get("main_state")
+        expected = (self._restoring_memory, self._off_start_memory,
+                    main.get(MEMORY_KEY) if isinstance(main, dict) else None,
+                    self._zone_baseline.get("off_start_identity"))
+        if any(record and not source_matches(self.hass, self.entry_data, record) for record in expected):
+            raise _HVACStateConfirmationError("off-start controller identity changed")
+
+    def _memory_target_available(self, entity_id: str, target: Any) -> bool:
+        """Require exact live bounds and grid for every mode-aware temperature write."""
+        observed = self._state(entity_id)
+        if observed is None or not self._zone_target_within_bounds(observed, {"target_temperature": target}):
+            return False
+        value, low, high, step = (finite(item) for item in (
+            target, observed.attributes.get("min_temp"), observed.attributes.get("max_temp"),
+            observed.attributes.get("target_temp_step")))
+        if value is None or low is None or high is None or step is None or step <= 0:
+            return False
+        return abs((value - low) / step - round((value - low) / step)) <= 1e-6
+
+    def _assert_memory_target(self, service: str, data: dict[str, Any]) -> None:
+        if (self._restoring_memory and data.get(ATTR_ENTITY_ID) == self._restoring_memory["head"]
+                and service in {SERVICE_TURN_ON, "set_hvac_mode", "set_temperature"}
+                and set(self._restoring_memory["pairs"].values()) - (
+                    self._restoring_owned_zone_entities - self._manual_zone_override_entity_ids())):
+            # A head write can clamp every physical zone's mode memory. Losing
+            # a zone baseline revokes that authority, even when no direct zone
+            # write is sent. Off remains available as the original safe power.
+            raise _HVACStateConfirmationError("manual zone prevents mode-memory head restoration")
+        if (self._mode_memory_control() and service == "set_temperature"
+                and not self._memory_target_available(str(data.get(ATTR_ENTITY_ID)), data.get("temperature"))):
+            raise _HVACStateConfirmationError("mode-memory target bounds or step changed")
 
     def _equipment_target_available(self, entity_id: str, target: Any) -> bool:
         """Require exact live bounds/step, with no silent setpoint rounding."""
@@ -214,7 +292,9 @@ class DaikinHVACAdapter:
             # including its override scope. Recovery still preserves this exact
             # zone, but a main or sibling override cannot block its restoration.
             self._climate_override_policy[entity_id] = (respect_manual_override, True)
+        self._assert_memory_identity()
         self._assert_zone_airflow(domain, service, data)
+        self._assert_memory_target(service, data)
         if domain == "climate" and respect_manual_override and self._zone_desired.get("equipment_compensation"):
             self._assert_equipment_command(service, data)
         if domain != "climate" and (
@@ -257,8 +337,20 @@ class DaikinHVACAdapter:
             if (item := self._state(entity)) is not None
         }
         main = self._state(str(self.entry_data.get(CONF_DAIKIN_CLIMATE)))
+        if (self._mode_memory_control() and entity_id == self.entry_data.get(CONF_DAIKIN_CLIMATE)
+                and service == "set_hvac_mode" and data.get("hvac_mode") == "dry"):
+            # Core Daikin exposes no subordinate temperature in Dry, including
+            # disabled aliases. Scope null feedback to this exact issued mode.
+            record["off_start_dry_zones"] = self._zone_climate_entities()
         record["main_mode"] = main.state if main is not None else None
         record["main_target"] = main.attributes.get("temperature") if main is not None else None
+        if (self._off_start_activation is not None and entity_id in pairs and service == SERVICE_TURN_ON
+                and main is not None and main.state == "off"):
+            record["off_start_head_activation"] = {
+                **self._off_start_activation,
+                "zone_climates": [climate for actuator, climate in pairs.items()
+                                  if actuator == entity_id or self._state_value(actuator) == "on"],
+            }
         entity_id = str(data.get(ATTR_ENTITY_ID))
         self._last_commands[entity_id] = record
         self._command_started[entity_id] = asyncio.get_running_loop().time()
@@ -293,7 +385,9 @@ class DaikinHVACAdapter:
                 self._raise_if_climate_override_requested(entity_id)
                 if respect_manual_override and self._zone_control_rejection() is not None:
                     raise _HVACStateConfirmationError("zone evidence changed during intent persistence")
+                self._assert_memory_identity()
                 self._assert_zone_airflow(domain, service, data)
+                self._assert_memory_target(service, data)
                 if (domain == "climate" and respect_manual_override
                         and self._zone_desired.get("equipment_compensation")):
                     self._assert_equipment_command(service, data)
@@ -541,6 +635,14 @@ class DaikinHVACAdapter:
 
     def takeover_snapshot(self) -> tuple[dict[str, str], dict[str, Any]]:
         """Return automation and zone state that must survive a takeover crash."""
+        if self._off_start_memory is not None:
+            targets = self._off_start_memory["modes"][self._off_start_memory["acquired_mode"]]["zones"]
+            self._deferred_zone_entities = set()
+            return self._enabled_automation_states(), {
+                **self._zone_states(), **{entity: {
+                    "target_temperature": target, "baseline_hvac_mode": self._off_start_memory["acquired_mode"],
+                } for entity, target in targets.items()},
+            }
         if self._deferred_zone_entities is None:
             self._deferred_zone_entities = {
                 entity_id
@@ -562,7 +664,10 @@ class DaikinHVACAdapter:
     def main_takeover_snapshot(self) -> dict[str, Any]:
         """Return main climate state that must survive a takeover crash."""
         climate_state = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
-        return {} if climate_state is None else _climate_state_snapshot(climate_state)
+        snapshot = {} if climate_state is None else _climate_state_snapshot(climate_state)
+        if self._off_start_memory is not None and climate_state is not None and climate_state.state == "off":
+            snapshot[MEMORY_KEY] = deepcopy(self._off_start_memory)
+        return snapshot
 
     async def async_execute(self, action: PlanAction) -> HVACCommandResult:
         """Execute a supported HVAC action."""
@@ -584,7 +689,8 @@ class DaikinHVACAdapter:
             # Durable zone/automation ownership remains for the supported retry
             # path. Cancellation must independently return the head's safe state.
             try:
-                await self.async_restore(saved_main_state=baseline)
+                if not baseline.get(MEMORY_KEY):
+                    await self.async_restore(saved_main_state=baseline)
             finally:
                 # Guard failure can return before restoration reaches the head.
                 # Emergency shutdown must still run for a known off baseline.
@@ -641,7 +747,7 @@ class DaikinHVACAdapter:
         climate_state = self._state(climate_entity)
         if climate_entity is None or climate_state is None:
             return HVACCommandResult(False, "daikin_climate_unavailable", pre_state, self._snapshot(), {}, True)
-        saved_main_state = _climate_state_snapshot(climate_state)
+        saved_main_state = self.main_takeover_snapshot()
         if not action.desired_state:
             return HVACCommandResult(False, "hvac_desired_state_empty", pre_state, self._snapshot(), {}, True)
         if _temperature_desired_state(action.desired_state) and not _has_restorable_temperature_target(
@@ -722,7 +828,11 @@ class DaikinHVACAdapter:
             original_main = self._zone_baseline.get("main_state") or saved_main_state
             original_mode = original_main.get("hvac_mode")
             desired_mode = action.desired_state.get("hvac_mode") or climate_state.state
-            if (original_mode not in _ACTIVE_HVAC_MODES or desired_mode != original_mode
+            memory = original_main.get(MEMORY_KEY, {})
+            reversible_off = (original_mode == "off" and memory.get("version") == 1
+                              and memory.get("acquired_mode") == desired_mode
+                              and (climate_state.state != "off" or self._off_start_memory is not None))
+            if not reversible_off and (original_mode not in _ACTIVE_HVAC_MODES or desired_mode != original_mode
                     or (not self._zone_baseline.get("main_state") and any(
                         (zone := self._state(entity)) is None or zone.state != original_mode
                         for entity in requested_zones
@@ -1022,15 +1132,31 @@ class DaikinHVACAdapter:
         for entity_id in list(zones):
             if await self._async_zone_restore_is_superseded(entity_id):
                 zones.pop(entity_id)
+        if (not main_state and zones and isinstance(identity := self._zone_baseline.get("off_start_identity"), dict)
+                and set(identity) == {"entry_id", "controller_fingerprint"}):
+            # Manual head supersession cannot make an inactive mode visible.
+            # Fresh vendor readback can still prove that its owned zone memory
+            # already matches, without selecting a mode or reopening a room.
+            observed_memory = await read_memory(self.hass, self.entry_data, "cool", allow_active_verification=True)
+            if (observed_memory is not None
+                    and all(observed_memory.get(key) == value for key, value in identity.items())):
+                zones = {entity: target for entity, target in zones.items() if not (
+                    isinstance(target, dict) and target.get("baseline_hvac_mode") in {"heat", "cool"}
+                    and observed_memory["modes"][target["baseline_hvac_mode"]]["zones"].get(entity)
+                    == target.get("target_temperature")
+                    or target in ("on", "off") and observed_memory["power"].get(entity) == target
+                )}
         main_observed = self._state(str(self.entry_data.get(CONF_DAIKIN_CLIMATE)))
         deferred_recovery = (
-            main_state.get("zone_recovery_attempted") is True
+            not main_state.get(MEMORY_KEY)
+            and main_state.get("zone_recovery_attempted") is True
             and main_observed is not None
             and main_observed.state == "off"
             and main_state.get("hvac_mode") == "off"
         )
         if (
             main_state
+            and not main_state.get(MEMORY_KEY)
             and _main_hvac_desired_state(main_state)
             and main_observed is not None
             and _already_in_desired_state(main_observed, main_state)
@@ -1054,6 +1180,7 @@ class DaikinHVACAdapter:
                 main_state = {}
         deferred_only = bool(
             zones
+            and not main_state.get(MEMORY_KEY)
             and (not main_state or deferred_recovery)
             and not self._can_restore_paired_targets(zones)
             and all(
@@ -1110,6 +1237,18 @@ class DaikinHVACAdapter:
         ) and not await self._async_arm_scheduler_guard():
             await self._async_persist_requested_manual_supersessions()
             main_superseded = self._manual_override_requested is not None and self._manual_override_requested()
+            memory = main_state.get(MEMORY_KEY)
+            if isinstance(memory, dict) and not main_superseded:
+                from .daikin_memory import provider
+                source = provider(self.hass, self.entry_data)
+                if (source is not None and source_matches(self.hass, self.entry_data, memory)
+                        and self.entry_data.get(CONF_DAIKIN_CLIMATE) == memory.get("head")):
+                    # Helper failure cannot strand planner-owned demand with a
+                    # proven original Off baseline. Do not select modes here.
+                    await self._async_apply_hvac_state(
+                        memory["head"], {"hvac_mode": "off"}, respect_zone_manual_override=False,
+                        emergency_off=True, force=self._unconfirmed_main_mode,
+                    )
             superseded_zones = self._manual_zone_override_entity_ids()
             return HVACCommandResult(
                 False,
@@ -1151,7 +1290,9 @@ class DaikinHVACAdapter:
         reason = "no_hvac_automation_state_saved"
         if not main_restored or not restored or not zones_restored:
             reason = "hvac_release_failed"
-            if self._zone_restore_needs_operator(unresolved_zones, unresolved_main_state):
+            if unresolved_main_state.get(MEMORY_KEY) and unresolved_main_state.get("zone_recovery_blocker"):
+                reason = "hvac_zone_restore_operator_required"
+            elif self._zone_restore_needs_operator(unresolved_zones, unresolved_main_state):
                 unresolved_main_state["zone_recovery_blocker"] = "saved_zone_targets_incompatible_with_off_baseline"
                 reason = "hvac_zone_restore_operator_required"
             else:
@@ -1317,6 +1458,10 @@ class DaikinHVACAdapter:
 
     def _zone_restore_deferred(self, entity_id: str, target: Any) -> bool:
         """Wait for a zone to expose a target and bounds compatible with its baseline."""
+        if isinstance(target, dict) and target.get("baseline_hvac_mode"):
+            head = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+            if head is None or head.state != target["baseline_hvac_mode"]:
+                return True
         if not entity_id.startswith("climate.") or not isinstance(target, dict):
             return False
         observed = self._state(entity_id)
@@ -1348,6 +1493,16 @@ class DaikinHVACAdapter:
         """Restore captured zone states."""
         unresolved: dict[str, Any] = {}
         for entity_id, state in states.items():
+            if (self._mode_memory_control() and state == "on"
+                    and (not self._restoring_off_start or self._manual_override_requested is not None
+                         and self._manual_override_requested())
+                    and not entity_id.startswith("climate.")
+                    and self._state_value(str(self.entry_data.get(CONF_DAIKIN_CLIMATE))) == "off"):
+                # A manually superseded head stays Off; opening a Daikin zone
+                # can otherwise recall its previous active mode.
+                if self._state_value(entity_id) != "on":
+                    unresolved[entity_id] = state
+                continue
             if await self._async_zone_restore_is_superseded(entity_id):
                 continue
             if entity_id.startswith("climate.") and self._zone_restore_deferred(entity_id, state):
@@ -1479,6 +1634,10 @@ class DaikinHVACAdapter:
         result = {}
         for actuator, climate in self._independent_pairs().items():
             target = zones.get(climate)
+            if isinstance(target, dict) and target.get("baseline_hvac_mode"):
+                head = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+                if head is None or head.state != target["baseline_hvac_mode"]:
+                    continue
             observed = self._state(climate)
             if (actuator in zones and isinstance(target, dict) and _has_restorable_temperature_target(target)
                     and observed is not None and not _already_in_desired_state(observed, target)
@@ -1494,10 +1653,130 @@ class DaikinHVACAdapter:
                 result.setdefault(actuator, saved[actuator])
         return result
 
+    async def _async_restore_off_start(
+        self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
+    ) -> tuple[bool, bool, dict[str, Any]]:
+        """One bounded, durable mode-aware restoration; failed shutdown never probes."""
+        memory = main_state[MEMORY_KEY]
+        from .daikin_memory import provider
+        from .zone_control import topology
+        source = provider(self.hass, self.entry_data)
+        valid = (memory.get("version") == 1 and memory.get("head") == main_entity
+                 and source is not None and source_matches(self.hass, self.entry_data, memory)
+                 and topology(self.entry_data).get("pairs") == memory.get("pairs"))
+        if not valid:
+            main_state["zone_recovery_blocker"] = "off_start_provider_identity_changed"
+            return False, False, dict(zones)
+        if main_state.get("off_start_restore_attempted"):
+            observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
+            if memory_matches(observed, memory, zones):
+                return True, True, {}
+            # Retain every baseline. Incomplete restoration may only inspect or
+            # shut down; never alternate remembered modes on subsequent retries.
+            await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+            main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
+            return False, False, dict(zones)
+        main_state["off_start_restore_attempted"] = True
+        main_state["zone_recovery_blocker"] = "off_start_restore_incomplete"
+        if self._async_persist_main_state is not None:
+            await self._async_persist_main_state(deepcopy(main_state))
+        pending = dict(zones)
+        self._restoring_memory = memory
+        self._restoring_owned_zone_entities = set(zones)
+        self._restoring_off_start = True
+        main_ok = False
+        try:
+            mode = memory["acquired_mode"]
+            normal = memory["modes"][mode]
+            current_power = {actuator: self._state_value(actuator) for actuator in memory["pairs"]}
+            current_open = {actuator for actuator, power in current_power.items() if power == "on"}
+            config = topology(self.entry_data)
+            safe = any(current_open == set(row) for row in config["safe_open_sets"])
+            if any(power not in {"on", "off"} for power in current_power.values()):
+                return False, False, pending
+            if not safe and self._state_value(main_entity) != "off":
+                if not await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"}):
+                    return False, False, pending
+            if self._state_value(main_entity) == "off":
+                self._off_start_activation = await read_activation(self.hass, self.entry_data)
+                if self._off_start_activation is None:
+                    return False, False, pending
+            # Keep an already safe subset. Capturing a closed thermostat's
+            # memory does not authorize reopening that room for restoration.
+            candidates = [set(row) for row in config["safe_open_sets"]
+                          if current_open <= set(row) and set(row) - current_open <= zones.keys()]
+            if not safe:
+                if not candidates:
+                    return False, False, pending
+                opened, _ = await self._async_restore_zone_states({
+                    actuator: "on" for actuator in min(candidates, key=lambda row: (
+                        -sum(zones.get(entity) == "on" for entity in row), len(row), sorted(row)))
+                    if actuator not in current_open
+                })
+                if not opened:
+                    return False, False, pending
+            stage = {"hvac_mode": mode, "target_temperature": normal["target_temperature"]}
+            if self._set_pending_main_restore is not None:
+                self._set_pending_main_restore(stage)
+            if not await self._async_restore_main_state_preserving_manual(main_entity, stage):
+                return False, False, pending
+            targets = {entity: {"target_temperature": target, "baseline_hvac_mode": mode}
+                       for entity, target in normal["zones"].items() if entity in zones}
+            _, unfinished = await self._async_restore_zone_states(targets)
+            pending = {entity: value for entity, value in zones.items() if not entity.startswith("climate.")}
+            pending.update(unfinished)
+            selected = memory["selected_mode"]
+            # Mode recall must be restored separately from the mode whose
+            # temperature was changed; generic off/19 cannot restore cool/23.
+            final = {"hvac_mode": selected,
+                     "target_temperature": memory["modes"][selected]["target_temperature"]}
+            if self._set_pending_main_restore is not None:
+                self._set_pending_main_restore(final)
+            main_ok = await self._async_restore_main_state_preserving_manual(main_entity, final)
+            if main_ok:
+                # Reopen original On paths under the original remembered mode,
+                # then confirm Off before closing original Off paths. Opening
+                # an On damper after shutdown could otherwise wake the head.
+                _, unfinished_on = await self._async_restore_zone_states({
+                    entity: value for entity, value in pending.items()
+                    if not entity.startswith("climate.") and value == "on"
+                })
+                main_ok = await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+                unfinished_power = {entity: value for entity, value in pending.items()
+                                    if not entity.startswith("climate.") and value != "on"}
+                if main_ok:
+                    _, unfinished_power = await self._async_restore_zone_states(unfinished_power)
+                pending = {entity: value for entity, value in pending.items() if entity.startswith("climate.")}
+                pending.update(unfinished_on)
+                pending.update(unfinished_power)
+        finally:
+            # Even cancellation and malformed persisted evidence retain Off as
+            # the known safe power baseline. Manual main supersession still wins.
+            if self._set_pending_main_restore is not None:
+                self._set_pending_main_restore(main_state)
+            try:
+                await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+            finally:
+                self._restoring_off_start = False
+                self._restoring_memory = None
+                self._restoring_owned_zone_entities.clear()
+                self._off_start_activation = None
+        if main_ok and not pending:
+            # Verify all modes after the mandatory shutdown cleanup, rather
+            # than claiming success from visible HA targets alone.
+            observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
+            if not memory_matches(observed, memory, zones):
+                main_ok, pending = False, dict(zones)
+        if pending or not main_ok:
+            main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
+        return main_ok, not pending, self._retain_paired_zone_power(zones, pending)
+
     async def _async_restore_main_and_zones(
         self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
     ) -> tuple[bool, bool, dict[str, Any]]:
         """Restore dependent targets before removing the mode that exposes them."""
+        if main_state.get(MEMORY_KEY):
+            return await self._async_restore_off_start(main_entity, main_state, zones)
         from .zone_control import topology
         config = topology(self.entry_data)
         independent = bool(config.get("supported") and zones
@@ -2108,6 +2387,11 @@ class DaikinHVACAdapter:
                     entity_id, lambda state: self._equipment_target_available(entity_id, desired_temperature),
                 )):
             raise _HVACStateConfirmationError("equipment target bounds were not confirmed")
+        if (desired_temperature is not None and self._mode_memory_control()
+                and not await self._async_wait_for_climate(
+                    entity_id, lambda state: self._memory_target_available(entity_id, desired_temperature),
+                )):
+            raise _HVACStateConfirmationError("mode-memory target bounds were not confirmed")
         if desired_temperature is not None and (force or not _temperature_matches(observed, desired_temperature)):
             command_sent = True
             await self._async_command(

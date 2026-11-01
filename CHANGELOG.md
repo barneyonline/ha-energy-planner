@@ -8,7 +8,7 @@
 
 ### ✨ New features
 
-- None
+- Add opt-in synchronized AirBase preconditioning from Off when fresh vendor readback proves complete heating/cooling head and zone memories. Persist immutable mode-aware restoration and separate attempt snapshots before writes; restore the changed mode before the original remembered mode and Off power. Unsupported or incomplete capability stays blocked, and interrupted restoration retains evidence for bounded operator recovery without repeated mode cycling.
 
 ### 🐛 Bug fixes
 
