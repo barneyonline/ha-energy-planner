@@ -20,7 +20,7 @@
 
 ### 🔄 Other changes
 
-- None
+- Add maintenance workflows and merge checks for HAL-managed issues and PR feedback, with shared operating instructions and changelog/release templates maintained in the central HAL plugin. Keep unattended activation gated by verification.
 
 ## 1.4.10 - 2026-11-01
 
@@ -44,7 +44,6 @@
 
 ### 🔄 Other changes
 
-- Add repository controls and templates for HAL-managed issue investigation, complete PR-feedback review, and verified bug-release delivery. Bind final independent handling verdicts to settled checks in separate PR conversation comments. Verify native clean-review receipts and explicit zero-run app-suite evidence without waiving actual feedback or check failures.
 - Refresh the README with Planning Hub light and dark banners, matching social artwork and a renderer for all 18 wiki banners, fresh Home Assistant screenshots in both themes, concise features, a compact expandable gallery, a direct HACS link and visible footer badges. Preserve detailed operating notes in the linked planning and control guide.
 
 ## 1.4.9 - 2026-10-31
