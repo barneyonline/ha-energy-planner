@@ -139,6 +139,10 @@ jobs:
             }
 
             async function reconcileIssue(issue) {
+              const existing = new Set(issue.labels.map((label) => typeof label === "string" ? label : label.name));
+              if (existing.has("automation/hal") || existing.has("automation/control")) {
+                return;
+              }
               const title = issue.title || "";
               if (!title.startsWith("[Bug]:") && !title.startsWith("[Feature]:")) {
                 return;
@@ -163,7 +167,6 @@ jobs:
                 await ensureLabel(label);
               }
 
-              const existing = new Set(issue.labels.map((label) => typeof label === "string" ? label : label.name));
               const managedExisting = [...existing].filter((label) =>
                 label === "status/needs-triage" ||
                 label === "status/needs-diagnostics" ||
