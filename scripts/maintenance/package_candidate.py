@@ -28,7 +28,7 @@ CONTROLLER_ACTIONS = {
 
 CALLER_TEMPLATE_SHA256 = {
     ".github/workflows/stale_blocked_issues.yml": "a817987414f6265b44aa86c1972cce96abb665a6c0dbff0efcaa9805f05cc1a5",
-    ".github/workflows/coverage-reporting.yml": "8d871b0d00bd42a568bf9022ac86a88acea331dac72f09b8300c5ffb61426543",
+    ".github/workflows/coverage-reporting.yml": "7348bc26ed69c1e24c7d00b74538c44272c2c070f904ed5d5fe7e749b36bcd5a",
     ".github/workflows/maintenance-control.yml": "acd5cb108642e568da2a0f41732fd281642848661a3138f8bb7ae60d6c0f34e6",
     ".github/workflows/maintenance-gate.yml": "713e663b82dbb75887b5733a862e03aaa43b52bedffdb0d369d5a8a3f1ea72d4",
 }
