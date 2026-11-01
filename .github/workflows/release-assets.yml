@@ -47,6 +47,7 @@ jobs:
             core.setOutput('release_tag', tag);
 
   package:
+    cache-mode: none
     needs: resolve
     runs-on: ubuntu-26.04
     steps:
