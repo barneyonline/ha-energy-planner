@@ -20,7 +20,6 @@ class CheckSelection:
 
 
 _ALL_CHECKS = {
-    ".github/workflows/ci.yml",
     ".github/workflows/tests.yml",
     "pyproject.toml",
     "scripts/install-test-dependencies.sh",
@@ -67,6 +66,8 @@ _WORKFLOW_ONLY_PATHS = {
     ".github/workflows/hassfest.yml",
     ".github/workflows/quality-scale.yml",
     ".github/workflows/release-assets.yml",
+    ".github/workflows/release-candidate.yml",
+    ".github/workflows/coverage-reporting.yml",
     ".github/workflows/validate.yaml",
 }
 
@@ -78,9 +79,7 @@ def _matches(path: str, patterns: tuple[str, ...]) -> bool:
 def select_checks(paths: list[str], *, force_all: bool = False) -> CheckSelection:
     """Return the checks needed for normalized repository-relative paths."""
     normalized = {path.strip().removeprefix("./") for path in paths if path.strip()}
-    dedicated_quality_scale = any(
-        _matches(path, _DEDICATED_QUALITY_SCALE_PATTERNS) for path in normalized
-    )
+    dedicated_quality_scale = any(_matches(path, _DEDICATED_QUALITY_SCALE_PATTERNS) for path in normalized)
     if force_all:
         return CheckSelection(True, True, True, False)
     if normalized & _ALL_CHECKS:

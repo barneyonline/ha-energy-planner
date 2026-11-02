@@ -17,7 +17,6 @@ jobs:
     if: >
       github.event_name == 'workflow_dispatch' ||
       (!contains(github.event.issue.labels.*.name, 'automation/hal') &&
-       !contains(github.event.issue.labels.*.name, 'automation/control') &&
        (
         startsWith(github.event.issue.title, '[Bug]:') ||
         startsWith(github.event.issue.title, '[Feature]:')
@@ -140,7 +139,7 @@ jobs:
 
             async function reconcileIssue(issue) {
               const existing = new Set(issue.labels.map((label) => typeof label === "string" ? label : label.name));
-              if (existing.has("automation/hal") || existing.has("automation/control")) {
+              if (existing.has("automation/hal")) {
                 return;
               }
               const title = issue.title || "";

@@ -47,7 +47,6 @@ jobs:
             core.setOutput('release_tag', tag);
 
   package:
-    cache-mode: none
     needs: resolve
     runs-on: ubuntu-26.04
     steps:
@@ -71,10 +70,9 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve.outputs.release_tag }}
           SOURCE_SHA: ${{ needs.resolve.outputs.source_sha }}
         run: >
-          python3 tools/scripts/maintenance/package_candidate.py
+          python3 tools/scripts/package_candidate.py
           --root candidate --domain ha_energy_planner
           --version "$RELEASE_TAG" --expected-sha "$SOURCE_SHA"
-          --historical-release-repair
           --output-dir "$RUNNER_TEMP/release-assets"
       - name: Smoke-test packaged Planner runtime
         env:
