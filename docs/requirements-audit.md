@@ -1176,6 +1176,21 @@ use throughout; the Docker and pull-request gates enforce that result.
   reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
+- Migration repair ownership and refresh: `migration_recovery.py` passes
+  `config_entry_id` when the HA 2026.11 issue refresh API is available. Integration
+  startup reconciles only existing `legacy_vehicle_target_` issue IDs, including
+  ownerless records restored from older versions. It recreates pending repairs
+  in place, preserving ignored state and creation time even after a target was
+  saved but migration retry failed; only removed or migrated entries lose their
+  notices. The synchronous refresh ends before storage or platform setup, and
+  exceptions cancel native stale-issue cleanup. No repairs are deleted on unload.
+  Explicit removal cleanup remains for HA 2026.10 and legacy ownerless records;
+  that version also reconciles stale notices without calling the new APIs.
+  `tests/test_repairs.py` covers these paths with inline config-entry/registry
+  fixtures and saved restart records, plus native 2026.11 ownership, disabled-entry
+  visibility, removal isolation and refresh cancellation tests when supported.
+  The advertised minimum remains 2026.10.0; this draft must not merge until the
+  owner handles the separate HA 2026.11 minimum-version bump.
 - The minimum and pinned baseline are HA 2026.10.0. Migration recovery uses the
   public retry API directly; obsolete restart branches, strings and tests are
   removed. Schemas import Probatio directly; binary-sensor device classes use
