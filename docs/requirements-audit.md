@@ -649,7 +649,13 @@ use throughout; the Docker and pull-request gates enforce that result.
   evidence. Pytest treats warnings as errors, with exact test-only exceptions for
   two upstream Home Assistant HTTP/aiohttp messages. Codecov uploads the generated
   coverage and test-result reports without automatic collection plugins or host
-  report searching. [Validation warnings](validation-warnings.md) records the
+  report searching. Reporting checks out only the validated producer commit as
+  source data, disables credential persistence, and uses that checkout for the
+  tracked-file network; test execution remains uncredentialed. The inline report
+  validator uses isolated Python imports to prevent producer-module execution.
+  Coverage paths remain relative across Docker and reporting checkouts, verified by
+  `tests/test_ci_coverage_paths.py`.
+  [Validation warnings](validation-warnings.md) records the
   remaining upstream/environment ownership and removal criteria.
   `scripts/report-smoke-warnings.py` and `tests/scripts/test_smoke_warnings.py`
   verify exact known-message classification, new diagnostic rejection, failure
