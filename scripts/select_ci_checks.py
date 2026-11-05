@@ -20,6 +20,9 @@ class CheckSelection:
 
 
 _ALL_CHECKS = {
+    "Dockerfile.dev",
+    ".dockerignore",
+    "docker-compose.yml",
     ".github/workflows/tests.yml",
     "pyproject.toml",
     "scripts/install-test-dependencies.sh",
@@ -32,6 +35,8 @@ _PYTEST_PATTERNS = (
     "scripts/*.py",
     "scripts/**/*.py",
     "scripts/docker-validate.sh",
+    "scripts/ha-dev.sh",
+    "scripts/docker-pytest-fast.sh",
 )
 
 _DEDICATED_QUALITY_SCALE_PATTERNS = (

@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1
+ARG HA_IMAGE=ghcr.io/home-assistant/home-assistant:2026.10.0
+FROM ${HA_IMAGE}
+
+ARG MYPY_VERSION
+ARG RUFF_VERSION
+
+# Mount session trust for installation without saving it in an image layer.
+# These development tools are on PyPI; HA's optional wheel index is unnecessary.
+RUN --mount=type=secret,id=cloud_ca \
+    --mount=type=bind,source=tests/requirements.txt,target=/run/test-requirements.txt \
+    if [ -f /run/secrets/cloud_ca ]; then export PIP_CERT=/run/secrets/cloud_ca; fi; \
+    export PIP_EXTRA_INDEX_URL=https://pypi.org/simple; \
+    python3 -m pip install --no-cache-dir --disable-pip-version-check --root-user-action ignore \
+      --index-url https://pypi.org/simple --extra-index-url https://pypi.org/simple \
+      -r /run/test-requirements.txt \
+      "mypy==$MYPY_VERSION" "ruff==$RUFF_VERSION" \
+    && python3 -m pip check \
+    && python3 -c 'import site; from pathlib import Path; p = Path(site.getsitepackages()[0]) / "homeassistant"; p.exists() or p.symlink_to("/usr/src/homeassistant/homeassistant")'
+
+# HA itself starts only through the optional manual runtime.
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

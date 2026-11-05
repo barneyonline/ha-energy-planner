@@ -8,6 +8,7 @@ dependencies = []
 baseline = "2026.10.0"
 previous = []
 mypy = "1.19.1"
+ruff = "0.14.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
