@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import os
 import re
 import shlex
@@ -25,51 +24,67 @@ SHA = "a" * 40
 PACKAGE = "custom_components/ha_energy_planner"
 
 
-class InventoryTests(unittest.TestCase):
-    def setUp(self) -> None:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.names = [f"{PACKAGE}/__init__.py", f"{PACKAGE}/nested/__init__.py", "tests/__init__.py", "codecov"]
-        self.tree = {
-            "commit": SHA,
-            "truncated": False,
-            "tree": [{"path": name, "type": "blob", "mode": "100644"} for name in self.names],
-        }
-
-    def test_inventory_is_exact_and_inert_despite_wrapper_downloads(self) -> None:
-        reporting.prepare(self.tree, SHA, self.root)
-        source, work = self.root / "codecov-source", self.root / "codecov-work"
-        for name in ("codecov", "codecov.SHA256SUM", "codecov.SHA256SUM.sig"):
-            (work / name).write_text("wrapper download")
-        actual = {path.relative_to(source).as_posix() for path in source.rglob("*") if path.is_file()}
-        self.assertEqual(set(self.names), actual)
-        self.assertTrue(all(path.stat().st_size == 0 for path in source.rglob("*") if path.is_file()))
-        self.assertFalse((source / ".git").exists())
-        self.assertFalse((work / ".git").exists())
-        # The original reports-only root had no source paths at all.
-        self.assertNotIn("coverage.xml", actual)
-
-    def test_wrong_or_truncated_commit_fails(self) -> None:
-        for changes in ({"commit": "b" * 40}, {"truncated": True}, {"tree": []}):
-            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as temporary:
-                with self.assertRaises(ValueError):
-                    reporting.prepare({**self.tree, **changes}, SHA, Path(temporary))
-
-    def test_unsafe_paths_are_rejected_and_symlinks_are_never_materialized(self) -> None:
-        for name in ("/absolute", "../escape", ".git/config", "a//b", "a\\b", "a\nb"):
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
-                tree = {**self.tree, "tree": [{"path": name, "type": "blob", "mode": "100644"}]}
-                with self.assertRaises(ValueError):
-                    reporting.prepare(tree, SHA, Path(temporary))
-        self.tree["tree"].append({"path": "link", "type": "blob", "mode": "120000"})
-        reporting.prepare(self.tree, SHA, self.root)
-        self.assertFalse((self.root / "codecov-source/link").exists())
+class CheckoutTests(unittest.TestCase):
+    def test_working_directory_is_clean_but_uses_the_checkout_git_inventory(self) -> None:
+        workflow = yaml.safe_load((ROOT / ".github/workflows/coverage-reporting.yml").read_text())
+        script = next(step["run"] for step in workflow["jobs"]["upload"]["steps"] if step.get("id") == "uploader")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "codecov-source"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
+            (source / "codecov").symlink_to(root / "must-not-overwrite")
+            (source / "codecov.yml").write_text("plugins: [candidate-program]\n")
+            (source / "sample.py").write_text("raise RuntimeError('candidate code must never run')\n")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(source),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.test",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "fixture",
+                ],
+                check=True,
+                capture_output=True,
+            )
+            sha = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+            output = root / "output"
+            subprocess.run(
+                ["bash", "-e", "-c", script],
+                env={**os.environ, "GITHUB_WORKSPACE": temporary, "GITHUB_OUTPUT": str(output), "SOURCE_SHA": sha},
+                check=True,
+                capture_output=True,
+            )
+            work = Path(output.read_text().strip().removeprefix("path="))
+            self.assertEqual({}, yaml.safe_load((work / "codecov.yml").read_text()))
+            for name in ("codecov", "codecov.SHA256SUM", "codecov.SHA256SUM.sig"):
+                (work / name).write_text("trusted wrapper download")
+            self.assertEqual(
+                str(source),
+                subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=work, text=True).strip(),
+            )
+            network = (
+                subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"], cwd=work).decode().split("\0")
+            )
+            self.assertEqual({"codecov", "codecov.yml", "sample.py"}, set(network) - {""})
+            self.assertFalse((root / "must-not-overwrite").exists())
 
 
 class XmlPathsTests(unittest.TestCase):
     def test_actual_producer_command_preserves_full_paths_and_covered_uncovered_lines(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github/workflows/tests.yml").read_text())
+        checkout = workflow["jobs"]["pytest-coverage"]["steps"][0]["with"]
+        self.assertEqual("${{ github.event.pull_request.head.sha || github.sha }}", checkout["ref"])
         script = next(
             step["run"] for step in workflow["jobs"]["pytest-coverage"]["steps"] if step.get("id") == "pytest"
         )
@@ -218,15 +233,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(
             {"contents": "read", "actions": "read", "pull-requests": "read", "id-token": "write"}, job["permissions"]
         )
-        self.assertNotIn("actions/checkout", json.dumps(workflow))
         steps = job["steps"]
+        checkout = next(step["with"] for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+        self.assertEqual("${{ steps.source.outputs.sha }}", checkout["ref"])
+        for setting in ("persist-credentials", "submodules", "lfs"):
+            self.assertEqual("false", checkout[setting])
         trusted = next(step for step in steps if "REPORTER_SHA" in step.get("env", {}))
         self.assertEqual("${{ github.workflow_sha }}", trusted["env"]["REPORTER_SHA"])
         for step in steps:
             if step.get("uses", "").startswith("codecov/"):
                 settings = step["with"]
-                self.assertEqual("${{ runner.temp }}/codecov-source", settings["root_dir"])
-                self.assertEqual("${{ runner.temp }}/codecov-work", settings["working-directory"])
+                self.assertEqual("${{ github.workspace }}/codecov-source", settings["root_dir"])
+                self.assertEqual("${{ steps.uploader.outputs.path }}", settings["working-directory"])
+                self.assertEqual("${{ steps.uploader.outputs.path }}/codecov.yml", settings["codecov_yml_path"])
                 for setting in ("use_oidc", "disable_search", "disable_file_fixes", "fail_ci_if_error"):
                     self.assertEqual("true", settings[setting])
                 self.assertEqual("noop", settings["plugins"])
