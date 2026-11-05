@@ -90,6 +90,9 @@ async def async_wait_for_plan_execution(self: EnergyPlannerCoordinator) -> None:
     execution_task = getattr(self, "_plan_execution_task", None)
     if execution_task is not None:
         tasks.add(execution_task)
+    reconciliation_task = getattr(self, "_export_reconcile_task", None)
+    if reconciliation_task is not None:
+        tasks.add(reconciliation_task)
     if not tasks:
         return
     results = await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)
