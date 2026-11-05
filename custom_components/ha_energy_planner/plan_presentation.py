@@ -44,18 +44,20 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     plan = coordinator.data
     status = dict(plan.device_plans.get("enphase_export_limit", {})) if plan is not None else {}
     ownership = coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {})
+    runtime_reason: str | None = None
     if isinstance(ownership, dict) and ownership:
         status["ownership"] = dict(ownership)
-        reason = ownership.get("pause") or (
+        runtime_reason = ownership.get("pause") or (
             "export_limit_pending" if ownership.get("pending") else
             "export_limit_restoration_pending" if ownership.get("restoring") else None
         )
-        if reason:
-            status.update(ready=False, reason=reason)
+        if runtime_reason:
+            status.update(ready=False, reason=runtime_reason)
     if getattr(coordinator, "options", {}).get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
         pause = control_pause_reason(coordinator.store.data.get("control_pause"), dt_util.utcnow(),
                                      asset="enphase_export_limit")
         if pause:
+            runtime_reason = pause
             status.update(ready=False, reason=pause)
     hass = getattr(coordinator, "hass", None)
     entity = getattr(coordinator, "entry_data", {}).get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
@@ -70,6 +72,14 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
             if status.get("reason") in {None, "export_limit_restoration_pending"} else status["reason"]))
         status["summary"] = ("Export setting changes are deferred until "
                              f"{timing['next_eligible_change_at']}; latest tariff and feedback will be rechecked.")
+    if getattr(coordinator, "_export_reconcile_pending", False):
+        status.update(ready=False, reconciliation_pending=True)
+        if runtime_reason and status.get("reason") == runtime_reason:
+            # Queueing does not replace a durable pause or outstanding readback.
+            status["summary"] = plain_reason(runtime_reason)
+        elif not timing.get("deferred"):
+            status.update(reason="export_reconciliation_pending",
+                          summary="Waiting for serialized control reconciliation; planning continues.")
     if status.get("reason") in {"export_limit_pending", "export_limit_restoration_pending"}:
         status["summary"] = "Waiting for gateway confirmation; the planned setting is not yet confirmed."
     return status

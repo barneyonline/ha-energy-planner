@@ -965,7 +965,9 @@ def test_restore_isolated_from_profile_and_pending_outcome(setup):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("stage", ["seed", "pending", "restore", "review", "unsupported", "off_restore", "off"])
+@pytest.mark.parametrize("stage", [
+    "seed", "pending", "restore", "review", "unsupported", "off_restore", "off", "reconciliation_pending",
+])
 def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, stage):
     from test_coordinator import _coordinator_for_runtime_services
 
@@ -1012,6 +1014,8 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             coordinator.store.async_add_outcome = setup.store.async_add_outcome
             coordinator.store.async_flush = setup.store.async_flush
         await coordinator._async_reconcile_export_limit()
+        if stage == "reconciliation_pending":
+            coordinator._export_reconcile_pending = True
         result = await coordinator._async_update_data_locked(defer_execution=True)
         if "history_training" in coordinator.__dict__ and coordinator.history_training.task:
             await coordinator.history_training.task
@@ -1995,5 +1999,84 @@ def test_restoration_already_at_original_baseline_does_not_fabricate_calendar_ac
             OutcomeResult.RESTORED, "export_limit_restored", False)
         assert not setup.control.state and len(setup.calls) == 2
         assert setup.store.data["calendar_history"]["history"] == history
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["confirm", "manual", "restore", "unavailable", "stale", "target", "storage"])
+def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(setup, change):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import FakeStore, _coordinator_for_runtime_services, _plan
+
+    async def run():
+        # Start with a durable pending export request, as after a reload.
+        await setup.control.execute(action(setup), NOW)
+        owner = _coordinator_for_runtime_services(entry_data=dict(DATA), options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        owner.store.async_delay_save = FakeStore().async_delay_save
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("pending"))
+        owner._schedule_debounced_refresh = Mock()
+        owner.async_update_listeners = Mock()
+        owner.executor.async_resolve_restore_notifications = AsyncMock()
+        setup.hass.async_create_task = asyncio.create_task
+        await owner._command_lock.acquire()
+        for _ in range(5):
+            await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        await asyncio.sleep(0)
+        assert not worker.done()
+        assert owner.refresh_metrics["export_reconciliation_pending"] is True
+        original_calls = len(setup.calls)
+        if change == "manual":
+            setup.states[ENTITY] = limit_state(700, slew=55)
+            # Pending confirmation may not adopt conflicting readback until
+            # its original deadline; it must never restore over a manual change.
+        elif change == "restore":
+            setup.states[ENTITY] = limit_state(0)
+            state = setup.control.state
+            state["restoring"] = True
+            await setup.control.save(state)
+            setup.mode["value"] = "confirm"
+        elif change == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        elif change == "stale":
+            setup.states[ENTITY] = limit_state(0, readback=NOW.timestamp() - 900)
+        elif change == "target":
+            owner.entry.data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY] = "sensor.replaced"
+        elif change == "storage":
+            setup.states[ENTITY] = limit_state(0)
+            setup.store.fail = True
+        else:
+            setup.states[ENTITY] = limit_state(0)
+        owner._command_lock.release()
+        await asyncio.wait_for(worker, 1)
+        assert owner._export_reconcile_task is None
+        if change == "storage":
+            assert owner._export_reconcile_pending is True
+            owner._schedule_debounced_refresh.assert_not_called()
+        else:
+            assert owner._export_reconcile_pending is False
+            owner._schedule_debounced_refresh.assert_called_once()
+        if change == "restore":
+            # Reconciliation confirms the original request first. Restoration
+            # still waits for main's mandatory observed-confirmation cooldown.
+            assert len(setup.calls) == original_calls
+            assert setup.control.state["restoring"] is True
+            advance_clock(setup)
+            await owner._async_update_data()
+            assert len(setup.calls) == original_calls + 1
+            assert not setup.control.state
+            # An ordinary refresh after recovery must not duplicate restoration.
+            await owner._async_update_data()
+            assert len(setup.calls) == original_calls + 1
+        else:
+            assert len(setup.calls) == original_calls
+        if change in {"manual", "unavailable", "stale", "target"}:
+            assert setup.control.state["pending"]
+            assert setup.control.state["baseline"]["watts"] is None
+        elif change == "confirm":
+            assert "pending" not in setup.control.state
+            assert setup.control.state["expected"]["watts"] == 0
 
     asyncio.run(run())

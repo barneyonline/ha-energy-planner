@@ -16,7 +16,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Account for the complete refresh lifecycle in elapsed-time diagnostics, including lock waits and final storage flush. Keep planning responsive behind busy control transactions with conservative deferred export reconciliation.
 
 ### 🔄 Other changes
 
