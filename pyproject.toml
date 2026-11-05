@@ -12,6 +12,8 @@ mypy = "1.19.1"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Print blocked-thread stacks before CI job timeouts terminate a stalled run.
+faulthandler_timeout = 60
 # Home Assistant 2026.10's HTTP implementation emits these aiohttp warnings.
 # Keep only these upstream exceptions; new warnings still fail validation.
 # See docs/validation-warnings.md for ownership and removal criteria.
