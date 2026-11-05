@@ -50,12 +50,12 @@ def test_coverage_report_survives_a_different_checkout_path(tmp_path: Path) -> N
         assert any((consumer / root / filename).is_file() for root in sources)
 
 
-def test_codecov_file_network_uses_the_report_producers_checkout() -> None:
+def test_codecov_file_network_uses_a_trusted_checkout_with_producer_attribution() -> None:
     """Both uploads need source metadata while reports stay outside that tree."""
     workflow = yaml.safe_load((ROOT / ".github/workflows/coverage-reporting.yml").read_text())
     steps = workflow["jobs"]["upload"]["steps"]
     checkout = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
-    assert checkout["with"]["ref"] == "${{ steps.source.outputs.sha }}"
+    assert checkout["with"]["ref"] == "${{ github.sha }}"
     assert checkout["with"]["persist-credentials"] is False
     assert checkout["if"] == "${{ steps.source.outputs.artifact_id != '' }}"
     uploads = [step for step in steps if step.get("uses", "").startswith("codecov/codecov-action@")]
@@ -65,11 +65,61 @@ def test_codecov_file_network_uses_the_report_producers_checkout() -> None:
         settings = upload["with"]
         assert settings["root_dir"] == "${{ github.workspace }}"
         assert settings["files"].startswith("${{ runner.temp }}/reports/")
-        assert settings["override_commit"] == checkout["with"]["ref"]
+        assert settings["override_commit"] == "${{ steps.source.outputs.sha }}"
         assert settings["use_oidc"] is True
         assert settings["plugins"] == "noop"
         assert settings["disable_search"] is True
         assert settings["disable_file_fixes"] is True
+
+
+def test_producer_file_index_keeps_the_trusted_working_tree(tmp_path: Path) -> None:
+    """Enumerate added/deleted PR files without installing their source tree."""
+    workflow = yaml.safe_load((ROOT / ".github/workflows/coverage-reporting.yml").read_text())
+    steps = workflow["jobs"]["upload"]["steps"]
+    step = next(step for step in steps if step.get("name") == "Index producer paths without checking out producer code")
+    checkout_step = next(step for step in steps if step.get("uses", "").startswith("actions/checkout@"))
+    assert steps.index(checkout_step) < steps.index(step)
+    uploads = [step for step in steps if step.get("uses", "").startswith("codecov/codecov-action@")]
+    assert all(steps.index(step) < steps.index(upload) for upload in uploads)
+
+    def git(directory: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(directory), *args],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    producer = tmp_path / "producer"
+    producer.mkdir()
+    git(producer, "init", "-q")
+    git(producer, "config", "user.name", "Test")
+    git(producer, "config", "user.email", "test@example.invalid")
+    (producer / "source.py").write_text("trusted = True\n")
+    (producer / "removed.py").write_text("removed = True\n")
+    git(producer, "add", ".")
+    git(producer, "commit", "-qm", "Trusted reporting revision")
+    trusted_sha = git(producer, "rev-parse", "HEAD")
+    (producer / "source.py").write_text("raise RuntimeError('Untrusted producer code')\n")
+    (producer / "removed.py").unlink()
+    (producer / "added.py").write_text("added = True\n")
+    git(producer, "add", "-A")
+    git(producer, "commit", "-qm", "Producer revision")
+    producer_sha = git(producer, "rev-parse", "HEAD")
+    reporter = tmp_path / "reporter"
+    git(tmp_path, "clone", "-q", str(producer), str(reporter))
+    git(reporter, "checkout", "-q", trusted_sha)
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=reporter,
+        env={**os.environ, "PRODUCER_SHA": producer_sha, "GH_TOKEN": "synthetic-test-token"},
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert git(reporter, "rev-parse", "HEAD") == trusted_sha
+    assert git(reporter, "ls-files").splitlines() == ["added.py", "source.py"]
+    assert (reporter / "source.py").read_text() == "trusted = True\n"
+    assert (reporter / "removed.py").is_file()
+    assert not (reporter / "added.py").exists()
+    assert "extraheader" not in git(reporter, "config", "--local", "--list")
 
 
 def test_report_validation_cannot_import_producer_modules(tmp_path: Path) -> None:

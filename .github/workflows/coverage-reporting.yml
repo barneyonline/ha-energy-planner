@@ -1,8 +1,8 @@
 name: Coverage Reporting
 
 # Test jobs have no reporting credentials. This default-branch workflow only
-# downloads their report files and checks out source only as data for Codecov's
-# tracked-file network. It never executes pull-request code.
+# downloads their report files and indexes producer paths for Codecov's tracked
+# file network. Only the trusted reporting revision is checked out.
 on:
   workflow_run:
     workflows: [Tests]
@@ -76,12 +76,27 @@ jobs:
             core.setOutput('sha', run.head_sha);
             core.setOutput('branch', branch);
             core.setOutput('pr', prNumber);
-      - name: Check out producer source for Codecov file matching
+      - name: Check out trusted reporting revision
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: actions/checkout@v6
         with:
-          ref: ${{ steps.source.outputs.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Index producer paths without checking out producer code
+        if: ${{ steps.source.outputs.artifact_id != '' }}
+        env:
+          PRODUCER_SHA: ${{ steps.source.outputs.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$PRODUCER_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          GIT_CONFIG_COUNT=1 \
+            GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" \
+            git fetch --no-tags --depth=1 origin "$PRODUCER_SHA"
+          # No -u: populate only the index consumed by Codecov's git ls-files.
+          git read-tree "$PRODUCER_SHA"
       - name: Download only the selected producer reports
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -96,7 +111,7 @@ jobs:
         env:
           REPORTS: ${{ runner.temp }}/reports
         run: |
-          # The producer tree is untrusted; exclude it from Python imports.
+          # Keep validation independent of repository-local Python modules.
           python3 -I - <<'PYTHON'
           import os
           import stat
