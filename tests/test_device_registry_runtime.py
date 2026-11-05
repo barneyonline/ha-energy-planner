@@ -29,6 +29,7 @@ def test_real_registry_migrates_only_this_entries_retired_devices(
         hass = HomeAssistant(str(tmp_path))
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
         entries = [
             ConfigEntry(
                 domain=DOMAIN, title=title, data={}, options={}, source="user",
