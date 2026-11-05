@@ -484,7 +484,7 @@ rules:
         - scripts/docker-ha-smoke.sh
   diagnostics:
     status: done
-    comment: Redacted diagnostics include current load-fallback status, reason, explanation and remaining grace, bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice. Persistent notifications are queued by stable ID until Home Assistant reaches its running state, with queued alerts cancelled on recovery, and the Explain control publishes bounded pending, accepted, rejected, and failure notifications. Every recorder-facing sensor and binary-sensor payload has a tested UTF-8 byte budget below Recorder's hard limit; compaction avoids full mapping copies and iterates only retained nested entries; calendar event metadata is explicitly byte-bounded, grouped into readable sections, and uses local time for embedded timestamps.
+    comment: Redacted diagnostics include current load-fallback status, reason, explanation and remaining grace, bounded model state, rolling refresh metrics, trigger/coalescing counters, phase timing, usable optimization horizon, detailed dry-run evidence, and current or pending AI advice. Persistent notifications are queued by stable ID until Home Assistant reaches its running state, with queued alerts cancelled on recovery, and the Explain control publishes bounded pending, accepted, rejected, and failure notifications. Every recorder-facing sensor and binary-sensor payload has a tested UTF-8 byte budget below Recorder's hard limit; compaction avoids full mapping copies and iterates only retained nested entries; calendar event metadata is explicitly byte-bounded, grouped into readable sections, and uses local time for embedded timestamps. Calendar publication and range queries select reconciled records before constructing returned HA event objects; current-plan window expansion remains before filtering, and complete confirmed history still participates in reconciliation. Store conversion and normalization share one container walk, preserving existing container/type representation; AI matching hashes the safe current plan once per getter call. Synthetic repeated-read, rollover, feedback, historical query and compaction evidence is documented in docs/entity-publication.md.
     references:
       code:
         - custom_components/ha_energy_planner/coordinator.py
@@ -500,6 +500,8 @@ rules:
         - tests/test_sensor.py
         - tests/test_binary_sensor.py
         - tests/test_calendar.py
+        - tests/test_entity_publication.py
+        - tests/test_next_actions_publication.py
         - scripts/docker-ha-smoke.sh
   discovery-update-info:
     status: exempt

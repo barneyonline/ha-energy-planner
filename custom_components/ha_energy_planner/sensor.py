@@ -868,13 +868,20 @@ def _charge_timeline_state_label(state: dict[str, Any]) -> str:
 def _ai_advice_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return the latest bounded explain-or-troubleshoot result."""
     capability = _ai_capability_attrs(coordinator)
-    current = _current_ai_recommendation(coordinator)
+    plan = coordinator.data
+    fingerprint = (
+        _material_plan_fingerprint(plan)
+        if coordinator.entry_data.get(CONF_AI_TASK_ENTITY) and plan is not None
+        and plan.health != InputHealth.UNSAFE and plan.status != "unsafe"
+        else None
+    )
+    current = _current_ai_recommendation(coordinator, fingerprint=fingerprint)
     if current is None:
         attributes: dict[str, Any] = {
             **capability,
             "result": None,
         }
-        pending = _current_ai_pending(coordinator)
+        pending = _current_ai_pending(coordinator, fingerprint=fingerprint)
         if pending is not None:
             attributes.update(pending)
         return attributes
@@ -937,21 +944,21 @@ def _ai_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any
     }
 
 
-def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
+def _current_ai_recommendation(
+    coordinator: EnergyPlannerCoordinator, *, fingerprint: str | None,
+) -> dict[str, Any] | None:
     """Return exact or materially equivalent advice for the safe current plan."""
-    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
+    # The caller computes this only for a configured provider and a safe plan.
+    if fingerprint is None:
         return None
-    plan = coordinator.data
-    if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
-        return None
-    fingerprint = _material_plan_fingerprint(plan)
     recommendations = coordinator.store.data.get("ai_recommendations", [])
     if not isinstance(recommendations, list):
         return None
+    plan_id = getattr(coordinator.data, "plan_id", None)
     for item in reversed(recommendations):
         if not isinstance(item, dict):
             continue
-        if item.get("plan_id") == plan.plan_id and item.get("plan_fingerprint") == fingerprint:
+        if item.get("plan_id") == plan_id and item.get("plan_fingerprint") == fingerprint:
             return item
     latest = recommendations[-1] if recommendations else None
     if _ai_recommendation_fingerprint(latest) == fingerprint:
@@ -959,14 +966,13 @@ def _current_ai_recommendation(coordinator: EnergyPlannerCoordinator) -> dict[st
     return None
 
 
-def _current_ai_pending(coordinator: EnergyPlannerCoordinator) -> dict[str, Any] | None:
+def _current_ai_pending(
+    coordinator: EnergyPlannerCoordinator, *, fingerprint: str | None,
+) -> dict[str, Any] | None:
     """Return pending metadata only when it belongs to the safe current plan."""
-    if not coordinator.entry_data.get(CONF_AI_TASK_ENTITY):
+    # The caller computes this only for a configured provider and a safe plan.
+    if fingerprint is None:
         return None
-    plan = coordinator.data
-    if plan is None or plan.health == InputHealth.UNSAFE or plan.status == "unsafe":
-        return None
-    fingerprint = _material_plan_fingerprint(plan)
     if getattr(coordinator, "_ai_advice_pending_fingerprint", None) != fingerprint:
         return None
     return {
