@@ -16,6 +16,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError, HomeAssistantError
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import frame
 from homeassistant.helpers import issue_registry as ir
 
 from custom_components.ha_energy_planner import async_migrate_entry, async_remove_entry
@@ -43,6 +44,7 @@ def make_entry():
 
 async def prepare(tmp_path):
     hass = HomeAssistant(str(tmp_path))
+    frame.async_setup(hass)
     loader.async_setup(hass)
     hass.config_entries = ConfigEntries(hass, {})
     await hass.config_entries.async_initialize()
