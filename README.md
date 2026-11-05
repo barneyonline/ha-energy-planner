@@ -107,6 +107,7 @@ The [planning and control guide](docs/planning-and-control.md) preserves the det
 - [Climate demand, thermal learning, independent zones and equipment compensation](docs/climate-decisions.md)
 - [HVAC restoration and recovery](docs/hvac-restoration-recovery.md)
 - [Export Limit timing and confirmed readback](docs/export-limit-timing.md)
+- [Amber tariff boundaries, forecast coverage and retry diagnostics](docs/tariff-coverage.md)
 - [Load forecasting, tariffs, solar and battery reserves](https://github.com/barneyonline/ha-energy-planner/wiki/Energy-Planning)
 - [Calendar timing, planned windows and confirmed history](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar)
 
