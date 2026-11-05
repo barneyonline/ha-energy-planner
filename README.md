@@ -94,6 +94,13 @@ Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs
 
 ## Documentation
 
+For a reproducible cloud development environment, run `scripts/ha-dev.sh build`
+once at installation and `scripts/ha-dev.sh start` at each session start. Targeted
+tests reuse the container through `scripts/docker-pytest-fast.sh tests/test_planner.py`.
+The manual HA UI is opt-in with `scripts/ha-dev.sh runtime` and uses the pinned
+baseline. See [cloud development](docs/cloud-development.md) for install/startup
+settings, proxy trust, caching and validation.
+
 [Setup](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup) · [Safety and production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production) · [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) · [Known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
 
 The [planning and control guide](docs/planning-and-control.md) preserves the detailed operating notes, compatibility requirements and safety limits.

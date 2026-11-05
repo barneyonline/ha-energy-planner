@@ -17,7 +17,10 @@
   - Runs compile checks, shell syntax checks, Dockerized pytest, replay fixtures, live-schema validation, real-history validation, Home Assistant `check_config`, and the Docker smoke test.
 - Quality scale evidence: `docker run --rm -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable python3 scripts/validate_quality_scale.py`
 - Focused test example: `docker run --rm -v "$PWD:/work" -w /work ghcr.io/home-assistant/home-assistant:stable python3 -m pytest -q tests/test_planner.py`
+- Cloud install: `scripts/ha-dev.sh build`; session startup: `scripts/ha-dev.sh start`.
+  - Startup verifies versions/dependencies without running tests. See `docs/cloud-development.md`.
 - Fast last-failure or targeted loop: `scripts/docker-pytest-fast.sh [pytest path or node ID]`
+  - Reuses the development container created by the install/start commands.
 - Real evidence bundle, optional for operator validation: `scripts/export-real-validation-bundle.sh`
 
 ## Coding Style & Naming Conventions
