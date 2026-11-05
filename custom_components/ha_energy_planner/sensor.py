@@ -406,6 +406,11 @@ def _planning_duration_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str,
         "counters": {key: metrics[key] for key in counter_keys if key in metrics},
         "trigger_counts": bounded_json(metrics.get("trigger_counts", {})),
         "phase_durations_ms": bounded_json(metrics.get("phase_durations_ms", latest.get("phases", {}))),
+        **({"exclusive_phases_ms": bounded_json(latest["exclusive_phases_ms"]),
+            "request_age_ms": latest.get("request_age_ms"),
+            "export_reconciliation_pending": metrics.get("export_reconciliation_pending", False),
+            "export_reconciliation": bounded_json(metrics.get("export_reconciliation", {}))}
+           if "exclusive_phases_ms" in latest else {}),
     }
 
 
