@@ -45,6 +45,30 @@ cases exercise this startup sequence on the supported minimum and stable images.
   Automatic collection plugins are disabled, so the host need not install
   coverage.py, gcov or Xcode. `codecov.yml` makes the existing default CI
   requirement explicit; statement and branch gates remain local and unchanged.
+  Reporting checks out its trusted workflow revision with credential persistence
+  disabled. It fetches the validated producer SHA with process-scoped credentials
+  and loads only its Git index with `git read-tree` (without `-u`), so Codecov's
+  `git ls-files` sees the producer's exact added/deleted paths while the working
+  tree remains trusted. Producer source is never checked out or executed in the
+  credentialed workflow. Both uploads use the repository as `root_dir`; downloaded
+  reports stay in runner temporary storage. Collection plugins and file fixes
+  remain disabled, so the uploader does not need producer source contents.
+  The inline report validator uses Python isolated mode (`-I`) so a producer's
+  `pathlib.py` or other local module cannot run through standard-library imports.
+  Coverage.py stores relative paths, so XML sources resolve in both Docker's
+  `/work` tree and the reporting checkout. This follows the action's
+  [checkout prerequisite](https://github.com/codecov/codecov-action#usage) and
+  Codecov's [source-path matching guidance](https://docs.codecov.com/docs/fixing-paths).
+  `tests/test_ci_coverage_paths.py` measures and reports from different roots,
+  checks both upload contracts, verifies index updates preserve the trusted
+  working tree, and rejects producer-module execution during validation.
+  A successful upload only means the report was queued: verify the
+  commit's processing state and nonempty files in Codecov too.
+  The 6 November investigation found 20,638/20,638 covered statements in the
+  [main test artifact](https://github.com/barneyonline/ha-energy-planner/actions/runs/42124067040),
+  while [Codecov's commit API](https://api.codecov.io/api/v2/github/barneyonline/repos/ha-energy-planner/commits/31b50efed20f573c9077a0edffa5e6169743b55a/)
+  reported `state: error` and zero files. The previous reporting job had no checkout
+  and pointed its tracked-file network at the temporary reports directory.
 - The smoke weather provider is a real weather entity with deterministic hourly
   forecasts, rather than a sensor passed to `weather.get_forecasts`. Dedicated
   tests retain legacy-attribute fallback coverage. The thermostat fixture starts
