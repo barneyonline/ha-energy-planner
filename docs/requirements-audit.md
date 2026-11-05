@@ -9,6 +9,26 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Amber tariff coverage uses declared native interval ends and durations in both
+  price sampling and the planning/lifecycle grid. Only the documented aligned
+  30-minute `per_kwh` interval starting at second 1 is translated to a half-open
+  interval starting at second 0. Malformed, inconsistent, ambiguous or overlapping
+  native intervals fail closed; real gaps and insufficient horizons remain unsafe.
+  Freshness checks, negative prices, high-resolution boundaries and export-setting
+  cooldowns retain their safety rules. Bounded forecast diagnostics report source
+  validity/freshness, normalization count, leading/internal/tail gap counts and
+  `next_retry_at`. Known validity boundaries within two seconds of collection
+  share one refresh after both sources are valid, including when context building
+  crosses the deadline. A fixed pending window bounds rescheduling; monotonic
+  elapsed time limits actual retries to once per 30 seconds. Recovery or teardown
+  cancels the pending timer; cancellation without execution permits replacement.
+  Evidence: `tests/test_forecasts.py`, `tests/test_inputs.py`,
+  `tests/test_coordinator.py`, existing export/cooldown tests and the sanitized
+  `tests/fixtures/tariffs/amber_boundary_2026_11_04.json` import/export replay.
+  [Tariff coverage notes](tariff-coverage.md) record schema provenance and the
+  limits of the historical evidence. Full validation remains
+  `scripts/docker-validate.sh`; no live improvement is claimed from replay.
+
 - CI hang recovery: real registry, vehicle-options, conditional-options and
   upgrade tests initialize config entries before loading the entity registry,
   satisfying HA 2026.11's startup dependency. Empty registry loads have ten-second

@@ -8,6 +8,7 @@ from typing import Any
 
 from .const import CONF_MIN_TARIFF_CONFIDENCE, CONF_PRICE_FRESHNESS_MINUTES
 from .forecasts import (
+    _amber_half_hour_start,
     _explicit_interval_minutes,
     _flatten_item,
     _forecast_item_unit,
@@ -103,18 +104,7 @@ def _tariff_confidence(attributes: dict[str, Any]) -> float | None:
 
 def _half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]) -> datetime:
     """Translate Amber's declared half-hour first-second start to a half-open block."""
-    # Amber documents duration=30 with e.g. 02:00:01Z through 02:30:00Z.
-    # Only this exact, aligned representation warrants adding the first second;
-    # arbitrary near-half-hour durations and real gaps/overlaps remain invalid.
-    if (
-        end is not None
-        and type(item.get("duration")) in (int, float)
-        and item["duration"] == 30
-        and (end.minute % 30, end.second, end.microsecond) == (0, 0, 0)
-        and end - start == BLOCK_DURATION - timedelta(seconds=1)
-    ):
-        return start - timedelta(seconds=1)
-    return start
+    return _amber_half_hour_start(start, end, item)
 
 
 def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
