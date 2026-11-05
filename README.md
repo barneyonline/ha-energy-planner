@@ -74,7 +74,7 @@ Choose which areas the planner manages, then review its state and next actions.
   <img src="docs/images/plan-calendar-light.jpg" alt="Plan calendar showing confirmed Export Limit history alongside upcoming EV charging and Export Limit windows" width="757">
 </picture>
 
-The calendar distinguishes upcoming plan windows from retained confirmed activity. See [Plan Calendar](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar).
+The calendar distinguishes upcoming plan windows from retained confirmed activity. State publication and range queries skip object construction for unrelated reconciled history while retaining complete confirmed history. See [publication performance evidence](docs/entity-publication.md) and [Plan Calendar](https://github.com/barneyonline/ha-energy-planner/wiki/Plan-Calendar).
 
 </details>
 
