@@ -151,22 +151,35 @@ class PrepareTests(unittest.TestCase):
 
 
 class DeliveryTests(unittest.TestCase):
+    # Upload metadata follows the observed anonymous public v2 API: JUnit name,
+    # both build_code fields and JUnit/error upload totals can be null. IDs are sanitized.
+    # Successful commit/file shape is specified by Codecov's v2 serializers:
+    # https://github.com/codecov/codecov-api/blob/852702582ff49975de15eecb2bb63a8bb261ddfd/api/shared/commit/serializers.py
     def setUp(self) -> None:
         self.expected = {"commit": SHA, "files": [f"{PACKAGE}/planner.py"], "lines": 2}
         self.commit = {
             "commitid": SHA,
             "state": "complete",
             "totals": {"files": 1, "lines": 2},
-            "report": {"files": [{"name": self.expected["files"][0], "totals": {"lines": 2}}]},
+            "report": {"files": [{"name": self.expected["files"][0], "totals": {"files": 0, "lines": 2}}]},
         }
         self.uploads = [
-            {"name": "coverage-123-2", "build_code": "123.2", "state": "processed", "totals": {"files": 1, "lines": 2}},
             {
-                "name": "junit-123-2",
+                "name": "coverage-123-2",
+                "build_code": None,
+                "state": "merged",
+                "state_id": 6,
+                "state_name": "MERGED",
+                "totals": {"files": 1, "lines": 2},
+            },
+            {
+                "name": None,
                 "job_code": "junit-123-2",
-                "build_code": "123.2",
+                "build_code": None,
                 "state": "processed",
                 "state_name": "UPLOADED",
+                "totals": None,
+                "build_url": None,
                 "storage_path": "test_results/v1/raw/report",
             },
         ]
@@ -177,12 +190,57 @@ class DeliveryTests(unittest.TestCase):
     def test_processed_junit_uploaded_label_and_nonempty_project_pass(self) -> None:
         self.assertTrue(self.ready())
 
+    def test_observed_merged_coverage_and_nullable_junit_schema(self) -> None:
+        # Read-only API evidence from the last successful Groq report. The file
+        # entry is an excerpt; only the coverage name is adapted below to model
+        # this reporter's attribution after the inventory fix reaches main.
+        commit_sha = "b6e763819d14640ebf53defb47492d0863b48383"
+        file = {
+            "name": "custom_components/groq/types.py",
+            "totals": {"files": 0, "lines": 4, "hits": 4, "misses": 0, "coverage": 100.0},
+            "line_coverage": [[3, 0], [5, 0], [7, 0], [12, 0]],
+        }
+        commit = {
+            "commitid": commit_sha,
+            "state": "complete",
+            "totals": {"files": 32, "lines": 4697, "hits": 4697, "sessions": 1},
+            "report": {"files": [file]},
+        }
+        coverage = {
+            "name": "CI - checks",
+            "job_code": "CI",
+            "build_code": None,
+            "build_url": "https://github.com/barneyonline/ha-groq/actions/runs/41177600806",
+            "provider": "github-actions",
+            "state": "merged",
+            "state_id": 6,
+            "state_name": "MERGED",
+            "totals": {"files": 32, "lines": 4697, "hits": 4697, "misses": 0, "coverage": 100.0},
+        }
+        expected = {"commit": commit_sha, "files": [file["name"]], "lines": 4}
+        uploads = [coverage, self.uploads[1]]
+        self.assertFalse(reporting.delivery_ready(commit, uploads, expected, "123", "2"))
+        coverage["name"] = "coverage-123-2"
+        self.assertTrue(reporting.delivery_ready(commit, uploads, expected, "123", "2"))
+        coverage.update(state="processed", state_id=1, state_name="UPLOADED", totals=None)
+        # An old complete project report cannot turn this unmerged attempt green.
+        self.assertFalse(reporting.delivery_ready(commit, uploads, expected, "123", "2"))
+
+    def test_observed_unusable_coverage_response_cannot_pass(self) -> None:
+        self.uploads[0].update(
+            job_code="Coverage Reporting", build_code=None, state="error", state_id=3, state_name="ERROR", totals=None
+        )
+        self.commit.update(state="error", totals={"files": 0, "lines": 0, "sessions": 0}, report={"files": []})
+        with self.assertRaisesRegex(ValueError, "Codecov rejected coverage-123-2"):
+            self.ready()
+
     def test_transport_only_wrong_attempt_and_missing_reports_never_pass(self) -> None:
         for mutate in [
             lambda: self.uploads[0].update(state="uploaded"),
+            lambda: self.uploads[0].update(state="processed"),
             lambda: self.uploads[1].update(state="pending"),
             lambda: self.uploads[0].update(name="coverage-123-1"),
-            lambda: self.uploads[0].update(build_code="123.1"),
+            lambda: self.uploads[1].update(job_code="junit-123-1"),
             lambda: self.commit.update(state="pending"),
             lambda: self.uploads.clear(),
         ]:
@@ -196,12 +254,12 @@ class DeliveryTests(unittest.TestCase):
             lambda: self.uploads[0].update(state="error", state_name="ERROR"),
             lambda: self.uploads[1].update(state="error"),
             lambda: self.uploads[0].update(totals={"files": 0, "lines": 0}),
+            lambda: self.uploads[0].update(totals=None),
             lambda: self.commit.update(state="error"),
             lambda: self.commit.update(commitid="b" * 40),
             lambda: self.commit.update(totals={"files": 0, "lines": 0}),
             lambda: self.commit.update(report={"files": []}),
             lambda: self.commit["report"]["files"][0].update(name="tests/planner.py"),
-            lambda: self.uploads[1].update(job_code="junit-123-1"),
             lambda: self.uploads[1].update(storage_path="v4/raw/coverage"),
             lambda: self.uploads.append(dict(self.uploads[0])),
         ]:

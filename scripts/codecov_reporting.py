@@ -151,11 +151,7 @@ def delivery_ready(commit: dict, uploads: list[dict], expected: dict, run: str, 
     selected = []
     for kind in ("coverage", "junit"):
         name = f"{kind}-{run}-{attempt}"
-        matches = [
-            upload
-            for upload in uploads
-            if upload.get("name") == name and upload.get("build_code") == f"{run}.{attempt}"
-        ]
+        matches = [upload for upload in uploads if upload.get("job_code" if kind == "junit" else "name") == name]
         if not matches:
             return False
         if any(upload.get("state") == "error" for upload in matches):
@@ -164,7 +160,7 @@ def delivery_ready(commit: dict, uploads: list[dict], expected: dict, run: str, 
             raise ValueError(f"Ambiguous Codecov upload {name}")
         selected.append(matches[0])
     coverage, junit = selected
-    if any(upload.get("state") != "processed" for upload in selected):
+    if coverage.get("state") != "merged" or junit.get("state") != "processed":
         return False
     if junit.get("job_code") != f"junit-{run}-{attempt}" or not junit.get("storage_path", "").startswith(
         "test_results/v1/raw/"
@@ -214,6 +210,7 @@ def verify(
                 print(f"Verified processed project coverage and test results: {url} (producer {run}.{attempt})")
                 return
         except HTTPError as error:
+            error.close()
             if error.code not in {404, 429, 500, 502, 503, 504}:
                 raise
             print(f"Codecov API not ready (HTTP {error.code})")
