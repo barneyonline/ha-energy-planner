@@ -15,6 +15,7 @@ from homeassistant.config_entries import ConfigEntries, ConfigEntry, ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import frame
 
 from custom_components.ha_energy_planner import async_migrate_entry
 from custom_components.ha_energy_planner.config_flow import ConfigFlow
@@ -52,6 +53,7 @@ def test_previous_release_setup_reload_restart_preserves_recovery(tmp_path: Path
 
     async def lifetime(restart=False):
         hass = HomeAssistant(str(tmp_path))
+        frame.async_setup(hass)
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
         await hass.config_entries.async_initialize()
@@ -133,6 +135,7 @@ def test_separate_data_and_options_writes_preserve_reload_recovery(tmp_path: Pat
 
     async def run() -> None:
         hass = HomeAssistant(str(tmp_path))
+        frame.async_setup(hass)
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
         await hass.config_entries.async_initialize()
@@ -186,6 +189,7 @@ def test_separate_data_and_options_writes_preserve_reload_recovery(tmp_path: Pat
 def test_legacy_target_reconfigure_directs_recovery_without_replacing_entry(tmp_path: Path) -> None:
     async def run():
         hass = HomeAssistant(str(tmp_path))
+        frame.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
         entry = make_entry({"ev_soc_entity": "sensor.car_soc"}, version=3)
         hass.config_entries._entries[entry.entry_id] = entry
@@ -218,10 +222,12 @@ def test_legacy_target_reconfigure_directs_recovery_without_replacing_entry(tmp_
 def test_loaded_target_repair_updates_legacy_subentry_and_uses_update_listener(tmp_path: Path) -> None:
     async def run():
         hass = HomeAssistant(str(tmp_path))
+        frame.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
         dr.async_setup(hass)
         await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await asyncio.wait_for(er.async_load(hass, load_empty=True), timeout=10)
         entry = make_entry({"instance_name": "Keep my settings"})
         hass.config_entries._entries[entry.entry_id] = entry
         for values in (

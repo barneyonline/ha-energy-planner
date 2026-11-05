@@ -54,9 +54,10 @@ def test_conditional_ev_options_survive_validated_saves(
         hass = HomeAssistant(str(tmp_path))
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
         dr.async_setup(hass)
         await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await asyncio.wait_for(er.async_load(hass, load_empty=True), timeout=10)
         original = {threshold: -0.05, toggle: True} if saved else {}
         entry = ConfigEntry(
             domain=DOMAIN, title="Disabled planner", data={}, options=original,

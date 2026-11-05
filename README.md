@@ -116,6 +116,8 @@ Configured through the Home Assistant UI. No separate vendor credentials or thir
 
 </details>
 
+Development validation covers the minimum and current stable Home Assistant runtimes; see the [CI hang diagnostics](docs/validation-warnings.md#ci-hang-diagnostics).
+
 [Releases](https://github.com/barneyonline/ha-energy-planner/releases) · [Changelog](CHANGELOG.md) · [Issues](https://github.com/barneyonline/ha-energy-planner/issues) · [Development](https://github.com/barneyonline/ha-energy-planner/wiki/Development) · [Requirements evidence](docs/requirements-audit.md) · [Quality-scale evidence](quality_scale.yaml) · [Validation warnings](docs/validation-warnings.md)
 
 ---

@@ -9,6 +9,16 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- CI hang recovery: real registry, vehicle-options, conditional-options and
+  upgrade tests initialize config entries before loading the entity registry,
+  satisfying HA 2026.11's startup dependency. Empty registry loads have ten-second
+  bounds; upgrade and repair tests initialize the frame helper. The existing
+  runtime cases reproduce the original stall without these prerequisites.
+  Coverage and runtime-compatibility jobs time out after 15 minutes, and pytest
+  dumps blocked-thread stacks after 60 seconds. The required summary continues
+  to reject failures and cancellations. See `docs/validation-warnings.md`;
+  the complete acceptance gate remains `scripts/docker-validate.sh`.
+
 - The approved Planning Hub artwork supplies a 1280 × 640 social preview,
   light/dark 1200 × 400 README banners and 18 page-specific wiki banners.
   `scripts/generate-doc-banners.cjs` renders editable SVG headings over shared
