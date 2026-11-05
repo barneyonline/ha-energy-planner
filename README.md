@@ -30,8 +30,6 @@ Local-first planning through your existing Home Assistant entities and actions.
 - **Review and control:** Current state, next actions, a plan calendar and per-area Automatic control.
 - **Diagnostics and explanations:** Redacted diagnostics and optional, on-demand AI advice.
 
-Refresh diagnostics separate command and planner lock waits, reconciliation, inputs, planning, post-plan work and the final storage flush. Busy control transactions defer export reconciliation while planning and health updates continue; export readiness stays blocked until reconciliation and fresh planning complete. The Planning duration sensor still measures the complete refresh call. See [refresh timing diagnostics](docs/refresh-timing.md) for phase accounting and its limits.
-
 ## At a glance
 
 Choose which areas the planner manages, then review its state and next actions.
@@ -93,13 +91,6 @@ Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs
 **Automatic control** records your request to operate; **Armed** reports actual command authority.
 
 ## Documentation
-
-For a reproducible cloud development environment, run `scripts/ha-dev.sh build`
-once at installation and `scripts/ha-dev.sh start` at each session start. Targeted
-tests reuse the container through `scripts/docker-pytest-fast.sh tests/test_planner.py`.
-The manual HA UI is opt-in with `scripts/ha-dev.sh runtime` and uses the pinned
-baseline. See [cloud development](docs/cloud-development.md) for install/startup
-settings, proxy trust, caching and validation.
 
 [Setup](https://github.com/barneyonline/ha-energy-planner/wiki/Hub-and-Input-Setup) · [Safety and production](https://github.com/barneyonline/ha-energy-planner/wiki/Safety-and-Production) · [Troubleshooting](https://github.com/barneyonline/ha-energy-planner/wiki/Troubleshooting) · [Known limitations](https://github.com/barneyonline/ha-energy-planner/wiki/Known-Limitations)
 
