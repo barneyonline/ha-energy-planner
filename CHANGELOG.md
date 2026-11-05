@@ -16,6 +16,7 @@
 
 ### 🔧 Improvements
 
+- Reduce entity publication work: avoid constructing unrelated events from reconciled calendar history, normalize Recorder attributes in one pass, and hash pending AI advice once per read. Preserve complete calendar history, diagnostic contents, Recorder budgets and current-plan safety checks.
 - Account for the complete refresh lifecycle in elapsed-time diagnostics, including lock waits and final storage flush. Keep planning responsive behind busy control transactions with conservative deferred export reconciliation.
 
 ### 🔄 Other changes

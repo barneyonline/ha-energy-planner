@@ -9,6 +9,21 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Calendar publication selects reconciled records before constructing returned
+  Home Assistant `CalendarEvent` objects; current-plan window expansion remains
+  before filtering. Complete confirmed history still participates in
+  reconciliation, with no retention limit, cache or control-path change.
+  `tests/test_entity_publication.py` exercises HA's repeated property sequence,
+  historical ranges, archived UID suppression, offset-aware ordering, expiration,
+  replans, options, live feedback and ownership changes without replanning, plus
+  repeated Next actions compaction and nonmutation. `entity.py` combines Store
+  conversion and normalization in one walk; `sensor.py` shares the current AI
+  fingerprint only within one getter call. `tests/test_entity.py` preserves
+  dataclass, datetime, enum and tuple/set behavior; full-shape Next actions
+  profiles and freshness tests are in `tests/test_next_actions_publication.py`.
+  Synthetic measurements and the unresolved live latency are documented in
+  `docs/entity-publication.md`.
+
 - Reproducible cloud development: `Dockerfile.dev` and `scripts/ha-dev.sh`
   build pinned HA/Python/test tooling, preserve proxy and session CA trust, and
   recreate an owned development container without running tests at startup.

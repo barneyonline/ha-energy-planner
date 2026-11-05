@@ -68,7 +68,7 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
     def event(self) -> CalendarEvent | None:
         """Return the current or next controlled action."""
         now = dt_util.utcnow()
-        events = [event for event in _events_with_history(self.coordinator) if event.end > now]
+        events = _events_with_history(self.coordinator, start_date=now, next_only=True)
         return None if not events else events[0]
 
     async def async_get_events(
@@ -78,26 +78,37 @@ class EnergyPlannerCalendar(EnergyPlannerEntity, CalendarEntity):
         end_date: datetime,
     ) -> list[CalendarEvent]:
         """Return controlled actions that overlap the requested range."""
-        return [
-            event for event in _events_with_history(self.coordinator)
-            if event.end > start_date and event.start < end_date
-        ]
+        return _events_with_history(
+            self.coordinator, start_date=start_date, end_date=end_date,
+        )
 
 
-def _events_with_history(coordinator: EnergyPlannerCoordinator) -> list[CalendarEvent]:
+def _events_with_history(
+    coordinator: EnergyPlannerCoordinator, *, start_date: datetime | None = None,
+    end_date: datetime | None = None, next_only: bool = False,
+) -> list[CalendarEvent]:
     """Combine saved history with live events without changing storage on reads."""
     state = update_calendar_history(
         coordinator.store.data.get("calendar_history"),
         calendar_event_records(coordinator), dt_util.utcnow(),
     )
-    return sorted(
-        [CalendarEvent(
+    # Reconcile complete confirmed history before selecting records. Historical
+    # UIDs and running-window matches still participate in that reconciliation,
+    # but HA need not validate/deepcopy a CalendarEvent for every elapsed record
+    # on each of its state, attributes and alarm-scheduling property reads.
+    records = [
+        record for record in [*state["history"], *state["pending"]]
+        if (start_date is None or datetime.fromisoformat(record["end"]) > start_date)
+        and (end_date is None or datetime.fromisoformat(record["start"]) < end_date)
+    ]
+    records.sort(key=lambda record: datetime.fromisoformat(record["start"]))
+    if next_only:
+        records = records[:1]
+    return [CalendarEvent(
             start=datetime.fromisoformat(record["start"]), end=datetime.fromisoformat(record["end"]),
             summary=record["summary"], uid=record["uid"],
             description=record.get("description"), location=record.get("location"),
-        ) for record in [*state["history"], *state["pending"]]],
-        key=lambda event: event.start,
-    )
+        ) for record in records]
 
 
 class _CalendarPlanView:
