@@ -9,6 +9,15 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Reproducible cloud development: `Dockerfile.dev` and `scripts/ha-dev.sh`
+  build pinned HA/Python/test tooling, preserve proxy and session CA trust, and
+  recreate an owned development container without running tests at startup.
+  `scripts/docker-pytest-fast.sh` reuses that container. The pinned manual
+  `ha-runtime` Compose profile is opt-in. `tests/scripts/test_ha_dev.py` covers
+  lifecycle, stale-image rejection, checkout isolation and command failures;
+  `docs/cloud-development.md` documents saved setup/start commands. Full acceptance
+  remains `scripts/docker-validate.sh`; saved cloud-template updates are external.
+
 - Amber tariff coverage uses declared native interval ends and durations in both
   price sampling and the planning/lifecycle grid. Only the documented aligned
   30-minute `per_kwh` interval starting at second 1 is translated to a half-open
