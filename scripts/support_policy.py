@@ -20,7 +20,7 @@ def support_policy(root: Path) -> dict[str, object]:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("field", choices=["minimum", "baseline", "matrix", "versions", "image", "mypy"])
+    parser.add_argument("field", choices=["minimum", "baseline", "matrix", "versions", "image", "mypy", "ruff"])
     args = parser.parse_args()
     value = support_policy(Path(__file__).resolve().parents[1])[args.field]
     print(json.dumps(value) if isinstance(value, list) else value)
