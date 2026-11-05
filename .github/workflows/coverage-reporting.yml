@@ -1,7 +1,7 @@
 name: Coverage Reporting
 
 # Test jobs have no reporting credentials. This default-branch workflow only
-# checks out producer source as data; it never executes pull-request code.
+# reads producer Git metadata; it never checks out or executes pull-request code.
 on:
   workflow_run:
     workflows: [Tests]
@@ -110,13 +110,13 @@ jobs:
           if total > 33554432:
               raise SystemExit('Report aggregate budget exceeded')
           PYTHON
-      # Codecov requires a checkout to build its source-file inventory.
-      # Source is data only: no packages, hooks, workflows or caches are run.
-      - name: Check out the verified producer source
+      # Codecov requires a checkout. Keep its working tree trusted; the exact
+      # producer file list comes from Git's index without materializing PR code.
+      - name: Check out the trusted reporter revision
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ steps.source.outputs.sha }}
+          ref: ${{ github.workflow_sha }}
           path: codecov-source
           persist-credentials: false
           submodules: false
@@ -127,27 +127,13 @@ jobs:
         env:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
         run: |
-          test "$(git -C "$GITHUB_WORKSPACE/codecov-source" rev-parse HEAD)" = "$SOURCE_SHA"
+          source="$GITHUB_WORKSPACE/codecov-source"
+          git -C "$source" -c core.hooksPath=/dev/null fetch --no-tags --depth=1 --filter=blob:none origin "$SOURCE_SHA"
+          test "$(git -C "$source" rev-parse FETCH_HEAD)" = "$SOURCE_SHA"
+          git -C "$source" read-tree FETCH_HEAD
           work="$(mktemp -d "$GITHUB_WORKSPACE/codecov-source/.codecov-work.XXXXXXXX")"
           printf '{}\n' > "$work/codecov.yml"
           echo "path=$work" >> "$GITHUB_OUTPUT"
-      - name: Read the trusted processing check
-        if: ${{ steps.source.outputs.artifact_id != '' }}
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          REPORTER_SHA: ${{ github.workflow_sha }}
-        with:
-          script: |
-            const fs = require('node:fs');
-            const path = require('node:path');
-            const helper = await github.rest.repos.getContent({
-              ...context.repo, path: 'scripts/codecov_reporting.py', ref: process.env.REPORTER_SHA,
-            });
-            if (helper.data.type !== 'file' || helper.data.encoding !== 'base64' || helper.data.size > 65536) {
-              throw new Error('Unexpected trusted processing check');
-            }
-            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'codecov-reporting.py'),
-              Buffer.from(helper.data.content, 'base64'), {flag: 'wx'});
       - name: Upload coverage to Codecov
         id: coverage_upload
         if: ${{ steps.source.outputs.artifact_id != '' }}
@@ -198,4 +184,4 @@ jobs:
           SOURCE_SHA: ${{ steps.source.outputs.sha }}
           SOURCE_RUN: ${{ github.event.workflow_run.id }}
           SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-        run: python3 -I -B "$RUNNER_TEMP/codecov-reporting.py"
+        run: python3 -I -B "$GITHUB_WORKSPACE/codecov-source/scripts/codecov_reporting.py"
