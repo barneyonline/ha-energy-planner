@@ -4563,7 +4563,8 @@ def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
     assert present != missing
 
 
-def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: Any) -> None:
+@pytest.mark.parametrize("through_refresh", [False, True])
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: Any, through_refresh: bool) -> None:
     coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
     coordinator.data = _plan("existing")
     coordinator.data.input_issues = ["amber_import_price_entity_unavailable"]
@@ -4578,13 +4579,19 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: 
     original = coordinator_module.dt_util.utcnow
     coordinator_module.dt_util.utcnow = lambda: coordinator.data.created_at
     try:
-        result = asyncio.run(coordinator._async_update_data_locked())
+        result = asyncio.run(
+            coordinator._async_update_data() if through_refresh else coordinator._async_update_data_locked()
+        )
     finally:
         coordinator_module.dt_util.utcnow = original
 
     assert result is coordinator.data
     assert coordinator._refresh_counters["fingerprint_skipped"] == 1
     assert "required_evidence_missing" in caplog.text
+
+    if through_refresh:
+        assert coordinator.last_refresh_metadata["phases"]["fingerprint_ms"] >= 0
+        assert "planner_ms" not in coordinator.last_refresh_metadata["exclusive_phases_ms"]
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -9621,22 +9628,24 @@ def test_manual_hvac_override_refresh_and_export_resume_complete_without_command
 def test_export_reconciliation_does_not_hold_planner_lock_while_waiting_for_command(monkeypatch):
     async def run():
         coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
         started = asyncio.Event()
         async def reconcile(_self, now):
             assert not coordinator._planner_lock.locked()
             started.set()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
-        # Review mode does not seed active ownership or issue restoration commands.
         await coordinator._command_lock.acquire()
-        task = asyncio.create_task(coordinator._async_update_data())
-        await asyncio.sleep(0)
+        result = await coordinator._async_update_data()
+        assert result.plan_id == "unblocked"
         assert not coordinator._planner_lock.locked()
-        coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
-        await asyncio.wait_for(coordinator._planner_lock.acquire(), .2)
-        coordinator._planner_lock.release()
+        assert not started.is_set()
+        deferred = coordinator._export_reconcile_task
         coordinator._command_lock.release()
-        await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(deferred, 1)
         assert started.is_set()
+        assert coordinator._export_reconcile_pending is False
     asyncio.run(run())
 
 
