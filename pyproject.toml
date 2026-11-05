@@ -26,6 +26,8 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["custom_components/ha_energy_planner"]
+# Reports leave the Docker /work mount before Codecov processes them.
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true
