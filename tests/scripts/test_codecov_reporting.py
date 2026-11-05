@@ -25,39 +25,46 @@ PACKAGE = "custom_components/ha_energy_planner"
 
 
 class CheckoutTests(unittest.TestCase):
-    def test_working_directory_is_clean_but_uses_the_checkout_git_inventory(self) -> None:
+    def test_git_index_uses_producer_paths_without_materializing_or_executing_source(self) -> None:
         workflow = yaml.safe_load((ROOT / ".github/workflows/coverage-reporting.yml").read_text())
         script = next(step["run"] for step in workflow["jobs"]["upload"]["steps"] if step.get("id") == "uploader")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "codecov-source"
-            source.mkdir()
-            subprocess.run(["git", "init", "-q", str(source)], check=True, capture_output=True)
-            (source / "codecov").symlink_to(root / "must-not-overwrite")
-            (source / "codecov.yml").write_text("plugins: [candidate-program]\n")
-            (source / "sample.py").write_text("raise RuntimeError('candidate code must never run')\n")
-            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
-            subprocess.run(
-                [
-                    "git",
-                    "-C",
-                    str(source),
-                    "-c",
-                    "user.name=Test",
-                    "-c",
-                    "user.email=test@example.test",
-                    "-c",
-                    "core.hooksPath=/dev/null",
-                    "-c",
-                    "commit.gpgsign=false",
-                    "commit",
-                    "-qm",
-                    "fixture",
-                ],
-                check=True,
-                capture_output=True,
-            )
-            sha = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+            origin, source = root / "origin", root / "codecov-source"
+            subprocess.run(["git", "init", "-qb", "main", str(origin)], check=True, capture_output=True)
+            (origin / "codecov").symlink_to(root / "must-not-overwrite")
+            (origin / "codecov.yml").write_text("{}\n")
+            (origin / "sample.py").write_text("# trusted source\n")
+
+            def commit(message: str) -> None:
+                subprocess.run(["git", "-C", str(origin), "add", "."], check=True)
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        str(origin),
+                        "-c",
+                        "user.name=Test",
+                        "-c",
+                        "user.email=test@example.test",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "commit",
+                        "-qm",
+                        message,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+            commit("trusted")
+            subprocess.run(["git", "clone", "-q", str(origin), str(source)], check=True, capture_output=True)
+            (origin / "candidate-only.py").write_text("raise RuntimeError('candidate must never run')\n")
+            (origin / "codecov.yml").write_text("plugins: [candidate-program]\n")
+            commit("producer")
+            sha = subprocess.check_output(["git", "-C", str(origin), "rev-parse", "HEAD"], text=True).strip()
             output = root / "output"
             subprocess.run(
                 ["bash", "-e", "-c", script],
@@ -67,16 +74,14 @@ class CheckoutTests(unittest.TestCase):
             )
             work = Path(output.read_text().strip().removeprefix("path="))
             self.assertEqual({}, yaml.safe_load((work / "codecov.yml").read_text()))
+            self.assertEqual({}, yaml.safe_load((source / "codecov.yml").read_text()))
+            self.assertFalse((source / "candidate-only.py").exists())
             for name in ("codecov", "codecov.SHA256SUM", "codecov.SHA256SUM.sig"):
                 (work / name).write_text("trusted wrapper download")
-            self.assertEqual(
-                str(source),
-                subprocess.check_output(["git", "rev-parse", "--show-toplevel"], cwd=work, text=True).strip(),
-            )
             network = (
                 subprocess.check_output(["git", "-C", str(source), "ls-files", "-z"], cwd=work).decode().split("\0")
             )
-            self.assertEqual({"codecov", "codecov.yml", "sample.py"}, set(network) - {""})
+            self.assertEqual({"codecov", "codecov.yml", "sample.py", "candidate-only.py"}, set(network) - {""})
             self.assertFalse((root / "must-not-overwrite").exists())
 
 
@@ -235,11 +240,9 @@ class WorkflowTests(unittest.TestCase):
         )
         steps = job["steps"]
         checkout = next(step["with"] for step in steps if step.get("uses", "").startswith("actions/checkout@"))
-        self.assertEqual("${{ steps.source.outputs.sha }}", checkout["ref"])
+        self.assertEqual("${{ github.workflow_sha }}", checkout["ref"])
         for setting in ("persist-credentials", "submodules", "lfs"):
             self.assertEqual("false", checkout[setting])
-        trusted = next(step for step in steps if "REPORTER_SHA" in step.get("env", {}))
-        self.assertEqual("${{ github.workflow_sha }}", trusted["env"]["REPORTER_SHA"])
         for step in steps:
             if step.get("uses", "").startswith("codecov/"):
                 settings = step["with"]
