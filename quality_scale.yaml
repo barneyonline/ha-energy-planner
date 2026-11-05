@@ -457,6 +457,7 @@ rules:
         - scripts/docker-compatibility.sh
         - tests/scripts/test_docker_compatibility.py
         - scripts/check_coverage.py
+        - tests/test_ci_coverage_paths.py
         - tests/test_planner.py
         - tests/test_ev.py
         - tests/test_executor.py
@@ -471,6 +472,8 @@ rules:
         - custom_components/ha_energy_planner/load_forecast.py
         - custom_components/ha_energy_planner/recorder_import.py
         - scripts/docker-validate.sh
+        - .github/workflows/coverage-reporting.yml
+        - pyproject.toml
         - scripts/validate-real-history-fixture.py
         - .github/workflows/release-assets.yml
       docs:

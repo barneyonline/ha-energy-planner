@@ -1,7 +1,8 @@
 name: Coverage Reporting
 
 # Test jobs have no reporting credentials. This default-branch workflow only
-# downloads their report files; it never checks out or executes pull-request code.
+# downloads their report files and checks out source only as data for Codecov's
+# tracked-file network. It never executes pull-request code.
 on:
   workflow_run:
     workflows: [Tests]
@@ -75,6 +76,12 @@ jobs:
             core.setOutput('sha', run.head_sha);
             core.setOutput('branch', branch);
             core.setOutput('pr', prNumber);
+      - name: Check out producer source for Codecov file matching
+        if: ${{ steps.source.outputs.artifact_id != '' }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+          persist-credentials: false
       - name: Download only the selected producer reports
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -89,7 +96,8 @@ jobs:
         env:
           REPORTS: ${{ runner.temp }}/reports
         run: |
-          python3 - <<'PYTHON'
+          # The producer tree is untrusted; exclude it from Python imports.
+          python3 -I - <<'PYTHON'
           import os
           import stat
           from pathlib import Path
@@ -116,7 +124,7 @@ jobs:
         with:
           use_oidc: true
           files: ${{ runner.temp }}/reports/coverage.xml
-          root_dir: ${{ runner.temp }}/reports
+          root_dir: ${{ github.workspace }}
           name: coverage-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           plugins: noop
           disable_search: true
@@ -134,7 +142,7 @@ jobs:
         with:
           use_oidc: true
           files: ${{ runner.temp }}/reports/junit.xml
-          root_dir: ${{ runner.temp }}/reports
+          root_dir: ${{ github.workspace }}
           name: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           job_code: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           report_type: test_results
