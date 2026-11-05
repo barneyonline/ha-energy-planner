@@ -46,6 +46,7 @@ jobs:
           echo "ha_matrix=$(python3 scripts/support_policy.py matrix)" >> "$GITHUB_OUTPUT"
 
   pytest-coverage:
+    timeout-minutes: 15
     needs: changes
     if: needs.changes.outputs.pytest == 'true'
     runs-on: ubuntu-26.04
@@ -165,6 +166,7 @@ jobs:
         run: scripts/docker-validate.sh
 
   runtime-compatibility:
+    timeout-minutes: 15
     needs: changes
     if: needs.changes.outputs.pytest == 'true' || needs.changes.outputs.validation_extras == 'true'
     runs-on: ubuntu-26.04
