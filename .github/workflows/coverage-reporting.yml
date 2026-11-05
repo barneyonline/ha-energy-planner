@@ -153,7 +153,7 @@ jobs:
           use_oidc: true
           files: ${{ runner.temp }}/reports/coverage.xml
           root_dir: ${{ runner.temp }}/codecov-source
-          working-directory: ${{ runner.temp }}/codecov-source
+          working-directory: ${{ runner.temp }}/codecov-work
           name: coverage-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           plugins: noop
           disable_search: true
@@ -173,7 +173,7 @@ jobs:
           use_oidc: true
           files: ${{ runner.temp }}/reports/junit.xml
           root_dir: ${{ runner.temp }}/codecov-source
-          working-directory: ${{ runner.temp }}/codecov-source
+          working-directory: ${{ runner.temp }}/codecov-work
           name: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           job_code: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           report_type: test_results

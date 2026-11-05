@@ -43,6 +43,7 @@ class PrepareTests(unittest.TestCase):
                     "tests/__init__.py",
                     "tests/planner.py",
                     "codecov.yml",
+                    "codecov",
                 ]
             ],
         }
@@ -82,6 +83,18 @@ class PrepareTests(unittest.TestCase):
         # The failed root_dir was reports-only: not one covered filename exists there.
         self.assertTrue(all(not (self.reports / cls.attrib["filename"]).exists() for cls in classes))
         self.assertTrue(all((self.inventory / cls.attrib["filename"]).is_file() for cls in classes))
+
+    def test_wrapper_downloads_cannot_contaminate_or_collide_with_source_inventory(self) -> None:
+        self.prepare()
+        work = self.root / "codecov-work"
+        for name in ("codecov", "codecov.SHA256SUM", "codecov.SHA256SUM.sig"):
+            (work / name).write_text("wrapper download")
+        expected = {entry["path"] for entry in self.tree["tree"]}
+        actual = {path.relative_to(self.inventory).as_posix() for path in self.inventory.rglob("*") if path.is_file()}
+        self.assertEqual(expected, actual)
+        self.assertEqual(0, (self.inventory / "codecov").stat().st_size)
+        self.assertGreater((work / "codecov").stat().st_size, 0)
+        self.assertFalse((work / ".git").exists())
 
     def test_repository_relative_report_is_also_unambiguous(self) -> None:
         root = ET.parse(self.reports / "coverage.xml").getroot()
@@ -355,7 +368,8 @@ class WorkflowTests(unittest.TestCase):
             if step.get("uses", "").startswith("codecov/"):
                 settings = step["with"]
                 self.assertEqual("${{ runner.temp }}/codecov-source", settings["root_dir"])
-                self.assertEqual(settings["root_dir"], settings["working-directory"])
+                self.assertEqual("${{ runner.temp }}/codecov-work", settings["working-directory"])
+                self.assertNotEqual(settings["root_dir"], settings["working-directory"])
                 self.assertEqual("true", settings["use_oidc"])
                 self.assertEqual("noop", settings["plugins"])
                 self.assertEqual("true", settings["disable_file_fixes"])

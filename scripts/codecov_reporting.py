@@ -96,6 +96,9 @@ def prepare(tree: dict, sha: str, reports: Path, inventory: Path, manifest: Path
     junit = read_xml(reports / "junit.xml")
     if junit.tag not in {"testsuites", "testsuite"} or not list(junit.iter("testcase")):
         raise ValueError("Empty test results")
+    # The wrapper downloads its executable/checksums into its working directory.
+    # Keep those files outside the exact producer inventory and outside Git.
+    (inventory.parent / "codecov-work").mkdir()
     inventory.mkdir()  # A fresh directory outside the workspace; no .git or source code.
     for name in sorted(files):
         path = inventory / name
