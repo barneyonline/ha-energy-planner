@@ -139,7 +139,7 @@ jobs:
               throw new Error('Producer source tree is incomplete or too large');
             }
             fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'codecov-tree.json'), metadata, {flag: 'wx'});
-      - name: Prepare inert source inventory and repository-relative coverage
+      - name: Prepare inert producer source inventory
         if: ${{ steps.source.outputs.artifact_id != '' }}
         env:
           MODE: prepare
@@ -191,6 +191,7 @@ jobs:
         if: ${{ always() && steps.source.outputs.artifact_id != '' && steps.coverage_upload.outcome == 'success' && steps.junit_upload.outcome == 'success' }}
         env:
           MODE: verify
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
           SOURCE_RUN: ${{ github.event.workflow_run.id }}
           SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
         run: python3 -I -B "$RUNNER_TEMP/codecov-reporting.py"

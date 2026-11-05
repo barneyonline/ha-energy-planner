@@ -72,7 +72,11 @@ jobs:
                 -o junit_family=legacy || test_status=$?
               report_status=0
               python3 -m coverage json --fail-under=0 -o coverage.json || report_status=$?
-              python3 -m coverage xml --fail-under=0 -o coverage.xml || report_status=$?
+              # Keep measurement/gates above on pyproject.toml. For XML, the
+              # documented include option retains full repository-relative paths.
+              python3 -m coverage xml --rcfile=/dev/null \
+                --include="custom_components/ha_energy_planner/*" \
+                --fail-under=0 -o coverage.xml || report_status=$?
               python3 -m coverage report -m --fail-under=0 || report_status=$?
               python3 scripts/check_coverage.py coverage.json || report_status=$?
               if [ "$test_status" -ne 0 ]; then
