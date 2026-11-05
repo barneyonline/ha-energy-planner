@@ -29,6 +29,7 @@ def test_real_registry_migrates_only_this_entries_retired_devices(
         hass = HomeAssistant(str(tmp_path))
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
+        await hass.config_entries.async_initialize()
         entries = [
             ConfigEntry(
                 domain=DOMAIN, title=title, data={}, options={}, source="user",
@@ -43,7 +44,7 @@ def test_real_registry_migrates_only_this_entries_retired_devices(
             hass.config_entries._entries[config_entry.entry_id] = config_entry
         dr.async_setup(hass)
         await dr.async_load(hass, load_empty=True)
-        await er.async_load(hass, load_empty=True)
+        await asyncio.wait_for(er.async_load(hass, load_empty=True), timeout=10)
         devices = dr.async_get(hass)
         entities = er.async_get(hass)
         try:
