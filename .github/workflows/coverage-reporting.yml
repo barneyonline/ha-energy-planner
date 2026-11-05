@@ -1,7 +1,7 @@
 name: Coverage Reporting
 
 # Test jobs have no reporting credentials. This default-branch workflow only
-# downloads their report files; it never checks out or executes pull-request code.
+# downloads reports and inert source paths; it never executes pull-request code.
 on:
   workflow_run:
     workflows: [Tests]
@@ -110,13 +110,50 @@ jobs:
           if total > 33554432:
               raise SystemExit('Report aggregate budget exceeded')
           PYTHON
+      - name: Read verified producer tree and trusted reporting helper
+        if: ${{ steps.source.outputs.artifact_id != '' }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          REPORTER_SHA: ${{ github.workflow_sha }}
+        with:
+          script: |
+            const fs = require('node:fs');
+            const path = require('node:path');
+            // Only the helper from this default-branch workflow revision runs.
+            // The producer supplies tree metadata, never code or executable hooks.
+            const helper = await github.rest.repos.getContent({
+              ...context.repo, path: 'scripts/codecov_reporting.py', ref: process.env.REPORTER_SHA,
+            });
+            if (helper.data.type !== 'file' || helper.data.encoding !== 'base64' || helper.data.size > 65536) {
+              throw new Error('Unexpected trusted reporting helper');
+            }
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'codecov-reporting.py'),
+              Buffer.from(helper.data.content, 'base64'), {flag: 'wx'});
+            const commit = await github.rest.git.getCommit({...context.repo, commit_sha: process.env.SOURCE_SHA});
+            const tree = await github.rest.git.getTree({
+              ...context.repo, tree_sha: commit.data.tree.sha, recursive: 'true',
+            });
+            const metadata = JSON.stringify({...tree.data, commit: commit.data.sha});
+            if (tree.data.truncated || Buffer.byteLength(metadata) > 16777216) {
+              throw new Error('Producer source tree is incomplete or too large');
+            }
+            fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'codecov-tree.json'), metadata, {flag: 'wx'});
+      - name: Prepare inert source inventory and repository-relative coverage
+        if: ${{ steps.source.outputs.artifact_id != '' }}
+        env:
+          MODE: prepare
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: python3 -I -B "$RUNNER_TEMP/codecov-reporting.py"
       - name: Upload coverage to Codecov
+        id: coverage_upload
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           use_oidc: true
           files: ${{ runner.temp }}/reports/coverage.xml
-          root_dir: ${{ runner.temp }}/reports
+          root_dir: ${{ runner.temp }}/codecov-source
+          working-directory: ${{ runner.temp }}/codecov-source
           name: coverage-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           plugins: noop
           disable_search: true
@@ -129,12 +166,14 @@ jobs:
           slug: ${{ github.repository }}
           fail_ci_if_error: true
       - name: Upload test results to Codecov
+        id: junit_upload
         if: ${{ steps.source.outputs.artifact_id != '' }}
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           use_oidc: true
           files: ${{ runner.temp }}/reports/junit.xml
-          root_dir: ${{ runner.temp }}/reports
+          root_dir: ${{ runner.temp }}/codecov-source
+          working-directory: ${{ runner.temp }}/codecov-source
           name: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           job_code: junit-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
           report_type: test_results
@@ -148,3 +187,10 @@ jobs:
           override_build_url: ${{ github.event.workflow_run.html_url }}
           slug: ${{ github.repository }}
           fail_ci_if_error: true
+      - name: Verify processed coverage and test results for this attempt
+        if: ${{ always() && steps.source.outputs.artifact_id != '' && steps.coverage_upload.outcome == 'success' && steps.junit_upload.outcome == 'success' }}
+        env:
+          MODE: verify
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+          SOURCE_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 -I -B "$RUNNER_TEMP/codecov-reporting.py"
