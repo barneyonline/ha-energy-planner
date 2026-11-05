@@ -649,9 +649,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   evidence. Pytest treats warnings as errors, with exact test-only exceptions for
   two upstream Home Assistant HTTP/aiohttp messages. Codecov uploads the generated
   coverage and test-result reports without automatic collection plugins or host
-  report searching. Reporting checks out only the validated producer commit as
-  source data, disables credential persistence, and uses that checkout for the
-  tracked-file network; test execution remains uncredentialed. The inline report
+  report searching. Reporting checks out its trusted workflow revision with
+  credential persistence disabled, then fetches and indexes the producer's paths
+  without checking out producer code. This preserves exact tracked-file network
+  matching while test execution remains uncredentialed. The inline report
   validator uses isolated Python imports to prevent producer-module execution.
   Coverage paths remain relative across Docker and reporting checkouts, verified by
   `tests/test_ci_coverage_paths.py`.

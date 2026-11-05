@@ -45,10 +45,14 @@ cases exercise this startup sequence on the supported minimum and stable images.
   Automatic collection plugins are disabled, so the host need not install
   coverage.py, gcov or Xcode. `codecov.yml` makes the existing default CI
   requirement explicit; statement and branch gates remain local and unchanged.
-  Reporting checks out the validated producer SHA with credentials persistence
-  disabled, solely so Codecov can enumerate tracked source files. Both uploads
-  use the checkout as `root_dir`; the downloaded reports stay in runner temporary
-  storage. No producer scripts or local actions run in the credentialed workflow.
+  Reporting checks out its trusted workflow revision with credential persistence
+  disabled. It fetches the validated producer SHA with process-scoped credentials
+  and loads only its Git index with `git read-tree` (without `-u`), so Codecov's
+  `git ls-files` sees the producer's exact added/deleted paths while the working
+  tree remains trusted. Producer source is never checked out or executed in the
+  credentialed workflow. Both uploads use the repository as `root_dir`; downloaded
+  reports stay in runner temporary storage. Collection plugins and file fixes
+  remain disabled, so the uploader does not need producer source contents.
   The inline report validator uses Python isolated mode (`-I`) so a producer's
   `pathlib.py` or other local module cannot run through standard-library imports.
   Coverage.py stores relative paths, so XML sources resolve in both Docker's
@@ -56,8 +60,9 @@ cases exercise this startup sequence on the supported minimum and stable images.
   [checkout prerequisite](https://github.com/codecov/codecov-action#usage) and
   Codecov's [source-path matching guidance](https://docs.codecov.com/docs/fixing-paths).
   `tests/test_ci_coverage_paths.py` measures and reports from different roots,
-  checks both upload contracts, and rejects producer-module execution during
-  validation. A successful upload only means the report was queued: verify the
+  checks both upload contracts, verifies index updates preserve the trusted
+  working tree, and rejects producer-module execution during validation.
+  A successful upload only means the report was queued: verify the
   commit's processing state and nonempty files in Codecov too.
   The 6 November investigation found 20,638/20,638 covered statements in the
   [main test artifact](https://github.com/barneyonline/ha-energy-planner/actions/runs/42124067040),
