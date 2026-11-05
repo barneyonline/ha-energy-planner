@@ -12,6 +12,28 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.11 - 2026-11-06
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Prevent false incomplete-horizon failures at Amber half-hour tariff boundaries by normalizing only the exact duration/end-backed first-second convention and honoring declared interval ends. Retain fail-closed handling for real gaps, stale sources and invalid metadata; add bounded validity retries and compact source/gap diagnostics.
 
 ### 🔧 Improvements
@@ -21,7 +43,10 @@
 
 ### 🔄 Other changes
 
-- Add maintenance workflows and merge checks for HAL-managed issues and PR feedback, with shared operating instructions and changelog/release templates maintained in the central HAL plugin. Keep unattended activation gated by verification.
+- Simplify maintenance to source-repository workflows, add release-candidate packaging, and isolate coverage reporting from untrusted candidate checks.
+- Add a reproducible Docker development environment with pinned dependencies and reusable test containers.
+- Fix stalled Home Assistant 2026.11 runtime checks by initializing test config entries before registry loading; bound CI jobs and report blocked-thread stacks.
+- Remove cloud development and refresh timing details from the README; require an explicit user request for future README changes.
 
 ## 1.4.10 - 2026-11-01
 

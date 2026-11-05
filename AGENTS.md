@@ -43,4 +43,5 @@
 ## Commit & Pull Request Guidelines
 - Commits should be concise and imperative.
 - PRs should include purpose, risk, validation commands, and links to relevant issues/spec sections.
-- Update `README.md`, `docs/requirements-audit.md`, and `quality_scale.yaml` when user-facing behavior, validation evidence, or quality-scale claims change.
+- Update `README.md` only when the user explicitly requests README changes. Put other documentation updates in the relevant `docs/` files.
+- Update `docs/requirements-audit.md` and `quality_scale.yaml` when user-facing behavior, validation evidence, or quality-scale claims change.
