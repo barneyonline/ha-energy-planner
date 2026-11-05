@@ -19,6 +19,21 @@ The record header determines its severity: quoted diagnostic text inside DEBUG
 or INFO messages does not become a warning. Standalone Python warning headers
 are retained, including the base `Warning` category and custom category names.
 
+## CI hang diagnostics
+
+Coverage and runtime-compatibility jobs have a 15-minute limit. Pytest prints
+blocked-thread stacks after 60 seconds in a test, so an unfinished job retains
+diagnostic evidence instead of waiting for GitHub's default six-hour limit.
+`Repository checks` waits for these jobs and fails if an applicable job fails or
+is cancelled; its pending state alone does not indicate a missing status name.
+
+HA 2026.11 entity-registry loading waits for config-entry initialization. Real
+registry tests initialize `ConfigEntries` before loading registries, as Core
+startup does, and bound empty entity-registry loads to ten seconds. Upgrade and
+repair tests also initialize Core's frame helper so compatibility notices use
+the correct test instance. The existing registry, options, upgrade and repair
+cases exercise this startup sequence on the supported minimum and stable images.
+
 ## Repository fixes
 
 - Artifact uploads use a Node 24 action. This replaces the Node 20 declaration
