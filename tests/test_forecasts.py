@@ -758,3 +758,197 @@ def test_tariff_grid_uses_utc_across_the_repeated_daylight_saving_hour():
     assert starts[1] == boundary
     assert starts[1].astimezone(zone).strftime('%H:%M %z') == '02:00 +1000'
     assert starts == sorted(set(starts))
+
+
+@pytest.mark.parametrize("direction", [0, 1], ids=["export", "import"])
+@pytest.mark.parametrize("seconds", [-0.8, 0, 9])
+def test_captured_amber_boundary_has_continuous_native_coverage(direction, seconds):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    rows = json.loads((Path(__file__).parent / "fixtures/tariffs/amber_boundary_2026_11_04.json").read_text())
+    row = rows[direction]
+    state = FakeState(row["state"], row["attributes"])
+    now = datetime(2026, 11, 4, 8, 0, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+    intervals = tariff_source_intervals(state, 15)
+    starts = planning_starts(now, 12, 15, intervals)
+    series = forecast_series_from_state(
+        state, issued_at=now, horizon_hours=12, interval_minutes=15,
+        value_keys=("per_kwh", "price", "value"), value_kind="price", slot_starts=starts,
+    )
+    coverage = forecast_coverage_details(
+        series, starts_at=now, interval_minutes=15, slot_starts=starts, horizon_end=now + timedelta(hours=12),
+    )
+    assert coverage["classification"] == "healthy"
+    assert coverage["continuous_hours"] == coverage["covered_hours"] == 12
+    assert intervals[0]["start"] == "2026-11-04T08:00:00+00:00"
+    assert intervals[0]["end"] == "2026-11-04T08:30:00+00:00"
+    assert all(at.second == 0 for at in starts[1:])
+    assert series[0] == row["attributes"]["detailedForecast"][0]["per_kwh"]
+    assert series[starts.index(datetime(2026, 11, 4, 8, 30, tzinfo=UTC))] == (
+        row["attributes"]["detailedForecast"][1]["per_kwh"]
+    )
+
+
+def _amber_state():
+    rows = json.loads((Path(__file__).parent / "fixtures/tariffs/amber_boundary_2026_11_04.json").read_text())
+    return FakeState(rows[0]["state"], rows[0]["attributes"])
+
+
+@pytest.mark.parametrize("changes", [
+    {"duration": None}, {"duration": True}, {"duration": "30"}, {"duration": float("nan")},
+    {"duration": -30}, {"duration": 15}, {"end_time": "bad"},
+    {"end_time": "2026-11-04T08:29:59+00:00"},
+    {"end_time": "2026-11-04T08:30:01+00:00"},
+    {"end_time": "2026-11-04T08:30:00"}, {"start_time": "2026-11-04T08:00:01"},
+    {"start_time": "bad"}, {"start_time": "2026-11-04T08:00:02+00:00"},
+    {"valid_at": "2026-11-04T08:00:00+00:00"}, {"per_kwh": True}, {"per_kwh": float("inf")},
+])
+def test_amber_inconsistent_metadata_cannot_fall_back_to_convenience_or_scalar(changes):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    state = _amber_state()
+    state.attributes["detailedForecast"][0].update(changes)
+    details = {}
+    assert tariff_source_intervals(state, 15, details=details) == []
+    assert details == {"source_validity": "invalid_intervals", "normalized_intervals": 0}
+    series = forecast_series_from_state(
+        state, issued_at=datetime(2026, 11, 4, 8, tzinfo=UTC), horizon_hours=12,
+        interval_minutes=15, value_keys=("per_kwh", "price", "value"), value_kind="price",
+    )
+    assert series == [None] * 48
+
+
+@pytest.mark.parametrize("missing", ["start_time", "end_time", "duration", "per_kwh"])
+def test_amber_partial_metadata_is_rejected(missing):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    state = _amber_state()
+    del state.attributes["detailedForecast"][1][missing]
+    assert tariff_source_intervals(state, 15) == []
+
+
+@pytest.mark.parametrize("kind", ["leading", "internal", "tail"])
+def test_amber_real_gaps_and_insufficient_coverage_remain_unsafe(kind):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    state = _amber_state()
+    items = state.attributes["detailedForecast"]
+    if kind == "leading":
+        items.pop(0)
+    elif kind == "internal":
+        items.pop(1)
+    else:
+        del items[14:]
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    starts = planning_starts(now, 12, 15, tariff_source_intervals(state, 15))
+    series = forecast_series_from_state(state, issued_at=now, horizon_hours=12, interval_minutes=15,
+        value_keys=("per_kwh",), value_kind="price", slot_starts=starts)
+    details = forecast_coverage_details(series, starts_at=now, interval_minutes=15,
+        slot_starts=starts, horizon_end=now + timedelta(hours=12))
+    assert details["classification"] == "unsafe"
+    key = {"leading": "leading", "internal": "internal", "tail": "trailing"}[kind]
+    assert details[f"{key}_missing_slots"] > 0
+
+
+def test_amber_overlap_and_mixed_non_dict_rows_fail_closed():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    state = _amber_state()
+    state.attributes["detailedForecast"][1] = state.attributes["detailedForecast"][0]
+    assert tariff_source_intervals(state, 15) == []
+    state.attributes["detailedForecast"][1] = 0.1
+    assert tariff_source_intervals(state, 15) == []
+
+
+@pytest.mark.parametrize("duration", [5, 15, 30])
+def test_declared_exact_high_resolution_boundaries_and_negative_price_changes(duration):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    origin = datetime(2026, 11, 4, 8, 0, 2, 100000, tzinfo=UTC)
+    prices = [-0.4, 0.3, -0.2]
+    items = [{"startTime": (origin + timedelta(minutes=i * duration)).isoformat(),
+              "endTime": (origin + timedelta(minutes=(i + 1) * duration)).isoformat(),
+              "duration": duration, "perKwh": price} for i, price in enumerate(prices)]
+    state = FakeState("99", {"detailedForecast": items})
+    intervals = tariff_source_intervals(state, 15)
+    assert datetime.fromisoformat(intervals[0]["start"]) == origin
+    assert datetime.fromisoformat(intervals[-1]["end"]) == origin + timedelta(minutes=3 * duration)
+    instants = [origin - timedelta(microseconds=1), origin,
+                origin + timedelta(minutes=duration) - timedelta(microseconds=1),
+                origin + timedelta(minutes=duration), origin + timedelta(minutes=2 * duration),
+                origin + timedelta(minutes=3 * duration)]
+    assert forecast_series_from_state(state, issued_at=origin, horizon_hours=2, interval_minutes=15,
+        value_keys=("per_kwh",), value_kind="price", slot_starts=instants) == [None, -0.4, -0.4, 0.3, -0.2, None]
+    starts = planning_starts(origin - timedelta(seconds=2), 2, 15, intervals)
+    assert all(datetime.fromisoformat(row["start"]) in starts for row in intervals)
+
+
+@pytest.mark.parametrize("origin", [
+    datetime(2026, 4, 4, 15, 30, tzinfo=UTC),  # Melbourne's repeated hour.
+    datetime(2026, 10, 3, 15, 30, tzinfo=UTC),  # Melbourne's skipped hour.
+])
+def test_amber_local_dst_metadata_preserves_utc_price_instants(origin):
+    from zoneinfo import ZoneInfo
+
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    zone = ZoneInfo("Australia/Melbourne")
+    items = [{"start_time": (origin + timedelta(minutes=30 * i, seconds=1)).astimezone(zone).isoformat(),
+              "end_time": (origin + timedelta(minutes=30 * (i + 1))).astimezone(zone).isoformat(),
+              "duration": 30, "per_kwh": price} for i, price in enumerate([-0.1, 0.2, -0.3])]
+    state = FakeState("99", {"detailedForecast": items})
+    intervals = tariff_source_intervals(state, 15)
+    assert [datetime.fromisoformat(row["start"]) for row in intervals] == [
+        origin + timedelta(minutes=30 * i) for i in range(3)]
+    assert forecast_series_from_state(state, issued_at=origin, horizon_hours=1, interval_minutes=15,
+        value_keys=("per_kwh",), value_kind="price") == [-0.1, -0.1, 0.2, 0.2]
+
+
+def test_other_provider_one_second_timestamps_are_not_rounded():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    origin = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    state = FakeState("-9", {"forecast": [
+        {"start_time": (origin + timedelta(minutes=i * 30, seconds=1)).isoformat(),
+         "end_time": (origin + timedelta(minutes=(i + 1) * 30)).isoformat(),
+         "duration": 30, "price": price} for i, price in enumerate([0.1, -0.2])
+    ]})
+    assert tariff_source_intervals(state, 15)[0]["start"] == (origin + timedelta(seconds=1)).isoformat()
+    assert forecast_series_from_state(state, issued_at=origin, horizon_hours=1, interval_minutes=15,
+        value_keys=("price",), value_kind="price") == [None, 0.1, 0.1, -0.2]
+
+
+@pytest.mark.parametrize("gap", [2, 30])
+def test_declared_tariff_ends_expose_short_internal_gaps(gap):
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+    from custom_components.ha_energy_planner.planning_grid import planning_starts
+
+    origin = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    state = FakeState("9", {"detailedForecast": [
+        {"start_time": origin.isoformat(), "end_time": (origin + timedelta(minutes=30)).isoformat(),
+         "duration": 30, "per_kwh": -0.1},
+        {"start_time": (origin + timedelta(minutes=30, seconds=gap)).isoformat(),
+         "end_time": (origin + timedelta(minutes=60, seconds=gap)).isoformat(), "duration": 30, "per_kwh": 0.2},
+    ]})
+    starts = planning_starts(origin, 1, 15, tariff_source_intervals(state, 15))
+    series = forecast_series_from_state(state, issued_at=origin, horizon_hours=1, interval_minutes=15,
+        value_keys=("per_kwh",), value_kind="price", slot_starts=starts)
+    assert series[starts.index(origin + timedelta(minutes=30))] is None
+    assert series[starts.index(origin + timedelta(minutes=30, seconds=gap))] == 0.2
+    detail = forecast_coverage_details(series, starts_at=origin, interval_minutes=15,
+        slot_starts=starts, horizon_end=origin + timedelta(hours=1))
+    assert detail["classification"] == "unsafe"
+    assert detail["internal_missing_slots"] == 1
+
+
+def test_declared_amber_duration_cannot_exceed_explicit_source_cadence():
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    state = _amber_state()
+    state.attributes["forecast_interval_minutes"] = 5
+    assert tariff_source_intervals(state, 15) == []
+    assert forecast_series_from_state(state, issued_at=datetime(2026, 11, 4, 8, tzinfo=UTC),
+        horizon_hours=1, interval_minutes=15, value_keys=("per_kwh",), value_kind="price") == [None] * 4

@@ -388,6 +388,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._unsub_listeners: list[Callable[[], None]] = []
         self._debounce_cancel: Callable[[], None] | None = None
         self._boundary_cancel: Callable[[], None] | None = None
+        self._tariff_retry_cancel: Callable[[], None] | None = None
+        self._tariff_retry_at: datetime | None = None
+        self._tariff_retry_window_end: datetime | None = None
+        self._tariff_retry_last_requested_at: float | None = None
         self._export_boundary_cancel: Callable[[], None] | None = None
         self._ev_auto_start_retry_cancel: Callable[[], None] | None = None
         self._ev_auto_start_compensation_pending = False
@@ -1230,6 +1234,60 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.hass, max((deadline - dt_util.utcnow()).total_seconds(), 0), due)
 
     @callback
+    def _schedule_tariff_validity_retry(
+        self, details: list[dict[str, Any]], *, observed_at: datetime | None = None,
+    ) -> None:
+        """Request once at a known brief tariff gap's end, with no polling loop."""
+        now = dt_util.utcnow()
+        observed_at = observed_at or now
+        deadlines = [_parse_datetime_or_none(item.get("next_retry_at")) for item in details]
+        # One retry must cover both import and export. Validate imminence at
+        # collection time: context building can outlive an advertised boundary.
+        deadline = max((at for at in deadlines if at is not None and at.utcoffset() is not None
+                        and abs((at - observed_at).total_seconds()) <= 2), default=None)
+        cancel = getattr(self, "_tariff_retry_cancel", None)
+        if deadline is None or getattr(self, "_tearing_down", False):
+            if cancel is not None:
+                cancel()
+                self._tariff_retry_cancel = None
+                self._tariff_retry_at = None
+            self._tariff_retry_window_end = None
+            return
+        previous = getattr(self, "_tariff_retry_at", None)
+        if previous is not None and deadline <= previous:
+            return
+        if cancel is not None:
+            # Merge later validity evidence into the existing pending timer,
+            # without allowing a moving source to postpone it indefinitely.
+            assert self._tariff_retry_window_end is not None
+            if deadline > self._tariff_retry_window_end:
+                return
+            cancel()
+        else:
+            last_requested = getattr(self, "_tariff_retry_last_requested_at", None)
+            if last_requested is not None and monotonic() - last_requested < 30:
+                return
+            self._tariff_retry_window_end = now + timedelta(seconds=2)
+        self._tariff_retry_at = deadline
+
+        @callback
+        def due(_now: Any) -> None:
+            if self._tearing_down or self._tariff_retry_cancel is not scheduled_cancel:
+                return
+            self._tariff_retry_cancel = None
+            self._tariff_retry_window_end = None
+            self._tariff_retry_last_requested_at = monotonic()
+            self._mark_forced_refresh("tariff_validity_boundary")
+            # Core's request cooldown may still be active from the gap's first
+            # refresh. Refresh at validity, retaining Core's serialization lock.
+            self._async_create_listener_task(self.async_refresh())
+
+        scheduled_cancel = async_call_later(
+            self.hass, max((deadline - now).total_seconds(), 0), due,
+        )
+        self._tariff_retry_cancel = scheduled_cancel
+
+    @callback
     def _schedule_next_boundary_refresh(self) -> None:
         """Schedule the next planning-interval boundary refresh."""
         if self._boundary_cancel is not None:
@@ -1534,6 +1592,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.store.async_save_forecast_calibration(forecast_calibration)
             manager.forecast_calibration = forecast_calibration
         context = manager.build_context(self.overrides)
+        self._schedule_tariff_validity_retry(
+            getattr(manager, "forecast_coverage_details", []), observed_at=context.created_at,
+        )
         runtime = dict(self.store.data.get("ownership", {}).get(EXPORT_ASSET, {}))
         if runtime and not getattr(context, "export_limit", None):
             # Keep outstanding restoration visible after its selector is off.
