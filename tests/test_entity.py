@@ -109,3 +109,41 @@ def test_recorder_safe_identifier_preserves_uniqueness_when_truncated() -> None:
     assert len(first.encode("utf-8")) <= 64
     assert len(second.encode("utf-8")) <= 64
     assert first != second
+
+
+def test_single_pass_normalization_preserves_store_types_and_container_context() -> None:
+    """Match the previous conversion order, including tuple/set string fallback."""
+    from copy import deepcopy
+    from dataclasses import dataclass
+    from datetime import UTC, datetime
+    from enum import StrEnum
+
+    from custom_components.ha_energy_planner.models import to_jsonable
+
+    class Label(StrEnum):
+        READY = "ready"
+
+    @dataclass(frozen=True)
+    class Evidence:
+        observed_at: datetime
+        status: Label
+
+    stamp = datetime(2026, 11, 6, tzinfo=UTC)
+    evidence = Evidence(stamp, Label.READY)
+    attributes = {
+        "stamp": stamp, "status": Label.READY, "record": evidence,
+        "list": [stamp, evidence, {"status": Label.READY}],
+        "tuple": (stamp, evidence, {"nested_date": stamp}),
+        "set": {stamp}, "fallback": 1+2j,
+    }
+    saved = deepcopy(attributes)
+    expected = _normalize_attribute_value(to_jsonable(attributes))
+
+    actual = recorder_safe_attributes(attributes)
+
+    assert actual == expected
+    assert actual["stamp"] == stamp.isoformat()
+    assert type(actual["status"]) is str
+    assert actual["record"]["observed_at"] == stamp.isoformat()
+    assert actual["tuple"][0] == str(stamp)
+    assert attributes == saved

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
+from enum import StrEnum
 from itertools import islice
 from typing import Any
 
@@ -65,7 +67,7 @@ def recorder_safe_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     Keep integration-owned attributes below 12 KiB so entity-platform fields
     such as friendly name, icon, and capabilities still have ample headroom.
     """
-    normalized = _normalize_attribute_value(to_jsonable(attributes))
+    normalized = _normalize_attribute_value(attributes, convert=True)
     if not isinstance(normalized, dict):
         return {}
     if _serialized_attribute_bytes(normalized) <= RECORDER_STATE_ATTRIBUTES_TARGET_BYTES:
@@ -108,16 +110,27 @@ def recorder_safe_identifier(value: Any, *, max_bytes: int) -> str:
     return f"{prefix}{suffix}"
 
 
-def _normalize_attribute_value(value: Any, *, depth: int = 0) -> Any:
-    """Convert attribute values to stable JSON-compatible structures."""
+def _normalize_attribute_value(value: Any, *, depth: int = 0, convert: bool = False) -> Any:
+    """Normalize and optionally convert Store types in a single container walk."""
     if depth >= 20:
         return "<truncated>"
+    if convert and isinstance(value, datetime | StrEnum):
+        return to_jsonable(value)
     if value is None or isinstance(value, str | int | float | bool):
         return value
     if isinstance(value, dict):
-        return {str(key): _normalize_attribute_value(item, depth=depth + 1) for key, item in value.items()}
-    if isinstance(value, list | tuple | set):
+        return {str(key): _normalize_attribute_value(item, depth=depth + 1, convert=convert)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalize_attribute_value(item, depth=depth + 1, convert=convert) for item in value]
+    if isinstance(value, tuple | set):
+        # to_jsonable historically leaves tuple/set contents untouched; retain
+        # their existing string fallback for dates and dataclasses.
         return [_normalize_attribute_value(item, depth=depth + 1) for item in value]
+    if convert:
+        converted = to_jsonable(value)
+        if converted is not value:
+            return _normalize_attribute_value(converted, depth=depth)
     return str(value)
 
 
