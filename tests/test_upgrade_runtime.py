@@ -219,7 +219,6 @@ def test_loaded_target_repair_updates_legacy_subentry_and_uses_update_listener(t
     async def run():
         hass = HomeAssistant(str(tmp_path))
         hass.config_entries = ConfigEntries(hass, {})
-        await hass.config_entries.async_initialize()
         dr.async_setup(hass)
         await dr.async_load(hass, load_empty=True)
         await er.async_load(hass, load_empty=True)

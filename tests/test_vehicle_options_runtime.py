@@ -31,7 +31,6 @@ def test_disabled_entry_vehicle_options_survive_setup(tmp_path: Path, legacy: bo
         hass = HomeAssistant(str(tmp_path))
         loader.async_setup(hass)
         hass.config_entries = ConfigEntries(hass, {})
-        await hass.config_entries.async_initialize()
         dr.async_setup(hass)
         await dr.async_load(hass, load_empty=True)
         await er.async_load(hass, load_empty=True)
