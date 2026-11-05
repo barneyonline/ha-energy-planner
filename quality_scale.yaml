@@ -193,6 +193,8 @@ rules:
         - tests/test_inputs.py
         - tests/test_forecasts.py
         - tests/fixtures/solcast_daily_power.json
+        - tests/fixtures/tariffs/amber_boundary_2026_11_04.json
+        - docs/tariff-coverage.md
         - tests/test_storage.py
         - tests/test_services.py
         - tests/test_ev.py

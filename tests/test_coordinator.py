@@ -10953,3 +10953,201 @@ def test_disabled_zone_remembered_target_during_owned_restoration(monkeypatch, s
             "climate_zone_changed", preserve_zone_entity_id="climate.zone",
         )
         assert not executor.hvac_feedback_commands
+
+
+def test_tariff_validity_retry_is_one_shot_bounded_and_cancelled_on_reload(monkeypatch):
+    from custom_components.ha_energy_planner import task_lifecycle
+
+    async def run():
+        now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: now.timestamp())
+        callbacks, cancelled = [], []
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+            callbacks.append((delay, cb)) or (lambda: cancelled.append(True))))
+        coordinator = _coordinator_for_runtime_services()
+        coordinator._tearing_down = False
+        coordinator._listener_tasks = set()
+        coordinator.hass.async_create_task = asyncio.create_task
+        deadline = now + timedelta(seconds=0.8)
+        details = [{"next_retry_at": deadline.isoformat()}] * 2
+        coordinator._schedule_tariff_validity_retry(details)
+        assert callbacks[0][0] == 0.8
+        for _ in range(10):
+            coordinator._schedule_tariff_validity_retry(details)
+        assert len(callbacks) == 1
+        callbacks[0][1](deadline)
+        callbacks[0][1](deadline)
+        await asyncio.sleep(0)
+        assert coordinator.refresh_requested == 1
+        assert coordinator._pending_refresh_trigger == "tariff_validity_boundary"
+        assert coordinator._force_next_refresh
+        # Old evidence and a moving boundary cannot cause repeated immediate work.
+        coordinator._schedule_tariff_validity_retry(details)
+        coordinator._schedule_tariff_validity_retry([{"next_retry_at": (deadline + timedelta(seconds=1)).isoformat()}])
+        assert len(callbacks) == 1
+        now += timedelta(minutes=5)
+        coordinator._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}])
+        assert len(callbacks) == 2
+        task_lifecycle._begin_shutdown(coordinator)
+        assert cancelled == [True]
+        assert coordinator._tariff_retry_at is None
+        assert coordinator._tariff_retry_cancel is None
+        callbacks[-1][1](now)
+        assert coordinator.refresh_requested == 1
+        coordinator._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}])
+        assert len(callbacks) == 2
+        # Setup after teardown owns a new callback; an old callback stays inert.
+        coordinator._tearing_down = False
+        coordinator._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}])
+        callbacks[-2][1](now)
+        assert len(callbacks) == 3
+        assert coordinator.refresh_requested == 1
+        callbacks[-1][1](now)
+        await asyncio.sleep(0)
+        assert coordinator.refresh_requested == 2
+
+    asyncio.run(run())
+
+
+def test_tariff_validity_retry_cancels_on_recovery_and_ignores_unbounded_evidence(monkeypatch):
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    callbacks, cancelled = [], []
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+        callbacks.append((delay, cb)) or (lambda: cancelled.append(True))))
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._tearing_down = False
+    coordinator._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}])
+    coordinator._schedule_tariff_validity_retry([])
+    assert cancelled == [True]
+    callbacks[0][1](now)
+    assert coordinator.refresh_requested == 0
+    for raw in [None, "bad", "2026-11-04T08:00:01", (now + timedelta(seconds=3)).isoformat(),
+                (now - timedelta(seconds=3)).isoformat()]:
+        coordinator._schedule_tariff_validity_retry([{"next_retry_at": raw}])
+    assert len(callbacks) == 1
+    # A refresh that crossed a just-advertised deadline gets one immediate retry.
+    coordinator._tariff_retry_at = None
+    coordinator._schedule_tariff_validity_retry([{"next_retry_at": (now - timedelta(seconds=1)).isoformat()}])
+    assert callbacks[-1][0] == 0
+
+
+def test_tariff_validity_retry_refreshes_during_home_assistant_debounce_cooldown(monkeypatch):
+    from homeassistant.helpers.debounce import Debouncer
+    from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+
+    async def run():
+        now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+        callbacks = []
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+            callbacks.append(cb) or (lambda: None)))
+        owner = _coordinator_for_runtime_services()
+        owner._tearing_down = False
+        owner._listener_tasks = set()
+        owner.hass.async_create_task = asyncio.create_task
+        owner._async_refresh = AsyncMock()
+        # Use Core's real coordinator methods and Debouncer, including an active
+        # cooldown from the refresh that just observed the leading gap.
+        owner._debounced_refresh = Debouncer(owner.hass, logging.getLogger(__name__), cooldown=10,
+                                             immediate=True, function=owner._async_refresh)
+        owner.async_request_refresh = DataUpdateCoordinator.async_request_refresh.__get__(owner)
+        owner.async_refresh = DataUpdateCoordinator.async_refresh.__get__(owner)
+        timer = asyncio.get_running_loop().call_later(10, lambda: None)
+        owner._debounced_refresh._timer_task = timer
+        try:
+            owner._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}])
+            callbacks[0](now + timedelta(seconds=1))
+            await asyncio.gather(*owner._listener_tasks)
+            owner._async_refresh.assert_awaited_once_with(log_failures=True)
+        finally:
+            timer.cancel()
+
+    asyncio.run(run())
+
+
+def test_tariff_retry_waits_for_all_known_sources_and_coalesces_pending_updates(monkeypatch):
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    callbacks, cancelled = [], []
+    monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+        callbacks.append((delay, cb)) or (lambda: cancelled.append(True))))
+    owner = _coordinator_for_runtime_services()
+    owner._tearing_down = False
+    owner._schedule_tariff_validity_retry([
+        {"next_retry_at": (now + timedelta(seconds=0.5)).isoformat()},
+        {"next_retry_at": (now + timedelta(seconds=1.5)).isoformat()},
+    ])
+    assert callbacks[-1][0] == 1.5
+    owner._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1.8)).isoformat()}])
+    assert callbacks[-1][0] == 1.8
+    assert cancelled == [True]
+    # A provider cannot keep extending the original pending retry window.
+    now += timedelta(seconds=1)
+    owner._schedule_tariff_validity_retry([{"next_retry_at": (now + timedelta(seconds=1.5)).isoformat()}])
+    assert len(callbacks) == 2
+    callbacks[0][1](now)
+    assert owner.refresh_requested == 0
+
+
+def test_tariff_retry_uses_snapshot_time_after_slow_build_and_bounds_actual_requests(monkeypatch):
+    async def run():
+        observed = datetime(2026, 11, 4, 8, tzinfo=UTC)
+        now = observed + timedelta(seconds=4)
+        elapsed = [100.0]
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: elapsed[0])
+        callbacks = []
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+            callbacks.append((delay, cb)) or (lambda: None)))
+        owner = _coordinator_for_runtime_services()
+        owner._tearing_down = False
+        owner._listener_tasks = set()
+        owner.hass.async_create_task = asyncio.create_task
+        owner._schedule_tariff_validity_retry(
+            [{"next_retry_at": (observed + timedelta(seconds=0.8)).isoformat()}], observed_at=observed,
+        )
+        assert callbacks[-1][0] == 0
+        callbacks[-1][1](now)
+        await asyncio.gather(*owner._listener_tasks)
+        assert owner.refresh_requested == 1
+        # Deadline separation exceeds 30s, but the actual attempts do not.
+        now += timedelta(seconds=29)
+        elapsed[0] += 29
+        details = [{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}]
+        owner._schedule_tariff_validity_retry(details, observed_at=now)
+        assert len(callbacks) == 1
+        now += timedelta(seconds=1)
+        elapsed[0] += 1
+        owner._schedule_tariff_validity_retry(
+            [{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}], observed_at=now,
+        )
+        assert len(callbacks) == 2
+
+    asyncio.run(run())
+
+
+def test_cancelled_tariff_retry_can_be_replaced_without_consuming_an_attempt(monkeypatch):
+    async def run():
+        now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+        callbacks = []
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
+            callbacks.append(cb) or (lambda: None)))
+        owner = _coordinator_for_runtime_services()
+        owner._tearing_down = False
+        owner._listener_tasks = set()
+        owner.hass.async_create_task = asyncio.create_task
+        details = [{"next_retry_at": (now + timedelta(seconds=1)).isoformat()}]
+        owner._schedule_tariff_validity_retry(details)
+        owner._schedule_tariff_validity_retry([])
+        owner._schedule_tariff_validity_retry(details)
+        assert len(callbacks) == 2
+        callbacks[0](now)
+        assert not owner._listener_tasks
+        callbacks[1](now)
+        await asyncio.gather(*owner._listener_tasks)
+        assert owner.refresh_requested == 1
+
+    asyncio.run(run())

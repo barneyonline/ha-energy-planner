@@ -228,10 +228,27 @@ class InputManager:
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
         tariffs = []
+        self._tariff_source_details: dict[str, dict[str, Any]] = {}
         for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
             state = self._state(self.entry_data.get(key))
             if state is not None:
-                tariffs.extend(tariff_source_intervals(state, interval))
+                details: dict[str, Any] = {}
+                intervals = tariff_source_intervals(state, interval, details=details)
+                age = now - state.last_updated
+                fresh = timedelta() <= age <= timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
+                details.update(source_freshness="fresh" if fresh else "stale", next_retry_at=None)
+                # Retry only a known, imminent validity boundary, never poll for
+                # missing data. Coverage remains unsafe until that instant.
+                if fresh and intervals and not any(
+                    datetime.fromisoformat(row["start"]) <= now < datetime.fromisoformat(row["end"])
+                    for row in intervals
+                ):
+                    upcoming = [datetime.fromisoformat(row["start"]) for row in intervals
+                                if now < datetime.fromisoformat(row["start"]) <= now + timedelta(seconds=2)]
+                    if upcoming:
+                        details["next_retry_at"] = min(upcoming).isoformat()
+                self._tariff_source_details[key] = details
+                tariffs.extend(intervals)
         self._slot_starts = planning_starts(now, horizon, interval, tariffs)
         import_prices, import_issue = self._required_series(
             CONF_AMBER_IMPORT_PRICE,
@@ -572,6 +589,7 @@ class InputManager:
             raw_forecast = list(primary_forecast or [None] * slot_count)
             coverage_details = forecast_coverage_details(forecast, starts_at=now, interval_minutes=interval,
                 slot_starts=getattr(self, "_slot_starts", None), horizon_end=now + timedelta(hours=horizon))
+            coverage_details.update(getattr(self, "_tariff_source_details", {}).get(config_key, {}))
             coverage = float(coverage_details["coverage_ratio"])
             self._record_forecast_confidence(
                 min(_state_confidence(source_state, default=1.0) for _, _, source_state in source_states)

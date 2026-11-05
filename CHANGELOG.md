@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Prevent false incomplete-horizon failures at Amber half-hour tariff boundaries by normalizing only the exact duration/end-backed first-second convention and honoring declared interval ends. Retain fail-closed handling for real gaps, stale sources and invalid metadata; add bounded validity retries and compact source/gap diagnostics.
 
 ### 🔧 Improvements
 

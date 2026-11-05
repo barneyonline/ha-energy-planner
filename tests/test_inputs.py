@@ -2468,3 +2468,99 @@ def test_point_sensor_confidence_uses_only_the_partial_current_interval():
     manager._slot_starts = [now + timedelta(minutes=m) for m in [0, 2, 15, 30, 45]]
     manager._required_series(CONF_PV_FORECAST, ('value',), 'power', now, 1, 15)
     assert manager.forecast_confidence_details[-1]['confidence'] == pytest.approx(.7 * 2 / 60, abs=5e-5)
+
+
+@pytest.mark.parametrize("seconds", [-0.8, 0, 9])
+def test_captured_amber_inputs_share_grid_lifecycle_and_health(monkeypatch, seconds):
+    import json
+    from pathlib import Path
+
+    from custom_components.ha_energy_planner.forecasts import tariff_source_intervals
+
+    now = datetime(2026, 11, 4, 8, 0, 1, tzinfo=UTC) + timedelta(seconds=seconds)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    rows = json.loads((Path(__file__).parent / "fixtures/tariffs/amber_boundary_2026_11_04.json").read_text())
+    states = {row["entity_id"]: FakeState(row["state"], row["attributes"], now) for row in rows}
+    states.update({"person.home": FakeState("home", {}, now),
+                   "sensor.pv": FakeState("1", {"forecast": [1] * 60}, now),
+                   "sensor.house": FakeState("1", {}, now), "sensor.battery": FakeState("50", {}, now)})
+    data = {CONF_PERSON_ENTITIES: ["person.home"],
+            CONF_AMBER_IMPORT_PRICE: "sensor.tariff_import", CONF_AMBER_EXPORT_PRICE: "sensor.tariff_export",
+            CONF_PV_FORECAST: "sensor.pv", CONF_HOUSEHOLD_LOAD: "sensor.house", CONF_BATTERY_SOC: "sensor.battery"}
+    manager = InputManager(FakeHass(states), data, {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    context = manager.build_context()
+    assert context.input_health == InputHealth.HEALTHY, context.input_issues
+    assert len(context.slots) == 49
+    assert context.slots[-1].end_at == now + timedelta(hours=12)
+    context.hvac_control = {"period_start": "2026-11-04T12:00:00+00:00"}
+    assert manager.retained_hvac_tariff_slots(context) == context.slots
+    native = tariff_source_intervals(states["sensor.tariff_import"], 15)
+    assert context.climate_inputs["tariff_intervals"] == native
+    assert {datetime.fromisoformat(row["start"]) for row in native[:24]} - {now.replace(microsecond=0, second=0)} <= {
+        slot.valid_at for slot in context.slots}
+    details = [row for row in manager.forecast_coverage_details
+               if row["config_key"] in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE)]
+    assert len(details) == 2
+    for row in details:
+        assert row["classification"] == "healthy"
+        assert row["normalized_intervals"] == 27
+        assert row["source_validity"] == "declared_intervals"
+        assert row["source_freshness"] == "fresh"
+        assert row["next_retry_at"] is None
+
+
+@pytest.mark.parametrize("gap,stale,invalid,expected_retry", [
+    (2, False, False, True), (3, False, False, False),
+    (2, True, False, False), (2, False, True, False),
+])
+def test_tariff_gap_diagnostics_and_known_validity_retry(monkeypatch, gap, stale, invalid, expected_retry):
+    origin = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    now = origin + timedelta(seconds=0.2)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    items = [{"start_time": (origin + timedelta(minutes=i * 30, seconds=gap)).isoformat(),
+              "end_time": (origin + timedelta(minutes=(i + 1) * 30, seconds=gap)).isoformat(),
+              "duration": 30, "per_kwh": 0.1} for i in range(27)]
+    if invalid:
+        items[1]["duration"] = "30"
+    state = FakeState("99", {"detailedForecast": items}, now - timedelta(minutes=31 if stale else 0))
+    manager = InputManager(FakeHass({"sensor.tariff": state}), {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"},
+                           {**DEFAULT_OPTIONS, "planning_interval_minutes": 15})
+    context = manager.build_context()
+    assert context.input_health == InputHealth.UNSAFE
+    assert f"{CONF_AMBER_IMPORT_PRICE}_incomplete_horizon" in context.input_issues
+    assert context.slots[0].import_price is None
+    if stale:
+        assert f"{CONF_AMBER_IMPORT_PRICE}_stale" in context.input_issues
+    detail = next(row for row in manager.forecast_coverage_details if row["config_key"] == CONF_AMBER_IMPORT_PRICE)
+    assert detail["leading_missing_slots"] > 0
+    assert detail["source_validity"] == ("invalid_intervals" if invalid else "declared_intervals")
+    assert detail["source_freshness"] == ("stale" if stale else "fresh")
+    assert detail["next_retry_at"] == ((origin + timedelta(seconds=gap)).isoformat() if expected_retry else None)
+    if expected_retry:
+        boundary = origin + timedelta(seconds=gap)
+        monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: boundary)
+        recovered = manager.build_context()
+        detail = next(row for row in manager.forecast_coverage_details if row["config_key"] == CONF_AMBER_IMPORT_PRICE)
+        assert recovered.slots[0].import_price == 0.1
+        assert detail["classification"] == "healthy"
+        assert detail["next_retry_at"] is None
+
+
+def test_stale_captured_amber_payload_cannot_make_inputs_healthy(monkeypatch):
+    import json
+    from pathlib import Path
+
+    now = datetime(2026, 11, 4, 8, tzinfo=UTC)
+    monkeypatch.setattr(inputs_module.dt_util, "utcnow", lambda: now)
+    rows = json.loads((Path(__file__).parent / "fixtures/tariffs/amber_boundary_2026_11_04.json").read_text())
+    row = rows[1]
+    state = FakeState(row["state"], row["attributes"], now - timedelta(minutes=31))
+    manager = InputManager(
+        FakeHass({"sensor.tariff": state}), {CONF_AMBER_IMPORT_PRICE: "sensor.tariff"}, DEFAULT_OPTIONS,
+    )
+    context = manager.build_context()
+    assert context.input_health == InputHealth.UNSAFE
+    assert f"{CONF_AMBER_IMPORT_PRICE}_stale" in context.input_issues
+    detail = next(row for row in manager.forecast_coverage_details if row["config_key"] == CONF_AMBER_IMPORT_PRICE)
+    assert detail["source_freshness"] == "stale"
+    assert detail["next_retry_at"] is None

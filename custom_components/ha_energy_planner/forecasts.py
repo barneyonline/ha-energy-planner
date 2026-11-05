@@ -51,15 +51,29 @@ def constant_forecast(
     ]
 
 
-def tariff_source_intervals(state: Any, interval_minutes: int) -> list[dict[str, Any]]:
+def tariff_source_intervals(
+    state: Any, interval_minutes: int, *, details: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Expose sanitized source boundaries used to identify tariff lifecycles."""
     attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
     keys = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
+    raw_items = _forecast_items(attributes, keys)
+    declared = _declared_tariff_intervals(raw_items, keys, str(attributes.get("unit_of_measurement", "")),
+                                         maximum_minutes=_explicit_interval_minutes(attributes))
+    if declared is not None:
+        intervals, normalized = declared
+        if details is not None:
+            details.update(source_validity="declared_intervals" if intervals else "invalid_intervals",
+                           normalized_intervals=normalized)
+        return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
+                for start, end, price in intervals[:576]]
+    if details is not None:
+        details.update(source_validity="inferred_intervals", normalized_intervals=0)
     parsed = [
         _parse_item(
             item, value_keys=keys, value_kind="price", default_unit=str(attributes.get("unit_of_measurement", ""))
         )
-        for item in _forecast_items(attributes, keys)
+        for item in raw_items
     ]
     points = sorted(
         {(_as_aware_utc(at), value) for item in parsed if item is not None for at, value in [item] if at is not None}
@@ -105,6 +119,16 @@ def forecast_series_from_state(
     slot_count = len(slot_starts) if slot_starts is not None else int((horizon_hours * 60) / interval_minutes)
     if not raw_items:
         return None
+    issued_at = _as_aware_utc(issued_at)
+    starts = slot_starts if slot_starts is not None else [
+        issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
+    ]
+    if value_kind == "price":
+        declared = _declared_tariff_intervals(raw_items, value_keys, default_unit,
+                                             maximum_minutes=_explicit_interval_minutes(attributes))
+        if declared is not None:
+            intervals, _normalized = declared
+            return [_value_for_tariff_slot(at, intervals) for at in starts]
     if value_kind == "power":
         raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
 
@@ -142,11 +166,68 @@ def forecast_series_from_state(
         explicit_cadence or timedelta(minutes=interval_minutes),
         maximum=explicit_cadence,
     )
-    issued_at = _as_aware_utc(issued_at)
-    starts = slot_starts if slot_starts is not None else [
-        issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
-    ]
     return [_value_for_slot(at, timestamped, final_cadence=cadence) for at in starts]
+
+
+def _amber_half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]) -> datetime:
+    """Translate only Amber's documented, duration-backed first-second convention."""
+    # public-api/swagger.json: duration=30, startTime=02:00:01Z, endTime=02:30:00Z.
+    # This is schema evidence, not permission to round arbitrary timestamps.
+    if (
+        end is not None
+        and type(item.get("duration")) in (int, float)
+        and item["duration"] == 30
+        and (end.minute % 30, end.second, end.microsecond) == (0, 0, 0)
+        and end - start == timedelta(minutes=30, seconds=-1)
+    ):
+        return start - timedelta(seconds=1)
+    return start
+
+
+def _declared_tariff_intervals(
+    raw_items: list[Any], value_keys: tuple[str, ...], default_unit: str, *, maximum_minutes: float | None,
+) -> tuple[list[tuple[datetime, datetime, float]], int] | None:
+    """Honor Amber interval metadata; reject broken native evidence without fallback.
+
+    Timestamp-only and other provider schemas retain their existing parser. Once
+    an Amber per_kwh source declares interval metadata, every row must validate.
+    Real gaps remain gaps and explicit ends cannot be extended by inferred cadence.
+    """
+    items = [_flatten_item(item) if isinstance(item, dict) else {} for item in raw_items]
+    if not any("per_kwh" in item and ("duration" in item or "end_time" in item) for item in items):
+        return None
+    intervals: list[tuple[datetime, datetime, float]] = []
+    normalized = 0
+    for item in items:
+        start = _parse_datetime_or_none(item.get("start_time"))
+        end = _parse_datetime_or_none(item.get("end_time"))
+        duration = item.get("duration")
+        parsed = _parse_item(item, value_keys=value_keys, value_kind="price", default_unit=default_unit)
+        if (
+            start is None or end is None or start.utcoffset() is None or end.utcoffset() is None
+            or type(duration) not in (int, float) or duration not in (5, 15, 30)
+            or type(item.get("per_kwh")) not in (int, float) or parsed is None or parsed[0] != start
+        ):
+            return [], 0
+        start, end = _as_aware_utc(start), _as_aware_utc(end)
+        canonical_start = _amber_half_hour_start(start, end, item)
+        if (end - canonical_start != timedelta(minutes=duration)
+                or (maximum_minutes is not None and duration > maximum_minutes)):
+            return [], 0
+        normalized += canonical_start != start
+        intervals.append((canonical_start, end, parsed[1]))
+    intervals.sort(key=itemgetter(0))
+    if any(right[0] < left[1] for left, right in zip(intervals, intervals[1:], strict=False)):
+        return [], 0
+    return intervals, normalized
+
+
+def _value_for_tariff_slot(at: datetime, intervals: list[tuple[datetime, datetime, float]]) -> float | None:
+    """Sample half-open declared intervals without bridging their gaps or tail."""
+    position = bisect_right(intervals, at, key=itemgetter(0)) - 1
+    if position < 0 or at >= intervals[position][1]:
+        return None
+    return intervals[position][2]
 
 
 def forecast_coverage_ratio(series: list[float | None] | None) -> float:

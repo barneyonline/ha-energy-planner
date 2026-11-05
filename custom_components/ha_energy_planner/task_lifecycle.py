@@ -47,6 +47,13 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if self._boundary_cancel is not None:
         self._boundary_cancel()
         self._boundary_cancel = None
+    tariff_cancel = getattr(self, "_tariff_retry_cancel", None)
+    if tariff_cancel is not None:
+        tariff_cancel()
+        self._tariff_retry_cancel = None
+    self._tariff_retry_at = None
+    self._tariff_retry_window_end = None
+    self._tariff_retry_last_requested_at = None
     export_cancel = getattr(self, "_export_boundary_cancel", None)
     if export_cancel is not None:
         export_cancel()
