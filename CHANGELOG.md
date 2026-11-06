@@ -12,15 +12,38 @@
 
 ### 🐛 Bug fixes
 
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.12 - 2026-11-07
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
 - Keep shared HVAC coast ownership and schedule suppression when an owned, confirmed closed completed zone is beyond the opposite comfort boundary and recovering passively. Continue room monitoring and hand off on worsening excursions, recovery demand or lost isolation evidence; preserve original restoration baselines.
 
 ### 🔧 Improvements
 
 - Replace the integration branding with the cleaner planning calendar, using the banner colours for solar, battery and EV charging. Include light/dark and high-resolution icon and logo variants.
+- Complete and enforce exact 100% statement and branch coverage across the integration, with additional boundary and failure-path tests.
 
 ### 🔄 Other changes
 
-- None
+- Correct Codecov source matching across reporting jobs while keeping producer code out of the credentialed reporting checkout.
 
 ## 1.4.11 - 2026-11-06
 
