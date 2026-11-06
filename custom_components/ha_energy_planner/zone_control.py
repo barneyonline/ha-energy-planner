@@ -6,6 +6,7 @@ airflow. Operators must supply exact pairs and installer-verified open sets.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import timedelta
 from typing import Any
 
@@ -70,7 +71,7 @@ def superseded_entities(data: dict[str, Any], entities: set[str]) -> set[str]:
     return result
 
 
-def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, Any]:
+def evaluate(context: DecisionContext, mode: str, target: float, *, check_airflow: bool = True) -> dict[str, Any]:
     """Compute desired zone power; persistence belongs to the ownership transaction."""
     from .zone_temperature import bounds, feedback_missing
 
@@ -131,7 +132,7 @@ def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, An
             "restart_not_before": restart_at.isoformat() if restart_at else None,
         }
     active = {entity for entity, state in power.items() if state == "on"}
-    if active and not any(active == set(row) for row in config["safe_open_sets"]):
+    if check_airflow and active and not any(active == set(row) for row in config["safe_open_sets"]):
         return {"supported": False, "reason": "minimum_airflow_unproven", "zones": rows}
     complete = not active
     if complete:
@@ -143,10 +144,78 @@ def evaluate(context: DecisionContext, mode: str, target: float) -> dict[str, An
             "reason": "all_zones_complete" if complete else "independent_zone_preparation"}
 
 
+def coast_isolated_rooms(context: DecisionContext, mode: str) -> set[str]:
+    """Exempt only owned, confirmed closed rooms recovering passively in head-off coast.
+
+    The opposite boundary is not a reason to restart same-mode conditioning.
+    A worsening excursion after entering coast does require recovery handoff.
+    No unavailable/disabled flag or thermostat alias proves physical closure.
+    """
+    from .zone_temperature import bounds
+
+    active = context.hvac_control
+    previous = active.get("zone_intent", {})
+    target = finite(active.get("precondition_target"))
+    if (active.get("main_state_committed") is not True or not previous.get("supported")
+            or target is None or active.get("command_confirmation") or active.get("required_evidence_lost")):
+        return set()
+    # Coast never applies preparation reopening requests. Validate room evidence
+    # here, then prove airflow against the physical states below.
+    intent = evaluate(context, mode, target, check_airflow=False)
+    if not intent.get("supported"):
+        return set()
+    states = context.climate_inputs.get("zone_actuator_states", {})
+    pairs = intent["pairs"]
+    if any(states.get(entity) not in {"on", "off"}
+           or states[entity] != previous.get("power", {}).get(entity)
+           or entity not in active.get("zone_states", {}) for entity in pairs):
+        return set()
+    opened = {entity for entity in pairs if states[entity] == "on"}
+    if not opened or not any(opened == set(row) for row in context.climate_inputs["zone_topology"]["safe_open_sets"]):
+        return set()
+    if (context.current_hvac_mode not in {mode, "off"} or (
+        active.get("phase") in {"pre_peak_coast", "peak_coast"} and context.current_hvac_mode != "off"
+    )):
+        return set()
+    isolated: set[str] = set()
+    for actuator, climate in pairs.items():
+        old = previous.get("zones", {}).get(actuator, {})
+        if states[actuator] != "off" or old.get("status") not in {"paused", "completed"}:
+            continue
+        value = intent["zones"][actuator]["temperature"]
+        before = finite(old.get("temperature"))
+        rooms = context.climate_inputs["zones"]
+        low, high = bounds(context, rooms[actuator] if actuator in rooms else rooms[climate])
+        opposite_breach = value < low if mode == "cool" else value > high
+        if previous.get("coast_isolation") and opposite_breach and (
+            before is None or (value < before if mode == "cool" else value > before)
+        ):
+            continue
+        isolated.update((actuator, climate))
+    return isolated
+
+
+def retained_coast_intent(context: DecisionContext, mode: str) -> dict[str, Any] | None:
+    """Refresh observations without replacing the confirmed physical completion intent."""
+    if not coast_isolated_rooms(context, mode):
+        return None
+    intent: dict[str, Any] = deepcopy(context.hvac_control["zone_intent"])
+    intent["coast_isolation"] = True
+    rooms = context.climate_inputs["zones"]
+    for actuator, row in intent["zones"].items():
+        climate = intent["pairs"][actuator]
+        room = rooms[actuator] if actuator in rooms else rooms[climate]
+        row["temperature"] = float(room["temperature"])
+        row["temperature_source"] = deepcopy(room["temperature_source"])
+    intent["evaluated_at"] = context.created_at.isoformat()
+    return intent
+
+
 def desired_fields(context: DecisionContext, mode: str, target: float, phase: str, *,
                    record: bool = True) -> dict[str, Any]:
     """Keep a confirmed airflow path through coast; stop the head before any closure."""
-    intent = evaluate(context, mode, target)
+    retained = retained_coast_intent(context, mode) if phase != "preconditioning" else None
+    intent = retained if retained is not None else evaluate(context, mode, target)
     if record:
         context.climate_legacy_decision["zone_control"] = intent
     if not intent.get("supported"):
@@ -175,26 +244,20 @@ def desired_fields(context: DecisionContext, mode: str, target: float, phase: st
 def live_rejection(hass: Any, data: dict[str, Any], options: dict[str, Any], desired: dict[str, Any],
                    previous: dict[str, Any], now: Any) -> str | None:
     """Recheck mapped sensor freshness and the exact subset immediately before I/O."""
-    from .climate_inputs import read_climate_inputs
-
     if desired.get("zone_control_blocked"):
         return str(desired["zone_control_blocked"])
     if desired.get("equipment_compensation") and (
         not desired.get("zone_intent") or desired.get("zone_stop") or desired.get("mode") != "cool"
     ):
         return "zone_equipment_intent_invalid"
-    if not desired.get("zone_intent") or desired.get("zone_stop"):
+    retained_coast = desired.get("zone_intent", {}).get("coast_isolation") is True
+    if not desired.get("zone_intent") or (desired.get("zone_stop") and not retained_coast):
         return None
-    inputs = read_climate_inputs(hass, data, options, now, now + timedelta(hours=12), {})
-    def helper(key: str) -> float | None:
-        state = hass.states.get(data.get(key))
-        return finite(state.state) if state is not None else None
-    context = DecisionContext(
-        now, "zone-readback", [], None, None, OccupancyState.UNKNOWN, InputHealth.HEALTHY,
-        climate_inputs=inputs, hvac_control=previous,
-        occupied_temperature_low_c=helper("climate_target_low_entity"),
-        occupied_temperature_high_c=helper("climate_target_high_entity"),
-    )
+    if retained_coast:
+        return None if confirmed_coast_intent(hass, data, options, desired, previous, now) is not None else (
+            "zone_coast_protection_lost"
+        )
+    context = _live_context(hass, data, options, previous, now)
     current = evaluate(context, str(desired.get("mode")), float(desired["precondition_target"]))
     if not current.get("supported"):
         return str(current["reason"])
@@ -209,3 +272,37 @@ def live_rejection(hass: Any, data: dict[str, Any], options: dict[str, Any], des
     ):
         return "zone_equipment_target_superseded"
     return None
+
+
+def _live_context(hass: Any, data: dict[str, Any], options: dict[str, Any],
+                  previous: dict[str, Any], now: Any) -> DecisionContext:
+    """Read one current set of room, physical switch and head observations."""
+    from .climate_inputs import read_climate_inputs
+
+    inputs = read_climate_inputs(hass, data, options, now, now + timedelta(hours=12), {})
+    def helper(key: str) -> float | None:
+        state = hass.states.get(data.get(key))
+        return finite(state.state) if state is not None else None
+    head = hass.states.get(data.get("daikin_climate_entity"))
+    return DecisionContext(
+        now, "zone-readback", [], None, None, OccupancyState.UNKNOWN, InputHealth.HEALTHY,
+        climate_inputs=inputs, hvac_control=previous,
+        current_hvac_mode=head.state if head is not None else None,
+        occupied_temperature_low_c=helper("climate_target_low_entity"),
+        occupied_temperature_high_c=helper("climate_target_high_entity"),
+    )
+
+
+def confirmed_coast_intent(hass: Any, data: dict[str, Any], options: dict[str, Any], desired: dict[str, Any],
+                           previous: dict[str, Any], now: Any, *,
+                           require_head_off: bool = False) -> dict[str, Any] | None:
+    """Capture a safe execution-time coast observation for durable recovery checks."""
+    from .zone_temperature import comfort_breached
+
+    context = _live_context(hass, data, options, previous, now)
+    if require_head_off and context.current_hvac_mode != "off":
+        return None
+    intent = retained_coast_intent(context, str(desired.get("mode")))
+    if intent is None or comfort_breached(context, str(desired.get("mode")), coasting=True):
+        return None
+    return intent

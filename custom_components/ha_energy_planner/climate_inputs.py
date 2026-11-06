@@ -196,7 +196,7 @@ def read_climate_inputs(
     hass: Any, data: dict[str, Any], options: dict[str, Any], now: datetime, end: datetime, load_details: dict[str, Any]
 ) -> dict[str, Any]:
     """Read only mapped sensors; missing optional evidence stays explicitly absent."""
-    from .zone_control import read_topology
+    from .zone_control import read_topology, topology
     sources: dict[str, Any] = {}
     freshness = timedelta(minutes=float(options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120)))
 
@@ -317,6 +317,10 @@ def read_climate_inputs(
         "irradiance_forecast": forecast,
         "zones": zones,
         "zone_topology": read_topology(hass, data),
+        "zone_actuator_states": {
+            entity: current.state if (current := state(entity)) is not None else None
+            for entity in topology(data).get("pairs", {})
+        },
         "sources": sources,
         "cop_table": {
             mode: [{"temperature": float(row["temperature"]), "cop": float(row["cop"])} for row in rows]

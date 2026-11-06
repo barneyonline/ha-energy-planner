@@ -2556,6 +2556,7 @@ def test_executor_applies_daikin_action_and_records_takeover(monkeypatch: object
                     "saved_automation_states": {"automation.hvac": "on"},
                     "saved_zone_states": {"switch.zone": "off"},
                     "saved_main_state": {},
+                    "confirmed_zone_intent": None,
                     "rollback_succeeded": None,
                     "command_sent": False,
                 },
@@ -2811,6 +2812,7 @@ def test_executor_marks_away_off_without_taking_zone_ownership(
                 saved_automation_states={"automation.hvac": "on"},
                 saved_zone_states=saved_zone_states,
                 saved_main_state={},
+                confirmed_zone_intent=None,
                 rollback_succeeded=None,
                 command_sent=False,
             )
@@ -2906,6 +2908,7 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
                 saved_zone_states={"switch.zone": "on"},
                 command_sent=command_sent,
                 saved_main_state={},
+                confirmed_zone_intent=None,
                 rollback_succeeded=None,
             )
 

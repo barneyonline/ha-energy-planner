@@ -255,7 +255,8 @@ class HVACOwnershipTransaction:
                 if (not hvac_control.get("preconditioning_started_at")
                         or self.previous.get("hvac_control", {}).get("lifecycle_id") != desired.get("lifecycle_id")):
                     hvac_control["preconditioning_started_at"] = self.now
-            if (desired.get("zone_intent") and desired["zone_intent"].get("power")
+            zone_intent = hvac_result.confirmed_zone_intent or desired.get("zone_intent")
+            if (zone_intent and zone_intent.get("power")
                     != self.previous.get("hvac_control", {}).get("zone_intent", {}).get("power")):
                 hvac_control["zone_transition_at"] = confirmed_at or self.now
             saved_zones = dict(hvac_control.get("zone_states", {}))
@@ -279,11 +280,11 @@ class HVACOwnershipTransaction:
             for key in HVAC_LIFECYCLE_FIELDS:
                 if desired.get(key) is not None:
                     hvac_control[key] = desired[key]
-            if desired.get("zone_intent"):
+            if zone_intent:
                 # The durable request starts recovery, but the off dwell starts
                 # at confirmed completion, never before a slow closure settles.
                 hvac_control["zone_intent"] = _zone_intent_pause_times(
-                    desired["zone_intent"], self.previous.get("hvac_control", {}).get("zone_intent", {}),
+                    zone_intent, self.previous.get("hvac_control", {}).get("zone_intent", {}),
                     confirmed_at or self.now,
                 )
             if (
