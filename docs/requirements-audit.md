@@ -1800,3 +1800,30 @@ has line-rate and branch-rate of 1 for every file. A full stable-image run also
 passed, followed by the final advice, Codecov path/gate and safety-stop checks.
 These are local validation results; hosted Codecov processing requires publishing
 the revision and completing its existing CI reporting workflow.
+
+### Completed-zone coast comfort handoff
+
+- `zone_temperature.py::comfort_breached` applies the opposite-boundary exception
+  only to canonical aliases returned by `zone_control.py::coast_isolated_rooms`.
+  Committed intent, actuator baselines, fresh mapped feedback, exact switch state
+  and safe airflow are required. All rooms retain the normal recovery boundary;
+  worsening opposite-boundary excursions during coast trigger ordinary handoff.
+- `zone_control.py::desired_fields` keeps head-off coast, frozen physical completion
+  intent and existing ownership, without changing original restoration baselines.
+  `live_rejection` rechecks retained coast immediately before I/O. The economic
+  subset gate still selects the existing fallback lifecycle and claims no savings.
+- `tests/test_zone_control.py` reproduces the preparation deadline failure in both
+  directions, paired aliases, real executor ownership across a reconstructed
+  executor/reload, schedule suppression, active-control sensor semantics, period-end
+  restoration and repeat release. Negative cases cover closure uncertainty,
+  reopening, missing ownership, active intent, sensor/topology/airflow loss,
+  participating-room breaches and worsening closed-room excursions.
+- Validation remains `scripts/docker-validate.sh`; see `docs/climate-decisions.md`
+  for the passive recovery and conservative sensor-noise tradeoff. This is local
+  deterministic evidence, not a deployment or a measured HVAC-performance claim.
+- Review regressions in `tests/test_zone_control.py::test_review_coast_*` cover
+  three-room safe physical airflow after preparation dwell expires, newer room
+  readings before/during execution, feedback loss or head restart after final
+  confirmation, and stale queued intent after a successful subset change.
+  `hvac_adapter.py` supplies the confirmed coast intent to `hvac_control.py`, which
+  persists it without replacing original restoration baselines.
