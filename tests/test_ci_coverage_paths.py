@@ -19,7 +19,14 @@ def test_coverage_report_survives_a_different_checkout_path(tmp_path: Path) -> N
     source.mkdir(parents=True)
     (source / "__init__.py").write_text("")
     probe = source / "probe.py"
-    probe.write_text("covered = True\n")
+    probe.write_text(
+        "def choose(flag):\n"
+        "    if flag:\n"
+        "        return 1\n"
+        "    return 0\n"
+        "assert choose(True) == 1\n"
+        "assert choose(False) == 0\n"
+    )
     config = str(ROOT / "pyproject.toml")
     env = {**os.environ, "COVERAGE_FILE": str(tmp_path / ".coverage")}
     subprocess.run(
@@ -42,6 +49,8 @@ def test_coverage_report_survives_a_different_checkout_path(tmp_path: Path) -> N
     )
     report = ET.parse(consumer / "coverage.xml").getroot()
     assert report.get("line-rate") == "1"
+    assert report.get("branch-rate") == "1"
+    assert int(report.get("branches-valid", "0")) > 0
     sources = [Path(node.text or "") for node in report.findall("./sources/source")]
     assert sources and all(not path.is_absolute() for path in sources)
     filenames = [node.attrib["filename"] for node in report.findall(".//class")]
@@ -157,3 +166,10 @@ def test_report_validation_cannot_import_producer_modules(tmp_path: Path) -> Non
     )
     assert not marker.exists(), "The credentialed validator executed a producer-controlled Python module"
     assert result.returncode == 0, result.stderr
+
+
+def test_codecov_requires_complete_project_and_patch_coverage():
+    config = yaml.safe_load((ROOT / "codecov.yml").read_text())
+    assert config["codecov"]["require_ci_to_pass"] is True
+    for kind in ("project", "patch"):
+        assert config["coverage"]["status"][kind]["default"] == {"target": "100%", "threshold": "0%"}

@@ -44,7 +44,8 @@ cases exercise this startup sequence on the supported minimum and stable images.
 - Codecov consumes the generated `coverage.xml` and `junit.xml` explicitly.
   Automatic collection plugins are disabled, so the host need not install
   coverage.py, gcov or Xcode. `codecov.yml` makes the existing default CI
-  requirement explicit; statement and branch gates remain local and unchanged.
+  requirement explicit and requires 100% project and patch coverage with zero
+  threshold. The local gate requires every statement and branch using raw counts.
   Reporting checks out its trusted workflow revision with credential persistence
   disabled. It fetches the validated producer SHA with process-scoped credentials
   and loads only its Git index with `git read-tree` (without `-u`), so Codecov's

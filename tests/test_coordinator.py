@@ -2323,7 +2323,10 @@ def test_start_listeners_stops_replug_auto_start_with_retained_ownership(
     assert len(coordinator.hass.created_tasks) == 1
 
 
-def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monkeypatch: object) -> None:
+@pytest.mark.parametrize("has_marker_callbacks", [True, False])
+def test_start_listeners_handles_override_helper_and_takeover_zone_changes(
+    monkeypatch: object, has_marker_callbacks: bool,
+) -> None:
     callbacks: list[object] = []
 
     monkeypatch.setattr(
@@ -2358,6 +2361,9 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
     )
     coordinator.store = FakeStore({"ownership": {"hvac_control": {"phase": "peak_coast"}}})
     coordinator.executor = FakeExecutor()
+    if not has_marker_callbacks:
+        coordinator.executor.mark_pending_hvac_manual_override = None
+        coordinator.executor.mark_pending_hvac_zone_manual_override = None
     coordinator.overrides = []
     coordinator._boundary_cancel = None
     coordinator._debounce_cancel = None
@@ -2455,10 +2461,10 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
     )
 
     assert len(coordinator.hass.created_tasks) == 5
-    assert coordinator.executor.pending_hvac_manual_overrides == 1
-    assert coordinator.executor.pending_hvac_manual_zone_overrides == [
-        "climate.zone_temperature"
-    ]
+    assert coordinator.executor.pending_hvac_manual_overrides == (1 if has_marker_callbacks else 0)
+    assert coordinator.executor.pending_hvac_manual_zone_overrides == (
+        ["climate.zone_temperature"] if has_marker_callbacks else []
+    )
     assert coordinator.executor.pending_hvac_desired_state == {
         "enable_zones": True,
         "configured_zones_only": False,
@@ -2467,7 +2473,7 @@ def test_start_listeners_handles_override_helper_and_takeover_zone_changes(monke
             "context_id": "planner-context",
             "state": "on",
         },
-        "manual_override_detected": True,
+        **({"manual_override_detected": True} if has_marker_callbacks else {}),
     }
     assert manual_changes == [
         ("climate_zone_changed", "switch.zone", False),
@@ -4893,6 +4899,12 @@ def test_update_data_locked_records_dry_run_comparison(
     active_result = asyncio.run(refresh_and_train())
 
     assert active_result.status == "unsafe"
+    assert active_result.mode == PlannerMode.ACTIVE_DEGRADED
+
+    FakeConstraintValidator.violations = ["grid_import_limit_exceeded"]
+    coordinator._force_next_refresh = True
+    active_result = asyncio.run(refresh_and_train())
+    assert active_result.status != "unsafe"
     assert active_result.mode == PlannerMode.ACTIVE_DEGRADED
 
 

@@ -1670,9 +1670,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         for issue in climate_issues:
             if issue not in context.input_issues:
                 context.input_issues.append(issue)
-        stored_ownership = self.store.data.get("ownership", {})
-        if isinstance(stored_ownership, dict):
-            context.hvac_control = _hvac_control_from_ownership(stored_ownership)
+        context.hvac_control = _hvac_control_from_ownership(self.store.data.get("ownership", {}))
         reconcile_cycle = getattr(self.executor, "async_reconcile_hvac_cycle", None)
         if callable(reconcile_cycle):
             await reconcile_cycle()
