@@ -424,31 +424,30 @@ class Executor:
                     rejected=True,
                 )
                 return result
-            if self.hass is not None:
-                capability_issues = (
-                    CapabilityDiscovery(
-                        self.hass,
-                        self.entry_data,
-                        self.options,
-                    )
-                    .inspect()
-                    .ev.issues
+            capability_issues = (
+                CapabilityDiscovery(
+                    self.hass,
+                    self.entry_data,
+                    self.options,
                 )
-                if capability_issues:
-                    result = EVCommandResult(
-                        False,
-                        ",".join(capability_issues),
-                        {},
-                        {},
-                    )
-                    await self._async_record_manual_ev_outcome(
-                        action,
-                        result,
-                        now,
-                        plan_id=plan_id,
-                        rejected=True,
-                    )
-                    return result
+                .inspect()
+                .ev.issues
+            )
+            if capability_issues:
+                result = EVCommandResult(
+                    False,
+                    ",".join(capability_issues),
+                    {},
+                    {},
+                )
+                await self._async_record_manual_ev_outcome(
+                    action,
+                    result,
+                    now,
+                    plan_id=plan_id,
+                    rejected=True,
+                )
+                return result
         ev_entry_data = self._ev_entry_data_for_action(action)
         if enabled and ev_entry_data.get("ev_power_limit_entity"):
             capability = power_capability(self.hass.states.get(ev_entry_data["ev_power_limit_entity"]), self.options)

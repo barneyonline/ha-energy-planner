@@ -1236,9 +1236,7 @@ class InputManager:
             ):
                 issue = f"{key}_stale"
                 if key == CONF_CARBON_INTENSITY_FORECAST:
-                    advisory_issue = _advisory_issue(issue)
-                    if advisory_issue is not None:
-                        issues.append(advisory_issue)
+                    issues.append(f"advisory_{issue}")
                 else:
                     issues.append(issue)
         load_entity = self.entry_data.get(CONF_HOUSEHOLD_LOAD)
