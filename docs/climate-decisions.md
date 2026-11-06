@@ -736,3 +736,46 @@ Climate observation predictions persist each baseline interval's end, so measure
 Forecast confidence weights coverage by actual duration rather than interval count, including point-only inputs. Load coverage diagnostics use the same elapsed durations. Calendar label upgrades retain a confirmed climate phase's existing identity (UID, confirmed start and location), while separate phase UIDs and discrete actions remain distinct.
 
 Coverage classification sums elapsed durations before converting to hours. Exact eight- and twelve-hour windows qualify at their existing thresholds even when import/export tariff boundaries are a second apart; a window ending one second short still fails that threshold.
+
+## Completed isolated rooms during coast
+
+At the preparation deadline, the existing pre-peak/peak coast keeps the shared
+head off and retains climate ownership, managed schedule suppression and the
+Climate control active signal. A completed closed room below its cooling comfort
+low (or above its heating comfort high) no longer releases the whole unit by
+itself. This exception requires committed ownership, persisted paused/completed
+intent, original actuator ownership, registry-validated switch/thermostat pairs,
+fresh unambiguous room feedback, exact physical switch readback matching intent,
+and an installer-verified remaining open set. Thermostat aliases and a generic
+disabled flag cannot establish closure. No new timer or schedule is introduced.
+
+The closed room remains monitored against its ordinary bounds. During head-off
+coast it may recover passively from the opposite-boundary excursion. Worsening
+relative to the last persisted coast temperature triggers the existing whole-unit
+comfort handoff; there is no relaxed temperature threshold. Any participating
+room breach, or any room reaching the coast recovery boundary, still hands off.
+Missing isolation proof cannot grant an exception. The adapter repeats physical,
+sensor and comfort checks before execution, including after intervening awaits.
+Manual changes, stop/control disable, away policy and pending recovery retain their
+existing authority. The original targets, dampers and automation enablement remain
+owned until actual release and use the existing guarded restoration transaction.
+A necessary recovery handoff releases the shared unit and schedules together;
+the existing no-reacquisition hold does not claim continued suppression.
+
+Coast preserves the confirmed physical completion intent instead of recalculating
+preparation reopening requests. Reload reads that persisted intent plus current
+physical state. Independent subsets continue through the fallback policy; their
+economic savings model remains unqualified and no economic takeover is enabled.
+Non-independent economic and fallback comfort checks retain their existing rules.
+The conservative worsening check may hand back control on sensor noise; this
+patch does not prove physical recovery or guarantee every room reaches comfort.
+Regression evidence is in tests/test_zone_control.py; full validation is
+scripts/docker-validate.sh. No live-device observations are claimed by these tests.
+
+Coast airflow proof uses the actual retained open set, independently of hypothetical
+preparation reopening requests after dwell/hysteresis expiry. After final device
+confirmation the adapter rechecks room feedback, physical isolation, comfort and
+the stopped head, and returns a fresh coast intent to the ownership transaction.
+That confirmed observation establishes the next recovery-trend baseline; an older
+queued action cannot replace the latest physical completion intent or hide drift
+between execution and the following refresh.

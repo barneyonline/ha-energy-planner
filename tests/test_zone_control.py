@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -1236,3 +1237,349 @@ def test_already_restored_closed_target_does_not_reopen_under_a_user_head():
     result = asyncio.run(DaikinHVACAdapter(hass, data()).async_restore({}, zones, {}))
     assert result.applied and not result.saved_zone_states
     assert not hass.services.calls
+
+
+@pytest.mark.parametrize('mode', ['cool', 'heat'])
+@pytest.mark.parametrize('phase,minutes', [('preconditioning', 0), ('pre_peak_coast', -5), ('peak_coast', 60)])
+def test_completed_isolated_room_retains_coast_at_real_phase_boundary(mode, phase, minutes):
+    c = isolated_boundary(mode)
+    c.created_at += timedelta(minutes=minutes)
+    c.hvac_control['phase'] = phase
+    if phase != 'preconditioning':
+        c.current_hvac_mode = 'off'
+    if minutes < 0:
+        c.slots.insert(0, replace(c.slots[0], valid_at=c.created_at, import_price=0.1))
+    c.slots = [slot for slot in c.slots if slot.valid_at >= c.created_at]
+    policy = HVACPlanningPolicy(DEFAULT_OPTIONS, {})
+    actions = policy._hvac_lifecycle_actions(c, c.created_at, c.created_at + timedelta(minutes=5))
+    assert actions[0].kind == 'set_hvac'
+    assert actions[0].desired_state['phase'] == ('pre_peak_coast' if minutes < 0 else 'peak_coast')
+    assert actions[0].desired_state['zone_stop']
+    assert actions[0].desired_state['hvac_mode'] == 'off'
+    assert economic_actions(c, DEFAULT_OPTIONS, actions) == actions
+
+
+def isolated_boundary(mode='cool'):
+    c = room_context(mode, 20.1 if mode == 'cool' else 20.9, 18.86 if mode == 'cool' else 22.14)
+    c.occupied_temperature_low_c, c.occupied_temperature_high_c = 19, 22
+    c.hvac_control = ownership(c, mode)
+    c.hvac_control.update(precondition_target=19 if mode == 'cool' else 22,
+                          zone_states={MAIN: 'on', BED: 'on'})
+    c.hvac_control['zone_intent'] = evaluate(c, mode, c.hvac_control['precondition_target'])
+    c.climate_inputs['zone_actuator_states'] = {MAIN: 'on', BED: 'off'}
+    for actuator, climate in PAIRS.items():
+        c.climate_inputs['zones'][climate] = deepcopy(c.climate_inputs['zones'][actuator])
+    base = datetime(2026, 11, 6, 2, tzinfo=UTC)
+    c.hvac_control.update(period_start=base + timedelta(hours=3), period_end=base + timedelta(hours=8))
+    c.created_at = base + timedelta(hours=3)
+    for row in c.hvac_control['zone_intent']['zones'].values():
+        if row['paused_at']:
+            row['paused_at'] = base.isoformat()
+    template = c.slots[-1]
+    c.slots = [replace(template, valid_at=base + timedelta(minutes=i * 5), import_price=0.5)
+               for i in range(36, 96)]
+    return c
+
+
+@pytest.mark.parametrize('mode', ['heat', 'cool'])
+@pytest.mark.parametrize('failure', [
+    'open', 'unknown', 'missing', 'no_intent', 'uncommitted', 'pending', 'lost', 'unowned',
+    'active_intent', 'unsafe_airflow', 'no_airflow', 'stale', 'sensor', 'topology', 'alias',
+    'participating', 'closed_needs_recovery', 'worsening', 'missing_prior_temperature', 'head_restarted',
+])
+def test_isolated_coast_keeps_conservative_comfort_handoff(mode, failure):
+    c = isolated_boundary(mode)
+    previous = c.hvac_control['zone_intent']
+    if failure == 'open':
+        c.climate_inputs['zone_actuator_states'][BED] = 'on'
+    elif failure == 'unknown':
+        c.climate_inputs['zone_actuator_states'][BED] = 'unavailable'
+    elif failure == 'missing':
+        c.climate_inputs.pop('zone_actuator_states')
+    elif failure == 'no_intent':
+        c.hvac_control.pop('zone_intent')
+    elif failure == 'uncommitted':
+        c.hvac_control.pop('main_state_committed')
+    elif failure == 'pending':
+        c.hvac_control['command_confirmation'] = {'entity_id': BED}
+    elif failure == 'lost':
+        c.hvac_control['required_evidence_lost'] = True
+    elif failure == 'unowned':
+        c.hvac_control['zone_states'].pop(BED)
+    elif failure == 'active_intent':
+        previous['zones'][BED]['status'] = 'active'
+    elif failure == 'unsafe_airflow':
+        c.climate_inputs['zone_topology']['safe_open_sets'] = [[MAIN, BED]]
+    elif failure == 'no_airflow':
+        c.climate_inputs['zone_actuator_states'][MAIN] = previous['power'][MAIN] = 'off'
+    elif failure == 'stale':
+        c.climate_inputs['zones'][BED]['temperature_source']['fresh'] = False
+    elif failure == 'sensor':
+        c.climate_inputs['zones'][BED]['temperature'] = None
+    elif failure == 'topology':
+        c.climate_inputs['zone_topology']['supported'] = False
+    elif failure == 'alias':
+        c.climate_inputs['zones'][BED_CLIMATE]['temperature_entity'] = 'sensor.other'
+    elif failure in {'participating', 'closed_needs_recovery'}:
+        for entity in ((MAIN, MAIN_CLIMATE) if failure == 'participating' else (BED, BED_CLIMATE)):
+            c.climate_inputs['zones'][entity]['temperature'] = 22 if mode == 'cool' else 19
+    else:
+        c.hvac_control['phase'] = 'peak_coast'
+        c.current_hvac_mode = 'off'
+        previous['coast_isolation'] = True
+        if failure == 'worsening':
+            previous['zones'][BED]['temperature'] += 0.01 if mode == 'cool' else -0.01
+        elif failure == 'missing_prior_temperature':
+            previous['zones'][BED]['temperature'] = None
+        else:
+            c.current_hvac_mode = mode
+    actions = HVACPlanningPolicy(DEFAULT_OPTIONS, {})._hvac_lifecycle_actions(
+        c, c.created_at, c.created_at + timedelta(minutes=5))
+    assert actions[0].kind == 'release_hvac'
+
+
+@pytest.mark.parametrize('failure', ['reopened', 'sensor', 'head', 'comfort'])
+def test_live_retained_coast_rechecks_physical_closure_before_any_write(monkeypatch, failure):
+    c = isolated_boundary()
+    hass = device(c)
+    hass.states.values[BED] = 'off'
+    hass.states.values['input_number.low'] = '19'
+    hass.states.values['input_number.high'] = '22'
+    monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+    desired = HVACPlanningPolicy(DEFAULT_OPTIONS, {})._hvac_lifecycle_actions(
+        c, c.created_at, c.created_at + timedelta(minutes=5))[0].desired_state
+    assert live_rejection(hass, data(), DEFAULT_OPTIONS, desired, c.hvac_control, c.created_at) is None
+    if failure == 'reopened':
+        hass.states.values[BED] = 'on'
+    elif failure == 'sensor':
+        hass.states.values['sensor.bed'].state = 'unavailable'
+    elif failure == 'head':
+        hass.states.values.pop('climate.head')
+    else:
+        hass.states.values['sensor.living'].state = '22'
+    adapter = DaikinHVACAdapter(hass, data())
+    adapter.set_zone_control_context(DEFAULT_OPTIONS, c.hvac_control)
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+    assert not result.applied and result.reason == 'zone_coast_protection_lost'
+    assert not hass.services.calls
+
+
+@pytest.mark.parametrize('mode', ['cool', 'heat'])
+def test_coast_executor_owns_schedules_through_reload_then_restores_once(monkeypatch, mode):
+    from custom_components.ha_energy_planner.binary_sensor import BINARY_SENSORS
+    c = isolated_boundary(mode)
+    hass = device(c)
+    hass.states.values[BED] = 'off'
+    hass.states.values['input_number.low'] = '19'
+    hass.states.values['input_number.high'] = '22'
+    schedules = {f'automation.schedule_{i}': 'on' if i != 4 else 'off' for i in range(1, 5)}
+    hass.states.values.update({entity: 'off' for entity in schedules})
+    entry = data()
+    from custom_components.ha_energy_planner.const import (
+        CONF_CLIMATE_AUTOMATIONS,
+        CONF_CLIMATE_CHANGE_FROM_SCHEDULER,
+        CONF_CLIMATE_SCHEDULER_GUARD_TIMER,
+    )
+    entry[CONF_CLIMATE_AUTOMATIONS] = list(schedules)
+    entry[CONF_CLIMATE_CHANGE_FROM_SCHEDULER] = 'input_boolean.scheduler'
+    entry[CONF_CLIMATE_SCHEDULER_GUARD_TIMER] = 'timer.guard'
+    hass.states.values.update({'input_boolean.scheduler': 'off', 'timer.guard': 'idle'})
+    original = {'hvac_control': {**c.hvac_control,
+        'main_state': {'hvac_mode': 'heat' if mode == 'cool' else 'cool', 'target_temperature': 24},
+        'zone_states': {MAIN: 'off', BED: 'on', MAIN_CLIMATE: {'target_temperature': 23},
+                        BED_CLIMATE: {'target_temperature': 23}}}, 'climate_automations': schedules}
+    store = FakeStore()
+    store.data['ownership'] = deepcopy(original)
+    options = {**DEFAULT_OPTIONS, 'dry_run': False, 'climate_control_enabled': True}
+    policy = HVACPlanningPolicy(DEFAULT_OPTIONS, {})
+    sensor = next(d for d in BINARY_SENSORS if d.key == 'climate_control_active')
+    async def run():
+        for elapsed, bed_temp in [(0, 18.86 if mode == 'cool' else 22.14),
+                                  (60, 19.67 if mode == 'cool' else 21.33)]:
+            c.created_at = datetime(2026, 11, 6, 5, tzinfo=UTC) + timedelta(minutes=elapsed)
+            c.slots = [s for s in c.slots if s.valid_at >= c.created_at]
+            c.hvac_control = deepcopy(store.data['ownership']['hvac_control'])
+            c.current_hvac_mode = hass.states.get('climate.head').state
+            for entity in (BED, BED_CLIMATE):
+                c.climate_inputs['zones'][entity]['temperature'] = bed_temp
+            hass.states.values['sensor.bed'].state = str(bed_temp)
+            for entity in ('sensor.bed', 'sensor.living'):
+                hass.states.values[entity].last_updated = c.created_at
+            monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+            action = policy._hvac_lifecycle_actions(c, c.created_at, c.created_at + timedelta(minutes=5))[0]
+            assert action.kind == 'set_hvac'
+            executor = Executor(store, hass=hass, entry_data=entry, options=options)
+            _arm_store(store, executor)
+            await executor.async_evaluate(_plan(c.created_at, action))
+            saved = store.data['ownership']
+            assert saved['hvac_control']['phase'] == 'peak_coast', store.data.get('outcomes')
+            assert saved['hvac_control']['main_state_committed']
+            assert saved['hvac_control']['main_state'] == original['hvac_control']['main_state']
+            assert saved['hvac_control']['zone_states'] == original['hvac_control']['zone_states']
+            assert saved['climate_automations'] == schedules
+            assert sensor.value_fn(SimpleNamespace(store=store))
+            assert hass.states.get('climate.head').state == 'off'
+            assert hass.states.get(BED).state == 'off'
+            assert all(hass.states.get(entity).state == 'off' for entity in schedules)
+            assert not any(service == 'set_hvac_mode' for _, service, _ in hass.services.calls)
+        c.created_at = datetime(2026, 11, 6, 10, tzinfo=UTC)
+        c.hvac_control = deepcopy(store.data['ownership']['hvac_control'])
+        c.slots = []
+        monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+        release = policy._hvac_lifecycle_actions(c, c.created_at, c.created_at + timedelta(minutes=5))[0]
+        assert release.desired_state['release_reason'] == 'hvac_expensive_period_ended'
+        await executor.async_evaluate(_plan(c.created_at, release))
+        assert not sensor.value_fn(SimpleNamespace(store=store)), store.data['ownership']
+        assert {entity: hass.states.get(entity).state for entity in schedules} == schedules
+        assert hass.states.get(BED).state == 'on'
+        assert hass.states.get(MAIN).state == 'off'
+        assert hass.states.get('climate.head').attributes['temperature'] == 24
+        assert hass.states.get('climate.head').state == original['hvac_control']['main_state']['hvac_mode']
+        assert all(hass.states.get(climate).attributes['temperature'] == 23 for climate in PAIRS.values())
+        calls = list(hass.services.calls)
+        await executor.async_release_hvac_control('period_ended_again')
+        assert [call for call in hass.services.calls if call[0] != 'persistent_notification'] == [
+            call for call in calls if call[0] != 'persistent_notification']
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('mapping', ['switch', 'climate', 'both'])
+@pytest.mark.parametrize('record', [True, False])
+def test_recovering_coast_keeps_canonical_intent_inside_comfort(mapping, record):
+    c = isolated_boundary()
+    c.hvac_control['phase'] = 'peak_coast'
+    c.hvac_control['zone_intent']['coast_isolation'] = True
+    c.hvac_control['zone_intent']['zones'][BED]['temperature'] = 19.8
+    c.current_hvac_mode = 'off'
+    for entity in (BED, BED_CLIMATE):
+        c.climate_inputs['zones'][entity]['temperature'] = 19.67
+    if mapping != 'both':
+        for entity in (PAIRS if mapping == 'climate' else PAIRS.values()):
+            c.climate_inputs['zones'].pop(entity)
+    desired = desired_fields(c, 'cool', 19, 'peak_coast', record=record)
+    assert desired['zone_intent']['power'] == {MAIN: 'on', BED: 'off'}
+    assert desired['zone_intent']['zones'][BED]['temperature'] == 19.67
+    assert desired['zone_intent']['zones'][BED]['status'] == 'paused'
+    assert not comfort_breached(c, 'cool', coasting=True)
+    if record:
+        assert c.climate_legacy_decision['zone_control'] == desired['zone_intent']
+    else:
+        assert not c.climate_legacy_decision
+
+
+@pytest.mark.parametrize('mode', ['cool', 'heat'])
+def test_review_coast_uses_physical_airflow_after_preparation_dwell(mode):
+    c = isolated_boundary(mode)
+    third, thermostat = 'switch.third', 'climate.third'
+    c.climate_inputs['zone_topology']['pairs'][third] = thermostat
+    c.climate_inputs['zone_topology']['safe_open_sets'] = [[MAIN, BED, third], [MAIN]]
+    c.climate_inputs['zones'][third] = deepcopy(c.climate_inputs['zones'][BED])
+    c.climate_inputs['zones'][third]['temperature_entity'] = 'sensor.third'
+    c.hvac_control['zone_intent'] = {}
+    c.hvac_control['zone_intent'] = evaluate(c, mode, c.hvac_control['precondition_target'])
+    c.hvac_control['zone_states'][third] = 'on'
+    c.climate_inputs['zone_actuator_states'][third] = 'off'
+    c.hvac_control['phase'] = 'peak_coast'
+    c.hvac_control['zone_intent']['coast_isolation'] = True
+    c.current_hvac_mode = 'off'
+    c.created_at += timedelta(minutes=11)
+    for entity in (BED, BED_CLIMATE):
+        c.climate_inputs['zones'][entity]['temperature'] = 19.5 if mode == 'cool' else 21.5
+    desired = desired_fields(c, mode, c.hvac_control['precondition_target'], 'peak_coast')
+    assert desired.get('zone_stop'), desired
+    assert desired['zone_intent']['power'] == {MAIN: 'on', BED: 'off', third: 'off'}
+    assert not comfort_breached(c, mode, coasting=True)
+
+
+@pytest.mark.parametrize('mode', ['cool', 'heat'])
+@pytest.mark.parametrize('when', ['before_execution', 'during_confirmation'])
+def test_review_coast_persists_confirmed_recovery_temperature(monkeypatch, mode, when):
+    c = isolated_boundary(mode)
+    hass = device(c)
+    hass.states.values[BED] = 'off'
+    hass.states.values['input_number.low'] = '19'
+    hass.states.values['input_number.high'] = '22'
+    monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+    desired = {'phase': 'peak_coast', 'mode': mode,
+               **desired_fields(c, mode, c.hvac_control['precondition_target'], 'peak_coast')}
+    confirmed = 18.95 if mode == 'cool' else 22.05
+    original_confirm = DaikinHVACAdapter._async_confirm_complete_hvac_state
+    async def confirm(self, *args):
+        result = await original_confirm(self, *args)
+        if when == 'during_confirmation':
+            hass.states.values['sensor.bed'].state = str(confirmed)
+        return result
+    monkeypatch.setattr(DaikinHVACAdapter, '_async_confirm_complete_hvac_state', confirm)
+    if when == 'before_execution':
+        hass.states.values['sensor.bed'].state = str(confirmed)
+    previous = {'hvac_control': {**c.hvac_control, 'main_state': {'hvac_mode': mode, 'target_temperature': 24}}}
+    tx = HVACOwnershipTransaction(previous, c.created_at)
+    prepared = tx.prepare(desired, {}, {}, {})
+    adapter = DaikinHVACAdapter(hass, data())
+    adapter.set_zone_control_context(DEFAULT_OPTIONS, c.hvac_control)
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+    assert result.applied
+    saved = tx.complete(result, prepared, desired, main_state_superseded=False, superseded_zone_entity_ids=set())
+    assert saved['hvac_control']['zone_intent']['zones'][BED]['temperature'] == confirmed
+    c.hvac_control = saved['hvac_control']
+    c.current_hvac_mode = 'off'
+    for entity in (BED, BED_CLIMATE):
+        c.climate_inputs['zones'][entity]['temperature'] = 18.9 if mode == 'cool' else 22.1
+    assert comfort_breached(c, mode, coasting=True)
+
+
+@pytest.mark.parametrize('failure', ['sensor', 'reopened', 'comfort', 'head_restarted'])
+def test_review_coast_rechecks_after_final_confirmation(monkeypatch, failure):
+    c = isolated_boundary()
+    hass = device(c)
+    hass.states.values[BED] = 'off'
+    hass.states.values['input_number.low'] = '19'
+    hass.states.values['input_number.high'] = '22'
+    monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+    desired = {'phase': 'peak_coast', 'mode': 'cool', **desired_fields(c, 'cool', 19, 'peak_coast')}
+    original = DaikinHVACAdapter._async_confirm_complete_hvac_state
+    async def confirm(self, *args):
+        result = await original(self, *args)
+        if failure == 'sensor':
+            hass.states.values['sensor.bed'].state = 'unavailable'
+        elif failure == 'reopened':
+            hass.states.values[BED] = 'on'
+        elif failure == 'comfort':
+            hass.states.values['sensor.living'].state = '22'
+        else:
+            hass.states.values['climate.head'] = FakeState('cool', {'temperature': 19})
+        return result
+    monkeypatch.setattr(DaikinHVACAdapter, '_async_confirm_complete_hvac_state', confirm)
+    adapter = DaikinHVACAdapter(hass, data())
+    adapter.set_zone_control_context(DEFAULT_OPTIONS, c.hvac_control)
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+    assert not result.applied
+
+
+def test_review_coast_confirmation_keeps_latest_physical_intent(monkeypatch):
+    c = isolated_boundary()
+    desired = {'phase': 'peak_coast', 'mode': 'cool', **desired_fields(c, 'cool', 19, 'peak_coast')}
+    # The planned coast predates another successful preparation subset change.
+    for entity in (MAIN, MAIN_CLIMATE):
+        c.climate_inputs['zones'][entity]['temperature'] = 18.9
+    for entity in (BED, BED_CLIMATE):
+        c.climate_inputs['zones'][entity]['temperature'] = 20.1
+    c.hvac_control['zone_intent'] = {}
+    c.hvac_control['zone_intent'] = evaluate(c, 'cool', 19)
+    c.climate_inputs['zone_actuator_states'] = {MAIN: 'off', BED: 'on'}
+    hass = device(c)
+    hass.states.values[MAIN] = 'off'
+    hass.states.values['input_number.low'] = '19'
+    hass.states.values['input_number.high'] = '22'
+    monkeypatch.setattr(adapter_module.dt_util, 'utcnow', lambda: c.created_at)
+    previous = {'hvac_control': {**c.hvac_control, 'main_state': {'hvac_mode': 'cool', 'target_temperature': 24}}}
+    tx = HVACOwnershipTransaction(previous, c.created_at)
+    prepared = tx.prepare(desired, {}, {}, {})
+    adapter = DaikinHVACAdapter(hass, data())
+    adapter.set_zone_control_context(DEFAULT_OPTIONS, c.hvac_control)
+    result = asyncio.run(adapter.async_execute(_action(desired)))
+    assert result.applied
+    saved = tx.complete(result, prepared, desired, main_state_superseded=False, superseded_zone_entity_ids=set())
+    assert saved['hvac_control']['zone_intent']['power'] == {MAIN: 'off', BED: 'on'}
+    assert 'zone_transition_at' not in saved['hvac_control']
+    assert hass.states.get(MAIN).state == 'off' and hass.states.get(BED).state == 'on'

@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Keep shared HVAC coast ownership and schedule suppression when an owned, confirmed closed completed zone is beyond the opposite comfort boundary and recovering passively. Continue room monitoring and hand off on worsening excursions, recovery demand or lost isolation evidence; preserve original restoration baselines.
 
 ### 🔧 Improvements
 
