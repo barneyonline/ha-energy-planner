@@ -9,6 +9,16 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 ## Covered
 
+- Local integration branding ships all eight Home Assistant PNG variants under
+  `custom_components/ha_energy_planner/brand/`: transparent light/dark icons at
+  256×256 and 512×512, and light/dark wordmark logos at 548×256 and 1096×512.
+  SVG sources preserve the approved calendar geometry and exact banner colour
+  samples. Legacy component-root and GitHub asset copies use the same mark.
+  `docs/branding.md` documents the specification and regeneration; design
+  concepts live outside the packaged component. Acceptance includes PNG
+  dimensions, alpha bounds, palette and package-content inspection, plus the
+  full `scripts/docker-validate.sh` gate.
+
 - Calendar publication selects reconciled records before constructing returned
   Home Assistant `CalendarEvent` objects; current-plan window expansion remains
   before filtering. Complete confirmed history still participates in
