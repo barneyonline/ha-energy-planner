@@ -3009,8 +3009,9 @@ def test_persisted_preconditioning_accounts_for_commands_after_limits(
     assert store.data["ownership"]["hvac_control"]["suppression_min_price_delta"] == 0.15
 
 
+@pytest.mark.parametrize("optional_hooks", [True, False])
 def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
-    monkeypatch: object,
+    monkeypatch: object, optional_hooks: bool,
 ) -> None:
     class FakeDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -3032,6 +3033,11 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
                 saved_main_state={},
                 command_sent=False,
             )
+
+    if not optional_hooks:
+        FakeDaikinAdapter.set_zone_control_context = None
+        FakeDaikinAdapter.set_abort_main_state = None
+        FakeDaikinAdapter.set_command_callback = None
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", FakeDaikinAdapter)
     now = datetime.now(UTC)
@@ -3078,8 +3084,9 @@ def test_executor_clears_provisional_hvac_ownership_after_successful_rollback(
     assert store.data["outcomes"][0].reason == "hvac_control_service_failed"
 
 
+@pytest.mark.parametrize("manual_supersession", [True, False])
 def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
-    monkeypatch: object,
+    monkeypatch: object, manual_supersession: bool,
 ) -> None:
     class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
@@ -3095,8 +3102,9 @@ def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
             return {"hvac_mode": "off", "target_temperature": 20}
 
         async def async_execute(self, action: PlanAction) -> object:
-            assert executor.mark_pending_hvac_manual_override() is True
-            assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
+            if manual_supersession:
+                assert executor.mark_pending_hvac_manual_override() is True
+                assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             raise RuntimeError("unexpected adapter failure")
 
     monkeypatch.setattr(executor_module, "DaikinHVACAdapter", RaisingDaikinAdapter)
@@ -3147,9 +3155,12 @@ def test_hvac_acquisition_exception_persists_inflight_manual_supersession(
         asyncio.run(executor.async_evaluate(plan))
 
     hvac_control = store.data["ownership"]["hvac_control"]
-    assert "main_state" not in hvac_control
-    assert hvac_control["zone_states"] == {"switch.living": "off"}
-    assert store.flush_count == 2
+    assert ("main_state" not in hvac_control) is manual_supersession
+    assert hvac_control["zone_states"] == {
+        "switch.living": "off",
+        **({} if manual_supersession else {"climate.bedrooms": {"target_temperature": 21}}),
+    }
+    assert store.flush_count == (2 if manual_supersession else 1)
 
 
 @pytest.mark.parametrize("rollback_succeeded", [True, False])
@@ -4635,15 +4646,17 @@ def test_executor_restore_retains_hvac_after_adapter_exception(monkeypatch: obje
     }
 
 
+@pytest.mark.parametrize("main_superseded", [True, False])
 def test_safe_state_exception_does_not_reintroduce_inflight_manual_hvac_changes(
-    monkeypatch: object,
+    monkeypatch: object, main_superseded: bool,
 ) -> None:
     class RaisingDaikinAdapter(_HVACAdapterDouble):
         def __init__(self, hass: object, entry_data: dict[str, Any]) -> None:
             pass
 
         async def async_restore(self, *args: object) -> object:
-            assert executor.mark_pending_hvac_manual_override() is True
+            if main_superseded:
+                assert executor.mark_pending_hvac_manual_override() is True
             assert executor.mark_pending_hvac_zone_manual_override("climate.bedrooms") is True
             raise RuntimeError("unexpected adapter failure")
 
@@ -4673,6 +4686,7 @@ def test_safe_state_exception_does_not_reintroduce_inflight_manual_hvac_changes(
             "zone_states": {"switch.living": "off"},
             "phase": "peak_coast",
             "required_evidence_lost": "hvac_release_failed",
+            **({} if main_superseded else {"main_state": {"hvac_mode": "off", "target_temperature": 20}}),
         },
     }
 

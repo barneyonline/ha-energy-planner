@@ -667,8 +667,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   `tests/test_calendar.py`, `tests/test_calendar_history.py` and
   `tests/test_sensor.py` cover fragmented full-horizon schedules, metadata
   freshness, retained history and discarded evidence branches.
-  Coverage instruments branches, enforces exactly 100% statement coverage with
-  `scripts/check_coverage.py`, and rejects per-module branch regressions against the reviewed baseline. The smoke test
+  Coverage instruments branches by default and enforces exactly 100% statement
+  and branch coverage with `scripts/check_coverage.py`, comparing raw counts without
+  rounding or a branch gap allowance. Codecov project and patch checks require 100%
+  with zero threshold. The smoke test
   now verifies coordinator refresh, entity
   registry entries, the Armed/Mode/Current state/Next actions/Plan calendar surface,
   Automatic control and its three device selectors, device registry registration, persisted active plan, discovery storage,
@@ -1759,3 +1761,32 @@ Valid charging evidence at or after the refusal remains an allowed reset.
 - Synthetic contention comparison: on base `92b4694`, a refresh does not complete while an unrelated transaction holds the command lock; the regression now completes planning before releasing that same blocker. A controlled 80-second command wait plus 3-second reconciliation is separately attributed as 80,000 ms wait and 3,000 ms work. This does not identify the cause of the observed live 81-second event or prove that it is fixed. See `docs/refresh-timing.md`. Full validation remains `scripts/docker-validate.sh` with unchanged statement/branch thresholds.
 
 - Review regressions in `tests/test_refresh_timing.py` verify one requested-counter increment per dispatched reconciliation follow-up, including coalesced triggers, and preserve durable export pauses, outstanding confirmation/restoration and scoped/global pause reasons while reporting reconciliation queueing separately. The generation invalidation still precedes reopening readiness.
+
+## Complete branch coverage gate (6 November 2026)
+
+The previous gate covered every statement but allowed reviewed branch gaps.
+The coverage work adds defensive payload, advice lifecycle, coordinator boundary
+and adapter restoration regressions in `tests/test_defensive_payloads.py`,
+`tests/test_advice_lifecycle_edges.py`, `tests/test_coordinator_boundaries.py` and
+`tests/test_adapter_restoration_edges.py`, plus variants in the existing
+coordinator/executor suites. Cases include stale/cancelled advice, absent optional
+callbacks, configuration handoff, deferred notification failure, command
+exceptions with and without manual supersession, zone-only rollback, retained
+legacy data and Recorder training failure. Redundant guards after established
+runtime/type invariants are simplified without changing their outcomes.
+
+`pyproject.toml` enables branch measurement for ordinary coverage runs.
+`scripts/check_coverage.py` rejects any missing statement or branch, including
+gaps whose percentage rounds to 100%; `tests/scripts/test_check_coverage.py`
+checks both count boundaries and malformed/missing CLI evidence. The branch
+baseline is removed. `codecov.yml` requires 100% project and patch coverage; the
+existing source attribution and credential-isolated reporting flow is retained.
+
+Verification: `scripts/docker-validate.sh` passed on Home Assistant 2026.10.0
+with 5,360 tests passing, five version-specific skips and 36 passing subtests.
+The fresh coverage report contains 20,632/20,632 statements and 8,324/8,324
+branches (100%, no partial branches) across 88 files. The generated Codecov XML
+has line-rate and branch-rate of 1 for every file. A full stable-image run also
+passed, followed by the final advice, Codecov path/gate and safety-stop checks.
+These are local validation results; hosted Codecov processing requires publishing
+the revision and completing its existing CI reporting workflow.

@@ -627,14 +627,13 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     actions = [_action_with_determination(action, accepted, audit) for action in enabled_actions[:12]]
     load_forecast = built_in_load_forecast_attrs(coordinator)
     for action in actions:
-        determination = action.get("determination")
-        if isinstance(determination, dict):
-            action_forecast = action_load_forecast_attrs(
-                coordinator,
-                str(action.get("action_id", "")),
-            )
-            if action_forecast:
-                determination["load_forecast"] = action_forecast
+        determination = action["determination"]
+        action_forecast = action_load_forecast_attrs(
+            coordinator,
+            str(action.get("action_id", "")),
+        )
+        if action_forecast:
+            determination["load_forecast"] = action_forecast
     result = {
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),

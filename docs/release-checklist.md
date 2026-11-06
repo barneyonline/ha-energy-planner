@@ -7,17 +7,19 @@ observation has run or that a release candidate has been published.
 ## Automated gate
 
 Run `scripts/docker-validate.sh` without skip flags: compilation, Ruff, strict
-typing, quality evidence, exact statement coverage, branch regression, fixtures,
+typing, quality evidence, exact statement and branch coverage, fixtures,
 HA configuration, runtime compatibility and smoke from the built ZIP. Capture
 the console log; opening environment evidence records image identity/digests,
 HA, Python, pytest, coverage and mypy. Floating stable is pulled by CI; the local
 release gate defaults to the pinned baseline.
 
-`tests/branch-coverage-baseline.json` limits uncovered branches per module. New
-modules have no gap allowance. Reduce limits as tests cover gaps. Do not raise
-limits just to make a change pass. Prioritize coordinator/executor/HVAC failure
-and cancellation scenarios when changing those paths; review defensive exits
-rather than adding assertions solely to reach a percentage.
+`scripts/check_coverage.py` requires every integration statement and branch to be
+covered. It compares raw counts so a missing path cannot pass through percentage
+rounding. There is no branch gap allowance. Prioritize coordinator/executor/HVAC
+failure and cancellation scenarios when changing those paths; remove provably
+redundant conditions instead of excluding executable paths from measurement.
+The uploaded XML retains branch evidence; Codecov project and patch checks both
+require 100% with zero threshold.
 
 ## Representative observation
 
