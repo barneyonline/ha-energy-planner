@@ -61,6 +61,7 @@ class HVACCommandResult:
     saved_zone_states: dict[str, Any] = field(default_factory=dict)
     saved_main_state: dict[str, Any] = field(default_factory=dict)
     command_sent: bool = False
+    confirmed_zone_intent: dict[str, Any] | None = None
 
 
 class DaikinHVACAdapter:
@@ -1057,6 +1058,20 @@ class DaikinHVACAdapter:
                 unresolved_zones,
                 unresolved_main_state,
             )
+        confirmed_zone_intent = None
+        if action.desired_state.get("zone_intent", {}).get("coast_isolation"):
+            from .zone_control import confirmed_coast_intent
+            # Confirmation awaits can deliver new room/switch feedback. Only
+            # execution-time observations may establish the next drift baseline.
+            confirmed_zone_intent = confirmed_coast_intent(
+                self.hass, self.entry_data, self._zone_options, action.desired_state,
+                self._zone_baseline, dt_util.utcnow(), require_head_off=True,
+            )
+            if confirmed_zone_intent is None:
+                return HVACCommandResult(
+                    False, "zone_coast_protection_lost", pre_state, self._snapshot(), changed_automations,
+                    False, saved_zone_states, saved_main_state, command_sent=command_sent,
+                )
         reason = "already_in_desired_hvac_state" if not command_sent else "hvac_action_applied"
         return HVACCommandResult(
             True,
@@ -1066,6 +1081,7 @@ class DaikinHVACAdapter:
             changed_automations,
             saved_zone_states=saved_zone_states,
             command_sent=command_sent,
+            confirmed_zone_intent=confirmed_zone_intent,
         )
 
     async def async_restore(

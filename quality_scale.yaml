@@ -847,3 +847,12 @@ rules:
 # reject invalid cooling bounds before the target write and preserve restoration.
 
 # Disabled-zone mode recall: coordinator.py::_matches_disabled_zone_mode_recall and executor.py retain bounded issued/confirmed command evidence without altering restoration baselines; tests/test_coordinator.py::test_disabled_zone_remembered_target_during_owned_restoration and tests/test_control_runtime.py::test_owned_release_recalls_disabled_zone_without_manual_override cover numeric off-zone recall, real HA release dispatch, explicit interventions, failures, reload and original-issue expiry, including permanent retirement after later failed head/zone/alias commands without retiring unrelated zones. Sanitized fixture: tests/fixtures/climate_feedback/disabled_zone_mode_recall.json. README.md and docs/requirements-audit.md describe limits; scripts/docker-validate.sh remains the full gate.
+# Completed-zone coast: zone_control.py::coast_isolated_rooms validates committed intent,
+# canonical physical readback, original ownership, fresh feedback and safe airflow;
+# zone_temperature.py preserves normal recovery boundaries and worsening-excursion handoff.
+# tests/test_zone_control.py covers symmetric boundary failures, aliases, live rechecks,
+# executor reload, schedule/guard ownership and once-only period-end baseline restoration.
+# docs/climate-decisions.md and docs/requirements-audit.md document limits; full gate unchanged.
+# Coast review: test_review_coast_* covers physical airflow independent of preparation
+# reopening requests, execution-time recovery baselines, final feedback/head rechecks,
+# and stale planned subset intent; hvac_adapter.py/hvac_control.py persist confirmed coast feedback.
