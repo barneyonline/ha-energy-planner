@@ -16,7 +16,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Replace the integration branding with the cleaner planning calendar, using the banner colours for solar, battery and EV charging. Include light/dark and high-resolution icon and logo variants.
 
 ### 🔄 Other changes
 

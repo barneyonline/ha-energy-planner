@@ -159,12 +159,20 @@ rules:
         - tests/test_executor.py
   brands:
     status: done
-    comment: Custom repository validation tracks the manifest and integration metadata; no upstream brand asset is required for this local custom integration.
+    comment: Local brand PNGs provide transparent light/dark icons and wordmark logos at standard and high resolution; SVG sources retain the approved banner palette.
     references:
       code:
         - custom_components/ha_energy_planner/manifest.json
+        - custom_components/ha_energy_planner/brand/icon.png
+        - custom_components/ha_energy_planner/brand/icon@2x.png
+        - custom_components/ha_energy_planner/brand/dark_icon.png
+        - custom_components/ha_energy_planner/brand/dark_icon@2x.png
+        - custom_components/ha_energy_planner/brand/logo.png
+        - custom_components/ha_energy_planner/brand/logo@2x.png
+        - custom_components/ha_energy_planner/brand/dark_logo.png
+        - custom_components/ha_energy_planner/brand/dark_logo@2x.png
       docs:
-        - README.md
+        - docs/branding.md
   common-modules:
     status: done
     references:
