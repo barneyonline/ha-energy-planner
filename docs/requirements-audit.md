@@ -24,6 +24,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   before filtering. Confirmed history participates in reconciliation within a
   365-day and 1,000-record retention ceiling; load normalization also compacts
   legacy Store data so repeated calendar reads and saves remain bounded.
+  Legacy records are validated and filtered by age before chronological selection
+  of the newest 1,000 confirmations, regardless of saved list order. Unsorted
+  history and persisted reload regressions are covered by
+  `tests/test_calendar_history.py` and `tests/test_storage.py`.
   `tests/test_entity_publication.py` exercises HA's repeated property sequence,
   historical ranges, archived UID suppression, offset-aware ordering, expiration,
   replans, options, live feedback and ownership changes without replanning, plus

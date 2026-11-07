@@ -9,6 +9,7 @@ from custom_components.ha_energy_planner.calendar_history import (
     CALENDAR_HISTORY_RETENTION_DAYS,
     calendar_records,
     confirm_calendar_action,
+    normalize_calendar_history,
     update_calendar_history,
 )
 
@@ -47,6 +48,27 @@ def test_history_keeps_only_the_newest_bounded_confirmations():
     state = update_calendar_history({"history": history}, [], NOW)
     assert len(state["history"]) == CALENDAR_HISTORY_HARD_CAP
     assert state["history"][-1]["uid"] == "archive-0"
+
+
+@pytest.mark.parametrize("newest_first", [False, True])
+def test_unsorted_legacy_history_retains_newest_confirmations(newest_first):
+    recent = [
+        record(start=-index - 2, end=-index - 1, uid=f"recent-{index}", actual=True)
+        for index in range(CALENDAR_HISTORY_HARD_CAP)
+    ]
+    older = record(start=-10_000, end=-9_999, uid="delayed-older", actual=True)
+    expired = record(start=-600_000, end=-599_999, uid="delayed-expired", actual=True)
+    pending = record(start=10, end=20, uid="pending")
+    saved = {"history": [*(recent if newest_first else reversed(recent)), older, expired],
+             "pending": [pending]}
+
+    state = normalize_calendar_history(saved, NOW)
+
+    assert [item["uid"] for item in state["history"]] == [
+        f"recent-{index}" for index in reversed(range(CALENDAR_HISTORY_HARD_CAP))
+    ]
+    assert state["pending"] == [pending]
+    assert saved["history"][-2:] == [older, expired]
 
 
 def test_history_cap_counts_valid_confirmations_after_malformed_tail_records():

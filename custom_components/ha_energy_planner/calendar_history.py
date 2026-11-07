@@ -12,15 +12,13 @@ CALENDAR_HISTORY_HARD_CAP = 1000
 def calendar_records(
     value: Any,
     *,
-    limit: int | None = None,
     confirmed_only: bool = False,
 ) -> list[dict[str, str]]:
     """Read only valid, compact calendar records from a saved list."""
     if not isinstance(value, list):
         return []
-    items = reversed(value) if limit is not None else iter(value)
     records = []
-    for item in items:
+    for item in value:
         if not isinstance(item, dict):
             continue
         start, end = _timestamp(item.get("start")), _timestamp(item.get("end"))
@@ -42,19 +40,14 @@ def calendar_records(
         if confirmed_only and not _confirmed_start(record):
             continue
         records.append(record)
-        if limit is not None and len(records) >= limit:
-            break
-    if limit is not None:
-        records.reverse()
     return records
 
 
 def normalize_calendar_history(saved: Any, now: datetime) -> dict[str, list[dict[str, str]]]:
-    """Normalize persisted history and apply its age and count ceilings."""
+    """Normalize all legacy records before applying age and chronological count ceilings."""
     saved = saved if isinstance(saved, dict) else {}
     history = calendar_records(
         saved.get("history"),
-        limit=CALENDAR_HISTORY_HARD_CAP,
         confirmed_only=True,
     )
     return {"history": _retained_history(history, now), "pending": calendar_records(saved.get("pending"))}

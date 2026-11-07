@@ -62,6 +62,9 @@
 # with a 365-day/1,000-record confirmed-history ceiling. tests/test_calendar.py,
 # tests/test_calendar_history.py and tests/test_sensor.py cover freshness,
 # full-horizon fragmentation, large retained history and bounded conversion.
+# Legacy history selection validates all records, filters expired entries, then
+# caps by timestamp rather than saved list order. tests/test_calendar_history.py
+# and tests/test_storage.py cover unsorted history and persisted reloads.
 # Planner work bounds: forecasts.py validates complete source evidence before
 # selecting at most 576 published tariff intervals for the requested horizon.
 # coordinator.py fingerprints bounded material attributes plus the HA state revision

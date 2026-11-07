@@ -1126,6 +1126,36 @@ def test_calendar_history_persists_with_plan_and_survives_reload(monkeypatch):
     asyncio.run(run())
 
 
+def test_loading_unsorted_legacy_history_persists_newest_confirmations(monkeypatch):
+    from custom_components.ha_energy_planner.calendar_history import CALENDAR_HISTORY_HARD_CAP
+
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    monkeypatch.setattr(FakeStore, "saved", None)
+    now = datetime.now(UTC)
+    records = []
+    for index in range(CALENDAR_HISTORY_HARD_CAP + 1):
+        start = (now - timedelta(minutes=index + 2)).isoformat()
+        records.append({"uid": f"confirmation-{index}", "summary": "Confirmed action",
+                        "start": start, "end": (now - timedelta(minutes=index + 1)).isoformat(),
+                        "confirmed_start": start})
+    # Legacy confirmation handlers appended delayed outcomes after newer entries.
+    legacy = {"calendar_history": {"history": [*reversed(records[:-1]), records[-1]], "pending": []}}
+    monkeypatch.setattr(FakeStore, "loaded", deepcopy(legacy))
+    store = PlannerStore(object(), "unsorted-history")
+
+    asyncio.run(store.async_load())
+
+    expected = list(reversed(records[:-1]))
+    assert store.data["calendar_history"]["history"] == expected
+    assert FakeStore.saved["calendar_history"]["history"] == expected
+    monkeypatch.setattr(FakeStore, "loaded", deepcopy(FakeStore.saved))
+    restored = PlannerStore(object(), "unsorted-history")
+    asyncio.run(restored.async_load())
+    assert restored.data["calendar_history"]["history"] == expected
+    assert legacy["calendar_history"]["history"][-1] == records[-1]
+
+
 def test_store_records_discrete_confirmation_and_filters_unconfirmed_history(monkeypatch):
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     now = datetime.now(UTC)

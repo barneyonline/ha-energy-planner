@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Retain the newest confirmed calendar history by timestamp when loading unsorted legacy records, so delayed older outcomes cannot evict newer confirmations.
 
 ### 🔧 Improvements
 
