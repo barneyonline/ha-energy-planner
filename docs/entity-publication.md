@@ -4,11 +4,11 @@ This change selects reconciled calendar records before constructing returned
 Home Assistant `CalendarEvent` objects. State publication selects the current or
 next record; range queries select records overlapping the requested range.
 Current-plan windows are still expanded into events before reconciliation and
-filtering, so those objects are additional work. Complete confirmed history
-still participates in validation and reconciliation before selection, including
-archived UID suppression and running-window matching.
-History retention, descriptions, confirmation rules and control execution are
-unchanged. There is no presentation cache: options, plan, feedback, ownership and
+filtering, so those objects are additional work. Confirmed history within the
+365-day/1,000-record retention ceiling participates in validation and reconciliation
+before selection, including archived UID suppression and running-window matching.
+The ceiling also applies when loading legacy Store data. Descriptions,
+confirmation rules and control execution are unchanged. There is no presentation cache: options, plan, feedback, ownership and
 clock changes are read each time.
 
 ## Reproduction and measurements
@@ -41,7 +41,9 @@ latency distribution or performance guarantee. Other profiled runs ranged from
 51.683 ms. The baseline fails the deterministic `event_constructions == 6`
 assertion; the fixed version passes. A single-event historical range constructs
 only two objects (the current plan event and the matching historical event),
-and a full historical query still returns all 5,000 confirmations.
+and a full historical query returned all 5,000 confirmations at that measurement
+base. Current retention bounds that query to the newest 1,000 confirmations within
+365 days; these original timings are not measurements of the retention change.
 
 The same fixture exercises the actual Next actions sensor value and attributes
 three times. It took 5.171 ms total, retained 9,711 UTF-8 JSON bytes, marked

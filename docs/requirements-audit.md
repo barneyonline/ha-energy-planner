@@ -284,12 +284,18 @@ use throughout; the Docker and pull-request gates enforce that result.
   records, range boundaries, deduplication, and storage reload;
   `tests/test_coordinator.py` and `tests/test_calendar.py` cover superseded
   confirmations and vehicle-swap generation safety.
-- Planner performance boundaries are deterministic: forecast inputs and decision
-  fingerprints retain at most 2,048 source rows while Home Assistant state
-  revisions preserve change detection outside that compact payload, the default climate search is
-  capped at 125,000 slot evaluations while preserving every near-term
-  start/target pair, and advisory weather retrieval completes before planner-lock
-  acquisition. Regression coverage lives in `tests/test_forecasts.py`,
+- Planner performance boundaries are deterministic: decision fingerprints retain
+  at most 2,048 entries per material container while Home Assistant state revisions
+  preserve change detection outside that compact payload. Forecast parsing validates
+  complete source evidence before applying the 576-interval publication ceiling,
+  selecting the requested horizon when that ceiling is needed, preserving malformed/overlapping tariff rejection, valid bucket
+  predecessors, global cadence, energy durations and legacy timestamp semantics.
+  Climate search retains its 500,000 slot-evaluation ceiling, covering every
+  near-term start/target pair for a 24-hour horizon with both modes ready, a
+  90-minute lead and seven temperature targets. Advisory
+  weather retrieval completes before planner-lock acquisition; configuration and
+  forced-refresh races release the lock and prepare again before planning.
+  Regression coverage lives in `tests/test_forecasts.py`,
   `tests/test_coordinator.py`, `tests/test_climate_engine.py`, and
   `tests/test_refresh_timing.py`.
 - The Energy Planner service contains a flat device list: one planner device with
@@ -737,8 +743,9 @@ use throughout; the Docker and pull-request gates enforce that result.
   price and W/kW/MW power normalization, plus weather forecast temperature attributes, with
   point-sensor fallback. Optional point-sensor power inputs used for forecast
   calibration and the HVAC thermal model use the same W/kW/MW normalization.
-  Oversized ordered payloads are narrowed to the source window that can cover the
-  requested planning slots before full value parsing and sorting.
+  Complete source evidence is normalized before selecting the published tariff
+  horizon; historical prefixes cannot hide current intervals or invalid native
+  interval metadata. Slot sampling uses binary searches on normalized points.
   Representative integration-specific Amber, external PV, and weather schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
 - Compact external-PV forecast calibration is implemented. It records due PV

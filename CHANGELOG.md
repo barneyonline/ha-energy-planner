@@ -4,7 +4,7 @@
 
 ### 🚧 Breaking changes
 
-- None
+- Confirmed calendar history is limited to 365 days and the newest 1,000 records. Older or excess records are removed during history normalization, including on load.
 
 ### ✨ New features
 
@@ -16,7 +16,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Bound decision fingerprints and confirmed calendar history (365 days / 1,000 records), select published tariff boundaries after complete source validation, and fetch advisory weather outside the planner lock even when configuration changes. Preserve climate search coverage for 24-hour heating and cooling horizons.
 
 ### 🔄 Other changes
 

@@ -12,6 +12,7 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
+from itertools import islice
 from math import isfinite
 from time import monotonic, perf_counter
 from typing import Any, cast
@@ -1329,39 +1330,50 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             timing.stage("export_reconciliation_ms")
             if getattr(self, "entry", None) is not None:
                 await self._async_admit_export_reconciliation(timing)
-            prepared_weather = None
-            if (
-                not getattr(self, "_tearing_down", False)
-                and getattr(self, "entry", None) is not None
-                and self.entry_data.get(CONF_WEATHER)
-            ):
-                timing.stage("weather_ms")
-                prepared_weather = await self._async_prepare_weather_forecast()
-            timing.stage("planner_lock_wait_ms")
-            async with self._planner_lock:
-                timing.stage("inputs_ms")
-                if getattr(self, "_tearing_down", False):
-                    succeeded = True
-                    self._increment_refresh_counter("teardown_skipped")
-                    return self.data
-                try:
-                    async with self.store.async_delay_save():
-                        try:
-                            self._deferred_plan_execution = None
-                            self._prepared_weather_for_refresh = prepared_weather
+            while True:
+                prepared_weather = None
+                if (
+                    not getattr(self, "_tearing_down", False)
+                    and getattr(self, "entry", None) is not None
+                    and self.entry_data.get(CONF_WEATHER)
+                ):
+                    timing.stage("weather_ms")
+                    prepared_weather = await self._async_prepare_weather_forecast()
+                timing.stage("planner_lock_wait_ms")
+                async with self._planner_lock:
+                    timing.stage("inputs_ms")
+                    if getattr(self, "_tearing_down", False):
+                        succeeded = True
+                        self._increment_refresh_counter("teardown_skipped")
+                        return self.data
+                    if prepared_weather is not None and (
+                        prepared_weather[0] != _weather_input_identity(self.entry_data, self.planner_options)
+                        or (getattr(self, "_force_next_refresh", False) and not prepared_weather[1])
+                    ):
+                        continue
+                    if prepared_weather is None and getattr(self, "entry", None) is not None and self.entry_data.get(
+                        CONF_WEATHER
+                    ):
+                        continue
+                    try:
+                        async with self.store.async_delay_save():
                             try:
-                                result = await self._async_update_data_locked(defer_execution=True)
+                                self._deferred_plan_execution = None
+                                self._prepared_weather_for_refresh = prepared_weather
+                                try:
+                                    result = await self._async_update_data_locked(defer_execution=True)
+                                finally:
+                                    del self._prepared_weather_for_refresh
                             finally:
-                                del self._prepared_weather_for_refresh
-                        finally:
-                            timing.stage("storage_flush_ms")
-                    # Capture and clear under the planner lock: another refresh
-                    # must never consume this refresh's execution request.
-                    deferred_execution = self._deferred_plan_execution
-                    self._deferred_plan_execution = None
-                except BaseException:
-                    self._deferred_plan_execution = None
-                    raise
+                                timing.stage("storage_flush_ms")
+                        # Capture and clear under the planner lock: another refresh
+                        # must never consume this refresh's execution request.
+                        deferred_execution = self._deferred_plan_execution
+                        self._deferred_plan_execution = None
+                    except BaseException:
+                        self._deferred_plan_execution = None
+                        raise
+                break
             timing.stage("post_refresh_ms")
             if deferred_execution is not None:
                 self._schedule_plan_execution(deferred_execution)
@@ -1526,10 +1538,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Refresh planner data while holding the planner lock."""
         preparation_started = perf_counter()
         self._update_vehicle_session()
-        if VEHICLES in combined_entry_data(self.entry):
-            await self.store.async_save_vehicle_session(self.vehicle_session.snapshot())
         started_generation = self._refresh_generation
         now = dt_util.utcnow()
+        options = self.planner_options
+        entry_data = self.entry_data
+        weather_forecast, weather_forecast_details = await self._async_weather_for_refresh(
+            entry_data, options, now=now, force=bool(getattr(self, "_force_next_refresh", False)),
+        )
+        if VEHICLES in combined_entry_data(self.entry):
+            await self.store.async_save_vehicle_session(self.vehicle_session.snapshot())
         active_overrides = _unexpired_overrides(
             self.overrides,
             now,
@@ -1545,8 +1562,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if stored_overrides != to_jsonable(self.overrides):
             await self.store.async_save_overrides(self.overrides)
         await self._async_reconcile_expired_manual_hvac_state(expired_manual_hvac_state)
-        options = self.planner_options
-        entry_data = self.entry_data
         if VEHICLES in entry_data:
             profile = self.vehicle_session.profile
             model = self.store.data.get("ev_vehicle_calibrations", {}).get(profile["id"], {}) if profile else {}
@@ -1560,9 +1575,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.options = options
         force_refresh = bool(getattr(self, "_force_next_refresh", False))
         self._force_next_refresh = False
-        weather_forecast, weather_forecast_details = await self._async_weather_for_refresh(
-            entry_data, options, now=now, force=force_refresh,
-        )
         load_source_outage = _updated_load_source_outage(
             self.hass,
             entry_data,
@@ -4727,7 +4739,7 @@ def _bounded_material_value(value: Any, *, depth: int = 0) -> Any:
             for item in value[:MAX_FORECAST_SOURCE_ROWS]
         ]
     if isinstance(value, dict):
-        items = list(value.items())[:MAX_FORECAST_SOURCE_ROWS]
+        items = islice(value.items(), MAX_FORECAST_SOURCE_ROWS)
         return {
             str(key): _bounded_material_value(item, depth=depth + 1)
             for key, item in items

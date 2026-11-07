@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from bisect import bisect_left, bisect_right
+from bisect import bisect_right
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from operator import itemgetter
@@ -60,8 +60,6 @@ def tariff_source_intervals(
     attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
     keys = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
     raw_items = _forecast_items(attributes, keys)
-    if slot_starts is not None:
-        raw_items = _bounded_source_rows(raw_items, slot_starts)
     declared = _declared_tariff_intervals(raw_items, keys, str(attributes.get("unit_of_measurement", "")),
                                          maximum_minutes=_explicit_interval_minutes(attributes))
     if declared is not None:
@@ -70,7 +68,7 @@ def tariff_source_intervals(
             details.update(source_validity="declared_intervals" if intervals else "invalid_intervals",
                            normalized_intervals=normalized)
         return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
-                for start, end, price in intervals[:576]]
+                for start, end, price in _tariff_window(intervals, slot_starts)]
     if details is not None:
         details.update(source_validity="inferred_intervals", normalized_intervals=0)
     parsed = [
@@ -89,7 +87,20 @@ def tariff_source_intervals(
         explicit_cadence or timedelta(minutes=interval_minutes),
         maximum=explicit_cadence,
     )
-    return [{"start": at.isoformat(), "end": (at + cadence).isoformat(), "price": price} for at, price in points[:576]]
+    intervals = [(at, at + cadence, price) for at, price in points]
+    return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
+            for start, end, price in _tariff_window(intervals, slot_starts)]
+
+
+def _tariff_window(
+    intervals: list[tuple[datetime, datetime, float]], starts: list[datetime] | None,
+) -> list[tuple[datetime, datetime, float]]:
+    """Bound published boundaries after validating the complete source evidence."""
+    if starts and len(intervals) > 576:
+        window_start = min(_as_aware_utc(start) for start in starts)
+        window_end = max(_as_aware_utc(start) for start in starts)
+        intervals = [row for row in intervals if row[1] > window_start and row[0] <= window_end]
+    return intervals[:576]
 
 
 def forecast_series_from_state(
@@ -127,7 +138,6 @@ def forecast_series_from_state(
     starts = slot_starts if slot_starts is not None else [
         issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
-    raw_items = _bounded_source_rows(raw_items, starts)
     if value_kind == "price":
         declared = _declared_tariff_intervals(raw_items, value_keys, default_unit,
                                              maximum_minutes=_explicit_interval_minutes(attributes))
@@ -441,40 +451,6 @@ def _forecast_items(attributes: dict[str, Any], value_keys: tuple[str, ...]) -> 
         if items:
             return items
     return []
-
-
-def _bounded_source_rows(raw_items: list[Any], starts: list[datetime]) -> list[Any]:
-    """Select the bounded source window that can cover planner slots."""
-    if len(raw_items) <= MAX_FORECAST_SOURCE_ROWS:
-        return raw_items
-    if not starts:
-        return raw_items[:MAX_FORECAST_SOURCE_ROWS]
-    timestamped = [
-        (timestamp, item)
-        for item in raw_items
-        if (timestamp := _source_row_timestamp(item)) is not None
-    ]
-    if not timestamped:
-        return raw_items[:MAX_FORECAST_SOURCE_ROWS]
-    timestamped.sort(key=itemgetter(0))
-    timestamps = [item[0] for item in timestamped]
-    window_start = min(_as_aware_utc(start) for start in starts)
-    window_end = max(_as_aware_utc(start) for start in starts)
-    begin = max(bisect_left(timestamps, window_start) - 1, 0)
-    end = min(bisect_right(timestamps, window_end) + 1, len(timestamped))
-    return [item for _timestamp, item in timestamped[begin:end]][:MAX_FORECAST_SOURCE_ROWS]
-
-
-def _source_row_timestamp(item: Any) -> datetime | None:
-    """Read one row timestamp without normalizing its complete value payload."""
-    if not isinstance(item, dict):
-        return None
-    flattened = _flatten_item(item)
-    for key in _TIME_KEYS:
-        timestamp = _parse_datetime_or_none(flattened.get(key))
-        if timestamp is not None and timestamp.utcoffset() is not None:
-            return _as_aware_utc(timestamp)
-    return None
 
 
 def _items_from_value(

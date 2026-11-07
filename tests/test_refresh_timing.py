@@ -60,7 +60,8 @@ def test_weather_is_prepared_before_planner_lock() -> None:
     async def scenario() -> None:
         coordinator = coordinator_for_timing()
         coordinator.entry.data["weather_entity"] = "weather.home"
-        prepared = object()
+        prepared = (coordinator_module._weather_input_identity(
+            coordinator.entry_data, coordinator.planner_options), False, {}, {})
         observed = []
 
         async def prepare():
@@ -79,6 +80,45 @@ def test_weather_is_prepared_before_planner_lock() -> None:
         assert (await coordinator._async_update_data()).plan_id == "weather-before-lock"
         assert observed == ["weather", "planner"]
         assert not hasattr(coordinator, "_prepared_weather_for_refresh")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("race", ["entity", "interval", "freshness", "force", "added"])
+def test_weather_configuration_races_retry_without_holding_planner_lock(race) -> None:
+    async def scenario() -> None:
+        coordinator = coordinator_for_timing()
+        if race != "added":
+            coordinator.entry.data["weather_entity"] = "weather.home"
+        calls = []
+
+        async def weather(data, options, **kwargs):
+            assert not coordinator._planner_lock.locked()
+            calls.append((data.get("weather_entity"), kwargs["force"]))
+            if len(calls) == 1:
+                if race == "entity":
+                    coordinator.entry.data["weather_entity"] = "weather.changed"
+                elif race == "interval":
+                    coordinator.entry.options["planning_interval_minutes"] = 15
+                elif race == "freshness":
+                    coordinator.entry.options["forecast_freshness_minutes"] = 30
+                elif race == "force":
+                    coordinator._force_next_refresh = True
+            return {}, {}
+
+        if race == "added":
+            # The weather selector may be added while awaiting the planner lock.
+            await coordinator._planner_lock.acquire()
+        coordinator._async_weather_forecast = weather
+        refresh = asyncio.create_task(coordinator._async_update_data())
+        if race == "added":
+            await asyncio.sleep(0)
+            coordinator.entry.data["weather_entity"] = "weather.home"
+            coordinator._planner_lock.release()
+        assert (await refresh).plan_id == "timed"
+        assert len(calls) == (1 if race == "added" else 2)
+        assert calls[-1] == ("weather.changed" if race == "entity" else "weather.home", race == "force")
+        coordinator._async_update_data_locked.assert_awaited_once()
 
     asyncio.run(scenario())
 
