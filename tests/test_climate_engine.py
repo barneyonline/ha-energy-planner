@@ -1562,6 +1562,7 @@ def test_default_horizon_search_covers_starts_and_targets_within_budget():
     from custom_components.ha_energy_planner.climate_optimizer import MAX_SEARCH_SLOT_EVALUATIONS, candidate_schedules
 
     count, lead, targets = 144, 18, [21, 21.5, 22, 22.5, 23, 23.5, 24]
+    assert MAX_SEARCH_SLOT_EVALUATIONS == 125_000
     schedules = candidate_schedules(count, lead, targets, MAX_SEARCH_SLOT_EVALUATIONS // (3 * count))
     assert schedules is not None and len(schedules) * 3 * count <= MAX_SEARCH_SLOT_EVALUATIONS
     assert {(start, target) for start, _, _, target in schedules} == {

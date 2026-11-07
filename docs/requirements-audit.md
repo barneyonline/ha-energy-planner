@@ -21,8 +21,9 @@ use throughout; the Docker and pull-request gates enforce that result.
 
 - Calendar publication selects reconciled records before constructing returned
   Home Assistant `CalendarEvent` objects; current-plan window expansion remains
-  before filtering. Complete confirmed history still participates in
-  reconciliation, with no retention limit, cache or control-path change.
+  before filtering. Confirmed history participates in reconciliation within a
+  365-day and 1,000-record retention ceiling; load normalization also compacts
+  legacy Store data so repeated calendar reads and saves remain bounded.
   `tests/test_entity_publication.py` exercises HA's repeated property sequence,
   historical ranges, archived UID suppression, offset-aware ordering, expiration,
   replans, options, live feedback and ownership changes without replanning, plus
@@ -283,6 +284,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   records, range boundaries, deduplication, and storage reload;
   `tests/test_coordinator.py` and `tests/test_calendar.py` cover superseded
   confirmations and vehicle-swap generation safety.
+- Planner performance boundaries are deterministic: forecast inputs and decision
+  fingerprints retain at most 2,048 source rows while Home Assistant state
+  revisions preserve change detection outside that compact payload, the default climate search is
+  capped at 125,000 slot evaluations while preserving every near-term
+  start/target pair, and advisory weather retrieval completes before planner-lock
+  acquisition. Regression coverage lives in `tests/test_forecasts.py`,
+  `tests/test_coordinator.py`, `tests/test_climate_engine.py`, and
+  `tests/test_refresh_timing.py`.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
@@ -728,6 +737,8 @@ use throughout; the Docker and pull-request gates enforce that result.
   price and W/kW/MW power normalization, plus weather forecast temperature attributes, with
   point-sensor fallback. Optional point-sensor power inputs used for forecast
   calibration and the HVAC thermal model use the same W/kW/MW normalization.
+  Oversized ordered payloads are narrowed to the source window that can cover the
+  requested planning slots before full value parsing and sorting.
   Representative integration-specific Amber, external PV, and weather schemas are covered by
   executable live-schema fixtures and the real-export validator profiles.
 - Compact external-PV forecast calibration is implemented. It records due PV

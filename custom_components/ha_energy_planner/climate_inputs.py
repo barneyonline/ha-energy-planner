@@ -304,7 +304,9 @@ def read_climate_inputs(
         "identity": climate_identity(data, options),
         "head_entity": data.get(CONF_DAIKIN_CLIMATE),
         **power_provenance(hass, data),
-        "tariff_intervals": tariff_source_intervals(tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5))),
+        "tariff_intervals": tariff_source_intervals(
+            tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), slot_starts=[now, end],
+        ),
         "target": finite(attrs.get("temperature")),
         "temperature_step": finite(attrs.get("target_temp_step")) or 0.5,
         "minimum_temperature": finite(attrs.get("min_temp")),

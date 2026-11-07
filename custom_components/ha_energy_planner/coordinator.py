@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from math import isfinite
 from time import monotonic, perf_counter
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
@@ -85,6 +85,7 @@ from .const import (
     CONF_EV_SMART_CHARGING_READY_BY,
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
+    CONF_FORECAST_FRESHNESS_MINUTES,
     CONF_HOUSEHOLD_LOAD,
     CONF_MANUAL_HVAC_OVERRIDE_MINUTES,
     CONF_MATERIAL_CHANGE_THRESHOLD_PERCENT,
@@ -120,6 +121,7 @@ from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION
 from .export_limit_cooldown import cooldown_status
 from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
+from .forecasts import MAX_FORECAST_SOURCE_ROWS
 from .inputs import InputManager
 from .load_forecast import normalize_power_kw
 from .models import (
@@ -1327,6 +1329,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             timing.stage("export_reconciliation_ms")
             if getattr(self, "entry", None) is not None:
                 await self._async_admit_export_reconciliation(timing)
+            prepared_weather = None
+            if (
+                not getattr(self, "_tearing_down", False)
+                and getattr(self, "entry", None) is not None
+                and self.entry_data.get(CONF_WEATHER)
+            ):
+                timing.stage("weather_ms")
+                prepared_weather = await self._async_prepare_weather_forecast()
             timing.stage("planner_lock_wait_ms")
             async with self._planner_lock:
                 timing.stage("inputs_ms")
@@ -1338,7 +1348,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     async with self.store.async_delay_save():
                         try:
                             self._deferred_plan_execution = None
-                            result = await self._async_update_data_locked(defer_execution=True)
+                            self._prepared_weather_for_refresh = prepared_weather
+                            try:
+                                result = await self._async_update_data_locked(defer_execution=True)
+                            finally:
+                                del self._prepared_weather_for_refresh
                         finally:
                             timing.stage("storage_flush_ms")
                     # Capture and clear under the planner lock: another refresh
@@ -1370,6 +1384,32 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "counters": dict(getattr(self, "_refresh_counters", {})),
             }
             CURRENT_REFRESH.reset(token)
+
+    async def _async_prepare_weather_forecast(
+        self,
+    ) -> tuple[tuple[Any, ...], bool, dict[str, Any], dict[str, Any]]:
+        """Fetch advisory weather before contending for the planner lock."""
+        entry_data = self.entry_data
+        options = self.planner_options
+        now = dt_util.utcnow()
+        force = bool(getattr(self, "_force_next_refresh", False))
+        forecast, details = await self._async_weather_forecast(
+            entry_data, options, now=now, force=force,
+        )
+        return _weather_input_identity(entry_data, options), force, forecast, details
+
+    async def _async_weather_for_refresh(
+        self, entry_data: dict[str, Any], options: dict[str, Any], *, now: datetime, force: bool,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Consume prefetched weather, with a direct-call fallback for tests and recovery."""
+        prepared = getattr(self, "_prepared_weather_for_refresh", None)
+        if prepared is not None:
+            identity, prepared_force, forecast, details = cast(
+                tuple[tuple[Any, ...], bool, dict[str, Any], dict[str, Any]], prepared,
+            )
+            if identity == _weather_input_identity(entry_data, options) and (prepared_force or not force):
+                return forecast, details
+        return await self._async_weather_forecast(entry_data, options, now=now, force=force)
 
     async def _async_admit_export_reconciliation(self, timing: RefreshTiming) -> None:
         """Defer a busy command queue, retaining a conservative readiness gate."""
@@ -1520,11 +1560,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.options = options
         force_refresh = bool(getattr(self, "_force_next_refresh", False))
         self._force_next_refresh = False
-        weather_forecast, weather_forecast_details = await self._async_weather_forecast(
-            entry_data,
-            options,
-            now=now,
-            force=force_refresh,
+        weather_forecast, weather_forecast_details = await self._async_weather_for_refresh(
+            entry_data, options, now=now, force=force_refresh,
         )
         load_source_outage = _updated_load_source_outage(
             self.hass,
@@ -3449,7 +3486,8 @@ def _decision_input_fingerprint(
             if state is None
             else {
                 "state": getattr(state, "state", None),
-                "attributes": _canonical_attributes(getattr(state, "attributes", {}) or {}),
+                "last_updated": getattr(state, "last_updated", None),
+                "attributes": _material_attributes(getattr(state, "attributes", {}) or {}),
             }
         )
     payload = {
@@ -4669,6 +4707,34 @@ def _material_attributes_changed(old_state: Any, new_state: Any) -> bool:
     return any(old_attributes.get(key) != new_attributes.get(key) for key in _MATERIAL_STATE_ATTRIBUTE_KEYS)
 
 
+def _material_attributes(attributes: Any) -> dict[str, Any]:
+    """Return only bounded attributes that can affect planning decisions."""
+    canonical = _canonical_attributes(attributes)
+    return {
+        key: _bounded_material_value(canonical[key])
+        for key in _MATERIAL_STATE_ATTRIBUTE_KEYS
+        if key in canonical
+    }
+
+
+def _bounded_material_value(value: Any, *, depth: int = 0) -> Any:
+    """Bound nested forecast containers before comparison and JSON hashing."""
+    if depth >= 6:
+        return None
+    if isinstance(value, list):
+        return [
+            _bounded_material_value(item, depth=depth + 1)
+            for item in value[:MAX_FORECAST_SOURCE_ROWS]
+        ]
+    if isinstance(value, dict):
+        items = list(value.items())[:MAX_FORECAST_SOURCE_ROWS]
+        return {
+            str(key): _bounded_material_value(item, depth=depth + 1)
+            for key, item in items
+        }
+    return value
+
+
 def _canonical_attributes(attributes: Any) -> dict[str, Any]:
     """Return attributes with the same camelCase aliases accepted by forecast parsing."""
     canonical = dict(attributes)
@@ -4678,6 +4744,15 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
         separated = re.sub(r"[^0-9A-Za-z]+", "_", separated)
         canonical.setdefault(separated.strip("_").lower(), value)
     return canonical
+
+
+def _weather_input_identity(entry_data: dict[str, Any], options: dict[str, Any]) -> tuple[Any, ...]:
+    """Identify the configuration and cache policy used for a weather fetch."""
+    return (
+        entry_data.get(CONF_WEATHER),
+        options.get(CONF_PLANNING_INTERVAL_MINUTES),
+        options.get(CONF_FORECAST_FRESHNESS_MINUTES),
+    )
 
 
 def _overrides_from_store(

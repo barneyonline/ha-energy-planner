@@ -10,7 +10,9 @@ from typing import Any
 
 import pytest
 
+from custom_components.ha_energy_planner import forecasts as forecasts_module
 from custom_components.ha_energy_planner.forecasts import (
+    MAX_FORECAST_SOURCE_ROWS,
     _energy_items_as_average_power,
     _energy_to_kwh,
     _items_from_value,
@@ -31,6 +33,73 @@ class FakeState:
 
     state: str
     attributes: dict[str, Any] = field(default_factory=dict)
+
+
+def test_forecast_series_parses_only_bounded_rows_for_large_ordered_payload(monkeypatch) -> None:
+    issued_at = datetime(2026, 6, 27, tzinfo=UTC)
+    rows = [
+        {"valid_at": (issued_at + timedelta(minutes=5 * index)).isoformat(), "value": index}
+        for index in range(MAX_FORECAST_SOURCE_ROWS * 3)
+    ]
+    calls = 0
+    original = forecasts_module._parse_item
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(forecasts_module, "_parse_item", counted)
+    series = forecast_series_from_state(
+        FakeState("0", {"forecast": rows}), issued_at=issued_at,
+        horizon_hours=24, interval_minutes=5, value_keys=("value",), value_kind="power",
+    )
+    assert series is not None and len(series) == 288
+    assert calls <= MAX_FORECAST_SOURCE_ROWS
+
+
+def test_large_source_row_bounding_falls_back_for_unordered_or_invalid_rows() -> None:
+    start = datetime(2026, 6, 27, tzinfo=UTC)
+    size = MAX_FORECAST_SOURCE_ROWS + 2
+    numeric = list(range(size))
+    assert forecasts_module._bounded_source_rows(numeric, []) == numeric[:MAX_FORECAST_SOURCE_ROWS]
+    assert forecasts_module._bounded_source_rows(numeric, [start]) == numeric[:MAX_FORECAST_SOURCE_ROWS]
+
+    rows = [
+        {"valid_at": (start + timedelta(minutes=index)).isoformat(), "value": index}
+        for index in range(size)
+    ]
+    bounded = forecasts_module._bounded_source_rows(rows, [start + timedelta(minutes=100)])
+    assert bounded[0]["value"] == 99
+    unordered = [rows[0], *reversed(rows[1:-1]), rows[-1]]
+    bounded = forecasts_module._bounded_source_rows(unordered, [start + timedelta(minutes=100)])
+    assert [row["value"] for row in bounded[:3]] == [99, 100, 101]
+    rows[size // 2] = {"value": "missing-time"}
+    bounded = forecasts_module._bounded_source_rows(rows, [start + timedelta(minutes=size // 2 + 1)])
+    assert bounded[0]["value"] == size // 2 - 1
+
+    assert forecasts_module._source_row_timestamp("not-a-row") is None
+    assert forecasts_module._source_row_timestamp({"valid_at": start.replace(tzinfo=None).isoformat()}) is None
+    assert forecasts_module._source_row_timestamp(
+        {"valid_at": "invalid", "datetime": start.isoformat()}
+    ) == start
+
+
+def test_tariff_intervals_select_current_window_after_large_history_prefix() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    origin = now - timedelta(minutes=15 * (MAX_FORECAST_SOURCE_ROWS + 10))
+    rows = [
+        {"start_time": (origin + timedelta(minutes=15 * index)).isoformat(), "price": index / 100}
+        for index in range(MAX_FORECAST_SOURCE_ROWS + 20)
+    ]
+    state = FakeState("0", {"forecast": rows, "forecast_interval_minutes": 15})
+    intervals = forecasts_module.tariff_source_intervals(
+        state, 15, slot_starts=[now, now + timedelta(hours=1)]
+    )
+    assert any(
+        datetime.fromisoformat(interval["start"]) <= now < datetime.fromisoformat(interval["end"])
+        for interval in intervals
+    )
 
 
 def test_forecast_series_parses_timestamp_keyed_watts_map() -> None:

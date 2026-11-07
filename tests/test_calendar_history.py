@@ -1,10 +1,12 @@
-"""Regression coverage for permanent plan calendar history."""
+"""Regression coverage for bounded confirmed plan calendar history."""
 
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from custom_components.ha_energy_planner.calendar_history import (
+    CALENDAR_HISTORY_HARD_CAP,
+    CALENDAR_HISTORY_RETENTION_DAYS,
     calendar_records,
     confirm_calendar_action,
     update_calendar_history,
@@ -25,17 +27,42 @@ def record(start=-10, end=10, uid="event", summary="EV: Charge", actual=False):
     return item
 
 
-def test_history_keeps_elapsed_windows_without_time_or_count_expiry():
+def test_history_expires_confirmed_windows_after_retention_period():
     elapsed = record(start=-30, end=-20, actual=True)
     future = record(start=20, end=30, uid="cancelled")
     state = update_calendar_history({}, [elapsed, future], NOW)
-    state = update_calendar_history(state, [], NOW + timedelta(days=1000))
-    assert len(state["history"]) == 1
     assert state["history"][0]["uid"] == elapsed["uid"]
     assert "End time is estimated" in state["history"][0]["description"]
-    assert state["pending"] == []
-    state = update_calendar_history(state, [], NOW + timedelta(days=2000))
-    assert len(state["history"]) == 1
+    state = update_calendar_history(
+        state, [], NOW + timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS + 1)
+    )
+    assert state == {"history": [], "pending": []}
+
+
+def test_history_keeps_only_the_newest_bounded_confirmations():
+    history = [
+        record(start=-index - 2, end=-index - 1, uid=f"archive-{index}", actual=True)
+        for index in reversed(range(CALENDAR_HISTORY_HARD_CAP + 25))
+    ]
+    state = update_calendar_history({"history": history}, [], NOW)
+    assert len(state["history"]) == CALENDAR_HISTORY_HARD_CAP
+    assert state["history"][-1]["uid"] == "archive-0"
+
+
+def test_history_cap_counts_valid_confirmations_after_malformed_tail_records():
+    history = [
+        record(start=-index - 2, end=-index - 1, uid=f"archive-{index}", actual=True)
+        for index in reversed(range(CALENDAR_HISTORY_HARD_CAP))
+    ]
+    unconfirmed = [
+        record(start=index, end=index + 1, uid=f"unconfirmed-{index}")
+        for index in range(25)
+    ]
+    state = update_calendar_history(
+        {"history": [*history, *unconfirmed, *([None] * 25)]}, [], NOW
+    )
+    assert len(state["history"]) == CALENDAR_HISTORY_HARD_CAP
+    assert state["history"][-1]["uid"] == "archive-0"
 
 
 def test_cancelled_future_window_is_discarded_before_it_starts():
@@ -102,20 +129,23 @@ def test_large_history_preserves_provisional_id_rejection_and_confirmed_extensio
         for index in range(1000)
     ]
     elapsed = record(start=-30, end=-20, uid="continuing", actual=True)
-    saved = {"history": [*history, elapsed], "pending": []}
+    saved = {"history": sorted([*history, elapsed], key=lambda item: item["start"]), "pending": []}
     # A reused provisional ID cannot recreate an already confirmed activity.
     provisional = record(start=10, end=20, uid="archive-0")
     future = record(start=20, end=30, uid="future")
     state = update_calendar_history(saved, [provisional, future], NOW)
-    assert state["history"] == sorted(saved["history"], key=lambda item: item["start"])
+    assert len(state["history"]) == CALENDAR_HISTORY_HARD_CAP
+    assert {item["uid"] for item in state["history"]} == {
+        item["uid"] for item in sorted(saved["history"], key=lambda item: item["start"])[-CALENDAR_HISTORY_HARD_CAP:]
+    }
     assert state["pending"] == [future]
 
     # Independent confirmation can extend the same phase beyond an archived
-    # estimate. No record count or age limit may discard the unrelated history.
+    # estimate without growing beyond the retained history ceiling.
     extended = record(start=-30, end=10, uid="replanned", actual=True)
     state = update_calendar_history(saved, [extended, future], NOW)
-    assert len(state["history"]) == 1000
-    assert {item["uid"] for item in state["history"]} == {item["uid"] for item in history}
+    assert len(state["history"]) == CALENDAR_HISTORY_HARD_CAP - 1
+    assert "archive-999" not in {item["uid"] for item in state["history"]}
     assert state["pending"] == [extended, future]
 
 

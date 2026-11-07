@@ -5,13 +5,22 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+CALENDAR_HISTORY_RETENTION_DAYS = 365
+CALENDAR_HISTORY_HARD_CAP = 1000
 
-def calendar_records(value: Any) -> list[dict[str, str]]:
+
+def calendar_records(
+    value: Any,
+    *,
+    limit: int | None = None,
+    confirmed_only: bool = False,
+) -> list[dict[str, str]]:
     """Read only valid, compact calendar records from a saved list."""
     if not isinstance(value, list):
         return []
+    items = reversed(value) if limit is not None else iter(value)
     records = []
-    for item in value:
+    for item in items:
         if not isinstance(item, dict):
             continue
         start, end = _timestamp(item.get("start")), _timestamp(item.get("end"))
@@ -20,18 +29,43 @@ def calendar_records(value: Any) -> list[dict[str, str]]:
         if not all(isinstance(item.get(key), str) and item[key] for key in ("uid", "summary")):
             continue
         record = {"start": start.isoformat(), "end": end.isoformat()}
-        for key, limit in (("uid", 255), ("summary", 255), ("location", 255), ("description", 4096)):
+        for key, byte_limit in (("uid", 255), ("summary", 255), ("location", 255), ("description", 4096)):
             text = item.get(key)
             if isinstance(text, str):
-                record[key] = text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+                record[key] = text.encode("utf-8")[:byte_limit].decode("utf-8", errors="ignore")
         confirmed = _timestamp(item.get("confirmed_start"))
         if confirmed is not None and confirmed == start:
             record["confirmed_start"] = confirmed.isoformat()
         if item.get("confirmed_action") == "true" and confirmed is not None and confirmed == start:
             record["confirmed_action"] = "true"
             record["summary"] = _confirmed_action_summary(record)
+        if confirmed_only and not _confirmed_start(record):
+            continue
         records.append(record)
+        if limit is not None and len(records) >= limit:
+            break
+    if limit is not None:
+        records.reverse()
     return records
+
+
+def normalize_calendar_history(saved: Any, now: datetime) -> dict[str, list[dict[str, str]]]:
+    """Normalize persisted history and apply its age and count ceilings."""
+    saved = saved if isinstance(saved, dict) else {}
+    history = calendar_records(
+        saved.get("history"),
+        limit=CALENDAR_HISTORY_HARD_CAP,
+        confirmed_only=True,
+    )
+    return {"history": _retained_history(history, now), "pending": calendar_records(saved.get("pending"))}
+
+
+def _retained_history(history: list[dict[str, str]], now: datetime) -> list[dict[str, str]]:
+    """Keep recent confirmations with a hard ceiling for Store and UI work."""
+    cutoff = now - timedelta(days=CALENDAR_HISTORY_RETENTION_DAYS)
+    retained = [record for record in history if datetime.fromisoformat(record["end"]) >= cutoff]
+    retained.sort(key=lambda item: item["start"])
+    return retained[-CALENDAR_HISTORY_HARD_CAP:]
 
 
 def _confirmed_action_summary(record: dict[str, str]) -> str:
@@ -54,10 +88,10 @@ def update_calendar_history(
 
     A start must be observed independently of planned timing. Historical window
     ends remain estimates unless a discrete action was confirmed by its adapter.
-    No time or count expiry applies to confirmed history.
+    Confirmed history is retained for one year with a hard count ceiling.
     """
     saved = saved if isinstance(saved, dict) else {}
-    history = [record for record in calendar_records(saved.get("history")) if _confirmed_start(record)]
+    history = normalize_calendar_history(saved, now)["history"]
     current = calendar_records(current)
     if not replace_plan:
         # Observations may come from an older coordinator plan while the latest
@@ -117,7 +151,7 @@ def update_calendar_history(
             _append_unique(history, record)
         else:
             active.append(record)
-    return {"history": sorted(history, key=lambda item: item["start"]), "pending": active}
+    return {"history": _retained_history(history, now), "pending": active}
 
 
 def _append_unique(history: list[dict[str, str]], record: dict[str, str]) -> None:
@@ -199,7 +233,7 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
     start = _timestamp(outcome.get("attempted_at"))
     if start is None:
         return state
-    history = [record for record in calendar_records(state.get("history")) if _confirmed_start(record)]
+    history = normalize_calendar_history(state, start)["history"]
     pending = calendar_records(state.get("pending"))
     restoring_export = outcome.get("kind") == "restore_export_limit"
     if restoring_export and any(record["uid"] == outcome.get("action_id") for record in history):
@@ -222,7 +256,7 @@ def confirm_calendar_action(saved: Any, outcome: dict[str, Any]) -> dict[str, An
         }
         record["summary"] = _confirmed_action_summary(record)
         _append_unique(history, record)
-    state["history"] = history
+    state["history"] = _retained_history(history, start)
     return state
 
 

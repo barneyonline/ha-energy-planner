@@ -27,7 +27,7 @@ from .zone_temperature import comfort_breached, temperatures
 
 # Bound the generated comparison set before evaluating it. Every generated
 # candidate is checked; insufficient budget for mandatory coverage fails closed.
-MAX_SEARCH_SLOT_EVALUATIONS = 500_000
+MAX_SEARCH_SLOT_EVALUATIONS = 125_000
 
 
 def simulate(

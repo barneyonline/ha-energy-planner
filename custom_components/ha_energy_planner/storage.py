@@ -12,7 +12,7 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 
 from .action_limits import budget_history, recent_attempts
-from .calendar_history import confirm_calendar_action, update_calendar_history
+from .calendar_history import confirm_calendar_action, normalize_calendar_history, update_calendar_history
 from .climate_inputs import instant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
@@ -530,6 +530,8 @@ def _normalize_loaded_data(loaded: dict[str, Any]) -> dict[str, Any]:
     for key in _DICT_FIELDS:
         if not isinstance(data.get(key), dict):
             data[key] = {}
+    if data.get("calendar_history"):
+        data["calendar_history"] = normalize_calendar_history(data["calendar_history"], datetime.now(UTC))
     if "ev_telemetry" in data and not isinstance(data["ev_telemetry"], dict):
         data["ev_telemetry"] = {"version": 1, "budget_uncertain": True}
     active_plan = data.get("active_plan")
