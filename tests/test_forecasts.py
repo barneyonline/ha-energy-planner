@@ -10,7 +10,9 @@ from typing import Any
 
 import pytest
 
+from custom_components.ha_energy_planner import forecasts as forecasts_module
 from custom_components.ha_energy_planner.forecasts import (
+    MAX_FORECAST_SOURCE_ROWS,
     _energy_items_as_average_power,
     _energy_to_kwh,
     _items_from_value,
@@ -31,6 +33,110 @@ class FakeState:
 
     state: str
     attributes: dict[str, Any] = field(default_factory=dict)
+
+
+@pytest.mark.parametrize("kind", ["value", "cadence", "energy", "naive"])
+def test_oversized_forecasts_preserve_full_source_semantics(kind) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    origin = now - timedelta(minutes=30 * (MAX_FORECAST_SOURCE_ROWS + 1))
+    rows = [
+        {"valid_at": (origin + timedelta(minutes=30 * i)).isoformat(), "value": 1.0}
+        for i in range(MAX_FORECAST_SOURCE_ROWS + 4)
+    ]
+    if kind == "value":
+        rows.append({"valid_at": (now + timedelta(minutes=4)).isoformat(), "value": "unavailable"})
+    elif kind == "cadence":
+        rows.append({"valid_at": (origin + timedelta(minutes=5)).isoformat(), "value": 1.0})
+    elif kind == "energy":
+        rows.append({"valid_at": (now + timedelta(minutes=4)).isoformat(), "value": "unavailable"})
+    else:
+        for row in rows:
+            row["valid_at"] = row["valid_at"].replace("+00:00", "")
+    state = FakeState("0", {"forecast": list(reversed(rows)),
+                            "unit_of_measurement": "kWh" if kind == "energy" else "kW"})
+    kwargs = dict(issued_at=now + timedelta(minutes=5), horizon_hours=1, interval_minutes=5,
+                  value_keys=("value",), value_kind="power")
+    actual = forecast_series_from_state(state, **kwargs)
+    if kind == "cadence":
+        assert actual == [None] * 5 + [1.0] + [None] * 5 + [1.0]
+    elif kind == "energy":
+        # The invalid value still ends the preceding four-minute energy bucket.
+        assert actual == [15.0] * 5 + [2.0] * 7
+    else:
+        assert actual == [1.0] * 12
+
+
+def test_dense_forecast_does_not_truncate_values_inside_requested_horizon() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    state = FakeState("0", {"forecast": [
+        {"valid_at": (now + timedelta(seconds=i)).isoformat(), "value": float(i)}
+        for i in range(3601)
+    ]})
+    assert forecast_series_from_state(state, issued_at=now, horizon_hours=1, interval_minutes=5,
+        value_keys=("value",), value_kind="power") == [float(i * 300) for i in range(12)]
+
+
+@pytest.mark.parametrize("invalid", ["start", "overlap", "non_dict", "naive"])
+def test_large_declared_tariffs_validate_all_source_evidence(invalid) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    rows = [
+        {"start_time": (now + timedelta(minutes=30 * i)).isoformat(),
+         "end_time": (now + timedelta(minutes=30 * (i + 1))).isoformat(),
+         "duration": 30, "per_kwh": 0.3}
+        for i in range(-MAX_FORECAST_SOURCE_ROWS, 3)
+    ]
+    if invalid == "start":
+        rows.append({**rows[0], "start_time": "broken"})
+    elif invalid == "overlap":
+        rows.insert(0, dict(rows[0]))
+    elif invalid == "naive":
+        rows.append({**rows[0], "start_time": rows[0]["start_time"].replace("+00:00", "")})
+    else:
+        rows.append(0.1)
+    state = FakeState("0", {"detailedForecast": rows})
+    details = {}
+    assert forecasts_module.tariff_source_intervals(
+        state, 5, details=details, slot_starts=[now, now + timedelta(hours=1)]
+    ) == []
+    assert details["source_validity"] == "invalid_intervals"
+    assert forecast_series_from_state(state, issued_at=now, horizon_hours=1, interval_minutes=5,
+        value_keys=("per_kwh",), value_kind="price") == [None] * 12
+
+
+@pytest.mark.parametrize("declared", [False, True])
+def test_published_tariff_window_keeps_current_rows_after_validation(declared) -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    rows = [
+        {"start_time": (now + timedelta(minutes=30 * i)).isoformat(),
+         "end_time": (now + timedelta(minutes=30 * (i + 1))).isoformat(),
+         "duration": 30, "per_kwh" if declared else "price": 0.3}
+        for i in range(-MAX_FORECAST_SOURCE_ROWS, 3)
+    ]
+    state = FakeState("0", {"detailedForecast": list(reversed(rows))})
+    result = forecasts_module.tariff_source_intervals(
+        state, 5, slot_starts=[now, now + timedelta(hours=1)]
+    )
+    assert len(result) == 3
+    assert result[0]["start"] == now.isoformat()
+    assert result[-1]["start"] == (now + timedelta(hours=1)).isoformat()
+    assert forecasts_module.tariff_source_intervals(state, 5, slot_starts=[]) != []
+
+
+def test_tariff_intervals_select_current_window_after_large_history_prefix() -> None:
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    origin = now - timedelta(minutes=15 * (MAX_FORECAST_SOURCE_ROWS + 10))
+    rows = [
+        {"start_time": (origin + timedelta(minutes=15 * index)).isoformat(), "price": index / 100}
+        for index in range(MAX_FORECAST_SOURCE_ROWS + 20)
+    ]
+    state = FakeState("0", {"forecast": rows, "forecast_interval_minutes": 15})
+    intervals = forecasts_module.tariff_source_intervals(
+        state, 15, slot_starts=[now, now + timedelta(hours=1)]
+    )
+    assert any(
+        datetime.fromisoformat(interval["start"]) <= now < datetime.fromisoformat(interval["end"])
+        for interval in intervals
+    )
 
 
 def test_forecast_series_parses_timestamp_keyed_watts_map() -> None:

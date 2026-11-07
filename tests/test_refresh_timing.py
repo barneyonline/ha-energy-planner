@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -53,6 +54,100 @@ def coordinator_for_timing():
     coordinator._schedule_debounced_refresh = Mock()
     coordinator.async_update_listeners = Mock()
     return coordinator
+
+
+def test_weather_is_prepared_before_planner_lock() -> None:
+    async def scenario() -> None:
+        coordinator = coordinator_for_timing()
+        coordinator.entry.data["weather_entity"] = "weather.home"
+        prepared = (coordinator_module._weather_input_identity(
+            coordinator.entry_data, coordinator.planner_options), False, {}, {})
+        observed = []
+
+        async def prepare():
+            observed.append("weather")
+            assert not coordinator._planner_lock.locked()
+            return prepared
+
+        async def update(*, defer_execution=False):
+            observed.append("planner")
+            assert coordinator._planner_lock.locked()
+            assert coordinator._prepared_weather_for_refresh is prepared
+            return _plan("weather-before-lock")
+
+        coordinator._async_prepare_weather_forecast = prepare
+        coordinator._async_update_data_locked = update
+        assert (await coordinator._async_update_data()).plan_id == "weather-before-lock"
+        assert observed == ["weather", "planner"]
+        assert not hasattr(coordinator, "_prepared_weather_for_refresh")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("race", ["entity", "interval", "freshness", "force", "added"])
+def test_weather_configuration_races_retry_without_holding_planner_lock(race) -> None:
+    async def scenario() -> None:
+        coordinator = coordinator_for_timing()
+        if race != "added":
+            coordinator.entry.data["weather_entity"] = "weather.home"
+        calls = []
+
+        async def weather(data, options, **kwargs):
+            assert not coordinator._planner_lock.locked()
+            calls.append((data.get("weather_entity"), kwargs["force"]))
+            if len(calls) == 1:
+                if race == "entity":
+                    coordinator.entry.data["weather_entity"] = "weather.changed"
+                elif race == "interval":
+                    coordinator.entry.options["planning_interval_minutes"] = 15
+                elif race == "freshness":
+                    coordinator.entry.options["forecast_freshness_minutes"] = 30
+                elif race == "force":
+                    coordinator._force_next_refresh = True
+            return {}, {}
+
+        if race == "added":
+            # The weather selector may be added while awaiting the planner lock.
+            await coordinator._planner_lock.acquire()
+        coordinator._async_weather_forecast = weather
+        refresh = asyncio.create_task(coordinator._async_update_data())
+        if race == "added":
+            await asyncio.sleep(0)
+            coordinator.entry.data["weather_entity"] = "weather.home"
+            coordinator._planner_lock.release()
+        assert (await refresh).plan_id == "timed"
+        assert len(calls) == (1 if race == "added" else 2)
+        assert calls[-1] == ("weather.changed" if race == "entity" else "weather.home", race == "force")
+        coordinator._async_update_data_locked.assert_awaited_once()
+
+    asyncio.run(scenario())
+
+
+def test_weather_preparation_and_direct_refresh_fallback() -> None:
+    async def scenario() -> None:
+        coordinator = coordinator_for_timing()
+        coordinator.entry.data["weather_entity"] = "weather.home"
+        expected = ({"forecast": [{"datetime": "2026-11-07T00:00:00+00:00"}]}, {"fetch_status": "fetched"})
+        coordinator._async_weather_forecast = AsyncMock(return_value=expected)
+        prepared = await coordinator._async_prepare_weather_forecast()
+        assert prepared[2:] == expected
+        coordinator._prepared_weather_for_refresh = prepared
+        now = datetime(2026, 11, 7, tzinfo=UTC)
+        assert await coordinator._async_weather_for_refresh(
+            coordinator.entry_data, coordinator.planner_options, now=now, force=False,
+        ) == expected
+        assert await coordinator._async_weather_for_refresh(
+            coordinator.entry_data, coordinator.planner_options, now=now, force=True,
+        ) == expected
+        coordinator.entry.data["weather_entity"] = "weather.changed"
+        assert await coordinator._async_weather_for_refresh(
+            coordinator.entry_data, coordinator.planner_options, now=now, force=False,
+        ) == expected
+        del coordinator._prepared_weather_for_refresh
+        assert await coordinator._async_weather_for_refresh({}, {}, now=now, force=True) == expected
+        assert coordinator._async_weather_forecast.await_count == 4
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("exit_path", [

@@ -711,6 +711,7 @@ class FakeState:
 
     state: str
     attributes: dict[str, object] = field(default_factory=dict)
+    last_updated: datetime | None = None
 
 
 class FakeStates:
@@ -4567,6 +4568,41 @@ def test_ai_fingerprint_lookup_and_decision_fingerprint_edges() -> None:
         now=datetime(2026, 6, 27, tzinfo=UTC),
     )
     assert present != missing
+
+
+def test_decision_fingerprint_bounds_large_forecast_attributes() -> None:
+    from custom_components.ha_energy_planner.forecasts import MAX_FORECAST_SOURCE_ROWS
+
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    origin = now - timedelta(minutes=5 * (MAX_FORECAST_SOURCE_ROWS + 10))
+    rows = [{"valid_at": (origin + timedelta(minutes=5 * index)).isoformat(), "value": index}
+            for index in range(MAX_FORECAST_SOURCE_ROWS + 300)]
+    state = FakeState("0", {"forecast": rows}, last_updated=now)
+    hass = FakeHass({"sensor.price": state})
+    entry_data = {"amber_import_price_entity": "sensor.price"}
+    first = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
+    rows[0]["value"] = "outside-planning-input"
+    state.last_updated = now + timedelta(seconds=1)
+    assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now) != first
+    first = _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
+    rows[MAX_FORECAST_SOURCE_ROWS + 10]["value"] = "inside-planning-input"
+    state.last_updated = now + timedelta(seconds=2)
+    assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now) != first
+    nested: Any = "leaf"
+    for _ in range(7):
+        nested = {"forecast": nested}
+    hass.states.values["sensor.price"] = FakeState("0", {"forecast": nested})
+    assert _decision_input_fingerprint(hass, entry_data, {}, [], now=now)
+
+
+def test_material_change_detects_changed_tail_outside_fingerprint_row_cap() -> None:
+    from custom_components.ha_energy_planner.forecasts import MAX_FORECAST_SOURCE_ROWS
+
+    rows = [{"value": index} for index in range(MAX_FORECAST_SOURCE_ROWS + 1)]
+    old = FakeState("0", {"forecast": deepcopy(rows)})
+    rows[-1]["value"] = "changed"
+    new = FakeState("0", {"forecast": rows})
+    assert coordinator_module._material_attributes_changed(old, new)
 
 
 @pytest.mark.parametrize("through_refresh", [False, True])

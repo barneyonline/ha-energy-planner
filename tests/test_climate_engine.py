@@ -1558,12 +1558,14 @@ def test_command_accepts_arrival_after_planned_early_release():
     assert command_rejection(hass, data, DEFAULT_OPTIONS, state, desired, NOW) == "economic_climate_power_not_measured"
 
 
-def test_default_horizon_search_covers_starts_and_targets_within_budget():
+@pytest.mark.parametrize("count", [144, 288])
+@pytest.mark.parametrize("ready_modes", [1, 2])
+def test_default_horizon_search_covers_starts_and_targets_within_budget(count, ready_modes):
     from custom_components.ha_energy_planner.climate_optimizer import MAX_SEARCH_SLOT_EVALUATIONS, candidate_schedules
 
-    count, lead, targets = 144, 18, [21, 21.5, 22, 22.5, 23, 23.5, 24]
-    schedules = candidate_schedules(count, lead, targets, MAX_SEARCH_SLOT_EVALUATIONS // (3 * count))
-    assert schedules is not None and len(schedules) * 3 * count <= MAX_SEARCH_SLOT_EVALUATIONS
+    lead, targets = 18, [21, 21.5, 22, 22.5, 23, 23.5, 24]
+    schedules = candidate_schedules(count, lead, targets, MAX_SEARCH_SLOT_EVALUATIONS // (3 * count * ready_modes))
+    assert schedules is not None and len(schedules) * 3 * count * ready_modes <= MAX_SEARCH_SLOT_EVALUATIONS
     assert {(start, target) for start, _, _, target in schedules} == {
         (start, target) for start in range(lead) for target in targets
     }

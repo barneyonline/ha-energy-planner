@@ -78,15 +78,15 @@ def test_calendar_publication_work_is_bounded_by_selected_events(monkeypatch):
     _publication(calendar)
     print({"calendar_ms_unprofiled": round((perf_counter()-started)*1000, 3)})
 
-    # A narrow history request builds just its matching event, while all 5000
-    # persisted confirmations remain available to an unbounded historical query.
+    # A narrow history request builds just its matching event, while historical
+    # queries remain bounded by the persisted confirmation ceiling.
     start = NOW - timedelta(minutes=100)
     with patch.object(calendar_module, "CalendarEvent", wraps=calendar_module.CalendarEvent) as events:
         matching = asyncio.run(calendar.async_get_events(owner.hass, start, start + timedelta(seconds=1)))
     assert len(matching) == 1
     assert events.call_count == 2
     all_history = asyncio.run(calendar.async_get_events(owner.hass, NOW - timedelta(days=30), NOW))
-    assert len(all_history) == 5000
+    assert len(all_history) == 1000
     assert owner.store.data == saved
 
 

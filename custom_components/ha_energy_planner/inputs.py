@@ -233,7 +233,10 @@ class InputManager:
             state = self._state(self.entry_data.get(key))
             if state is not None:
                 details: dict[str, Any] = {}
-                intervals = tariff_source_intervals(state, interval, details=details)
+                intervals = tariff_source_intervals(
+                    state, interval, details=details,
+                    slot_starts=[now, now + timedelta(hours=horizon)],
+                )
                 age = now - state.last_updated
                 fresh = timedelta() <= age <= timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
                 details.update(source_freshness="fresh" if fresh else "stale", next_retry_at=None)

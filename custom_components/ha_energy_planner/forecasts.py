@@ -23,6 +23,7 @@ _FORECAST_CONTAINER_KEYS = (
 _TIME_KEYS = ("valid_at", "datetime", "start_time", "period_start", "from", "time", "date", "nem_time")
 FORECAST_HEALTHY_HOURS = 12.0
 FORECAST_DEGRADED_HOURS = 8.0
+MAX_FORECAST_SOURCE_ROWS = 2048
 
 
 def constant_forecast(
@@ -53,6 +54,7 @@ def constant_forecast(
 
 def tariff_source_intervals(
     state: Any, interval_minutes: int, *, details: dict[str, Any] | None = None,
+    slot_starts: list[datetime] | None = None,
 ) -> list[dict[str, Any]]:
     """Expose sanitized source boundaries used to identify tariff lifecycles."""
     attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
@@ -66,7 +68,7 @@ def tariff_source_intervals(
             details.update(source_validity="declared_intervals" if intervals else "invalid_intervals",
                            normalized_intervals=normalized)
         return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
-                for start, end, price in intervals[:576]]
+                for start, end, price in _tariff_window(intervals, slot_starts)]
     if details is not None:
         details.update(source_validity="inferred_intervals", normalized_intervals=0)
     parsed = [
@@ -85,7 +87,20 @@ def tariff_source_intervals(
         explicit_cadence or timedelta(minutes=interval_minutes),
         maximum=explicit_cadence,
     )
-    return [{"start": at.isoformat(), "end": (at + cadence).isoformat(), "price": price} for at, price in points[:576]]
+    intervals = [(at, at + cadence, price) for at, price in points]
+    return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
+            for start, end, price in _tariff_window(intervals, slot_starts)]
+
+
+def _tariff_window(
+    intervals: list[tuple[datetime, datetime, float]], starts: list[datetime] | None,
+) -> list[tuple[datetime, datetime, float]]:
+    """Bound published boundaries after validating the complete source evidence."""
+    if starts and len(intervals) > 576:
+        window_start = min(_as_aware_utc(start) for start in starts)
+        window_end = max(_as_aware_utc(start) for start in starts)
+        intervals = [row for row in intervals if row[1] > window_start and row[0] <= window_end]
+    return intervals[:576]
 
 
 def forecast_series_from_state(
