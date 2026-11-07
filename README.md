@@ -88,6 +88,8 @@ Enter your Home Assistant URL if prompted by the HACS link. [Manual installation
 
 Requires **Home Assistant 2026.10.0+** (Python **3.14+**). Normal planning needs tariff and solar forecasts, household consumption with Recorder history, and battery SOC. [Export-only operation](https://github.com/barneyonline/ha-energy-planner/wiki/Enphase-Export-Limit) has narrower requirements.
 
+On Home Assistant **2026.11+**, migration Repairs belong to their config entry: disabling the entry hides them, and removing it deletes them. Startup refresh preserves ignored repairs that still need migration and removes stale notices, including records from older versions. Home Assistant 2026.10 retains explicit cleanup without the newer ownership and refresh APIs.
+
 **Automatic control** records your request to operate; **Armed** reports actual command authority.
 
 ## Documentation

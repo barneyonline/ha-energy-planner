@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+from contextlib import nullcontext
 from pathlib import Path
 from types import MappingProxyType
 from unittest.mock import AsyncMock, patch
@@ -19,13 +20,14 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import frame
 from homeassistant.helpers import issue_registry as ir
 
-from custom_components.ha_energy_planner import async_migrate_entry, async_remove_entry
+from custom_components.ha_energy_planner import async_migrate_entry, async_remove_entry, async_setup
 from custom_components.ha_energy_planner.config_flow import ConfigFlow
 from custom_components.ha_energy_planner.const import CONF_EV_SMART_CHARGING_TARGET_SOC as TARGET
 from custom_components.ha_energy_planner.const import DOMAIN
 from custom_components.ha_energy_planner.migration_recovery import (
     async_clear_migration_issue,
     async_create_migration_issue,
+    async_refresh_migration_issues,
     async_save_vehicle_target,
     migration_issue_id,
 )
@@ -46,6 +48,7 @@ async def prepare(tmp_path):
     hass = HomeAssistant(str(tmp_path))
     frame.async_setup(hass)
     loader.async_setup(hass)
+    frame.async_setup(hass)
     hass.config_entries = ConfigEntries(hass, {})
     await hass.config_entries.async_initialize()
     dr.async_setup(hass)
@@ -359,4 +362,186 @@ def test_repair_cannot_overwrite_target_during_migration(tmp_path, surface):
             assert ir.async_get(hass).async_get_issue(DOMAIN, migration_issue_id(entry.entry_id)).is_fixable
         finally:
             await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("legacy_api", [False, True])
+def test_startup_refresh_preserves_ignored_repairs_and_removes_stale_issues(tmp_path, legacy_api):
+    """Reconcile real registry records, including ownerless records from older Core."""
+    async def run():
+        hass = await prepare(tmp_path)
+        pending, retrying, migrated, removed, disabled = [make_entry() for _ in range(5)]
+        for entry in (pending, retrying, migrated, removed, disabled):
+            hass.config_entries._entries[entry.entry_id] = entry
+        registry = ir.async_get(hass)
+        try:
+            # Simulate issues created by the previous integration, without ownership.
+            for entry in (pending, retrying, migrated, removed, disabled):
+                ir.async_create_issue(
+                    hass, DOMAIN, migration_issue_id(entry.entry_id), is_fixable=True,
+                    severity=ir.IssueSeverity.ERROR, translation_key="legacy_vehicle_target",
+                )
+                registry.async_ignore(DOMAIN, migration_issue_id(entry.entry_id), True)
+            original = registry.async_get_issue(DOMAIN, migration_issue_id(pending.entry_id))
+            hass.config_entries.async_update_entry(retrying, data={**retrying.data, TARGET: "sensor.target"})
+            hass.config_entries.async_update_entry(migrated, version=5)
+            hass.config_entries._entries.pop(removed.entry_id)
+            from homeassistant.config_entries import ConfigEntryDisabler
+            object.__setattr__(disabled, "disabled_by", ConfigEntryDisabler.USER)
+            for domain, issue_id in ((DOMAIN, "unrelated"), ("other", migration_issue_id("foreign"))):
+                ir.async_create_issue(
+                    hass, domain, issue_id, is_fixable=False,
+                    severity=ir.IssueSeverity.WARNING, translation_key="unrelated",
+                )
+            with patch.object(ir, "async_refresh_issues", None, create=True) if legacy_api else nullcontext():
+                assert await async_setup(hass, {})
+                assert await async_setup(hass, {})
+            for entry in (pending, retrying, disabled):
+                issue = registry.async_get_issue(DOMAIN, migration_issue_id(entry.entry_id))
+                assert issue is not None and issue.dismissed_version == original.dismissed_version
+                assert issue.data == {"entry_id": entry.entry_id}
+                if not legacy_api and hasattr(ir, "async_refresh_issues"):
+                    assert issue.config_entry_id == entry.entry_id
+            assert registry.async_get_issue(DOMAIN, migration_issue_id(pending.entry_id)).created == original.created
+            for entry in (migrated, removed):
+                assert registry.async_get_issue(DOMAIN, migration_issue_id(entry.entry_id)) is None
+            assert registry.async_get_issue(DOMAIN, "unrelated") is not None
+            assert registry.async_get_issue("other", migration_issue_id("foreign")) is not None
+        finally:
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+def test_new_registry_contract_scopes_refresh_and_sets_owner_on_every_creation(tmp_path):
+    """Exercise optional API selection even on the advertised minimum Core."""
+    async def run():
+        hass = await prepare(tmp_path)
+        entry = make_entry()
+        hass.config_entries._entries[entry.entry_id] = entry
+        try:
+            async_create_migration_issue(hass, entry)
+            issue_id = migration_issue_id(entry.entry_id)
+            stale_id = migration_issue_id("removed")
+            ir.async_create_issue(
+                hass, DOMAIN, stale_id, is_fixable=True,
+                severity=ir.IssueSeverity.ERROR, translation_key="legacy_vehicle_target",
+            )
+            with (
+                patch.object(ir, "async_refresh_issues", return_value=nullcontext(), create=True) as refresh,
+                patch.object(ir, "async_create_issue") as create,
+            ):
+                async_refresh_migration_issues(hass)
+                async_create_migration_issue(hass, entry)
+                refresh.assert_called_once_with(hass, DOMAIN, issue_ids=[issue_id, stale_id])
+                assert ir.async_get(hass).async_get_issue(DOMAIN, stale_id) is not None
+                assert create.call_count == 2
+                assert all(call.kwargs["config_entry_id"] == entry.entry_id for call in create.call_args_list)
+                create.side_effect = HomeAssistantError("registry failed")
+                with pytest.raises(HomeAssistantError, match="registry failed"):
+                    async_create_migration_issue(hass, entry)
+                assert create.call_count == 3
+        finally:
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(not hasattr(ir, "async_refresh_issues"), reason="Requires HA 2026.11 issue registry")
+def test_native_refresh_cancels_cleanup_on_error(tmp_path):
+    async def run():
+        hass = await prepare(tmp_path)
+        entry = make_entry()
+        hass.config_entries._entries[entry.entry_id] = entry
+        try:
+            async_create_migration_issue(hass, entry)
+            ir.async_create_issue(
+                hass, DOMAIN, migration_issue_id("removed"), is_fixable=True,
+                severity=ir.IssueSeverity.ERROR, translation_key="legacy_vehicle_target",
+            )
+            with patch.object(ir, "async_create_issue", side_effect=HomeAssistantError("registry failed")):
+                with pytest.raises(HomeAssistantError, match="registry failed"):
+                    async_refresh_migration_issues(hass)
+            assert ir.async_get(hass).async_get_issue(DOMAIN, migration_issue_id("removed")) is not None
+            assert ir.async_get(hass).async_get_issue(DOMAIN, migration_issue_id(entry.entry_id)) is not None
+        finally:
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(not hasattr(ir, "async_refresh_issues"), reason="Requires HA 2026.11 issue registry")
+def test_native_ownership_hides_disabled_issues_and_core_removes_only_the_owner(tmp_path):
+    """Core ownership works independently of Planner's legacy removal fallback."""
+    shutil.copytree(ROOT / "custom_components/ha_energy_planner", tmp_path / "custom_components/ha_energy_planner")
+
+    async def run():
+        from homeassistant.config_entries import ConfigEntryDisabler
+
+        hass = await prepare(tmp_path)
+        first, second = make_entry(), make_entry()
+        for entry in (first, second):
+            hass.config_entries._entries[entry.entry_id] = entry
+        registry = ir.async_get(hass)
+        try:
+            assert not await hass.config_entries.async_setup(first.entry_id)
+            assert second.state is ConfigEntryState.MIGRATION_ERROR
+            first_id, second_id = migration_issue_id(first.entry_id), migration_issue_id(second.entry_id)
+            original = registry.async_ignore(DOMAIN, first_id, True)
+            assert registry.async_get_issue(DOMAIN, first_id).config_entry_id == first.entry_id
+            assert registry.async_get_issue(DOMAIN, second_id).config_entry_id == second.entry_id
+            # A failed migration cannot be unloaded by a normal reload. Both
+            # that attempt and a public migration retry must preserve dismissal.
+            with pytest.raises(HomeAssistantError):
+                await hass.config_entries.async_reload(first.entry_id)
+            await hass.config_entries.async_retry_migration(first.entry_id)
+            assert registry.async_get_issue(DOMAIN, first_id).dismissed_version == original.dismissed_version
+            assert registry.async_get_issue(DOMAIN, first_id).created == original.created
+            with pytest.raises(HomeAssistantError):
+                await hass.config_entries.async_set_disabled_by(first.entry_id, ConfigEntryDisabler.USER)
+            issue = registry.async_get_issue(DOMAIN, first_id)
+            assert issue is not None and registry.async_is_hidden(issue)
+            with pytest.raises(HomeAssistantError):
+                await hass.config_entries.async_set_disabled_by(first.entry_id, None)
+            issue = registry.async_get_issue(DOMAIN, first_id)
+            assert not registry.async_is_hidden(issue) and issue.dismissed_version == original.dismissed_version
+            with patch("custom_components.ha_energy_planner.async_remove_entry", new=AsyncMock()):
+                result = await hass.config_entries.async_remove(first.entry_id)
+            assert result["require_restart"] is False
+            assert registry.async_get_issue(DOMAIN, first_id) is None
+            assert registry.async_get_issue(DOMAIN, second_id) is not None
+        finally:
+            await hass.async_stop(force=True)
+    asyncio.run(run())
+
+
+def test_startup_adopts_saved_ownerless_dismissal_and_cleans_stale_restart_records(tmp_path):
+    async def run():
+        hass = await prepare(tmp_path)
+        entry = make_entry()
+        hass.config_entries._entries[entry.entry_id] = entry
+        hass.config_entries._async_schedule_save()
+        issue_id = migration_issue_id(entry.entry_id)
+        try:
+            for identity in (issue_id, migration_issue_id("removed")):
+                ir.async_create_issue(
+                    hass, DOMAIN, identity, is_fixable=True,
+                    severity=ir.IssueSeverity.ERROR, translation_key="legacy_vehicle_target",
+                )
+                ir.async_get(hass).async_ignore(DOMAIN, identity, True)
+            original = ir.async_get(hass).async_get_issue(DOMAIN, issue_id)
+        finally:
+            await hass.async_stop(force=True)
+        restarted = await prepare(tmp_path)
+        try:
+            await ir.async_load(restarted)
+            registry = ir.async_get(restarted)
+            assert not registry.async_get_issue(DOMAIN, issue_id).active
+            assert registry.async_get_issue(DOMAIN, migration_issue_id("removed")) is not None
+            assert await async_setup(restarted, {})
+            issue = registry.async_get_issue(DOMAIN, issue_id)
+            assert issue.active and issue.dismissed_version == original.dismissed_version
+            assert issue.created == original.created and issue.data == {"entry_id": entry.entry_id}
+            if hasattr(ir, "async_refresh_issues"):
+                assert issue.config_entry_id == entry.entry_id
+            assert registry.async_get_issue(DOMAIN, migration_issue_id("removed")) is None
+        finally:
+            await restarted.async_stop(force=True)
     asyncio.run(run())
