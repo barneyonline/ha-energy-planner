@@ -136,6 +136,8 @@ class DryRunPlanner:
         device_plans.setdefault("climate", {})["preconditioning"] = planning_status(
             context, actions, mode, _rejected_climate_decision(context, self.options)["reason"], self.options
         )
+        if context.weather_evidence:
+            device_plans.setdefault("climate", {})["weather"] = dict(context.weather_evidence)
         timeline_card = _timeline_card_rows(device_plans)
 
         summary = "Planner disabled"

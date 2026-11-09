@@ -67,6 +67,7 @@ from .forecasts import (
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
 from .models import DaylightWindow, DecisionContext, DecisionSlot, InputHealth, OccupancyState, Override
 from .planning_grid import planning_starts
+from .weather import WEATHER_TEMPERATURE_KEYS, weather_issued_at
 
 _CALIBRATION_FIELDS_BY_CONFIG = {
     CONF_PV_FORECAST: "pv_forecast_kw",
@@ -456,6 +457,7 @@ class InputManager:
             forecast_confidence_by_source=forecast_confidence_by_source,
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
             daylight_windows=daylight_windows,
+            weather_evidence=dict(self.weather_forecast_details),
             climate_inputs=read_climate_inputs(
                 self.hass, dict(self.entry_data), dict(self.options), now, now + timedelta(hours=horizon),
                 {**self.load_forecast_details,
@@ -1079,7 +1081,50 @@ class InputManager:
         if not entity_id:
             return None, [None] * slot_count, None
         state = self._state(entity_id)
-        if not self._valid_state(state):
+        details = self.weather_forecast_details
+        good_at = dt_util.parse_datetime(str(details.get("last_good_at", "")))
+        expires = dt_util.parse_datetime(str(details.get("grace_expires_at", "")))
+        if good_at is not None and expires is not None:
+            details["cache_age_seconds"] = max((now - good_at).total_seconds(), 0.0)
+            details["grace_remaining_seconds"] = max((expires - now).total_seconds(), 0.0)
+            if not self._valid_state(state):
+                details["availability"] = "cached"
+            if (details.get("entity_id") != entity_id or good_at > now
+                    or (details.get("availability") == "cached" and now >= expires)):
+                self.weather_forecast = {}
+                details["availability"] = "unavailable"
+        legacy_forecast = None
+        if details.get("availability") == "unavailable" and self._valid_state(state):
+            attributes = getattr(state, "attributes", {}) or {}
+            try:
+                provider_issued = weather_issued_at(attributes, now)
+                legacy_at = provider_issued or _forecast_source_issued_at(state, now)
+            except ValueError:
+                legacy_at = None
+            if legacy_at is not None and timedelta(0) <= now - legacy_at <= timedelta(
+                minutes=int(self.options.get(CONF_FORECAST_FRESHNESS_MINUTES, 120))
+            ):
+                candidate = forecast_series_from_state(
+                    state, issued_at=legacy_at, horizon_hours=horizon, interval_minutes=interval,
+                    value_keys=WEATHER_TEMPERATURE_KEYS, value_kind="temperature",
+                    slot_starts=getattr(self, "_slot_starts", None) or [
+                        now + timedelta(minutes=i * interval) for i in range(slot_count)],
+                )
+                if candidate and any(value is not None for value in candidate):
+                    legacy_forecast = candidate
+                    self.weather_forecast = {}
+                    details.update(
+                        availability="live", last_good_at=legacy_at.isoformat(),
+                        observation_at=getattr(state, "last_updated", legacy_at).isoformat(),
+                        provider_issued_at=provider_issued.isoformat() if provider_issued is not None else None,
+                        original_fetched_at=None, last_successful_fetch_at=None,
+                        cache_age_seconds=max((now - legacy_at).total_seconds(), 0.0),
+                        grace_expires_at=None, grace_remaining_seconds=None,
+                    )
+        cached_weather = details.get("availability") == "cached"
+        service_forecast = self.weather_forecast.get("forecast")
+        if (not self._valid_state(state) and not (cached_weather and service_forecast)
+                or details.get("availability") == "unavailable"):
             self.weather_forecast_details = {
                 **self.weather_forecast_details,
                 "source_type": "unavailable_state",
@@ -1099,10 +1144,11 @@ class InputManager:
                 details=self.weather_forecast_details,
             )
             return None, [None] * slot_count, f"{config_key}_unavailable"
-        attributes = getattr(state, "attributes", {}) or {}
+        attributes = (self.weather_forecast_details.get("forecast_attributes", {}) if cached_weather else
+                      getattr(state, "attributes", {}) or {})
         value = _attribute_value(attributes, "temperature", "native_temperature", "current_temperature", "temp")
         if value is None:
-            value = state.state
+            value = state.state if state is not None and not cached_weather else None
         current_temperature = _finite_float_or_none(value)
         if current_temperature is not None:
             unit = str(_attribute_value(attributes, "unit_of_measurement", "unit", "temperature_unit") or "")
@@ -1112,14 +1158,14 @@ class InputManager:
         service_forecast = self.weather_forecast.get("forecast")
         if isinstance(service_forecast, list) and service_forecast:
             forecast_state = SimpleNamespace(
-                attributes={**attributes, "forecast": service_forecast},
+                attributes={**attributes, "forecast_interval_minutes": 60, "forecast": service_forecast},
             )
-        forecast = forecast_series_from_state(
+        forecast = legacy_forecast if legacy_forecast is not None else forecast_series_from_state(
             forecast_state,
             issued_at=now,
             horizon_hours=horizon,
             interval_minutes=interval,
-            value_keys=("outdoor_temperature_forecast_c", "temperature", "native_temperature", "temp", "value"),
+            value_keys=WEATHER_TEMPERATURE_KEYS,
             value_kind="temperature",
             slot_starts=getattr(self, "_slot_starts", None),
         )
@@ -1132,6 +1178,7 @@ class InputManager:
             )
             coverage = float(coverage_details["coverage_ratio"])
             source = (
+                "weather_service_hourly_cache" if cached_weather else
                 "weather_service_hourly"
                 if forecast_state is not state and coverage == 1.0
                 else "weather_service_hourly_partial"
@@ -1162,14 +1209,22 @@ class InputManager:
                 "coverage_end": coverage_details.get("last_timestamp"),
             }
             self._record_forecast_confidence(
-                _state_confidence(state, default=1.0) * coverage,
+                0.0 if cached_weather or state is None else _state_confidence(state, default=1.0) * coverage,
                 config_key=config_key,
                 entity_id=str(entity_id),
                 source=source,
                 details=self.weather_forecast_details,
             )
             padded = list(forecast[:slot_count])
-            issue = None if coverage == 1.0 else f"{config_key}_incomplete_horizon"
+            self.weather_forecast_details["values_start_at"] = now.isoformat()
+            continuous_slots = next((i for i, value in enumerate(padded) if value is None), len(padded))
+            starts = getattr(self, "_slot_starts", [])
+            continuous_until = (starts[continuous_slots] if starts and continuous_slots < len(starts) else
+                                min(now + timedelta(minutes=continuous_slots * interval),
+                                    now + timedelta(hours=horizon)))
+            self.weather_forecast_details["continuous_until"] = continuous_until.isoformat()
+            issue = (f"{config_key}_cached_outage" if cached_weather else
+                     None if coverage == 1.0 else f"{config_key}_incomplete_horizon")
             return current_temperature, padded, issue
         if current_temperature is not None:
             self.weather_forecast_details = {

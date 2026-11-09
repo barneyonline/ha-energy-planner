@@ -1080,8 +1080,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   production score is capped by required tariff, PV, and household-load
   sources, while tariff, solar, load, climate, EV, and Enphase action gates use
   only their relevant source and device evidence. A low optional carbon source
-  therefore cannot suppress climate control, but low weather confidence still
-  blocks climate preconditioning at its configured threshold. Degraded input
+  therefore cannot suppress climate control. Low weather confidence blocks new
+  climate acquisition at its configured threshold. A confirmed owned lifecycle
+  may continue through a bounded advisory-weather grace without inflating weather
+  or climate confidence; it must retain fresh non-weather safety evidence. Degraded input
   issues, capability failures, and scoped pauses are isolated to their control
   area, including startup reconciliation and command-authority reporting;
   occupancy availability is scoped to climate. Unsafe or unrecognized shared
@@ -1852,3 +1854,46 @@ the revision and completing its existing CI reporting workflow.
   confirmation, and stale queued intent after a successful subset change.
   `hvac_adapter.py` supplies the confirmed coast intent to `hvac_control.py`, which
   persists it without replacing original restoration baselines.
+
+### Bounded advisory weather outage continuation
+
+- `weather.py` serializes prefetches and keys the in-memory hourly forecast cache
+  by weather source, interval, freshness policy and HA timezone. The fallback
+  ceiling is 15 minutes from the last confirmed live fetch before an outage,
+  capped by the immutable forecast evidence's configured freshness deadline.
+  Healthy identical polls update availability proof without renewing forecast
+  age. Outage deadlines survive retries, changed payloads and flapping; only
+  successful fetches across five uninterrupted recovery minutes permit a new
+  outage window. Restart/reload have no persisted forecast to revive.
+- `inputs.py` consumes cached hourly rows even when current conditions are
+  unavailable, preserving original unit/coverage metadata and recording zero
+  weather confidence. It recomputes age/expiry after prefetch lock waits and
+  derives an exact continuous-coverage deadline without extending gaps or tails.
+  Failed service requests still assess healthy, fresh legacy attribute forecasts
+  using their original issue/update time, including relative array positions;
+  invalid or stale evidence stays unavailable.
+- `weather_control.py`, `planner_hvac.py` and `climate_runtime.py` constrain both
+  climate policies to the existing confirmed lifecycle and last confirmed safe
+  intent. `hvac_control.py` stores that intent only after confirmed execution.
+  Cached evidence cannot acquire control, reverse/restart, extend a window,
+  reopen a zone or increase demand. Forward coast transitions still require the
+  PR175 isolation, recovery and airflow evidence.
+- `constraints.py`, `executor.py` and `hvac_adapter.py` recheck current ownership,
+  live device/room evidence and weather expiry before device writes. The existing
+  release transaction restores original settings and schedules. The coordinator
+  advances its existing boundary refresh timer to the weather grace deadline.
+- `tests/test_weather_outage.py` exercises the observed five-minute outage pattern,
+  confirmed isolated Bedrooms, preparation/coast/expiry schedule behavior,
+  recovery, non-renewing flaps, unavailable startup, no cache, partial/expired
+  coverage, identity changes, restart/reload, concurrent fetches, room/comfort/
+  tariff/manual/command failures, demand bounds and no-write live rejection.
+  `tests/test_coordinator.py` preserves timeout/cancellation and freshness checks.
+  `tests/fixtures/live_schema/weather_outage_provenance.json` supplies supported
+  weather response/state shapes and all five issuance aliases with valid, stale
+  and malformed values; fixture-backed regressions exercise the actual async
+  fetch and unit normalization rather than only the series parser. The long-lived
+  identical-poll, legacy fallback and sustained-recovery regressions protect
+  the three review findings.
+  Full validation remains `scripts/docker-validate.sh`. See
+  `docs/climate-decisions.md` for the operator policy and diagnostic semantics.
+  Offline evidence is not deployment or physical-performance verification.

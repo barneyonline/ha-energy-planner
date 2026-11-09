@@ -138,7 +138,21 @@ class DaikinHVACAdapter:
             self._deferred_zone_entities = None
 
     def _zone_control_rejection(self) -> str | None:
+        from .weather_control import intent_rejection
         from .zone_control import live_rejection
+        lease = self._zone_desired.get("weather_continuation")
+        if lease:
+            if lease.get("entity_id") != self.entry_data.get("weather_entity"):
+                return "hvac_weather_source_changed"
+            expiry = dt_util.parse_datetime(str(lease.get("expires_at", "")))
+            if expiry is None or dt_util.utcnow() >= expiry:
+                return "hvac_weather_grace_expired"
+            safe = self._zone_baseline.get("weather_safe_intent", {})
+            head = self._state(self.entry_data.get(CONF_DAIKIN_CLIMATE))
+            reason = intent_rejection(self._zone_desired, safe, dt_util.utcnow(),
+                                      head.state if head is not None else None)
+            if reason is not None:
+                return reason
         rejection = live_rejection(self.hass, self.entry_data, self._zone_options, self._zone_desired,
                                    self._zone_baseline, dt_util.utcnow())
         if rejection is None and self._zone_desired.get("equipment_compensation"):

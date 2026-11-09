@@ -18,8 +18,69 @@ behaviour. A tariff difference alone is not reported as a monetary saving.
 
 Automatic activation does not enable Automatic control, change Armed, or bypass
 manual overrides, confidence, minimum-cycle or rollback checks. After economic
-activation, degraded evidence returns control to normal climate automations.
+activation, degraded required evidence returns control to normal climate automations;
+a brief advisory weather outage has the bounded continuation exception below.
 Select Legacy explicitly to restore the old policy.
+
+### Brief weather outages
+
+A weather service failure or unavailable weather entity does not alone end an
+otherwise-safe, already-confirmed climate lifecycle. The coordinator keeps the
+last successful hourly forecast in memory and separates its immutable evidence
+age from successful live availability checks. The conservative **15-minute**
+outage grace starts from the last confirmed live fetch before the outage; it is
+also capped by the original forecast evidence's configured freshness deadline.
+Routine successful polls therefore preserve outage tolerance even when hourly
+forecast values stay unchanged. They do not relabel the forecast as newly issued.
+
+Once an outage starts, its deadline stays fixed across failed retries, cache hits,
+changed forecast payloads and brief availability flaps. A successful fetch is
+reassessed immediately as live evidence; a new outage window becomes eligible
+only after successful fetches confirm at least five uninterrupted minutes of
+recovery. A failure restarts that recovery check, not the existing grace. Explicit
+provider issuance metadata, original fetch/observation times and actual continuous
+coverage remain unchanged when a payload is unchanged. Missing values, gaps and
+out-of-horizon values stay unknown. The remaining lifecycle must fit inside that
+real coverage.
+
+A failed hourly service request also preserves the supported live entity-attribute
+forecast path. A healthy weather entity with fresh, valid attribute forecasts is
+assessed using its original issue/update time and actual coverage. Missing, stale,
+future-dated, malformed or unavailable attribute evidence cannot substitute for a
+successful source. A point temperature is not promoted to a forecast by this path.
+
+Grace authorizes only continuation of the existing confirmed ownership and
+intent. It permits existing safe preparation-to-coast transitions, including the
+confirmed isolated-room contract described below. It does not acquire ownership,
+reverse mode, restart an idle head, move back from coast to preparation, extend
+preparation or release deadlines, reopen a closed zone, or increase head/room
+target demand. The existing executor still confirms device commands and owns
+schedule suppression and restoration. A successful transaction can narrow the
+confirmed intent during grace; it cannot renew weather evidence.
+
+Fresh room and device evidence, comfort boundaries, actual isolation/airflow,
+manual actions, occupancy, tariffs, minimum-cycle rules and all other safety
+gates remain authoritative. A weather lease is rechecked at execution and before
+adapter writes, including after asynchronous persistence. Grace expiry schedules
+a refresh at the exact deadline and uses the existing release/restoration path.
+Source/policy changes invalidate incompatible caches. Restart and reload discard
+the in-memory forecast; persisted ownership alone cannot authorize grace.
+
+Weather diagnostics and the climate device plan expose live/cached/unavailable
+availability, original fetch and observation times, provider issue time when
+present, evidence age, last successful live fetch, outage/recovery times,
+original and effective coverage, grace expiry/remaining,
+retained ownership and its reason. Cached weather has **zero weather-source
+confidence**; the energy-planning confidence still describes its required energy
+sources. Continuation checks the previous qualified climate confidence and fresh
+non-weather confidence separately. This does not qualify acquisition or change
+reported climate confidence. Recovery with a successful forecast is reassessed
+through the usual policy and constraints, retaining compatible ownership without
+an intermediate restoration/reacquisition.
+
+Deterministic evidence is in `tests/test_weather_outage.py`, with cache and refresh
+regressions in `tests/test_coordinator.py` and `tests/test_refresh_timing.py`.
+These offline tests do not establish physical results on a deployed system.
 
 ### Direction permission and fallback evidence
 

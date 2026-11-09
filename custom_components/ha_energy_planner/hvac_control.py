@@ -294,6 +294,13 @@ class HVACOwnershipTransaction:
             ):
                 hvac_control["precondition_end"] = confirmed_at or self.now
                 hvac_control["phase_started_at"] = confirmed_at or self.now
+            if desired.get("weather_safe_intent") is not None:
+                hvac_control["weather_safe_intent"] = deepcopy(desired["weather_safe_intent"])
+            elif desired.get("weather_continuation"):
+                from .weather_control import INTENT_KEYS
+                safe = dict(hvac_control.get("weather_safe_intent", {}))
+                safe.update({key: deepcopy(desired.get(key)) for key in INTENT_KEYS})
+                hvac_control["weather_safe_intent"] = safe
             hvac_control.setdefault("started_at", self.now)
             ownership_data["hvac_control"] = hvac_control
             ownership_data.pop("hvac_release_hold_until", None)

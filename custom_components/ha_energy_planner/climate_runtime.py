@@ -44,13 +44,17 @@ def update_readiness(
         and model.get("validation_version") == VALIDATION_VERSION
         and model.get("physical", {}).get("version") == PHYSICAL_VERSION
     )
+    from .weather_control import continuation_rejection, weather_degraded
+    weather_grace = weather_degraded(context) and continuation_rejection(context, context.created_at) is None
+    material_issues = [issue for issue in context.input_issues
+                       if not (weather_grace and issue == "advisory_weather_entity_cached_outage")]
     live_valid = (
         versions_valid
         and context.climate_inputs.get("power_source_type") == "measured"
         and model.get("power_source_type") == "measured"
         and context.current_hvac_power_kw is not None
         and context.climate_inputs.get("configuration_valid", True)
-        and not context.input_issues
+        and not material_issues
         and all(source.get("fresh") for source in context.climate_inputs.get("sources", {}).values())
         and model.get("identity") == context.climate_inputs.get("identity")
     )
@@ -120,6 +124,12 @@ def update_readiness(
 
 
 def economic_actions(context: DecisionContext, options: dict[str, Any], legacy: list[PlanAction]) -> list[PlanAction]:
+    """Bound economic selection by the same weather/ownership contract as fallback."""
+    from .weather_control import bound_weather_actions
+    return bound_weather_actions(context, options, _economic_actions(context, options, legacy))
+
+
+def _economic_actions(context: DecisionContext, options: dict[str, Any], legacy: list[PlanAction]) -> list[PlanAction]:
     """Return one policy's actions; authority still belongs to the existing executor."""
     if (context.hvac_control.get("economic_policy_version")
             and context.hvac_control.get("mode") in {"heat", "cool"}

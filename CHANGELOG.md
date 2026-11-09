@@ -12,6 +12,8 @@
 
 ### 🐛 Bug fixes
 
+- Preserve outage grace after healthy unchanged forecast polls, keep grace fixed through flapping until sustained recovery, and retain fresh legacy attribute forecasts when the hourly service fails.
+- Retain confirmed, otherwise-safe climate ownership during brief advisory weather outages using in-memory last-good forecasts during an outage grace of at most 15 minutes, capped by the original evidence's freshness deadline. Keep schedules suppressed through safe coast transitions, preserve degraded weather confidence and original evidence age, and restore control on expiry or safety/ownership loss. Cached weather cannot acquire control, restart or reverse HVAC, extend a run, reopen a closed zone or increase demand.
 - Retain the newest confirmed calendar history by timestamp when loading unsorted legacy records, so delayed older outcomes cannot evict newer confirmations.
 
 ### 🔧 Improvements
