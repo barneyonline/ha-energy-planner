@@ -411,7 +411,8 @@ def test_hourly_weather_cache_hit_respects_shorter_forecast_freshness() -> None:
     )
 
     assert services.calls == 2
-    assert details["fetch_status"] == "fetched"
+    # An identical successful retry does not renew the original evidence age.
+    assert details["fetch_status"] == "failed"
 
 
 def test_hourly_weather_forecast_failure_uses_fresh_cache_then_legacy_fallback() -> None:
@@ -436,6 +437,7 @@ def test_hourly_weather_forecast_failure_uses_fresh_cache_then_legacy_fallback()
             config=SimpleNamespace(time_zone="UTC"),
         ),
         _weather_forecast_cache={
+            "identity": ("weather.home", 5, 120, "UTC"),
             "entity_id": "weather.home",
             "fetched_at": now - timedelta(minutes=10),
             "forecast": cached_forecast,
@@ -8283,6 +8285,7 @@ def test_weather_deadline_respects_elapsed_cache_age_and_cancellation(monkeypatc
             states=SimpleNamespace(get=lambda _entity_id: SimpleNamespace(state="sunny")),
         )
         cache = {
+            "identity": ("weather.home", 5, 1, "UTC"),
             "entity_id": "weather.home", "fetched_at": now - timedelta(seconds=59),
             "forecast": [{"datetime": now.isoformat(), "temperature": 20}],
         }
@@ -8929,6 +8932,7 @@ def test_weather_waits_for_available_entity_and_preserves_cache_freshness(
             states=SimpleNamespace(get=lambda _entity_id: state),
         ),
         _weather_forecast_cache={} if cache_age_minutes is None else {
+            "identity": ("weather.home", None, None, "UTC"),
             "entity_id": "weather.home",
             "fetched_at": now - timedelta(minutes=cache_age_minutes),
             "forecast": forecast,
@@ -8945,8 +8949,8 @@ def test_weather_waits_for_available_entity_and_preserves_cache_freshness(
     state = SimpleNamespace(state="sunny")
     result, details = asyncio.run(fetch())
     service.assert_awaited_once()
-    assert result == {"forecast": forecast}
-    assert details["fetch_status"] == "fetched"
+    assert result == ({"forecast": forecast} if cache_age_minutes != 121 else {})
+    assert details["fetch_status"] == ("fetched" if cache_age_minutes != 121 else "failed")
 
 
 def test_startup_warmup_waits_thirty_minutes_before_validation(monkeypatch: Any) -> None:

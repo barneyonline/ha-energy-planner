@@ -1,3 +1,18 @@
+# Weather outage evidence: weather.py and weather_control.py bound in-memory
+# hourly fallback to 15 minutes and the shorter freshness policy without renewing
+# original evidence age. Successful live polls and a latched outage/recovery clock
+# preserve grace for healthy unchanged forecasts without flap-based renewal.
+# inputs.py retains fresh legacy attribute forecasts on service failure and reports
+# actual coverage and zero cached weather
+# confidence; planner_hvac.py/climate_runtime.py constrain confirmed ownership and
+# hvac_control.py persists confirmed intent. constraints.py/executor.py/hvac_adapter.py
+# preserve live safety and execution expiry checks. tests/test_weather_outage.py
+# covers isolated-zone cooling/coast, schedules/restoration, expiry/recovery/flaps,
+# cache identities/restart, concurrent fetches and no-write safety rejection.
+# tests/fixtures/live_schema/weather_outage_provenance.json covers provider issuance
+# aliases and malformed/stale shapes through real async fetch regressions.
+# See docs/climate-decisions.md and docs/requirements-audit.md; full validation
+# remains scripts/docker-validate.sh, with no claim of live-device verification.
 # Safe Off starts: daikin_memory.py, hvac_adapter.py, hvac_control.py and executor.py retain complete vendor mode memories before writes, separate attempt compensation from immutable ownership, and bound incomplete recovery. tests/test_daikin_memory.py and tests/test_hvac_restoration_baseline.py cover hidden targets, exact native bindings and lifecycle/attempt source agreement across coast/resume, restore-compatible capture, provenance, rollback/reload and manual supersession including indirect head clamps, changes during native reads/persistence, and fresh execution-window/helper/production authority; config_flow.py, strings/translations, README.md, docs/hvac-restoration-recovery.md and docs/requirements-audit.md document the default-off surface. Coverage also exercises rejected readback after manual head takeover and successful safe-airflow reopening during rollback. Full gate: scripts/docker-validate.sh.
 # Export deferral projections: enphase_export_limit.py retains feedback_ready independently of command readiness; export_limit_policy.py projects fresh confirmed caps through the hold and eligible tariff intent afterward; planner.py shares the cap for estimated export costs. tests/test_export_limit_cooldown.py covers zero/finite/disabled settings, tariff signs, surplus above/below the cap, eligibility, restoration/service gates, pending/stale feedback, preserved PV/import costs and unchanged control audits.
 # Export restoration audit identity: enphase_export_limit.py freezes audit_action_id before repairing a pending request clock; tests/test_export_limit_cooldown.py covers replay before/after saved confirmation, disabled/limited baselines and repeated backward clock adjustments without duplicate confirmed calendar actions or extra device writes.
@@ -217,6 +232,7 @@ rules:
         - custom_components/ha_energy_planner/plan_presentation.py
         - custom_components/ha_energy_planner/training.py
         - custom_components/ha_energy_planner/weather.py
+        - custom_components/ha_energy_planner/weather_control.py
       tests:
         - tests/test_planner.py
         - tests/test_hvac_cycle.py

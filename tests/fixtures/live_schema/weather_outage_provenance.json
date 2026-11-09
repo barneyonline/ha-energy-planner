@@ -1,0 +1,135 @@
+{
+  "kind": "forecast_state",
+  "name": "synthetic_weather_outage_provenance",
+  "source_entity_id": "weather.home",
+  "response_action": "weather.get_forecasts",
+  "response_type": "hourly",
+  "issued_at": "2026-06-27T00:00:00+00:00",
+  "horizon_hours": 1,
+  "interval_minutes": 15,
+  "value_kind": "temperature",
+  "value_keys": [
+    "outdoor_temperature_forecast_c",
+    "temperature",
+    "native_temperature",
+    "temp",
+    "value"
+  ],
+  "state": "sunny",
+  "attributes": {
+    "temperature_unit": "F",
+    "forecast_issued_at": "2026-06-27T00:00:00+00:00"
+  },
+  "response": {
+    "weather.home": {
+      "forecast": [
+        {
+          "datetime": "2026-06-27T00:00:00+00:00",
+          "native_temperature": 68
+        },
+        {
+          "datetime": "2026-06-27T00:30:00+00:00",
+          "native_temperature": 77
+        }
+      ]
+    }
+  },
+  "expected": [
+    20.0,
+    20.0,
+    25.0,
+    25.0
+  ],
+  "weather_fetch_cases": [
+    {
+      "name": "forecast_issued_at_valid",
+      "attribute": "forecast_issued_at",
+      "value": "2026-06-27T00:00:00+00:00",
+      "expected_fetch_status": "fetched"
+    },
+    {
+      "name": "forecast_issued_at_stale",
+      "attribute": "forecast_issued_at",
+      "value": "2026-06-26T20:00:00+00:00",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "forecast_issued_at_malformed",
+      "attribute": "forecast_issued_at",
+      "value": "not-an-instant",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "issued_at_valid",
+      "attribute": "issued_at",
+      "value": "2026-06-27T00:00:00+00:00",
+      "expected_fetch_status": "fetched"
+    },
+    {
+      "name": "issued_at_stale",
+      "attribute": "issued_at",
+      "value": "2026-06-26T20:00:00+00:00",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "issued_at_malformed",
+      "attribute": "issued_at",
+      "value": "not-an-instant",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "generated_at_valid",
+      "attribute": "generated_at",
+      "value": "2026-06-27T00:00:00+00:00",
+      "expected_fetch_status": "fetched"
+    },
+    {
+      "name": "generated_at_stale",
+      "attribute": "generated_at",
+      "value": "2026-06-26T20:00:00+00:00",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "generated_at_malformed",
+      "attribute": "generated_at",
+      "value": "not-an-instant",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "generated_time_valid",
+      "attribute": "generated_time",
+      "value": "2026-06-27T00:00:00+00:00",
+      "expected_fetch_status": "fetched"
+    },
+    {
+      "name": "generated_time_stale",
+      "attribute": "generated_time",
+      "value": "2026-06-26T20:00:00+00:00",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "generated_time_malformed",
+      "attribute": "generated_time",
+      "value": "not-an-instant",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "forecast_generated_at_valid",
+      "attribute": "forecast_generated_at",
+      "value": "2026-06-27T00:00:00+00:00",
+      "expected_fetch_status": "fetched"
+    },
+    {
+      "name": "forecast_generated_at_stale",
+      "attribute": "forecast_generated_at",
+      "value": "2026-06-26T20:00:00+00:00",
+      "expected_fetch_status": "failed"
+    },
+    {
+      "name": "forecast_generated_at_malformed",
+      "attribute": "forecast_generated_at",
+      "value": "not-an-instant",
+      "expected_fetch_status": "failed"
+    }
+  ]
+}

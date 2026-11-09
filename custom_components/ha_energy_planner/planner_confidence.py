@@ -134,12 +134,29 @@ def _subsystem_confidence(base: float, issue_text: str, issue_markers: tuple[str
     return base
 
 
+def hvac_continuation_confidence(context: DecisionContext, options: Mapping[str, Any]) -> bool:
+    """Check non-weather confidence plus the last confirmed climate qualification."""
+    breakdown = _confidence_breakdown(context, [])
+    issues = " ".join(i for i in context.input_issues if not i.startswith("advisory_"))
+    safe = context.hvac_control.get("weather_safe_intent", {})
+    climate = _finite_number(safe.get("climate_confidence")) or 0.0
+    breakdown["climate"] = _subsystem_confidence(
+        min(confidence_from_health(context.input_health), climate), issues, ("daikin_", "climate_", "weather_"))
+    return _confidence_values_meet_threshold(ActionAsset.DAIKIN, breakdown, options)
+
+
 def _action_meets_confidence_threshold(
     action: PlanAction,
     context: DecisionContext,
     options: Mapping[str, Any],
 ) -> bool:
     """Return whether an action clears tariff and device confidence thresholds."""
+    if action.asset == ActionAsset.DAIKIN and action.desired_state.get("weather_continuation"):
+        from .weather_control import continuation_rejection, intent_rejection
+        return (continuation_rejection(context, context.created_at) is None
+                and intent_rejection(action.desired_state, context.hvac_control.get("weather_safe_intent", {}),
+                                     action.execute_not_before, context.current_hvac_mode) is None
+                and hvac_continuation_confidence(context, options))
     return asset_meets_confidence_threshold(action.asset, context, options)
 
 

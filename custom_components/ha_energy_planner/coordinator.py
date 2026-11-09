@@ -417,6 +417,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._tearing_down = False
         self._force_next_refresh = False
         self._manual_override_helper_guard: tuple[str, datetime] | None = None
+        self._weather_fetch_lock: asyncio.Lock | None = None
         self._weather_forecast_cache: dict[str, Any] = {}
         self.weather_forecast_diagnostics: dict[str, Any] = {}
         self._load_forecast_training_attempted = False
@@ -1300,6 +1301,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             int(self.options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)),
         )
 
+        weather = getattr(self, "weather_forecast_diagnostics", {})
+        expiry = _parse_datetime_or_none(weather.get("grace_expires_at"))
+        if weather.get("ownership_retained") and expiry is not None:
+            remaining = (expiry - dt_util.utcnow()).total_seconds()
+            if remaining > 0:
+                delay = min(delay, remaining)
+
         @callback
         def _refresh(now: Any) -> None:
             self._boundary_cancel = None
@@ -1347,7 +1355,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         self._increment_refresh_counter("teardown_skipped")
                         return self.data
                     if prepared_weather is not None and (
-                        prepared_weather[0] != _weather_input_identity(self.entry_data, self.planner_options)
+                        prepared_weather[0] != _weather_input_identity(
+                            self.entry_data, self.planner_options,
+                            str(getattr(getattr(self.hass, "config", None), "time_zone", "UTC")))
                         or (getattr(self, "_force_next_refresh", False) and not prepared_weather[1])
                     ):
                         continue
@@ -1405,10 +1415,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.planner_options
         now = dt_util.utcnow()
         force = bool(getattr(self, "_force_next_refresh", False))
+        identity = _weather_input_identity(
+            entry_data, options, str(getattr(getattr(self.hass, "config", None), "time_zone", "UTC")))
         forecast, details = await self._async_weather_forecast(
             entry_data, options, now=now, force=force,
         )
-        return _weather_input_identity(entry_data, options), force, forecast, details
+        return identity, force, forecast, details
 
     async def _async_weather_for_refresh(
         self, entry_data: dict[str, Any], options: dict[str, Any], *, now: datetime, force: bool,
@@ -1419,7 +1431,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             identity, prepared_force, forecast, details = cast(
                 tuple[tuple[Any, ...], bool, dict[str, Any], dict[str, Any]], prepared,
             )
-            if identity == _weather_input_identity(entry_data, options) and (prepared_force or not force):
+            if identity == _weather_input_identity(
+                entry_data, options, str(getattr(getattr(self.hass, "config", None), "time_zone", "UTC"))
+            ) and (prepared_force or not force):
                 return forecast, details
         return await self._async_weather_forecast(entry_data, options, now=now, force=force)
 
@@ -1761,6 +1775,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         try:
             plan = await self.hass.async_add_executor_job(create_plan)
+            if getattr(context, "weather_evidence", None):
+                self.weather_forecast_diagnostics = dict(context.weather_evidence)
+                if context.weather_evidence.get("ownership_retained"):
+                    self._schedule_next_boundary_refresh()
         finally:
             stage("post_plan_ms")
             if (refresh_timing := current_timing()) is not None and len(worker_times) == 2:
@@ -4758,12 +4776,15 @@ def _canonical_attributes(attributes: Any) -> dict[str, Any]:
     return canonical
 
 
-def _weather_input_identity(entry_data: dict[str, Any], options: dict[str, Any]) -> tuple[Any, ...]:
+def _weather_input_identity(
+    entry_data: dict[str, Any], options: dict[str, Any], timezone: str = "UTC",
+) -> tuple[Any, ...]:
     """Identify the configuration and cache policy used for a weather fetch."""
     return (
         entry_data.get(CONF_WEATHER),
         options.get(CONF_PLANNING_INTERVAL_MINUTES),
         options.get(CONF_FORECAST_FRESHNESS_MINUTES),
+        timezone,
     )
 
 

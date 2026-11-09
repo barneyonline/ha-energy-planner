@@ -163,6 +163,7 @@ class DecisionContext:
     climate_engine: dict[str, Any] = field(default_factory=dict)
     climate_decision: dict[str, Any] = field(default_factory=dict)
     climate_legacy_decision: dict[str, Any] = field(default_factory=dict)
+    weather_evidence: dict[str, Any] = field(default_factory=dict)
     ev_evidence: dict[str, Any] = field(default_factory=dict)
     export_limit: dict[str, Any] = field(default_factory=dict)
 

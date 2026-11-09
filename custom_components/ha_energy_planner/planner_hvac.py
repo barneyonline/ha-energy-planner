@@ -37,6 +37,7 @@ from .thermal_model import (
     thermal_hvac_load_kw,
     thermal_model_summary,
 )
+from .weather_control import bound_weather_actions, continuation_rejection, weather_degraded
 from .zone_control import desired_fields
 from .zone_temperature import bounds, comfort_breached, control_temperature, feedback_missing, temperatures
 from .zone_temperature import target_reached as rooms_reached
@@ -81,6 +82,16 @@ class HVACPlanningPolicy:
         )
 
     def _hvac_lifecycle_actions(
+        self,
+        context: DecisionContext,
+        execute_not_before: datetime,
+        execute_not_after: datetime,
+    ) -> list[PlanAction]:
+        """Apply bounded advisory-weather policy to the existing lifecycle."""
+        return bound_weather_actions(context, self.options, self._lifecycle_actions(
+            context, execute_not_before, execute_not_after))
+
+    def _lifecycle_actions(
         self,
         context: DecisionContext,
         execute_not_before: datetime,
@@ -135,13 +146,15 @@ class HVACPlanningPolicy:
         if (
             active.get("phase") in {"preconditioning", "pre_peak_coast", "peak_coast"}
             and _confidence_rejection_reason(ActionAsset.DAIKIN, context, self.options) is not None
+            and not (weather_degraded(context) and continuation_rejection(context, now) is None)
         ):
             return [
                 self._hvac_release_action(
                     context,
                     now,
                     now + interval,
-                    "hvac_confidence_below_threshold",
+                    (continuation_rejection(context, now) if weather_degraded(context)
+                     else "hvac_confidence_below_threshold") or "hvac_confidence_below_threshold",
                 )
             ]
 

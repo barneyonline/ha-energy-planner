@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -84,7 +85,7 @@ def test_weather_is_prepared_before_planner_lock() -> None:
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("race", ["entity", "interval", "freshness", "force", "added"])
+@pytest.mark.parametrize("race", ["entity", "interval", "freshness", "force", "added", "timezone"])
 def test_weather_configuration_races_retry_without_holding_planner_lock(race) -> None:
     async def scenario() -> None:
         coordinator = coordinator_for_timing()
@@ -115,6 +116,8 @@ def test_weather_configuration_races_retry_without_holding_planner_lock(race) ->
                     coordinator.entry.options["forecast_freshness_minutes"] = 30
                 elif race == "force":
                     coordinator._force_next_refresh = True
+                elif race == "timezone":
+                    coordinator.hass.config = SimpleNamespace(time_zone="Australia/Melbourne")
             return {}, {}
 
         if race == "added":

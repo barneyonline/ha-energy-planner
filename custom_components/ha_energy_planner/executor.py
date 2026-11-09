@@ -814,6 +814,7 @@ class Executor:
                 cycle = self.store.data.get("hvac_cycle", {})
                 validation_context = replace(
                     context, hvac_cycle=cycle if cycle.get("entity_id") == entity else {},
+                    hvac_control=dict(self.store.data.get("ownership", {}).get("hvac_control", {})),
                     current_hvac_mode=live.state if live is not None else context.current_hvac_mode,
                 )
             violations = ConstraintValidator(self.options).validate_action(
