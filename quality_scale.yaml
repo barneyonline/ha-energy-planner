@@ -74,6 +74,10 @@
 # lead and seven temperature targets.
 # Focused regressions live in tests/test_forecasts.py,
 # tests/test_coordinator.py, tests/test_refresh_timing.py and tests/test_climate_engine.py.
+# Additional planner regressions: tests/test_climate_engine.py covers every
+# start/target pair for a 12-hour dual-mode nine-target search within the existing
+# work budget. tests/test_refresh_timing.py invokes the locked weather consumer
+# for configuration/force races and rejects weather requests under that lock.
 # README presentation: README.md provides concise features, themed image pairs, a direct HACS link and visible footer badges. docs/planning-and-control.md preserves its detailed operating and compatibility guidance; docs/images/README.md records the approved Planning Hub artwork, 18 wiki banners, social-preview upload and screenshot provenance. scripts/generate-doc-banners.cjs checks heading widths and exports themed PNG banners. Runtime behavior and the self-assessed quality level are unchanged; scripts/docker-validate.sh remains the full gate.
 # Cloud development: Dockerfile.dev and scripts/ha-dev.sh use repository HA/tool
 # pins, BuildKit CA secrets and a per-session development container. Lifecycle,

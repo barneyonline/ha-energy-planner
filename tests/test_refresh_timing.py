@@ -92,6 +92,17 @@ def test_weather_configuration_races_retry_without_holding_planner_lock(race) ->
             coordinator.entry.data["weather_entity"] = "weather.home"
         calls = []
 
+        async def locked_refresh(**kwargs):
+            assert coordinator._planner_lock.locked()
+            await coordinator._async_weather_for_refresh(
+                coordinator.entry_data, coordinator.planner_options,
+                now=datetime(2026, 11, 9, tzinfo=UTC),
+                force=bool(getattr(coordinator, "_force_next_refresh", False)),
+            )
+            return _plan("timed")
+
+        coordinator._async_update_data_locked = AsyncMock(side_effect=locked_refresh)
+
         async def weather(data, options, **kwargs):
             assert not coordinator._planner_lock.locked()
             calls.append((data.get("weather_entity"), kwargs["force"]))
