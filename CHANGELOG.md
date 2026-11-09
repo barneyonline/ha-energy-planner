@@ -4,6 +4,28 @@
 
 ### 🚧 Breaking changes
 
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.13 - 2026-11-09
+
+### 🚧 Breaking changes
+
 - Confirmed calendar history is limited to 365 days and the newest 1,000 records. Older or excess records are removed during history normalization, including on load.
 
 ### ✨ New features
