@@ -301,7 +301,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   forced-refresh races release the lock and prepare again before planning.
   Regression coverage lives in `tests/test_forecasts.py`,
   `tests/test_coordinator.py`, `tests/test_climate_engine.py`, and
-  `tests/test_refresh_timing.py`.
+  `tests/test_refresh_timing.py`. Additional regressions cover the 12-hour
+  dual-mode search with nine supported targets between 20–24°C and exercise the
+  locked weather consumer during selector, interval, freshness, force and
+  selector-addition races, asserting that weather requests stay outside the lock.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
