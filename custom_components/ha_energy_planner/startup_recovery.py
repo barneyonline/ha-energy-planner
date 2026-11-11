@@ -375,12 +375,7 @@ async def _async_reactivate_after_startup_recovery(
             require_unowned=False,
             refresh=False,
         )
-        self._mark_forced_refresh("startup_auto_recovery_activation")
-        self._startup_auto_recovery_activation_active = True
-        try:
-            await self.async_refresh()
-        finally:
-            self._startup_auto_recovery_activation_active = False
+        await self._async_refresh_with_export_preflight("startup_auto_recovery_activation")
     except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
         _LOGGER.exception("Startup automatic-control activation refresh failed")
         await self.async_disarm_production_control("startup_auto_recovery_replan_failed")

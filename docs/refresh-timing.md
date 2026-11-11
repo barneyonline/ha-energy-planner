@@ -18,8 +18,8 @@ Diagnostics under `refresh_performance.latest` and the sensor attributes expose:
 
 Refresh phases are `export_admission_ms`, `planner_lock_wait_ms`, `inputs_ms`, `planner_ms`, `post_plan_ms`,
 `storage_flush_ms`, `post_refresh_ms` and `unattributed_ms` (residual setup and
-accounting work). Startup validation and activation can also report
-`startup_export_wait_ms`. The background export transaction separately reports
+accounting work). Startup and operator preflight refreshes can also report
+`export_preflight_wait_ms`. The background export transaction separately reports
 `command_lock_wait_ms`, `export_reconciliation_ms` and, when reached, its wait
 for the planner to finish publishing. Only reached phases appear. `planner_ms` includes executor
 queueing and result delivery. Additional `planner_queue_ms` and `planner_work_ms`
@@ -51,10 +51,11 @@ alone keeps fresh, unchanged settings eligible for reuse when no command or
 restoration remains unresolved. These settled polls also leave queued plans
 current. A fresh readback after an outage or stale period, a settings change,
 and readbacks for pending commands or restorations still request a fresh plan.
-Startup validation and
-activation wait for the shared reconciliation before planning. If an operator
-enables Automatic Control while the option-triggered plan is still provisional,
-preflight checks a fresh plan with reconciled Export Limit evidence. Disabled
+Startup validation and activation wait for shared reconciliation within their
+own refresh, after weather collection. The Automatic Control switch and Arm
+Production Control button and service use that path when their plan is
+provisional. Preflight checks the evidence
+again under the planner lock and can retry once if it changed while queued. Disabled
 Export Limit mappings with no retained ownership use the normal fingerprint
 shortcut. A provisional
 plan does not count toward the dry-run arming requirement. If feedback or the

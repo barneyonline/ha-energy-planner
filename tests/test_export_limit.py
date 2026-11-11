@@ -955,8 +955,11 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("scenario", ["pending", "completed", "completed_with_pause", "unavailable"])
-def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypatch, scenario):
+@pytest.mark.parametrize("scenario", [
+    "pending", "completed", "completed_with_pause", "competing_refresh", "competing_provisional", "weather_update",
+    "planner_lock_update", "operator_arm", "unavailable",
+])
+def test_operator_control_transition_checks_reconciled_export_plan(setup, monkeypatch, scenario):
     from unittest.mock import Mock
 
     from homeassistant.exceptions import HomeAssistantError
@@ -966,11 +969,12 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
     from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
 
     async def run():
-        opts = {**OPTIONS, CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True, "ai_enabled": False}
-        owner = _coordinator_for_runtime_services(entry_data=DATA, options=opts, hass=setup.hass)
+        opts = {**OPTIONS, CONF_PLANNER_ENABLED: scenario == "operator_arm", CONF_DRY_RUN: True, "ai_enabled": False}
+        mapping = {**DATA, "weather_entity": "weather.home"} if scenario == "weather_update" else DATA
+        owner = _coordinator_for_runtime_services(entry_data=mapping, options=opts, hass=setup.hass)
         owner.store.data["production"] = {
             "armed": False, "dry_run_ready_cycles": 3,
-            "dry_run_evidence_fingerprint": production_evidence_fingerprint(DATA, opts),
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(mapping, opts),
         }
         setup.hass.config_entries = SimpleNamespace(
             async_update_entry=lambda entry, options: setattr(entry, "options", options),
@@ -982,6 +986,7 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
         owner._schedule_debounced_refresh = Mock()
         owner._schedule_plan_execution = Mock()
         release, checked = asyncio.Event(), asyncio.Event()
+        start_competing_refresh = asyncio.Event()
         preflight_reasons = []
         if scenario == "unavailable":
             setup.states[ENTITY].state = "unavailable"
@@ -996,9 +1001,37 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
             await release.wait()
             await save_rate_limits(value)
 
-        async def refresh():
+        async def competing_refresh():
+            await start_competing_refresh.wait()
             owner.data = await owner._async_update_data()
-            if scenario.startswith("completed") and (worker := owner._export_reconcile_task) is not None:
+
+        async def weather(*args, **kwargs):
+            if scenario == "weather_update" and owner._pending_refresh_trigger == "automatic_control_preflight":
+                setup.states[ENTITY] = limit_state(1500)
+                await asyncio.sleep(0)
+            return {}, {}
+
+        competitor = asyncio.create_task(competing_refresh()) if scenario.startswith("competing_") else None
+
+        async def refresh():
+            if owner._pending_refresh_trigger == "automatic_control_preflight":
+                if competitor is not None:
+                    start_competing_refresh.set()
+                    await competitor
+                    if scenario == "competing_provisional":
+                        release.set()
+                if scenario == "planner_lock_update":
+                    await owner._planner_lock.acquire()
+
+                    def change_and_unlock():
+                        setup.states[ENTITY] = limit_state(1500)
+                        owner._planner_lock.release()
+
+                    asyncio.get_running_loop().call_soon(change_and_unlock)
+            owner.data = await owner._async_update_data()
+            if (scenario.startswith("completed") or scenario in {"competing_refresh", "planner_lock_update"}) and (
+                worker := owner._export_reconcile_task
+            ) is not None:
                 release.set()
                 await worker
 
@@ -1009,6 +1042,7 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
 
         owner.store.async_save_command_rate_limits = wait_then_save_rate_limits
         owner.async_refresh = owner.async_request_refresh = refresh
+        owner._async_weather_forecast = weather
         monkeypatch.setattr(module, "build_preflight_report", preflight)
         monkeypatch.setattr(module, "InputManager", lambda hass, data, options, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {},
@@ -1016,9 +1050,15 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
             retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
             forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
         ))
-        enable = asyncio.create_task(owner.async_set_active_control(True))
+        if scenario == "operator_arm":
+            owner._mark_forced_refresh("state_change")
+            await refresh()
+            enable = asyncio.create_task(owner.async_operator_arm_production_control())
+        else:
+            enable = asyncio.create_task(owner.async_set_active_control(True))
         await asyncio.wait_for(checked.wait(), 1)
-        release.set()
+        if scenario != "competing_provisional":
+            release.set()
         try:
             if scenario == "unavailable":
                 with pytest.raises(HomeAssistantError, match="Automatic control is not ready"):
@@ -1032,7 +1072,8 @@ def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypat
             "external_export_limit_conflict" if scenario == "completed_with_pause" else "export_reconciliation_pending",
             "export_limit_entity_unavailable" if scenario == "unavailable" else None,
         ]
-        assert owner.active_control is (scenario != "unavailable")
+        assert owner.store.data["production"]["armed"] is (scenario != "unavailable")
+        assert owner.active_control is (scenario not in {"operator_arm", "unavailable"})
         assert not setup.calls
 
     asyncio.run(run())

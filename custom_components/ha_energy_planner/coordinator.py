@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -213,6 +214,9 @@ from .weather import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_EXPORT_PREFLIGHT_REFRESH: ContextVar[tuple[EnergyPlannerCoordinator, asyncio.Task[Any] | None] | None] = ContextVar(
+    "export_preflight_refresh", default=None,
+)
 
 
 EV_AUTO_START_COMPENSATION_RETRY_SECONDS = 30
@@ -462,7 +466,6 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._load_recovery_ready = asyncio.Event()
         self._load_recovery_pending = False
         self._startup_auto_recovery_validation_active = False
-        self._startup_auto_recovery_activation_active = False
         self._last_startup_auto_recovery_validation: dict[str, Any] | None = None
         self.last_refresh_metadata: dict[str, Any] = {}
         super().__init__(
@@ -1359,15 +1362,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._refresh_trigger_counts = trigger_counts
         try:
             timing.stage("export_admission_ms")
-            if getattr(self, "entry", None) is not None:
-                if (getattr(self, "_startup_auto_recovery_validation_active", False)
-                        or getattr(self, "_startup_auto_recovery_activation_active", False)):
-                    timing.stage("startup_export_wait_ms")
-                    await self._async_prepare_export_reconciliation_for_preflight()
-                else:
-                    self._admit_export_reconciliation()
+            has_entry = getattr(self, "entry", None) is not None
+            wait_for_export = has_entry and (
+                getattr(self, "_startup_auto_recovery_validation_active", False)
+                or _EXPORT_PREFLIGHT_REFRESH.get() == (self, asyncio.current_task())
+            )
+            if wait_for_export:
+                # An earlier refresh can consume the shared force flag while
+                # this direct refresh waits for the coordinator lock.
+                self._force_next_refresh = True
+            elif has_entry:
+                self._admit_export_reconciliation()
+            retried_export_preflight = False
             while True:
                 prepared_weather = None
+                preflight_export = None
                 if (
                     not getattr(self, "_tearing_down", False)
                     and getattr(self, "entry", None) is not None
@@ -1375,6 +1384,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 ):
                     timing.stage("weather_ms")
                     prepared_weather = await self._async_prepare_weather_forecast()
+                if wait_for_export:
+                    timing.stage("export_preflight_wait_ms")
+                    await self._async_prepare_export_reconciliation_for_preflight()
+                    preflight_export = self._export_reconciled_for
                 timing.stage("planner_lock_wait_ms")
                 async with self._planner_lock:
                     timing.stage("inputs_ms")
@@ -1393,11 +1406,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         CONF_WEATHER
                     ):
                         continue
-                    if getattr(self, "_export_reconciled_for", None) is not None:
-                        # Weather and planner-lock waits may outlive the settled
-                        # inputs. Recheck before using the result for this plan.
-                        self._admit_export_reconciliation()
+                    if preflight_export is not None or getattr(self, "_export_reconciled_for", None) is not None:
+                        # Planner-lock waits may outlive even the evidence just
+                        # checked by preflight. Give that refresh one retry.
+                        retry_preflight = wait_for_export and not retried_export_preflight
+                        task = self._admit_export_reconciliation(schedule_followup=not retry_preflight)
                         self._export_reconciled_for = None
+                        if retry_preflight and task is not None:
+                            retried_export_preflight = True
+                            continue
                     try:
                         async with self.store.async_delay_save():
                             try:
@@ -1469,6 +1486,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ) and (prepared_force or not force):
                 return forecast, details
         return await self._async_weather_forecast(entry_data, options, now=now, force=force)
+
+    async def _async_refresh_with_export_preflight(self, trigger: str) -> None:
+        """Require settled export evidence in this direct coordinator refresh."""
+        token = _EXPORT_PREFLIGHT_REFRESH.set((self, asyncio.current_task()))
+        try:
+            self._mark_forced_refresh(trigger)
+            await self.async_refresh()
+        finally:
+            _EXPORT_PREFLIGHT_REFRESH.reset(token)
 
     async def _async_prepare_export_reconciliation_for_preflight(self) -> None:
         """Settle export evidence before validating a control transition."""
@@ -2793,7 +2819,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         reason: str = "user_acknowledged",
     ) -> None:
         """Apply an explicit operator arm only after current safety validation."""
-        report = build_preflight_report(self.hass, self)
+        report = await self._async_operator_control_preflight()
         if not report.get("safe_to_activate_now"):
             rejection_reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2846,22 +2872,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 translation_key="active_control_no_device_selected",
             )
 
-        report = build_preflight_report(self.hass, self)
-        if (
-            not report.get("safe_to_activate_now")
-            and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
-            and (
-                getattr(self, "_export_reconcile_pending", False)
-                or (self.data is not None
-                    and self.data.control_area_health.get(EXPORT_ASSET, {}).get("reconciliation_pending"))
-            )
-        ):
-            # The option-triggered refresh can publish a provisional plan
-            # before reconciliation or its scheduled follow-up finishes.
-            await self._async_prepare_export_reconciliation_for_preflight()
-            self._mark_forced_refresh("automatic_control_preflight")
-            await self.async_refresh()
-            report = build_preflight_report(self.hass, self)
+        report = await self._async_operator_control_preflight()
         if not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2877,6 +2888,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
         await self._async_compensate_ev_auto_start(require_unowned=False)
+
+    async def _async_operator_control_preflight(self) -> dict[str, Any]:
+        """Recheck operator readiness if the current export plan is provisional."""
+        report = build_preflight_report(self.hass, self)
+        if (
+            not report.get("safe_to_activate_now")
+            and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+            and (
+                getattr(self, "_export_reconcile_pending", False)
+                or (self.data is not None
+                    and self.data.control_area_health.get(EXPORT_ASSET, {}).get("reconciliation_pending"))
+            )
+        ):
+            await self._async_refresh_with_export_preflight("automatic_control_preflight")
+            report = build_preflight_report(self.hass, self)
+        return report
 
     async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
         """Enable or safely restore exactly one device control area."""
