@@ -57,6 +57,18 @@ def coordinator_for_timing():
     return coordinator
 
 
+def test_startup_refresh_without_export_does_not_wait_for_command_lock():
+    async def scenario():
+        owner = coordinator_for_timing()
+        owner._startup_auto_recovery_validation_active = True
+        async with owner._command_lock:
+            plan = await asyncio.wait_for(owner._async_update_data(), 1)
+        assert plan.plan_id == "timed"
+        assert not getattr(owner, "_export_reconcile_pending", False)
+
+    asyncio.run(scenario())
+
+
 def test_weather_is_prepared_before_planner_lock() -> None:
     async def scenario() -> None:
         coordinator = coordinator_for_timing()
@@ -648,6 +660,38 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
         assert coordinator.refresh_requested == 1
         assert coordinator.refresh_metrics["requested"] == 1
         assert coordinator.refresh_metrics.get("coalesced", 0) == int(already_scheduled)
+    asyncio.run(scenario())
+
+
+def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_timer(monkeypatch):
+    async def scenario():
+        owner = coordinator_for_timing()
+        del owner._schedule_debounced_refresh
+        owner.entry.data["enphase_export_limit_entity"] = "select.export"
+        owner._listener_tasks = set()
+        owner.async_request_refresh = owner._async_update_data
+        reconcile = AsyncMock()
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        timers = []
+        cancelled = []
+
+        def schedule(hass, delay, callback):
+            timers.append(callback)
+            return lambda: cancelled.append(callback)
+
+        monkeypatch.setattr(coordinator_module, "async_call_later", schedule)
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        completion = timers[-1]
+        owner._schedule_debounced_refresh("state_change")
+        assert completion in cancelled
+        timers[-1](None)
+        await asyncio.gather(*owner._listener_tasks)
+        assert owner.last_refresh_metadata["trigger"] == "state_change"
+        assert not owner._export_reconcile_pending
+        assert owner._export_reconcile_task is None
+        reconcile.assert_awaited_once()
+
     asyncio.run(scenario())
 
 

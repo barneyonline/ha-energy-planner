@@ -883,6 +883,70 @@ def test_export_only_preflight_discovery_and_dry_run_evidence(setup, request, ma
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("in_flight", [False, True])
+def test_export_only_startup_validation_and_activation_wait_for_reconciliation(setup, monkeypatch, in_flight):
+    from unittest.mock import Mock
+
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    async def run():
+        opts = {**OPTIONS, CONF_DRY_RUN: False, "ai_enabled": False}
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {"armed": False}
+        owner._startup_auto_recovery_validation_active = False
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        checks = []
+        first_flush = asyncio.Event()
+        release_first_flush = asyncio.Event()
+
+        async def flush():
+            # Force the reconciliation task to yield before the plan can use it.
+            validating, active = owner._startup_auto_recovery_validation_active, owner.active_control
+            if validating or active:
+                assert not owner._planner_lock.locked()
+            checks.append((validating, active))
+            if in_flight and len(checks) == 1:
+                first_flush.set()
+                await release_first_flush.wait()
+            await asyncio.sleep(0)
+
+        owner.store.async_flush = flush
+
+        async def refresh():
+            owner.data = await owner._async_update_data()
+
+        owner.async_refresh = refresh
+        monkeypatch.setattr(module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(runtime.evidence(setup.hass, DATA, opts, NOW)),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        if in_flight:
+            await owner._async_update_data()
+            await asyncio.wait_for(first_flush.wait(), 1)
+            owner._schedule_plan_execution.reset_mock()
+        validation = asyncio.create_task(owner._async_run_startup_auto_recovery_validation())
+        await asyncio.sleep(0)
+        release_first_flush.set()
+        assert await validation == (True, "validation_succeeded")
+        owner._schedule_plan_execution.assert_not_called()
+        assert await owner._async_reactivate_after_startup_recovery(3) == (True, "automatic_control_reactivated")
+        assert checks == ([(False, False)] if in_flight else []) + [(True, False), (False, True)]
+        assert owner.data.control_area_health[EXPORT_ASSET]["ready"]
+        assert owner.active_control
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
 def test_boundary_timer_and_shutdown_rebuild_fresh_plan(setup, monkeypatch):
     from test_coordinator import _coordinator_for_runtime_services
 

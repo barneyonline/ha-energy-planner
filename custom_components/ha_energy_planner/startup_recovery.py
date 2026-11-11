@@ -376,7 +376,11 @@ async def _async_reactivate_after_startup_recovery(
             refresh=False,
         )
         self._mark_forced_refresh("startup_auto_recovery_activation")
-        await self.async_refresh()
+        self._startup_auto_recovery_activation_active = True
+        try:
+            await self.async_refresh()
+        finally:
+            self._startup_auto_recovery_activation_active = False
     except Exception:  # noqa: BLE001 - a failed activation refresh must fail closed.
         _LOGGER.exception("Startup automatic-control activation refresh failed")
         await self.async_disarm_production_control("startup_auto_recovery_replan_failed")

@@ -18,7 +18,8 @@ Diagnostics under `refresh_performance.latest` and the sensor attributes expose:
 
 Refresh phases are `export_admission_ms`, `planner_lock_wait_ms`, `inputs_ms`, `planner_ms`, `post_plan_ms`,
 `storage_flush_ms`, `post_refresh_ms` and `unattributed_ms` (residual setup and
-accounting work). The background export transaction separately reports
+accounting work). Startup validation and activation can also report
+`startup_export_wait_ms`. The background export transaction separately reports
 `command_lock_wait_ms`, `export_reconciliation_ms` and, when reached, its wait
 for the planner to finish publishing. Only reached phases appear. `planner_ms` includes executor
 queueing and result delivery. Additional `planner_queue_ms` and `planner_work_ms`
@@ -42,8 +43,11 @@ continue input collection and planning, with export readiness marked
 `export_reconciliation_pending`. Pending refreshes cannot use the fingerprint
 shortcut. Device execution checks the gate under the command lock; while it is
 closed, a current planned HVAC release is eligible. Stable reconciliation
-invalidates the earlier plan and requests one coalesced fresh refresh. The
-earlier plan does not count toward the dry-run arming requirement. Failure,
+invalidates the earlier plan and requests one coalesced fresh refresh. The next
+plan can use the settled result once while the export inputs still match, even
+if a telemetry event replaced the scheduled refresh. Startup validation and
+activation wait for the shared reconciliation before planning. A provisional
+plan does not count toward the dry-run arming requirement. Failure,
 cancellation or changed export feedback leaves readiness closed for a later
 input or boundary refresh. Durable pending, uncertain,
 manual-change, baseline and restoration checks remain in the export controller.

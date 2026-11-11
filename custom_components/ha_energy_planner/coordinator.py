@@ -428,7 +428,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_phase_durations: dict[str, float] = {}
         self._export_reconcile_task: asyncio.Task[None] | None = None
         self._export_reconcile_pending = False
-        self._export_reconciled_for: tuple[int, tuple[Any, ...] | None] | None = None
+        self._export_reconciled_for: tuple[Any, ...] | None = None
         self._last_export_reconciliation: dict[str, Any] = {}
         self._refresh_request_timing: tuple[str, float, asyncio.Task[Any] | None] | None = None
         self._debounce_requested_at: float | None = None
@@ -449,6 +449,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._load_recovery_ready = asyncio.Event()
         self._load_recovery_pending = False
         self._startup_auto_recovery_validation_active = False
+        self._startup_auto_recovery_activation_active = False
         self._last_startup_auto_recovery_validation: dict[str, Any] | None = None
         self.last_refresh_metadata: dict[str, Any] = {}
         super().__init__(
@@ -1234,6 +1235,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def due(_now: Any) -> None:
             self._export_boundary_cancel = None
+            # A tariff/cooldown boundary can make a deferred restore actionable
+            # even when the gateway's feedback has not changed.
+            self._export_reconciled_for = None
             self._mark_forced_refresh("export_tariff_boundary")
             self._async_create_listener_task(self.async_request_refresh())
 
@@ -1337,18 +1341,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         trigger_counts = getattr(self, "_refresh_trigger_counts", {})
         trigger_counts[trigger] = int(trigger_counts.get(trigger, 0)) + 1
         self._refresh_trigger_counts = trigger_counts
-        reconciled_for = getattr(self, "_export_reconciled_for", None)
-        self._export_reconciled_for = None
         try:
             timing.stage("export_admission_ms")
-            # The completion refresh consumes durable export feedback once.
-            # A newer input request must reconcile again instead of inheriting
-            # the exemption; repeated I/O would otherwise create a loop.
-            if getattr(self, "entry", None) is not None and not (
-                trigger == "export_reconciled" and reconciled_for is not None
-                and reconciled_for == (self._refresh_generation, self._export_reconciliation_inputs())
-            ):
-                self._admit_export_reconciliation()
+            if getattr(self, "entry", None) is not None:
+                if (getattr(self, "_startup_auto_recovery_validation_active", False)
+                        or getattr(self, "_startup_auto_recovery_activation_active", False)):
+                    timing.stage("startup_export_wait_ms")
+                    await self._async_prepare_startup_export_reconciliation()
+                else:
+                    self._admit_export_reconciliation()
             while True:
                 prepared_weather = None
                 if (
@@ -1376,6 +1377,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         CONF_WEATHER
                     ):
                         continue
+                    if getattr(self, "_export_reconciled_for", None) is not None:
+                        # Weather and planner-lock waits may outlive the settled
+                        # inputs. Recheck before using the result for this plan.
+                        self._admit_export_reconciliation()
+                        self._export_reconciled_for = None
                     try:
                         async with self.store.async_delay_save():
                             try:
@@ -1448,31 +1454,48 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return forecast, details
         return await self._async_weather_forecast(entry_data, options, now=now, force=force)
 
-    def _admit_export_reconciliation(self) -> None:
+    async def _async_prepare_startup_export_reconciliation(self) -> None:
+        """Settle export evidence before startup inspects the committed plan."""
+        if (task := getattr(self, "_export_reconcile_task", None)) is not None:
+            # A job admitted before validation may have seen a different
+            # startup policy. Let it finish and check its evidence again.
+            await asyncio.shield(task)
+        if (task := self._admit_export_reconciliation(schedule_followup=False)) is not None:
+            await asyncio.shield(task)
+
+    def _admit_export_reconciliation(self, *, schedule_followup: bool = True) -> asyncio.Task[None] | None:
         """Keep export provider and persistence waits out of input acquisition."""
         if getattr(self, "_tearing_down", False):
-            return
-        task = getattr(self, "_export_reconcile_task", None)
+            return None
+        task: asyncio.Task[None] | None = getattr(self, "_export_reconcile_task", None)
         if task is not None and not task.done():
-            return
+            return task
+        # A different refresh trigger or planner generation can replace the
+        # completion callback without superseding the actual export evidence.
+        reconciled_for = getattr(self, "_export_reconciled_for", None)
+        if reconciled_for is not None and reconciled_for == self._export_reconciliation_inputs():
+            return None
+        self._export_reconciled_for = None
         was_pending = getattr(self, "_export_reconcile_pending", False)
         if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
             if was_pending:
                 self._mark_replan_requested(force=True)
                 self._export_reconcile_pending = False
-            return
+            return None
         # Close readiness before the job can yield. Even an idle command lock
         # does not make the transaction cheap: it can flush and call services.
         self._export_reconcile_pending = True
         # One entry-owned job queues fairly behind the current transaction.
         # It re-reads configuration/feedback only after acquiring command authority.
         task = self.entry.async_create_background_task(
-            self.hass, self._async_deferred_export_reconciliation(), f"{DOMAIN} export reconciliation",
+            self.hass, self._async_deferred_export_reconciliation(schedule_followup=schedule_followup),
+            f"{DOMAIN} export reconciliation",
             eager_start=False,
         )
         self._export_reconcile_task = task
+        return task
 
-    async def _async_deferred_export_reconciliation(self) -> None:
+    async def _async_deferred_export_reconciliation(self, *, schedule_followup: bool = True) -> None:
         """Reconcile once, then force fresh planning before allowing execution."""
         timing = RefreshTiming()
         succeeded = False
@@ -1486,10 +1509,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             async with self._planner_lock:
                 if (not getattr(self, "_tearing_down", False)
                         and observed_inputs == self._export_reconciliation_inputs()):
-                    self._schedule_debounced_refresh(
-                        "export_reconciled", debounce_seconds=0, force=True,
-                    )
-                    self._export_reconciled_for = (self._refresh_generation, observed_inputs)
+                    if schedule_followup:
+                        self._schedule_debounced_refresh("export_reconciled", debounce_seconds=0, force=True)
+                    else:
+                        self._mark_replan_requested(force=True)
+                    self._export_reconciled_for = observed_inputs
                     self._export_reconcile_pending = False
                     succeeded = True
                 # Changed feedback/configuration leaves readiness closed for
