@@ -955,6 +955,89 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("scenario", ["pending", "completed", "completed_with_pause", "unavailable"])
+def test_manual_automatic_control_checks_reconciled_export_plan(setup, monkeypatch, scenario):
+    from unittest.mock import Mock
+
+    from homeassistant.exceptions import HomeAssistantError
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
+
+    async def run():
+        opts = {**OPTIONS, CONF_PLANNER_ENABLED: False, CONF_DRY_RUN: True, "ai_enabled": False}
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {
+            "armed": False, "dry_run_ready_cycles": 3,
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(DATA, opts),
+        }
+        setup.hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, options: setattr(entry, "options", options),
+        )
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        release, checked = asyncio.Event(), asyncio.Event()
+        preflight_reasons = []
+        if scenario == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        if scenario == "completed_with_pause":
+            owner.store.data["ownership"] = {EXPORT_ASSET: {
+                "identity": runtime.target_identity(setup.hass, ENTITY), "pause": "external_export_limit_conflict",
+            }}
+
+        save_rate_limits = owner.store.async_save_command_rate_limits
+
+        async def wait_then_save_rate_limits(value):
+            await release.wait()
+            await save_rate_limits(value)
+
+        async def refresh():
+            owner.data = await owner._async_update_data()
+            if scenario.startswith("completed") and (worker := owner._export_reconcile_task) is not None:
+                release.set()
+                await worker
+
+        def preflight(hass, coordinator):
+            preflight_reasons.append(coordinator.data.control_area_health[EXPORT_ASSET]["reason"])
+            checked.set()
+            return build_preflight_report(hass, coordinator)
+
+        owner.store.async_save_command_rate_limits = wait_then_save_rate_limits
+        owner.async_refresh = owner.async_request_refresh = refresh
+        monkeypatch.setattr(module, "build_preflight_report", preflight)
+        monkeypatch.setattr(module, "InputManager", lambda hass, data, options, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(runtime.evidence(hass, data, options, NOW)),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        enable = asyncio.create_task(owner.async_set_active_control(True))
+        await asyncio.wait_for(checked.wait(), 1)
+        release.set()
+        try:
+            if scenario == "unavailable":
+                with pytest.raises(HomeAssistantError, match="Automatic control is not ready"):
+                    await enable
+            else:
+                await enable
+        finally:
+            if (worker := owner._export_reconcile_task) is not None:
+                await worker
+        assert preflight_reasons == [
+            "external_export_limit_conflict" if scenario == "completed_with_pause" else "export_reconciliation_pending",
+            "export_limit_entity_unavailable" if scenario == "unavailable" else None,
+        ]
+        assert owner.active_control is (scenario != "unavailable")
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
 def test_boundary_timer_and_shutdown_rebuild_fresh_plan(setup, monkeypatch):
     from test_coordinator import _coordinator_for_runtime_services
 
@@ -1085,7 +1168,13 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             setup.mode["value"] = "pending"
             coordinator.store.async_add_outcome = setup.store.async_add_outcome
             coordinator.store.async_flush = setup.store.async_flush
-        await coordinator._async_reconcile_export_limit()
+        if stage == "off_restore":
+            setup.hass.async_create_task = asyncio.create_task
+            worker = coordinator._admit_export_reconciliation(schedule_followup=False)
+            assert worker is not None
+            await worker
+        else:
+            await coordinator._async_reconcile_export_limit()
         if stage == "reconciliation_pending":
             coordinator._export_reconcile_pending = True
         result = await coordinator._async_update_data_locked(defer_execution=True)

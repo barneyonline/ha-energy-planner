@@ -12,13 +12,16 @@ from test_coordinator import FakeEntry, FakeHass, FakeStore, _plan
 
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner import refresh_timing as timing_module
+from custom_components.ha_energy_planner.const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
 
 
 def test_refresh_plans_while_unrelated_command_owns_lock() -> None:
     async def scenario() -> None:
         coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-        coordinator.entry = FakeEntry({"enphase_export_limit_entity": "select.export"})
+        coordinator.entry = FakeEntry(
+            {"enphase_export_limit_entity": "select.export"}, {CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True},
+        )
         coordinator.hass = FakeHass()
         coordinator.hass.async_create_task = asyncio.create_task
         coordinator.store = FakeStore()
@@ -46,10 +49,13 @@ def test_refresh_plans_while_unrelated_command_owns_lock() -> None:
     asyncio.run(scenario())
 
 
-def coordinator_for_timing():
+def coordinator_for_timing(*, export_entity=None):
     from test_coordinator import _coordinator_for_runtime_services
 
-    coordinator = _coordinator_for_runtime_services()
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={"enphase_export_limit_entity": export_entity} if export_entity else None,
+        options={CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True} if export_entity else None,
+    )
     coordinator.hass.async_create_task = asyncio.create_task
     coordinator._async_update_data_locked = AsyncMock(return_value=_plan("timed"))
     coordinator._schedule_debounced_refresh = Mock()
@@ -304,8 +310,7 @@ def test_child_task_cannot_write_parent_timing():
 @pytest.mark.parametrize("order", ["executor_first", "reconciliation_first"])
 def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, result, order):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.old"
+        coordinator = coordinator_for_timing(export_entity="select.old")
         coordinator._schedule_debounced_refresh.side_effect = (
             lambda trigger, *, debounce_seconds, force: coordinator._mark_replan_requested(force=force)
         )
@@ -384,8 +389,7 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
 
 def test_export_transaction_wait_and_work_have_separate_elapsed_timings(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
         entered = asyncio.Event()
@@ -423,8 +427,7 @@ def test_mapping_removed_after_failed_reconciliation_clears_runtime_gate():
 
 def test_shutdown_drains_deferred_reconciliation(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         reconcile = AsyncMock()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
         await coordinator._command_lock.acquire()
@@ -505,8 +508,7 @@ def test_real_pipeline_distinguishes_planner_executor_queue_work_and_delivery(mo
 
 def test_background_reconciliation_failure_does_not_pollute_refresh_timing(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         coordinator._last_phase_durations = {"old_planner_ms": 10000}
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
@@ -557,8 +559,7 @@ def test_request_age_tracks_first_coalesced_trigger(monkeypatch):
 @pytest.mark.parametrize("shutdown_during_admission", [False, True])
 def test_refresh_does_not_join_existing_waiter_on_just_released_command_lock(monkeypatch, shutdown_during_admission):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", AsyncMock())
         release_waiter = asyncio.Event()
         await coordinator._command_lock.acquire()
@@ -670,9 +671,8 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
 
 def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_timer(monkeypatch):
     async def scenario():
-        owner = coordinator_for_timing()
+        owner = coordinator_for_timing(export_entity="select.export")
         del owner._schedule_debounced_refresh
-        owner.entry.data["enphase_export_limit_entity"] = "select.export"
         owner._listener_tasks = set()
         owner.async_request_refresh = owner._async_update_data
         reconcile = AsyncMock()

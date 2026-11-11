@@ -52,7 +52,11 @@ restoration remains unresolved. These settled polls also leave queued plans
 current. A fresh readback after an outage or stale period, a settings change,
 and readbacks for pending commands or restorations still request a fresh plan.
 Startup validation and
-activation wait for the shared reconciliation before planning. A provisional
+activation wait for the shared reconciliation before planning. If an operator
+enables Automatic Control while the option-triggered plan is still provisional,
+preflight checks a fresh plan with reconciled Export Limit evidence. Disabled
+Export Limit mappings with no retained ownership use the normal fingerprint
+shortcut. A provisional
 plan does not count toward the dry-run arming requirement. If feedback or the
 cooldown boundary changed during reconciliation, one coalesced follow-up
 checks it again. Failure or cancellation leaves readiness closed until a later

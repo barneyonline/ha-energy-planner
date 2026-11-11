@@ -4607,9 +4607,14 @@ def test_material_change_detects_changed_tail_outside_fingerprint_row_cap() -> N
     assert coordinator_module._material_attributes_changed(old, new)
 
 
-@pytest.mark.parametrize("through_refresh", [False, True])
-def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: Any, through_refresh: bool) -> None:
-    coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
+@pytest.mark.parametrize("through_refresh,disabled_export_mapping", [(False, False), (True, False), (True, True)])
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
+    caplog: Any, through_refresh: bool, disabled_export_mapping: bool,
+) -> None:
+    entry_data = {"amber_import_price_entity": "sensor.price"}
+    if disabled_export_mapping:
+        entry_data["enphase_export_limit_entity"] = "sensor.export_limit"
+    coordinator = _coordinator_for_runtime_services(entry_data=entry_data)
     coordinator.data = _plan("existing")
     coordinator.data.input_issues = ["amber_import_price_entity_unavailable"]
     coordinator._last_decision_fingerprint = _decision_input_fingerprint(
@@ -4636,6 +4641,8 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: 
     if through_refresh:
         assert coordinator.last_refresh_metadata["phases"]["fingerprint_ms"] >= 0
         assert "planner_ms" not in coordinator.last_refresh_metadata["exclusive_phases_ms"]
+        assert not getattr(coordinator, "_export_reconcile_pending", False)
+        assert getattr(coordinator, "_export_reconcile_task", None) is None
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -9682,7 +9689,10 @@ def test_manual_hvac_override_refresh_and_export_resume_complete_without_command
 
 def test_export_reconciliation_does_not_hold_planner_lock_while_waiting_for_command(monkeypatch):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.hass.async_create_task = asyncio.create_task
         coordinator._schedule_debounced_refresh = Mock()
         coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
@@ -9723,7 +9733,10 @@ def test_export_reconciliation_rechecks_mapping_after_waiting_for_command(monkey
 @pytest.mark.parametrize("change", ["none", "reconfigure", "after_completion", "cancel", "fail"])
 def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_lock(monkeypatch, change):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.hass.async_create_task = asyncio.create_task
         coordinator._schedule_debounced_refresh = Mock()
         coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
@@ -9835,7 +9848,10 @@ def test_pending_export_does_not_suppress_owned_ev_safety_stop():
 @pytest.mark.parametrize("ordering", ["completion_first", "release_first", "new_input"])
 def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypatch, ordering):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.hass.async_create_task = asyncio.create_task
         monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
         started, finish = asyncio.Event(), asyncio.Event()
@@ -9886,7 +9902,10 @@ def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypat
 @pytest.mark.parametrize("stage", ["before", "queued", "inflight"])
 def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, stage):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.data = _plan("shutdown")
         reconcile = AsyncMock()
         restore = AsyncMock()

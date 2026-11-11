@@ -1363,7 +1363,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 if (getattr(self, "_startup_auto_recovery_validation_active", False)
                         or getattr(self, "_startup_auto_recovery_activation_active", False)):
                     timing.stage("startup_export_wait_ms")
-                    await self._async_prepare_startup_export_reconciliation()
+                    await self._async_prepare_export_reconciliation_for_preflight()
                 else:
                     self._admit_export_reconciliation()
             while True:
@@ -1470,8 +1470,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return forecast, details
         return await self._async_weather_forecast(entry_data, options, now=now, force=force)
 
-    async def _async_prepare_startup_export_reconciliation(self) -> None:
-        """Settle export evidence before startup inspects the committed plan."""
+    async def _async_prepare_export_reconciliation_for_preflight(self) -> None:
+        """Settle export evidence before validating a control transition."""
         if (task := getattr(self, "_export_reconcile_task", None)) is not None:
             # A job admitted before validation may have seen a different
             # startup policy. Let it finish and check its evidence again.
@@ -1493,7 +1493,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             return None
         self._export_reconciled_for = None
         was_pending = getattr(self, "_export_reconcile_pending", False)
-        if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET)
+        if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY) or (
+            self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True and not ownership
+        ):
             if was_pending:
                 self._mark_replan_requested(force=True)
                 self._export_reconcile_pending = False
@@ -1765,7 +1768,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True:
                 context.export_limit.update(ready=False, reason="export_limit_control_disabled")
             if getattr(self, "_export_reconcile_pending", False):
-                context.export_limit.update(ready=False, reason="export_reconciliation_pending")
+                context.export_limit.update(
+                    ready=False, reason="export_reconciliation_pending", reconciliation_pending=True,
+                )
             if runtime.get("pause") or runtime.get("pending") or runtime.get("restoring"):
                 context.export_limit.update(ready=False, reason=runtime.get("pause") or (
                     "export_limit_pending" if runtime.get("pending") else "export_limit_restoration_pending"))
@@ -2842,6 +2847,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
 
         report = build_preflight_report(self.hass, self)
+        if (
+            not report.get("safe_to_activate_now")
+            and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+            and (
+                getattr(self, "_export_reconcile_pending", False)
+                or (self.data is not None
+                    and self.data.control_area_health.get(EXPORT_ASSET, {}).get("reconciliation_pending"))
+            )
+        ):
+            # The option-triggered refresh can publish a provisional plan
+            # before reconciliation or its scheduled follow-up finishes.
+            await self._async_prepare_export_reconciliation_for_preflight()
+            self._mark_forced_refresh("automatic_control_preflight")
+            await self.async_refresh()
+            report = build_preflight_report(self.hass, self)
         if not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(

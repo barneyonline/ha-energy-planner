@@ -14,6 +14,7 @@
 
 - Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes.
 - Let planning continue while Export Limit reconciliation runs. Keep other device actions and EV safety stops eligible, and retry export restoration when its cooldown expires during reconciliation.
+- Check a reconciled Export Limit plan when turning on Automatic Control. Skip export reconciliation for disabled mappings with no retained ownership.
 
 ### 🔧 Improvements
 
