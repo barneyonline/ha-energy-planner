@@ -92,11 +92,19 @@ the operator. The check runs again after persistence and scheduler-guard waits.
 
 A mode-aware restoration gets one durable automatic attempt. Failure or
 interruption retains the original evidence and requests shutdown; subsequent
-retries inspect readback and can confirm an already completed restoration, but
-cannot oscillate between modes to discover or repair unknown settings.
+retries wait for available head feedback. If the head is active or a prior mode
+write is still uncertain, a retry can request shutdown with the captured
+controller and manual authority checks. Once Off is confirmed, retries use
+read-only vendor verification without renewing the scheduler guard. A separate
+unsettled command or schedule write still uses its own guard. Partial zone
+acknowledgements before shutdown do not retire targets from the set that must
+match final readback. Retries cannot select modes to discover or repair unknown
+settings.
 `hvac_zone_restore_operator_required` and `off_start_restore_operator_required`
 identify incomplete recovery; a changed registry owner reports
 `off_start_provider_identity_changed` and prevents writes to the replacement.
+An identified controller with unavailable or unusable readback reports
+`off_start_restore_waiting_for_feedback` and retains its ownership.
 Use the bounded operator handoff below if readback cannot confirm completion.
 No saved target is silently clamped, invented or discarded. Before reporting
 success, a fresh read-only vendor snapshot must confirm the original remembered

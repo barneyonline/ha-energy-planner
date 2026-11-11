@@ -16,10 +16,12 @@ Diagnostics under `refresh_performance.latest` and the sensor attributes expose:
 | `export_reconciliation_pending` | Runtime gate while command authority/reconciliation is outstanding or failed. |
 | `export_reconciliation` | Last deferred reconciliation's total, phases and success flag, separately from refresh time. |
 
-Exclusive phases are `command_lock_wait_ms`, `export_reconciliation_ms`,
-`planner_lock_wait_ms`, `inputs_ms`, `planner_ms`, `post_plan_ms`,
+Refresh phases are `export_admission_ms`, `planner_lock_wait_ms`, `inputs_ms`, `planner_ms`, `post_plan_ms`,
 `storage_flush_ms`, `post_refresh_ms` and `unattributed_ms` (residual setup and
-accounting work). Only reached phases appear. `planner_ms` includes executor
+accounting work). Startup and operator preflight refreshes can also report
+`export_preflight_wait_ms`. The background export transaction separately reports
+`command_lock_wait_ms`, `export_reconciliation_ms` and, when reached, its wait
+for the planner to finish publishing. Only reached phases appear. `planner_ms` includes executor
 queueing and result delivery. Additional `planner_queue_ms` and `planner_work_ms`
 are details inside that phase when the worker completes, not additional elapsed
 phases. If cancelled while a worker is still running, its later completion cannot
@@ -34,16 +36,37 @@ The final storage-flush phase is measured on exceptional exits too. Timings reta
 one snapshot per refresh/deferred reconciliation and the existing bounded counters;
 no raw input payloads or durable timing history are added.
 
-When the command lock is busy, one entry-owned reconciliation job queues behind
-it. Immediate admission respects older lock waiters, including the gap after
-release before a waiter resumes. A zero-deadline timeout bounds only lock
-acquisition to the current event-loop turn; reconciliation and device transactions
-are never put inside that timeout. Refreshes continue input collection and planning, with export readiness marked
+One entry-owned reconciliation job runs independently of refresh input collection,
+even when the command lock is idle. The job respects older lock waiters and
+holds command authority through any in-flight device transaction. Refreshes
+continue input collection and planning, with export readiness marked
 `export_reconciliation_pending`. Pending refreshes cannot use the fingerprint
-shortcut. Device execution checks the gate under the command lock; it cannot
-execute a plan built from unconfirmed ownership. Successful reconciliation
-invalidates those plans and requests a coalesced fresh refresh. Failures keep the
-gate closed and retry on the next normal refresh. Durable pending, uncertain,
+shortcut. Device execution checks the gate under the command lock. Export
+actions wait while it is closed. Other device actions and checks for owned EV
+safety stops remain eligible, including when only export reconciliation changed
+the plan generation. They still require the queued plan's control options to
+match current settings. Stable reconciliation requests one coalesced fresh refresh. The next
+plan can use the settled result once while the export inputs still match, even
+if a telemetry event replaced the scheduled refresh. A newer readback timestamp
+alone keeps fresh, unchanged settings eligible for reuse when no command or
+restoration remains unresolved. These settled polls also leave queued plans
+current. A fresh readback after an outage or stale period, a settings change,
+and readbacks for pending commands or restorations still request a fresh plan.
+Startup validation and activation wait for shared reconciliation within their
+own refresh, after weather collection. The Automatic Control switch and Arm
+Production Control button and service use that path when their plan is
+provisional. A newer Disable or Disarm request supersedes an earlier activation
+while preflight or arming is in progress. Preflight checks the evidence
+again under the planner lock and can retry once if it changed while queued. Disabled
+Export Limit mappings with no retained ownership use the normal fingerprint
+shortcut. A provisional
+plan does not count toward the dry-run arming requirement. If feedback or the
+cooldown boundary changed during reconciliation, one coalesced follow-up
+checks it again. An already-due export boundary gives the follow-up priority
+through coalescing. If preflight reconciliation finishes with stale evidence
+after that deadline, the follow-up waits for the coordinator lock so it can
+run after the preflight refresh. Failure or cancellation leaves readiness closed until a later
+input or boundary refresh. Durable pending, uncertain,
 manual-change, baseline and restoration checks remain in the export controller.
 The follow-up increments the requested-refresh counter only when dispatched,
 including when it coalesces with an already scheduled refresh. Export status
@@ -55,10 +78,10 @@ Configuration and feedback are read again after command acquisition. Shutdown
 stops admission and drains the job before final restoration, preserving in-flight
 command durability. No busy polling or increased refresh interval is used.
 
-Uncontended reconciliation still occurs before planning, including any necessary
-restoration and durable writes. Slow reconciliation or storage can therefore still
-lengthen that refresh, now with explicit accounting. This change targets coupling
-to an already busy unrelated command; it does not promise a maximum refresh time.
+Unchanged input saves in a planning batch no longer queue behind an existing
+Store write for a flush that the batch would defer. The refresh still waits for
+its final flush. Device work still waits for the shared command lock and for
+required durability; these changes do not impose a maximum refresh time.
 
 The controlled contention test fails on base `92b4694`: planning cannot finish
 until an unrelated command releases the lock. With this change planning finishes

@@ -439,6 +439,113 @@ def test_failed_attempt_can_finish_from_read_only_confirmed_memory(system):
     asyncio.run(run())
 
 
+def test_interrupted_off_handoff_retries_without_guard_or_memory_writes(system):
+    s = system
+
+    async def run():
+        # The baseline has the opposite open damper to the acquired plan.
+        s.hass.states.values[MAIN], s.hass.states.values[BED] = "off", "on"
+        s.publish()
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        main, zones = s.adapter.main_takeover_snapshot(), s.adapter.takeover_snapshot()[1]
+        assert (await s.adapter.async_execute(_action(s.desired))).applied
+        original = s.hass.services.async_call
+        head = "climate.head"
+
+        async def lose_feedback(domain, service, payload, **kwargs):
+            if (payload["entity_id"] == head and service == "set_hvac_mode"
+                    and payload.get("hvac_mode") == "heat"):
+                await original(domain, service, payload, **kwargs)
+                s.hass.states.values[head] = "unavailable"
+                for zone in PAIRS.values():
+                    s.hass.states.values[zone] = "unavailable"
+            else:
+                await original(domain, service, payload, **kwargs)
+
+        s.hass.services.async_call = lose_feedback
+        first = await DaikinHVACAdapter(s.hass, s.data).async_restore({}, zones, main)
+        assert first.reason == "hvac_zone_restore_operator_required"
+        assert first.saved_main_state["off_start_restore_attempted"]
+        assert first.saved_main_state[MEMORY_KEY] == main[MEMORY_KEY]
+        assert first.saved_zone_states == zones
+        s.hass.services.async_call = original
+        s.hass.services.calls.clear()
+
+        async def retry(*, guard_ok=True):
+            restarted = DaikinHVACAdapter(s.hass, s.data)
+            guard_calls = []
+
+            async def arm(**kwargs):
+                guard_calls.append(kwargs)
+                return guard_ok
+
+            restarted._async_arm_scheduler_guard = arm
+            result = await restarted.async_restore(
+                {}, first.saved_zone_states, json.loads(json.dumps(first.saved_main_state)),
+            )
+            return result, guard_calls
+
+        read_count = len(s.reads)
+        result, guards = await retry()
+        assert result.reason == "hvac_zone_restore_pending" and not guards and len(s.reads) == read_count
+        assert result.saved_main_state["zone_recovery_blocker"] == "off_start_restore_waiting_for_feedback"
+        s.hass.states.values[head] = FakeState("heat")
+        s.publish()
+        s.entry.runtime_data.last_update_success = False
+        result, guards = await retry()
+        assert result.reason == "hvac_zone_restore_pending" and not guards and len(s.reads) == read_count
+        s.entry.runtime_data.last_update_success = True
+        result, guards = await retry(guard_ok=False)
+        assert not result.applied and guards
+        assert [service for _, service, _ in s.hass.services.calls] == ["turn_off"]
+        assert s.hass.states.get(head).state == "off"
+        s.hass.services.calls.clear()
+        s.values.control["pow"] = "1"
+        result, guards = await retry()
+        assert result.reason == "hvac_zone_restore_pending" and not guards and not s.hass.services.calls
+        s.publish()
+        for _ in range(2):
+            result, guards = await retry()
+            assert not result.applied and not guards and not s.hass.services.calls
+        s.hass.states.values[MAIN], s.hass.states.values[BED] = "off", "on"
+        s.modes["cool"]["zones"][MAIN_CLIMATE] = 23
+        s.publish()
+        result, guards = await retry()
+        assert not result.applied and not guards and not s.hass.services.calls
+        s.modes["cool"]["zones"][MAIN_CLIMATE] = 24
+        s.publish()
+        result, guards = await retry()
+        assert result.applied and not guards and not s.hass.services.calls
+
+    asyncio.run(run())
+
+
+def test_off_retry_persists_new_blocker_instead_of_earlier_attempt_marker(system):
+    from test_executor import FakeStore
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    s = system
+
+    async def run():
+        await s.adapter.async_prepare_off_start(_action(s.desired))
+        main, zones = s.adapter.main_takeover_snapshot(), s.adapter.takeover_snapshot()[1]
+        main.update(off_start_restore_attempted=True, zone_recovery_blocker="off_start_restore_incomplete")
+        store = FakeStore()
+        store.data["ownership"] = {"hvac_control": {"main_state": main, "zone_states": zones}}
+        s.hass.states.values["climate.head"] = "unavailable"
+        s.entry.runtime_data.last_update_success = False
+        executor = Executor(store, hass=s.hass, entry_data=s.data)
+        outcome = await executor.async_release_hvac_control("hvac_comfort_handoff")
+        assert outcome.reason == "hvac_zone_restore_pending"
+        retained = store.data["ownership"]["hvac_control"]["main_state"]
+        assert retained["zone_recovery_blocker"] == "off_start_restore_waiting_for_feedback"
+        assert retained["off_start_restore_attempted"] and retained[MEMORY_KEY] == main[MEMORY_KEY]
+        assert not s.hass.services.calls
+
+    asyncio.run(run())
+
+
 def test_refresh_compensation_is_separate_from_lifecycle_and_survives_reload(system):
     from test_executor import FakeStore
 

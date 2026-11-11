@@ -60,6 +60,7 @@ def copy_off_start_recovery(control: dict[str, Any], current: Any) -> None:
     saved = control.get("main_state")
     latest = current.get("main_state") if isinstance(current, dict) else None
     if (isinstance(saved, dict) and isinstance(latest, dict) and saved.get("off_start_memory")
+            and not saved.get("off_start_restore_attempted")
             and saved["off_start_memory"] == latest.get("off_start_memory")
             and latest.get("off_start_restore_attempted")):
         control["main_state"] = {**saved, "off_start_restore_attempted": True,

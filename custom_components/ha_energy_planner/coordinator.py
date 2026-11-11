@@ -8,8 +8,9 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import cached_property
 from itertools import islice
@@ -120,7 +121,8 @@ from .ev_runtime import audit_evidence
 from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
 from .export_limit_cooldown import cooldown_status
-from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
+from .export_limit_cooldown import interval as export_change_interval
+from .export_limit_policy import EXPORT_ASSET, area_safe, block_time, confirmed_feedback
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .forecasts import MAX_FORECAST_SOURCE_ROWS
 from .inputs import InputManager
@@ -212,6 +214,9 @@ from .weather import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_EXPORT_PREFLIGHT_REFRESH: ContextVar[tuple[EnergyPlannerCoordinator, asyncio.Task[Any] | None] | None] = ContextVar(
+    "export_preflight_refresh", default=None,
+)
 
 
 EV_AUTO_START_COMPENSATION_RETRY_SECONDS = 30
@@ -314,6 +319,19 @@ _DECISION_INPUT_ENTITY_KEYS = frozenset(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class _ExportReconciliationInputs:
+    entity: str
+    feedback: dict[str, Any]
+    issue: str | None
+    last_readback: int | float | None
+    active_control: bool
+    enabled: bool
+    change_interval: float
+    startup_validation: bool
+    restore_deferred: bool
+
+
 class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
     """Manage planner refresh and entity state."""
 
@@ -403,6 +421,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.entry_update_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
         self._device_control_lock = asyncio.Lock()
+        self._production_arm_request: object | None = None
         self._command_lock = asyncio.Lock()
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
@@ -426,9 +445,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._last_phase_durations: dict[str, float] = {}
         self._export_reconcile_task: asyncio.Task[None] | None = None
         self._export_reconcile_pending = False
+        self._export_reconciled_for: _ExportReconciliationInputs | None = None
+        self._export_replan_generations: tuple[int, int] | None = None
+        self._export_boundary_followup_due = False
         self._last_export_reconciliation: dict[str, Any] = {}
         self._refresh_request_timing: tuple[str, float, asyncio.Task[Any] | None] | None = None
         self._debounce_requested_at: float | None = None
+        self._debounce_immediate = False
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._plan_execution_task: asyncio.Task[None] | None = None
         self._pending_plan_execution: tuple[int, EnergyPlan, DecisionContext, dict[str, Any]] | None = None
@@ -765,7 +788,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ]
             entity_id = str(event.data.get("entity_id") or "")
             if entity_id in {entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_feedback_entity}:
-                self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
+                if entity_id != export_feedback_entity or not self._only_export_readback_advanced(
+                    event.data.get("old_state"), event.data.get("new_state"), now,
+                ):
+                    self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
                 return
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
             is_hvac = is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
@@ -1158,6 +1184,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         *,
         debounce_seconds: float = DEBOUNCE_SECONDS,
         force: bool = False,
+        immediate: bool = False,
     ) -> None:
         """Coalesce repeated input changes into one coordinator refresh."""
         self._mark_replan_requested(force=force)
@@ -1166,19 +1193,27 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         else perf_counter())
         self._debounce_requested_at = requested_at
         if self._debounce_cancel is not None:
+            immediate = immediate or getattr(self, "_debounce_immediate", False)
             self._debounce_cancel()
             self._increment_refresh_counter("coalesced")
 
-        delay = max(float(debounce_seconds), self._non_manual_refresh_delay())
+        self._debounce_immediate = immediate
+        delay = 0.0 if immediate else max(float(debounce_seconds), self._non_manual_refresh_delay())
 
         async def request_refresh() -> None:
             self._refresh_request_timing = (trigger, requested_at, request_owner())
-            await self.async_request_refresh()
+            if immediate:
+                # HA's debouncer can discard its callback while another
+                # refresh owns the lock. A due deadline must wait for it.
+                await self.async_refresh()
+            else:
+                await self.async_request_refresh()
 
         @callback
         def _refresh(now: Any) -> None:
             self._debounce_cancel = None
             self._debounce_requested_at = None
+            self._debounce_immediate = False
             self._pending_refresh_trigger = trigger
             self._last_non_manual_refresh_requested_at = monotonic()
             self._increment_refresh_counter("requested")
@@ -1231,6 +1266,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         @callback
         def due(_now: Any) -> None:
             self._export_boundary_cancel = None
+            # A tariff/cooldown boundary can make a deferred restore actionable
+            # even when the gateway's feedback has not changed.
+            self._export_reconciled_for = None
+            self._export_boundary_followup_due = True
             self._mark_forced_refresh("export_tariff_boundary")
             self._async_create_listener_task(self.async_request_refresh())
 
@@ -1335,11 +1374,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         trigger_counts[trigger] = int(trigger_counts.get(trigger, 0)) + 1
         self._refresh_trigger_counts = trigger_counts
         try:
-            timing.stage("export_reconciliation_ms")
-            if getattr(self, "entry", None) is not None:
-                await self._async_admit_export_reconciliation(timing)
+            timing.stage("export_admission_ms")
+            has_entry = getattr(self, "entry", None) is not None
+            wait_for_export = has_entry and (
+                getattr(self, "_startup_auto_recovery_validation_active", False)
+                or _EXPORT_PREFLIGHT_REFRESH.get() == (self, asyncio.current_task())
+            )
+            if wait_for_export:
+                # An earlier refresh can consume the shared force flag while
+                # this direct refresh waits for the coordinator lock.
+                self._force_next_refresh = True
+            elif has_entry:
+                self._admit_export_reconciliation()
+            retried_export_preflight = False
             while True:
                 prepared_weather = None
+                preflight_export = None
                 if (
                     not getattr(self, "_tearing_down", False)
                     and getattr(self, "entry", None) is not None
@@ -1347,6 +1397,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 ):
                     timing.stage("weather_ms")
                     prepared_weather = await self._async_prepare_weather_forecast()
+                if wait_for_export:
+                    timing.stage("export_preflight_wait_ms")
+                    await self._async_prepare_export_reconciliation_for_preflight()
+                    preflight_export = self._export_reconciled_for
                 timing.stage("planner_lock_wait_ms")
                 async with self._planner_lock:
                     timing.stage("inputs_ms")
@@ -1365,6 +1419,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         CONF_WEATHER
                     ):
                         continue
+                    if preflight_export is not None or getattr(self, "_export_reconciled_for", None) is not None:
+                        # Planner-lock waits may outlive even the evidence just
+                        # checked by preflight. Give that refresh one retry.
+                        retry_preflight = wait_for_export and not retried_export_preflight
+                        task = self._admit_export_reconciliation(schedule_followup=not retry_preflight)
+                        self._export_reconciled_for = None
+                        if retry_preflight and task is not None:
+                            retried_export_preflight = True
+                            continue
                     try:
                         async with self.store.async_delay_save():
                             try:
@@ -1437,60 +1500,93 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 return forecast, details
         return await self._async_weather_forecast(entry_data, options, now=now, force=force)
 
-    async def _async_admit_export_reconciliation(self, timing: RefreshTiming) -> None:
-        """Defer a busy command queue, retaining a conservative readiness gate."""
+    async def _async_refresh_with_export_preflight(self, trigger: str) -> None:
+        """Require settled export evidence in this direct coordinator refresh."""
+        token = _EXPORT_PREFLIGHT_REFRESH.set((self, asyncio.current_task()))
+        try:
+            self._mark_forced_refresh(trigger)
+            await self.async_refresh()
+        finally:
+            _EXPORT_PREFLIGHT_REFRESH.reset(token)
+
+    async def _async_prepare_export_reconciliation_for_preflight(self) -> None:
+        """Settle export evidence before validating a control transition."""
+        if (task := getattr(self, "_export_reconcile_task", None)) is not None:
+            # A job admitted before validation may have seen a different
+            # startup policy. Let it finish and check its evidence again.
+            await asyncio.shield(task)
+        if (task := self._admit_export_reconciliation(schedule_followup=False)) is not None:
+            await asyncio.shield(task)
+
+    def _admit_export_reconciliation(self, *, schedule_followup: bool = True) -> asyncio.Task[None] | None:
+        """Keep export provider and persistence waits out of input acquisition."""
         if getattr(self, "_tearing_down", False):
-            return
-        task = getattr(self, "_export_reconcile_task", None)
+            return None
+        task: asyncio.Task[None] | None = getattr(self, "_export_reconcile_task", None)
         if task is not None and not task.done():
-            return
+            return task
+        # A different refresh trigger or planner generation can replace the
+        # completion callback without superseding the actual export evidence.
+        reconciled_for = getattr(self, "_export_reconciled_for", None)
+        if reconciled_for is not None and self._export_reconciliation_matches(reconciled_for):
+            return None
+        self._export_reconciled_for = None
         was_pending = getattr(self, "_export_reconcile_pending", False)
-        if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET)
+        if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY) or (
+            self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True and not ownership
+        ):
+            self._export_boundary_followup_due = False
             if was_pending:
                 self._mark_replan_requested(force=True)
                 self._export_reconcile_pending = False
-            return
-        # Close readiness before even a bounded acquisition can yield.
+            return None
+        # Close readiness before the job can yield. Even an idle command lock
+        # does not make the transaction cheap: it can flush and call services.
         self._export_reconcile_pending = True
-        timing.stage("command_lock_wait_ms")
-        if not self._command_lock.locked():
-            try:
-                # Lock.locked() can be false while an older waiter has priority.
-                # Bound admission to this loop turn; never time out/cancel the
-                # reconciliation transaction itself or inspect private waiters.
-                async with asyncio.timeout(0):
-                    await self._command_lock.acquire()
-            except TimeoutError:
-                if getattr(self, "_tearing_down", False):
-                    return
-            else:
-                timing.stage("export_reconciliation_ms")
-                try:
-                    await self._async_reconcile_export_limit_locked()
-                    if was_pending:
-                        self._mark_replan_requested(force=True)
-                    self._export_reconcile_pending = False
-                finally:
-                    self._command_lock.release()
-                return
         # One entry-owned job queues fairly behind the current transaction.
         # It re-reads configuration/feedback only after acquiring command authority.
-        self._export_reconcile_task = self.entry.async_create_background_task(
-            self.hass, self._async_deferred_export_reconciliation(), f"{DOMAIN} export reconciliation",
+        task = self.entry.async_create_background_task(
+            self.hass, self._async_deferred_export_reconciliation(schedule_followup=schedule_followup),
+            f"{DOMAIN} export reconciliation",
+            eager_start=False,
         )
+        self._export_reconcile_task = task
+        return task
 
-    async def _async_deferred_export_reconciliation(self) -> None:
+    async def _async_deferred_export_reconciliation(self, *, schedule_followup: bool = True) -> None:
         """Reconcile once, then force fresh planning before allowing execution."""
         timing = RefreshTiming()
         succeeded = False
         try:
-            await self._async_reconcile_export_limit(timing)
-            if not getattr(self, "_tearing_down", False):
-                # Invalidate plans built against pending ownership before the
-                # readiness gate is opened; execution checks this under its lock.
-                self._mark_replan_requested(force=True)
-                self._export_reconcile_pending = False
-                succeeded = True
+            observed_inputs = await self._async_reconcile_export_limit(timing)
+            # Never hold command authority while waiting for the planner. Let
+            # a refresh already building with the closed gate commit before
+            # invalidating it, so it cannot request another reconciliation in
+            # the middle of publishing this completion.
+            timing.stage("planner_lock_wait_ms")
+            async with self._planner_lock:
+                if not getattr(self, "_tearing_down", False):
+                    settled = self._export_reconciliation_matches(observed_inputs)
+                    # The waking refresh may have found this job in flight.
+                    # Retry changed feedback or an elapsed cooldown boundary.
+                    boundary_due = getattr(self, "_export_boundary_followup_due", False)
+                    needs_followup = schedule_followup or (boundary_due and not settled)
+                    if needs_followup or settled:
+                        previous_generation = self._refresh_generation
+                        if needs_followup:
+                            trigger = "export_reconciled" if settled else "export_reconciliation_changed"
+                            self._schedule_debounced_refresh(
+                                trigger, debounce_seconds=0, force=True, immediate=boundary_due,
+                            )
+                        else:
+                            self._mark_replan_requested(force=True)
+                        self._export_boundary_followup_due = False
+                        self._export_replan_generations = (previous_generation, self._refresh_generation)
+                    if settled:
+                        self._export_reconciled_for = observed_inputs
+                        self._export_reconcile_pending = False
+                        succeeded = True
         except Exception as error:
             _LOGGER.warning("Deferred export reconciliation failed (%s)", type(error).__name__)
             # Keep the gate closed. The next normal refresh retries, without
@@ -1500,13 +1596,60 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._export_reconcile_task = None
             if not getattr(self, "_tearing_down", False):
                 self.async_update_listeners()
-                if succeeded:
-                    self._schedule_debounced_refresh("export_reconciled", debounce_seconds=0, force=True)
 
-    async def _async_reconcile_export_limit(self, timing: RefreshTiming | None = None) -> None:
-        """Reconcile commands before acquiring the planner lock, never inside it."""
+    def _export_reconciliation_inputs(self) -> _ExportReconciliationInputs | None:
+        """Compare export authority and freshness across a deferred transaction."""
+        entity = combined_entry_data(self.entry).get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        if not entity:
+            return None
+        now = dt_util.utcnow()
+        observed, issue = export_limit_feedback(self.hass, entity, now)
+        options = self.options
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        restore_deferred = bool(ownership.get("restoring")) and cooldown_status(
+            self.store.data, observed.get("identity"), options, now,
+        ).get("deferred") is True
+        return _ExportReconciliationInputs(
+            entity, observed, issue, observed.pop("last_readback", None), self.active_control,
+            options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True, export_change_interval(options),
+            getattr(self, "_startup_auto_recovery_validation_active", False),
+            restore_deferred,
+        )
+
+    def _export_reconciliation_matches(self, settled: _ExportReconciliationInputs | None) -> bool:
+        """Allow a newer poll to corroborate unchanged, fully settled settings."""
+        current = self._export_reconciliation_inputs()
+        if settled == current:
+            return True
+        if settled is None or current is None:
+            return False
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        return (
+            settled.issue is None and current.issue is None
+            and current.feedback.get("pending") is False
+            and not ownership.get("pending") and not ownership.get("restoring")
+            and settled.last_readback is not None and current.last_readback is not None
+            and current.last_readback >= settled.last_readback
+            and settled == replace(current, last_readback=settled.last_readback)
+        )
+
+    def _only_export_readback_advanced(self, old_state: Any, new_state: Any, now: datetime) -> bool:
+        """Keep queued plans current when a poll only corroborates settled settings."""
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        if ownership.get("pending") or ownership.get("restoring"):
+            return False
+        previous, previous_issue = confirmed_feedback(old_state, now)
+        current, current_issue = confirmed_feedback(new_state, now)
+        if previous_issue is not None or current_issue is not None or current["pending"]:
+            return False
+        return current.pop("last_readback") > previous.pop("last_readback") and current == previous
+
+    async def _async_reconcile_export_limit(
+        self, timing: RefreshTiming | None = None,
+    ) -> _ExportReconciliationInputs | None:
+        """Reconcile commands without holding the planner lock."""
         if getattr(self, "_tearing_down", False):
-            return
+            return None
         entry_data = self.entry_data
         if entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
             if timing is not None:
@@ -1514,7 +1657,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             async with self._command_lock:
                 if timing is not None:
                     timing.stage("export_reconciliation_ms")
+                observed_inputs = self._export_reconciliation_inputs()
                 await self._async_reconcile_export_limit_locked()
+                return observed_inputs
+        return None
 
     async def _async_reconcile_export_limit_locked(self) -> None:
         """Re-read and durably reconcile export state under command authority."""
@@ -1667,7 +1813,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True:
                 context.export_limit.update(ready=False, reason="export_limit_control_disabled")
             if getattr(self, "_export_reconcile_pending", False):
-                context.export_limit.update(ready=False, reason="export_reconciliation_pending")
+                context.export_limit.update(
+                    ready=False, reason="export_reconciliation_pending", reconciliation_pending=True,
+                )
             if runtime.get("pause") or runtime.get("pending") or runtime.get("restoring"):
                 context.export_limit.update(ready=False, reason=runtime.get("pause") or (
                     "export_limit_pending" if runtime.get("pending") else "export_limit_restoration_pending"))
@@ -2690,7 +2838,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         reason: str = "user_acknowledged",
     ) -> None:
         """Apply an explicit operator arm only after current safety validation."""
-        report = build_preflight_report(self.hass, self)
+        request = self._production_arm_request = object()
+        report = await self._async_operator_control_preflight()
+        if self._production_arm_request is not request:
+            return
         if not report.get("safe_to_activate_now"):
             rejection_reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2705,8 +2856,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 restore_owned_state=False,
             )
         finally:
-            await self.async_arm_production_control(reason)
-            await self._async_compensate_ev_auto_start(require_unowned=False)
+            if self._production_arm_request is request:
+                await self.async_arm_production_control(reason)
+                await self._async_compensate_ev_auto_start(require_unowned=False)
 
     async def async_set_active_control(self, enabled: bool) -> None:
         """Enable or safely return from automatic device control as one operation."""
@@ -2716,6 +2868,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.options
         options[CONF_PLANNER_ENABLED] = True
         if not enabled:
+            self._production_arm_request = None
             await self.async_cancel_startup_auto_recovery("automatic_control_disabled")
             options[CONF_DRY_RUN] = True
             self.hass.config_entries.async_update_entry(self.entry, options=options)
@@ -2723,6 +2876,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.async_disarm_production_control("automatic_control_disabled")
             return
 
+        request = self._production_arm_request = object()
         options[CONF_DRY_RUN] = True
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
@@ -2743,7 +2897,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 translation_key="active_control_no_device_selected",
             )
 
-        report = build_preflight_report(self.hass, self)
+        report = await self._async_operator_control_preflight()
+        if self._production_arm_request is not request:
+            return
         if not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2754,11 +2910,29 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
 
         await self.async_arm_production_control("automatic_control_enabled")
+        if self._production_arm_request is not request:
+            return
         options = self.options
         options[CONF_DRY_RUN] = False
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
         await self._async_compensate_ev_auto_start(require_unowned=False)
+
+    async def _async_operator_control_preflight(self) -> dict[str, Any]:
+        """Recheck operator readiness if the current export plan is provisional."""
+        report = build_preflight_report(self.hass, self)
+        if (
+            not report.get("safe_to_activate_now")
+            and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+            and (
+                getattr(self, "_export_reconcile_pending", False)
+                or (self.data is not None
+                    and self.data.control_area_health.get(EXPORT_ASSET, {}).get("reconciliation_pending"))
+            )
+        ):
+            await self._async_refresh_with_export_preflight("automatic_control_preflight")
+            report = build_preflight_report(self.hass, self)
+        return report
 
     async def async_set_device_control(self, option_key: str, enabled: bool) -> None:
         """Enable or safely restore exactly one device control area."""
@@ -3007,6 +3181,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
         """Disarm production control."""
+        self._production_arm_request = None
         self._clear_ev_auto_start_compensation()
         production = parse_production_state(self.store.data.get("production")).raw
         production.update(
@@ -3040,6 +3215,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         reason: str = "user_requested",
     ) -> None:
         """Cancel startup recovery and apply an explicit operator disarm."""
+        self._production_arm_request = None
         try:
             await self.async_cancel_startup_auto_recovery(
                 "operator_disarmed",
@@ -3104,7 +3280,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
             and not violations
         )
-        if review_safe:
+        # A provisional plan and its reconciled replacement are one review
+        # cycle. Only the plan with settled export authority earns credit.
+        if review_safe and not getattr(self, "_export_reconcile_pending", False):
             evidence_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
             ready_cycles = production_state.dry_run_ready_cycles
             if production.get("dry_run_evidence_fingerprint") != evidence_fingerprint:
@@ -3280,12 +3458,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     return
                 started_generation, plan, context, options = request
                 async with self._command_lock:
-                    if (
-                        getattr(self, "_tearing_down", False)
-                        or started_generation != self._refresh_generation
-                        or getattr(self, "_export_reconcile_pending", False)
-                    ):
+                    if getattr(self, "_tearing_down", False):
                         continue
+                    superseded = started_generation != self._refresh_generation
+                    if superseded and not self._generation_changed_only_by_export_replan(started_generation):
+                        continue
+                    if superseded or getattr(self, "_export_reconcile_pending", False):
+                        # Export readiness does not change other device actions.
+                        # Even an empty action list lets the executor check for
+                        # a planner-owned EV safety stop using current evidence.
+                        plan = replace(plan, actions=[
+                            action for action in plan.actions if action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT
+                        ])
                     try:
                         await self._async_execute_plan_if_current(
                             started_generation,
@@ -3308,6 +3492,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         finally:
             self._plan_execution_task = None
 
+    def _generation_changed_only_by_export_replan(self, started_generation: int) -> bool:
+        return (started_generation, self._refresh_generation) == getattr(self, "_export_replan_generations", None)
+
     async def _async_execute_plan_if_current(
         self,
         started_generation: int,
@@ -3316,16 +3503,30 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options: dict[str, Any],
     ) -> None:
         """Execute one current plan, stopping between actions when it becomes stale."""
-        if (
-            getattr(self, "_tearing_down", False)
-            or started_generation != self._refresh_generation
-        ):
+        independent_of_export = all(action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT for action in plan.actions)
+
+        def has_current_generation() -> bool:
+            return started_generation == self._refresh_generation or (
+                independent_of_export and self._generation_changed_only_by_export_replan(started_generation)
+            )
+
+        def is_current() -> bool:
+            if not has_current_generation():
+                return False
+            # Export reconciliation can let a plan reach the command lock
+            # before an options listener has marked its generation obsolete.
+            if started_generation == self._refresh_generation and not getattr(self, "_export_reconcile_pending", False):
+                return True
+            return options == self.planner_options and has_current_generation()
+
+        if getattr(self, "_tearing_down", False) or not is_current():
             return
         await self._async_reconcile_vehicle_ownership()
-        self.executor.options = options
-        self.executor.entry_data = self.entry_data
-        if started_generation != self._refresh_generation:
+        entry_data = self.entry_data
+        if not is_current():
             return
+        self.executor.options = options
+        self.executor.entry_data = entry_data
         async def evaluate(action_plan: EnergyPlan) -> PlanAction | None:
             try:
                 return await self.executor.async_evaluate(action_plan, context)
@@ -3348,7 +3549,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     plan.plan_id,
                 )
                 break
-            if started_generation != self._refresh_generation:
+            if not is_current():
                 _LOGGER.debug(
                     "Stopping coordinated execution for obsolete plan %s from generation %s; "
                     "current generation is %s",

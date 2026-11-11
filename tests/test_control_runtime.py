@@ -1813,7 +1813,8 @@ def test_off_dry_acquisition_and_release_with_real_feedback(tmp_path, monkeypatc
                   CONF_CLIMATE_MANUAL_OVERRIDE: "input_boolean.operator_hold"}
         hass.states.async_set("input_boolean.operator_hold", "off")
         monkeypatch.setattr(
-            daikin_memory, "provider", lambda *args: (vendor, {MAIN_CLIMATE: 0, BED_CLIMATE: 1}, "core-daikin")
+            daikin_memory, "provider",
+            lambda *args, **kwargs: (vendor, {MAIN_CLIMATE: 0, BED_CLIMATE: 1}, "core-daikin"),
         )
         monkeypatch.setattr(daikin_memory, "read_topology", lambda *args: zone_control.topology(config))
         monkeypatch.setattr(zone_control, "read_topology", lambda *args: zone_control.topology(config))

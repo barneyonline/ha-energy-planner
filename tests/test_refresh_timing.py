@@ -12,13 +12,16 @@ from test_coordinator import FakeEntry, FakeHass, FakeStore, _plan
 
 from custom_components.ha_energy_planner import coordinator as coordinator_module
 from custom_components.ha_energy_planner import refresh_timing as timing_module
+from custom_components.ha_energy_planner.const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED
 from custom_components.ha_energy_planner.coordinator import EnergyPlannerCoordinator
 
 
 def test_refresh_plans_while_unrelated_command_owns_lock() -> None:
     async def scenario() -> None:
         coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
-        coordinator.entry = FakeEntry({"enphase_export_limit_entity": "select.export"})
+        coordinator.entry = FakeEntry(
+            {"enphase_export_limit_entity": "select.export"}, {CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True},
+        )
         coordinator.hass = FakeHass()
         coordinator.hass.async_create_task = asyncio.create_task
         coordinator.store = FakeStore()
@@ -46,15 +49,30 @@ def test_refresh_plans_while_unrelated_command_owns_lock() -> None:
     asyncio.run(scenario())
 
 
-def coordinator_for_timing():
+def coordinator_for_timing(*, export_entity=None):
     from test_coordinator import _coordinator_for_runtime_services
 
-    coordinator = _coordinator_for_runtime_services()
+    coordinator = _coordinator_for_runtime_services(
+        entry_data={"enphase_export_limit_entity": export_entity} if export_entity else None,
+        options={CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED: True} if export_entity else None,
+    )
     coordinator.hass.async_create_task = asyncio.create_task
     coordinator._async_update_data_locked = AsyncMock(return_value=_plan("timed"))
     coordinator._schedule_debounced_refresh = Mock()
     coordinator.async_update_listeners = Mock()
     return coordinator
+
+
+def test_startup_refresh_without_export_does_not_wait_for_command_lock():
+    async def scenario():
+        owner = coordinator_for_timing()
+        owner._startup_auto_recovery_validation_active = True
+        async with owner._command_lock:
+            plan = await asyncio.wait_for(owner._async_update_data(), 1)
+        assert plan.plan_id == "timed"
+        assert not getattr(owner, "_export_reconcile_pending", False)
+
+    asyncio.run(scenario())
 
 
 def test_weather_is_prepared_before_planner_lock() -> None:
@@ -292,8 +310,10 @@ def test_child_task_cannot_write_parent_timing():
 @pytest.mark.parametrize("order", ["executor_first", "reconciliation_first"])
 def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, result, order):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.old"
+        coordinator = coordinator_for_timing(export_entity="select.old")
+        coordinator._schedule_debounced_refresh.side_effect = (
+            lambda trigger, *, debounce_seconds, force, immediate: coordinator._mark_replan_requested(force=force)
+        )
         reconcile = AsyncMock()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
         coordinator._async_execute_plan_if_current = AsyncMock()
@@ -333,13 +353,19 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
         else:
             await worker
         await executor
-        coordinator._async_execute_plan_if_current.assert_not_awaited()
+        execute = coordinator._async_execute_plan_if_current
+        if result == "shutdown":
+            execute.assert_not_awaited()
+        else:
+            execute.assert_awaited_once()
+            assert execute.await_args.args[1].actions == []
         assert coordinator._export_reconcile_task is None
         if result in {"failure", "cancel"}:
             assert coordinator._export_reconcile_pending is True
             coordinator._schedule_debounced_refresh.assert_not_called()
             reconcile.side_effect = None
             await coordinator._async_update_data()
+            await coordinator._export_reconcile_task
             assert coordinator._export_reconcile_pending is False
         elif result == "shutdown":
             reconcile.assert_not_awaited()
@@ -348,23 +374,22 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
             assert coordinator._export_reconcile_pending is False
             assert coordinator._refresh_generation == 1
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciled", debounce_seconds=0, force=True)
+                "export_reconciled", debounce_seconds=0, force=True, immediate=False)
             assert reconcile.await_count == (0 if result == "mapping_removed" else 1)
         assert coordinator._last_export_reconciliation["duration_ms"] >= 0
         if result == "success":
-            # Exactly one current plan can execute after reconciliation and
-            # fresh planning; stale/pending-era work was dropped above.
-            coordinator._pending_plan_execution = (coordinator._refresh_generation, _plan("fresh"), object(), {})
+            # The settled plan uses the ordinary execution path.
+            fresh = _plan("fresh")
+            coordinator._pending_plan_execution = (coordinator._refresh_generation, fresh, object(), {})
             await coordinator._async_drain_plan_execution()
-            coordinator._async_execute_plan_if_current.assert_awaited_once()
+            assert execute.await_args.args[1] is fresh
 
     asyncio.run(scenario())
 
 
-def test_inline_reconciliation_wait_and_work_have_separate_elapsed_timings(monkeypatch):
+def test_export_transaction_wait_and_work_have_separate_elapsed_timings(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
         entered = asyncio.Event()
@@ -402,8 +427,7 @@ def test_mapping_removed_after_failed_reconciliation_clears_runtime_gate():
 
 def test_shutdown_drains_deferred_reconciliation(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         reconcile = AsyncMock()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
         await coordinator._command_lock.acquire()
@@ -482,10 +506,9 @@ def test_real_pipeline_distinguishes_planner_executor_queue_work_and_delivery(mo
     asyncio.run(scenario())
 
 
-def test_inline_reconciliation_failure_reports_only_this_refresh(monkeypatch):
+def test_background_reconciliation_failure_does_not_pollute_refresh_timing(monkeypatch):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         coordinator._last_phase_durations = {"old_planner_ms": 10000}
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
@@ -495,13 +518,16 @@ def test_inline_reconciliation_failure_reports_only_this_refresh(monkeypatch):
             raise OSError("reconciliation persistence failed")
 
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", fail)
-        with pytest.raises(OSError):
-            await coordinator._async_update_data()
+        await coordinator._async_update_data()
         latest = coordinator.last_refresh_metadata
-        assert latest["succeeded"] is False
-        assert latest["exclusive_phases_ms"]["export_reconciliation_ms"] == 4000
+        assert latest["succeeded"] is True
+        assert latest["duration_ms"] == 0
         assert "old_planner_ms" not in latest["phases"]
-        assert "inputs_ms" not in latest["phases"]
+        assert "inputs_ms" in latest["phases"]
+        await coordinator._export_reconcile_task
+        assert coordinator.last_refresh_metadata == latest
+        assert coordinator._last_export_reconciliation["succeeded"] is False
+        assert coordinator._last_export_reconciliation["exclusive_phases_ms"]["export_reconciliation_ms"] == 4000
         assert coordinator._export_reconcile_pending is True
         assert timing_module.CURRENT_REFRESH.get() is None
     asyncio.run(scenario())
@@ -533,8 +559,7 @@ def test_request_age_tracks_first_coalesced_trigger(monkeypatch):
 @pytest.mark.parametrize("shutdown_during_admission", [False, True])
 def test_refresh_does_not_join_existing_waiter_on_just_released_command_lock(monkeypatch, shutdown_during_admission):
     async def scenario():
-        coordinator = coordinator_for_timing()
-        coordinator.entry.data["enphase_export_limit_entity"] = "select.export"
+        coordinator = coordinator_for_timing(export_entity="select.export")
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", AsyncMock())
         release_waiter = asyncio.Event()
         await coordinator._command_lock.acquire()
@@ -631,7 +656,7 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
         if already_scheduled:
             coordinator._schedule_debounced_refresh("state_change")
         generation = coordinator._refresh_generation
-        coordinator._async_reconcile_export_limit = AsyncMock()
+        coordinator._async_reconcile_export_limit = AsyncMock(return_value=None)
         coordinator._export_reconcile_pending = True
         await coordinator._async_deferred_export_reconciliation()
         assert coordinator._refresh_generation > generation
@@ -641,6 +666,37 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
         assert coordinator.refresh_requested == 1
         assert coordinator.refresh_metrics["requested"] == 1
         assert coordinator.refresh_metrics.get("coalesced", 0) == int(already_scheduled)
+    asyncio.run(scenario())
+
+
+def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_timer(monkeypatch):
+    async def scenario():
+        owner = coordinator_for_timing(export_entity="select.export")
+        del owner._schedule_debounced_refresh
+        owner._listener_tasks = set()
+        owner.async_request_refresh = owner._async_update_data
+        reconcile = AsyncMock()
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        timers = []
+        cancelled = []
+
+        def schedule(hass, delay, callback):
+            timers.append(callback)
+            return lambda: cancelled.append(callback)
+
+        monkeypatch.setattr(coordinator_module, "async_call_later", schedule)
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        completion = timers[-1]
+        owner._schedule_debounced_refresh("state_change")
+        assert completion in cancelled
+        timers[-1](None)
+        await asyncio.gather(*owner._listener_tasks)
+        assert owner.last_refresh_metadata["trigger"] == "state_change"
+        assert not owner._export_reconcile_pending
+        assert owner._export_reconcile_task is None
+        reconcile.assert_awaited_once()
+
     asyncio.run(scenario())
 
 

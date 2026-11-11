@@ -31,6 +31,7 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     # A refresh task may already be queued even after its timer/listener is
     # cancelled. Suppress its eventual commit until setup is resumed.
     self._tearing_down = True
+    self._production_arm_request = None
     if "history_training" in self.__dict__:
         self.history_training.stop()
     cancel_deferred_notifications_for_entry(
@@ -58,6 +59,7 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     if export_cancel is not None:
         export_cancel()
         self._export_boundary_cancel = None
+    self._export_boundary_followup_due = False
     ai_task = getattr(self, "_ai_advice_task", None)
     if ai_task is not None and not ai_task.done():
         ai_task.cancel()

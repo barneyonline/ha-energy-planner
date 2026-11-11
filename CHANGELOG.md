@@ -13,6 +13,10 @@
 ### 🐛 Bug fixes
 
 - Send EV stops promptly when charging feedback shows active charging and the charger switch still reports Off.
+- Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes.
+- Let planning continue while Export Limit reconciliation runs. Keep other device actions and EV safety stops eligible, and retry export restoration when its cooldown expires during reconciliation.
+- Check a reconciled Export Limit plan when turning on Automatic Control or arming production control. Skip export reconciliation for disabled mappings with no retained ownership.
+- Keep production control stopped when an older Enable or Arm request finishes after a newer Disable or Disarm request.
 
 ### 🔧 Improvements
 

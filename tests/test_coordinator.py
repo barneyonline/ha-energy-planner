@@ -996,7 +996,7 @@ class FakeEntry:
     title: str = "Energy Planner"
 
     def async_create_background_task(
-        self, hass: object, coroutine: object, name: str
+        self, hass: object, coroutine: object, name: str, eager_start: bool = True,
     ) -> object:
         """Create background work through the test Home Assistant instance."""
         return hass.async_create_task(coroutine)
@@ -4607,9 +4607,14 @@ def test_material_change_detects_changed_tail_outside_fingerprint_row_cap() -> N
     assert coordinator_module._material_attributes_changed(old, new)
 
 
-@pytest.mark.parametrize("through_refresh", [False, True])
-def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: Any, through_refresh: bool) -> None:
-    coordinator = _coordinator_for_runtime_services(entry_data={"amber_import_price_entity": "sensor.price"})
+@pytest.mark.parametrize("through_refresh,disabled_export_mapping", [(False, False), (True, False), (True, True)])
+def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
+    caplog: Any, through_refresh: bool, disabled_export_mapping: bool,
+) -> None:
+    entry_data = {"amber_import_price_entity": "sensor.price"}
+    if disabled_export_mapping:
+        entry_data["enphase_export_limit_entity"] = "sensor.export_limit"
+    coordinator = _coordinator_for_runtime_services(entry_data=entry_data)
     coordinator.data = _plan("existing")
     coordinator.data.input_issues = ["amber_import_price_entity_unavailable"]
     coordinator._last_decision_fingerprint = _decision_input_fingerprint(
@@ -4636,6 +4641,8 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(caplog: 
     if through_refresh:
         assert coordinator.last_refresh_metadata["phases"]["fingerprint_ms"] >= 0
         assert "planner_ms" not in coordinator.last_refresh_metadata["exclusive_phases_ms"]
+        assert not getattr(coordinator, "_export_reconcile_pending", False)
+        assert getattr(coordinator, "_export_reconcile_task", None) is None
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -6718,6 +6725,9 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
     unsafe = _plan("unsafe")
     unsafe.health = InputHealth.UNSAFE
 
+    coordinator._export_reconcile_pending = True
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    coordinator._export_reconcile_pending = False
     asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
     asyncio.run(coordinator._async_record_dry_run_comparison(dry_run))
     asyncio.run(coordinator._async_update_production_evidence(unsafe, []))
@@ -7477,6 +7487,54 @@ def test_operator_arm_rejects_stale_evidence_without_cancelling_recovery(
     assert production["startup_auto_recovery"]["status"] == "waiting_for_safe"
     assert coordinator._startup_auto_recovery_authorized is True
     assert coordinator.executor.startup_recovery_dismissals == 0
+
+
+@pytest.mark.parametrize("wait_at", ["startup_cancellation", "arming_save"])
+def test_operator_disarm_wins_after_arming_preflight_has_passed(monkeypatch, wait_at):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(options={
+            CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: True, CONF_EV_CONTROL_ENABLED: True,
+        })
+        coordinator.hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, options: setattr(entry, "options", options),
+        )
+        monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda *args: {"safe_to_activate_now": True})
+        coordinator._async_compensate_ev_auto_start = AsyncMock()
+        paused, resume = asyncio.Event(), asyncio.Event()
+        cancel_startup = coordinator.async_cancel_startup_auto_recovery
+        save_production = coordinator._async_save_production
+
+        async def wait_before_cancel(reason, **kwargs):
+            if reason == "operator_armed":
+                paused.set()
+                await resume.wait()
+            await cancel_startup(reason, **kwargs)
+
+        async def wait_after_save(production):
+            await save_production(production)
+            if production.get("armed"):
+                paused.set()
+                await resume.wait()
+
+        if wait_at == "startup_cancellation":
+            coordinator.async_cancel_startup_auto_recovery = wait_before_cancel
+            arm = asyncio.create_task(coordinator.async_operator_arm_production_control())
+        else:
+            coordinator._async_save_production = wait_after_save
+            arm = asyncio.create_task(coordinator.async_set_active_control(True))
+        try:
+            await asyncio.wait_for(paused.wait(), 1)
+            await coordinator.async_operator_disarm_production_control("later_stop")
+        finally:
+            resume.set()
+            await arm
+
+        assert coordinator.store.data["production"]["armed"] is False
+        assert coordinator.store.data["production"]["disarmed_reason"] == "later_stop"
+        assert coordinator.dry_run
+        coordinator._async_compensate_ev_auto_start.assert_not_awaited()
+
+    asyncio.run(run())
 
 
 def test_home_assistant_shutdown_preserves_persisted_recovery_state() -> None:
@@ -9679,7 +9737,10 @@ def test_manual_hvac_override_refresh_and_export_resume_complete_without_command
 
 def test_export_reconciliation_does_not_hold_planner_lock_while_waiting_for_command(monkeypatch):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.hass.async_create_task = asyncio.create_task
         coordinator._schedule_debounced_refresh = Mock()
         coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
@@ -9717,10 +9778,201 @@ def test_export_reconciliation_rechecks_mapping_after_waiting_for_command(monkey
 
 
 
+@pytest.mark.parametrize("change", ["none", "reconfigure", "after_completion", "cancel", "fail"])
+def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_lock(monkeypatch, change):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile(_self, now):
+            started.set()
+            await finish.wait()
+            if change == "fail":
+                raise OSError("synthetic write failure")
+
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        refresh = asyncio.create_task(coordinator._async_update_data())
+        worker = None
+        try:
+            await started.wait()
+            assert (await asyncio.wait_for(asyncio.shield(refresh), 1)).plan_id == "unblocked"
+            assert coordinator._export_reconcile_pending
+            worker = coordinator._export_reconcile_task
+            await coordinator._async_update_data()
+            assert coordinator._export_reconcile_task is worker
+            if change == "reconfigure":
+                coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
+            elif change == "cancel":
+                worker.cancel()
+        finally:
+            finish.set()
+            await refresh
+            if worker is not None:
+                await asyncio.gather(worker, return_exceptions=True)
+        stable = change in {"none", "after_completion"}
+        assert coordinator._export_reconcile_pending != stable
+        assert not coordinator._command_lock.locked()
+        assert coordinator._export_reconcile_task is None
+        if stable:
+            coordinator._schedule_debounced_refresh.assert_called_once_with(
+                "export_reconciled", debounce_seconds=0, force=True, immediate=False,
+            )
+            if change == "after_completion":
+                coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
+            coordinator._pending_refresh_trigger = "export_reconciled"
+            await coordinator._async_update_data()
+            if change == "none":
+                assert coordinator._export_reconcile_task is None  # No reconciliation loop.
+            else:
+                assert coordinator._export_reconcile_pending
+                await coordinator._export_reconcile_task
+        elif change == "reconfigure":
+            coordinator._schedule_debounced_refresh.assert_called_once_with(
+                "export_reconciliation_changed", debounce_seconds=0, force=True, immediate=False,
+            )
+        else:
+            coordinator._schedule_debounced_refresh.assert_not_called()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("release_due", [False, True])
+def test_failed_export_preflight_keeps_other_device_actions_eligible(release_due):
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._export_reconcile_pending = True
+    coordinator._async_execute_plan_if_current = AsyncMock()
+    plan = _plan("release")
+    export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
+    release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+    ev = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
+    plan.actions = [export, ev, release] if release_due else [export, ev]
+    coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
+    asyncio.run(coordinator._async_drain_plan_execution())
+    execute = coordinator._async_execute_plan_if_current
+    execute.assert_awaited_once()
+    assert execute.await_args.args[1].actions == ([ev, release] if release_due else [ev])
+
+
+def test_pending_export_does_not_suppress_owned_ev_safety_stop():
+    from test_executor import FakeHass as ExecutorHass
+    from test_executor import FakeStore as ExecutorStore
+    from test_executor import _context
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    async def run():
+        now = datetime.now(UTC)
+        hass = ExecutorHass({"binary_sensor.ev_connected": "on", "input_boolean.ev_charger": "off"})
+        entry_data = {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_charger",
+            "enphase_export_limit_entity": "select.export",
+        }
+        owner = _coordinator_for_runtime_services(entry_data=entry_data, hass=hass)
+        owner.store = ExecutorStore()
+        owner.store.async_save_calendar_events = AsyncMock()
+        owner.executor = Executor(owner.store, hass=hass, entry_data=entry_data, options=owner.options)
+        context = _context(now)
+        assert (await owner.executor.async_manual_ev_charging(True, context)).applied
+        assert hass.states.values["input_boolean.ev_charger"] == "on"
+        hass.states.values["binary_sensor.ev_connected"] = "off"
+        context.ev_connected = False
+        plan = _plan("owned-stop")
+        plan.created_at = now
+        owner._export_reconcile_pending = True
+        owner._pending_plan_execution = (owner._refresh_generation, plan, context, owner.planner_options)
+        await owner._async_drain_plan_execution()
+        assert hass.states.values["input_boolean.ev_charger"] == "off"
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("ordering", [
+    "completion_first", "release_first", "new_input", "control_disabled", "control_disabled_before_completion",
+    "control_disabled_during_prepare",
+])
+def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypatch, ordering):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True, CONF_EV_CONTROL_ENABLED: True,
+                     CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+            store_data={"production": {"armed": True}},
+        )
+        coordinator.hass.async_create_task = asyncio.create_task
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile(_self, now):
+            started.set()
+            await finish.wait()
+
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        worker = coordinator._admit_export_reconciliation()
+        await asyncio.wait_for(started.wait(), 1)
+        plan = _plan("queued-release")
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: plan.created_at)
+        release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+        export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
+        disabled = ordering.startswith("control_disabled")
+        ev_start = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
+        plan.actions = [export, ev_start if disabled else release]
+        coordinator._pending_plan_execution = (
+            coordinator._refresh_generation, plan, object(), coordinator.planner_options,
+        )
+        drain = asyncio.create_task(coordinator._async_drain_plan_execution())
+        await asyncio.sleep(0)
+        assert not drain.done()  # Reconciliation still owns the command lock.
+        if ordering == "new_input":
+            coordinator._mark_replan_requested()
+        if disabled and ordering != "control_disabled_during_prepare":
+            # ConfigEntry options are published before the disable handler can
+            # take command authority and restore the device.
+            coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = False
+        if ordering == "control_disabled_before_completion":
+            async with coordinator._planner_lock:
+                finish.set()
+                await asyncio.wait_for(drain, 1)
+        elif ordering in {"release_first", "control_disabled_during_prepare"}:
+            preparing, resume = asyncio.Event(), asyncio.Event()
+
+            async def prepare_release():
+                preparing.set()
+                await resume.wait()
+
+            coordinator._async_reconcile_vehicle_ownership = prepare_release
+            async with coordinator._planner_lock:
+                # Let execution take command authority while completion is
+                # waiting to publish its result under the planner lock.
+                finish.set()
+                await asyncio.wait_for(preparing.wait(), 1)
+            await asyncio.wait_for(worker, 1)
+            if disabled:
+                coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = False
+            resume.set()
+        else:
+            finish.set()
+        await asyncio.wait_for(asyncio.gather(worker, drain), 1)
+        assert not coordinator._export_reconcile_pending
+        evaluated = [item.actions for item, _ in coordinator.executor.evaluated]
+        assert evaluated == ([] if disabled or ordering == "new_input" else [[release]])
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stage", ["before", "queued", "inflight"])
 def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, stage):
     async def run():
-        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator = _coordinator_for_runtime_services(
+            entry_data={"enphase_export_limit_entity": "select.export"},
+            options={"enphase_export_limit_control_enabled": True},
+        )
         coordinator.data = _plan("shutdown")
         reconcile = AsyncMock()
         restore = AsyncMock()
@@ -9734,8 +9986,11 @@ def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, sta
                 started.set()
                 await finish.wait()
             reconcile.side_effect = in_progress
-            task = asyncio.create_task(coordinator._async_update_data())
+            coordinator.hass.async_create_task = asyncio.create_task
+            coordinator._async_update_data_locked = AsyncMock(return_value=coordinator.data)
+            await coordinator._async_update_data()
             await started.wait()
+            task = coordinator._export_reconcile_task
             coordinator._begin_shutdown()
             shutdown = asyncio.create_task(coordinator.async_wait_for_refresh_shutdown())
             await asyncio.sleep(0)

@@ -883,6 +883,224 @@ def test_export_only_preflight_discovery_and_dry_run_evidence(setup, request, ma
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("scenario", ["settled", "in_flight", "changed_feedback"])
+def test_export_only_startup_validation_and_activation_wait_for_reconciliation(setup, monkeypatch, scenario):
+    from unittest.mock import Mock
+
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    async def run():
+        opts = {**OPTIONS, CONF_DRY_RUN: False, "ai_enabled": False}
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {"armed": False}
+        owner._startup_auto_recovery_validation_active = False
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        checks = []
+        first_flush = asyncio.Event()
+        release_first_flush = asyncio.Event()
+
+        async def flush():
+            # Force the reconciliation task to yield before the plan can use it.
+            validating, active = owner._startup_auto_recovery_validation_active, owner.active_control
+            if validating or active:
+                assert not owner._planner_lock.locked()
+            checks.append((validating, active))
+            if scenario == "in_flight" and len(checks) == 1:
+                first_flush.set()
+                await release_first_flush.wait()
+            elif scenario == "changed_feedback":
+                setup.states[ENTITY] = limit_state(0)
+            await asyncio.sleep(0)
+
+        owner.store.async_flush = flush
+
+        async def refresh():
+            owner.data = await owner._async_update_data()
+
+        owner.async_refresh = refresh
+        monkeypatch.setattr(module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(runtime.evidence(setup.hass, DATA, opts, NOW)),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        if scenario == "in_flight":
+            await owner._async_update_data()
+            await asyncio.wait_for(first_flush.wait(), 1)
+            owner._schedule_plan_execution.reset_mock()
+        validation = asyncio.create_task(owner._async_run_startup_auto_recovery_validation())
+        await asyncio.sleep(0)
+        release_first_flush.set()
+        result = await validation
+        owner._schedule_plan_execution.assert_not_called()
+        if scenario == "changed_feedback":
+            assert result[0] is False and not owner.active_control
+            assert owner._export_reconcile_pending
+            owner._schedule_debounced_refresh.assert_not_called()
+            return
+        assert result == (True, "validation_succeeded")
+        assert await owner._async_reactivate_after_startup_recovery(3) == (True, "automatic_control_reactivated")
+        assert checks == ([(False, False)] if scenario == "in_flight" else []) + [(True, False), (False, True)]
+        assert owner.data.control_area_health[EXPORT_ASSET]["ready"]
+        assert owner.active_control
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("scenario", [
+    "pending", "completed", "completed_with_pause", "competing_refresh", "competing_provisional", "weather_update",
+    "planner_lock_update", "operator_arm", "arm_then_disarm", "enable_then_disable", "unavailable",
+])
+def test_operator_control_transition_checks_reconciled_export_plan(setup, monkeypatch, scenario):
+    from unittest.mock import Mock
+
+    from homeassistant.exceptions import HomeAssistantError
+    from test_coordinator import _coordinator_for_runtime_services
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
+
+    async def run():
+        arm_only = scenario in {"operator_arm", "arm_then_disarm"}
+        stop_requested = scenario in {"arm_then_disarm", "enable_then_disable"}
+        opts = {**OPTIONS, CONF_PLANNER_ENABLED: arm_only, CONF_DRY_RUN: True, "ai_enabled": False}
+        mapping = {**DATA, "weather_entity": "weather.home"} if scenario == "weather_update" else DATA
+        owner = _coordinator_for_runtime_services(entry_data=mapping, options=opts, hass=setup.hass)
+        owner.store.data["production"] = {
+            "armed": False, "dry_run_ready_cycles": 3,
+            "dry_run_evidence_fingerprint": production_evidence_fingerprint(mapping, opts),
+        }
+        setup.hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, options: setattr(entry, "options", options),
+        )
+        setup.hass.async_create_task = asyncio.create_task
+        setup.hass.async_create_background_task = lambda coro, name: asyncio.create_task(coro)
+        setup.hass.async_add_executor_job = lambda func, *args: asyncio.to_thread(func, *args)
+        owner._schedule_export_boundary = Mock()
+        owner._schedule_debounced_refresh = Mock()
+        owner._schedule_plan_execution = Mock()
+        release, checked = asyncio.Event(), asyncio.Event()
+        stop_saved = asyncio.Event()
+        start_competing_refresh = asyncio.Event()
+        preflight_reasons = []
+        if scenario == "unavailable":
+            setup.states[ENTITY].state = "unavailable"
+        if scenario == "completed_with_pause":
+            owner.store.data["ownership"] = {EXPORT_ASSET: {
+                "identity": runtime.target_identity(setup.hass, ENTITY), "pause": "external_export_limit_conflict",
+            }}
+
+        save_rate_limits = owner.store.async_save_command_rate_limits
+        save_production = owner.store.async_save_production
+
+        async def wait_then_save_rate_limits(value):
+            await release.wait()
+            await save_rate_limits(value)
+
+        async def record_stop(production):
+            await save_production(production)
+            if production.get("disarmed_reason") and not production.get("armed"):
+                stop_saved.set()
+
+        async def competing_refresh():
+            await start_competing_refresh.wait()
+            owner.data = await owner._async_update_data()
+
+        async def weather(*args, **kwargs):
+            if scenario == "weather_update" and owner._pending_refresh_trigger == "automatic_control_preflight":
+                setup.states[ENTITY] = limit_state(1500)
+                await asyncio.sleep(0)
+            return {}, {}
+
+        competitor = asyncio.create_task(competing_refresh()) if scenario.startswith("competing_") else None
+
+        async def refresh():
+            if owner._pending_refresh_trigger == "automatic_control_preflight":
+                if competitor is not None:
+                    start_competing_refresh.set()
+                    await competitor
+                    if scenario == "competing_provisional":
+                        release.set()
+                if scenario == "planner_lock_update":
+                    await owner._planner_lock.acquire()
+
+                    def change_and_unlock():
+                        setup.states[ENTITY] = limit_state(1500)
+                        owner._planner_lock.release()
+
+                    asyncio.get_running_loop().call_soon(change_and_unlock)
+            owner.data = await owner._async_update_data()
+            if (scenario.startswith("completed") or scenario in {"competing_refresh", "planner_lock_update"}) and (
+                worker := owner._export_reconcile_task
+            ) is not None:
+                release.set()
+                await worker
+
+        def preflight(hass, coordinator):
+            preflight_reasons.append(coordinator.data.control_area_health[EXPORT_ASSET]["reason"])
+            checked.set()
+            return build_preflight_report(hass, coordinator)
+
+        owner.store.async_save_command_rate_limits = wait_then_save_rate_limits
+        owner.store.async_save_production = record_stop
+        owner.async_refresh = owner.async_request_refresh = refresh
+        owner._async_weather_forecast = weather
+        monkeypatch.setattr(module, "build_preflight_report", preflight)
+        monkeypatch.setattr(module, "InputManager", lambda hass, data, options, **kwargs: SimpleNamespace(
+            current_forecast_observations=lambda: {},
+            build_context=lambda overrides: context(runtime.evidence(hass, data, options, NOW)),
+            retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
+            forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
+        ))
+        if arm_only:
+            owner._mark_forced_refresh("state_change")
+            await refresh()
+            enable = asyncio.create_task(owner.async_operator_arm_production_control())
+        else:
+            enable = asyncio.create_task(owner.async_set_active_control(True))
+        await asyncio.wait_for(checked.wait(), 1)
+        stop = None
+        if stop_requested:
+            stop = asyncio.create_task(
+                owner.async_operator_disarm_production_control() if arm_only else owner.async_set_active_control(False)
+            )
+            await asyncio.wait_for(stop_saved.wait(), 1)
+        if scenario != "competing_provisional":
+            release.set()
+        try:
+            if scenario == "unavailable":
+                with pytest.raises(HomeAssistantError, match="Automatic control is not ready"):
+                    await enable
+            else:
+                await enable
+            if stop is not None:
+                await stop
+        finally:
+            if (worker := owner._export_reconcile_task) is not None:
+                await worker
+        assert preflight_reasons == [
+            "external_export_limit_conflict" if scenario == "completed_with_pause" else "export_reconciliation_pending",
+            "export_limit_entity_unavailable" if scenario == "unavailable" else None,
+        ]
+        armed = not stop_requested and scenario != "unavailable"
+        assert owner.store.data["production"]["armed"] is armed
+        assert owner.active_control is (armed and not arm_only)
+        if stop_requested:
+            assert owner.dry_run
+            assert all(not saved.get("armed") for saved in owner.store.production_saves)
+        assert not setup.calls
+
+    asyncio.run(run())
+
+
 def test_boundary_timer_and_shutdown_rebuild_fresh_plan(setup, monkeypatch):
     from test_coordinator import _coordinator_for_runtime_services
 
@@ -1013,7 +1231,13 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             setup.mode["value"] = "pending"
             coordinator.store.async_add_outcome = setup.store.async_add_outcome
             coordinator.store.async_flush = setup.store.async_flush
-        await coordinator._async_reconcile_export_limit()
+        if stage == "off_restore":
+            setup.hass.async_create_task = asyncio.create_task
+            worker = coordinator._admit_export_reconciliation(schedule_followup=False)
+            assert worker is not None
+            await worker
+        else:
+            await coordinator._async_reconcile_export_limit()
         if stage == "reconciliation_pending":
             coordinator._export_reconcile_pending = True
         result = await coordinator._async_update_data_locked(defer_execution=True)
@@ -1052,6 +1276,62 @@ def test_feedback_attribute_change_requests_fresh_plan(setup, monkeypatch):
     callbacks[0](FakeEvent(ENTITY, "pending", "pending"))
     assert requests[-1][0] == ("export_limit_feedback",)
     assert requests[-1][1]["force"]
+
+
+@pytest.mark.parametrize("poll", ["later", "changed_watts", "stale_recovery", "backward", "gateway_pending",
+                                  "planner_pending", "restoring"])
+def test_export_feedback_poll_keeps_queued_release_current_only_for_settled_settings(setup, monkeypatch, poll):
+    from test_coordinator import _coordinated_action, _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.models import ActionAsset
+
+    async def run():
+        callbacks = []
+        monkeypatch.setattr(module, "async_track_state_change_event", lambda hass, ids, callback: (
+            callbacks.append(callback) or (lambda: None)))
+        monkeypatch.setattr(module, "async_call_later", lambda *args: lambda: None)
+        setup.hass.async_create_task = asyncio.create_task
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        if poll in {"planner_pending", "restoring"}:
+            key = "pending" if poll == "planner_pending" else "restoring"
+            owner.store.data["ownership"] = {EXPORT_ASSET: {key: True}}
+        if poll == "stale_recovery":
+            setup.states[ENTITY] = limit_state(readback=NOW.timestamp() - 601)
+        owner.async_start_listeners()
+
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile():
+            started.set()
+            await finish.wait()
+
+        owner._async_reconcile_export_limit_locked = reconcile
+        worker = owner._admit_export_reconciliation()
+        await asyncio.wait_for(started.wait(), 1)
+        plan = _plan("queued-release-during-poll")
+        plan.created_at = NOW
+        release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+        plan.actions = [release]
+        owner._pending_plan_execution = (owner._refresh_generation, plan, object(), owner.planner_options)
+        drain = asyncio.create_task(owner._async_drain_plan_execution())
+        await asyncio.sleep(0)
+        assert not drain.done()
+
+        old = setup.states[ENTITY]
+        setup.clock["now"] += timedelta(seconds=60)
+        new = limit_state(
+            3000 if poll == "changed_watts" else None,
+            pending=poll == "gateway_pending",
+            readback=NOW.timestamp() - 1 if poll == "backward" else setup.clock["now"].timestamp(),
+        )
+        setup.states[ENTITY] = new
+        callbacks[0](SimpleNamespace(data={"entity_id": ENTITY, "old_state": old, "new_state": new}))
+        finish.set()
+        await asyncio.wait_for(asyncio.gather(worker, drain), 1)
+        assert [item.actions for item, _ in owner.executor.evaluated] == ([[release]] if poll == "later" else [])
+
+    asyncio.run(run())
 
 
 def test_independent_toggle_and_explicit_resume(setup, monkeypatch):
@@ -1828,11 +2108,12 @@ def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, 
 
 
 def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setup):
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
     from test_coordinator import _coordinator_for_runtime_services
 
     async def run():
+        setup.hass.async_create_task = asyncio.create_task
         coordinator = _coordinator_for_runtime_services(
             entry_data=DATA, options={**OPTIONS, CONF_DRY_RUN: False}, hass=setup.hass,
         )
@@ -1842,9 +2123,11 @@ def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setu
                                   "pause": "external_export_limit_conflict"})
         plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
         coordinator._async_update_data_locked = AsyncMock(return_value=plan)
+        coordinator._schedule_debounced_refresh = Mock()
         coordinator.async_request_refresh = coordinator._async_update_data
         await asyncio.wait_for(coordinator.async_resume_control(asset=EXPORT_ASSET), 1)
         await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "operator"), 1)
+        await coordinator.async_wait_for_plan_execution()
         assert coordinator.last_refresh_metadata["succeeded"] is True
         assert "pause" not in coordinator.store.data["ownership"][EXPORT_ASSET]
         assert not setup.calls
@@ -2065,10 +2348,12 @@ def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(
             assert setup.control.state["restoring"] is True
             advance_clock(setup)
             await owner._async_update_data()
+            await owner._export_reconcile_task
             assert len(setup.calls) == original_calls + 1
             assert not setup.control.state
             # An ordinary refresh after recovery must not duplicate restoration.
             await owner._async_update_data()
+            await owner._export_reconcile_task
             assert len(setup.calls) == original_calls + 1
         else:
             assert len(setup.calls) == original_calls
@@ -2078,5 +2363,167 @@ def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(
         elif change == "confirm":
             assert "pending" not in setup.control.state
             assert setup.control.state["expected"]["watts"] == 0
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("poll", ["later", "during_flush", "different_watts", "stale", "earlier", "gateway_pending",
+                                  "planner_pending", "mapping_removed"])
+def test_completed_export_reconciliation_reuses_only_fresh_settled_settings(setup, poll):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        if poll == "planner_pending":
+            await setup.control.execute(action(setup), NOW)
+            # The matching setting was read before dispatch. Only the next
+            # timestamp can confirm this command despite identical watts.
+            setup.states[ENTITY] = limit_state(0, readback=NOW.timestamp() - 1)
+        elif poll == "gateway_pending":
+            setup.states[ENTITY] = limit_state(pending=True)
+        owner = _coordinator_for_runtime_services(entry_data=dict(DATA), options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("poll"))
+
+        if poll == "during_flush":
+            async def flush():
+                advance_clock(setup, 1)
+
+            owner.store.async_flush = flush
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert not owner._export_reconcile_pending
+        if poll == "planner_pending":
+            assert setup.control.state["pending"]
+
+        if poll == "stale":
+            setup.clock["now"] += timedelta(minutes=11)
+        else:
+            advance_clock(setup, 60)
+        if poll == "different_watts":
+            setup.states[ENTITY] = limit_state(3000, readback=setup.clock["now"].timestamp())
+        elif poll == "earlier":
+            setup.states[ENTITY].attributes["last_successful_readback"] = NOW.timestamp() - 1
+        elif poll == "mapping_removed":
+            owner.entry.data.pop(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+
+        owner._mark_forced_refresh("state_change")
+        await owner._async_update_data()
+        if poll in {"later", "during_flush", "mapping_removed"}:
+            assert owner._export_reconcile_task is None
+            assert not owner._export_reconcile_pending
+        else:
+            assert owner._export_reconcile_pending
+            await owner._export_reconcile_task
+            if poll == "planner_pending":
+                assert "pending" not in setup.control.state
+                assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timer_fired,preflight", [(False, False), (True, False), (True, True)])
+def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypatch, timer_fired, preflight):
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    async def run():
+        await setup.control.execute(action(setup), NOW)
+        setup.states[ENTITY] = limit_state(0)
+        await setup.control.reconcile(NOW)
+        await setup.control.save({**setup.control.state, "restoring": True})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        refresh_lock = asyncio.Lock()
+        planning, finish_planning = asyncio.Event(), asyncio.Event()
+
+        async def plan(*, defer_execution):
+            if preflight and not planning.is_set():
+                planning.set()
+                await finish_planning.wait()
+            return _plan("cooldown")
+
+        async def refresh():
+            async with refresh_lock:
+                await owner._async_update_data()
+
+        async def request_refresh():
+            # Model Home Assistant dropping the debounced callback when its
+            # timer expires while the explicit refresh still holds the lock.
+            if not refresh_lock.locked():
+                await refresh()
+
+        owner._async_update_data_locked = plan
+        owner.async_refresh = refresh
+        owner.async_request_refresh = request_refresh
+        owner._listener_tasks = set()
+        owner._export_boundary_cancel = None
+        setup.hass.async_create_task = asyncio.create_task
+        timers = []
+        monkeypatch.setattr(module, "async_call_later", lambda hass, delay, callback: (
+            timers.append((delay, callback)) or (lambda: None)))
+        first_flush, finish = asyncio.Event(), asyncio.Event()
+
+        async def flush():
+            if not first_flush.is_set():
+                first_flush.set()
+                await finish.wait()
+            await setup.store.async_flush()
+
+        owner.store.async_flush = flush
+        boundary = NOW + timedelta(seconds=300)
+        owner._schedule_export_boundary({"deferred": True, "next_eligible_change_at": boundary.isoformat()})
+        initial_refresh = None
+        if preflight:
+            initial_refresh = asyncio.create_task(owner._async_refresh_with_export_preflight("test_preflight"))
+        else:
+            await refresh()
+        await asyncio.wait_for(first_flush.wait(), 1)
+        worker = owner._export_reconcile_task
+        assert len(setup.calls) == 1
+
+        setup.clock["now"] = boundary  # The original gateway readback is still fresh.
+        if timer_fired:
+            timers.pop()[1](None)
+            await asyncio.gather(*owner._listener_tasks)
+            assert owner._export_reconcile_task is worker
+        else:
+            # Input collection can replace a timer before its callback runs.
+            owner._schedule_export_boundary({})
+            timers.clear()
+        owner._last_non_manual_refresh_requested_at = module.monotonic()
+        finish.set()
+        await worker
+        assert owner._export_reconcile_pending
+        assert len(timers) == 1
+
+        if timer_fired:
+            assert timers[-1][0] == 0
+            owner._schedule_debounced_refresh("state_change")
+            assert timers[-1][0] == 0
+        else:
+            assert timers[-1][0] > 0
+        setup.mode["value"] = "confirm"
+        timers.pop()[1](None)
+        if initial_refresh is not None:
+            await asyncio.wait_for(planning.wait(), 1)
+            await asyncio.sleep(0)
+            assert owner._listener_tasks  # The urgent request waits for the refresh lock.
+            finish_planning.set()
+            await initial_refresh
+        await asyncio.gather(*owner._listener_tasks)
+        if owner._export_reconcile_task is not None:
+            await owner._export_reconcile_task
+        assert len(setup.calls) == 2
+        assert not setup.control.state
+        owner._schedule_debounced_refresh("state_change")
+        assert timers[-1][0] > 0
 
     asyncio.run(run())

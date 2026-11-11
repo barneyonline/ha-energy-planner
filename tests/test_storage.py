@@ -308,6 +308,37 @@ def test_store_delay_save_batches_multiple_mutations(monkeypatch: object) -> Non
     assert FakeStore.saved["discovery"] == {"ok": True}
 
 
+def test_unchanged_batched_input_does_not_wait_for_inflight_store_write(monkeypatch: object) -> None:
+    async def run() -> None:
+        started, release, inputs_ready = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        class SlowStore(FakeStore):
+            async def async_save(self, data: dict[str, Any]) -> None:
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(storage_module, "Store", SlowStore)
+        store = PlannerStore(object())
+
+        async def refresh():
+            async with store.async_delay_save():
+                await store.async_save_discovery({})
+                inputs_ready.set()
+
+        write = asyncio.create_task(store.async_save_ownership({"ev": "owned"}))
+        await started.wait()
+        planning = asyncio.create_task(refresh())
+        try:
+            await asyncio.sleep(0)
+            assert inputs_ready.is_set()
+            assert not planning.done()  # The final flush still waits for durability.
+        finally:
+            release.set()
+            await asyncio.gather(write, planning)
+
+    asyncio.run(run())
+
+
 def test_store_forced_flush_persists_inside_delay_context(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.loaded = None
