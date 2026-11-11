@@ -426,6 +426,14 @@ use throughout; the Docker and pull-request gates enforce that result.
   policy ends planner billing exposure without confirming a stop and therefore
   preserves failed-stop backoff. Regression evidence is in
   `tests/test_executor.py` and `tests/test_vehicles.py`.
+  `ev_adapter.py` dispatches the first stop before waiting for confirmation when
+  active charging feedback precedes the switch update. It rechecks the switch
+  and connection before retrying. For these stops, Off must be accompanied by
+  inactive charging or verified unplug feedback, including after compensation.
+  `tests/test_ev_adapter.py` uses a virtual clock to cover the dispatch time
+  with one and zero retries, feedback settling, unavailable readings, service
+  failure and session changes. `tests/test_executor.py` verifies that the
+  auto-start compensation records the command and retains backoff on failure.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,
   so their own feedback cannot be mistaken for an external auto-start while

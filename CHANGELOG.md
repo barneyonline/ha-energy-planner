@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Send EV stops promptly when charging feedback shows active charging and the charger switch still reports Off.
 
 ### 🔧 Improvements
 

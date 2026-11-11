@@ -831,6 +831,10 @@ rules:
 # confirmed safe-stop evidence. Vehicle policy release preserves stop backoff;
 # reload, repeated-check, and vehicle selection regressions cover these paths.
 # Evidence: tests/test_coordinator.py, tests/test_executor.py, tests/test_vehicles.py.
+# ev_adapter.py dispatches a stop immediately when active charging precedes
+# switch feedback and rechecks safe state before retries. tests/test_ev_adapter.py
+# covers first dispatch timing, readback and session changes. tests/test_executor.py
+# verifies auto-start compensation accounting and backoff when the stop stays unconfirmed.
 # coordinator.py avoids planner/command lock inversion and refresh under command
 # ownership. Boundary callbacks publish clock-dependent status while refresh waits.
 # task_lifecycle.py drains export reconciliation before unload restoration;
