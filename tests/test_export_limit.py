@@ -2427,10 +2427,8 @@ def test_completed_export_reconciliation_reuses_only_fresh_settled_settings(setu
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("timer_fired", [False, True])
-def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypatch, timer_fired):
-    from unittest.mock import AsyncMock
-
+@pytest.mark.parametrize("timer_fired,preflight", [(False, False), (True, False), (True, True)])
+def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypatch, timer_fired, preflight):
     from test_coordinator import _coordinator_for_runtime_services, _plan
 
     from custom_components.ha_energy_planner import coordinator as module
@@ -2443,8 +2441,28 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
         owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
         owner.store.data = setup.store.data
         owner.store.async_add_outcome = setup.store.async_add_outcome
-        owner._async_update_data_locked = AsyncMock(return_value=_plan("cooldown"))
-        owner.async_request_refresh = owner._async_update_data
+        refresh_lock = asyncio.Lock()
+        planning, finish_planning = asyncio.Event(), asyncio.Event()
+
+        async def plan(*, defer_execution):
+            if preflight and not planning.is_set():
+                planning.set()
+                await finish_planning.wait()
+            return _plan("cooldown")
+
+        async def refresh():
+            async with refresh_lock:
+                await owner._async_update_data()
+
+        async def request_refresh():
+            # Model Home Assistant dropping the debounced callback when its
+            # timer expires while the explicit refresh still holds the lock.
+            if not refresh_lock.locked():
+                await refresh()
+
+        owner._async_update_data_locked = plan
+        owner.async_refresh = refresh
+        owner.async_request_refresh = request_refresh
         owner._listener_tasks = set()
         owner._export_boundary_cancel = None
         setup.hass.async_create_task = asyncio.create_task
@@ -2462,9 +2480,13 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
         owner.store.async_flush = flush
         boundary = NOW + timedelta(seconds=300)
         owner._schedule_export_boundary({"deferred": True, "next_eligible_change_at": boundary.isoformat()})
-        await owner._async_update_data()
-        worker = owner._export_reconcile_task
+        initial_refresh = None
+        if preflight:
+            initial_refresh = asyncio.create_task(owner._async_refresh_with_export_preflight("test_preflight"))
+        else:
+            await refresh()
         await asyncio.wait_for(first_flush.wait(), 1)
+        worker = owner._export_reconcile_task
         assert len(setup.calls) == 1
 
         setup.clock["now"] = boundary  # The original gateway readback is still fresh.
@@ -2490,6 +2512,12 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
             assert timers[-1][0] > 0
         setup.mode["value"] = "confirm"
         timers.pop()[1](None)
+        if initial_refresh is not None:
+            await asyncio.wait_for(planning.wait(), 1)
+            await asyncio.sleep(0)
+            assert owner._listener_tasks  # The urgent request waits for the refresh lock.
+            finish_planning.set()
+            await initial_refresh
         await asyncio.gather(*owner._listener_tasks)
         if owner._export_reconcile_task is not None:
             await owner._export_reconcile_task

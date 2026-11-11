@@ -850,7 +850,8 @@ rules:
 # completion and invalidation by newer planning inputs.
 # Coordinator and export tests verify independent EV safety stops and preserve
 # a cooldown wakeup that arrives during reconciliation, including through
-# telemetry coalescing. Queued plans still require current control options.
+# telemetry coalescing and while explicit preflight holds the coordinator lock.
+# Queued plans still require current control options.
 # tests/test_daikin_memory.py replays interrupted Off restoration and verifies the
 # complete zone baseline without new scheduler-guard or device writes once Off.
 # external feedback adoption preserves failure pauses until explicit resume.

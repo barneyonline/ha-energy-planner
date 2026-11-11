@@ -1202,7 +1202,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         async def request_refresh() -> None:
             self._refresh_request_timing = (trigger, requested_at, request_owner())
-            await self.async_request_refresh()
+            if immediate:
+                # HA's debouncer can discard its callback while another
+                # refresh owns the lock. A due deadline must wait for it.
+                await self.async_refresh()
+            else:
+                await self.async_request_refresh()
 
         @callback
         def _refresh(now: Any) -> None:
@@ -1565,13 +1570,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     settled = self._export_reconciliation_matches(observed_inputs)
                     # The waking refresh may have found this job in flight.
                     # Retry changed feedback or an elapsed cooldown boundary.
-                    if schedule_followup or settled:
+                    boundary_due = getattr(self, "_export_boundary_followup_due", False)
+                    needs_followup = schedule_followup or (boundary_due and not settled)
+                    if needs_followup or settled:
                         previous_generation = self._refresh_generation
-                        if schedule_followup:
+                        if needs_followup:
                             trigger = "export_reconciled" if settled else "export_reconciliation_changed"
                             self._schedule_debounced_refresh(
-                                trigger, debounce_seconds=0, force=True,
-                                immediate=getattr(self, "_export_boundary_followup_due", False),
+                                trigger, debounce_seconds=0, force=True, immediate=boundary_due,
                             )
                         else:
                             self._mark_replan_requested(force=True)

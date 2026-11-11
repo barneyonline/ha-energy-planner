@@ -63,7 +63,9 @@ shortcut. A provisional
 plan does not count toward the dry-run arming requirement. If feedback or the
 cooldown boundary changed during reconciliation, one coalesced follow-up
 checks it again. An already-due export boundary gives the follow-up priority
-through coalescing. Failure or cancellation leaves readiness closed until a later
+through coalescing. If preflight reconciliation finishes with stale evidence
+after that deadline, the follow-up waits for the coordinator lock so it can
+run after the preflight refresh. Failure or cancellation leaves readiness closed until a later
 input or boundary refresh. Durable pending, uncertain,
 manual-change, baseline and restoration checks remain in the export controller.
 The follow-up increments the requested-refresh counter only when dispatched,
