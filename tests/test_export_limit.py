@@ -1291,7 +1291,7 @@ def test_export_feedback_poll_keeps_queued_release_current_only_for_settled_sett
         plan.created_at = NOW
         release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
         plan.actions = [release]
-        owner._pending_plan_execution = (owner._refresh_generation, plan, object(), {})
+        owner._pending_plan_execution = (owner._refresh_generation, plan, object(), owner.planner_options)
         drain = asyncio.create_task(owner._async_drain_plan_execution())
         await asyncio.sleep(0)
         assert not drain.done()
@@ -2428,7 +2428,7 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
         setup.hass.async_create_task = asyncio.create_task
         timers = []
         monkeypatch.setattr(module, "async_call_later", lambda hass, delay, callback: (
-            timers.append(callback) or (lambda: None)))
+            timers.append((delay, callback)) or (lambda: None)))
         first_flush, finish = asyncio.Event(), asyncio.Event()
 
         async def flush():
@@ -2447,24 +2447,33 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
 
         setup.clock["now"] = boundary  # The original gateway readback is still fresh.
         if timer_fired:
-            timers.pop()(None)
+            timers.pop()[1](None)
             await asyncio.gather(*owner._listener_tasks)
             assert owner._export_reconcile_task is worker
         else:
             # Input collection can replace a timer before its callback runs.
             owner._schedule_export_boundary({})
             timers.clear()
+        owner._last_non_manual_refresh_requested_at = module.monotonic()
         finish.set()
         await worker
         assert owner._export_reconcile_pending
         assert len(timers) == 1
 
+        if timer_fired:
+            assert timers[-1][0] == 0
+            owner._schedule_debounced_refresh("state_change")
+            assert timers[-1][0] == 0
+        else:
+            assert timers[-1][0] > 0
         setup.mode["value"] = "confirm"
-        timers.pop()(None)
+        timers.pop()[1](None)
         await asyncio.gather(*owner._listener_tasks)
         if owner._export_reconcile_task is not None:
             await owner._export_reconcile_task
         assert len(setup.calls) == 2
         assert not setup.control.state
+        owner._schedule_debounced_refresh("state_change")
+        assert timers[-1][0] > 0
 
     asyncio.run(run())

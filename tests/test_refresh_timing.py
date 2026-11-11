@@ -312,7 +312,7 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
     async def scenario():
         coordinator = coordinator_for_timing(export_entity="select.old")
         coordinator._schedule_debounced_refresh.side_effect = (
-            lambda trigger, *, debounce_seconds, force: coordinator._mark_replan_requested(force=force)
+            lambda trigger, *, debounce_seconds, force, immediate: coordinator._mark_replan_requested(force=force)
         )
         reconcile = AsyncMock()
         monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
@@ -374,7 +374,7 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
             assert coordinator._export_reconcile_pending is False
             assert coordinator._refresh_generation == 1
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciled", debounce_seconds=0, force=True)
+                "export_reconciled", debounce_seconds=0, force=True, immediate=False)
             assert reconcile.await_count == (0 if result == "mapping_removed" else 1)
         assert coordinator._last_export_reconciliation["duration_ms"] >= 0
         if result == "success":

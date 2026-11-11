@@ -446,9 +446,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._export_reconcile_pending = False
         self._export_reconciled_for: _ExportReconciliationInputs | None = None
         self._export_replan_generations: tuple[int, int] | None = None
+        self._export_boundary_followup_due = False
         self._last_export_reconciliation: dict[str, Any] = {}
         self._refresh_request_timing: tuple[str, float, asyncio.Task[Any] | None] | None = None
         self._debounce_requested_at: float | None = None
+        self._debounce_immediate = False
         self._ai_advice_task: asyncio.Task[None] | None = None
         self._plan_execution_task: asyncio.Task[None] | None = None
         self._pending_plan_execution: tuple[int, EnergyPlan, DecisionContext, dict[str, Any]] | None = None
@@ -1181,6 +1183,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         *,
         debounce_seconds: float = DEBOUNCE_SECONDS,
         force: bool = False,
+        immediate: bool = False,
     ) -> None:
         """Coalesce repeated input changes into one coordinator refresh."""
         self._mark_replan_requested(force=force)
@@ -1189,10 +1192,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         else perf_counter())
         self._debounce_requested_at = requested_at
         if self._debounce_cancel is not None:
+            immediate = immediate or getattr(self, "_debounce_immediate", False)
             self._debounce_cancel()
             self._increment_refresh_counter("coalesced")
 
-        delay = max(float(debounce_seconds), self._non_manual_refresh_delay())
+        self._debounce_immediate = immediate
+        delay = 0.0 if immediate else max(float(debounce_seconds), self._non_manual_refresh_delay())
 
         async def request_refresh() -> None:
             self._refresh_request_timing = (trigger, requested_at, request_owner())
@@ -1202,6 +1207,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         def _refresh(now: Any) -> None:
             self._debounce_cancel = None
             self._debounce_requested_at = None
+            self._debounce_immediate = False
             self._pending_refresh_trigger = trigger
             self._last_non_manual_refresh_requested_at = monotonic()
             self._increment_refresh_counter("requested")
@@ -1257,6 +1263,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # A tariff/cooldown boundary can make a deferred restore actionable
             # even when the gateway's feedback has not changed.
             self._export_reconciled_for = None
+            self._export_boundary_followup_due = True
             self._mark_forced_refresh("export_tariff_boundary")
             self._async_create_listener_task(self.async_request_refresh())
 
@@ -1523,6 +1530,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if not self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY) or (
             self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True and not ownership
         ):
+            self._export_boundary_followup_due = False
             if was_pending:
                 self._mark_replan_requested(force=True)
                 self._export_reconcile_pending = False
@@ -1560,9 +1568,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         previous_generation = self._refresh_generation
                         if schedule_followup:
                             trigger = "export_reconciled" if settled else "export_reconciliation_changed"
-                            self._schedule_debounced_refresh(trigger, debounce_seconds=0, force=True)
+                            self._schedule_debounced_refresh(
+                                trigger, debounce_seconds=0, force=True,
+                                immediate=getattr(self, "_export_boundary_followup_due", False),
+                            )
                         else:
                             self._mark_replan_requested(force=True)
+                        self._export_boundary_followup_due = False
                         self._export_replan_generations = (previous_generation, self._refresh_generation)
                     if settled:
                         self._export_reconciled_for = observed_inputs
@@ -3474,18 +3486,28 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         """Execute one current plan, stopping between actions when it becomes stale."""
         independent_of_export = all(action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT for action in plan.actions)
 
-        def is_current() -> bool:
+        def has_current_generation() -> bool:
             return started_generation == self._refresh_generation or (
                 independent_of_export and self._generation_changed_only_by_export_replan(started_generation)
             )
 
+        def is_current() -> bool:
+            if not has_current_generation():
+                return False
+            # Export reconciliation can let a plan reach the command lock
+            # before an options listener has marked its generation obsolete.
+            if started_generation == self._refresh_generation and not getattr(self, "_export_reconcile_pending", False):
+                return True
+            return options == self.planner_options and has_current_generation()
+
         if getattr(self, "_tearing_down", False) or not is_current():
             return
         await self._async_reconcile_vehicle_ownership()
-        self.executor.options = options
-        self.executor.entry_data = self.entry_data
+        entry_data = self.entry_data
         if not is_current():
             return
+        self.executor.options = options
+        self.executor.entry_data = entry_data
         async def evaluate(action_plan: EnergyPlan) -> PlanAction | None:
             try:
                 return await self.executor.async_evaluate(action_plan, context)

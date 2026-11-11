@@ -9773,7 +9773,7 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
         assert coordinator._export_reconcile_task is None
         if stable:
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciled", debounce_seconds=0, force=True,
+                "export_reconciled", debounce_seconds=0, force=True, immediate=False,
             )
             if change == "after_completion":
                 coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
@@ -9786,7 +9786,7 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
                 await coordinator._export_reconcile_task
         elif change == "reconfigure":
             coordinator._schedule_debounced_refresh.assert_called_once_with(
-                "export_reconciliation_changed", debounce_seconds=0, force=True,
+                "export_reconciliation_changed", debounce_seconds=0, force=True, immediate=False,
             )
         else:
             coordinator._schedule_debounced_refresh.assert_not_called()
@@ -9838,19 +9838,24 @@ def test_pending_export_does_not_suppress_owned_ev_safety_stop():
         plan = _plan("owned-stop")
         plan.created_at = now
         owner._export_reconcile_pending = True
-        owner._pending_plan_execution = (owner._refresh_generation, plan, context, owner.options)
+        owner._pending_plan_execution = (owner._refresh_generation, plan, context, owner.planner_options)
         await owner._async_drain_plan_execution()
         assert hass.states.values["input_boolean.ev_charger"] == "off"
 
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("ordering", ["completion_first", "release_first", "new_input"])
+@pytest.mark.parametrize("ordering", [
+    "completion_first", "release_first", "new_input", "control_disabled", "control_disabled_before_completion",
+    "control_disabled_during_prepare",
+])
 def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypatch, ordering):
     async def run():
         coordinator = _coordinator_for_runtime_services(
             entry_data={"enphase_export_limit_entity": "select.export"},
-            options={"enphase_export_limit_control_enabled": True},
+            options={"enphase_export_limit_control_enabled": True, CONF_EV_CONTROL_ENABLED: True,
+                     CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: False},
+            store_data={"production": {"armed": True}},
         )
         coordinator.hass.async_create_task = asyncio.create_task
         monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
@@ -9867,14 +9872,26 @@ def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypat
         monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: plan.created_at)
         release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
         export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
-        plan.actions = [export, release]
-        coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
+        disabled = ordering.startswith("control_disabled")
+        ev_start = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
+        plan.actions = [export, ev_start if disabled else release]
+        coordinator._pending_plan_execution = (
+            coordinator._refresh_generation, plan, object(), coordinator.planner_options,
+        )
         drain = asyncio.create_task(coordinator._async_drain_plan_execution())
         await asyncio.sleep(0)
         assert not drain.done()  # Reconciliation still owns the command lock.
         if ordering == "new_input":
             coordinator._mark_replan_requested()
-        if ordering == "release_first":
+        if disabled and ordering != "control_disabled_during_prepare":
+            # ConfigEntry options are published before the disable handler can
+            # take command authority and restore the device.
+            coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = False
+        if ordering == "control_disabled_before_completion":
+            async with coordinator._planner_lock:
+                finish.set()
+                await asyncio.wait_for(drain, 1)
+        elif ordering in {"release_first", "control_disabled_during_prepare"}:
             preparing, resume = asyncio.Event(), asyncio.Event()
 
             async def prepare_release():
@@ -9888,13 +9905,15 @@ def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypat
                 finish.set()
                 await asyncio.wait_for(preparing.wait(), 1)
             await asyncio.wait_for(worker, 1)
+            if disabled:
+                coordinator.entry.options[CONF_EV_CONTROL_ENABLED] = False
             resume.set()
         else:
             finish.set()
         await asyncio.wait_for(asyncio.gather(worker, drain), 1)
         assert not coordinator._export_reconcile_pending
         evaluated = [item.actions for item, _ in coordinator.executor.evaluated]
-        assert evaluated == ([] if ordering == "new_input" else [[release]])
+        assert evaluated == ([] if disabled or ordering == "new_input" else [[release]])
 
     asyncio.run(run())
 

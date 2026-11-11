@@ -44,7 +44,8 @@ continue input collection and planning, with export readiness marked
 shortcut. Device execution checks the gate under the command lock. Export
 actions wait while it is closed. Other device actions and checks for owned EV
 safety stops remain eligible, including when only export reconciliation changed
-the plan generation. Stable reconciliation requests one coalesced fresh refresh. The next
+the plan generation. They still require the queued plan's control options to
+match current settings. Stable reconciliation requests one coalesced fresh refresh. The next
 plan can use the settled result once while the export inputs still match, even
 if a telemetry event replaced the scheduled refresh. A newer readback timestamp
 alone keeps fresh, unchanged settings eligible for reuse when no command or
@@ -60,7 +61,8 @@ Export Limit mappings with no retained ownership use the normal fingerprint
 shortcut. A provisional
 plan does not count toward the dry-run arming requirement. If feedback or the
 cooldown boundary changed during reconciliation, one coalesced follow-up
-checks it again. Failure or cancellation leaves readiness closed until a later
+checks it again. An already-due export boundary gives the follow-up priority
+through coalescing. Failure or cancellation leaves readiness closed until a later
 input or boundary refresh. Durable pending, uncertain,
 manual-change, baseline and restoration checks remain in the export controller.
 The follow-up increments the requested-refresh counter only when dispatched,
