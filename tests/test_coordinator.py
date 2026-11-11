@@ -996,7 +996,7 @@ class FakeEntry:
     title: str = "Energy Planner"
 
     def async_create_background_task(
-        self, hass: object, coroutine: object, name: str
+        self, hass: object, coroutine: object, name: str, eager_start: bool = True,
     ) -> object:
         """Create background work through the test Home Assistant instance."""
         return hass.async_create_task(coroutine)
@@ -6718,6 +6718,9 @@ def test_production_evidence_and_dry_run_comparison_are_recorded() -> None:
     unsafe = _plan("unsafe")
     unsafe.health = InputHealth.UNSAFE
 
+    coordinator._export_reconcile_pending = True
+    asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
+    coordinator._export_reconcile_pending = False
     asyncio.run(coordinator._async_update_production_evidence(dry_run, []))
     asyncio.run(coordinator._async_record_dry_run_comparison(dry_run))
     asyncio.run(coordinator._async_update_production_evidence(unsafe, []))
@@ -9717,6 +9720,82 @@ def test_export_reconciliation_rechecks_mapping_after_waiting_for_command(monkey
 
 
 
+@pytest.mark.parametrize("change", ["none", "reconfigure", "after_completion", "cancel", "fail"])
+def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_lock(monkeypatch, change):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator.hass.async_create_task = asyncio.create_task
+        coordinator._schedule_debounced_refresh = Mock()
+        coordinator._async_update_data_locked = AsyncMock(return_value=_plan("unblocked"))
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile(_self, now):
+            started.set()
+            await finish.wait()
+            if change == "fail":
+                raise OSError("synthetic write failure")
+
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        refresh = asyncio.create_task(coordinator._async_update_data())
+        worker = None
+        try:
+            await started.wait()
+            assert (await asyncio.wait_for(asyncio.shield(refresh), 1)).plan_id == "unblocked"
+            assert coordinator._export_reconcile_pending
+            worker = coordinator._export_reconcile_task
+            await coordinator._async_update_data()
+            assert coordinator._export_reconcile_task is worker
+            if change == "reconfigure":
+                coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
+            elif change == "cancel":
+                worker.cancel()
+        finally:
+            finish.set()
+            await refresh
+            if worker is not None:
+                await asyncio.gather(worker, return_exceptions=True)
+        stable = change in {"none", "after_completion"}
+        assert coordinator._export_reconcile_pending != stable
+        assert not coordinator._command_lock.locked()
+        assert coordinator._export_reconcile_task is None
+        if stable:
+            coordinator._schedule_debounced_refresh.assert_called_once_with(
+                "export_reconciled", debounce_seconds=0, force=True,
+            )
+            if change == "after_completion":
+                coordinator.entry.data["enphase_export_limit_entity"] = "select.replacement"
+            coordinator._pending_refresh_trigger = "export_reconciled"
+            await coordinator._async_update_data()
+            if change == "none":
+                assert coordinator._export_reconcile_task is None  # No reconciliation loop.
+            else:
+                assert coordinator._export_reconcile_pending
+                await coordinator._export_reconcile_task
+        else:
+            coordinator._schedule_debounced_refresh.assert_not_called()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("release_due", [False, True])
+def test_failed_export_preflight_keeps_planned_hvac_release_eligible(release_due):
+    coordinator = _coordinator_for_runtime_services()
+    coordinator._export_reconcile_pending = True
+    coordinator._async_execute_plan_if_current = AsyncMock()
+    plan = _plan("release")
+    export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
+    release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+    plan.actions = [export, release] if release_due else [export]
+    coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
+    asyncio.run(coordinator._async_drain_plan_execution())
+    execute = coordinator._async_execute_plan_if_current
+    if release_due:
+        execute.assert_awaited_once()
+        assert execute.await_args.args[1].actions == [release]
+    else:
+        execute.assert_not_awaited()
+
+
 @pytest.mark.parametrize("stage", ["before", "queued", "inflight"])
 def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, stage):
     async def run():
@@ -9734,8 +9813,11 @@ def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, sta
                 started.set()
                 await finish.wait()
             reconcile.side_effect = in_progress
-            task = asyncio.create_task(coordinator._async_update_data())
+            coordinator.hass.async_create_task = asyncio.create_task
+            coordinator._async_update_data_locked = AsyncMock(return_value=coordinator.data)
+            await coordinator._async_update_data()
             await started.wait()
+            task = coordinator._export_reconcile_task
             coordinator._begin_shutdown()
             shutdown = asyncio.create_task(coordinator.async_wait_for_refresh_shutdown())
             await asyncio.sleep(0)

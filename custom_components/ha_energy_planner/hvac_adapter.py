@@ -1260,8 +1260,9 @@ class DaikinHVACAdapter:
                 saved_zone_states=zones,
                 saved_main_state=main_state if zones else {},
             )
+        off_start_retry = main_state.get(MEMORY_KEY) and main_state.get("off_start_restore_attempted")
         if (
-            zones or main_state or any(
+            (not off_start_retry and (zones or main_state)) or any(
                 desired == "on" and self._state_value(entity) != "on" for entity, desired in states.items()
             )
         ) and not await self._async_arm_scheduler_guard():
@@ -1320,7 +1321,9 @@ class DaikinHVACAdapter:
         reason = "no_hvac_automation_state_saved"
         if not main_restored or not restored or not zones_restored:
             reason = "hvac_release_failed"
-            if unresolved_main_state.get(MEMORY_KEY) and unresolved_main_state.get("zone_recovery_blocker"):
+            if unresolved_main_state.get("zone_recovery_blocker") == "off_start_restore_waiting_for_feedback":
+                reason = "hvac_zone_restore_pending"
+            elif unresolved_main_state.get(MEMORY_KEY) and unresolved_main_state.get("zone_recovery_blocker"):
                 reason = "hvac_zone_restore_operator_required"
             elif self._zone_restore_needs_operator(unresolved_zones, unresolved_main_state):
                 unresolved_main_state["zone_recovery_blocker"] = "saved_zone_targets_incompatible_with_off_baseline"
@@ -1688,22 +1691,38 @@ class DaikinHVACAdapter:
     ) -> tuple[bool, bool, dict[str, Any]]:
         """One bounded, durable mode-aware restoration; failed shutdown never probes."""
         memory = main_state[MEMORY_KEY]
-        from .daikin_memory import provider
+        from .daikin_memory import provider, source_identity
         from .zone_control import topology
-        source = provider(self.hass, self.entry_data)
+        source = provider(self.hass, self.entry_data, require_available=False)
         valid = (memory.get("version") == 1 and memory.get("head") == main_entity
-                 and source is not None and source_matches(self.hass, self.entry_data, memory)
+                 and source is not None
+                 and all(memory.get(key) == value for key, value in source_identity(source).items())
                  and topology(self.entry_data).get("pairs") == memory.get("pairs"))
         if not valid:
             main_state["zone_recovery_blocker"] = "off_start_provider_identity_changed"
             return False, False, dict(zones)
+        state = self._state_value(main_entity)
+        if state is None or provider(self.hass, self.entry_data) is None:
+            main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+            return False, False, dict(zones)
         if main_state.get("off_start_restore_attempted"):
-            observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
-            if memory_matches(observed, memory, zones):
-                return True, True, {}
-            # Retain every baseline. Incomplete restoration may only inspect or
-            # shut down; never alternate remembered modes on subsequent retries.
-            await self._async_restore_main_state_preserving_manual(main_entity, {"hvac_mode": "off"})
+            if state != "off" or self._unconfirmed_main_mode:
+                # A known Off baseline permits shutdown only. Keep the
+                # captured identity enforced across guard and Store awaits.
+                self._restoring_memory = memory
+                try:
+                    await self._async_restore_main_state_preserving_manual(
+                        main_entity, {"hvac_mode": "off"}, emergency_off=True,
+                    )
+                finally:
+                    self._restoring_memory = None
+            else:
+                observed = await read_memory(self.hass, self.entry_data, memory["acquired_mode"])
+                if observed is None:
+                    main_state["zone_recovery_blocker"] = "off_start_restore_waiting_for_feedback"
+                    return False, False, dict(zones)
+                if memory_matches(observed, memory, zones):
+                    return True, True, {}
             main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
             return False, False, dict(zones)
         main_state["off_start_restore_attempted"] = True
@@ -1799,7 +1818,10 @@ class DaikinHVACAdapter:
                 main_ok, pending = False, dict(zones)
         if pending or not main_ok:
             main_state["zone_recovery_blocker"] = "off_start_restore_operator_required"
-        return main_ok, not pending, self._retain_paired_zone_power(zones, pending)
+            # Partial acknowledgements preceded a mode change or a failed
+            # shutdown. Keep the full owned set for the next native readback.
+            return main_ok, False, dict(zones)
+        return True, True, {}
 
     async def _async_restore_main_and_zones(
         self, main_entity: str, main_state: dict[str, Any], zones: dict[str, Any],
@@ -1982,10 +2004,12 @@ class DaikinHVACAdapter:
         self,
         entity_id: str,
         saved_state: dict[str, Any],
+        *,
+        emergency_off: bool = False,
     ) -> bool:
         """Restore main state unless a user supersedes the pending snapshot."""
         try:
-            return await self._async_restore_main_state(entity_id, saved_state)
+            return await self._async_restore_main_state(entity_id, saved_state, emergency_off=emergency_off)
         except _HVACManualOverrideError:
             await self._async_persist_requested_manual_supersessions()
             return True
@@ -1994,15 +2018,19 @@ class DaikinHVACAdapter:
         self,
         entity_id: str,
         saved_state: dict[str, Any],
+        *,
+        emergency_off: bool = False,
     ) -> bool:
         """Restore original state immediately, including acquisition rollback."""
         self._restoring_main_state = True
         try:
-            return await self._async_restore_main_state_impl(entity_id, saved_state)
+            return await self._async_restore_main_state_impl(entity_id, saved_state, emergency_off=emergency_off)
         finally:
             self._restoring_main_state = False
 
-    async def _async_restore_main_state_impl(self, entity_id: str, saved_state: dict[str, Any]) -> bool:
+    async def _async_restore_main_state_impl(
+        self, entity_id: str, saved_state: dict[str, Any], *, emergency_off: bool = False,
+    ) -> bool:
         """Restore and confirm the complete main state changed during takeover."""
         desired_state = _main_hvac_desired_state(saved_state)
         if not desired_state:
@@ -2046,6 +2074,7 @@ class DaikinHVACAdapter:
                     {"hvac_mode": "off"},
                     respect_zone_manual_override=False,
                     force=self._unconfirmed_main_mode,
+                    emergency_off=emergency_off,
                 )
             except _HVACManualOverrideError:
                 raise

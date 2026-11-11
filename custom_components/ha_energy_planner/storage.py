@@ -442,6 +442,10 @@ class PlannerStore:
 
     async def _async_flush(self, *, force: bool = False) -> None:
         """Serialize Store writes until every observed mutation is durable."""
+        if self._save_delay_depth and not force:
+            # A batched caller must not queue behind disk I/O for a flush that
+            # the outer scope already owns. Recheck after lock acquisition too.
+            return
         async with self._save_lock:
             while self._is_dirty:
                 if self._save_delay_depth and not force:

@@ -12,7 +12,8 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes.
+- Let planner input collection continue while Export Limit reconciliation runs. Keep planned HVAC releases eligible when export readiness is blocked.
 
 ### 🔧 Improvements
 

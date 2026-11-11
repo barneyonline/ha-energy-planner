@@ -1828,11 +1828,12 @@ def test_external_feedback_preserves_failure_pause_until_explicit_resume(setup, 
 
 
 def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setup):
-    from unittest.mock import AsyncMock
+    from unittest.mock import AsyncMock, Mock
 
     from test_coordinator import _coordinator_for_runtime_services
 
     async def run():
+        setup.hass.async_create_task = asyncio.create_task
         coordinator = _coordinator_for_runtime_services(
             entry_data=DATA, options={**OPTIONS, CONF_DRY_RUN: False}, hass=setup.hass,
         )
@@ -1842,9 +1843,11 @@ def test_mapped_export_resume_and_climate_override_refresh_without_deadlock(setu
                                   "pause": "external_export_limit_conflict"})
         plan = DryRunPlanner(OPTIONS).create_plan(context(runtime.evidence(setup.hass, DATA, OPTIONS, NOW)))
         coordinator._async_update_data_locked = AsyncMock(return_value=plan)
+        coordinator._schedule_debounced_refresh = Mock()
         coordinator.async_request_refresh = coordinator._async_update_data
         await asyncio.wait_for(coordinator.async_resume_control(asset=EXPORT_ASSET), 1)
         await asyncio.wait_for(coordinator.async_set_manual_hvac_override(60, "operator"), 1)
+        await coordinator.async_wait_for_plan_execution()
         assert coordinator.last_refresh_metadata["succeeded"] is True
         assert "pause" not in coordinator.store.data["ownership"][EXPORT_ASSET]
         assert not setup.calls
@@ -2065,10 +2068,12 @@ def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(
             assert setup.control.state["restoring"] is True
             advance_clock(setup)
             await owner._async_update_data()
+            await owner._export_reconcile_task
             assert len(setup.calls) == original_calls + 1
             assert not setup.control.state
             # An ordinary refresh after recovery must not duplicate restoration.
             await owner._async_update_data()
+            await owner._export_reconcile_task
             assert len(setup.calls) == original_calls + 1
         else:
             assert len(setup.calls) == original_calls
