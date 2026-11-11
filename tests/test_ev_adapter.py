@@ -522,6 +522,210 @@ def test_ev_stop_confirms_stateful_control_without_charging_feedback(
     assert hass.services.calls == [("switch", "turn_off", {"entity_id": "switch.ev_charger"})]
 
 
+@pytest.mark.parametrize("retries", [1, 0])
+@pytest.mark.parametrize("provider_error", [False, True])
+def test_ev_stop_dispatches_before_waiting_on_stale_off_switch(
+    monkeypatch: pytest.MonkeyPatch, retries: int, provider_error: bool,
+) -> None:
+    switch = "switch.ev_charger"
+    connector = "sensor.ev_connector_status"
+    plugged = "binary_sensor.ev_connected"
+    hass = FakeHass({switch: "off", connector: "CHARGING", plugged: "on"})
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: connector, CONF_EV_CONNECTED: plugged},
+        confirmation_timeout_seconds=30, confirmation_poll_seconds=0.25, confirmation_retries=retries,
+    )
+    elapsed = 0.0
+    dispatch_times: list[float] = []
+    original_call = hass.services.async_call
+
+    async def stop(domain, service, data, blocking=False):
+        dispatch_times.append(elapsed)
+        await original_call(domain, service, data, blocking)
+        if provider_error:
+            raise RuntimeError("provider timed out after accepting stop")
+        hass.states.values[connector] = "SUSPENDED_EVSE"
+
+    async def advance_feedback(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+        if dispatch_times:
+            hass.states.values[connector] = "SUSPENDED_EVSE"
+        else:
+            hass.states.values[switch] = "on"
+
+    async def run_stop():
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio.get_running_loop(), "time", lambda: elapsed)
+            patch.setattr(ev_adapter_module.asyncio, "sleep", advance_feedback)
+            patch.setattr(hass.services, "async_call", stop)
+            return await adapter.async_execute(_action(ActionKind.EV_STOP))
+
+    result = asyncio.run(run_stop())
+
+    assert dispatch_times == [0.0]
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": switch})]
+    assert result.applied and result.command_sent and result.safe_state_confirmed
+    expected_reason = (
+        "ev_charging_stopped_confirmed_after_service_error" if provider_error else "ev_charging_stopped_confirmed"
+    )
+    assert result.reason == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("charging", "connection", "control", "session_current", "reason"),
+    [
+        ("SUSPENDED_EV", "on", "off", True, "already_in_desired_state"),
+        ("CHARGING", "off", "off", True, "already_in_desired_state"),
+        ("Finishing", "on", "off", True, "already_in_desired_state"),
+        ("warming_up", "on", "off", True, "ev_charging_confirmation_timeout"),
+        ("unknown", "on", "off", True, "ev_charging_confirmation_unavailable"),
+        ("unavailable", "on", "off", True, "ev_charging_confirmation_unavailable"),
+        ("CHARGING", "on", "unavailable", True, "ev_control_unavailable"),
+        ("CHARGING", "on", "off", False, "ev_vehicle_session_changed"),
+    ],
+)
+def test_ev_stop_skips_dispatch_without_a_writable_unsafe_control(
+    charging: str, connection: str, control: str, session_current: bool, reason: str,
+) -> None:
+    switch = "switch.ev_charger"
+    connector = "sensor.ev_connector_status"
+    plugged = "binary_sensor.ev_connected"
+    hass = FakeHass({switch: control, connector: charging, plugged: connection})
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: connector, CONF_EV_CONNECTED: plugged},
+        confirmation_timeout_seconds=0, confirmation_retries=0, command_guard=lambda: session_current,
+    )
+
+    result = asyncio.run(adapter.async_set_charging(False))
+
+    assert result.reason == reason
+    assert result.applied is (reason == "already_in_desired_state")
+    assert bool(result.safe_state_confirmed) is result.applied
+    assert not result.command_sent
+    assert hass.services.calls == []
+
+
+@pytest.mark.parametrize("change", [
+    "unplug", "inactive", "retry", "session_changed", "unknown_then_unplug", "plugged", "detecting",
+    "finishing", "late_switch", "temporary_unavailable",
+])
+def test_ev_stop_rechecks_feedback_and_session_before_retry(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    switch = "switch.ev_charger"
+    connector = "sensor.ev_connector_status"
+    plugged = "binary_sensor.ev_connected"
+    unknown_feedback = change == "unknown_then_unplug"
+    hass = FakeHass({
+        switch: "on" if unknown_feedback or change == "late_switch" else "off",
+        connector: "warming_up" if unknown_feedback else "CHARGING",
+        plugged: "on",
+    })
+    elapsed = 0.0
+    session_current = True
+    dispatch_times: list[float] = []
+    original_call = hass.services.async_call
+
+    async def stop(domain, service, data, blocking=False):
+        dispatch_times.append(elapsed)
+        await original_call(domain, service, data, blocking)
+        if len(dispatch_times) == 2:
+            hass.states.values[connector] = "SUSPENDED_EVSE"
+        elif change == "late_switch":
+            hass.states.values[switch] = "on"
+        elif change == "temporary_unavailable":
+            hass.states.values[connector] = "unavailable"
+
+    async def advance_feedback(delay: float) -> None:
+        nonlocal elapsed, session_current
+        elapsed += delay
+        if change in {"unplug", "unknown_then_unplug"}:
+            hass.states.values[plugged] = "off"
+        elif change in {"inactive", "temporary_unavailable"}:
+            hass.states.values[connector] = "SUSPENDED_EVSE"
+        elif change == "finishing":
+            hass.states.values[connector] = "Finishing"
+        elif change == "late_switch":
+            if elapsed >= 0.75:
+                hass.states.values[connector] = "SUSPENDED_EVSE"
+            if elapsed >= 1.25:
+                hass.states.values[switch] = "off"
+        elif change in {"plugged", "detecting"}:
+            hass.states.values[plugged] = change
+        elif change == "session_changed":
+            session_current = False
+
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: connector, CONF_EV_CONNECTED: plugged},
+        confirmation_timeout_seconds=1, confirmation_poll_seconds=0.25, confirmation_retries=1,
+        command_guard=lambda: session_current,
+    )
+
+    async def run_stop():
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio.get_running_loop(), "time", lambda: elapsed)
+            patch.setattr(ev_adapter_module.asyncio, "sleep", advance_feedback)
+            patch.setattr(hass.services, "async_call", stop)
+            return await adapter.async_set_charging(False)
+
+    result = asyncio.run(run_stop())
+
+    assert dispatch_times == ([0.0, 1.0] if change in {"retry", "plugged", "detecting"} else [0.0])
+    assert result.command_sent
+    if change == "session_changed":
+        assert not result.applied and not result.safe_state_confirmed
+        assert result.reason == "ev_vehicle_session_changed"
+    else:
+        assert result.applied and result.safe_state_confirmed
+        assert result.reason == "ev_charging_stopped_confirmed"
+
+
+@pytest.mark.parametrize("compensation_feedback", ["CHARGING", "unavailable", "SUSPENDED_EVSE", "delayed"])
+def test_ev_stop_checks_feedback_after_compensating_a_contradictory_off_switch(
+    monkeypatch: pytest.MonkeyPatch, compensation_feedback: str,
+) -> None:
+    switch = "switch.ev_charger"
+    connector = "sensor.ev_connector_status"
+    hass = FakeHass({switch: "off", connector: "CHARGING"})
+    original_call = hass.services.async_call
+
+    async def stop(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        if len(hass.services.calls) == 1:
+            raise RuntimeError("stop service failed")
+        if compensation_feedback != "delayed":
+            hass.states.values[connector] = compensation_feedback
+
+    adapter = EVChargerAdapter(
+        hass, {CONF_EV_CHARGER: switch, CONF_EV_CHARGING: connector},
+        confirmation_timeout_seconds=1, confirmation_poll_seconds=0.25, confirmation_retries=0,
+    )
+
+    elapsed = 0.0
+
+    async def advance_feedback(delay: float) -> None:
+        nonlocal elapsed
+        elapsed += delay
+        if len(hass.services.calls) == 2 and compensation_feedback == "delayed":
+            hass.states.values[connector] = "SUSPENDED_EVSE"
+
+    async def run_stop():
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio.get_running_loop(), "time", lambda: elapsed)
+            patch.setattr(ev_adapter_module.asyncio, "sleep", advance_feedback)
+            patch.setattr(hass.services, "async_call", stop)
+            return await adapter.async_set_charging(False)
+
+    result = asyncio.run(run_stop())
+
+    assert not result.applied and result.command_sent
+    assert result.reason == "ev_control_service_failed"
+    assert hass.services.calls == [("switch", "turn_off", {"entity_id": switch})] * 2
+    assert result.safe_state_confirmed is (compensation_feedback in {"SUSPENDED_EVSE", "delayed"})
+    assert result.rollback_succeeded is result.safe_state_confirmed
+
+
 
 
 
