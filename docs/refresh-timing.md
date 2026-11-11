@@ -42,10 +42,14 @@ holds command authority through any in-flight device transaction. Refreshes
 continue input collection and planning, with export readiness marked
 `export_reconciliation_pending`. Pending refreshes cannot use the fingerprint
 shortcut. Device execution checks the gate under the command lock; while it is
-closed, a current planned HVAC release is eligible. Stable reconciliation
+closed, a current planned HVAC release is eligible. A due release also survives
+the generation change from export completion when no planning input superseded
+it. Stable reconciliation
 invalidates the earlier plan and requests one coalesced fresh refresh. The next
 plan can use the settled result once while the export inputs still match, even
-if a telemetry event replaced the scheduled refresh. Startup validation and
+if a telemetry event replaced the scheduled refresh. A newer readback timestamp
+alone keeps fresh, unchanged settings eligible for reuse when no command or
+restoration remains unresolved. Startup validation and
 activation wait for the shared reconciliation before planning. A provisional
 plan does not count toward the dry-run arming requirement. Failure,
 cancellation or changed export feedback leaves readiness closed for a later

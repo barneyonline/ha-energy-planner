@@ -9796,6 +9796,57 @@ def test_failed_export_preflight_keeps_planned_hvac_release_eligible(release_due
         execute.assert_not_awaited()
 
 
+@pytest.mark.parametrize("ordering", ["completion_first", "release_first", "new_input"])
+def test_completed_export_reconciliation_preserves_queued_hvac_release(monkeypatch, ordering):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(entry_data={"enphase_export_limit_entity": "select.export"})
+        coordinator.hass.async_create_task = asyncio.create_task
+        monkeypatch.setattr(coordinator_module, "async_call_later", lambda *args: lambda: None)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile(_self, now):
+            started.set()
+            await finish.wait()
+
+        monkeypatch.setattr(coordinator_module.ExportLimitControl, "reconcile", reconcile)
+        worker = coordinator._admit_export_reconciliation()
+        await asyncio.wait_for(started.wait(), 1)
+        plan = _plan("queued-release")
+        monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: plan.created_at)
+        release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+        export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
+        plan.actions = [export, release]
+        coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
+        drain = asyncio.create_task(coordinator._async_drain_plan_execution())
+        await asyncio.sleep(0)
+        assert not drain.done()  # Reconciliation still owns the command lock.
+        if ordering == "new_input":
+            coordinator._mark_replan_requested()
+        if ordering == "release_first":
+            preparing, resume = asyncio.Event(), asyncio.Event()
+
+            async def prepare_release():
+                preparing.set()
+                await resume.wait()
+
+            coordinator._async_reconcile_vehicle_ownership = prepare_release
+            async with coordinator._planner_lock:
+                # Let execution take command authority while completion is
+                # waiting to publish its result under the planner lock.
+                finish.set()
+                await asyncio.wait_for(preparing.wait(), 1)
+            await asyncio.wait_for(worker, 1)
+            resume.set()
+        else:
+            finish.set()
+        await asyncio.wait_for(asyncio.gather(worker, drain), 1)
+        assert not coordinator._export_reconcile_pending
+        evaluated = [item.actions for item, _ in coordinator.executor.evaluated]
+        assert evaluated == ([] if ordering == "new_input" else [[release]])
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("stage", ["before", "queued", "inflight"])
 def test_export_reconciliation_is_noncommanding_during_teardown(monkeypatch, stage):
     async def run():

@@ -2149,3 +2149,63 @@ def test_busy_refresh_reconciles_latest_export_state_once_after_command_release(
             assert setup.control.state["expected"]["watts"] == 0
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("poll", ["later", "during_flush", "different_watts", "stale", "earlier", "gateway_pending",
+                                  "planner_pending", "mapping_removed"])
+def test_completed_export_reconciliation_reuses_only_fresh_settled_settings(setup, poll):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        if poll == "planner_pending":
+            await setup.control.execute(action(setup), NOW)
+            # The matching setting was read before dispatch. Only the next
+            # timestamp can confirm this command despite identical watts.
+            setup.states[ENTITY] = limit_state(0, readback=NOW.timestamp() - 1)
+        elif poll == "gateway_pending":
+            setup.states[ENTITY] = limit_state(pending=True)
+        owner = _coordinator_for_runtime_services(entry_data=dict(DATA), options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        setup.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("poll"))
+
+        if poll == "during_flush":
+            async def flush():
+                advance_clock(setup, 1)
+
+            owner.store.async_flush = flush
+
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert not owner._export_reconcile_pending
+        if poll == "planner_pending":
+            assert setup.control.state["pending"]
+
+        if poll == "stale":
+            setup.clock["now"] += timedelta(minutes=11)
+        else:
+            advance_clock(setup, 60)
+        if poll == "different_watts":
+            setup.states[ENTITY] = limit_state(3000, readback=setup.clock["now"].timestamp())
+        elif poll == "earlier":
+            setup.states[ENTITY].attributes["last_successful_readback"] = NOW.timestamp() - 1
+        elif poll == "mapping_removed":
+            owner.entry.data.pop(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+
+        owner._mark_forced_refresh("state_change")
+        await owner._async_update_data()
+        if poll in {"later", "during_flush", "mapping_removed"}:
+            assert owner._export_reconcile_task is None
+            assert not owner._export_reconcile_pending
+        else:
+            assert owner._export_reconcile_pending
+            await owner._export_reconcile_task
+            if poll == "planner_pending":
+                assert "pending" not in setup.control.state
+                assert len(setup.calls) == 1
+
+    asyncio.run(run())

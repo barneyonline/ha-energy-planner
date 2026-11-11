@@ -840,6 +840,9 @@ rules:
 # cover slow dependencies, cancellation, stale completion and durable flushes.
 # tests/test_refresh_timing.py covers telemetry replacing the export completion
 # refresh. tests/test_export_limit.py covers settled export-only startup recovery.
+# Export poll regressions preserve timestamp checks for pending commands and
+# restoration. tests/test_coordinator.py covers HVAC release on both sides of
+# reconciliation completion and invalidation by newer planning inputs.
 # tests/test_daikin_memory.py replays interrupted Off restoration and verifies the
 # complete zone baseline without new scheduler-guard or device writes once Off.
 # external feedback adoption preserves failure pauses until explicit resume.
