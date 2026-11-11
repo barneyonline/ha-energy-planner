@@ -5271,6 +5271,45 @@ def test_auto_start_compensation_noop_does_not_report_charging_interrupted() -> 
     assert store.data["outcomes"][-1].result == OutcomeResult.SKIPPED
 
 
+@pytest.mark.parametrize("confirmed", [True, False])
+def test_auto_start_compensation_dispatches_when_switch_feedback_is_stale(
+    monkeypatch: pytest.MonkeyPatch, confirmed: bool,
+) -> None:
+    charger = "switch.ev_charger"
+    connector = "sensor.ev_connector"
+    plugged = "binary_sensor.ev_connected"
+    hass = FakeHass({charger: "off", connector: "CHARGING", plugged: "on"})
+    original_call = hass.services.async_call
+
+    async def stop(domain, service, data, blocking=False):
+        await original_call(domain, service, data, blocking)
+        if confirmed and service == "turn_off":
+            hass.states.values[connector] = "SUSPENDED_EVSE"
+
+    monkeypatch.setattr(hass.services, "async_call", stop)
+    store = FakeStore()
+    executor = Executor(
+        store,
+        hass=hass,
+        entry_data={CONF_EV_CHARGER: charger, CONF_EV_CHARGING: connector, CONF_EV_CONNECTED: plugged},
+        options={CONF_EV_CONFIRMATION_TIMEOUT_SECONDS: 0, CONF_EV_CONFIRMATION_RETRIES: 0},
+    )
+
+    result = asyncio.run(executor.async_compensate_ev_auto_start(None))
+
+    assert result.command_sent
+    assert result.applied is confirmed
+    assert result.safe_state_confirmed is confirmed
+    assert _device_calls(hass) == [("switch", "turn_off", {"entity_id": charger})] * (1 if confirmed else 2)
+    limits = store.data["command_rate_limits"]
+    assert isinstance(limits["ev:ev_stop"], datetime)
+    assert ("ev_safety_stop_failed_at" in limits) is not confirmed
+    assert any(call[:2] == ("persistent_notification", "create") for call in hass.services.calls) is confirmed
+    outcome = store.data["outcomes"][-1]
+    assert outcome.result == (OutcomeResult.APPLIED if confirmed else OutcomeResult.FAILED)
+    assert outcome.reason == ("ev_charging_stopped_confirmed" if confirmed else "ev_charging_confirmation_timeout")
+
+
 def test_compensated_manual_ev_stop_is_successful() -> None:
     now = datetime.now(UTC)
     hass = FakeHass(
