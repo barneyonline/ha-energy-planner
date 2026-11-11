@@ -12,11 +12,33 @@
 
 ### 🐛 Bug fixes
 
-- Send EV stops promptly when charging feedback shows active charging and the charger switch still reports Off.
-- Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes.
-- Let planning continue while Export Limit reconciliation runs. Keep other device actions and EV safety stops eligible, and retry export restoration when its cooldown expires during reconciliation.
-- Check a reconciled Export Limit plan when turning on Automatic Control or arming production control. Skip export reconciliation for disabled mappings with no retained ownership.
-- Keep production control stopped when an older Enable or Arm request finishes after a newer Disable or Disarm request.
+- None
+
+### 🔧 Improvements
+
+- None
+
+### 🔄 Other changes
+
+- None
+
+## 1.4.14 - 2026-11-11
+
+### 🚧 Breaking changes
+
+- None
+
+### ✨ New features
+
+- None
+
+### 🐛 Bug fixes
+
+- Send EV stops promptly when charging feedback shows active charging and the charger switch still reports Off. ([#181](https://github.com/barneyonline/ha-energy-planner/pull/181))
+- Retain all owned Daikin settings when an Off-start restoration is interrupted. Once the head is confirmed Off, verify recovery without restarting the scheduler guard or changing modes. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Let planning continue while Export Limit reconciliation runs. Keep other device actions and EV safety stops eligible, and retry export restoration when its cooldown expires during reconciliation. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Check a reconciled Export Limit plan when turning on Automatic Control or arming production control. Skip export reconciliation for disabled mappings with no retained ownership. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
+- Keep production control stopped when an older Enable or Arm request finishes after a newer Disable or Disarm request. ([#182](https://github.com/barneyonline/ha-energy-planner/pull/182))
 
 ### 🔧 Improvements
 
