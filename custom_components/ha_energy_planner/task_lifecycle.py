@@ -31,6 +31,7 @@ def _begin_shutdown(self: EnergyPlannerCoordinator) -> None:
     # A refresh task may already be queued even after its timer/listener is
     # cancelled. Suppress its eventual commit until setup is resumed.
     self._tearing_down = True
+    self._production_arm_request = None
     if "history_training" in self.__dict__:
         self.history_training.stop()
     cancel_deferred_notifications_for_entry(

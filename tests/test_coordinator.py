@@ -7489,6 +7489,54 @@ def test_operator_arm_rejects_stale_evidence_without_cancelling_recovery(
     assert coordinator.executor.startup_recovery_dismissals == 0
 
 
+@pytest.mark.parametrize("wait_at", ["startup_cancellation", "arming_save"])
+def test_operator_disarm_wins_after_arming_preflight_has_passed(monkeypatch, wait_at):
+    async def run():
+        coordinator = _coordinator_for_runtime_services(options={
+            CONF_PLANNER_ENABLED: True, CONF_DRY_RUN: True, CONF_EV_CONTROL_ENABLED: True,
+        })
+        coordinator.hass.config_entries = SimpleNamespace(
+            async_update_entry=lambda entry, options: setattr(entry, "options", options),
+        )
+        monkeypatch.setattr(coordinator_module, "build_preflight_report", lambda *args: {"safe_to_activate_now": True})
+        coordinator._async_compensate_ev_auto_start = AsyncMock()
+        paused, resume = asyncio.Event(), asyncio.Event()
+        cancel_startup = coordinator.async_cancel_startup_auto_recovery
+        save_production = coordinator._async_save_production
+
+        async def wait_before_cancel(reason, **kwargs):
+            if reason == "operator_armed":
+                paused.set()
+                await resume.wait()
+            await cancel_startup(reason, **kwargs)
+
+        async def wait_after_save(production):
+            await save_production(production)
+            if production.get("armed"):
+                paused.set()
+                await resume.wait()
+
+        if wait_at == "startup_cancellation":
+            coordinator.async_cancel_startup_auto_recovery = wait_before_cancel
+            arm = asyncio.create_task(coordinator.async_operator_arm_production_control())
+        else:
+            coordinator._async_save_production = wait_after_save
+            arm = asyncio.create_task(coordinator.async_set_active_control(True))
+        try:
+            await asyncio.wait_for(paused.wait(), 1)
+            await coordinator.async_operator_disarm_production_control("later_stop")
+        finally:
+            resume.set()
+            await arm
+
+        assert coordinator.store.data["production"]["armed"] is False
+        assert coordinator.store.data["production"]["disarmed_reason"] == "later_stop"
+        assert coordinator.dry_run
+        coordinator._async_compensate_ev_auto_start.assert_not_awaited()
+
+    asyncio.run(run())
+
+
 def test_home_assistant_shutdown_preserves_persisted_recovery_state() -> None:
     coordinator = _startup_recovery_test_coordinator()
     coordinator.store.data["production"]["startup_auto_recovery"] = {

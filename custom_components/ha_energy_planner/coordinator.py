@@ -421,6 +421,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.entry_update_lock = asyncio.Lock()
         self._options_update_lock = asyncio.Lock()
         self._device_control_lock = asyncio.Lock()
+        self._production_arm_request: object | None = None
         self._command_lock = asyncio.Lock()
         self._last_handled_options = dict(entry.options)
         self._last_control_mode_state = (self.planner_enabled, self.dry_run)
@@ -2831,7 +2832,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         reason: str = "user_acknowledged",
     ) -> None:
         """Apply an explicit operator arm only after current safety validation."""
+        request = self._production_arm_request = object()
         report = await self._async_operator_control_preflight()
+        if self._production_arm_request is not request:
+            return
         if not report.get("safe_to_activate_now"):
             rejection_reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2846,8 +2850,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 restore_owned_state=False,
             )
         finally:
-            await self.async_arm_production_control(reason)
-            await self._async_compensate_ev_auto_start(require_unowned=False)
+            if self._production_arm_request is request:
+                await self.async_arm_production_control(reason)
+                await self._async_compensate_ev_auto_start(require_unowned=False)
 
     async def async_set_active_control(self, enabled: bool) -> None:
         """Enable or safely return from automatic device control as one operation."""
@@ -2857,6 +2862,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options = self.options
         options[CONF_PLANNER_ENABLED] = True
         if not enabled:
+            self._production_arm_request = None
             await self.async_cancel_startup_auto_recovery("automatic_control_disabled")
             options[CONF_DRY_RUN] = True
             self.hass.config_entries.async_update_entry(self.entry, options=options)
@@ -2864,6 +2870,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             await self.async_disarm_production_control("automatic_control_disabled")
             return
 
+        request = self._production_arm_request = object()
         options[CONF_DRY_RUN] = True
         self.hass.config_entries.async_update_entry(self.entry, options=options)
         await self.async_handle_options_update()
@@ -2885,6 +2892,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
 
         report = await self._async_operator_control_preflight()
+        if self._production_arm_request is not request:
+            return
         if not report.get("safe_to_activate_now"):
             reason = _active_control_not_ready_reason(report)
             raise HomeAssistantError(
@@ -2895,6 +2904,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
 
         await self.async_arm_production_control("automatic_control_enabled")
+        if self._production_arm_request is not request:
+            return
         options = self.options
         options[CONF_DRY_RUN] = False
         self.hass.config_entries.async_update_entry(self.entry, options=options)
@@ -3164,6 +3175,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
     async def async_disarm_production_control(self, reason: str = "user_requested") -> None:
         """Disarm production control."""
+        self._production_arm_request = None
         self._clear_ev_auto_start_compensation()
         production = parse_production_state(self.store.data.get("production")).raw
         production.update(
@@ -3197,6 +3209,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         reason: str = "user_requested",
     ) -> None:
         """Cancel startup recovery and apply an explicit operator disarm."""
+        self._production_arm_request = None
         try:
             await self.async_cancel_startup_auto_recovery(
                 "operator_disarmed",

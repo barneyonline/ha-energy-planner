@@ -957,7 +957,7 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
 
 @pytest.mark.parametrize("scenario", [
     "pending", "completed", "completed_with_pause", "competing_refresh", "competing_provisional", "weather_update",
-    "planner_lock_update", "operator_arm", "unavailable",
+    "planner_lock_update", "operator_arm", "arm_then_disarm", "enable_then_disable", "unavailable",
 ])
 def test_operator_control_transition_checks_reconciled_export_plan(setup, monkeypatch, scenario):
     from unittest.mock import Mock
@@ -969,7 +969,9 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
     from custom_components.ha_energy_planner.preflight import build_preflight_report, production_evidence_fingerprint
 
     async def run():
-        opts = {**OPTIONS, CONF_PLANNER_ENABLED: scenario == "operator_arm", CONF_DRY_RUN: True, "ai_enabled": False}
+        arm_only = scenario in {"operator_arm", "arm_then_disarm"}
+        stop_requested = scenario in {"arm_then_disarm", "enable_then_disable"}
+        opts = {**OPTIONS, CONF_PLANNER_ENABLED: arm_only, CONF_DRY_RUN: True, "ai_enabled": False}
         mapping = {**DATA, "weather_entity": "weather.home"} if scenario == "weather_update" else DATA
         owner = _coordinator_for_runtime_services(entry_data=mapping, options=opts, hass=setup.hass)
         owner.store.data["production"] = {
@@ -986,6 +988,7 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
         owner._schedule_debounced_refresh = Mock()
         owner._schedule_plan_execution = Mock()
         release, checked = asyncio.Event(), asyncio.Event()
+        stop_saved = asyncio.Event()
         start_competing_refresh = asyncio.Event()
         preflight_reasons = []
         if scenario == "unavailable":
@@ -996,10 +999,16 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
             }}
 
         save_rate_limits = owner.store.async_save_command_rate_limits
+        save_production = owner.store.async_save_production
 
         async def wait_then_save_rate_limits(value):
             await release.wait()
             await save_rate_limits(value)
+
+        async def record_stop(production):
+            await save_production(production)
+            if production.get("disarmed_reason") and not production.get("armed"):
+                stop_saved.set()
 
         async def competing_refresh():
             await start_competing_refresh.wait()
@@ -1041,6 +1050,7 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
             return build_preflight_report(hass, coordinator)
 
         owner.store.async_save_command_rate_limits = wait_then_save_rate_limits
+        owner.store.async_save_production = record_stop
         owner.async_refresh = owner.async_request_refresh = refresh
         owner._async_weather_forecast = weather
         monkeypatch.setattr(module, "build_preflight_report", preflight)
@@ -1050,13 +1060,19 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
             retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
             forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
         ))
-        if scenario == "operator_arm":
+        if arm_only:
             owner._mark_forced_refresh("state_change")
             await refresh()
             enable = asyncio.create_task(owner.async_operator_arm_production_control())
         else:
             enable = asyncio.create_task(owner.async_set_active_control(True))
         await asyncio.wait_for(checked.wait(), 1)
+        stop = None
+        if stop_requested:
+            stop = asyncio.create_task(
+                owner.async_operator_disarm_production_control() if arm_only else owner.async_set_active_control(False)
+            )
+            await asyncio.wait_for(stop_saved.wait(), 1)
         if scenario != "competing_provisional":
             release.set()
         try:
@@ -1065,6 +1081,8 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
                     await enable
             else:
                 await enable
+            if stop is not None:
+                await stop
         finally:
             if (worker := owner._export_reconcile_task) is not None:
                 await worker
@@ -1072,8 +1090,12 @@ def test_operator_control_transition_checks_reconciled_export_plan(setup, monkey
             "external_export_limit_conflict" if scenario == "completed_with_pause" else "export_reconciliation_pending",
             "export_limit_entity_unavailable" if scenario == "unavailable" else None,
         ]
-        assert owner.store.data["production"]["armed"] is (scenario != "unavailable")
-        assert owner.active_control is (scenario not in {"operator_arm", "unavailable"})
+        armed = not stop_requested and scenario != "unavailable"
+        assert owner.store.data["production"]["armed"] is armed
+        assert owner.active_control is (armed and not arm_only)
+        if stop_requested:
+            assert owner.dry_run
+            assert all(not saved.get("armed") for saved in owner.store.production_saves)
         assert not setup.calls
 
     asyncio.run(run())

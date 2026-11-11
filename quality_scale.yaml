@@ -842,6 +842,7 @@ rules:
 # refresh. tests/test_export_limit.py covers settled export-only startup recovery.
 # The export-only Automatic Control switch and Arm Production Control verify
 # settled preflight evidence after competing refreshes and weather or planner waits.
+# Operator stop tests verify Disable and Disarm supersede pending activation.
 # Coordinator tests cover fingerprint skips for disabled, unowned export mappings.
 # Export poll regressions preserve timestamp checks for pending commands and
 # restoration and keep queued HVAC releases current during settled readbacks.

@@ -55,7 +55,8 @@ and readbacks for pending commands or restorations still request a fresh plan.
 Startup validation and activation wait for shared reconciliation within their
 own refresh, after weather collection. The Automatic Control switch and Arm
 Production Control button and service use that path when their plan is
-provisional. Preflight checks the evidence
+provisional. A newer Disable or Disarm request supersedes an earlier activation
+while preflight or arming is in progress. Preflight checks the evidence
 again under the planner lock and can retry once if it changed while queued. Disabled
 Export Limit mappings with no retained ownership use the normal fingerprint
 shortcut. A provisional
