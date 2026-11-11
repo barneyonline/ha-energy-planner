@@ -883,8 +883,8 @@ def test_export_only_preflight_discovery_and_dry_run_evidence(setup, request, ma
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("in_flight", [False, True])
-def test_export_only_startup_validation_and_activation_wait_for_reconciliation(setup, monkeypatch, in_flight):
+@pytest.mark.parametrize("scenario", ["settled", "in_flight", "changed_feedback"])
+def test_export_only_startup_validation_and_activation_wait_for_reconciliation(setup, monkeypatch, scenario):
     from unittest.mock import Mock
 
     from test_coordinator import _coordinator_for_runtime_services
@@ -912,9 +912,11 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
             if validating or active:
                 assert not owner._planner_lock.locked()
             checks.append((validating, active))
-            if in_flight and len(checks) == 1:
+            if scenario == "in_flight" and len(checks) == 1:
                 first_flush.set()
                 await release_first_flush.wait()
+            elif scenario == "changed_feedback":
+                setup.states[ENTITY] = limit_state(0)
             await asyncio.sleep(0)
 
         owner.store.async_flush = flush
@@ -929,17 +931,23 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
             retained_hvac_tariff_slots=lambda ctx: None, thermal_sample=lambda built: {},
             forecast_training_slots=[], forecast_calibration={}, load_forecast_details={},
         ))
-        if in_flight:
+        if scenario == "in_flight":
             await owner._async_update_data()
             await asyncio.wait_for(first_flush.wait(), 1)
             owner._schedule_plan_execution.reset_mock()
         validation = asyncio.create_task(owner._async_run_startup_auto_recovery_validation())
         await asyncio.sleep(0)
         release_first_flush.set()
-        assert await validation == (True, "validation_succeeded")
+        result = await validation
         owner._schedule_plan_execution.assert_not_called()
+        if scenario == "changed_feedback":
+            assert result[0] is False and not owner.active_control
+            assert owner._export_reconcile_pending
+            owner._schedule_debounced_refresh.assert_not_called()
+            return
+        assert result == (True, "validation_succeeded")
         assert await owner._async_reactivate_after_startup_recovery(3) == (True, "automatic_control_reactivated")
-        assert checks == ([(False, False)] if in_flight else []) + [(True, False), (False, True)]
+        assert checks == ([(False, False)] if scenario == "in_flight" else []) + [(True, False), (False, True)]
         assert owner.data.control_area_health[EXPORT_ASSET]["ready"]
         assert owner.active_control
         assert not setup.calls
@@ -2207,5 +2215,70 @@ def test_completed_export_reconciliation_reuses_only_fresh_settled_settings(setu
             if poll == "planner_pending":
                 assert "pending" not in setup.control.state
                 assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("timer_fired", [False, True])
+def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypatch, timer_fired):
+    from unittest.mock import AsyncMock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+
+    async def run():
+        await setup.control.execute(action(setup), NOW)
+        setup.states[ENTITY] = limit_state(0)
+        await setup.control.reconcile(NOW)
+        await setup.control.save({**setup.control.state, "restoring": True})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store.data = setup.store.data
+        owner.store.async_add_outcome = setup.store.async_add_outcome
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("cooldown"))
+        owner.async_request_refresh = owner._async_update_data
+        owner._listener_tasks = set()
+        owner._export_boundary_cancel = None
+        setup.hass.async_create_task = asyncio.create_task
+        timers = []
+        monkeypatch.setattr(module, "async_call_later", lambda hass, delay, callback: (
+            timers.append(callback) or (lambda: None)))
+        first_flush, finish = asyncio.Event(), asyncio.Event()
+
+        async def flush():
+            if not first_flush.is_set():
+                first_flush.set()
+                await finish.wait()
+            await setup.store.async_flush()
+
+        owner.store.async_flush = flush
+        boundary = NOW + timedelta(seconds=300)
+        owner._schedule_export_boundary({"deferred": True, "next_eligible_change_at": boundary.isoformat()})
+        await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        await asyncio.wait_for(first_flush.wait(), 1)
+        assert len(setup.calls) == 1
+
+        setup.clock["now"] = boundary  # The original gateway readback is still fresh.
+        if timer_fired:
+            timers.pop()(None)
+            await asyncio.gather(*owner._listener_tasks)
+            assert owner._export_reconcile_task is worker
+        else:
+            # Input collection can replace a timer before its callback runs.
+            owner._schedule_export_boundary({})
+            timers.clear()
+        finish.set()
+        await worker
+        assert owner._export_reconcile_pending
+        assert len(timers) == 1
+
+        setup.mode["value"] = "confirm"
+        timers.pop()(None)
+        await asyncio.gather(*owner._listener_tasks)
+        if owner._export_reconcile_task is not None:
+            await owner._export_reconcile_task
+        assert len(setup.calls) == 2
+        assert not setup.control.state
 
     asyncio.run(run())

@@ -9771,6 +9771,10 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
             else:
                 assert coordinator._export_reconcile_pending
                 await coordinator._export_reconcile_task
+        elif change == "reconfigure":
+            coordinator._schedule_debounced_refresh.assert_called_once_with(
+                "export_reconciliation_changed", debounce_seconds=0, force=True,
+            )
         else:
             coordinator._schedule_debounced_refresh.assert_not_called()
 
@@ -9778,22 +9782,54 @@ def test_slow_export_reconciliation_does_not_block_refresh_with_idle_command_loc
 
 
 @pytest.mark.parametrize("release_due", [False, True])
-def test_failed_export_preflight_keeps_planned_hvac_release_eligible(release_due):
+def test_failed_export_preflight_keeps_other_device_actions_eligible(release_due):
     coordinator = _coordinator_for_runtime_services()
     coordinator._export_reconcile_pending = True
     coordinator._async_execute_plan_if_current = AsyncMock()
     plan = _plan("release")
     export = _coordinated_action(plan, "export", ActionAsset.ENPHASE_EXPORT_LIMIT, ActionKind.RESTORE_EXPORT_LIMIT)
     release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
-    plan.actions = [export, release] if release_due else [export]
+    ev = _coordinated_action(plan, "ev", ActionAsset.EV, ActionKind.EV_START)
+    plan.actions = [export, ev, release] if release_due else [export, ev]
     coordinator._pending_plan_execution = (coordinator._refresh_generation, plan, object(), {})
     asyncio.run(coordinator._async_drain_plan_execution())
     execute = coordinator._async_execute_plan_if_current
-    if release_due:
-        execute.assert_awaited_once()
-        assert execute.await_args.args[1].actions == [release]
-    else:
-        execute.assert_not_awaited()
+    execute.assert_awaited_once()
+    assert execute.await_args.args[1].actions == ([ev, release] if release_due else [ev])
+
+
+def test_pending_export_does_not_suppress_owned_ev_safety_stop():
+    from test_executor import FakeHass as ExecutorHass
+    from test_executor import FakeStore as ExecutorStore
+    from test_executor import _context
+
+    from custom_components.ha_energy_planner.executor import Executor
+
+    async def run():
+        now = datetime.now(UTC)
+        hass = ExecutorHass({"binary_sensor.ev_connected": "on", "input_boolean.ev_charger": "off"})
+        entry_data = {
+            CONF_EV_CONNECTED: "binary_sensor.ev_connected",
+            CONF_EV_CHARGER: "input_boolean.ev_charger",
+            "enphase_export_limit_entity": "select.export",
+        }
+        owner = _coordinator_for_runtime_services(entry_data=entry_data, hass=hass)
+        owner.store = ExecutorStore()
+        owner.store.async_save_calendar_events = AsyncMock()
+        owner.executor = Executor(owner.store, hass=hass, entry_data=entry_data, options=owner.options)
+        context = _context(now)
+        assert (await owner.executor.async_manual_ev_charging(True, context)).applied
+        assert hass.states.values["input_boolean.ev_charger"] == "on"
+        hass.states.values["binary_sensor.ev_connected"] = "off"
+        context.ev_connected = False
+        plan = _plan("owned-stop")
+        plan.created_at = now
+        owner._export_reconcile_pending = True
+        owner._pending_plan_execution = (owner._refresh_generation, plan, context, owner.options)
+        await owner._async_drain_plan_execution()
+        assert hass.states.values["input_boolean.ev_charger"] == "off"
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("ordering", ["completion_first", "release_first", "new_input"])

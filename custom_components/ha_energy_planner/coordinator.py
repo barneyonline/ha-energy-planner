@@ -128,7 +128,6 @@ from .inputs import InputManager
 from .load_forecast import normalize_power_kw
 from .models import (
     ActionAsset,
-    ActionKind,
     ActionOutcome,
     DecisionContext,
     EnergyPlan,
@@ -326,6 +325,7 @@ class _ExportReconciliationInputs:
     enabled: bool
     change_interval: float
     startup_validation: bool
+    restore_deferred: bool
 
 
 class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
@@ -441,7 +441,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._export_reconcile_task: asyncio.Task[None] | None = None
         self._export_reconcile_pending = False
         self._export_reconciled_for: _ExportReconciliationInputs | None = None
-        self._export_completion_generations: tuple[int, int] | None = None
+        self._export_replan_generations: tuple[int, int] | None = None
         self._last_export_reconciliation: dict[str, Any] = {}
         self._refresh_request_timing: tuple[str, float, asyncio.Task[Any] | None] | None = None
         self._debounce_requested_at: float | None = None
@@ -1520,19 +1520,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # the middle of publishing this completion.
             timing.stage("planner_lock_wait_ms")
             async with self._planner_lock:
-                if (not getattr(self, "_tearing_down", False)
-                        and self._export_reconciliation_matches(observed_inputs)):
-                    previous_generation = self._refresh_generation
-                    if schedule_followup:
-                        self._schedule_debounced_refresh("export_reconciled", debounce_seconds=0, force=True)
-                    else:
-                        self._mark_replan_requested(force=True)
-                    self._export_completion_generations = (previous_generation, self._refresh_generation)
-                    self._export_reconciled_for = observed_inputs
-                    self._export_reconcile_pending = False
-                    succeeded = True
-                # Changed feedback/configuration leaves readiness closed for
-                # the next input or boundary refresh, like a failed attempt.
+                if not getattr(self, "_tearing_down", False):
+                    settled = self._export_reconciliation_matches(observed_inputs)
+                    # The waking refresh may have found this job in flight.
+                    # Retry changed feedback or an elapsed cooldown boundary.
+                    if schedule_followup or settled:
+                        previous_generation = self._refresh_generation
+                        if schedule_followup:
+                            trigger = "export_reconciled" if settled else "export_reconciliation_changed"
+                            self._schedule_debounced_refresh(trigger, debounce_seconds=0, force=True)
+                        else:
+                            self._mark_replan_requested(force=True)
+                        self._export_replan_generations = (previous_generation, self._refresh_generation)
+                    if settled:
+                        self._export_reconciled_for = observed_inputs
+                        self._export_reconcile_pending = False
+                        succeeded = True
         except Exception as error:
             _LOGGER.warning("Deferred export reconciliation failed (%s)", type(error).__name__)
             # Keep the gate closed. The next normal refresh retries, without
@@ -1548,12 +1551,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         entity = combined_entry_data(self.entry).get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
         if not entity:
             return None
-        observed, issue = export_limit_feedback(self.hass, entity, dt_util.utcnow())
+        now = dt_util.utcnow()
+        observed, issue = export_limit_feedback(self.hass, entity, now)
         options = self.options
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        restore_deferred = bool(ownership.get("restoring")) and cooldown_status(
+            self.store.data, observed.get("identity"), options, now,
+        ).get("deferred") is True
         return _ExportReconciliationInputs(
             entity, observed, issue, observed.pop("last_readback", None), self.active_control,
             options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True, export_change_interval(options),
             getattr(self, "_startup_auto_recovery_validation_active", False),
+            restore_deferred,
         )
 
     def _export_reconciliation_matches(self, settled: _ExportReconciliationInputs | None) -> bool:
@@ -3360,16 +3369,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     if getattr(self, "_tearing_down", False):
                         continue
                     superseded = started_generation != self._refresh_generation
-                    if superseded and not self._generation_changed_only_by_export_completion(started_generation):
+                    if superseded and not self._generation_changed_only_by_export_replan(started_generation):
                         continue
                     if superseded or getattr(self, "_export_reconcile_pending", False):
-                        # Export reconciliation only supersedes actions that
-                        # need the reconciled plan. Keep due HVAC releases, with
-                        # the usual checks against any newer planning inputs.
-                        releases = [action for action in plan.actions if action.kind == ActionKind.RELEASE_HVAC]
-                        if not releases:
-                            continue
-                        plan = replace(plan, actions=releases)
+                        # Export readiness does not change other device actions.
+                        # Even an empty action list lets the executor check for
+                        # a planner-owned EV safety stop using current evidence.
+                        plan = replace(plan, actions=[
+                            action for action in plan.actions if action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT
+                        ])
                     try:
                         await self._async_execute_plan_if_current(
                             started_generation,
@@ -3392,8 +3400,8 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         finally:
             self._plan_execution_task = None
 
-    def _generation_changed_only_by_export_completion(self, started_generation: int) -> bool:
-        return (started_generation, self._refresh_generation) == getattr(self, "_export_completion_generations", None)
+    def _generation_changed_only_by_export_replan(self, started_generation: int) -> bool:
+        return (started_generation, self._refresh_generation) == getattr(self, "_export_replan_generations", None)
 
     async def _async_execute_plan_if_current(
         self,
@@ -3403,11 +3411,11 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         options: dict[str, Any],
     ) -> None:
         """Execute one current plan, stopping between actions when it becomes stale."""
-        releases_only = bool(plan.actions) and all(action.kind == ActionKind.RELEASE_HVAC for action in plan.actions)
+        independent_of_export = all(action.asset != ActionAsset.ENPHASE_EXPORT_LIMIT for action in plan.actions)
 
         def is_current() -> bool:
             return started_generation == self._refresh_generation or (
-                releases_only and self._generation_changed_only_by_export_completion(started_generation)
+                independent_of_export and self._generation_changed_only_by_export_replan(started_generation)
             )
 
         if getattr(self, "_tearing_down", False) or not is_current():

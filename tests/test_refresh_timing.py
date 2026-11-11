@@ -348,7 +348,12 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
         else:
             await worker
         await executor
-        coordinator._async_execute_plan_if_current.assert_not_awaited()
+        execute = coordinator._async_execute_plan_if_current
+        if result == "shutdown":
+            execute.assert_not_awaited()
+        else:
+            execute.assert_awaited_once()
+            assert execute.await_args.args[1].actions == []
         assert coordinator._export_reconcile_task is None
         if result in {"failure", "cancel"}:
             assert coordinator._export_reconcile_pending is True
@@ -368,11 +373,11 @@ def test_deferred_reconciliation_coalesces_and_gates_execution(monkeypatch, resu
             assert reconcile.await_count == (0 if result == "mapping_removed" else 1)
         assert coordinator._last_export_reconciliation["duration_ms"] >= 0
         if result == "success":
-            # Exactly one current plan can execute after reconciliation and
-            # fresh planning; stale/pending-era work was dropped above.
-            coordinator._pending_plan_execution = (coordinator._refresh_generation, _plan("fresh"), object(), {})
+            # The settled plan uses the ordinary execution path.
+            fresh = _plan("fresh")
+            coordinator._pending_plan_execution = (coordinator._refresh_generation, fresh, object(), {})
             await coordinator._async_drain_plan_execution()
-            coordinator._async_execute_plan_if_current.assert_awaited_once()
+            assert execute.await_args.args[1] is fresh
 
     asyncio.run(scenario())
 
