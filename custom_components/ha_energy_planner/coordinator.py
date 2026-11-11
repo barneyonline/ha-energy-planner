@@ -121,7 +121,7 @@ from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
 from .export_limit_cooldown import cooldown_status
 from .export_limit_cooldown import interval as export_change_interval
-from .export_limit_policy import EXPORT_ASSET, area_safe, block_time
+from .export_limit_policy import EXPORT_ASSET, area_safe, block_time, confirmed_feedback
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .forecasts import MAX_FORECAST_SOURCE_ROWS
 from .inputs import InputManager
@@ -782,7 +782,10 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             ]
             entity_id = str(event.data.get("entity_id") or "")
             if entity_id in {entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_feedback_entity}:
-                self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
+                if entity_id != export_feedback_entity or not self._only_export_readback_advanced(
+                    event.data.get("old_state"), event.data.get("new_state"), now,
+                ):
+                    self._schedule_debounced_refresh("export_limit_feedback", debounce_seconds=0, force=True)
                 return
             is_main_climate = entity_id == entry_data.get(CONF_DAIKIN_CLIMATE)
             is_hvac = is_main_climate or entity_id in _split_entity_values(entry_data.get(CONF_CLIMATE_ZONES))
@@ -1581,6 +1584,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             and current.last_readback >= settled.last_readback
             and settled == replace(current, last_readback=settled.last_readback)
         )
+
+    def _only_export_readback_advanced(self, old_state: Any, new_state: Any, now: datetime) -> bool:
+        """Keep queued plans current when a poll only corroborates settled settings."""
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        if ownership.get("pending") or ownership.get("restoring"):
+            return False
+        previous, previous_issue = confirmed_feedback(old_state, now)
+        current, current_issue = confirmed_feedback(new_state, now)
+        if previous_issue is not None or current_issue is not None or current["pending"]:
+            return False
+        return current.pop("last_readback") > previous.pop("last_readback") and current == previous
 
     async def _async_reconcile_export_limit(
         self, timing: RefreshTiming | None = None,

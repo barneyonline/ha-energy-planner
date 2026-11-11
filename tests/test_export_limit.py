@@ -1126,6 +1126,62 @@ def test_feedback_attribute_change_requests_fresh_plan(setup, monkeypatch):
     assert requests[-1][1]["force"]
 
 
+@pytest.mark.parametrize("poll", ["later", "changed_watts", "stale_recovery", "backward", "gateway_pending",
+                                  "planner_pending", "restoring"])
+def test_export_feedback_poll_keeps_queued_release_current_only_for_settled_settings(setup, monkeypatch, poll):
+    from test_coordinator import _coordinated_action, _coordinator_for_runtime_services, _plan
+
+    from custom_components.ha_energy_planner import coordinator as module
+    from custom_components.ha_energy_planner.models import ActionAsset
+
+    async def run():
+        callbacks = []
+        monkeypatch.setattr(module, "async_track_state_change_event", lambda hass, ids, callback: (
+            callbacks.append(callback) or (lambda: None)))
+        monkeypatch.setattr(module, "async_call_later", lambda *args: lambda: None)
+        setup.hass.async_create_task = asyncio.create_task
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        if poll in {"planner_pending", "restoring"}:
+            key = "pending" if poll == "planner_pending" else "restoring"
+            owner.store.data["ownership"] = {EXPORT_ASSET: {key: True}}
+        if poll == "stale_recovery":
+            setup.states[ENTITY] = limit_state(readback=NOW.timestamp() - 601)
+        owner.async_start_listeners()
+
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def reconcile():
+            started.set()
+            await finish.wait()
+
+        owner._async_reconcile_export_limit_locked = reconcile
+        worker = owner._admit_export_reconciliation()
+        await asyncio.wait_for(started.wait(), 1)
+        plan = _plan("queued-release-during-poll")
+        plan.created_at = NOW
+        release = _coordinated_action(plan, "release", ActionAsset.DAIKIN, ActionKind.RELEASE_HVAC)
+        plan.actions = [release]
+        owner._pending_plan_execution = (owner._refresh_generation, plan, object(), {})
+        drain = asyncio.create_task(owner._async_drain_plan_execution())
+        await asyncio.sleep(0)
+        assert not drain.done()
+
+        old = setup.states[ENTITY]
+        setup.clock["now"] += timedelta(seconds=60)
+        new = limit_state(
+            3000 if poll == "changed_watts" else None,
+            pending=poll == "gateway_pending",
+            readback=NOW.timestamp() - 1 if poll == "backward" else setup.clock["now"].timestamp(),
+        )
+        setup.states[ENTITY] = new
+        callbacks[0](SimpleNamespace(data={"entity_id": ENTITY, "old_state": old, "new_state": new}))
+        finish.set()
+        await asyncio.wait_for(asyncio.gather(worker, drain), 1)
+        assert [item.actions for item, _ in owner.executor.evaluated] == ([[release]] if poll == "later" else [])
+
+    asyncio.run(run())
+
+
 def test_independent_toggle_and_explicit_resume(setup, monkeypatch):
     from unittest.mock import AsyncMock
 

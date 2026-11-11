@@ -841,8 +841,9 @@ rules:
 # tests/test_refresh_timing.py covers telemetry replacing the export completion
 # refresh. tests/test_export_limit.py covers settled export-only startup recovery.
 # Export poll regressions preserve timestamp checks for pending commands and
-# restoration. tests/test_coordinator.py covers HVAC release on both sides of
-# reconciliation completion and invalidation by newer planning inputs.
+# restoration and keep queued HVAC releases current during settled readbacks.
+# tests/test_coordinator.py covers HVAC release on both sides of reconciliation
+# completion and invalidation by newer planning inputs.
 # Coordinator and export tests verify independent EV safety stops and preserve
 # a cooldown wakeup that arrives during reconciliation.
 # tests/test_daikin_memory.py replays interrupted Off restoration and verifies the

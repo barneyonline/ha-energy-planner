@@ -48,7 +48,10 @@ the plan generation. Stable reconciliation requests one coalesced fresh refresh.
 plan can use the settled result once while the export inputs still match, even
 if a telemetry event replaced the scheduled refresh. A newer readback timestamp
 alone keeps fresh, unchanged settings eligible for reuse when no command or
-restoration remains unresolved. Startup validation and
+restoration remains unresolved. These settled polls also leave queued plans
+current. A fresh readback after an outage or stale period, a settings change,
+and readbacks for pending commands or restorations still request a fresh plan.
+Startup validation and
 activation wait for the shared reconciliation before planning. A provisional
 plan does not count toward the dry-run arming requirement. If feedback or the
 cooldown boundary changed during reconciliation, one coalesced follow-up
