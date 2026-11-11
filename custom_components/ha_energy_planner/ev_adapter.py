@@ -27,6 +27,7 @@ from .ev_policy import finite, power_capability
 from .ev_runtime import timestamp
 from .ev_telemetry import measured, reported_at
 from .models import ActionKind, PlanAction
+from .vehicles import connection
 
 
 @dataclass(slots=True)
@@ -372,7 +373,7 @@ class EVChargerAdapter:
                         enabled,
                         control_state=confirmation_entity is not None,
                         valid_until=valid_until,
-                        confirm_stop=stop_feedback_required,
+                        stop_control=entity_id if stop_feedback_required else None,
                     )
                     if confirmation == "expired":
                         return await self._async_confirmation_failure(
@@ -430,7 +431,7 @@ class EVChargerAdapter:
                 enabled,
                 control_state=confirmation_entity is not None,
                 valid_until=valid_until,
-                confirm_stop=stop_feedback_required,
+                stop_control=entity_id if stop_feedback_required else None,
             )
             if confirmation == "expired":
                 return await self._async_confirmation_failure(
@@ -497,27 +498,23 @@ class EVChargerAdapter:
 
     def _existing_state_proves_safe(self) -> bool:
         """Return whether an off control and inactive or unplugged feedback prove safety."""
-        persistent_control = self._keep_on_entity()
-        if not persistent_control or persistent_control.split(".", 1)[0] not in {
-            "switch",
-            "input_boolean",
-        }:
-            return False
-        control_state = self._state(persistent_control)
-        if control_state is None or not _control_state_matches(control_state, False):
-            return False
-
-        connected_entity = self.entry_data.get(CONF_EV_CONNECTED)
-        connected_state = self._state(connected_entity) if connected_entity else None
-        disconnected = self.connected_override is False or (
-            connected_state is not None and not _truthy_state(connected_state)
+        return self._control_is_off(self._stop_entity()) and self._charging_has_stopped(
+            self._state(self.entry_data.get(CONF_EV_CHARGING))
         )
-        if disconnected:
-            return True
 
-        charging_entity = self.entry_data.get(CONF_EV_CHARGING)
-        charging_state = self._state(charging_entity) if charging_entity else None
-        return charging_state is not None and ev_charging_state(charging_state.state) is False
+    def _control_is_off(self, entity_id: str | None) -> bool:
+        if not entity_id or entity_id.split(".", 1)[0] not in {"switch", "input_boolean"}:
+            return False
+        state = self._state(entity_id)
+        return state is not None and _control_state_matches(state, False)
+
+    def _charging_has_stopped(self, charging_state: State | None) -> bool:
+        connected_state = self._state(self.entry_data.get(CONF_EV_CONNECTED))
+        return (
+            self.connected_override is False
+            or connection(getattr(connected_state, "state", None)) is False
+            or (charging_state is not None and _charging_state_matches(charging_state, False) is True)
+        )
 
     def _charging_feedback_is_active(self) -> bool:
         state = self._state(self.entry_data.get(CONF_EV_CHARGING))
@@ -525,17 +522,17 @@ class EVChargerAdapter:
 
     async def _async_confirm_state(
         self, entity_id: str, enabled: bool, *, control_state: bool = False, valid_until: datetime | None = None,
-        confirm_stop: bool = False,
+        stop_control: str | None = None,
     ) -> str:
         """Wait for charging feedback or a stateful control to match the request."""
+        if stop_control is not None:
+            return await self._async_confirm_stop(stop_control, entity_id, extend_for_control=True)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.confirmation_timeout_seconds
         while True:
             remaining_lease = (valid_until - dt_util.utcnow()).total_seconds() if valid_until is not None else None
             if remaining_lease is not None and remaining_lease <= 0:
                 return "expired"
-            if confirm_stop and self._existing_state_proves_safe():
-                return "confirmed"
             state = self._state(entity_id)
             if state is None:
                 return "unavailable"
@@ -544,12 +541,34 @@ class EVChargerAdapter:
             matches = (
                 _control_state_matches(state, enabled) if control_state else _charging_state_matches(state, enabled)
             )
-            if not confirm_stop and matches is True:
+            if matches is True:
                 return "confirmed"
             if loop.time() >= deadline:
                 return "timeout"
             await asyncio.sleep(min(self.confirmation_poll_seconds, max(deadline - loop.time(), 0.0),
                                     remaining_lease if remaining_lease is not None else self.confirmation_poll_seconds))
+
+    async def _async_confirm_stop(
+        self, control_entity: str, charging_entity: str | None, *, extend_for_control: bool,
+    ) -> str:
+        """Require both stop signals together and allow their updates to arrive separately."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.confirmation_timeout_seconds
+        waiting_for_control = False
+        while True:
+            charging_state = self._state(charging_entity)
+            charging_stopped = self._charging_has_stopped(charging_state)
+            if charging_stopped:
+                if self._control_is_off(control_entity):
+                    return "confirmed"
+                if extend_for_control and not waiting_for_control:
+                    # Preserve the switch's readback window once charging stops.
+                    waiting_for_control = True
+                    deadline = loop.time() + self.confirmation_timeout_seconds
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return "unavailable" if charging_state is None and not charging_stopped else "timeout"
+            await asyncio.sleep(min(self.confirmation_poll_seconds, remaining))
 
     async def _async_confirmation_failure(
         self,
@@ -577,16 +596,10 @@ class EVChargerAdapter:
                 entity_ids={command_entity_id},
             )
         if not attempted:
-            # Remember active feedback even if the switch goes off or the
-            # charging entity drops out during the compensating command.
-            stop_feedback_required = stop_feedback_required or (
-                not requested_enabled and self._charging_feedback_is_active()
+            attempted, restored = await self._async_issue_safe_stop(
+                check_active_feedback=not requested_enabled,
+                require_stopped_feedback=stop_feedback_required,
             )
-            attempted, restored = await self._async_issue_safe_stop()
-            if restored and (stop_feedback_required or (
-                not requested_enabled and self._charging_feedback_is_active()
-            )):
-                restored = self._existing_state_proves_safe()
         post_state = {**self._snapshot(), **refusal}
         return EVCommandResult(
             False,
@@ -636,14 +649,26 @@ class EVChargerAdapter:
             restored = restored and confirmed
         return attempted, attempted and restored
 
-    async def _async_issue_safe_stop(self) -> tuple[bool, bool]:
+    async def _async_issue_safe_stop(
+        self, *, check_active_feedback: bool, require_stopped_feedback: bool,
+    ) -> tuple[bool, bool]:
         """Confirm the charger switch is off after an uncertain command."""
         stop_entity = self._stop_entity()
         if not stop_entity:
             return False, False
+        # Retain positive feedback even if the charging entity drops out during dispatch.
+        require_stopped_feedback = require_stopped_feedback or (
+            check_active_feedback and self._charging_feedback_is_active()
+        )
         result = await self._async_call_control(stop_entity, turn_on=False, force=True)
-        return (result.command_sent or result.applied,
-                result.applied and await self._async_control_proves_safe(stop_entity))
+        if not (result.command_sent or result.applied):
+            return False, False
+        if require_stopped_feedback or (check_active_feedback and self._charging_feedback_is_active()):
+            confirmation = await self._async_confirm_stop(
+                stop_entity, self.entry_data.get(CONF_EV_CHARGING), extend_for_control=False,
+            )
+            return True, confirmation == "confirmed"
+        return True, result.applied and await self._async_control_proves_safe(stop_entity)
 
     async def _async_write_number(
         self, entity_id: str, value: float, *, valid_until: datetime | None = None,
@@ -948,6 +973,8 @@ def _truthy_state(state: State) -> bool:
 
 def _charging_state_matches(state: State, enabled: bool) -> bool | None:
     """Return whether a charging-feedback state confirms the requested state."""
+    if not enabled and str(state.state).strip().lower() == "finishing":
+        return True
     charging = ev_charging_state(state.state)
     return None if charging is None else charging is enabled
 

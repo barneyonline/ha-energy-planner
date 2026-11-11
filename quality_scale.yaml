@@ -833,7 +833,8 @@ rules:
 # Evidence: tests/test_coordinator.py, tests/test_executor.py, tests/test_vehicles.py.
 # ev_adapter.py dispatches a stop immediately when active charging precedes
 # switch feedback and rechecks safe state before retries. tests/test_ev_adapter.py
-# covers first dispatch timing, readback and session changes. tests/test_executor.py
+# covers first dispatch timing, explicit unplug and Finishing evidence, delayed
+# switch and compensation readback, and session changes. tests/test_executor.py
 # verifies auto-start compensation accounting and backoff when the stop stays unconfirmed.
 # coordinator.py avoids planner/command lock inversion and refresh under command
 # ownership. Boundary callbacks publish clock-dependent status while refresh waits.

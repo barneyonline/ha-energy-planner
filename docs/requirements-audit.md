@@ -430,9 +430,12 @@ use throughout; the Docker and pull-request gates enforce that result.
   active charging feedback precedes the switch update. It rechecks the switch
   and connection before retrying. For these stops, Off must be accompanied by
   inactive charging or verified unplug feedback, including after compensation.
+  Stopped `Finishing` feedback is accepted with Off. Unknown connection values
+  cannot prove unplug, and confirmation allows time for the switch and charging
+  feedback to update separately.
   `tests/test_ev_adapter.py` uses a virtual clock to cover the dispatch time
   with one and zero retries, feedback settling, unavailable readings, service
-  failure and session changes. `tests/test_executor.py` verifies that the
+  failure, delayed compensation readback and session changes. `tests/test_executor.py` verifies that the
   auto-start compensation records the command and retains backoff on failure.
   Planner and manual starts establish that expectation immediately before the
   service boundary and retain it only when a start command may have taken effect,

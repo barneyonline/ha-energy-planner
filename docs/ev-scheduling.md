@@ -235,8 +235,12 @@ reports Off. Charging feedback can arrive before the switch update. The planner
 checks again before retrying and skips writes when the switch is Off and
 feedback shows charging has stopped or the vehicle is unplugged. A stop
 dispatched against active charging feedback requires both an Off switch and
-stopped or unplugged feedback for confirmation. Unconfirmed automatic stops
-retain the existing failure backoff.
+stopped or unplugged feedback for confirmation. The switch has its own
+confirmation window once stopped feedback arrives. Brief gaps in charging
+feedback can settle within the confirmation window, including after a
+compensating stop. `Finishing` is stopped feedback. A plug sensor state must
+explicitly report a disconnect to serve as unplugged evidence. Unconfirmed
+automatic stops retain the existing failure backoff.
 
 ## Vehicle suspension and waiting
 
