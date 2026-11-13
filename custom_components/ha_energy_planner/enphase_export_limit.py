@@ -3,17 +3,27 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from datetime import UTC, datetime
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from aiohttp import ClientResponseError, ServerDisconnectedError
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 
-from .adapter_helpers import DeviceTargetUnavailable, async_call_device_service
-from .const import CONF_AMBER_EXPORT_PRICE, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
+from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
+from .adapter_helpers import DEVICE_SERVICE_TIMEOUT_SECONDS, DeviceTargetUnavailable, async_call_device_service
+from .const import (
+    CONF_AMBER_EXPORT_PRICE,
+    CONF_DRY_RUN,
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
+    CONF_ENPHASE_EXPORT_LIMIT_ENTITY,
+    CONF_PLANNER_ENABLED,
+)
 from .export_limit_cooldown import (
+    MIN_CHANGE_SECONDS,
     control_key,
     cooldown_status,
     interval,
@@ -22,8 +32,156 @@ from .export_limit_cooldown import (
     same_control,
     valid_stamp,
 )
-from .export_limit_policy import EXPORT_ASSET, READBACK_MAX_AGE, confirmed_feedback, tariff_blocks
+from .export_limit_policy import EXPORT_ASSET, READBACK_MAX_AGE, aware_time, confirmed_feedback, tariff_blocks
 from .models import ActionAsset, ActionKind, ActionOutcome, OutcomeResult, PlanAction
+from .safety import parse_production_state
+
+UNAVAILABLE_REJECTION = "export_limit_service_rejected:installer_or_gateway_unavailable"
+UPSTREAM_CONTROLS_DISABLED = "export_limit_upstream_controls_disabled"
+INSTALLER_FORM_MISMATCH = "export_limit_service_rejected:installer_form_mismatch"
+INSTALLER_SESSION_EXPIRED = "export_limit_service_rejected:installer_session_expired"
+RETRY_DEFERRED_REASONS = {
+    EXPORT_ACTION_CAP_REACHED,
+    "external_export_limit_changed",
+    "export_limit_already_desired",
+    "export_limit_entity_unavailable",
+    "export_limit_pending",
+    "export_limit_retry_interrupted",
+    "export_limit_retry_not_sent",
+    "export_limit_retry_readback_changed",
+    "export_limit_target_changed",
+    "export_tariff_changed",
+    "export_tariff_expired",
+}
+MAX_RETRY_ATTEMPTS = 3
+RETRY_INTERVAL = timedelta(seconds=MIN_CHANGE_SECONDS)
+_OPERATOR_PAUSES = {
+    UNAVAILABLE_REJECTION,
+    UPSTREAM_CONTROLS_DISABLED,
+    "export_limit_service_rejected",
+    "export_limit_service_rejected:controls_disabled",
+    INSTALLER_FORM_MISMATCH,
+    INSTALLER_SESSION_EXPIRED,
+    "export_limit_unsupported",
+}
+
+
+class RetryWriteDeferred(ServiceValidationError):
+    """Planner withdrew authority at the provider's pre-write boundary."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def preserve_retry_on_reload(state: dict[str, Any], target: dict[str, str] | None) -> bool:
+    """Keep a same-target operator blocker as well as a resumable retry."""
+    if state.get("retry", {}).get("state") == "operator_required" and state.get("pause"):
+        identity = state.get("identity")
+        return bool(target and identity and same_control(identity, target))
+    return resumable_retry(state, target)
+
+
+RetryApply = Callable[[int | None, Callable[[], None]], Awaitable[object]]
+
+
+def resumable_retry(state: dict[str, Any], target: dict[str, str] | None) -> bool:
+    """Return whether a recovery episode can continue after a lifecycle handoff."""
+    identity = state.get("identity")
+    if (not target or not identity or not same_control(identity, target)
+            or state.get("restoring") or state.get("pending")):
+        return False
+    retry = state.get("retry")
+    if not isinstance(retry, dict):
+        return False
+    attempts = retry.get("attempts")
+    if type(attempts) is not int or not 0 <= attempts <= MAX_RETRY_ATTEMPTS:
+        return False
+    if retry.get("state") == "ready":
+        return not state.get("pause")
+    return (
+        state.get("pause") == UNAVAILABLE_REJECTION
+        and aware_time(retry.get("next_attempt_at")) is not None
+        and (retry.get("state") == "checking" or (
+            retry.get("state") == "scheduled" and attempts < MAX_RETRY_ATTEMPTS
+        ))
+    )
+
+
+def _temporary_rejection(error: ServiceValidationError) -> bool:
+    """Recognize Enphase's explicitly chained pre-write availability errors."""
+    cause = error.__cause__
+    return (
+        error.translation_domain == "enphase_ev"
+        and error.translation_key == "export_limit_unavailable"
+        and (
+            isinstance(cause, (TimeoutError, ServerDisconnectedError))
+            or isinstance(cause, ClientResponseError) and cause.status in {502, 503, 504}
+        )
+    )
+
+
+def installer_runtime(hass: HomeAssistant, identity: dict[str, str]) -> Any:
+    """Find the exact loaded Enphase entry's optional read-only preparation hook."""
+    entry = hass.config_entries.async_get_entry(identity["config_entry_id"])
+    if (entry is None or entry.domain != "enphase_ev"
+            or entry.state is not ConfigEntryState.LOADED or entry.disabled_by is not None):
+        return None
+    coordinator = getattr(getattr(entry, "runtime_data", None), "coordinator", None)
+    return getattr(coordinator, "export_limit_runtime", None)
+
+
+async def probe_installer(runtime: Any) -> tuple[Any, str | None, bool]:
+    """Check the session, gateway and installer form used by Enphase Configure."""
+    if runtime is None:
+        # The mapped entry may still be loading after a restart.
+        return None, "export_limit_retry_readiness_check_unavailable", False
+    prepare = getattr(runtime, "async_prepare", None)
+    if not callable(prepare) or not callable(getattr(runtime, "async_apply_guarded", None)):
+        return None, "export_limit_retry_readiness_check_unavailable", True
+    try:
+        async with asyncio.timeout(DEVICE_SERVICE_TIMEOUT_SECONDS):
+            snapshot = await prepare()
+    except TimeoutError:
+        return None, "export_limit_retry_readiness_timeout", False
+    except ServiceValidationError as err:
+        if _temporary_rejection(err):
+            return None, UNAVAILABLE_REJECTION, False
+        if err.translation_key == "export_limit_session_expired":
+            return None, "export_limit_service_rejected:installer_session_expired", True
+        if err.translation_key == "export_limit_disabled":
+            return None, "export_limit_service_rejected:controls_disabled", True
+        return None, "export_limit_retry_readiness_rejected", True
+    except Exception:
+        return None, "export_limit_retry_readiness_check_failed", True
+    if getattr(snapshot, "supported", None) is not True:
+        return None, "export_limit_unsupported", True
+    if getattr(runtime, "enabled", None) is not True:
+        return None, "export_limit_service_rejected:controls_disabled", True
+    if getattr(runtime, "pending", False) is not None:
+        return None, "export_limit_pending", False
+    if not isinstance(getattr(snapshot, "enabled", None), bool) or not hasattr(snapshot, "slew"):
+        return None, "export_limit_retry_readiness_check_unavailable", True
+    return snapshot, None, False
+
+
+def retry_status(state: dict[str, Any], *, running: bool) -> dict[str, Any]:
+    """Expose bounded retry progress without provider exception details."""
+    retry = dict(state.get("retry", {}))
+    if not retry and state.get("pause") in _OPERATOR_PAUSES:
+        retry = {"state": "operator_required", "reason": state["pause"], "attempts": 0, "next_attempt_at": None}
+    if retry:
+        retry["max_attempts"] = MAX_RETRY_ATTEMPTS
+        if state.get("pending"):
+            retry.update(state="awaiting_confirmation", reason=state.get("pause") or "export_limit_pending",
+                         next_attempt_at=None)
+        elif retry["state"] == "checking" and not running:
+            # A process can stop after reserving the check. Its next deadline
+            # remains durable, but there is no active installer request.
+            retry["state"] = "scheduled"
+        if retry["state"] == "operator_required":
+            retry["operator_action"] = "Check Enphase Export Limit in Configure, then resume Export Limit control."
+    return retry
 
 
 def target_identity(hass: HomeAssistant, entity: str) -> dict[str, str] | None:
@@ -127,9 +285,18 @@ class ExportLimitControl:
         if identity is None:
             return None
         limits = dict(self.store.data.get("command_rate_limits", {}))
-        record = normalized_record(limits, identity, self.state, now)
+        state = self.state
+        record = normalized_record(limits, identity, state, now)
+        if record.get("clock_recovered_at") == now.isoformat():
+            await self.store.async_reanchor_export_attempts(now)
         limits[control_key(identity)] = record
         await self.store.async_save_command_rate_limits(limits)
+        retry = state.get("retry")
+        if (isinstance(retry, dict) and (deadline := aware_time(retry.get("next_attempt_at"))) is not None
+                and deadline > now + RETRY_INTERVAL):
+            state["retry"] = {**retry, "next_attempt_at": (now + RETRY_INTERVAL).isoformat()}
+            await self.save(state)
+            await self.store.async_flush()
         return record
 
     async def save_timing(self, identity: dict[str, str], record: dict[str, Any], *, flush: bool = True) -> None:
@@ -143,8 +310,152 @@ class ExportLimitControl:
         return cooldown_status(self.store.data, target_identity(
             self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, "")), self.options, now)
 
+    def retry_deadline(self, now: datetime) -> datetime | None:
+        """Respect both the paced check and the durable command cooldown."""
+        state = self.state
+        if state.get("pending") or state.get("restoring"):
+            return None
+        retry = state.get("retry")
+        if not isinstance(retry, dict) or type(retry.get("attempts")) is not int:
+            return None
+        ready = retry.get("state") == "ready" and not state.get("pause")
+        deadline = aware_time(retry.get("next_attempt_at"))
+        if ready and deadline is None:
+            deadline = now
+        if not ready and (state.get("pause") != UNAVAILABLE_REJECTION or deadline is None):
+            return None
+        assert deadline is not None
+        if deadline > now + RETRY_INTERVAL:
+            return now  # Wake to repair the persisted clocks before checking eligibility.
+        # Expire an interrupted final check even if the allowance is closed.
+        if ready or retry.get("rechecking_ready") or retry["attempts"] < MAX_RETRY_ATTEMPTS:
+            if (allowance := self._retry_allowance_at(now)) is not None:
+                deadline = max(deadline, allowance)
+        cooldown = aware_time(self.cooldown(now).get("next_eligible_change_at"))
+        return max(deadline, cooldown) if cooldown else deadline
+
+    def _retry_allowance_at(self, now: datetime) -> datetime | None:
+        """Defer a check when the current tariff would require a capped write."""
+        budget = action_budget(budget_history(self.store.data), self.options, now, EXPORT_ASSET)
+        allowance = aware_time(budget["allowance_available_at"])
+        if allowance is not None:
+            current = evidence(self.hass, self.data, self.options, now)
+            if current["ready"] and current["blocks"][0]["watts"] != current["feedback"]["watts"]:
+                return allowance
+        return None
+
+    async def claim_retry(self, now: datetime, *, pending: bool = False) -> dict[str, Any] | None:
+        """Durably consume a check before any provider I/O, including after restart."""
+        if self.retry_deadline(now) is None:
+            return None
+        # A timer can wake before the planner has persisted clock repair.
+        await self.prepare_cooldown(now)
+        deadline = self.retry_deadline(now)
+        if deadline is None or now < deadline:
+            return None
+        state = self.state
+        retry = state["retry"]
+        ready = retry["state"] == "ready" or bool(retry.get("rechecking_ready"))
+        if not ready and retry["attempts"] >= MAX_RETRY_ATTEMPTS:
+            await self.finish_retry(retry, "export_limit_retry_exhausted", terminal=True)
+            return None
+        if pending:
+            # A settled readback is required before checking installer access.
+            # Waiting for an existing request does not spend an installer check.
+            if ready:
+                retry = dict(retry)
+                retry.pop("rechecking_ready", None)
+                state.pop("pause", None)
+            await self.save({**state, "retry": {
+                **retry, "state": "ready" if ready else "scheduled", "reason": "export_limit_pending",
+                "next_attempt_at": (now + RETRY_INTERVAL).isoformat(),
+            }})
+            await self.store.async_flush()
+            return None
+        retry = {**retry, "attempts": retry["attempts"] if ready else retry["attempts"] + 1, "state": "checking",
+                 "next_attempt_at": (now + RETRY_INTERVAL).isoformat()}
+        if ready:
+            retry["rechecking_ready"] = True
+        try:
+            await self.save({**state, "retry": retry, "pause": UNAVAILABLE_REJECTION})
+            await self.store.async_flush()
+        except BaseException:
+            # Store updates its in-memory ownership before the write completes.
+            await self.save(state)
+            raise
+        return retry
+
+    async def finish_retry(
+        self, claim: dict[str, Any], reason: str | None, *, terminal: bool = False,
+        awaiting_startup_arm: bool = False, refund: bool = False, flush: bool = True,
+    ) -> None:
+        """Release a settled no-op or retain a paced or terminal blocker."""
+        state = self.state
+        if state.get("retry") != claim or state.get("pause") != UNAVAILABLE_REJECTION or state.get("pending"):
+            return
+        retry = {key: value for key, value in claim.items() if key != "rechecking_ready"}
+        if refund and not claim.get("rechecking_ready"):
+            retry["attempts"] -= 1
+        if reason is None:
+            state.pop("pause")
+            if awaiting_startup_arm:
+                state["retry"] = {**retry, "state": "ready", "reason": "export_limit_installer_ready",
+                                  "next_attempt_at": None}
+            else:
+                state.pop("retry")
+        else:
+            if not terminal and reason in RETRY_DEFERRED_REASONS:
+                # A deferral leaves the check available once the blocker clears.
+                state["retry"] = self.defer_retry(claim, reason, datetime.now(UTC))
+                if state["retry"]["state"] == "ready":
+                    state.pop("pause")
+            elif terminal or claim["attempts"] >= MAX_RETRY_ATTEMPTS:
+                state["pause"] = reason if terminal else "export_limit_retry_exhausted"
+                state["retry"] = {**retry, "state": "operator_required", "reason": reason, "next_attempt_at": None}
+            else:
+                state["retry"] = {**retry, "state": "scheduled", "reason": reason,
+                                  "next_attempt_at": (datetime.now(UTC) + RETRY_INTERVAL).isoformat()}
+        await self.save(state)
+        if flush:
+            await self.store.async_flush()
+
+    async def finish_unsent_retry(
+        self, claim: dict[str, Any], reason: str, readback_since: float, *, flush: bool = True,
+    ) -> None:
+        """Settle a rejected write with no command charge."""
+        state = self.state
+        if state.get("retry") != claim or state.get("pause") != UNAVAILABLE_REJECTION or state.get("pending"):
+            return
+        if reason in {
+            "export_limit_already_desired", "external_export_limit_changed", "export_limit_retry_readback_changed",
+        }:
+            now = datetime.now(UTC)
+            current = evidence(self.hass, self.data, self.options, now)
+            observed = current["feedback"]
+            if (current["ready"] and same_control(observed["identity"], state["identity"])
+                    and observed["last_readback"] >= readback_since
+                    and observed["watts"] == current["blocks"][0]["watts"]):
+                if state.get("expected") and any(
+                    state["expected"].get(key) != observed[key] for key in ("watts", "slew_rate")
+                ):
+                    await self.adopt_external_feedback(observed, now)
+                await self.finish_retry(claim, None, flush=flush)
+                return
+        terminal = reason in {UPSTREAM_CONTROLS_DISABLED, INSTALLER_SESSION_EXPIRED, INSTALLER_FORM_MISMATCH}
+        await self.finish_retry(claim, reason, terminal=terminal, refund=terminal, flush=flush)
+
+    @staticmethod
+    def defer_retry(retry: dict[str, Any], reason: str, now: datetime) -> dict[str, Any]:
+        """Return a paced retry for a check invalidated before a write."""
+        retry = dict(retry)
+        ready = bool(retry.pop("rechecking_ready", False))
+        return {**retry, "attempts": retry["attempts"] - int(not ready), "state": "ready" if ready else "scheduled",
+                "reason": reason,
+                "next_attempt_at": (now + RETRY_INTERVAL).isoformat()}
+
     async def audit(
-        self, pending: dict[str, Any], result: OutcomeResult, reason: str, now: datetime, observed: dict[str, Any]
+        self, pending: dict[str, Any], result: OutcomeResult, reason: str, now: datetime, observed: dict[str, Any],
+        *, desired_state: dict[str, Any] | None = None,
     ) -> None:
         await self.store.async_add_outcome(
             ActionOutcome(
@@ -163,9 +474,21 @@ class ExportLimitControl:
                 asset=EXPORT_ASSET,
                 kind=pending["kind"],
                 service_target=pending["identity"]["entity_id"],
-                desired_state={"watts": pending["watts"]},
+                desired_state=desired_state if desired_state is not None else {"watts": pending["watts"]},
             )
         )
+
+    async def record_pending(
+        self, state: dict[str, Any], pending: dict[str, Any], observed: dict[str, Any],
+    ) -> None:
+        """Persist the attempt debit and its receipt in the same Store generation."""
+        pending["attempt_recorded"] = True
+        async with self.store.async_delay_save():
+            await self.audit(
+                pending, OutcomeResult.PENDING, "export_limit_pending",
+                datetime.fromtimestamp(pending["sent_at"], UTC), observed,
+            )
+            await self.save(state)
 
     async def adopt_external_feedback(self, observed: dict[str, Any], now: datetime) -> None:
         """Retire superseded ownership without clearing unrelated failure pauses."""
@@ -192,6 +515,9 @@ class ExportLimitControl:
         }
         if previous.get("pause") and previous["pause"] != "external_export_limit_conflict":
             adopted["pause"] = previous["pause"]
+        retry = previous.get("retry")
+        if retry and (adopted.get("pause") or retry.get("state") == "ready"):
+            adopted["retry"] = retry
         await self.save(adopted)
 
     async def reconcile(self, now: datetime) -> str | None:
@@ -215,7 +541,12 @@ class ExportLimitControl:
             pending = {**pending, "confirmation_not_before": now.timestamp()}
             state["pending"] = pending
             await self.save(state)
+        if pending and pending.get("attempt_recorded") is False:
+            # A crash after the durable reservation leaves the write uncertain.
+            await self.record_pending(state, pending, pending["pre_state"])
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+        if "identity" in observed and not same_control(observed["identity"], state["identity"]):
+            return "export_limit_target_changed"
         if issue:
             pending = state.get("pending")
             if pending and now.timestamp() - pending["sent_at"] >= READBACK_MAX_AGE.total_seconds():
@@ -223,10 +554,12 @@ class ExportLimitControl:
                 return "export_limit_unconfirmed"
             if issue == "export_limit_unsupported" and not pending:
                 state["pause"] = issue
+                if retry := state.get("retry"):
+                    state["retry"] = {**retry, "state": "operator_required", "reason": issue, "next_attempt_at": None}
                 await self.save(state)
+                if retry:
+                    await self.store.async_flush()
             return issue
-        if not same_control(observed["identity"], state["identity"]):
-            return "export_limit_target_changed"
         if state["identity"] != observed["identity"]:
             state["identity"] = observed["identity"]
             await self.save(state)
@@ -266,6 +599,7 @@ class ExportLimitControl:
                     await self.save({})
                     return None
                 state.pop("pending")
+                state.pop("retry", None)
                 state["expected"] = {"watts": observed["watts"], "slew_rate": observed["slew_rate"]}
                 await self.save(state)
             elif now.timestamp() - pending["sent_at"] >= READBACK_MAX_AGE.total_seconds():
@@ -280,6 +614,11 @@ class ExportLimitControl:
         ):
             await self.adopt_external_feedback(observed, now)
             return self.state.get("pause")
+        if state.get("retry", {}).get("state") == "ready" and not state.get("pause") and not state.get("restoring"):
+            current = evidence(self.hass, self.data, self.options, now)
+            if current["ready"] and current["blocks"][0]["watts"] == observed["watts"]:
+                state.pop("retry")
+                await self.save(state)
         return self.state.get("pause")
 
     async def unconfirmed(
@@ -297,13 +636,22 @@ class ExportLimitControl:
         if state.get("pending"):
             return
         state.pop("pause", None)
+        state.pop("retry", None)
         await self.save(state if state.get("baseline") else {})
 
-    async def execute(self, action: PlanAction, now: datetime) -> tuple[OutcomeResult, str, bool]:
+    async def execute(
+        self, action: PlanAction, now: datetime, *, retry: dict[str, Any] | None = None,
+        retry_apply: RetryApply | None = None,
+    ) -> tuple[OutcomeResult, str, bool]:
         """Execute a validated tariff transition without blocking for confirmation."""
         issue = await self.reconcile(now)
-        if issue:
+        if retry is not None and (issue != UNAVAILABLE_REJECTION or self.state.get("retry") != retry):
+            return OutcomeResult.REJECTED, issue or "export_limit_retry_interrupted", False
+        if issue and retry is None:
             return OutcomeResult.REJECTED, issue, False
+        if retry is None and self.state.get("retry", {}).get("state") == "ready":
+            return OutcomeResult.REJECTED, "export_limit_retry_recheck_required", False
+        now = datetime.now(UTC)
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
         if issue or observed.get("pending"):
             return OutcomeResult.REJECTED, issue or "export_limit_pending", False
@@ -314,7 +662,9 @@ class ExportLimitControl:
             return OutcomeResult.SKIPPED, "export_limit_already_desired", False
         state = self.state or {"identity": observed["identity"]}
         state.setdefault("baseline", {"watts": observed["watts"], "slew_rate": observed["slew_rate"]})
-        return await self.dispatch(state, action, desired, now, observed)
+        if retry is not None:
+            state.pop("pause")
+        return await self.dispatch(state, action, desired, now, observed, retry_apply=retry_apply)
 
     async def dispatch(
         self,
@@ -325,6 +675,7 @@ class ExportLimitControl:
         observed: dict[str, Any],
         *,
         restore: bool = False,
+        retry_apply: RetryApply | None = None,
     ) -> tuple[OutcomeResult, str, bool]:
         """Durability precedes the service boundary, including compensation."""
         timing = await self.prepare_cooldown(now)
@@ -343,6 +694,7 @@ class ExportLimitControl:
             # None on disk means the process may have died before dispatch.
             # Recovery then requires a new settings read after reconciliation.
             "confirmation_not_before": None,
+            "attempt_recorded": False,
             "restore": restore,
             "pre_state": observed,
             "slew_rate": state["baseline"]["slew_rate"] if restore else None,
@@ -351,8 +703,10 @@ class ExportLimitControl:
         reservation = {**timing, "attempted_at": now.timestamp(), "checked_at": now.timestamp(),
                        "interval_seconds": interval(self.options)}
         try:
-            await self.save(state)
-            await self.save_timing(state["identity"], reservation)
+            async with self.store.async_delay_save():
+                await self.save(state)
+                await self.save_timing(state["identity"], reservation, flush=False)
+            await self.store.async_flush()
         except BaseException:
             # The service boundary has not been entered. A failed/cancelled
             # persistence attempt cannot create an uncertain gateway request.
@@ -375,14 +729,28 @@ class ExportLimitControl:
         if not restore:
             if not action.execute_not_before <= dispatch_now < action.execute_not_after:
                 blocked = "export_tariff_expired"
-            if self.before_dispatch:
-                blocked = blocked or self.before_dispatch()
+            if self.before_dispatch and (not blocked or (
+                retry_apply is not None and blocked == "export_limit_entity_unavailable"
+            )):
+                guard_issue = self.before_dispatch()
+                blocked = guard_issue or blocked
+
+        async def rollback_reservation(reason: str) -> None:
+            async with self.store.async_delay_save():
+                await self.save_timing(state["identity"], timing, flush=False)
+                if reason == "external_export_limit_changed":
+                    if previous.get("retry"):
+                        await self.save(previous)
+                    await self.adopt_external_feedback(latest, dispatch_now)
+                else:
+                    await self.save(previous)
+                if retry_apply is not None:
+                    await self.finish_unsent_retry(previous["retry"], reason, observed["last_readback"], flush=False)
+            if retry_apply is not None:
+                await self.store.async_flush()
+
         if blocked:
-            await self.save_timing(state["identity"], timing, flush=False)
-            if blocked == "external_export_limit_changed":
-                await self.adopt_external_feedback(latest, dispatch_now)
-            else:
-                await self.save(previous)
+            await rollback_reservation(blocked)
             if restore:
                 await self.audit(pending, OutcomeResult.REJECTED, blocked, dispatch_now, latest)
             return OutcomeResult.REJECTED, blocked, False
@@ -393,36 +761,87 @@ class ExportLimitControl:
         if restore:
             data["slew_rate"] = pending["slew_rate"]
         pending["confirmation_not_before"] = dispatch_now.timestamp()
+        dispatch_reached = retry_apply is None
+
+        def mark_dispatched() -> None:
+            nonlocal dispatch_reached
+            dispatch_reached = True
+            pending["confirmation_not_before"] = datetime.now(UTC).timestamp()
+
         try:
-            await async_call_device_service(self.hass, "enphase_ev", service, data)
+            if retry_apply is None:
+                await async_call_device_service(self.hass, "enphase_ev", service, data)
+            else:
+                async with asyncio.timeout(DEVICE_SERVICE_TIMEOUT_SECONDS):
+                    await retry_apply(watts, mark_dispatched)
         except DeviceTargetUnavailable:
-            await self.save_timing(state["identity"], timing, flush=False)
-            await self.save(previous)
+            await rollback_reservation("export_limit_entity_unavailable")
             if restore:
                 await self.audit(pending, OutcomeResult.REJECTED, "export_limit_entity_unavailable", now, {})
             return OutcomeResult.REJECTED, "export_limit_entity_unavailable", False
         except asyncio.CancelledError:
-            await self.save(state)
-            await self.audit(pending, OutcomeResult.PENDING, "export_limit_pending", now, observed)
+            if dispatch_reached:
+                await self.record_pending(state, pending, observed)
+            else:
+                await rollback_reservation("export_limit_retry_not_sent")
             raise
         except ServiceValidationError as err:
+            if not dispatch_reached:
+                reason = err.reason if isinstance(err, RetryWriteDeferred) else {
+                    "export_limit_changed": "export_limit_retry_readback_changed",
+                    "export_limit_pending": "export_limit_pending",
+                    "export_limit_disabled": UPSTREAM_CONTROLS_DISABLED,
+                    "export_limit_session_expired": INSTALLER_SESSION_EXPIRED,
+                    "export_limit_mismatch": INSTALLER_FORM_MISMATCH,
+                }.get(str(err.translation_key or ""), "export_limit_retry_not_sent")
+                await rollback_reservation(reason)
+                return OutcomeResult.REJECTED, reason, False
             reservation.update(attempted_at=datetime.now(UTC).timestamp(), checked_at=datetime.now(UTC).timestamp())
-            await self.save_timing(state["identity"], reservation)
             state.pop("pending")
             reason = {
                 "export_limit_disabled": "export_limit_service_rejected:controls_disabled",
                 "export_limit_session_expired": "export_limit_service_rejected:installer_session_expired",
-                "export_limit_unavailable": "export_limit_service_rejected:installer_or_gateway_unavailable",
+                "export_limit_unavailable": UNAVAILABLE_REJECTION,
             }.get(str(err.translation_key or ""), "export_limit_service_rejected")
             state["pause"] = reason
-            await self.save(state)
-            if restore:
-                await self.audit(pending, OutcomeResult.FAILED, reason, now, observed)
+            retry = state.get("retry")
+            if not restore and _temporary_rejection(err):
+                next_attempt = (datetime.now(UTC) + RETRY_INTERVAL).isoformat()
+                if retry is None:
+                    state.setdefault("expected", {"watts": observed["watts"], "slew_rate": observed["slew_rate"]})
+                    retry = {"attempts": 0, "state": "scheduled", "reason": reason,
+                             "next_attempt_at": next_attempt}
+                elif retry["attempts"] >= MAX_RETRY_ATTEMPTS:
+                    state["pause"] = "export_limit_retry_exhausted"
+                    retry = {**retry, "state": "operator_required", "reason": reason, "next_attempt_at": None}
+                else:
+                    retry = {**retry, "state": "scheduled", "reason": reason,
+                             "next_attempt_at": next_attempt}
+            elif retry is not None:
+                retry = {**retry, "state": "operator_required", "reason": reason, "next_attempt_at": None}
+            if retry is not None:
+                retry.pop("rechecking_ready", None)
+                state["retry"] = retry
+            # Publish the known rejection and retire pending intent together.
+            async with self.store.async_delay_save():
+                await self.save_timing(state["identity"], reservation, flush=False)
+                await self.audit(
+                    pending, OutcomeResult.FAILED, reason, now, observed,
+                    desired_state=None if restore else action.desired_state,
+                )
+                await self.save(state)
+            if retry is not None:
+                await self.store.async_flush()
             return OutcomeResult.FAILED, reason, True
-        except Exception:  # An accepted but timed-out write remains uncertain.
-            pass
-        await self.save(state)
-        await self.audit(pending, OutcomeResult.PENDING, "export_limit_pending", now, observed)
+        except Exception:
+            if not dispatch_reached:
+                await rollback_reservation("export_limit_retry_not_sent")
+                return OutcomeResult.REJECTED, "export_limit_retry_not_sent", False
+        else:
+            if not dispatch_reached:
+                await rollback_reservation("export_limit_already_desired")
+                return OutcomeResult.SKIPPED, "export_limit_already_desired", False
+        await self.record_pending(state, pending, observed)
         await self.reconcile(datetime.now(UTC))
         return OutcomeResult.PENDING, "export_limit_pending", True
 
@@ -431,23 +850,41 @@ class ExportLimitControl:
         state = self.state
         if not state.get("baseline"):
             return OutcomeResult.SKIPPED, "export_limit_not_owned", False
+        if retry := state.get("retry"):
+            state["retry"] = {**retry, "state": "operator_required", "next_attempt_at": None}
         state["restoring"] = True
         await self.save(state)
-        issue = await self.reconcile(now)
+        reconciliation_issue = await self.reconcile(now)
         state = self.state
         if not state:
             return OutcomeResult.RESTORED, "export_limit_restored", False
-        if issue:
-            return OutcomeResult.PENDING, issue, False
+        if reconciliation_issue:
+            active = (
+                self.options.get(CONF_PLANNER_ENABLED) is True
+                and self.options.get(CONF_DRY_RUN) is False
+                and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+                and parse_production_state(self.store.data.get("production")).armed
+            )
+            # Stopping control may release an already-restored baseline. A
+            # rejection pause still blocks any compensating service call.
+            retry_paused = retry and not state.get("pending") and reconciliation_issue == state.get("pause")
+            if active or not retry_paused:
+                return OutcomeResult.PENDING, reconciliation_issue, False
         if not state.get("baseline"):
             return OutcomeResult.SKIPPED, "export_limit_not_owned", False
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
         if issue:
             return OutcomeResult.PENDING, issue, False
+        if observed["pending"]:
+            return OutcomeResult.PENDING, "export_limit_pending", False
+        if not same_control(observed["identity"], state["identity"]):
+            return OutcomeResult.PENDING, "export_limit_target_changed", False
         baseline = state["baseline"]
         if all(observed[key] == baseline[key] for key in ("watts", "slew_rate")):
             await self.save({})
             return OutcomeResult.RESTORED, "export_limit_restored", False
+        if reconciliation_issue:
+            return OutcomeResult.PENDING, reconciliation_issue, False
         action = PlanAction(
             "restore_export_limit",
             "manual",

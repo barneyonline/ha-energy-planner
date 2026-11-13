@@ -35,6 +35,8 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
         return {}, "export_limit_entity_unavailable"
     attributes = state.attributes
     readback: Any = attributes.get("last_successful_readback")
+    if readback is None:
+        return {}, "export_limit_entity_unavailable"
     if type(readback) not in (int, float) or not isfinite(readback):
         return {}, "export_limit_readback_invalid"
     age = now.timestamp() - readback
@@ -184,23 +186,27 @@ def build_actions(context: DecisionContext) -> list[PlanAction]:
     for block in evidence["blocks"]:
         desired = block["watts"]
         if desired != expected:
-            actions.append(
-                PlanAction(
-                    action_id=f"{context.plan_id}-export-limit-{block['start']}",
-                    plan_id=context.plan_id,
-                    execute_not_before=block_time(block["start"]),
-                    execute_not_after=block_time(block["end"]),
-                    asset=ActionAsset.ENPHASE_EXPORT_LIMIT,
-                    kind=ActionKind.SET_EXPORT_LIMIT if desired == 0 else ActionKind.DISABLE_EXPORT_LIMIT,
-                    desired_state={"watts": desired, "tariff_block": block},
-                    hard_constraints=["export_tariff_fresh", "export_limit_readback"],
-                    reason_codes=["negative_export_price" if desired == 0 else "nonnegative_export_price"],
-                    expected_cost_delta=None,
-                    confidence=block["confidence"],
-                )
-            )
+            actions.append(export_action(context.plan_id, block))
         expected = desired
     return actions
+
+
+def export_action(plan_id: str, block: dict[str, Any]) -> PlanAction:
+    """Build a guarded action for a validated tariff block."""
+    desired = block["watts"]
+    return PlanAction(
+        action_id=f"{plan_id}-export-limit-{block['start']}",
+        plan_id=plan_id,
+        execute_not_before=block_time(block["start"]),
+        execute_not_after=block_time(block["end"]),
+        asset=ActionAsset.ENPHASE_EXPORT_LIMIT,
+        kind=ActionKind.SET_EXPORT_LIMIT if desired == 0 else ActionKind.DISABLE_EXPORT_LIMIT,
+        desired_state={"watts": desired, "tariff_block": block},
+        hard_constraints=["export_tariff_fresh", "export_limit_readback"],
+        reason_codes=["negative_export_price" if desired == 0 else "nonnegative_export_price"],
+        expected_cost_delta=None,
+        confidence=block["confidence"],
+    )
 
 
 def assumed_export_limit_watts(context: DecisionContext, at: datetime) -> int | None:

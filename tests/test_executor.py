@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -292,6 +293,11 @@ class FakeStore:
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         self.data["command_rate_limits"] = limits
 
+    async def async_reanchor_export_attempts(self, now):
+        from custom_components.ha_energy_planner.action_limits import budget_history, reanchor_export_attempts
+
+        self.data["action_attempts"] = reanchor_export_attempts(budget_history(self.data), now)
+
     async def async_save_control_pause(self, pause: dict[str, Any]) -> None:
         self.data["control_pause"] = pause
 
@@ -300,6 +306,10 @@ class FakeStore:
 
     async def async_flush(self) -> None:
         self.flush_count += 1
+
+    @asynccontextmanager
+    async def async_delay_save(self):
+        yield
 
 
 def _arm_store(store: FakeStore, executor: Executor) -> None:

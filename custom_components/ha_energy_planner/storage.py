@@ -11,7 +11,7 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 
-from .action_limits import budget_history, recent_attempts
+from .action_limits import budget_history, reanchor_export_attempts, recent_attempts
 from .calendar_history import confirm_calendar_action, normalize_calendar_history, update_calendar_history
 from .climate_inputs import instant
 from .const import STORE_KEY, STORE_VERSION
@@ -405,6 +405,10 @@ class PlannerStore:
     async def async_save_command_rate_limits(self, limits: dict[str, Any]) -> None:
         """Persist command rate-limit timestamps."""
         await self._async_set_if_changed("command_rate_limits", limits)
+
+    async def async_reanchor_export_attempts(self, now: datetime) -> None:
+        """Persist the bounded export allowance before reopening command timing."""
+        await self._async_set_if_changed("action_attempts", reanchor_export_attempts(budget_history(self.data), now))
 
     async def async_save_production(self, production: dict[str, Any]) -> None:
         """Persist production arming state."""

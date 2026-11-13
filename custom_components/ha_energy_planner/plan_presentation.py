@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
-from .enphase_export_limit import target_identity
+from .enphase_export_limit import retry_status, target_identity
 from .export_limit_cooldown import cooldown_status
 from .models import ActionAsset, ActionKind, InputHealth, PlanAction, to_jsonable
 from .preflight import _current_plan_report
@@ -82,6 +82,18 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
                           summary="Waiting for serialized control reconciliation; planning continues.")
     if status.get("reason") in {"export_limit_pending", "export_limit_restoration_pending"}:
         status["summary"] = "Waiting for gateway confirmation; the planned setting is not yet confirmed."
+    retry = (
+        retry_status(ownership, running=getattr(coordinator, "_export_retry_running", False))
+        if isinstance(ownership, dict) else {}
+    )
+    if retry:
+        scheduled = getattr(coordinator, "_export_retry_at", None) if retry["state"] == "scheduled" else None
+        retry["next_attempt_at"] = scheduled.isoformat() if scheduled is not None else None
+        if retry["state"] == "scheduled" and scheduled is None:
+            retry["state"] = "suspended"
+        if retry.get("operator_action"):
+            status["summary"] = retry["operator_action"]
+        status["retry"] = retry
     return status
 
 

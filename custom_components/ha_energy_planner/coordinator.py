@@ -27,7 +27,11 @@ from homeassistant.util import dt as dt_util
 
 from . import advice_runtime, startup_recovery, task_lifecycle
 from .action_limits import budget_history
-from .adapter_helpers import async_call_device_service, service_entity_available, zone_temperature_sync_deferred
+from .adapter_helpers import (
+    async_call_device_service,
+    service_entity_available,
+    zone_temperature_sync_deferred,
+)
 from .advice_runtime import (
     _AI_ADVICE_NOTIFICATION_ID as _AI_ADVICE_NOTIFICATION_ID,
 )
@@ -108,7 +112,15 @@ from .const import (
 )
 from .constraints import ConstraintValidator
 from .discovery import CapabilityDiscovery
-from .enphase_export_limit import ExportLimitControl
+from .enphase_export_limit import (
+    RETRY_INTERVAL,
+    UPSTREAM_CONTROLS_DISABLED,
+    ExportLimitControl,
+    RetryWriteDeferred,
+    installer_runtime,
+    preserve_retry_on_reload,
+    probe_installer,
+)
 from .enphase_export_limit import evidence as export_limit_evidence
 from .enphase_export_limit import feedback as export_limit_feedback
 from .enphase_export_limit import feedback_entity_id as export_limit_feedback_entity_id
@@ -120,9 +132,17 @@ from .ev_control import _ev_action_wants_power
 from .ev_runtime import audit_evidence
 from .ev_telemetry import reported_at, sample_ev, update_ev_telemetry
 from .executor import _EV_SAFETY_PLAN_ISSUES, PLAN_FALLBACK_STARTUP_NOTIFICATION_GRACE, Executor, _ev_control_topology
-from .export_limit_cooldown import cooldown_status
+from .export_limit_cooldown import cooldown_status, same_control
 from .export_limit_cooldown import interval as export_change_interval
-from .export_limit_policy import EXPORT_ASSET, area_safe, block_time, confirmed_feedback
+from .export_limit_policy import (
+    EXPORT_ASSET,
+    area_safe,
+    aware_time,
+    block_time,
+    confirmed_feedback,
+    export_action,
+    tariff_blocks,
+)
 from .forecast_calibration import FORECAST_CALIBRATION_VERSION, update_forecast_calibration
 from .forecasts import MAX_FORECAST_SOURCE_ROWS
 from .inputs import InputManager
@@ -402,6 +422,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         self.executor.ev_command_guard = self._ev_command_guard
         self.executor.ev_restore_guard = self._ev_restore_allowed
+        self.executor.export_write_blocked = self._export_write_blocked
         self.executor.ev_allocation_deadline_callback = self._schedule_ev_allocation_deadline
         self._ev_allocation_cancel: Callable[[], None] | None = None
         self._ev_allocation_deadline: Any = None
@@ -462,6 +483,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._ai_current_plan_fingerprint: str | None = None
         self._ai_current_plan_safe = False
         self._startup_auto_recovery_authorized = False
+        self._export_retry_startup_blocked = False
         self._startup_auto_recovery_deadline: float | None = None
         self._startup_auto_recovery_task: asyncio.Task[None] | None = None
         self._startup_auto_recovery_start_unsub: Callable[[], None] | None = None
@@ -1693,6 +1715,259 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # A planning save-delay scope may be active concurrently. Do not
         # open runtime readiness until reconciliation is durable anyway.
         await self.store.async_flush()
+        self._schedule_export_retry()
+
+    def _export_retry_control(self) -> ExportLimitControl | None:
+        """Check live control authority and the exact owned gateway."""
+        if (getattr(self, "_tearing_down", False) or getattr(self, "_export_retry_startup_blocked", False)
+                or not getattr(self.hass, "is_running", True) or not self.automatic_control_requested
+                or not (self.active_control or getattr(self, "_startup_auto_recovery_authorized", False))):
+            return None
+        options = self.planner_options
+        if options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is not True:
+            return None
+        entry_data = self.entry_data
+        control = ExportLimitControl(self.hass, self.store, entry_data, options=options)
+        if (control.state.get("retry", {}).get("state") == "ready"
+                and (not self.active_control or getattr(self, "_startup_auto_recovery_authorized", False))):
+            return None
+        identity = export_target_identity(self.hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""))
+        owned = control.state.get("identity")
+        return control if identity and owned and same_control(identity, owned) else None
+
+    def _export_write_blocked(self) -> bool:
+        """Keep export writes closed during provisional startup activation."""
+        production = self.store.data.get("production")
+        return bool(getattr(self, "_export_startup_activation_pending", False)) or (
+            isinstance(production, dict) and production.get("startup_activation_pending") is True
+        )
+
+    @callback
+    def _schedule_export_retry(self) -> None:
+        """Keep one wakeup independent of planning refreshes and feedback events."""
+        if getattr(self, "_export_retry_running", False):
+            return
+        ownership = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+        if not ownership.get("retry") and getattr(self, "_export_retry_cancel", None) is None:
+            return
+        now = dt_util.utcnow()
+        control = self._export_retry_control()
+        deadline = control.retry_deadline(now) if control is not None else None
+        pause = self.store.data.get("control_pause")
+        if deadline is not None and control_pause_reason(pause, now, asset=EXPORT_ASSET):
+            until = aware_time(pause.get("until")) if isinstance(pause, dict) else None
+            deadline = max(deadline, until) if until is not None and until > now else None
+        backoff = getattr(self, "_export_retry_backoff_until", None)
+        if deadline is not None and backoff is not None:
+            # The storage backoff is a short delay. A wall-clock rollback
+            # must not leave it anchored hours ahead of a repaired retry.
+            self._export_retry_backoff_until = backoff = min(backoff, now + RETRY_INTERVAL)
+            deadline = max(deadline, backoff)
+        if deadline == getattr(self, "_export_retry_at", None):
+            return
+        if (cancel := getattr(self, "_export_retry_cancel", None)) is not None:
+            cancel()
+        self._export_retry_cancel = None
+        self._export_retry_at = deadline
+        if deadline is None:
+            return
+
+        @callback
+        def wake(_now: datetime) -> None:
+            if self._export_retry_at != deadline or getattr(self, "_tearing_down", False):
+                return
+            self._export_retry_at = self._export_retry_cancel = None
+            self._export_retry_running = True
+            self._async_create_listener_task(self._async_run_export_retry())
+
+        self._export_retry_cancel = async_call_later(self.hass, max(0.0, (deadline - now).total_seconds()), wake)
+
+    async def _async_run_export_retry(self) -> None:
+        """Run the due check and publish the resulting ownership state."""
+        try:
+            await self._async_retry_export_limit()
+        except Exception as err:
+            # A failed durability check cannot admit a write or busy-loop.
+            _LOGGER.warning("Export Limit retry failed (%s)", type(err).__name__)
+            self._export_retry_backoff_until = dt_util.utcnow() + RETRY_INTERVAL
+        finally:
+            self._export_retry_running = False
+            if not getattr(self, "_tearing_down", False):
+                self._schedule_export_retry()
+                generation = self._refresh_generation
+                self._schedule_debounced_refresh("export_limit_retry", debounce_seconds=0, force=True)
+                self._export_replan_generations = (generation, self._refresh_generation)
+                self.async_update_listeners()
+
+    async def _async_retry_export_limit(self) -> None:
+        """Check installer readiness without holding command authority across provider I/O."""
+        async with self._command_lock:
+            now = dt_util.utcnow()
+            control = self._export_retry_control()
+            if control is None or control_pause_reason(self.store.data.get("control_pause"), now, asset=EXPORT_ASSET):
+                return
+            observed, _ = export_limit_feedback(self.hass, control.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+            claim = await control.claim_retry(now, pending=observed.get("pending") is True)
+            if claim is None:
+                return
+            # Reservation persistence yields. Check again before calling Enphase.
+            now = dt_util.utcnow()
+            live = self._export_retry_control()
+            if live is None or control_pause_reason(self.store.data.get("control_pause"), now, asset=EXPORT_ASSET):
+                await control.finish_retry(claim, "export_limit_retry_interrupted")
+                return
+            identity = live.state["identity"]
+            observed, _ = export_limit_feedback(self.hass, live.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+            if observed.get("pending"):
+                await control.finish_retry(claim, "export_limit_pending")
+                return
+
+        upstream = installer_runtime(self.hass, identity)
+        started = dt_util.utcnow()
+        snapshot, issue, terminal = await probe_installer(upstream)
+
+        async with self._command_lock:
+            now = dt_util.utcnow()
+            live = self._export_retry_control()
+            if live is None:
+                target = export_target_identity(self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""))
+                interruption = (
+                    "export_limit_target_changed" if target is None or not same_control(target, identity)
+                    else "export_limit_retry_interrupted"
+                )
+                await control.finish_retry(claim, interruption)
+                return
+            control = live
+            if control.state.get("retry") != claim:
+                return
+            if control_pause_reason(self.store.data.get("control_pause"), now, asset=EXPORT_ASSET):
+                await control.finish_retry(claim, "export_limit_retry_interrupted")
+                return
+            if installer_runtime(self.hass, identity) is not upstream:
+                await control.finish_retry(claim, "export_limit_target_changed")
+                return
+            if issue is not None:
+                await control.finish_retry(claim, issue, terminal=terminal)
+                return
+            _, feedback_issue = export_limit_feedback(
+                self.hass, control.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now,
+            )
+            if feedback_issue == "export_limit_entity_unavailable":
+                await control.finish_retry(claim, feedback_issue)
+                return
+            setting = (snapshot.watts if snapshot.enabled else None, snapshot.slew)
+            await control.reconcile(now)
+            now = dt_util.utcnow()
+            if installer_runtime(self.hass, identity) is not upstream:
+                await control.finish_retry(claim, "export_limit_target_changed")
+                return
+            current = export_limit_evidence(self.hass, control.data, control.options, now)
+            observed = current["feedback"]
+            if not current["ready"] or observed["last_readback"] < started.timestamp():
+                await control.finish_retry(claim, current["reason"] or "export_limit_readback_stale")
+                return
+
+            def retry_authority() -> str | None:
+                if (getattr(self, "_tearing_down", False)
+                        or not getattr(self.hass, "is_running", True)
+                        or getattr(self, "_export_retry_startup_blocked", False)
+                        or not (self.active_control or getattr(self, "_startup_auto_recovery_authorized", False))
+                        or control_pause_reason(
+                            self.store.data.get("control_pause"), dt_util.utcnow(), asset=EXPORT_ASSET,
+                        )
+                        or self.entry_data != control.data or self.planner_options != control.options):
+                    return "export_limit_retry_interrupted"
+                target = control.data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY]
+                live_identity = export_target_identity(self.hass, target)
+                if (live_identity is None or not same_control(live_identity, identity)
+                        or installer_runtime(self.hass, identity) is not upstream):
+                    return "export_limit_target_changed"
+                if upstream.enabled is not True:
+                    return UPSTREAM_CONTROLS_DISABLED
+                return None
+
+            def retry_guard() -> str | None:
+                if (reason := retry_authority()) is not None:
+                    return reason
+                target = control.data[CONF_ENPHASE_EXPORT_LIMIT_ENTITY]
+                live, live_issue = export_limit_feedback(self.hass, target, dt_util.utcnow())
+                if upstream.pending is not None or live.get("pending"):
+                    return "export_limit_pending"
+                if (live_issue or live["last_readback"] < started.timestamp()
+                        or (live["watts"], live["slew_rate"]) != setting):
+                    return "export_limit_retry_readback_changed"
+                return None
+
+            if (guard_issue := retry_guard()) is not None:
+                await control.finish_retry(claim, guard_issue, terminal=guard_issue == UPSTREAM_CONTROLS_DISABLED)
+                return
+            block = current["blocks"][0]
+            if observed["watts"] == block["watts"]:
+                await control.finish_retry(claim, None)
+                return
+            def startup_pending() -> bool:
+                return (getattr(self, "_startup_auto_recovery_authorized", False)
+                        or getattr(self, "_startup_auto_recovery_validation_active", False)
+                        or self._export_write_blocked())
+
+            if not self.active_control or startup_pending():
+                # Let startup validate and arm production before the guarded
+                # retry obtains a fresh snapshot for the write.
+                await control.finish_retry(claim, None, awaiting_startup_arm=True)
+                return
+            self.executor.options = control.options
+            self.executor.entry_data = control.data
+            action = export_action(f"export-retry-{now.isoformat()}", block)
+
+            def dispatch_guard() -> str | None:
+                if not self.active_control or startup_pending():
+                    return "export_limit_retry_interrupted"
+                return retry_guard()
+
+            def validate_write() -> None:
+                now = dt_util.utcnow()
+                if not self.active_control or startup_pending():
+                    raise RetryWriteDeferred("export_limit_retry_interrupted")
+                if (reason := retry_authority()) is not None:
+                    raise RetryWriteDeferred(reason)
+                _, feedback_issue = export_limit_feedback(
+                    self.hass, control.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now,
+                )
+                if feedback_issue == "export_limit_entity_unavailable":
+                    raise RetryWriteDeferred(feedback_issue)
+                if self.executor._control_rejection_reason(action, now) is not None:
+                    raise RetryWriteDeferred("export_limit_retry_interrupted")
+                if not action.execute_not_before <= now < action.execute_not_after:
+                    raise RetryWriteDeferred("export_tariff_expired")
+                state = self.hass.states.get(control.data[CONF_AMBER_EXPORT_PRICE])
+                blocks, _ = tariff_blocks(state, now, control.options)
+                if not blocks or blocks[0] != block:
+                    raise RetryWriteDeferred("export_tariff_changed")
+
+            async def apply(watts: int | None, mark_dispatched: Callable[[], None]) -> object:
+                denial: RetryWriteDeferred | None = None
+
+                def authorize() -> None:
+                    nonlocal denial
+                    try:
+                        validate_write()
+                    except RetryWriteDeferred as err:
+                        denial = err
+                        raise
+                    mark_dispatched()
+
+                try:
+                    return await upstream.async_apply_guarded(watts, expected=snapshot, before_write=authorize)
+                except (Exception, asyncio.CancelledError):
+                    if denial is not None:
+                        raise denial from None
+                    raise
+
+            _, reason, sent = await self.executor.async_execute_export_limit(
+                action, now, retry=claim, retry_guard=dispatch_guard, retry_apply=apply,
+            )
+            if not sent:
+                await control.finish_unsent_retry(claim, reason, started.timestamp())
 
     async def _async_update_data_locked(self, *, defer_execution: bool = False) -> EnergyPlan:
         """Refresh planner data while holding the planner lock."""
@@ -2113,10 +2388,22 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         )
         recovery = production.raw.get("startup_auto_recovery")
         recovery_status = str(recovery.get("status", "")) if isinstance(recovery, dict) else ""
+        provisional_arm = production.armed and (
+            production.raw.get("startup_activation_pending") is True
+            or (recovery_status == "restoring" and production.raw.get("armed_reason") == "startup_auto_recovered")
+        )
+        if provisional_arm:
+            # A restart between arming and final preflight must resume from
+            # disarmed recovery before the first plan can send commands.
+            await self.async_disarm_production_control("startup_activation_interrupted")
+            production = parse_production_state(self.store.data.get("production"))
         recovery_pending_while_disarmed = bool(
             self.automatic_control_requested
             and not production.armed
-            and recovery_status in {"waiting_for_safe", "validating", "restoring"}
+            and isinstance(recovery, dict)
+            and (provisional_arm or recovery_status in {"waiting_for_safe", "validating", "restoring"}
+                 or (recovery_status == "waiting_for_home_assistant"
+                     and recovery.get("last_reason") == "startup_safe_recovery_pending"))
         )
         expected_fingerprint = production_evidence_fingerprint(self.entry_data, self.options)
 
@@ -2127,6 +2414,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # reload or process stop between these operations still retries
             # once the pause clears.
             self._startup_auto_recovery_authorized = True
+            self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
             await self._async_update_startup_auto_recovery(
                 "waiting_for_safe",
@@ -2145,6 +2433,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # with three fresh, non-commanding plans instead of leaving the
             # installation permanently disarmed with no task able to recover.
             self._startup_auto_recovery_authorized = True
+            self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
             await self._async_update_startup_auto_recovery(
                 "waiting_for_safe",
@@ -2160,6 +2449,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             # action gates still reject unsafe work while the startup grace
             # observes the fully started Home Assistant instance.
             self._startup_auto_recovery_authorized = True
+            self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
             self.executor.notification_grace_until = datetime.max.replace(tzinfo=UTC)
             await self._async_update_startup_auto_recovery(
@@ -2172,6 +2462,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
 
         if recovery_pending_while_disarmed:
             self._startup_auto_recovery_authorized = True
+            self._export_retry_startup_blocked = True
             self._startup_auto_recovery_deadline = None
             await self._async_update_startup_auto_recovery(
                 "waiting_for_home_assistant",
@@ -2300,6 +2591,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         )
                     await self._async_save_production(policy_production)
                     self._last_handled_options = option_state
+                    self._schedule_export_retry()
                 await self.async_request_replan()
                 return
             store_data = getattr(getattr(self, "store", None), "data", {})
@@ -2335,11 +2627,12 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if (
                 was_running
                 and automatic_control_still_requested
-                and not device_control_only_change
+                and (not device_control_only_change or self._export_write_blocked())
                 and parse_production_state(self.store.data.get("production")).armed
             ):
                 await self.async_disarm_production_control("configuration_changed")
-                await self.async_restore_safe_state("configuration_changed", refresh=False)
+                if not device_control_only_change:
+                    await self.async_restore_safe_state("configuration_changed", refresh=False)
 
             self.executor.options = current_options
             self.executor.entry_data = self.entry_data
@@ -2404,10 +2697,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                     )
                     await self._async_save_production(production_update)
                 self._startup_auto_recovery_authorized = True
+                self._export_retry_startup_blocked = True
                 await self._async_update_startup_auto_recovery(
                     "waiting_for_home_assistant",
                     successful_runs=0,
-                    reason="configuration_changed",
+                    reason=(
+                        "startup_safe_recovery_pending" if self._export_write_blocked() else "configuration_changed"
+                    ),
                 )
                 self.async_start_startup_auto_recovery()
 
@@ -2429,13 +2725,24 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 )
             )
         )
-        await self.async_cancel_startup_auto_recovery("configuration_changed")
+        # This method owns the disarm and restore so cancellation cannot
+        # restore the same devices before we evaluate the export handoff.
+        await self.async_cancel_startup_auto_recovery("configuration_changed", restore_owned_state=False)
         if automatic_lifecycle_was_active:
             if parse_production_state(self.store.data.get("production")).armed:
                 await self.async_disarm_production_control("configuration_changed")
+            export_state = self.store.data.get("ownership", {}).get(EXPORT_ASSET, {})
+            preserve_export_retry = (
+                self.automatic_control_requested
+                and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
+                and preserve_retry_on_reload(export_state, export_target_identity(
+                    self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""),
+                ))
+            )
             restore = await self.async_restore_safe_state(
                 "configuration_changed",
                 refresh=False,
+                preserve_export_retry=preserve_export_retry,
             )
             store_data = getattr(getattr(self, "store", None), "data", {})
             ownership = store_data.get("ownership") if isinstance(store_data, dict) else None
@@ -2809,16 +3116,20 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             preserve_main_state=preserve_main_state,
         )
 
-    async def async_restore_safe_state(self, reason: str, *, refresh: bool = True) -> ActionOutcome:
+    async def async_restore_safe_state(
+        self, reason: str, *, refresh: bool = True, preserve_export_retry: bool = False,
+    ) -> ActionOutcome:
         """Restore safe state and refresh."""
         async with self._command_lock:
-            outcome = await self.executor.async_restore_safe_state(reason)
+            outcome = await self.executor.async_restore_safe_state(reason, preserve_export_retry=preserve_export_retry)
         if refresh:
             self._mark_forced_refresh("safe_state_restored")
             await self.async_request_refresh()
         return outcome
 
-    async def async_arm_production_control(self, reason: str = "user_acknowledged") -> None:
+    async def async_arm_production_control(
+        self, reason: str = "user_acknowledged", *, provisional: bool = False,
+    ) -> None:
         """Arm production control after operator acknowledgement."""
         production = parse_production_state(self.store.data.get("production")).raw
         now = dt_util.utcnow()
@@ -2830,7 +3141,15 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 "acknowledged_at": now,
             }
         )
+        if provisional:
+            self._export_startup_activation_pending = True
+            production["startup_activation_pending"] = True
+        else:
+            production.pop("startup_activation_pending", None)
         await self._async_save_production(production)
+        if not provisional:
+            self._export_startup_activation_pending = False
+        self._schedule_export_retry()
         self.async_update_listeners()
 
     async def async_operator_arm_production_control(
@@ -3184,6 +3503,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self._production_arm_request = None
         self._clear_ev_auto_start_compensation()
         production = parse_production_state(self.store.data.get("production")).raw
+        production.pop("startup_activation_pending", None)
         production.update(
             {
                 "armed": False,
@@ -3237,6 +3557,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             "reason": reason,
         }
         await self._async_save_control_pause(pause)
+        self._schedule_export_retry()
         self._mark_forced_refresh("control_paused")
         await self.async_request_refresh()
 
@@ -3253,6 +3574,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if asset in {"all", EXPORT_ASSET}:
             async with self._command_lock:
                 await ExportLimitControl(self.hass, self.store, self.entry_data).resume()
+            self._schedule_export_retry()
         self._mark_forced_refresh("control_resumed")
         await self.async_request_refresh()
 
@@ -3533,6 +3855,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             finally:
                 from .calendar import calendar_event_records
 
+                self._schedule_export_retry()
                 # Capture each completed transaction before later asynchronous
                 # work can end its activity. Also retain confirmation on failure
                 # or generation change without republishing an obsolete plan.
