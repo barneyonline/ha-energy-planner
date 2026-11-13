@@ -13,6 +13,7 @@
 ### 🐛 Bug fixes
 
 - Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard.
+- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change.
 
 ### 🔧 Improvements
 
