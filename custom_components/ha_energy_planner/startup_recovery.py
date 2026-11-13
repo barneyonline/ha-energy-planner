@@ -199,9 +199,8 @@ async def async_cancel_startup_auto_recovery(
         if not preserve_control:
             await self.executor.async_dismiss_startup_recovery_notification()
         return
-    if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload"}:
-        # Persist the current grace/recovery state verbatim so the next
-        # process can distinguish an armed restart from disarmed recovery.
+    if preserve_control and reason in {"home_assistant_shutdown", "configuration_reload", "options_changed"}:
+        # Keep recovery restartable until shutdown or the new options handoff.
         return
     await self._async_update_startup_auto_recovery(
         "interrupted" if preserve_control else "cancelled",

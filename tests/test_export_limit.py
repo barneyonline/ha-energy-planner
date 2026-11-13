@@ -1857,6 +1857,36 @@ def installer_rejection(key="export_limit_unavailable", cause=None):
     return error
 
 
+@pytest.mark.parametrize("restore", [False, True])
+def test_identity_bound_service_rejection_rolls_back_unsent_write(setup, monkeypatch, restore):
+    async def run():
+        if restore:
+            setup.mode["value"] = "confirm"
+            await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup) if restore else NOW
+        prior_timing = setup.control.cooldown(now)["last_dispatch_reserved_at"]
+
+        async def reject(hass, domain, service, data):
+            assert domain == "enphase_ev" and data["expected_gateway"] == GATEWAY
+            raise installer_rejection("export_limit_changed")
+
+        monkeypatch.setattr(runtime, "async_call_device_service", reject)
+        if restore:
+            result = await setup.control.restore(now)
+            assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+            assert setup.control.state["gateway_identity"] == GATEWAY
+        else:
+            result = await setup.control.execute(action(setup), now)
+            assert not setup.control.state
+        assert result == (OutcomeResult.PENDING if restore else OutcomeResult.REJECTED,
+                          "export_limit_target_changed", False)
+        assert not setup.control.state.get("pending")
+        assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == prior_timing
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == int(restore)
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("expired", [False, True])
 def test_installer_probe_failure_counts_when_it_publishes_unavailable(setup, retry_owner, expired):
     async def run():
@@ -2055,8 +2085,73 @@ def test_pending_gateway_mismatch_never_confirms_and_can_be_retired(setup, saved
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("same_control", [False, True])
+def test_resume_retires_settled_baseline_only_for_same_control(setup, same_control):
+    async def run():
+        setup.mode["value"] = "confirm"
+        await setup.control.execute(action(setup), NOW)
+        owned = setup.control.state
+        assert owned["baseline"] and not owned.get("pending")
+        setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+        if not same_control:
+            setup.registry[ENTITY].device_id = "different-control"
+        await setup.control.resume()
+        assert setup.control.state == ({} if same_control else owned)
+
+    asyncio.run(run())
+
+
+def test_legacy_ready_retry_without_baseline_requires_resume(setup):
+    async def run():
+        setup.states[ENTITY] = limit_state(0)
+        await setup.control.save({
+            "identity": runtime.target_identity(setup.hass, ENTITY),
+            "expected": {"watts": 0, "slew_rate": 100.0},
+            "retry": {"state": "ready", "attempts": 1, "next_attempt_at": None},
+        })
+        assert await setup.control.reconcile(NOW) == runtime.GATEWAY_UNVERIFIED
+        assert setup.control.state["retry"]["state"] == "ready"
+        await setup.control.resume()
+        assert not setup.control.state
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("operation", ["confirm", "restore", "retry"])
+def test_reconciliation_rechecks_gateway_after_alias_save(select_setup, operation):
+    setup = select_setup
+
+    async def run():
+        control = runtime.ExportLimitControl(setup.hass, setup.store, setup.mapping)
+        state = {"identity": runtime.target_identity(setup.hass, setup.sensor), "gateway_identity": GATEWAY}
+        if operation == "retry":
+            state["retry"] = {"state": "ready", "attempts": 1, "next_attempt_at": None}
+        else:
+            state["baseline"] = {"watts": None, "slew_rate": 100.0}
+            state["pending"] = {
+                "action_id": "alias-request", "plan_id": "alias-plan", "kind": "set_export_limit",
+                "identity": state["identity"], "sent_at": NOW.timestamp(), "confirmation_not_before": NOW.timestamp(),
+                "attempt_recorded": True, "watts": 0, "slew_rate": None, "restore": operation == "restore",
+                "pre_state": {"watts": None, "slew_rate": 100.0},
+            }
+        await control.save(state)
+        setup.states[setup.sensor] = limit_state(0)
+        save = setup.store.async_save_ownership
+
+        async def save_then_replace(ownership):
+            await save(ownership)
+            setup.states[setup.sensor].attributes["gateway_identity"] = "b" * 64
+
+        setup.store.async_save_ownership = save_then_replace
+        assert await control.reconcile(NOW) == runtime.GATEWAY_CHANGED
+        assert control.state == {**state, "identity": runtime.target_identity(setup.hass, setup.select)}
+        assert not setup.store.data["execution_audit"]
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("gateway", ["b" * 64, None])
-def test_no_write_restore_rechecks_gateway_after_alias_save(select_setup, gateway):
+def test_no_write_restore_rechecks_gateway_after_reconciliation(select_setup, gateway):
     setup = select_setup
 
     async def run():
@@ -2066,15 +2161,15 @@ def test_no_write_restore_rechecks_gateway_after_alias_save(select_setup, gatewa
             "identity": runtime.target_identity(setup.hass, setup.sensor),
             "gateway_identity": GATEWAY, "baseline": baseline, "expected": baseline,
         })
-        save = setup.store.async_save_ownership
+        reconcile = control.reconcile
 
-        async def save_then_replace(ownership):
-            await save(ownership)
-            state = ownership.get(EXPORT_ASSET)
-            if state and state["identity"]["entity_id"] == setup.select:
-                setup.states[setup.sensor].attributes["gateway_identity"] = gateway
+        async def reconcile_then_replace(now):
+            issue = await reconcile(now)
+            assert issue is None
+            setup.states[setup.sensor].attributes["gateway_identity"] = gateway
+            return issue
 
-        setup.store.async_save_ownership = save_then_replace
+        control.reconcile = reconcile_then_replace
         assert await control.restore(NOW) == (
             OutcomeResult.PENDING, runtime.GATEWAY_CHANGED if gateway else runtime.GATEWAY_UNVERIFIED, False,
         )
@@ -3644,6 +3739,31 @@ def test_operator_disarm_restores_export_after_one_failed_store_save(setup, retr
     asyncio.run(run())
 
 
+def test_restart_finishes_export_restore_interrupted_by_operator_disarm(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        setup.states[ENTITY] = limit_state(3000)
+        setup.mode["value"] = "confirm"
+        assert (await owner.executor.async_execute_export_limit(action(setup), NOW))[2]
+        advance_clock(setup)
+        await owner._async_update_startup_auto_recovery(
+            "cancelled", successful_runs=0, reason="operator_disarmed", completed=True, disarm_reason="user_requested",
+        )
+        assert not setup.control.state.get("restoring")
+        assert setup.states[ENTITY].attributes["confirmed_watts"] == 0
+
+        restarted = retry_owner.create()
+        await restarted.async_reconcile_production_evidence_contract()
+        assert setup.control.state["restoring"]
+        assert not restarted.active_control
+        assert not getattr(restarted, "_startup_auto_recovery_authorized", False)
+        await restarted._async_reconcile_export_limit()
+        assert setup.states[ENTITY].attributes["confirmed_watts"] == 3000
+        assert not setup.control.state
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("legacy", [False, True])
 def test_operator_disarm_stays_authoritative_across_restart(setup, retry_owner, legacy):
     async def run():
@@ -4208,7 +4328,9 @@ def test_device_toggle_during_startup_grace_preserves_other_ownership(setup, dis
     asyncio.run(run())
 
 
-def test_device_toggle_saves_recovery_before_disarm_can_reach_disk(setup, retry_owner):
+@pytest.mark.parametrize("provisional", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_device_toggle_preserves_disarmed_recovery_across_restart(setup, retry_owner, provisional, interrupted):
     from test_coordinator import FakeExecutor
 
     from custom_components.ha_energy_planner.const import CONF_ENPHASE_CONTROL_ENABLED
@@ -4217,16 +4339,26 @@ def test_device_toggle_saves_recovery_before_disarm_can_reach_disk(setup, retry_
         owner = retry_owner.create({CONF_ENPHASE_CONTROL_ENABLED: True})
         owner.executor = FakeExecutor()
         owner._startup_auto_recovery_authorized = True
-        await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
-        await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        if provisional:
+            await owner._async_update_startup_auto_recovery("restoring", successful_runs=1, reason="starting")
+            await owner.async_arm_production_control("startup_auto_recovered", provisional=True)
+        else:
+            await owner._async_update_startup_auto_recovery(
+                "validating", successful_runs=0, reason="validation_in_progress", disarm_reason="startup_grace_unsafe",
+            )
         owner.entry.options[CONF_ENPHASE_CONTROL_ENABLED] = False
 
         async def lose_power_before_restoration():
             raise OSError("interrupted option transition")
 
-        owner.executor.async_persist_ev_grid_reservation = lose_power_before_restoration
-        with pytest.raises(OSError, match="interrupted option transition"):
+        if interrupted:
+            owner.executor.async_persist_ev_grid_reservation = lose_power_before_restoration
+            with pytest.raises(OSError, match="interrupted option transition"):
+                await owner.async_handle_options_update()
+        else:
+            owner.async_start_startup_auto_recovery = Mock()
             await owner.async_handle_options_update()
+            owner.async_start_startup_auto_recovery.assert_called_once()
         setup.store.data = deepcopy(setup.store.data)
         assert setup.store.data["production"]["armed"] is False
         assert "startup_activation_pending" not in setup.store.data["production"]

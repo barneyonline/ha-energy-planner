@@ -1908,9 +1908,14 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 live, live_issue = export_limit_feedback(self.hass, target, dt_util.utcnow())
                 if upstream.pending is not None or live.get("pending"):
                     return "export_limit_pending"
-                if not live_issue and (mismatch := gateway_identity_issue(gateway, live.get("gateway_identity"))):
+                return prepared_readback_issue(live, live_issue)
+
+            def prepared_readback_issue(live: dict[str, Any], issue: str | None) -> str | None:
+                if issue == "export_limit_entity_unavailable":
+                    return issue
+                if not issue and (mismatch := gateway_identity_issue(gateway, live.get("gateway_identity"))):
                     return mismatch
-                if (live_issue or live["last_readback"] < started.timestamp()
+                if (issue or live["last_readback"] < started.timestamp()
                         or (live["watts"], live["slew_rate"]) != setting):
                     return "export_limit_retry_readback_changed"
                 return None
@@ -1956,13 +1961,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 live, feedback_issue = export_limit_feedback(
                     self.hass, control.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now,
                 )
-                if feedback_issue == "export_limit_entity_unavailable":
-                    raise RetryWriteDeferred(feedback_issue)
-                if not feedback_issue and (mismatch := gateway_identity_issue(gateway, live.get("gateway_identity"))):
-                    raise RetryWriteDeferred(mismatch)
-                if (feedback_issue or live["last_readback"] < started.timestamp()
-                        or (live["watts"], live["slew_rate"]) != setting):
-                    raise RetryWriteDeferred("export_limit_retry_readback_changed")
+                # The provider has published its own pending intent by here.
+                if (reason := prepared_readback_issue(live, feedback_issue)) is not None:
+                    raise RetryWriteDeferred(reason)
                 if self.executor._control_rejection_reason(action, now) is not None:
                     raise RetryWriteDeferred("export_limit_retry_interrupted")
                 if not action.execute_not_before <= now < action.execute_not_after:
@@ -2429,11 +2430,18 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             production.raw.get("startup_activation_pending") is True
             or (recovery_status == "restoring" and production.raw.get("armed_reason") == "startup_auto_recovered")
         )
-        if production.armed and operator_disarmed:
-            # Older saves can contain a completed operator cancellation with
-            # the old arm still present.
-            await self.async_disarm_production_control("operator_disarmed")
-            return True
+        if operator_disarmed:
+            if production.armed:
+                # Older saves can contain a completed operator cancellation with
+                # the old arm still present.
+                await self.async_disarm_production_control("operator_disarmed")
+            export = ExportLimitControl(self.hass, self.store, self.entry_data)
+            export_state = export.state
+            if export_state.get("baseline") and not export_state.get("restoring"):
+                # The stop can be durable before the original process reaches
+                # its restore call. Reconcile and restore under the command lock.
+                await export.save({**export_state, "restoring": True})
+            return production.armed
         if provisional_arm:
             if self.automatic_control_requested:
                 # Commit the disarm and resumable disposition together, even
@@ -2669,21 +2677,23 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             )
             automatic_lifecycle_was_active = was_running or recovery_was_pending
             operator_disarm = getattr(self, "_operator_disarm_request", None)
-            await self.async_cancel_startup_auto_recovery(
-                "options_changed", restore_owned_state=not device_control_only_change)
-            if operator_disarm is not getattr(self, "_operator_disarm_request", None):
-                was_running = automatic_lifecycle_was_active = False
             automatic_control_still_requested = bool(
                 strict_bool(current_options.get(CONF_PLANNER_ENABLED), default=False)
                 and not strict_bool(current_options.get(CONF_DRY_RUN), default=True)
             )
-            resume_provisional_recovery = (
-                was_running and automatic_control_still_requested
-                and device_control_only_change and self._export_write_blocked()
+            resume_disarmed_recovery = (
+                automatic_control_still_requested and device_control_only_change
+                and ((was_running and self._export_write_blocked()) or (recovery_was_pending and not production.armed))
             )
-            if resume_provisional_recovery:
-                # The provisional arm still blocks dispatch if we restart before
-                # this save. Once disarmed, this status carries recovery intent.
+            await self.async_cancel_startup_auto_recovery(
+                "options_changed", preserve_control=resume_disarmed_recovery,
+                restore_owned_state=not device_control_only_change,
+            )
+            if operator_disarm is not getattr(self, "_operator_disarm_request", None):
+                was_running = automatic_lifecycle_was_active = resume_disarmed_recovery = False
+            if resume_disarmed_recovery:
+                # Preserve the previous recovery while cancellation drains.
+                # Save its restartable replacement before restoration or replanning.
                 await self._async_update_startup_auto_recovery(
                     "waiting_for_home_assistant", successful_runs=0, reason="startup_safe_recovery_pending",
                 )
@@ -2691,7 +2701,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 was_running
                 and automatic_control_still_requested
                 and operator_disarm is getattr(self, "_operator_disarm_request", None)
-                and (not device_control_only_change or resume_provisional_recovery)
+                and (not device_control_only_change or resume_disarmed_recovery)
                 and parse_production_state(self.store.data.get("production")).armed
             ):
                 await self.async_disarm_production_control("configuration_changed")
@@ -2765,12 +2775,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                         return
                 self._startup_auto_recovery_authorized = True
                 self._export_retry_startup_blocked = True
-                if not resume_provisional_recovery:
+                if not resume_disarmed_recovery:
                     await self._async_update_startup_auto_recovery(
                         "waiting_for_home_assistant",
                         successful_runs=0,
                         reason=(
-                            "startup_safe_recovery_pending" if self._export_write_blocked() else "configuration_changed"
+                            "configuration_changed" if self.active_control and not self._export_write_blocked()
+                            else "startup_safe_recovery_pending"
                         ),
                     )
                 if operator_disarm is getattr(self, "_operator_disarm_request", None):

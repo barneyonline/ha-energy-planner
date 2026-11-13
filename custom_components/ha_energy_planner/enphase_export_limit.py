@@ -577,12 +577,20 @@ class ExportLimitControl:
             return None
         if pending := state.get("pending"):
             await self._recover_pending(state, pending, now)
-        observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+        entity = self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+        observed, issue = feedback(self.hass, entity, now)
+        if not issue and state["identity"] != observed["identity"] and same_control(
+            observed["identity"], state["identity"],
+        ):
+            state["identity"] = observed["identity"]
+            await self.save(state)
+            now = datetime.now(UTC)
+            observed, issue = feedback(self.hass, entity, now)
         if "identity" in observed and not same_control(observed["identity"], state["identity"]):
             return "export_limit_target_changed"
         gateway = state.get("gateway_identity")
         pending = state.get("pending")
-        if not issue and (gateway or pending or state.get("baseline")):
+        if not issue and (gateway or pending or state.get("baseline") or state.get("retry")):
             issue = gateway_identity_issue(gateway, observed.get("gateway_identity"))
         if issue:
             if pending and now.timestamp() - pending["sent_at"] >= READBACK_MAX_AGE.total_seconds():
@@ -596,10 +604,6 @@ class ExportLimitControl:
                 if retry:
                     await self.store.async_flush()
             return issue
-        if state["identity"] != observed["identity"]:
-            state["identity"] = observed["identity"]
-            await self.save(state)
-        pending = state.get("pending")
         if state.get("pause") == "external_export_limit_conflict" and not pending:
             if observed["pending"]:
                 return "export_limit_pending"
@@ -617,27 +621,31 @@ class ExportLimitControl:
                     await self.audit(pending, OutcomeResult.REJECTED, "external_export_limit_changed", now, observed)
                     await self.adopt_external_feedback(observed, now)
                     return self.state.get("pause")
-                record = await self.prepare_cooldown(now)
-                assert record is not None
-                if record.get("confirmation_request") != pending["sent_at"]:
-                    # API time is a read completion, not physical change time.
-                    # Start at our first observation, once per request.
-                    record.update(confirmed_at=now.timestamp(), confirmation_request=pending["sent_at"])
-                    await self.save_timing(observed["identity"], record)
-                await self.audit(
-                    pending,
-                    OutcomeResult.RESTORED if pending["restore"] else OutcomeResult.APPLIED,
-                    "export_limit_restored" if pending["restore"] else "export_limit_confirmed",
-                    now,
-                    observed,
-                )
+                record = normalized_record(self.store.data.get("command_rate_limits", {}),
+                                           observed["identity"], state, now)
+                async with self.store.async_delay_save():
+                    if record.get("confirmation_request") != pending["sent_at"]:
+                        # API time is a read completion, not physical change time.
+                        # Start at our first observation, once per request.
+                        record.update(confirmed_at=now.timestamp(), confirmation_request=pending["sent_at"])
+                        await self.save_timing(observed["identity"], record, flush=False)
+                    await self.audit(
+                        pending,
+                        OutcomeResult.RESTORED if pending["restore"] else OutcomeResult.APPLIED,
+                        "export_limit_restored" if pending["restore"] else "export_limit_confirmed",
+                        now,
+                        observed,
+                    )
+                    if pending["restore"]:
+                        await self.save({})
+                    else:
+                        state.pop("pending")
+                        state.pop("retry", None)
+                        state["expected"] = {"watts": observed["watts"], "slew_rate": observed["slew_rate"]}
+                        await self.save(state)
+                await self.store.async_flush()
                 if pending["restore"]:
-                    await self.save({})
                     return None
-                state.pop("pending")
-                state.pop("retry", None)
-                state["expected"] = {"watts": observed["watts"], "slew_rate": observed["slew_rate"]}
-                await self.save(state)
             elif now.timestamp() - pending["sent_at"] >= READBACK_MAX_AGE.total_seconds():
                 await self.unconfirmed(state, pending, now, observed)
                 return "export_limit_unconfirmed"
@@ -662,23 +670,25 @@ class ExportLimitControl:
     ) -> None:
         """Pause once even if readback itself has become unavailable or stale."""
         if state.get("pause") != "export_limit_unconfirmed":
-            state["pause"] = "export_limit_unconfirmed"
-            await self.save(state)
-            await self.audit(pending, OutcomeResult.FAILED, "export_limit_unconfirmed", now, observed)
+            async with self.store.async_delay_save():
+                await self.audit(pending, OutcomeResult.FAILED, "export_limit_unconfirmed", now, observed)
+                state["pause"] = "export_limit_unconfirmed"
+                await self.save(state)
 
     async def resume(self) -> None:
         """Clear a pause or retire ownership of a verified replaced gateway."""
         state = self.state
         now = datetime.now(UTC)
         observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+        if state and "identity" in observed and not same_control(observed["identity"], state["identity"]):
+            return
         gateway = state.get("gateway_identity")
         can_retire = (
             not issue and not observed["pending"] and observed.get("gateway_identity")
             and observed["gateway_identity"] != gateway
         )
         if pending := state.get("pending"):
-            if (can_retire and same_control(observed["identity"], state["identity"])
-                    and (gateway or state.get("pause") == "export_limit_unconfirmed")):
+            if can_retire and (gateway or state.get("pause") == "export_limit_unconfirmed"):
                 # Keep the original reservation and account for an uncertain
                 # dispatch without treating the replacement as confirmation.
                 async with self.store.async_delay_save():
@@ -844,6 +854,15 @@ class ExportLimitControl:
                 await rollback_reservation("export_limit_retry_not_sent")
             raise
         except ServiceValidationError as err:
+            if (retry_apply is None and "expected_gateway" in data and err.translation_domain == "enphase_ev"
+                    and err.translation_key == "export_limit_changed"):
+                # Enphase rejects an identity-bound snapshot change before
+                # setting pending intent or sending the gateway request.
+                reason = "export_limit_target_changed"
+                await rollback_reservation(reason)
+                if restore:
+                    await self.audit(pending, OutcomeResult.REJECTED, reason, dispatch_now, latest)
+                return OutcomeResult.REJECTED, reason, False
             if not dispatch_reached:
                 if isinstance(err, RetryWriteDeferred):
                     reason = err.reason
