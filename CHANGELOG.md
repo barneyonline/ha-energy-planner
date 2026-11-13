@@ -12,7 +12,7 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard.
 
 ### 🔧 Improvements
 

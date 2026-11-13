@@ -3,17 +3,23 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+EXPORT_ACTION_CAP_REACHED = "export_limit_daily_action_cap_reached"
+
 
 def counted_attempt(row: Any) -> bool:
     """Count applied/uncertain attempts, excluding no-ops and climate releases."""
     return (
         isinstance(row, dict)
         and row.get("asset") in {"ev", "daikin", "enphase", "enphase_export_limit"}
-        and ((row.get("result") == "pending" or str(row.get("reason", "")).startswith("export_limit_service_rejected"))
-             if row.get("asset") == "enphase_export_limit"
-             else (row.get("result") in {"applied", "failed", "restored"}
-                   or row.get("asset") == "ev" and row.get("reason") == "ev_vehicle_suspended"
-                   and row.get("command_sent") is True))
+        and (
+            (row.get("command_sent") is not False
+             and (row.get("result") == "pending"
+                  or str(row.get("reason", "")).startswith("export_limit_service_rejected")))
+            if row.get("asset") == "enphase_export_limit"
+            else (row.get("result") in {"applied", "failed", "restored"}
+                  or row.get("asset") == "ev" and row.get("reason") == "ev_vehicle_suspended"
+                  and row.get("command_sent") is True)
+        )
         and row.get("reason") not in {"already_in_desired_state", "already_in_desired_hvac_state"}
         # Older EV safety-stop retries recorded missing local targets as failed
         # commands even though the adapter never dispatched a service call.
@@ -32,12 +38,25 @@ def attempt_time(row: dict[str, Any]) -> datetime | None:
         return None
 
 
+def reanchor_export_attempts(rows: list[Any], now: datetime) -> list[Any]:
+    """Move only future export dispatches to the clock correction time."""
+    # A future export attempt is evidence of a dispatch during clock skew.
+    # Persist its accounting time on repair so later reads cannot extend it.
+    return [
+        {**row, "attempted_at": now.isoformat()}
+        if (counted_attempt(row) and row["asset"] == "enphase_export_limit"
+            and (at := attempt_time(row)) is not None and at > now)
+        else row
+        for row in rows
+    ]
+
+
 def recent_attempts(rows: Any, now: datetime) -> list[dict[str, Any]]:
     """Retain compact timestamps independently of presentation audit rotation."""
     return [
         {**{key: row.get(key) for key in ("attempted_at", "asset", "kind", "result", "reason")},
          **({"command_sent": row["command_sent"]} if isinstance(row.get("command_sent"), bool) else {})}
-        for row in rows if counted_attempt(row)
+        for row in reanchor_export_attempts(rows, now) if counted_attempt(row)
         and (at := attempt_time(row)) is not None and now - timedelta(hours=24) < at <= now
     ] if isinstance(rows, list) else []
 
@@ -57,7 +76,7 @@ def action_budget(rows: Any, options: dict[str, Any], now: datetime, asset: str)
     }
 
 
-def budget_history(store: dict[str, Any]) -> Any:
+def budget_history(store: dict[str, Any]) -> list[Any]:
     """Use legacy audit only before a dedicated attempt ledger exists."""
     rows = store.get("action_attempts")
     if not isinstance(rows, list):

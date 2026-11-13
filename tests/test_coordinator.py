@@ -833,6 +833,11 @@ class FakeStore:
     async def async_save_command_rate_limits(self, value):
         self.data["command_rate_limits"] = value
 
+    async def async_reanchor_export_attempts(self, now):
+        from custom_components.ha_energy_planner.action_limits import budget_history, reanchor_export_attempts
+
+        self.data["action_attempts"] = reanchor_export_attempts(budget_history(self.data), now)
+
     async def async_save_ownership(self, ownership: dict[str, object]) -> None:
         self.data["ownership"] = ownership
 
@@ -927,7 +932,7 @@ class FakeExecutor:
         self.evaluated.append((plan, context))
         return None
 
-    async def async_restore_safe_state(self, reason: str) -> None:
+    async def async_restore_safe_state(self, reason: str, *, preserve_export_retry: bool = False) -> None:
         self.restored.append(reason)
 
     async def async_restore_device_control(self, asset: str, reason: str) -> object:

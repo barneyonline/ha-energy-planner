@@ -12,6 +12,7 @@ from homeassistant.helpers.start import async_at_started
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED,
     CONF_HOUSEHOLD_LOAD,
     DOMAIN,
     STARTUP_WARMUP_SECONDS,
@@ -90,6 +91,8 @@ def async_start_startup_auto_recovery(self: EnergyPlannerCoordinator) -> None:
                 successful_runs=0,
                 reason="startup_safe_recovery_resumed",
             )
+            self._export_retry_startup_blocked = False
+            self._schedule_export_retry()
         self._startup_auto_recovery_task = self.entry.async_create_background_task(
             self.hass,
             self._async_run_startup_auto_recovery(),
@@ -130,6 +133,7 @@ async def async_cancel_startup_auto_recovery(
     )
     self._startup_auto_recovery_authorized = False
     self._startup_auto_recovery_deadline = None
+    self._export_retry_startup_blocked = False
     if hasattr(self, "executor"):
         self.executor.notification_grace_until = None
     start_unsub = getattr(self, "_startup_auto_recovery_start_unsub", None)
@@ -257,6 +261,8 @@ async def _async_complete_startup_grace(self: EnergyPlannerCoordinator) -> tuple
         completed=True,
     )
     self.executor.notification_grace_until = None
+    self._export_retry_startup_blocked = False
+    self._schedule_export_retry()
     await self.executor.async_dismiss_startup_recovery_notification()
     return True, "startup_grace_completed_healthy"
 
@@ -290,6 +296,8 @@ async def _async_enter_startup_safe_recovery(self: EnergyPlannerCoordinator, rea
     )
     await self.executor.async_notify_startup_recovery_unsafe(restore_reason or reason)
     self.executor.notification_grace_until = None
+    self._export_retry_startup_blocked = False
+    self._schedule_export_retry()
 
 
 async def _async_retry_startup_safe_recovery(self: EnergyPlannerCoordinator) -> None:
@@ -369,7 +377,9 @@ async def _async_reactivate_after_startup_recovery(
     if not final_ready or not report.get("safe_to_activate_now"):
         return False, reason if not final_ready else "final_preflight_failed"
 
-    await self.async_arm_production_control("startup_auto_recovered")
+    # Cancellation can revoke recovery while production is provisionally
+    # armed. Keep export writes closed until validation or a later operator arm.
+    await self.async_arm_production_control("startup_auto_recovered", provisional=True)
     try:
         await self._async_compensate_ev_auto_start(
             require_unowned=False,
@@ -387,6 +397,9 @@ async def _async_reactivate_after_startup_recovery(
         except Exception:  # noqa: BLE001 - the production gate remains disarmed.
             _LOGGER.exception("Could not restore safe state after failed recovery refresh")
         return False, "active_replan_failed"
+
+    if not self._startup_auto_recovery_authorized:
+        return False, "startup_recovery_cancelled"
 
     final_report = build_preflight_report(self.hass, self)
     final_ready, reason = _startup_auto_recovery_validation_ready(final_report, self.entry_data)
@@ -408,6 +421,10 @@ async def _async_reactivate_after_startup_recovery(
         reason="automatic_control_reactivated",
         completed=True,
     )
+    self._export_startup_activation_pending = False
+    self._schedule_export_retry()
+    if self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+        self._schedule_debounced_refresh("startup_export_activation", debounce_seconds=0, force=True)
     await self.executor.async_dismiss_startup_recovery_notification()
     return True, "automatic_control_reactivated"
 
@@ -495,6 +512,8 @@ async def _async_update_startup_auto_recovery(
         self._startup_auto_recovery_authorized = False
         self._startup_auto_recovery_deadline = None
         recovery["completed_at"] = now
+    if status == "recovered":
+        production.pop("startup_activation_pending", None)
     production["startup_auto_recovery"] = recovery
     await self._async_save_production(production)
     self.async_update_listeners()

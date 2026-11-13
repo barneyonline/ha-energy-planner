@@ -58,6 +58,47 @@ class FakeStore:
         FakeStore.save_count += 1
 
 
+@pytest.mark.parametrize("repair_on_load", [False, True])
+def test_export_attempt_clock_repair_is_persisted_once(monkeypatch, repair_on_load):
+    from custom_components.ha_energy_planner.action_limits import action_budget
+
+    now = datetime.now(UTC)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+
+    monkeypatch.setattr(storage_module, "datetime", Clock)
+    monkeypatch.setattr(storage_module, "Store", FakeStore)
+    monkeypatch.setattr(FakeStore, "loaded_by_key", None)
+    future = (now + timedelta(days=30)).isoformat()
+    attempt = dict(asset="enphase_export_limit", kind="set_export_limit", result="pending",
+                   attempted_at=future, reason="export_limit_pending")
+
+    async def run():
+        store = PlannerStore(object(), "export-clock")
+        if repair_on_load:
+            monkeypatch.setattr(FakeStore, "loaded", {"action_attempts": [attempt], "execution_audit": [attempt]})
+            await store.async_load()
+        else:
+            store.data.update(action_attempts=[attempt], execution_audit=[attempt])
+            await store.async_reanchor_export_attempts(now)
+        assert FakeStore.saved["action_attempts"][0]["attempted_at"] == now.isoformat()
+        assert FakeStore.saved["execution_audit"][0]["attempted_at"] == future
+        monkeypatch.setattr(FakeStore, "loaded", deepcopy(FakeStore.saved))
+        restarted = PlannerStore(object(), "export-clock")
+        await restarted.async_load()
+        await restarted.async_reanchor_export_attempts(now + timedelta(hours=1))
+        ledger = restarted.data["action_attempts"]
+        assert ledger[0]["attempted_at"] == now.isoformat()
+        cap = {"max_daily_export_limit_actions": 1}
+        assert action_budget(ledger, cap, now + timedelta(hours=23), "enphase_export_limit")["remaining"] == 0
+        assert action_budget(ledger, cap, now + timedelta(hours=24), "enphase_export_limit")["remaining"] == 1
+
+    asyncio.run(run())
+
+
 def test_store_namespaces_state_per_config_entry_and_supports_legacy_fallback(monkeypatch: object) -> None:
     monkeypatch.setattr(storage_module, "Store", FakeStore)
     FakeStore.created_keys = []

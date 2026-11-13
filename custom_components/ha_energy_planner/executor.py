@@ -13,7 +13,7 @@ from typing import Any
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.util import dt as dt_util
 
-from .action_limits import action_budget, budget_history
+from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
 from .adapter_helpers import profile_control_service as _profile_control_service_for_target
 from .climate_runtime import command_rejection
 from .command_models import ControlAction, ManualControlAction
@@ -55,8 +55,9 @@ from .constraints import ConstraintValidator, _projected_grid_flows_kw
 from .discovery import CapabilityDiscovery
 from .enphase_adapter import EnphaseCommandResult, EnphaseProfileAdapter
 from .enphase_control import EnphaseControlTransaction
-from .enphase_export_limit import ExportLimitControl
+from .enphase_export_limit import ExportLimitControl, RetryApply, preserve_retry_on_reload
 from .enphase_export_limit import evidence as export_limit_evidence
+from .enphase_export_limit import target_identity as export_target_identity
 from .ev_adapter import EVChargerAdapter, EVCommandResult
 from .ev_control import _ev_action_wants_power, _positive_float, reserve_ev_grid_capacity
 from .ev_policy import finite, power_capability
@@ -179,6 +180,7 @@ class Executor:
                 })
         self.ev_command_guard: Callable[[], Callable[[], bool]] = lambda: lambda: True
         self.ev_restore_guard: Callable[[], bool] = lambda: True
+        self.export_write_blocked: Callable[[], bool] = lambda: False
         self.ev_start_feedback_expected_until: datetime | None = None
         self.ev_allocation_deadline_callback: Any = None
         self._ev_safety_stop_attempted_plan_id: str | None = None
@@ -781,22 +783,7 @@ class Executor:
             )
             return None
         if action.asset == ActionAsset.ENPHASE_EXPORT_LIMIT:
-            reason = self._export_limit_rejection_reason(action, now)
-            result, sent = OutcomeResult.REJECTED, False
-            if reason is None:
-                assert self.hass is not None
-                mapped_target = self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
-                def recheck() -> str | None:
-                    if self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY) != mapped_target:
-                        return "export_limit_target_changed"
-                    return self._export_limit_rejection_reason(action, dt_util.utcnow())
-                result, reason, sent = await ExportLimitControl(
-                    self.hass, self.store, self.entry_data, recheck, options=self.options).execute(action, now)
-            if sent:
-                await self._async_record_command_attempt(action, now)
-            if result != OutcomeResult.PENDING:
-                await self.store.async_add_outcome(self._action_outcome(
-                    action, now, result=result, reason=reason, pre_state={}, post_state={}, plan_id=plan.plan_id))
+            await self.async_execute_export_limit(action, now, plan_id=plan.plan_id)
             return None
         if action.asset == ActionAsset.DAIKIN and action.desired_state.get("hvac_mode") not in {None, "off"}:
             await self.async_reconcile_hvac_cycle()
@@ -1675,9 +1662,9 @@ class Executor:
             await self.async_resolve_restore_notifications("daikin")
         return outcome
 
-    async def async_restore_safe_state(self, reason: str) -> ActionOutcome:
+    async def async_restore_safe_state(self, reason: str, *, preserve_export_retry: bool = False) -> ActionOutcome:
         """Restore planner ownership state and notify the user."""
-        return await self._async_restore_safe_state(reason, assets=None)
+        return await self._async_restore_safe_state(reason, assets=None, preserve_export_retry=preserve_export_retry)
 
     async def async_restore_device_control(self, asset: str, reason: str) -> ActionOutcome:
         """Restore planner ownership for exactly one device control area."""
@@ -1690,6 +1677,7 @@ class Executor:
         reason: str,
         *,
         assets: set[str] | None,
+        preserve_export_retry: bool = False,
     ) -> ActionOutcome:
         """Restore all planner ownership or the selected device control areas."""
         command_guard = self.ev_command_guard()
@@ -1716,10 +1704,20 @@ class Executor:
         restore_ev = (assets is None or "ev" in assets) and command_guard() and self.ev_restore_guard()
         restore_hvac = assets is None or "daikin" in assets
         restore_enphase = assets is None or "enphase" in assets
-        restore_export = (assets is None or EXPORT_ASSET in assets) and not (
-            assets is None and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
-            and reason in {"startup_grace_unsafe", "startup_auto_recovery", "startup_control_paused"}
-        )
+        if assets is None and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True:
+            preserve_export = preserve_export_retry or reason in {
+                "startup_grace_unsafe", "startup_auto_recovery", "startup_control_paused",
+            } or (
+                self.hass is not None and reason in {
+                    "startup_auto_recovery_replan_failed", "startup_auto_recovery_replan_unsafe",
+                    "production_evidence_contract_changed",
+                } and preserve_retry_on_reload(ownership.get(EXPORT_ASSET, {}), export_target_identity(
+                    self.hass, self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""),
+                ))
+            )
+        else:
+            preserve_export = False
+        restore_export = (assets is None or EXPORT_ASSET in assets) and not preserve_export
         attempted_assets = {
             asset for asset, enabled in (("ev", restore_ev), ("daikin", restore_hvac),
                                         ("enphase", restore_enphase), (EXPORT_ASSET, restore_export))
@@ -2051,8 +2049,41 @@ class Executor:
             command_sent=command_sent,
         )
 
+    async def async_execute_export_limit(
+        self, action: PlanAction, now: datetime, *, plan_id: str | None = None, retry: dict[str, Any] | None = None,
+        retry_guard: Callable[[], str | None] | None = None,
+        retry_apply: RetryApply | None = None,
+    ) -> tuple[OutcomeResult, str, bool]:
+        """Run a tariff transition through the same production and dispatch gates."""
+        reason = self._export_limit_rejection_reason(action, now)
+        result, sent = OutcomeResult.REJECTED, False
+        if reason is None:
+            assert self.hass is not None
+            mapped_target = self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
+
+            def recheck() -> str | None:
+                if self.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY) != mapped_target:
+                    return "export_limit_target_changed"
+                return (retry_guard() if retry_guard else None) or self._export_limit_rejection_reason(
+                    action, dt_util.utcnow(),
+                )
+
+            result, reason, sent = await ExportLimitControl(
+                self.hass, self.store, self.entry_data, recheck, options=self.options,
+            ).execute(action, now, retry=retry, retry_apply=retry_apply)
+        if sent:
+            await self._async_record_command_attempt(action, now)
+        if result != OutcomeResult.PENDING and not (sent and result == OutcomeResult.FAILED):
+            await self.store.async_add_outcome(self._action_outcome(
+                action, now, result=result, reason=reason, pre_state={}, post_state={},
+                plan_id=plan_id or action.plan_id, command_sent=sent,
+            ))
+        return result, reason, sent
+
     def _export_limit_rejection_reason(self, action: PlanAction, now: datetime) -> str | None:
         """Revalidate policy authority again after the durability await."""
+        if self.export_write_blocked():
+            return "export_limit_retry_interrupted"
         reason = self._control_rejection_reason(action, now) or self._rate_limit_reason(action, now)
         if not self.options.get(CONF_PLANNER_ENABLED):
             return "planner_disabled"
@@ -3667,7 +3698,7 @@ def _daily_action_cap_reason(asset: ActionAsset, options: dict[str, Any], audit:
         ActionAsset.DAIKIN: (CONF_MAX_DAILY_CLIMATE_ACTIONS, "climate_daily_action_cap_reached"),
         ActionAsset.ENPHASE: (CONF_MAX_DAILY_ENPHASE_ACTIONS, "enphase_daily_action_cap_reached"),
         ActionAsset.ENPHASE_EXPORT_LIMIT: (
-            CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS, "export_limit_daily_action_cap_reached"),
+            CONF_MAX_DAILY_EXPORT_LIMIT_ACTIONS, EXPORT_ACTION_CAP_REACHED),
     }
     option_key, reason = option_by_asset[asset]
     cap = int(options.get(option_key, 0) or 0)
