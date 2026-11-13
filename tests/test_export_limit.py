@@ -2085,18 +2085,29 @@ def test_pending_gateway_mismatch_never_confirms_and_can_be_retired(setup, saved
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("same_control", [False, True])
-def test_resume_retires_settled_baseline_only_for_same_control(setup, same_control):
+@pytest.mark.parametrize("same_target", [True, False])
+def test_explicit_resume_retires_settled_baseline_only_for_same_control(setup, same_target):
+    from test_coordinator import _coordinator_for_runtime_services
+
     async def run():
+        setup.states[ENTITY] = limit_state(3000)
         setup.mode["value"] = "confirm"
         await setup.control.execute(action(setup), NOW)
         owned = setup.control.state
-        assert owned["baseline"] and not owned.get("pending")
+        assert owned["baseline"]["watts"] == 3000 and not owned.get("pending")
+        timing = deepcopy(setup.store.data["command_rate_limits"])
+        now = advance_clock(setup, 60)
+        setup.states[ENTITY] = limit_state(5000, readback=now.timestamp())
         setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
-        if not same_control:
+        if not same_target:
             setup.registry[ENTITY].device_id = "different-control"
-        await setup.control.resume()
-        assert setup.control.state == ({} if same_control else owned)
+
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        await owner.async_resume_control(asset=EXPORT_ASSET)
+        assert setup.control.state == ({} if same_target else owned)
+        assert setup.store.data["command_rate_limits"] == timing
+        assert len(setup.calls) == 1
 
     asyncio.run(run())
 
@@ -2177,6 +2188,67 @@ def test_no_write_restore_rechecks_gateway_after_reconciliation(select_setup, ga
         assert control.state["gateway_identity"] == GATEWAY
         assert control.state["restoring"]
         assert not setup.calls
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize(("change", "issue"), [
+    ("none", None),
+    ("replacement", runtime.GATEWAY_CHANGED),
+    ("unverified", runtime.GATEWAY_UNVERIFIED),
+    ("remapped", "export_limit_target_changed"),
+    ("stale", "export_limit_readback_stale"),
+    ("pending", "export_limit_pending"),
+])
+def test_pending_restore_revalidates_feedback_after_alias_save(select_setup, change, issue):
+    setup = select_setup
+
+    async def run():
+        sensor_mapping = {**setup.mapping, CONF_ENPHASE_EXPORT_LIMIT_ENTITY: setup.sensor}
+        original = runtime.ExportLimitControl(setup.hass, setup.store, sensor_mapping)
+        setup.mode["value"] = "confirm"
+        await original.execute(build_actions(context(runtime.evidence(
+            setup.hass, sensor_mapping, OPTIONS, NOW,
+        )))[0], NOW)
+        now = advance_clock(setup)
+        setup.mode["value"] = "pending"
+        assert await original.restore(now) == (OutcomeResult.PENDING, "export_limit_pending", True)
+        owned = original.state
+        assert owned["pending"]["restore"]
+        audit = deepcopy(setup.store.data["execution_audit"])
+        history = deepcopy(setup.store.data["calendar_history"])
+        setup.states[setup.sensor] = limit_state(readback=now.timestamp())
+        save = setup.store.async_save_ownership
+
+        async def save_alias(ownership):
+            await save(ownership)
+            state = ownership.get(EXPORT_ASSET)
+            if not state or state["identity"]["entity_id"] != setup.select:
+                return
+            attrs = setup.states[setup.sensor].attributes
+            if change == "replacement":
+                attrs["gateway_identity"] = "b" * 64
+            elif change == "unverified":
+                attrs.pop("gateway_identity")
+            elif change == "remapped":
+                setup.registry[setup.sensor].device_id = setup.registry[setup.select].device_id = "different-control"
+            elif change == "stale":
+                attrs["last_successful_readback"] = now.timestamp() - 601
+            elif change == "pending":
+                setup.states[setup.sensor] = limit_state(pending=True, readback=now.timestamp())
+
+        setup.store.async_save_ownership = save_alias
+        result = await setup.control.restore(now)
+        if issue is None:
+            assert result == (OutcomeResult.RESTORED, "export_limit_restored", False)
+            assert not setup.control.state
+        else:
+            assert result == (OutcomeResult.PENDING, issue, False)
+            for key in ("baseline", "gateway_identity", "pending"):
+                assert setup.control.state[key] == owned[key]
+            assert setup.store.data["execution_audit"] == audit
+            assert setup.store.data["calendar_history"] == history
+        assert len(setup.calls) == 2
 
     asyncio.run(run())
 
