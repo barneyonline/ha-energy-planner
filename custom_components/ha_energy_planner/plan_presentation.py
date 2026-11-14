@@ -9,7 +9,14 @@ from typing import TYPE_CHECKING, Any
 from homeassistant.util import dt as dt_util
 
 from .const import CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED, CONF_ENPHASE_EXPORT_LIMIT_ENTITY
-from .enphase_export_limit import retry_status, target_identity
+from .enphase_export_limit import (
+    COMPANION_UPGRADE_REQUIRED,
+    GATEWAY_CHANGED,
+    GATEWAY_UNVERIFIED,
+    live_owned_gateway_issue,
+    retry_status,
+    target_identity,
+)
 from .export_limit_cooldown import cooldown_status
 from .models import ActionAsset, ActionKind, InputHealth, PlanAction, to_jsonable
 from .preflight import _current_plan_report
@@ -64,6 +71,11 @@ def export_limit_status(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
     identity = target_identity(hass, entity) if hass is not None and entity else None
     if identity is None and isinstance(ownership, dict):
         identity = ownership.get("identity")
+    if hass is not None and isinstance(ownership, dict) and (
+        gateway_issue := live_owned_gateway_issue(hass, entity, ownership, dt_util.utcnow())
+    ):
+        runtime_reason = gateway_issue
+        status.update(ready=False, reason=gateway_issue, summary=plain_reason(gateway_issue))
     timing = cooldown_status(coordinator.store.data, identity,
                              getattr(coordinator, "options", {}), dt_util.utcnow())
     status.update(timing)
@@ -619,6 +631,9 @@ def plain_reason(value: Any) -> str:
     """Return a plain-English explanation for an internal reason or issue code."""
     text = str(value or "").strip()
     labels = {
+        COMPANION_UPGRADE_REQUIRED: "Upgrade Enphase Energy to enable verified Export Limit recovery.",
+        GATEWAY_CHANGED: "Export Limit ownership belongs to a different gateway.",
+        GATEWAY_UNVERIFIED: "Waiting for Export Limit readback verified against the active gateway.",
         "ev_load_fallback_continue": "Consumption unavailable; continuing with conservative forecast limits.",
         "ev_load_fallback_waiting": "Consumption unavailable; waiting for stable readings before starting.",
         "ev_load_fallback_capacity_pause": "Charging paused: conservative household capacity is insufficient.",

@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from homeassistant.core import HomeAssistant
 
@@ -141,10 +141,12 @@ class PlannerStore:
 
     async def async_save_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Persist observed activity even when no new plan is computed."""
         self.record_calendar_events(events, now=now)
+        history = cast("dict[str, Any] | None", self.data.get("calendar_history"))
         await self._async_flush()
+        return history
 
     def record_calendar_events(
         self, events: list[dict[str, str]], *, now: datetime | None = None, location: str | None = None,

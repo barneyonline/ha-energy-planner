@@ -100,6 +100,7 @@ def limit_state(watts=None, *, pending=False, slew=100.0, readback=None):
             "request_status": "pending" if pending else "confirmed",
             "last_successful_readback": readback if readback is not None else NOW.timestamp(),
             "gateway_identity": GATEWAY,
+            "gateway_identity_verified": True,
         },
     )
 
@@ -972,6 +973,7 @@ def test_export_only_startup_validation_and_activation_wait_for_reconciliation(s
             await setup.control.save({
                 "identity": runtime.target_identity(setup.hass, ENTITY),
                 "gateway_identity": GATEWAY,
+                "gateway_identity_verified": True,
                 "baseline": {"watts": None, "slew_rate": 100.0},
                 "expected": {"watts": 0, "slew_rate": 100.0},
             })
@@ -1298,6 +1300,7 @@ def test_restore_isolated_from_profile_and_pending_outcome(setup):
 
 @pytest.mark.parametrize("stage", [
     "seed", "pending", "restore", "review", "unsupported", "off_restore", "off", "reconciliation_pending",
+    "replacement", "legacy_baseline", "unverified_readback",
 ])
 def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, stage):
     from test_coordinator import _coordinator_for_runtime_services
@@ -1326,6 +1329,20 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
         coordinator._schedule_debounced_refresh = lambda *args, **kwargs: None
         if stage == "unsupported":
             setup.states[ENTITY].state = "unsupported"
+        identity_case = stage in {"replacement", "legacy_baseline", "unverified_readback"}
+        if identity_case:
+            ready_plan = DryRunPlanner(opts).create_plan(context(runtime.evidence(setup.hass, DATA, opts, NOW)))
+            assert ready_plan.control_area_health[EXPORT_ASSET]["ready"]
+            original = {"watts": None, "slew_rate": 100}
+            ownership = {"identity": runtime.target_identity(setup.hass, ENTITY), "baseline": original,
+                         "expected": original}
+            if stage != "legacy_baseline":
+                ownership["gateway_identity"] = GATEWAY
+            await setup.control.save(ownership)
+            if stage == "replacement":
+                setup.states[ENTITY].attributes["gateway_identity"] = "b" * 64
+            elif stage == "unverified_readback":
+                setup.states[ENTITY].attributes["gateway_identity_verified"] = False
         ctx = context({} if stage in {"off_restore", "off"} else runtime.evidence(setup.hass, DATA, opts, NOW))
         monkeypatch.setattr(module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {}, build_context=lambda overrides: ctx,
@@ -1362,6 +1379,25 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             assert not result.actions
             return
         assert result.control_area_health[EXPORT_ASSET]
+        if identity_case:
+            from custom_components.ha_energy_planner.plan_presentation import export_limit_status
+            from custom_components.ha_energy_planner.preflight import build_preflight_report
+
+            reason = runtime.GATEWAY_CHANGED if stage == "replacement" else runtime.GATEWAY_UNVERIFIED
+            assert result.control_area_health[EXPORT_ASSET]["reason"] == reason
+            assert not result.actions
+            # Preflight and presentation must catch the mismatch even before
+            # the coordinator publishes a replacement for a ready plan.
+            coordinator.data = ready_plan
+            assert export_limit_status(coordinator)["reason"] == reason
+            report = build_preflight_report(setup.hass, coordinator)
+            assert not report["safe_to_activate_now"]
+            assert EXPORT_ASSET not in report["control_areas"]["confidence_eligible"]
+            assert report["control_areas"]["details"][EXPORT_ASSET]["reason"] == reason
+            snapshot = coordinator._export_reconciliation_inputs()
+            assert snapshot.issue == reason and not snapshot.reusable
+            assert setup.control.state == ownership
+            assert not setup.calls
         if stage == "seed":
             assert EXPORT_ASSET in coordinator.store.data["ownership"]
         elif stage != "review":
@@ -2008,6 +2044,52 @@ def test_retry_rechecks_gateway_before_a_prepared_no_op(setup, retry_owner):
     asyncio.run(run())
 
 
+def test_retry_cannot_settle_matching_watts_from_unverified_readback(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        now = advance_clock(setup)
+
+        async def prepare_then_unverified():
+            setup.states[ENTITY] = limit_state(0, readback=now.timestamp())
+            snapshot = await retry_owner.prepare()
+            setup.states[ENTITY].attributes["gateway_identity_verified"] = False
+            return snapshot
+
+        retry_owner.upstream.async_prepare.side_effect = prepare_then_unverified
+        await owner._async_retry_export_limit()
+        assert setup.control.state["retry"]["reason"] == runtime.GATEWAY_UNVERIFIED
+        assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
+        retry_owner.upstream.async_apply_guarded.assert_not_awaited()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_unverified_gateway_hash_cannot_complete_confirmation_or_no_write_restore(setup, pending):
+    async def run():
+        setup.mode["value"] = "pending" if pending else "confirm"
+        await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup, 60)
+        ownership = setup.control.state
+        state = limit_state(0 if pending else ownership["baseline"]["watts"], readback=now.timestamp())
+        state.attributes.pop("gateway_identity_verified")
+        setup.states[ENTITY] = state
+        audit = deepcopy(setup.store.data["execution_audit"])
+        if pending:
+            assert await setup.control.reconcile(now) == runtime.GATEWAY_UNVERIFIED
+            assert setup.control.state["pending"] == ownership["pending"]
+        else:
+            assert await setup.control.restore(now) == (OutcomeResult.PENDING, runtime.GATEWAY_UNVERIFIED, False)
+            assert setup.control.state["restoring"]
+        assert setup.control.state["baseline"] == ownership["baseline"]
+        assert setup.store.data["execution_audit"] == audit
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("replacement", ["settled", "pending", "stale", "unverified", "wrong_target", "same_gateway"])
 @pytest.mark.parametrize("receipt_saved", [True, False])
 def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_request(setup, replacement, receipt_saved):
@@ -2162,25 +2244,22 @@ def test_reconciliation_rechecks_gateway_after_alias_save(select_setup, operatio
 
 
 @pytest.mark.parametrize("gateway", ["b" * 64, None])
-def test_no_write_restore_rechecks_gateway_after_reconciliation(select_setup, gateway):
-    setup = select_setup
-
+def test_no_write_restore_rechecks_gateway_after_reconciliation(setup, gateway):
     async def run():
-        control = runtime.ExportLimitControl(setup.hass, setup.store, setup.mapping)
+        control = setup.control
         baseline = {"watts": None, "slew_rate": 100.0}
         await control.save({
-            "identity": runtime.target_identity(setup.hass, setup.sensor),
+            "identity": runtime.target_identity(setup.hass, ENTITY),
             "gateway_identity": GATEWAY, "baseline": baseline, "expected": baseline,
         })
         reconcile = control.reconcile
 
-        async def reconcile_then_replace(now):
-            issue = await reconcile(now)
-            assert issue is None
-            setup.states[setup.sensor].attributes["gateway_identity"] = gateway
-            return issue
+        async def reconcile_then_change_gateway(now):
+            result = await reconcile(now)
+            setup.states[ENTITY].attributes["gateway_identity"] = gateway
+            return result
 
-        control.reconcile = reconcile_then_replace
+        control.reconcile = reconcile_then_change_gateway
         assert await control.restore(NOW) == (
             OutcomeResult.PENDING, runtime.GATEWAY_CHANGED if gateway else runtime.GATEWAY_UNVERIFIED, False,
         )
@@ -2275,6 +2354,7 @@ def test_retiring_guarded_runtime_defers_without_operator_pause(setup, retry_own
         replacement = SimpleNamespace(
             enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
             async_apply_guarded=AsyncMock(side_effect=apply),
+            verifies_export_limit_gateway=True,
         )
         retry_owner.entry.runtime_data.coordinator.export_limit_runtime = replacement
         setup.mode["value"] = "confirm"
@@ -2354,7 +2434,9 @@ def retry_owner(setup, monkeypatch):
             slew=state.attributes["slew_rate"], gateway_identity=state.attributes["gateway_identity"],
         )
 
-    upstream = SimpleNamespace(async_prepare=AsyncMock(side_effect=prepare), enabled=True, pending=None)
+    upstream = SimpleNamespace(
+        async_prepare=AsyncMock(side_effect=prepare), enabled=True, pending=None, verifies_export_limit_gateway=True,
+    )
     upstream_entry = SimpleNamespace(domain="enphase_ev", state=ConfigEntryState.LOADED, disabled_by=None,
                                      runtime_data=SimpleNamespace(coordinator=SimpleNamespace(
                                          export_limit_runtime=upstream,
@@ -2487,8 +2569,9 @@ def test_export_retry_replans_and_only_confirms_from_matching_feedback(setup, re
 
 
 @pytest.mark.parametrize(("scenario", "reason", "terminal"), [
-    ("missing", "export_limit_retry_readiness_check_unavailable", True),
-    ("legacy_write", "export_limit_retry_readiness_check_unavailable", True),
+    ("missing", runtime.COMPANION_UPGRADE_REQUIRED, True),
+    ("legacy_write", runtime.COMPANION_UPGRADE_REQUIRED, True),
+    ("legacy_guarded", runtime.COMPANION_UPGRADE_REQUIRED, True),
     ("wrong_entry", "export_limit_retry_readiness_check_unavailable", False),
     ("entry_unloaded", "export_limit_retry_readiness_check_unavailable", False),
     ("entry_disabled", "export_limit_retry_readiness_check_unavailable", False),
@@ -2519,6 +2602,8 @@ def test_export_retry_needs_installer_and_fresh_settled_policy_evidence(setup, r
         elif scenario == "legacy_write":
             upstream.async_apply = AsyncMock()
             del upstream.async_apply_guarded
+        elif scenario == "legacy_guarded":
+            del upstream.verifies_export_limit_gateway
         elif scenario == "wrong_entry":
             setup.hass.config_entries.async_get_entry = lambda _: None
         elif scenario == "entry_unloaded":
@@ -2563,12 +2648,20 @@ def test_export_retry_needs_installer_and_fresh_settled_policy_evidence(setup, r
         await owner._async_retry_export_limit()
         assert len(setup.calls) == 1
         retry = setup.control.state["retry"]
-        assert retry["attempts"] == (0 if scenario in {"pending_before", "pending_during", "different_settings"} else 1)
+        free_check = reason == runtime.COMPANION_UPGRADE_REQUIRED or scenario in {
+            "pending_before", "pending_during", "different_settings",
+        }
+        assert retry["attempts"] == (0 if free_check else 1)
         assert retry["reason"] == reason
         assert retry["state"] == ("operator_required" if terminal else "scheduled")
         if scenario == "legacy_write":
             upstream.async_prepare.assert_not_called()
             upstream.async_apply.assert_not_called()
+        if scenario == "legacy_guarded":
+            upstream.async_prepare.assert_not_called()
+            upstream.async_apply_guarded.assert_not_called()
+            status = runtime.retry_status(setup.control.state, running=False)
+            assert status["operator_action"].startswith("Upgrade Enphase Energy")
         if scenario == "entry_unloaded":
             retry_owner.entry.state = ConfigEntryState.LOADED
             advance_clock(setup)
@@ -2656,6 +2749,7 @@ def test_export_retry_rechecks_authority_after_probe(setup, retry_owner, scenari
             retry_owner.entry.runtime_data.coordinator.export_limit_runtime = SimpleNamespace(
                 enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
                 async_apply_guarded=retry_owner.upstream.async_apply_guarded,
+                verifies_export_limit_gateway=True,
             )
         elif scenario == "shutdown":
             owner._begin_shutdown()
@@ -2843,15 +2937,22 @@ def test_retry_refunds_final_check_when_runtime_reloads_during_reconciliation(se
         await owner.executor.async_execute_export_limit(action(setup), NOW)
         setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
         advance_clock(setup)
-        save_timing = setup.store.async_save_command_rate_limits
+        save_ownership = setup.store.async_save_ownership
+        prepare = retry_owner.prepare
 
-        async def reload_after_probe(timing):
-            await save_timing(timing)
-            if retry_owner.upstream.async_prepare.await_count:
+        async def prepare_with_external_change():
+            # Reconciliation adopts this new baseline and persists it.
+            setup.states[ENTITY] = limit_state(5000)
+            return await prepare()
+
+        async def reload_during_adoption(ownership):
+            await save_ownership(ownership)
+            if ownership[EXPORT_ASSET].get("expected", {}).get("watts") == 5000:
                 retry_owner.entry.state = ConfigEntryState.NOT_LOADED
                 setup.states[ENTITY].state = "unavailable"
 
-        setup.store.async_save_command_rate_limits = reload_after_probe
+        retry_owner.upstream.async_prepare.side_effect = prepare_with_external_change
+        setup.store.async_save_ownership = reload_during_adoption
         await owner._async_retry_export_limit()
         retry_owner.upstream.async_prepare.assert_awaited_once()
         retry_owner.upstream.async_apply_guarded.assert_not_called()
@@ -3361,6 +3462,7 @@ def test_startup_retry_rechecks_the_loaded_provider_after_arming(setup, retry_ow
         replacement = SimpleNamespace(
             enabled=True, pending=None, async_prepare=AsyncMock(side_effect=retry_owner.prepare),
             async_apply_guarded=AsyncMock(side_effect=old.async_apply_guarded.side_effect),
+            verifies_export_limit_gateway=True,
         )
         retry_owner.entry.runtime_data.coordinator.export_limit_runtime = replacement
         setup.mode["value"] = "confirm"

@@ -540,12 +540,14 @@ def test_request_age_tracks_first_coalesced_trigger(monkeypatch):
         clock = [0.0]
         monkeypatch.setattr(timing_module, "perf_counter", lambda: clock[0])
         monkeypatch.setattr(coordinator_module, "perf_counter", lambda: clock[0])
+        monkeypatch.setattr(coordinator_module, "monotonic", lambda: clock[0])
         callbacks = []
         monkeypatch.setattr(coordinator_module, "async_call_later", lambda hass, delay, cb: (
             callbacks.append(cb) or (lambda: None)))
-        coordinator._schedule_debounced_refresh("first")
+        coordinator._schedule_debounced_refresh("first", debounce_seconds=1)
         clock[0] = 1
-        coordinator._schedule_debounced_refresh("latest")
+        coordinator._schedule_debounced_refresh("latest", debounce_seconds=1)
+        callbacks[0](None)
         clock[0] = 2
         coordinator.async_request_refresh = coordinator._async_update_data
         callbacks[-1](None)
@@ -669,7 +671,7 @@ def test_deferred_reconciliation_counts_only_the_dispatched_followup(monkeypatch
     asyncio.run(scenario())
 
 
-def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_timer(monkeypatch):
+def test_telemetry_refresh_preserves_export_completion_timer(monkeypatch):
     async def scenario():
         owner = coordinator_for_timing(export_entity="select.export")
         del owner._schedule_debounced_refresh
@@ -689,10 +691,11 @@ def test_telemetry_refresh_reuses_reconciliation_after_replacing_completion_time
         await owner._export_reconcile_task
         completion = timers[-1]
         owner._schedule_debounced_refresh("state_change")
-        assert completion in cancelled
+        assert timers == [completion]
+        assert not cancelled
         timers[-1](None)
         await asyncio.gather(*owner._listener_tasks)
-        assert owner.last_refresh_metadata["trigger"] == "state_change"
+        assert owner.last_refresh_metadata["trigger"] == "export_reconciled"
         assert not owner._export_reconcile_pending
         assert owner._export_reconcile_task is None
         reconcile.assert_awaited_once()

@@ -9,9 +9,10 @@ from typing import Any
 
 from aiohttp import ClientResponseError, ServerDisconnectedError
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.hass_dict import HassKey
 
 from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
 from .adapter_helpers import DEVICE_SERVICE_TIMEOUT_SECONDS, DeviceTargetUnavailable, async_call_device_service
@@ -29,12 +30,25 @@ from .export_limit_cooldown import (
     interval,
     next_eligible,
     normalized_record,
+    prune_inactive_records,
     same_control,
     valid_stamp,
 )
-from .export_limit_policy import EXPORT_ASSET, READBACK_MAX_AGE, aware_time, confirmed_feedback, tariff_blocks
+from .export_limit_policy import (
+    EXPORT_ASSET,
+    READBACK_MAX_AGE,
+    ExportTariffCache,
+    aware_time,
+    confirmed_feedback,
+    tariff_blocks,
+)
+from .export_limit_policy import (
+    GATEWAY_UNVERIFIED as GATEWAY_UNVERIFIED,
+)
 from .models import ActionAsset, ActionKind, ActionOutcome, OutcomeResult, PlanAction
 from .safety import parse_production_state
+
+_TARIFF_CACHE: HassKey[ExportTariffCache] = HassKey("ha_energy_planner_export_tariff")
 
 UNAVAILABLE_REJECTION = "export_limit_service_rejected:installer_or_gateway_unavailable"
 UPSTREAM_CONTROLS_DISABLED = "export_limit_upstream_controls_disabled"
@@ -42,7 +56,7 @@ INSTALLER_FORM_MISMATCH = "export_limit_service_rejected:installer_form_mismatch
 INSTALLER_SESSION_EXPIRED = "export_limit_service_rejected:installer_session_expired"
 INSTALLER_WRITE_REJECTED = "export_limit_service_rejected"
 GATEWAY_CHANGED = "export_limit_gateway_changed"
-GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
+COMPANION_UPGRADE_REQUIRED = "export_limit_companion_upgrade_required"
 RETRY_DEFERRED_REASONS = {
     EXPORT_ACTION_CAP_REACHED,
     "external_export_limit_changed",
@@ -75,6 +89,14 @@ def gateway_identity_issue(saved: str | None, observed: str | None) -> str | Non
     if saved == observed:
         return None
     return GATEWAY_CHANGED if saved and observed else GATEWAY_UNVERIFIED
+
+
+def owned_gateway_issue(ownership: dict[str, Any], observed: dict[str, Any]) -> str | None:
+    """Compare feedback with the gateway that owns the baseline or request."""
+    gateway = ownership.get("gateway_identity")
+    if gateway or any(ownership.get(key) for key in ("pending", "baseline", "retry")):
+        return gateway_identity_issue(gateway, observed.get("gateway_identity"))
+    return None
 
 
 class RetryWriteDeferred(ServiceValidationError):
@@ -155,8 +177,9 @@ async def probe_installer(runtime: Any) -> tuple[Any, str | None, bool]:
         # The mapped entry may still be loading after a restart.
         return None, "export_limit_retry_readiness_check_unavailable", False
     prepare = getattr(runtime, "async_prepare", None)
-    if not callable(prepare) or not callable(getattr(runtime, "async_apply_guarded", None)):
-        return None, "export_limit_retry_readiness_check_unavailable", True
+    if (not callable(prepare) or not callable(getattr(runtime, "async_apply_guarded", None))
+            or getattr(runtime, "verifies_export_limit_gateway", False) is not True):
+        return None, COMPANION_UPGRADE_REQUIRED, True
     try:
         async with asyncio.timeout(DEVICE_SERVICE_TIMEOUT_SECONDS):
             snapshot = await prepare()
@@ -198,7 +221,13 @@ def retry_status(state: dict[str, Any], *, running: bool) -> dict[str, Any]:
             # remains durable, but there is no active installer request.
             retry["state"] = "scheduled"
         if retry["state"] == "operator_required":
-            retry["operator_action"] = "Check Enphase Export Limit in Configure, then resume Export Limit control."
+            if retry["reason"] == COMPANION_UPGRADE_REQUIRED:
+                retry["operator_action"] = (
+                    "Upgrade Enphase Energy to a release that verifies the active gateway for Export Limit "
+                    "readback and supports guarded apply. Then resume Export Limit control."
+                )
+            else:
+                retry["operator_action"] = "Check Enphase Export Limit in Configure, then resume Export Limit control."
     return retry
 
 
@@ -251,17 +280,42 @@ def feedback(hass: HomeAssistant, entity: str | None, now: datetime) -> tuple[di
     if identity is None:
         return {}, "export_limit_target_invalid"
     sensor = feedback_entity_id(hass, entity)
-    observed, issue = confirmed_feedback(hass.states.get(sensor) if sensor else None, now)
+    readback = state if sensor == entity else hass.states.get(sensor) if sensor else None
+    observed, issue = confirmed_feedback(readback, now)
     observed["identity"] = identity
     return observed, issue
+
+
+def live_owned_gateway_issue(
+    hass: HomeAssistant, entity: str | None, ownership: dict[str, Any], now: datetime,
+) -> str | None:
+    """Check ownership against current feedback without parsing tariffs."""
+    if not entity or not any(ownership.get(key) for key in ("gateway_identity", "pending", "baseline", "retry")):
+        return None
+    observed, issue = feedback(hass, entity, now)
+    if issue is None:
+        return owned_gateway_issue(ownership, observed)
+    return GATEWAY_UNVERIFIED if issue == GATEWAY_UNVERIFIED else None
+
+
+def current_tariff_blocks(
+    hass: HomeAssistant, entity: str | None, options: dict[str, Any], now: datetime,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Recheck the live tariff while reusing validation for the same HA State."""
+    state = hass.states.get(entity) if entity else None
+    if not isinstance(state, State):
+        return tariff_blocks(state, now, options)
+    if (cache := hass.data.get(_TARIFF_CACHE)) is None:
+        cache = hass.data[_TARIFF_CACHE] = ExportTariffCache()
+    return tariff_blocks(state, now, options, cache=cache)
 
 
 def evidence(hass: HomeAssistant, data: dict[str, Any], options: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Build price-only readiness without depending on the energy optimizer."""
     observed, issue = feedback(hass, data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
     feedback_ready = issue is None and not observed.get("pending")
-    state = hass.states.get(str(data[CONF_AMBER_EXPORT_PRICE])) if data.get(CONF_AMBER_EXPORT_PRICE) else None
-    blocks, tariff_issue = tariff_blocks(state, now, options)
+    entity = str(data[CONF_AMBER_EXPORT_PRICE]) if data.get(CONF_AMBER_EXPORT_PRICE) else None
+    blocks, tariff_issue = current_tariff_blocks(hass, entity, options, now)
     service_issue = None
     if not all(hass.services.has_service("enphase_ev", name) for name in ("set_export_limit", "disable_export_limit")):
         service_issue = "export_limit_services_unavailable"
@@ -307,8 +361,13 @@ class ExportLimitControl:
         record = normalized_record(limits, identity, state, now)
         if record.get("clock_recovered_at") == now.isoformat():
             await self.store.async_reanchor_export_attempts(now)
-        limits[control_key(identity)] = record
-        await self.store.async_save_command_rate_limits(limits)
+        key = control_key(identity)
+        if key not in limits:
+            owned = state.get("identity")
+            prune_inactive_records(limits, {key, control_key(owned)} if owned else {key}, now)
+        if limits.get(key) != record:
+            limits[key] = record
+            await self.store.async_save_command_rate_limits(limits)
         retry = state.get("retry")
         if (isinstance(retry, dict) and (deadline := aware_time(retry.get("next_attempt_at"))) is not None
                 and deadline > now + RETRY_INTERVAL):
@@ -529,7 +588,8 @@ class ExportLimitControl:
             record = await self.prepare_cooldown(now)
             assert record is not None
             if record.get("external_settlement_request") != pending["sent_at"]:
-                record.update(external_settled_at=now.timestamp(), external_settlement_request=pending["sent_at"])
+                record.update(checked_at=now.timestamp(), external_settled_at=now.timestamp(),
+                              external_settlement_request=pending["sent_at"])
                 await self.save_timing(observed["identity"], record)
         adopted: dict[str, Any] = {
             "identity": observed["identity"],
@@ -569,6 +629,13 @@ class ExportLimitControl:
             # A crash after the durable reservation leaves the write uncertain.
             await self.record_pending(state, pending, pending["pre_state"])
 
+    def _owned_feedback(self, state: dict[str, Any], now: datetime) -> tuple[dict[str, Any], str | None]:
+        """Read feedback that can be attributed to this ownership."""
+        observed, issue = feedback(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
+        if "identity" in observed and not same_control(observed["identity"], state["identity"]):
+            return observed, "export_limit_target_changed"
+        return observed, issue or owned_gateway_issue(state, observed)
+
     async def reconcile(self, now: datetime) -> str | None:
         """Resolve durable commands and reconcile external changes without latching a pause."""
         await self.prepare_cooldown(now)
@@ -577,21 +644,16 @@ class ExportLimitControl:
             return None
         if pending := state.get("pending"):
             await self._recover_pending(state, pending, now)
-        entity = self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY)
-        observed, issue = feedback(self.hass, entity, now)
-        if not issue and state["identity"] != observed["identity"] and same_control(
-            observed["identity"], state["identity"],
-        ):
+        observed, issue = self._owned_feedback(state, now)
+        if not issue and state["identity"] != observed["identity"]:
             state["identity"] = observed["identity"]
             await self.save(state)
+            # The alias save can yield while the mapped gateway changes.
             now = datetime.now(UTC)
-            observed, issue = feedback(self.hass, entity, now)
-        if "identity" in observed and not same_control(observed["identity"], state["identity"]):
-            return "export_limit_target_changed"
-        gateway = state.get("gateway_identity")
+            observed, issue = self._owned_feedback(state, now)
+        if issue == "export_limit_target_changed":
+            return issue
         pending = state.get("pending")
-        if not issue and (gateway or pending or state.get("baseline") or state.get("retry")):
-            issue = gateway_identity_issue(gateway, observed.get("gateway_identity"))
         if issue:
             if pending and now.timestamp() - pending["sent_at"] >= READBACK_MAX_AGE.total_seconds():
                 await self.unconfirmed(state, pending, now, observed)
@@ -627,7 +689,8 @@ class ExportLimitControl:
                     if record.get("confirmation_request") != pending["sent_at"]:
                         # API time is a read completion, not physical change time.
                         # Start at our first observation, once per request.
-                        record.update(confirmed_at=now.timestamp(), confirmation_request=pending["sent_at"])
+                        record.update(checked_at=now.timestamp(), confirmed_at=now.timestamp(),
+                                      confirmation_request=pending["sent_at"])
                         await self.save_timing(observed["identity"], record, flush=False)
                     await self.audit(
                         pending,
@@ -683,9 +746,11 @@ class ExportLimitControl:
         if state and "identity" in observed and not same_control(observed["identity"], state["identity"]):
             return
         gateway = state.get("gateway_identity")
+        owned_identity = state.get("identity")
         can_retire = (
             not issue and not observed["pending"] and observed.get("gateway_identity")
             and observed["gateway_identity"] != gateway
+            and owned_identity and same_control(observed["identity"], owned_identity)
         )
         if pending := state.get("pending"):
             if can_retire and (gateway or state.get("pause") == "export_limit_unconfirmed"):

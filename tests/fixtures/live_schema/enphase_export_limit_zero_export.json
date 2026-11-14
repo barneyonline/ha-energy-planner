@@ -15,7 +15,8 @@
       "pending_requested_at": null,
       "request_status": "confirmed",
       "last_successful_readback": 1790813400.0,
-      "gateway_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      "gateway_identity": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "gateway_identity_verified": true
     }
   },
   "expected": {
