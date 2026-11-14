@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import UTC, datetime, timedelta
 from math import isfinite
-from typing import Any
+from operator import itemgetter
+from typing import TYPE_CHECKING, Any
 
 from .const import CONF_MIN_TARIFF_CONFIDENCE, CONF_PRICE_FRESHNESS_MINUTES
 from .forecasts import (
@@ -18,6 +20,9 @@ from .forecasts import (
     normalize_scalar_value,
 )
 from .models import ActionAsset, ActionKind, DecisionContext, DecisionSlot, PlanAction
+
+if TYPE_CHECKING:
+    from homeassistant.core import State
 
 EXPORT_ASSET = "enphase_export_limit"
 PRICE_KEYS = ("export_price", "feed_in_price", "per_kwh", "price", "value")
@@ -109,7 +114,10 @@ def _half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]
     return _amber_half_hour_start(start, end, item)
 
 
-def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+def tariff_blocks(
+    state: Any, now: datetime, options: dict[str, Any], *,
+    cache: ExportTariffCache | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
     """Preserve real half-hour source intervals without extrapolating scalar prices."""
     if state is None or state.state in {"unknown", "unavailable"}:
         return [], "export_tariff_unavailable"
@@ -124,6 +132,40 @@ def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[l
         or confidence < float(options.get(CONF_MIN_TARIFF_CONFIDENCE, 50)) / 100
     ):
         return [], "export_tariff_confidence_low"
+    if cache is not None:
+        parsed, issue = cache.parse(state, attributes)
+    else:
+        parsed, issue = _parse_blocks(attributes)
+    if issue is not None:
+        return [], issue
+    index = bisect_right(parsed, now, key=itemgetter(0)) - 1
+    if index < 0 or now >= parsed[index][1]:
+        return [], "export_tariff_block_missing"
+    return [
+        {"start": start.isoformat(), "end": end.isoformat(), "price": price,
+         "watts": 0 if price < 0 else None, "confidence": confidence}
+        for start, end, price in parsed[index:index + 2]
+    ], None
+
+
+class ExportTariffCache:
+    """Retain at most one completely validated HA tariff source."""
+
+    def __init__(self) -> None:
+        self._state: State | None = None
+        self._result: tuple[list[tuple[datetime, datetime, float]], str | None] = ([], None)
+
+    def parse(
+        self, state: State, attributes: dict[str, Any],
+    ) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
+        if self._state is not state:
+            self._result = _parse_blocks(attributes)
+            self._state = state
+        return self._result
+
+
+def _parse_blocks(attributes: dict[str, Any]) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
+    """Validate the complete immutable source before selecting its current block."""
     items = _forecast_items(attributes, PRICE_KEYS)
     parsed = []
     for raw in items:
@@ -144,7 +186,7 @@ def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[l
         start = _half_hour_start(start, end, item)
         parsed.append((start, end, price))
     parsed.sort(key=lambda value: value[0])
-    blocks: list[dict[str, Any]] = []
+    blocks: list[tuple[datetime, datetime, float]] = []
     cadence = _explicit_interval_minutes(attributes)
     if cadence is not None and cadence != 30:
         return [], "export_tariff_ambiguous_duration"
@@ -156,24 +198,12 @@ def tariff_blocks(state: Any, now: datetime, options: dict[str, Any]) -> tuple[l
                 end = start + BLOCK_DURATION
             else:
                 return [], "export_tariff_ambiguous_duration"
-        if end - start != BLOCK_DURATION or (blocks and start < block_time(blocks[-1]["end"])):
+        if end - start != BLOCK_DURATION or (blocks and start < blocks[-1][1]):
             return [], "export_tariff_overlap_or_duration"
-        if blocks and start > block_time(blocks[-1]["end"]):
+        if blocks and start > blocks[-1][1]:
             return [], "export_tariff_gap"
-        blocks.append(
-            {
-                "start": start.isoformat(),
-                "end": end.isoformat(),
-                "price": price,
-                "watts": 0 if price < 0 else None,
-                "confidence": confidence,
-            }
-        )
-    current = next((block for block in blocks if block_time(block["start"]) <= now < block_time(block["end"])), None)
-    if current is None:
-        return [], "export_tariff_block_missing"
-    following = next((block for block in blocks if block_time(block["start"]) == block_time(current["end"])), None)
-    return [current, *([following] if following else [])], None
+        blocks.append((start, end, price))
+    return blocks, None
 
 
 def build_actions(context: DecisionContext) -> list[PlanAction]:

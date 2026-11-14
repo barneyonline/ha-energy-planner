@@ -2253,6 +2253,37 @@ def test_export_retry_rechecks_authority_after_probe(setup, retry_owner, scenari
     asyncio.run(run())
 
 
+def test_retry_refunds_final_check_when_runtime_reloads_during_reconciliation(setup, retry_owner):
+    async def run():
+        owner = retry_owner.create()
+        await owner.executor.async_execute_export_limit(action(setup), NOW)
+        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
+        advance_clock(setup)
+        save_ownership = setup.store.async_save_ownership
+        prepare = retry_owner.prepare
+
+        async def prepare_with_external_change():
+            # Reconciliation adopts this new baseline and persists it.
+            setup.states[ENTITY] = limit_state(5000)
+            return await prepare()
+
+        async def reload_during_adoption(ownership):
+            await save_ownership(ownership)
+            if ownership[EXPORT_ASSET].get("expected", {}).get("watts") == 5000:
+                retry_owner.entry.state = ConfigEntryState.NOT_LOADED
+                setup.states[ENTITY].state = "unavailable"
+
+        retry_owner.upstream.async_prepare.side_effect = prepare_with_external_change
+        setup.store.async_save_ownership = reload_during_adoption
+        await owner._async_retry_export_limit()
+        retry_owner.upstream.async_prepare.assert_awaited_once()
+        retry_owner.upstream.async_apply_guarded.assert_not_called()
+        assert setup.control.state["retry"]["attempts"] == 2
+        assert setup.control.state["retry"]["reason"] == "export_limit_target_changed"
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize(("change", "reason"), [
     ("disable_planner", "export_limit_retry_interrupted"),
     ("disarm", "export_limit_retry_interrupted"),
@@ -2397,30 +2428,6 @@ def test_retry_rechecks_admission_after_persisting_claim(setup, retry_owner, cha
         expected_reason = "export_limit_pending" if change == "pending" else "export_limit_retry_interrupted"
         assert retry["reason"] == expected_reason
         assert len(setup.calls) == 1
-
-    asyncio.run(run())
-
-
-def test_retry_refunds_final_check_when_runtime_reloads_during_reconciliation(setup, retry_owner):
-    async def run():
-        owner = retry_owner.create()
-        await owner.executor.async_execute_export_limit(action(setup), NOW)
-        setup.store.data["ownership"][EXPORT_ASSET]["retry"]["attempts"] = 2
-        advance_clock(setup)
-        save_timing = setup.store.async_save_command_rate_limits
-
-        async def reload_after_probe(timing):
-            await save_timing(timing)
-            if retry_owner.upstream.async_prepare.await_count:
-                retry_owner.entry.state = ConfigEntryState.NOT_LOADED
-                setup.states[ENTITY].state = "unavailable"
-
-        setup.store.async_save_command_rate_limits = reload_after_probe
-        await owner._async_retry_export_limit()
-        retry_owner.upstream.async_prepare.assert_awaited_once()
-        retry_owner.upstream.async_apply_guarded.assert_not_called()
-        assert setup.control.state["retry"]["attempts"] == 2
-        assert setup.control.state["retry"]["reason"] == "export_limit_target_changed"
 
     asyncio.run(run())
 
