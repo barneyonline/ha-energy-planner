@@ -57,14 +57,11 @@ from .const import (
 from .ev import ev_charging_state, ev_vehicle_suspended
 from .forecast_calibration import apply_forecast_calibration
 from .forecasts import (
-    ForecastSource,
     forecast_coverage_details,
     forecast_series_from_state,
     forecast_timestamp_status_from_state,
     latest_forecast_valid_at_from_state,
     normalize_scalar_value,
-    parse_forecast_source,
-    parse_tariff_source,
     tariff_source_intervals,
 )
 from .load_forecast import STALE_MODEL_AGE, load_forecast_from_model, normalize_power_kw
@@ -191,8 +188,6 @@ class InputManager:
         self._forecast_source_issued_at: dict[str, datetime] = {}
         self._forecast_confidence_scores: list[float] = []
         self._state_cache: dict[str, State | None] = {}
-        self._forecast_sources: dict[tuple[str, tuple[str, ...], str], ForecastSource] = {}
-        self._tariff_sources: dict[str, ForecastSource] = {}
 
     def build_context(self, overrides: list[Override] | None = None) -> DecisionContext:
         """Extend EV forecasts without weakening the configured control-health horizon."""
@@ -200,9 +195,6 @@ class InputManager:
 
         from .planner_ev import _next_ready_by
 
-        self._state_cache.clear()
-        self._forecast_sources.clear()
-        self._tariff_sources.clear()
         context = self._build_context(overrides)
         if (not self.entry_data.get(CONF_EV_SOC) or context.ev_target_soc_percent is None
                 or context.ev_connected is False):
@@ -218,10 +210,7 @@ class InputManager:
             load_forecast_update_reason=self.load_forecast_update_reason, load_source_outage=self.load_source_outage,
             weather_forecast=self.weather_forecast, weather_forecast_details=self.weather_forecast_details,
         )
-        extended_manager._state_cache = self._state_cache
-        extended_manager._forecast_sources = self._forecast_sources
-        extended_manager._tariff_sources = self._tariff_sources
-        extended = extended_manager._build_context(overrides, now=context.created_at, ev_extension=True)
+        extended = extended_manager._build_context(overrides, now=context.created_at)
         context.slots[-1] = extended.slots[len(context.slots) - 1]
         context.slots.extend(extended.slots[len(context.slots):])
         context.daylight_windows = extended.daylight_windows
@@ -230,7 +219,7 @@ class InputManager:
         return context
 
     def _build_context(
-        self, overrides: list[Override] | None = None, *, now: datetime | None = None, ev_extension: bool = False,
+        self, overrides: list[Override] | None = None, *, now: datetime | None = None
     ) -> DecisionContext:
         """Build one detached context at an explicit shared forecast origin."""
         now = now or dt_util.utcnow()
@@ -240,23 +229,15 @@ class InputManager:
         interval = int(self.options[CONF_PLANNING_INTERVAL_MINUTES])
         horizon = int(self.options[CONF_PLANNING_HORIZON_HOURS])
         tariffs = []
-        import_intervals = None
         self._tariff_source_details: dict[str, dict[str, Any]] = {}
         for key in (CONF_AMBER_IMPORT_PRICE, CONF_AMBER_EXPORT_PRICE):
-            entity = self.entry_data.get(key)
-            state = self._state(entity)
+            state = self._state(self.entry_data.get(key))
             if state is not None:
-                source_key = str(entity)
-                if (source := self._tariff_sources.get(source_key)) is None:
-                    source = self._tariff_sources[source_key] = parse_tariff_source(state, interval)
                 details: dict[str, Any] = {}
                 intervals = tariff_source_intervals(
                     state, interval, details=details,
                     slot_starts=[now, now + timedelta(hours=horizon)],
-                    source=source,
                 )
-                if key == CONF_AMBER_IMPORT_PRICE:
-                    import_intervals = intervals
                 age = now - state.last_updated
                 fresh = timedelta() <= age <= timedelta(minutes=int(self.options[CONF_PRICE_FRESHNESS_MINUTES]))
                 details.update(source_freshness="fresh" if fresh else "stale", next_retry_at=None)
@@ -426,8 +407,7 @@ class InputManager:
         from .enphase_export_limit import evidence
 
         export_limit = (evidence(self.hass, dict(self.entry_data), dict(self.options), now)
-                        if not ev_extension and self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True
-                        else {})
+                        if self.options.get(CONF_ENPHASE_EXPORT_LIMIT_CONTROL_ENABLED) is True else {})
         return DecisionContext(
             export_limit=export_limit,
             created_at=now,
@@ -478,12 +458,10 @@ class InputManager:
             local_timezone=str(getattr(getattr(self.hass, "config", None), "time_zone", None) or "UTC"),
             daylight_windows=daylight_windows,
             weather_evidence=dict(self.weather_forecast_details),
-            climate_inputs={} if ev_extension else read_climate_inputs(
+            climate_inputs=read_climate_inputs(
                 self.hass, dict(self.entry_data), dict(self.options), now, now + timedelta(hours=horizon),
                 {**self.load_forecast_details,
                  "hvac_power_subtracted": self.load_forecast_model.get("cleaning", {}).get("hvac_power_subtracted")},
-                tariff_intervals=import_intervals if import_intervals is not None else [],
-                read_state=self._state,
             ),
         )
 
@@ -597,14 +575,8 @@ class InputManager:
         if calibration_field:
             self._forecast_source_issued_at[calibration_field] = source_issued_at
 
-        source_forecasts = []
-        for _, source_entity, source_state in source_states:
-            cache_key = (source_entity, value_keys, value_kind)
-            if (source := self._forecast_sources.get(cache_key)) is None:
-                source = self._forecast_sources[cache_key] = parse_forecast_source(
-                    source_state, interval, value_keys, value_kind,
-                )
-            source_forecasts.append(forecast_series_from_state(
+        source_forecasts = [
+            forecast_series_from_state(
                 source_state,
                 issued_at=now,
                 horizon_hours=horizon,
@@ -612,8 +584,9 @@ class InputManager:
                 value_keys=value_keys,
                 value_kind=value_kind,
                 slot_starts=getattr(self, "_slot_starts", None),
-                source=source,
-            ))
+            )
+            for _source_key, _source_entity, source_state in source_states
+        ]
         forecasts = [item for item in source_forecasts if item]
         forecast = _stitch_forecast_series(forecasts, slot_count) if forecasts else None
         if forecast:

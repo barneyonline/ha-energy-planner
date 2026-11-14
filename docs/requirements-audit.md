@@ -166,6 +166,7 @@ use throughout; the Docker and pull-request gates enforce that result.
 - Export Limit regressions also cover operator disarm during an options handoff, restoration after a transient disarm Store failure, bounded installer rejections before dispatch, and a same-site replacement gateway with matching settings. The companion verifies the supplied gateway identity on a fresh read and classifies definitive HTTP rejections from response headers.
 - `tests/test_export_limit.py` exercises Automatic Control switch-off during a guarded write and verifies that the retry and reservation are refunded while startup cleanup waits. It also covers explicit Resume after a verified same-control gateway replacement, including an uncertain dispatch whose receipt was never saved, and checks that a replacement or missing gateway identity during an alias save leaves the original restoration baseline intact.
 - Export Limit replacement regressions verify that matching replacement feedback preserves retry and restoration ownership, and that pending commands expire without recording success. Explicit Resume keeps the original attempt accounting. The Enphase companion exercises stale single-row settings against current inventory and retries a failed durable confirmation clear before reload.
+- Resume can retire an expired upstream intent under the companion's write lock after a fresh verified gateway replacement. Planner requires settled feedback for the same replacement before releasing ownership and retains the unconfirmed audit and existing attempt. Both repositories test the boundary, including failed clear persistence. Planner tests also verify that an identity-bound preparation rejection for a competing request or mismatched form refunds the reservation for ordinary writes and restores.
 - `tests/test_export_limit.py` covers a restart during an already-disarmed device-only options handoff, restoration after an interrupted operator disarm, same-control ownership checks on Resume, and fresh gateway verification after an entity alias save. Identity-bound Enphase rejections before a write release the reservation and preserve the existing allowance. The zero-export live-schema fixture exercises the companion's opaque identity field. A pending restoration across a Sensor-to-Select alias save can confirm only from fresh, settled feedback for the original gateway.
 - Selective Export Limit resume retains only effectively active pauses, preserving legacy string asset selectors without creating or reviving unrelated pauses. Export tariff confidence accepts the existing input layer's four confidence aliases and fraction/percentage encodings, rejects invalid or below-threshold evidence, and is rechecked before execution. Reproduced resume and low-confidence dispatch defects are covered in `tests/test_export_limit.py` (`coordinator.py`, `export_limit_policy.py`, `executor.py`).
 
@@ -313,14 +314,6 @@ use throughout; the Docker and pull-request gates enforce that result.
   dual-mode search with nine supported targets between 20–24°C and exercise the
   locked weather consumer during selector, interval, freshness, force and
   selector-addition races, asserting that weather requests stay outside the lock.
-- Planning boundaries retain their original deadlines under repeated state
-  changes while honoring the non-manual refresh floor. EV horizon extension shares
-  one set of forecast reads and parsed sources across both grids, including the
-  previous partial tail. The EV optimizer ranks the same bounded candidates and
-  builds allocation records for the selected schedule. Execution records new
-  calendar confirmations without normalizing history after each no-op evaluation.
-  Regressions are in `tests/test_coordinator.py`, `tests/test_refresh_timing.py`,
-  `tests/test_inputs.py`, and `tests/test_ev_optimization.py`.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
@@ -1562,19 +1555,12 @@ or live deployment was performed; live cycle acceptance remains outstanding.
 ### Export conflict recovery and planner lock reliability
 
 - Gateway identity mismatches block Export Limit planning, live preflight and
-  reuse of settled reconciliation evidence. The companion verifies active
+  readiness for new commands. The companion verifies active
   inventory for each settings read, so a stale row cannot confirm pending
   ownership or a no-write settlement. Automatic retry checks the companion
   capability and reports an upgrade requirement without spending an installer
   check. Coverage is in `tests/test_export_limit.py` and the companion's
   `tests/components/enphase_ev/test_export_limit.py`.
-- Fresh, unchanged Export Limit feedback can corroborate a previous settled
-  reconciliation across planning intervals. Changed or stale feedback, pending
-  ownership and invalid timing re-enter reconciliation. Ordinary observations
-  leave durable cooldown records untouched. Export policy revalidates time and
-  confidence at dispatch while reusing the parsed rows of the current Home
-  Assistant state. `tests/test_export_limit_cooldown.py` covers reuse, invalidation
-  and retention of active or owned timing across remaps.
 
 - `coordinator.py` admits one entry-owned export reconciliation job without awaiting it during routine refreshes, even when the command lock is idle. Freshness, authority, durable reservations and cooldown still apply. A stable completion opens readiness and requests one fresh plan. Cancellation, failure or changed feedback leaves readiness closed. A pending export check does not veto an already-planned HVAC release. `storage.py` avoids queuing a no-op flush during batched input collection while retaining the final durability barrier. `tests/test_coordinator.py` and `tests/test_storage.py` exercise slow work, coalescing, stale configuration, cancellation and teardown. Climate override mutations use command then planner ordering, release both locks before requesting refresh, and keep helper failures actionable. `task_lifecycle.py` drains command then planner work before final unload restoration.
 - `enphase_export_limit.py` automatically adopts fresh, settled external feedback and retires a superseded baseline. Existing `external_export_limit_conflict` pauses migrate on reconciliation; unsupported-control and Unconfirmed pauses survive external changes until explicit resume, along with service rejections that cannot be recovered automatically. New tariff commands capture the new baseline; in-flight upstream requests, stale feedback, replaced targets and unconfirmed planner commands still block unsafe duplicate writes. `tests/test_export_limit.py` covers these transitions, late confirmation with and without slew changes, failure pause preservation and external changes during restoration.

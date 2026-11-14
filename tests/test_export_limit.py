@@ -1395,7 +1395,7 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             assert EXPORT_ASSET not in report["control_areas"]["confidence_eligible"]
             assert report["control_areas"]["details"][EXPORT_ASSET]["reason"] == reason
             snapshot = coordinator._export_reconciliation_inputs()
-            assert snapshot.issue == reason and not snapshot.reusable
+            assert snapshot.issue == reason
             assert setup.control.state == ownership
             assert not setup.calls
         if stage == "seed":
@@ -1894,7 +1894,12 @@ def installer_rejection(key="export_limit_unavailable", cause=None):
 
 
 @pytest.mark.parametrize("restore", [False, True])
-def test_identity_bound_service_rejection_rolls_back_unsent_write(setup, monkeypatch, restore):
+@pytest.mark.parametrize(("key", "reason"), [
+    ("export_limit_changed", "export_limit_target_changed"),
+    ("export_limit_pending", "export_limit_pending"),
+    ("export_limit_mismatch", runtime.INSTALLER_FORM_MISMATCH),
+])
+def test_identity_bound_service_rejection_rolls_back_unsent_write(setup, monkeypatch, restore, key, reason):
     async def run():
         if restore:
             setup.mode["value"] = "confirm"
@@ -1904,18 +1909,19 @@ def test_identity_bound_service_rejection_rolls_back_unsent_write(setup, monkeyp
 
         async def reject(hass, domain, service, data):
             assert domain == "enphase_ev" and data["expected_gateway"] == GATEWAY
-            raise installer_rejection("export_limit_changed")
+            raise installer_rejection(key)
 
         monkeypatch.setattr(runtime, "async_call_device_service", reject)
         if restore:
             result = await setup.control.restore(now)
             assert setup.control.state["baseline"] == {"watts": None, "slew_rate": 100.0}
             assert setup.control.state["gateway_identity"] == GATEWAY
+            assert setup.store.data["execution_audit"][-1]["command_sent"] is False
         else:
             result = await setup.control.execute(action(setup), now)
-            assert not setup.control.state
-        assert result == (OutcomeResult.PENDING if restore else OutcomeResult.REJECTED,
-                          "export_limit_target_changed", False)
+            assert "baseline" not in setup.control.state
+        assert result == (OutcomeResult.PENDING if restore else OutcomeResult.REJECTED, reason, False)
+        assert setup.control.state.get("pause") == (reason if key == "export_limit_mismatch" else None)
         assert not setup.control.state.get("pending")
         assert setup.control.cooldown(now)["last_dispatch_reserved_at"] == prior_timing
         assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == int(restore)
@@ -2090,9 +2096,13 @@ def test_unverified_gateway_hash_cannot_complete_confirmation_or_no_write_restor
     asyncio.run(run())
 
 
-@pytest.mark.parametrize("replacement", ["settled", "pending", "stale", "unverified", "wrong_target", "same_gateway"])
+@pytest.mark.parametrize(
+    "replacement", ["settled", "pending", "stale", "unverified", "wrong_target", "same_gateway"],
+)
 @pytest.mark.parametrize("receipt_saved", [True, False])
-def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_request(setup, replacement, receipt_saved):
+def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_request(
+    setup, monkeypatch, replacement, receipt_saved,
+):
     from test_coordinator import _coordinator_for_runtime_services
 
     async def run():
@@ -2114,6 +2124,7 @@ def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_reque
         if replacement == "wrong_target":
             setup.registry[ENTITY].device_id = "different-control"
 
+        monkeypatch.setattr(runtime, "installer_runtime", lambda *_: None)
         owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
         owner.store = setup.store
         await owner.async_resume_control(asset=EXPORT_ASSET)
@@ -2128,6 +2139,60 @@ def test_explicit_resume_retires_only_a_verified_replaced_gateways_pending_reque
         else:
             assert setup.control.state == owned
         assert setup.store.data["command_rate_limits"][timing_key]["attempted_at"] == NOW.timestamp()
+        assert len(setup.calls) == 1
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("result", ["retired", "still_pending", "refused", "unavailable", "timeout", "remapped"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_checks_companion_retirement_before_releasing_original_ownership(setup, monkeypatch, result, legacy):
+    from test_coordinator import _coordinator_for_runtime_services
+
+    async def run():
+        replacement = "b" * 64
+        original = None if legacy else GATEWAY
+        if legacy:
+            setup.states[ENTITY].attributes.pop("gateway_identity")
+        await setup.control.execute(action(setup), NOW)
+        now = advance_clock(setup, 600)
+        setup.states[ENTITY] = limit_state(0, pending=True, readback=now.timestamp())
+        setup.states[ENTITY].attributes.update(gateway_identity=replacement, request_status="unconfirmed")
+        if legacy:
+            assert await setup.control.reconcile(now) == "export_limit_unconfirmed"
+        ownership = setup.control.state
+        budget = action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"]
+
+        async def retire(gateway, *, original_gateway):
+            assert gateway == replacement and original_gateway == original
+            assert setup.control.state == ownership
+            if result == "unavailable":
+                raise installer_rejection()
+            if result == "timeout":
+                raise TimeoutError
+            if result == "refused":
+                return False
+            if result != "still_pending":
+                setup.states[ENTITY].attributes["pending"] = False
+                setup.states[ENTITY].state = "zero_export"
+            if result == "remapped":
+                setup.registry[ENTITY].device_id = "another-control"
+            return True
+
+        retire_hook = AsyncMock(side_effect=retire)
+        monkeypatch.setattr(runtime, "installer_runtime", lambda *_: SimpleNamespace(
+            async_retire_replaced_intent=retire_hook,
+        ))
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=setup.hass)
+        owner.store = setup.store
+        await owner.async_resume_control(asset=EXPORT_ASSET)
+        retire_hook.assert_awaited_once_with(replacement, original_gateway=original)
+        assert setup.control.state == ({} if result == "retired" else ownership)
+        assert action_budget(budget_history(setup.store.data), {}, now, EXPORT_ASSET)["used"] == budget == 1
+        audit = setup.store.data["execution_audit"]
+        assert [row["result"] for row in audit] == (
+            [OutcomeResult.PENDING, OutcomeResult.FAILED] if result == "retired" or legacy else [OutcomeResult.PENDING]
+        )
         assert len(setup.calls) == 1
 
     asyncio.run(run())

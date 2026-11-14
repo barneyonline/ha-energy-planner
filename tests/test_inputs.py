@@ -2403,8 +2403,6 @@ def test_native_grid_retains_partial_intervals_and_exact_horizon(monkeypatch):
 
 
 def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monkeypatch):
-    from unittest.mock import Mock
-
     now = datetime(2026, 10, 19, 20, 3, tzinfo=UTC)
     monkeypatch.setattr(inputs_module.dt_util, 'utcnow', lambda: now)
     origin = now.replace(minute=2)
@@ -2425,17 +2423,10 @@ def test_ev_horizon_extension_recomputes_the_previous_partial_tail_average(monke
         profile['expected'][21 * 4 + 1] = profile['upper'][21 * 4 + 1] = 10
     manager = InputManager(hass, data, {**DEFAULT_OPTIONS, 'planning_interval_minutes': 15,
                 'planning_horizon_hours': 1, 'default_ready_by': '23:00'}, load_forecast_model=model)
-    parse = Mock(wraps=inputs_module.parse_forecast_source)
-    monkeypatch.setattr(inputs_module, "parse_forecast_source", parse)
-    read = Mock(wraps=hass.states.get)
-    monkeypatch.setattr(hass.states, "get", read)
     context = manager.build_context()
     tail = next(s for s in context.slots if s.valid_at == now.replace(hour=21, minute=2))
     assert tail.end_at == now.replace(hour=21, minute=17)
     assert tail.baseline_load_forecast_kw == 2.2
-    assert parse.call_count == 3  # Import, export and PV across both grids.
-    assert read.call_args_list.count((("sensor.import",), {})) == 1
-    assert read.call_args_list.count((("sensor.pv",), {})) == 1
 
 
 @pytest.mark.parametrize('config_key', [CONF_AMBER_IMPORT_PRICE, CONF_PV_FORECAST, CONF_WEATHER])

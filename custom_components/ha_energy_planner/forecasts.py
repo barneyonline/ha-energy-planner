@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from bisect import bisect_right
-from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from math import isfinite
 from operator import itemgetter
@@ -25,53 +24,6 @@ _TIME_KEYS = ("valid_at", "datetime", "start_time", "period_start", "from", "tim
 FORECAST_HEALTHY_HOURS = 12.0
 FORECAST_DEGRADED_HOURS = 8.0
 MAX_FORECAST_SOURCE_ROWS = 2048
-_TARIFF_VALUE_KEYS = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
-
-
-@dataclass(slots=True)
-class ForecastSource:
-    """Validated source rows independent of the requested planning grid."""
-
-    declared: tuple[list[tuple[datetime, datetime, float]], int] | None
-    points: list[tuple[datetime, float]]
-    ordered: list[float | None]
-    cadence: timedelta
-    ordered_interval: float
-
-
-def parse_forecast_source(
-    state: Any, interval_minutes: int, value_keys: tuple[str, ...], value_kind: str, *,
-    unit_key_only: bool = False,
-) -> ForecastSource:
-    """Normalize once before sampling on one or more grids."""
-    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
-    raw_items = _forecast_items(attributes, value_keys)
-    default_unit = str(attributes.get("unit_of_measurement", "" if unit_key_only else
-                                     attributes.get("unit", attributes.get("temperature_unit", ""))))
-    explicit_interval = _explicit_interval_minutes(attributes)
-    declared = (_declared_tariff_intervals(raw_items, value_keys, default_unit, maximum_minutes=explicit_interval)
-                if value_kind == "price" and raw_items else None)
-    if declared is not None:
-        return ForecastSource(declared, [], [], timedelta(), float(interval_minutes))
-    if value_kind == "power":
-        raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
-    parsed = [_parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit)
-              for item in raw_items]
-    points = sorted(
-        [(_as_aware_utc(item[0]), item[1]) for item in parsed if item is not None and item[0] is not None],
-        key=itemgetter(0),
-    )
-    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
-    cadence = _conservative_cadence(
-        points, explicit_cadence or timedelta(minutes=interval_minutes), maximum=explicit_cadence,
-    )
-    ordered = [item[1] if item is not None else None for item in parsed] if not points and any(parsed) else []
-    return ForecastSource(None, points, ordered, cadence, explicit_interval or float(interval_minutes))
-
-
-def parse_tariff_source(state: Any, interval_minutes: int) -> ForecastSource:
-    """Normalize source intervals using the planning grid's price key precedence."""
-    return parse_forecast_source(state, interval_minutes, _TARIFF_VALUE_KEYS, "price", unit_key_only=True)
 
 
 def constant_forecast(
@@ -103,11 +55,13 @@ def constant_forecast(
 def tariff_source_intervals(
     state: Any, interval_minutes: int, *, details: dict[str, Any] | None = None,
     slot_starts: list[datetime] | None = None,
-    source: ForecastSource | None = None,
 ) -> list[dict[str, Any]]:
     """Expose sanitized source boundaries used to identify tariff lifecycles."""
-    source = source if source is not None else parse_tariff_source(state, interval_minutes)
-    declared = source.declared
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    keys = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
+    raw_items = _forecast_items(attributes, keys)
+    declared = _declared_tariff_intervals(raw_items, keys, str(attributes.get("unit_of_measurement", "")),
+                                         maximum_minutes=_explicit_interval_minutes(attributes))
     if declared is not None:
         intervals, normalized = declared
         if details is not None:
@@ -117,7 +71,23 @@ def tariff_source_intervals(
                 for start, end, price in _tariff_window(intervals, slot_starts)]
     if details is not None:
         details.update(source_validity="inferred_intervals", normalized_intervals=0)
-    intervals = [(at, at + source.cadence, price) for at, price in sorted(set(source.points))]
+    parsed = [
+        _parse_item(
+            item, value_keys=keys, value_kind="price", default_unit=str(attributes.get("unit_of_measurement", ""))
+        )
+        for item in raw_items
+    ]
+    points = sorted(
+        {(_as_aware_utc(at), value) for item in parsed if item is not None for at, value in [item] if at is not None}
+    )
+    explicit_interval = _explicit_interval_minutes(attributes)
+    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+    cadence = _conservative_cadence(
+        points,
+        explicit_cadence or timedelta(minutes=interval_minutes),
+        maximum=explicit_cadence,
+    )
+    intervals = [(at, at + cadence, price) for at, price in points]
     return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
             for start, end, price in _tariff_window(intervals, slot_starts)]
 
@@ -143,7 +113,6 @@ def forecast_series_from_state(
     value_kind: str,
     require_timestamped: bool = False,
     slot_starts: list[datetime] | None = None,
-    source: ForecastSource | None = None,
 ) -> list[float | None] | None:
     """Return a slot-aligned numeric forecast series from common HA attributes.
 
@@ -154,31 +123,65 @@ def forecast_series_from_state(
     Set ``require_timestamped`` for freshness evidence: ordered values have no
     source interval and must not be treated as proof of current coverage.
     """
-    source = source if source is not None else parse_forecast_source(state, interval_minutes, value_keys, value_kind)
-    if source.declared is None and not source.points and not source.ordered:
+    attributes = _with_canonical_keys(getattr(state, "attributes", {}) or {})
+    raw_items = _forecast_items(attributes, value_keys)
+    default_unit = str(
+        attributes.get(
+            "unit_of_measurement",
+            attributes.get("unit", attributes.get("temperature_unit", "")),
+        )
+    )
+    slot_count = len(slot_starts) if slot_starts is not None else int((horizon_hours * 60) / interval_minutes)
+    if not raw_items:
         return None
     issued_at = _as_aware_utc(issued_at)
     starts = slot_starts if slot_starts is not None else [
         issued_at + timedelta(minutes=offset) for offset in range(0, horizon_hours * 60, interval_minutes)
     ]
-    if source.declared is not None:
-        intervals, _normalized = source.declared
-        return [_value_for_tariff_slot(at, intervals) for at in starts]
-    if not source.points:
+    if value_kind == "price":
+        declared = _declared_tariff_intervals(raw_items, value_keys, default_unit,
+                                             maximum_minutes=_explicit_interval_minutes(attributes))
+        if declared is not None:
+            intervals, _normalized = declared
+            return [_value_for_tariff_slot(at, intervals) for at in starts]
+    if value_kind == "power":
+        raw_items = _energy_items_as_average_power(raw_items, value_keys, default_unit)
+
+    parsed_items = [
+        _parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit) for item in raw_items
+    ]
+    parsed = [item for item in parsed_items if item is not None]
+    if not parsed:
+        return None
+
+    if all(valid_at is None for valid_at, _value in parsed):
         if require_timestamped:
             return None
         # Ordered payloads have no temporal metadata. Treat each source position as
         # exactly one planner interval and retain invalid positions as gaps. This is
         # deliberately conservative: inventing a longer cadence would silently
         # extend a short forecast across the rest of the planning horizon.
-        source_interval = source.ordered_interval
-        if slot_starts is None:
-            return _align_ordered_values(source.ordered, len(starts), interval_minutes, source_interval)
-        return [
-            source.ordered[index] if 0 <= (index := int((at - issued_at).total_seconds() / 60 / source_interval))
-            < len(source.ordered) else None for at in starts
-        ]
-    return [_value_for_slot(at, source.points, final_cadence=source.cadence) for at in starts]
+        source_interval = _explicit_interval_minutes(attributes) or float(interval_minutes)
+        if slot_starts is not None:
+            values = [item[1] if item is not None else None for item in parsed_items]
+            return [
+                values[index] if 0 <= (index := int((at - issued_at).total_seconds() / 60 / source_interval))
+                < len(values) else None for at in slot_starts
+            ]
+        return _align_ordered_values(parsed_items, slot_count, interval_minutes, source_interval)
+
+    timestamped = sorted(
+        [(_as_aware_utc(valid_at), value) for valid_at, value in parsed if valid_at is not None],
+        key=lambda item: item[0],
+    )
+    explicit_interval = _explicit_interval_minutes(attributes)
+    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+    cadence = _conservative_cadence(
+        timestamped,
+        explicit_cadence or timedelta(minutes=interval_minutes),
+        maximum=explicit_cadence,
+    )
+    return [_value_for_slot(at, timestamped, final_cadence=cadence) for at in starts]
 
 
 def _amber_half_hour_start(start: datetime, end: datetime | None, item: dict[str, Any]) -> datetime:
@@ -341,7 +344,7 @@ def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
 
 
 def _align_ordered_values(
-    values: list[float | None],
+    parsed_items: list[tuple[datetime | None, float] | None],
     slot_count: int,
     planner_interval_minutes: int,
     source_interval_minutes: float,
@@ -351,10 +354,11 @@ def _align_ordered_values(
     for index in range(slot_count):
         elapsed = index * planner_interval_minutes
         source_index = int(elapsed // source_interval_minutes)
-        if source_index >= len(values):
+        if source_index >= len(parsed_items):
             series.append(None)
             continue
-        series.append(values[source_index])
+        item = parsed_items[source_index]
+        series.append(item[1] if item is not None else None)
     return series
 
 

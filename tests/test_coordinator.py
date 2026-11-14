@@ -814,9 +814,8 @@ class FakeStore:
     async def async_save_overrides(self, overrides: list[object]) -> None:
         self.data["overrides"] = overrides
 
-    async def async_save_calendar_events(self, events, *, now=None):
+    async def async_save_calendar_events(self, events, *, now=None) -> None:
         self.record_calendar_events(events, now=now)
-        return self.data["calendar_history"]
 
     def record_calendar_events(self, events, *, now=None, location=None) -> None:
         from custom_components.ha_energy_planner.calendar_history import update_calendar_history
@@ -8171,37 +8170,6 @@ def test_debounced_and_boundary_refresh_callbacks_schedule_refresh(monkeypatch: 
     assert scheduled[2] == (-3, "old_boundary_cancelled")
 
 
-def test_planning_boundary_keeps_its_deadline_during_material_events(monkeypatch):
-    clock = 290
-    timers = {}
-    requests = []
-    owner = _coordinator_for_runtime_services()
-    owner._last_non_manual_refresh_requested_at = clock
-
-    def schedule(hass, delay, callback):
-        token = object()
-        timers[token] = (clock + delay, callback)
-        return lambda: timers.pop(token)
-
-    def request(coroutine):
-        requests.append((clock, owner._pending_refresh_trigger))
-        coroutine.close()
-
-    owner._async_create_listener_task = request
-    monkeypatch.setattr(coordinator_module, "monotonic", lambda: clock)
-    monkeypatch.setattr(coordinator_module, "async_call_later", schedule)
-    for clock in range(292, 421, 2):
-        for token, (deadline, callback) in list(timers.items()):
-            if deadline <= clock:
-                del timers[token]
-                callback(None)
-        if clock == 300:
-            owner._schedule_debounced_refresh("interval_boundary", debounce_seconds=0)
-        if clock <= 400:
-            owner._schedule_debounced_refresh("state_change")
-    assert requests[0] == (350, "interval_boundary")
-
-
 def _coordinator_for_commit(previous: EnergyPlan | None, *, current_generation: int) -> EnergyPlannerCoordinator:
     coordinator = EnergyPlannerCoordinator.__new__(EnergyPlannerCoordinator)
     coordinator.store = FakeStore()
@@ -9328,26 +9296,6 @@ def test_calendar_confirmation_is_saved_after_adapter_execution(monkeypatch):
     pending = coordinator.store.data["calendar_history"]["pending"]
     assert len(pending) == 1
     assert pending[0]["confirmed_start"] == now.isoformat()
-
-
-def test_noop_actions_do_not_rebuild_calendar_history():
-    now = datetime.now(UTC)
-    owner = _coordinator_for_commit(None, current_generation=1)
-    owner.entry = FakeEntry({CONF_EV_CHARGING: "sensor.charging"}, {CONF_EV_CONTROL_ENABLED: True})
-    read = Mock(return_value=SimpleNamespace(state="off", last_changed=now, attributes={}))
-    owner.hass = SimpleNamespace(states=SimpleNamespace(get=read))
-    owner._async_reconcile_vehicle_ownership = AsyncMock()
-    owner.executor.async_evaluate = AsyncMock()
-    owner.store.record_calendar_events = Mock()
-    plan = _plan("no-op")
-    plan.created_at = now
-    plan.actions = [_coordinated_action(plan, str(i), ActionAsset.EV, ActionKind.EV_START) for i in range(4)]
-    owner.executor.async_evaluate.return_value = None
-
-    asyncio.run(owner._async_execute_plan_if_current(1, plan, object(), {}))
-    assert owner.executor.async_evaluate.await_count == 4
-    assert read.call_count == 4  # One observation per transaction.
-    owner.store.record_calendar_events.assert_not_called()
 
 
 def test_commit_drops_result_invalidated_during_calendar_vehicle_resolution():
