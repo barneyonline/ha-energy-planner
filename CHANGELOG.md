@@ -44,7 +44,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Link migration Repairs to their config entry and refresh existing notices on Home Assistant 2026.11+, preserving ignored pending repairs and clearing stale records. Retain explicit cleanup on the unchanged 2026.10 minimum. Draft implementation is blocked from merge until the owner handles the separate HA 2026.11 minimum-version bump.
 
 ### 🔄 Other changes
 
