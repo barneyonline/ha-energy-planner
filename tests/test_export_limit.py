@@ -1395,7 +1395,7 @@ def test_coordinator_refresh_reconciles_export_transaction(setup, monkeypatch, s
             assert EXPORT_ASSET not in report["control_areas"]["confidence_eligible"]
             assert report["control_areas"]["details"][EXPORT_ASSET]["reason"] == reason
             snapshot = coordinator._export_reconciliation_inputs()
-            assert snapshot.issue == reason
+            assert snapshot.issue == reason and not snapshot.reusable
             assert setup.control.state == ownership
             assert not setup.calls
         if stage == "seed":

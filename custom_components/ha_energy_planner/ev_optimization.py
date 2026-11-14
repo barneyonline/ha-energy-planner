@@ -315,19 +315,23 @@ def optimise_ev(
 
     action_limited_feasible = False
 
-    def simulate(requested: Mapping[int, float]) -> Simulation | None:
-        nonlocal evaluations, action_limited_feasible
-        signature = tuple(sorted((i, round(p, 6)) for i, p in requested.items() if p > 0))
-        if evaluations >= MAX_EVALUATIONS:
-            return None
-        evaluations += 1
+    daylight_enabled = bool(options.get("ev_daylight_lowest_cost_charging_enabled"))
+    daylight_available = daylight_enabled and any(slot.daylight for slot in slots)
+
+    def delivery_power(index: int, power: float) -> float:
+        if (index == 0 and context.ev_charging is True
+                and context.ev_evidence.get("delivery_status") in {"stalled", "unavailable"}):
+            return 0.0
+        return power
+
+    def simulate(signature: tuple[tuple[int, float], ...]) -> Simulation | None:
+        nonlocal action_limited_feasible
         # Retained schedules and refinement must obey the same current-slot
         # constraints as seed generation. Safety/price exclusions remain final.
         if (signature and 0 in by_index and signature[0][0] != 0
                 and (force_current or continuous and context.ev_charging is True)):
             return None
         soc, expected_soc = current_soc, current_soc
-        allocations: list[EVChargeAllocation] = []
         powers: dict[int, float] = {}
         energies: dict[int, float] = {}
         cost = carbon = extra = daylight_energy = 0.0
@@ -370,13 +374,7 @@ def optimise_ev(
             previous_power = power
             previous_active = True
             started = True
-            prediction_power = power
-            if (
-                index == 0
-                and context.ev_charging is True
-                and context.ev_evidence.get("delivery_status") in {"stalled", "unavailable"}
-            ):
-                prediction_power = 0.0
+            prediction_power = delivery_power(index, power)
             after, energy, duration_hours = _charge_interval(
                 context, soc, target, prediction_power, item.hours, soc_per_kwh
             )
@@ -392,7 +390,6 @@ def optimise_ev(
             if prediction_power == 0:
                 expected_energy, expected_hours = power * item.hours, item.hours
             source = context.slots[index]
-            effective, solar, grid = _charge_cost_components(source, energy / duration_hours if duration_hours else 0)
             exposure_energy = expected_energy if prediction_power == 0 else energy
             exposure_hours = expected_hours if prediction_power == 0 else duration_hours
             _, _, exposure_grid = _charge_cost_components(
@@ -410,26 +407,6 @@ def optimise_ev(
             carbon += expected_grid * expected_hours * max(intensity if intensity is not None else unknown_carbon, 0)
             if item.daylight:
                 daylight_energy += energy
-            allocations.append(
-                EVChargeAllocation(
-                    source.valid_at,
-                    energy / item.hours,
-                    after - soc,
-                    item.import_price,
-                    effective,
-                    solar,
-                    grid,
-                    source.carbon_intensity_g_per_kwh,
-                    grid * duration_hours * source.carbon_intensity_g_per_kwh
-                    if source.carbon_intensity_g_per_kwh is not None
-                    else None,
-                    "daylight"
-                    if item.daylight and options.get("ev_daylight_lowest_cost_charging_enabled")
-                    else "ready_by_fallback"
-                    if options.get("ev_daylight_lowest_cost_charging_enabled") and any(s.daylight for s in slots)
-                    else "ready_by",
-                )
-            )
             powers[index] = power
             energies[index] = expected_energy
             soc, expected_soc, previous_end = after, expected_after, physical_end
@@ -453,7 +430,7 @@ def optimise_ev(
             )
 
         schedule = EVChargeSchedule(
-            allocations, target, soc, max(target - current_soc, 0), soc < target - 1e-6, "bounded_ev_schedule"
+            [], target, soc, max(target - current_soc, 0), soc < target - 1e-6, "bounded_ev_schedule"
         )
         return Simulation(
             schedule,
@@ -471,10 +448,14 @@ def optimise_ev(
         )
 
     def add(requested: Mapping[int, float]) -> Simulation | None:
+        nonlocal evaluations
         signature = tuple(sorted((i, round(p, 6)) for i, p in requested.items() if p > 0))
         if signature in cached:
             return cached[signature]
-        result = simulate(requested)
+        if evaluations >= MAX_EVALUATIONS:
+            return None
+        evaluations += 1
+        result = simulate(signature)
         cached[signature] = result
         if result is not None:
             results.append(result)
@@ -629,15 +610,19 @@ def optimise_ev(
     # Carbon uses the existing normalized cost/emission preference within the
     # same feasibility, buffer, and dwell class. Daylight is a tie-breaker,
     # never authority to displace a cheaper economic choice.
-    peers = [r for r in results if rank(r)[:4] == rank(best)[:4]]
-    if carbon_weight > 0 and peers:
+    if carbon_weight > 0:
+        best_class = rank(best)[:4]
+        peers = [r for r in results if rank(r)[:4] == best_class]
         costs, emissions = [r.cost for r in peers], [r.carbon for r in peers]
+        cost_min, emissions_min = min(costs), min(emissions)
+        cost_range = max(max(costs) - cost_min, 1e-9)
+        emissions_range = max(max(emissions) - emissions_min, 1e-9)
         weight = min(max(carbon_weight, 0), 1)
         best = min(
             peers,
             key=lambda r: (
-                (1 - weight) * (r.cost - min(costs)) / max(max(costs) - min(costs), 1e-9)
-                + weight * (r.carbon - min(emissions)) / max(max(emissions) - min(emissions), 1e-9),
+                (1 - weight) * (r.cost - cost_min) / cost_range
+                + weight * (r.carbon - emissions_min) / emissions_range,
                 r.cost,
                 -r.daylight_energy if options.get("ev_daylight_lowest_cost_charging_enabled") else 0,
             ),
@@ -677,11 +662,29 @@ def optimise_ev(
             if capacity_soc < target - 1e-6
             else "search_no_feasible_schedule"
         )
-    physical = {context.slots[i].valid_at.isoformat(): p for i, p in best.powers.items()}
     latest = max(
-        (r.schedule.allocations[0].valid_at for r in results if not r.schedule.infeasible and r.schedule.allocations),
+        (context.slots[next(iter(r.powers))].valid_at for r in results if not r.schedule.infeasible and r.powers),
         default=None,
     )
+    # Materialize presentation data only for the selected physical powers.
+    soc = current_soc
+    for index, power in best.powers.items():
+        item = by_index[index]
+        after, energy, duration = _charge_interval(
+            context, soc, target, delivery_power(index, power), item.hours, soc_per_kwh,
+        )
+        source = context.slots[index]
+        effective, solar, grid = _charge_cost_components(source, energy / duration if duration else 0)
+        best.schedule.allocations.append(EVChargeAllocation(
+            source.valid_at, energy / item.hours, after - soc, item.import_price, effective, solar, grid,
+            source.carbon_intensity_g_per_kwh,
+            grid * duration * source.carbon_intensity_g_per_kwh
+            if source.carbon_intensity_g_per_kwh is not None else None,
+            "daylight" if item.daylight and daylight_enabled
+            else "ready_by_fallback" if daylight_available else "ready_by",
+        ))
+        soc = after
+    physical = {context.slots[i].valid_at.isoformat(): p for i, p in best.powers.items()}
     best.schedule.reason = (
         "already_at_target"
         if current_soc >= target

@@ -18,7 +18,7 @@
 
 ### 🔧 Improvements
 
-- None
+- Keep scheduled refreshes on time during frequent input changes and reduce repeated tariff, EV forecast, and calendar processing.
 
 ### 🔄 Other changes
 

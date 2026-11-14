@@ -9,9 +9,10 @@ from typing import Any
 
 from aiohttp import ClientResponseError, ServerDisconnectedError
 from homeassistant.config_entries import ConfigEntryState
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
+from homeassistant.util.hass_dict import HassKey
 
 from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
 from .adapter_helpers import DEVICE_SERVICE_TIMEOUT_SECONDS, DeviceTargetUnavailable, async_call_device_service
@@ -29,12 +30,14 @@ from .export_limit_cooldown import (
     interval,
     next_eligible,
     normalized_record,
+    prune_inactive_records,
     same_control,
     valid_stamp,
 )
 from .export_limit_policy import (
     EXPORT_ASSET,
     READBACK_MAX_AGE,
+    ExportTariffCache,
     aware_time,
     confirmed_feedback,
     tariff_blocks,
@@ -44,6 +47,8 @@ from .export_limit_policy import (
 )
 from .models import ActionAsset, ActionKind, ActionOutcome, OutcomeResult, PlanAction
 from .safety import parse_production_state
+
+_TARIFF_CACHE: HassKey[ExportTariffCache] = HassKey("ha_energy_planner_export_tariff")
 
 UNAVAILABLE_REJECTION = "export_limit_service_rejected:installer_or_gateway_unavailable"
 UPSTREAM_CONTROLS_DISABLED = "export_limit_upstream_controls_disabled"
@@ -298,12 +303,24 @@ def live_owned_gateway_issue(
     return GATEWAY_UNVERIFIED if issue == GATEWAY_UNVERIFIED else None
 
 
+def current_tariff_blocks(
+    hass: HomeAssistant, entity: str | None, options: dict[str, Any], now: datetime,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Recheck the live tariff while reusing validation for the same HA State."""
+    state = hass.states.get(entity) if entity else None
+    if not isinstance(state, State):
+        return tariff_blocks(state, now, options)
+    if (cache := hass.data.get(_TARIFF_CACHE)) is None:
+        cache = hass.data[_TARIFF_CACHE] = ExportTariffCache()
+    return tariff_blocks(state, now, options, cache=cache)
+
+
 def evidence(hass: HomeAssistant, data: dict[str, Any], options: dict[str, Any], now: datetime) -> dict[str, Any]:
     """Build price-only readiness without depending on the energy optimizer."""
     observed, issue = feedback(hass, data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), now)
     feedback_ready = issue is None and not observed.get("pending")
-    state = hass.states.get(str(data[CONF_AMBER_EXPORT_PRICE])) if data.get(CONF_AMBER_EXPORT_PRICE) else None
-    blocks, tariff_issue = tariff_blocks(state, now, options)
+    entity = str(data[CONF_AMBER_EXPORT_PRICE]) if data.get(CONF_AMBER_EXPORT_PRICE) else None
+    blocks, tariff_issue = current_tariff_blocks(hass, entity, options, now)
     service_issue = None
     if not all(hass.services.has_service("enphase_ev", name) for name in ("set_export_limit", "disable_export_limit")):
         service_issue = "export_limit_services_unavailable"
@@ -349,8 +366,13 @@ class ExportLimitControl:
         record = normalized_record(limits, identity, state, now)
         if record.get("clock_recovered_at") == now.isoformat():
             await self.store.async_reanchor_export_attempts(now)
-        limits[control_key(identity)] = record
-        await self.store.async_save_command_rate_limits(limits)
+        key = control_key(identity)
+        if key not in limits:
+            owned = state.get("identity")
+            prune_inactive_records(limits, {key, control_key(owned)} if owned else {key}, now)
+        if limits.get(key) != record:
+            limits[key] = record
+            await self.store.async_save_command_rate_limits(limits)
         retry = state.get("retry")
         if (isinstance(retry, dict) and (deadline := aware_time(retry.get("next_attempt_at"))) is not None
                 and deadline > now + RETRY_INTERVAL):
@@ -572,7 +594,8 @@ class ExportLimitControl:
             record = await self.prepare_cooldown(now)
             assert record is not None
             if record.get("external_settlement_request") != pending["sent_at"]:
-                record.update(external_settled_at=now.timestamp(), external_settlement_request=pending["sent_at"])
+                record.update(checked_at=now.timestamp(), external_settled_at=now.timestamp(),
+                              external_settlement_request=pending["sent_at"])
                 await self.save_timing(observed["identity"], record)
         adopted: dict[str, Any] = {
             "identity": observed["identity"],
@@ -672,7 +695,8 @@ class ExportLimitControl:
                     if record.get("confirmation_request") != pending["sent_at"]:
                         # API time is a read completion, not physical change time.
                         # Start at our first observation, once per request.
-                        record.update(confirmed_at=now.timestamp(), confirmation_request=pending["sent_at"])
+                        record.update(checked_at=now.timestamp(), confirmed_at=now.timestamp(),
+                                      confirmation_request=pending["sent_at"])
                         await self.save_timing(observed["identity"], record, flush=False)
                     await self.audit(
                         pending,
