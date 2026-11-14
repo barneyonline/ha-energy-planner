@@ -15,6 +15,7 @@ from test_export_limit import setup as export_setup
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
 from custom_components.ha_energy_planner import export_limit_policy
+from custom_components.ha_energy_planner.action_limits import action_budget, budget_history
 from custom_components.ha_energy_planner.const import CONF_COMMAND_RATE_LIMIT_SECONDS, CONF_DRY_RUN
 from custom_components.ha_energy_planner.export_limit_cooldown import control_key, cooldown_status
 from custom_components.ha_energy_planner.export_limit_policy import EXPORT_ASSET, build_actions
@@ -280,6 +281,62 @@ def test_settled_refreshes_do_not_reconcile_or_save_unchanged_settings(setup, mo
         await owner._export_reconcile_task
         assert owner._schedule_debounced_refresh.call_count == 2
         save.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("skew_seconds", [480, 8 * 3600])
+def test_clock_repair_reopens_daily_allowance_after_remap_and_settled_refresh(setup, monkeypatch, skew_seconds):
+    from unittest.mock import AsyncMock, Mock
+
+    from test_coordinator import _coordinator_for_runtime_services, _plan
+
+    async def run():
+        s = setup
+        # Control B has already been observed at the correct time.
+        saved_device = s.registry[ENTITY].device_id
+        await s.control.prepare_cooldown(NOW)
+        key_b = control_key(runtime.target_identity(s.hass, ENTITY))
+        record_b = deepcopy(s.store.data["command_rate_limits"][key_b])
+
+        # A dispatch on control A is recorded with the clock ahead.
+        dispatch = move(s, skew_seconds)
+        s.registry[ENTITY].device_id = "gateway-ahead"
+        s.states["sensor.export_price"] = price_state(start=dispatch.replace(minute=0))
+        s.states["sensor.export_price"].last_updated = dispatch
+        s.mode["value"] = "confirm"
+        assert (await s.control.execute(action(s), dispatch))[2]
+        original_audit = deepcopy(s.store.data["execution_audit"])
+
+        # Return to B and settle its feedback while the clock is still ahead.
+        s.registry[ENTITY].device_id = saved_device
+        readback = NOW if skew_seconds == 480 else dispatch
+        s.states[ENTITY] = limit_state(readback=readback.timestamp())
+        await s.control.save({})
+        owner = _coordinator_for_runtime_services(entry_data=DATA, options=OPTIONS, hass=s.hass)
+        owner.store = s.store
+        s.hass.async_create_task = asyncio.create_task
+        owner._schedule_debounced_refresh = Mock()
+        owner._async_update_data_locked = AsyncMock(return_value=_plan("remapped"))
+        await owner._async_update_data()
+        await owner._export_reconcile_task
+        assert owner._settled_export_reconciliation is not None
+
+        # Identical verified feedback can be published after correcting the clock.
+        # Repair must run even though B's saved cooldown is valid and unchanged.
+        corrected = move(s, 0)
+        await owner._async_update_data()
+        worker = owner._export_reconcile_task
+        assert worker is not None
+        await worker
+        assert s.store.data["command_rate_limits"][key_b] == record_b
+        assert s.store.data["execution_audit"] == original_audit
+        ledger = budget_history(s.store.data)
+        assert ledger[0]["attempted_at"] == corrected.isoformat()
+        cap = {"max_daily_export_limit_actions": 1}
+        assert action_budget(ledger, cap, corrected + timedelta(hours=23), EXPORT_ASSET)["remaining"] == 0
+        assert action_budget(ledger, cap, corrected + timedelta(hours=24), EXPORT_ASSET)["remaining"] == 1
+        assert len(s.calls) == 1
 
     asyncio.run(run())
 

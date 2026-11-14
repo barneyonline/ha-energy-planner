@@ -12,7 +12,8 @@
 
 ### 🐛 Bug fixes
 
-- None
+- Repair the rolling Export Limit allowance after a clock correction, including after the control mapping changes.
+- Keep forecast refreshes running when a provider reports an out-of-range forecast interval.
 
 ### 🔧 Improvements
 

@@ -322,6 +322,10 @@ use throughout; the Docker and pull-request gates enforce that result.
   calendar confirmations without normalizing history after each no-op evaluation.
   Regressions are in `tests/test_coordinator.py`, `tests/test_refresh_timing.py`,
   `tests/test_inputs.py`, and `tests/test_ev_optimization.py`.
+- Forecast parsing ignores explicit cadence beyond the representable date range
+  and constructs a duration only for timestamped rows. Empty and ordered payloads
+  are covered in `tests/test_forecasts.py`. The timestamped provider case is
+  covered by `tests/fixtures/live_schema/pv_oversized_cadence.json`.
 - The Energy Planner service contains a flat device list: one planner device with
   all planner entities, plus one device per tracked vehicle. Vehicle devices
   represent saved profiles; telemetry entities remain owned by their source
@@ -1844,6 +1848,10 @@ Valid charging evidence at or after the refusal remains an allowed reset.
 - The Automatic Control switch and Arm Production Control button and service recheck a provisional Export Limit plan in a refresh that waits for reconciliation after weather collection. `tests/test_export_limit.py` covers competing refreshes, feedback changes during weather or a planner lock wait, pending and just-completed workers, unavailable feedback, and retained restoration after disabling export control. `tests/test_coordinator.py` verifies unchanged plans still use the fingerprint shortcut with an unused export mapping.
 - `tests/test_export_limit.py` verifies that Disable and Disarm supersede an earlier operator request during export preflight. `tests/test_coordinator.py` verifies that a later disarm still wins while startup recovery cancellation or the arming save is pending.
 - A newer fresh poll with unchanged settings can corroborate export reconciliation while no command or restoration is unresolved. `tests/test_export_limit.py` exercises unchanged, changed, stale and backward readbacks, pending confirmation and deferred restoration. `tests/test_coordinator.py` verifies that a due HVAC release survives export completion on either side of command-lock acquisition and that a newer planning input still supersedes it.
+- A future export dispatch in the shared attempt ledger invalidates settled
+  reconciliation reuse. `tests/test_export_limit_cooldown.py` verifies that a
+  clock correction after remapping reopens the allowance after 24 hours and
+  leaves the mapped control's valid cooldown and the original audit intact.
 - The export feedback listener preserves a queued HVAC release across a newer fresh poll with unchanged, settled settings. `tests/test_export_limit.py` delivers the actual listener event during reconciliation and verifies invalidation for changes to settings, stale feedback recovery, backward timestamps, pending commands and restoration.
 - Pending export work blocks only export commands and leaves the executor's owned EV safety stop eligible. `tests/test_coordinator.py` covers mixed plans and a disconnected charger with planner ownership. `tests/test_export_limit.py` verifies that an in-flight reconciliation cannot consume a cooldown wakeup or defer the due restore until unrelated telemetry arrives.
 - `tests/test_coordinator.py` verifies that a queued EV start is dropped when the selector changes before or after export completion publishes, including while execution prepares under the command lock. `tests/test_export_limit.py` covers an already-due cooldown follow-up bypassing the normal cadence and retaining priority when telemetry coalesces with it.
