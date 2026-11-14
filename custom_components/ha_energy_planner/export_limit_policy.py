@@ -31,6 +31,7 @@ END_KEYS = ("end_time", "period_end", "valid_until", "to")
 BLOCK_DURATION = timedelta(minutes=30)
 
 
+GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
 READBACK_MAX_AGE = timedelta(minutes=10)
 
 
@@ -73,6 +74,11 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
         "request_status": attributes.get("request_status"),
         "last_readback": readback,
     }
+    gateway = attributes.get("gateway_identity")
+    if isinstance(gateway, str) and len(gateway) == 64 and all(char in "0123456789abcdef" for char in gateway):
+        if attributes.get("gateway_identity_verified") is not True:
+            return result, GATEWAY_UNVERIFIED
+        result["gateway_identity"] = gateway
     if not 0 <= age <= READBACK_MAX_AGE.total_seconds():
         return result, "export_limit_readback_stale"
     return result, None
