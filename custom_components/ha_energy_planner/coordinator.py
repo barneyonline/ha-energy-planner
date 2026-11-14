@@ -26,7 +26,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
 
 from . import advice_runtime, startup_recovery, task_lifecycle
-from .action_limits import budget_history
+from .action_limits import budget_history, has_future_export_attempt
 from .adapter_helpers import (
     async_call_device_service,
     service_entity_available,
@@ -1582,7 +1582,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         # completion callback without superseding the actual export evidence.
         reconciled_for = getattr(self, "_export_reconciled_for", None)
         settled = getattr(self, "_settled_export_reconciliation", None)
-        if reconciled_for is not None or settled is not None:
+        if (reconciled_for is not None or settled is not None) and not has_future_export_attempt(
+            budget_history(self.store.data), dt_util.utcnow(),
+        ):
             current = self._export_reconciliation_inputs()
             if (settled is not None and current is not None and current.reusable
                     and settled.ownership == current.ownership

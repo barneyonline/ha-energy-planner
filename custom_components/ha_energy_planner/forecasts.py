@@ -26,6 +26,8 @@ FORECAST_HEALTHY_HOURS = 12.0
 FORECAST_DEGRADED_HOURS = 8.0
 MAX_FORECAST_SOURCE_ROWS = 2048
 _TARIFF_VALUE_KEYS = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
+_LATEST_FORECAST_END = datetime.max.replace(tzinfo=UTC)
+_MAX_FORECAST_INTERVAL_MINUTES = (_LATEST_FORECAST_END - datetime.min.replace(tzinfo=UTC)).total_seconds() / 60
 
 
 @dataclass(slots=True)
@@ -61,10 +63,14 @@ def parse_forecast_source(
         [(_as_aware_utc(item[0]), item[1]) for item in parsed if item is not None and item[0] is not None],
         key=itemgetter(0),
     )
-    explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
-    cadence = _conservative_cadence(
-        points, explicit_cadence or timedelta(minutes=interval_minutes), maximum=explicit_cadence,
-    )
+    if explicit_interval is not None and explicit_interval >= _MAX_FORECAST_INTERVAL_MINUTES:
+        explicit_interval = None
+    cadence = timedelta()
+    if points:
+        explicit_cadence = timedelta(minutes=explicit_interval) if explicit_interval is not None else None
+        cadence = _conservative_cadence(
+            points, explicit_cadence or timedelta(minutes=interval_minutes), maximum=explicit_cadence,
+        )
     ordered = [item[1] if item is not None else None for item in parsed] if not points and any(parsed) else []
     return ForecastSource(None, points, ordered, cadence, explicit_interval or float(interval_minutes))
 
@@ -117,7 +123,8 @@ def tariff_source_intervals(
                 for start, end, price in _tariff_window(intervals, slot_starts)]
     if details is not None:
         details.update(source_validity="inferred_intervals", normalized_intervals=0)
-    intervals = [(at, at + source.cadence, price) for at, price in sorted(set(source.points))]
+    intervals = [(at, at + min(source.cadence, _LATEST_FORECAST_END - at), price)
+                 for at, price in sorted(set(source.points))]
     return [{"start": start.isoformat(), "end": end.isoformat(), "price": price}
             for start, end, price in _tariff_window(intervals, slot_starts)]
 
@@ -333,7 +340,7 @@ def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
             continue
         try:
             value = float(raw_value)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             continue
         if isfinite(value) and value > 0:
             return value
@@ -715,7 +722,7 @@ def _value_for_slot(
     if position < 0:
         return None
     selected_at, selected = timestamped[position]
-    if slot_time >= selected_at + final_cadence:
+    if slot_time - selected_at >= final_cadence:
         return None
     return selected
 

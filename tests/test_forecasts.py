@@ -614,11 +614,12 @@ def test_ordered_forecast_honors_explicit_minute_cadence_without_extending_cover
     ) == [1.0, 1.0, 2.0, 2.0, None, None, None, None]
 
 
-def test_ordered_forecast_ignores_invalid_explicit_cadence() -> None:
+@pytest.mark.parametrize("cadence", ["invalid", 1e15])
+def test_ordered_forecast_ignores_invalid_explicit_cadence(cadence) -> None:
     issued_at = datetime(2026, 6, 27, 0, 0, tzinfo=UTC)
     state = FakeState(
         "0",
-        {"forecast": [1.0, 2.0], "forecast_interval_minutes": "invalid"},
+        {"forecast": [1.0, 2.0], "forecast_interval_minutes": cadence},
     )
 
     assert forecast_series_from_state(
@@ -629,6 +630,17 @@ def test_ordered_forecast_ignores_invalid_explicit_cadence() -> None:
         value_keys=("value",),
         value_kind="price",
     ) == [1.0, 2.0, None, None]
+
+
+def test_empty_forecast_with_oversized_cadence_has_no_coverage() -> None:
+    assert forecast_series_from_state(
+        FakeState("0", {"forecast": [], "interval_minutes": 1e15}),
+        issued_at=datetime(2026, 6, 27, tzinfo=UTC),
+        horizon_hours=1,
+        interval_minutes=15,
+        value_keys=("value",),
+        value_kind="price",
+    ) is None
 
 
 def test_timestamped_forecast_does_not_fill_irregular_internal_gaps() -> None:

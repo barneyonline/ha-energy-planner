@@ -38,14 +38,26 @@ def attempt_time(row: dict[str, Any]) -> datetime | None:
         return None
 
 
+def _future_export_attempt(row: Any, now: datetime) -> bool:
+    """Distinguish a future dispatch from an audit-only outcome."""
+    return (
+        counted_attempt(row) and row["asset"] == "enphase_export_limit"
+        and (at := attempt_time(row)) is not None and at > now
+    )
+
+
+def has_future_export_attempt(rows: list[Any], now: datetime) -> bool:
+    """Check the shared ledger independently of the mapped control."""
+    return any(_future_export_attempt(row, now) for row in rows)
+
+
 def reanchor_export_attempts(rows: list[Any], now: datetime) -> list[Any]:
     """Move only future export dispatches to the clock correction time."""
     # A future export attempt is evidence of a dispatch during clock skew.
     # Persist its accounting time on repair so later reads cannot extend it.
     return [
         {**row, "attempted_at": now.isoformat()}
-        if (counted_attempt(row) and row["asset"] == "enphase_export_limit"
-            and (at := attempt_time(row)) is not None and at > now)
+        if _future_export_attempt(row, now)
         else row
         for row in rows
     ]

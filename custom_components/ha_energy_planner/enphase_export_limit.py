@@ -14,7 +14,7 @@ from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util.hass_dict import HassKey
 
-from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history
+from .action_limits import EXPORT_ACTION_CAP_REACHED, action_budget, budget_history, has_future_export_attempt
 from .adapter_helpers import DEVICE_SERVICE_TIMEOUT_SECONDS, DeviceTargetUnavailable, async_call_device_service
 from .const import (
     CONF_AMBER_EXPORT_PRICE,
@@ -358,14 +358,14 @@ class ExportLimitControl:
 
     async def prepare_cooldown(self, now: datetime) -> dict[str, Any] | None:
         """Persist migration/clock recovery even when control is otherwise blocked."""
+        if has_future_export_attempt(budget_history(self.store.data), now):
+            await self.store.async_reanchor_export_attempts(now)
         identity = target_identity(self.hass, self.data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY, ""))
         if identity is None:
             return None
         limits = dict(self.store.data.get("command_rate_limits", {}))
         state = self.state
         record = normalized_record(limits, identity, state, now)
-        if record.get("clock_recovered_at") == now.isoformat():
-            await self.store.async_reanchor_export_attempts(now)
         key = control_key(identity)
         if key not in limits:
             owned = state.get("identity")
