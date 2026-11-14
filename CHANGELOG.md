@@ -13,6 +13,8 @@
 ### 🐛 Bug fixes
 
 - Retry verified temporary Enphase Export Limit failures with a bounded, restart-safe budget. Recovery uses the latest tariff and requires a compatible Enphase write guard.
+- Preserve operator disarm across interrupted Export Limit recovery, and verify gateway identity before retrying, restoring, or confirming a pending change.
+- Let Resume retire an expired Export Limit request after a verified gateway replacement. Keep the original attempt on record, and refund identity-bound requests refused before sending.
 
 ### 🔧 Improvements
 

@@ -35,6 +35,7 @@ from .const import (
     CONF_PLANNER_ENABLED,
 )
 from .discovery import CapabilityDiscovery
+from .enphase_export_limit import live_owned_gateway_issue
 from .entry_data import combined_entry_data, remove_retired_config_keys
 from .ev_policy import EV_DEFAULTS
 from .export_limit_policy import EXPORT_ASSET, area_safe
@@ -95,6 +96,7 @@ def build_preflight_report(
         plan=plan,
         pause=coordinator.store.data.get("control_pause"),
         now=now,
+        export_ownership=coordinator.store.data.get("ownership", {}).get(EXPORT_ASSET, {}),
     )
     entity_report = _entity_report(hass, entry_data, required_areas=control_areas["required"])
     service_report = _service_report(hass, entry_data, required_areas=control_areas["required"])
@@ -674,12 +676,21 @@ def _runtime_control_area_report(
     plan: Any,
     pause: Any,
     now: datetime,
+    export_ownership: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return shared capability, pause, and confidence readiness by area."""
     control_areas = _control_area_report(entry_data, options)
     discovery = CapabilityDiscovery(hass, entry_data, options).inspect().as_dict()
     _apply_ev_keep_on_preflight(discovery, entry_data, options)
     _apply_control_area_readiness(hass, entry_data, control_areas, discovery)
+    if EXPORT_ASSET in control_areas["required"] and (
+        gateway_issue := live_owned_gateway_issue(
+            hass, entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY), export_ownership, now,
+        )
+    ):
+        control_areas["details"][EXPORT_ASSET].update(ready=False, reason=gateway_issue)
+        control_areas["ready"] = [area for area in control_areas["ready"] if area != EXPORT_ASSET]
+        control_areas["blocked"] = list(dict.fromkeys([*control_areas["blocked"], EXPORT_ASSET]))
     ready = list(control_areas.get("ready", []))
     available, paused = partition_control_areas_by_pause(pause, now, ready)
     confidence_eligible = confidence_eligible_control_areas(plan, available, options)

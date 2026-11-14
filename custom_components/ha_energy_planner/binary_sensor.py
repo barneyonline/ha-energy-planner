@@ -105,6 +105,7 @@ def _armed_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
         plan=plan,
         pause=pause,
         now=now,
+        export_ownership=coordinator.store.data.get("ownership", {}).get("enphase_export_limit", {}),
     )
     required_control_areas = list(control_areas["required"])
     ready_control_areas = list(control_areas.get("ready", []))
