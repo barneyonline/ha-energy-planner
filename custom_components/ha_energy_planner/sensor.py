@@ -18,6 +18,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
 from .ai_advisor import ai_rejection_detail, ai_target_detail
+from .climate_inputs import climate_storage_value
 from .const import (
     CONF_AI_TASK_ENTITY,
     CONF_BYPASS_SAFETY_GATES,
@@ -544,7 +545,7 @@ def _live_entity_snapshot(
     state = states.get(entity_id) if states is not None else None
     attributes = dict(getattr(state, "attributes", {}) or {})
     details = {
-        key: attributes[key]
+        key: value
         for key in (
             "current_temperature",
             "temperature",
@@ -553,7 +554,7 @@ def _live_entity_snapshot(
             "hvac_action",
             "unit_of_measurement",
         )
-        if attributes.get(key) is not None
+        if isinstance(value := climate_storage_value(attributes.get(key)), str | int | float)
     }
     result = {
         "entity_id": entity_id,
@@ -618,9 +619,12 @@ def _next_asset_summary(plan: EnergyPlan, asset: ActionAsset) -> str:
 
 def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]:
     """Return ordered actions with the evidence used to determine each one."""
+    result: dict[str, Any] = {"actions": []}
+    if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
+        result["climate_capability"] = _climate_capability_attrs(coordinator)
     plan = coordinator.data
     if plan is None:
-        return {"actions": []}
+        return result
     audit = dict(plan.decision_audit or {})
     accepted = _accepted_decisions(plan)
     enabled_actions = [action for action in _ordered_actions(plan) if _asset_control_enabled(coordinator, action.asset)]
@@ -634,7 +638,7 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         )
         if action_forecast:
             determination["load_forecast"] = action_forecast
-    result = {
+    result.update({
         "plan_id": plan.plan_id,
         "plan_created_at": plan.created_at.isoformat(),
         "mode": display_state(plan.mode),
@@ -648,11 +652,9 @@ def _next_actions_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str, Any]
         "action_count": len(enabled_actions),
         "actions": actions,
         "ai_explanation": _ai_advice_attrs(coordinator),
-    }
+    })
     if coordinator.entry_data.get(CONF_ENPHASE_EXPORT_LIMIT_ENTITY):
         result["export_limit"] = export_limit_status(coordinator)
-    if coordinator.entry_data.get(CONF_DAIKIN_CLIMATE):
-        result["climate_capability"] = _climate_capability_attrs(coordinator)
     if coordinator.entry_data.get(CONF_WEATHER):
         result["weather_forecast"] = _weather_forecast_attrs(coordinator)
     return result
@@ -664,9 +666,11 @@ def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
         return {
             "available": False,
             "issues": ["home_assistant_unavailable"],
+            "unavailable_zones": [],
             "main_target_unavailable": [],
             "zone_targets_unavailable": [],
             "zone_targets_deferred": [],
+            "zone_targets_absent_in_dry_mode": [],
             "synchronize_zone_temperatures": False,
         }
     evidence = (
@@ -681,9 +685,11 @@ def _climate_capability_attrs(coordinator: EnergyPlannerCoordinator) -> dict[str
     return {
         "available": evidence.supported,
         "issues": list(evidence.issues),
+        "unavailable_zones": list(evidence.details.get("unavailable_zones", [])),
         "main_target_unavailable": list(evidence.details.get("main_target_unavailable", [])),
         "zone_targets_unavailable": list(evidence.details.get("zone_targets_unavailable", [])),
         "zone_targets_deferred": list(evidence.details.get("zone_targets_deferred", [])),
+        "zone_targets_absent_in_dry_mode": list(evidence.details.get("zone_targets_absent_in_dry_mode", [])),
         "synchronize_zone_temperatures": evidence.details.get("synchronize_zone_temperatures", False),
     }
 

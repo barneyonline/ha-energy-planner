@@ -60,7 +60,8 @@ from .advice_runtime import (
     _material_preview as _material_preview,
 )
 from .availability import AvailabilityIdentity, availability_details
-from .climate_inputs import finite
+from .climate_inputs import climate_storage_value, finite
+from .climate_inputs import temperature_targets_match as _matching_hvac_target
 from .climate_learning import observe
 from .climate_runtime import update_readiness
 from .const import (
@@ -105,13 +106,15 @@ from .const import (
     DEBOUNCE_SECONDS,
     DEFAULT_OPTIONS,
     DOMAIN,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
     HVAC_ZONE_SETTLE_MAX_SECONDS,
     HVAC_ZONE_SETTLE_SECONDS,
     MIN_NON_MANUAL_REFRESH_INTERVAL_SECONDS,
     STATE_UNKNOWN_VALUES,
 )
 from .constraints import ConstraintValidator
-from .discovery import CapabilityDiscovery
+from .discovery import CapabilityDiscovery, CapabilityEvidence
 from .enphase_export_limit import (
     COMPANION_UPGRADE_REQUIRED,
     GATEWAY_CHANGED,
@@ -431,6 +434,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         self.executor.ev_command_guard = self._ev_command_guard
         self.executor.ev_restore_guard = self._ev_restore_allowed
         self.executor.export_write_blocked = self._export_write_blocked
+        self.executor.log_dry_takeover_transition = self._log_dry_takeover_transition
         self.executor.ev_allocation_deadline_callback = self._schedule_ev_allocation_deadline
         self._ev_allocation_cancel: Callable[[], None] | None = None
         self._ev_allocation_deadline: Any = None
@@ -2120,6 +2124,17 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         elif load_recovery_completed:
             self._load_recovery_pending = True
         await self._async_save_load_source_outage(load_source_outage)
+        capabilities = CapabilityDiscovery(self.hass, entry_data, options)
+        dry_hvac = capabilities.hvac_evidence_in_dry()
+        # Sample ownership with the Dry evidence. A command can confirm the
+        # Off start and clear its provisional snapshot during a later await.
+        dry_control = _hvac_control_from_ownership(self.store.data.get("ownership", {})) if dry_hvac is not None else {}
+        dry_during_provisional_off_start = bool(
+            dry_hvac is not None and dry_hvac.issues == [HVAC_DRY_ZONE_TARGETS_ABSENT]
+            and dry_control.get("attempt_snapshot") and not dry_control.get("main_state_committed")
+            and not dry_control.get("required_evidence_lost")
+        )
+        self._log_dry_takeover_transition(dry_hvac is not None and HVAC_DRY_ZONE_TARGETS_ABSENT in dry_hvac.issues)
         decision_fingerprint = _decision_input_fingerprint(
             self.hass,
             entry_data,
@@ -2127,6 +2142,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self.overrides,
             now=dt_util.utcnow(),
             weather_forecast=weather_forecast,
+            dry_hvac=dry_hvac,
+            dry_takeover_revision=getattr(self, "_dry_takeover_revision", 0),
+            dry_during_provisional_off_start=dry_during_provisional_off_start,
         )
         if (
             not force_refresh
@@ -2140,11 +2158,13 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if (refresh_timing := current_timing()) is not None:
                 refresh_timing.aliases["fingerprint_ms"] = round((perf_counter() - preparation_started) * 1000, 3)
             assert self.data is not None
-            self._log_availability_transition(self.data.input_issues)
+            hvac_details = self.store.data.get("discovery", {}).get("hvac", {}).get("details")
+            self._log_availability_transition(self.data.input_issues, hvac_details=hvac_details)
             return self.data
         self.executor.entry_data = entry_data
-        discovery = CapabilityDiscovery(self.hass, entry_data, options).inspect()
-        await self.store.async_save_discovery(discovery.as_dict())
+        discovery = capabilities.inspect(hvac=dry_hvac)
+        discovery_report = discovery.as_dict()
+        await self.store.async_save_discovery(discovery_report)
         request = self._training_request()
         self.history_training.request(request)
         ev_charge_calibration = request.ev_model
@@ -2260,6 +2280,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             if issue not in context.input_issues:
                 context.input_issues.append(issue)
         context.hvac_control = _hvac_control_from_ownership(self.store.data.get("ownership", {}))
+        context.dry_during_provisional_off_start = dry_during_provisional_off_start
         reconcile_cycle = getattr(self.executor, "async_reconcile_hvac_cycle", None)
         if callable(reconcile_cycle):
             await reconcile_cycle()
@@ -2267,7 +2288,7 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
         if isinstance(cycle, dict) and cycle.get("entity_id") == entry_data.get(CONF_DAIKIN_CLIMATE):
             context.hvac_cycle = dict(cycle)
         context.hvac_tariff_slots = manager.retained_hvac_tariff_slots(context)
-        if context.hvac_control and climate_issues:
+        if context.hvac_control and climate_issues and not dry_during_provisional_off_start:
             context.hvac_control["required_evidence_lost"] = ",".join(climate_issues)
         stored_thermal = dict(self.store.data.get("thermal_model", {}))
         thermal_model = update_zone_thermal_model(stored_thermal, thermal_sample(
@@ -2322,7 +2343,9 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
                 plan.status = "unsafe"
             if plan.mode == PlannerMode.ACTIVE_HEALTHY:
                 plan.mode = PlannerMode.ACTIVE_DEGRADED
-        self._log_availability_transition(plan.input_issues)
+        self._log_availability_transition(
+            plan.input_issues, hvac_details=discovery_report.get("hvac", {}).get("details"),
+        )
         self._record_startup_auto_recovery_validation_candidate(plan, violations)
         await self.executor.async_notify_plan_fallback(plan, violations)
         from .plan_presentation import latest_forecast_snapshot
@@ -2388,9 +2411,21 @@ class EnergyPlannerCoordinator(DataUpdateCoordinator[EnergyPlan | None]):
             self._sync_ai_request_to_plan(plan)
         return result
 
-    def _log_availability_transition(self, issues: list[str]) -> None:
+    def _log_dry_takeover_transition(self, dry_takeover_blocked: bool) -> None:
+        """Log changes to the Dry takeover block observed by planning or execution."""
+        if dry_takeover_blocked != getattr(self, "_dry_takeover_blocked", False):
+            if dry_takeover_blocked:
+                _LOGGER.info(HVAC_DRY_TAKEOVER_SUMMARY)
+            else:
+                _LOGGER.info("Daikin Dry mode no longer blocks HVAC takeover")
+            self._dry_takeover_blocked = dry_takeover_blocked
+            # A queued action may observe a complete Dry episode between
+            # refreshes. Do not reuse a plan whose audit still shows that pause.
+            self._dry_takeover_revision = getattr(self, "_dry_takeover_revision", 0) + 1
+
+    def _log_availability_transition(self, issues: list[str], *, hvac_details: dict[str, Any] | None = None) -> None:
         """Log each input transition with bounded details and recovery duration."""
-        active = availability_details(issues, self.entry_data)
+        active = availability_details(issues, self.entry_data, hvac_details=hvac_details)
         previous: dict[AvailabilityIdentity, tuple[float, str]] = getattr(self, "_availability_outages", {})
         now = monotonic()
         warned: set[AvailabilityIdentity] = getattr(self, "_availability_warned", set())
@@ -4208,6 +4243,9 @@ def _decision_input_fingerprint(
     *,
     now: datetime,
     weather_forecast: dict[str, Any] | None = None,
+    dry_hvac: CapabilityEvidence | None = None,
+    dry_takeover_revision: int = 0,
+    dry_during_provisional_off_start: bool = False,
 ) -> str:
     """Return a stable fingerprint of decision state for one planning interval."""
     interval_seconds = max(int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), 1) * 60
@@ -4229,7 +4267,12 @@ def _decision_input_fingerprint(
         "options": options,
         "overrides": to_jsonable(overrides),
         "weather_forecast": weather_forecast or {},
+        "dry_takeover_revision": dry_takeover_revision,
+        "dry_during_provisional_off_start": dry_during_provisional_off_start,
     }
+    if dry_hvac is not None:
+        # Registry verification can change synchronization and its faults without a state change.
+        payload["hvac_in_dry"] = dry_hvac
     encoded = json.dumps(to_jsonable(payload), sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -5312,16 +5355,6 @@ def _pending_zone_hvac_manual_change_entity_id(
     return None if str(new_state.state).lower() == expected_power else entity_id
 
 
-def _matching_hvac_target(observed: Any, expected: Any) -> bool:
-    """Return whether Home Assistant published the expected climate target."""
-    if expected is None:
-        return False
-    try:
-        return abs(float(observed) - float(expected)) < 0.05
-    except (TypeError, ValueError):
-        return False
-
-
 def _matches_hvac_command_feedback(
     desired: dict[str, Any],
     event: Any,
@@ -5359,7 +5392,7 @@ def _matches_hvac_command_feedback(
         try:
             if float(observed_temperature) != float(desired_temperature):
                 return False
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return False
         matched_command_change = True
     return matched_command_change
@@ -5454,6 +5487,9 @@ def _bounded_material_value(value: Any, *, depth: int = 0) -> Any:
     """Bound nested forecast containers before comparison and JSON hashing."""
     if depth >= 6:
         return None
+    if type(value) is int and climate_storage_value(value) is None:
+        # Keep malformed values distinct from a genuinely absent target.
+        return {"integer_out_of_range": True}
     if isinstance(value, list):
         return [
             _bounded_material_value(item, depth=depth + 1)

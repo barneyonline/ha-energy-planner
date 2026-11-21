@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 from homeassistant.core import CoreState
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import entity_registry
 from homeassistant.util import dt as dt_util
 
 from custom_components.ha_energy_planner import advice_runtime as advice_runtime_module
@@ -45,8 +46,11 @@ from custom_components.ha_energy_planner.const import (
     CONF_EV_SMART_CHARGING_TARGET_SOC,
     CONF_EV_SOC,
     CONF_HOUSEHOLD_LOAD,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
     CONF_PLANNER_ENABLED,
     CONF_PLANNING_INTERVAL_MINUTES,
+    HVAC_DRY_RELEASE_DURING_OFF_START,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
 )
 from custom_components.ha_energy_planner.coordinator import (
     EnergyPlannerCoordinator,
@@ -705,6 +709,29 @@ def test_startup_auto_recovery_preflight_helpers_cover_every_blocker() -> None:
         "validation_succeeded",
     )
     assert _startup_auto_recovery_successful_runs("invalid") == 0
+
+
+@pytest.mark.parametrize("fault", [None, "zone_target", "other_area", "missing_entity", "recorder", "unsafe_plan"])
+def test_startup_waiting_for_dry_distinguishes_genuine_faults(fault: str | None) -> None:
+    required = ["hvac", "ev"] if fault == "other_area" else ["hvac"]
+    issues = [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    if fault == "zone_target":
+        issues.append("climate_zone_target_unavailable")
+    report = {
+        "control_areas": {"required": required, "ready": []},
+        "discovery": {"hvac": {"supported": False, "issues": issues}},
+        "entities": {"missing": ["sensor.input"] if fault == "missing_entity" else []},
+        "recorder": {"available": fault != "recorder"},
+        "current_plan": {"safe": fault != "unsafe_plan"},
+    }
+
+    ready, reason = _startup_auto_recovery_validation_ready(report, {CONF_HOUSEHOLD_LOAD: "sensor.load"})
+
+    assert ready is False
+    assert reason == (HVAC_DRY_ZONE_TARGETS_ABSENT if fault is None else "no_ready_control_area")
+    assert _startup_auto_recovery_validation_ready(report, {})[1] == (
+        HVAC_DRY_ZONE_TARGETS_ABSENT if fault in {None, "recorder"} else "no_ready_control_area"
+    )
 
 
 @dataclass(slots=True)
@@ -4613,6 +4640,86 @@ def test_material_change_detects_changed_tail_outside_fingerprint_row_cap() -> N
     assert coordinator_module._material_attributes_changed(old, new)
 
 
+def test_dry_zone_registry_changes_refresh_fingerprint_with_identical_states(monkeypatch: pytest.MonkeyPatch) -> None:
+    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": 22}),
+        main: FakeState("dry", {"zone_id": 0}),
+        bedroom: FakeState("dry", {"zone_id": 1}),
+    })
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    other = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="other")
+    registry = dict.fromkeys((head, main, bedroom), daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [main, bedroom]}
+    options = {CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True}
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+
+    def fingerprint() -> str:
+        capabilities = coordinator_module.CapabilityDiscovery(hass, entry_data, options)
+        dry_hvac = capabilities.hvac_evidence_in_dry()
+        assert capabilities.inspect(hvac=dry_hvac).hvac is dry_hvac
+        return _decision_input_fingerprint(hass, entry_data, options, [], now=now, dry_hvac=dry_hvac)
+
+    both_zones = fingerprint()
+    assert fingerprint() == both_zones
+    registry[bedroom] = other
+    main_only = fingerprint()
+    registry[main] = other
+    no_zones = fingerprint()
+    assert len({both_zones, main_only, no_zones}) == 3
+    registry[bedroom] = daikin
+    assert fingerprint() not in {both_zones, main_only, no_zones}
+    registry[main] = daikin
+    assert fingerprint() == both_zones
+
+
+def test_dry_registry_verification_refreshes_rollback_faults_without_state_changes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    head, main, bedroom = "climate.daikin", "climate.main", "climate.bedroom"
+    switches = ["switch.main", "switch.bedroom"]
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": 22}),
+        main: FakeState("dry", {"zone_id": 0, "temperature": 10**5000}),
+        bedroom: FakeState("dry", {"zone_id": 1, "temperature": "malformed"}),
+        **dict.fromkeys(switches, "on"),
+    })
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys([head, main, bedroom, switches[0]], daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={
+            CONF_DAIKIN_CLIMATE: head,
+            CONF_CLIMATE_ZONES: [main, bedroom, *switches],
+            "hvac_zone_control": {
+                "pairs": {switches[0]: main, switches[1]: bedroom},
+                "safe_open_sets": [switches],
+            },
+        },
+        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False},
+    )
+
+    async def run() -> None:
+        coordinator.data = await coordinator._async_update_data_locked()
+        assert "climate_zone_target_unavailable" not in coordinator.data.input_issues
+        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_absent_in_dry_mode"] == []
+
+        registry[switches[1]] = daikin
+        plan = await coordinator._async_update_data_locked()
+        assert "climate_zone_target_unavailable" in plan.input_issues
+        assert HVAC_DRY_ZONE_TARGETS_ABSENT not in plan.input_issues
+        assert coordinator.store.discovery[-1]["hvac"]["details"]["zone_targets_unavailable"] == [main, bedroom]
+        assert coordinator.executor.fallback[0] is plan
+
+    asyncio.run(run())
+    assert f"issue=climate_zone_target_unavailable entities={main}" in caplog.text
+    assert f"issue=climate_zone_target_unavailable entities={bedroom}" in caplog.text
+
+
 @pytest.mark.parametrize("through_refresh,disabled_export_mapping", [(False, False), (True, False), (True, True)])
 def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
     caplog: Any, through_refresh: bool, disabled_export_mapping: bool,
@@ -4623,6 +4730,7 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
     coordinator = _coordinator_for_runtime_services(entry_data=entry_data)
     coordinator.data = _plan("existing")
     coordinator.data.input_issues = ["amber_import_price_entity_unavailable"]
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
     coordinator._last_decision_fingerprint = _decision_input_fingerprint(
         coordinator.hass,
         coordinator.entry_data,
@@ -4649,6 +4757,134 @@ def test_unchanged_decision_fingerprint_short_circuits_refresh_pipeline(
         assert "planner_ms" not in coordinator.last_refresh_metadata["exclusive_phases_ms"]
         assert not getattr(coordinator, "_export_reconcile_pending", False)
         assert getattr(coordinator, "_export_reconcile_task", None) is None
+
+
+@pytest.mark.parametrize(
+    ("stored_loss", "completion_during_refresh"),
+    [(None, False), (None, True), ("hvac_acquisition_rollback_failed", False)],
+)
+def test_refresh_queues_recheck_of_provisional_dry_only_release(
+    monkeypatch: pytest.MonkeyPatch, stored_loss: str | None, completion_during_refresh: bool,
+) -> None:
+    head, zone = "climate.daikin", "climate.zone"
+    hass = FakeHass({head: FakeState("dry", {"temperature": 22}), zone: FakeState("dry", {"zone_id": 0})})
+    native = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, zone), native)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    monkeypatch.setattr(
+        coordinator_module.InputManager, "_health_from_issues", staticmethod(lambda _: InputHealth.HEALTHY),
+    )
+    main = {"hvac_mode": "off", "target_temperature": 22}
+    control = {"main_state": main, "attempt_snapshot": {"main_state": main, "zone_states": {}}}
+    if stored_loss:
+        control["required_evidence_lost"] = stored_loss
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
+        options={CONF_PLANNER_ENABLED: True, CONF_CLIMATE_CONTROL_ENABLED: True,
+                 CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+        store_data={"ownership": {"hvac_control": control}},
+    )
+
+    def confirm_off_start() -> None:
+        hass.states.values[head] = FakeState("cool", {"temperature": 21})
+        hass.states.values[zone] = FakeState("cool", {"zone_id": 0, "temperature": 21})
+        coordinator.store.data["ownership"]["hvac_control"] = {"main_state": main, "main_state_committed": True}
+
+    save_discovery = coordinator.store.async_save_discovery
+
+    async def save_discovery_then_confirm(discovery: dict[str, Any]) -> None:
+        await save_discovery(discovery)
+        confirm_off_start()
+
+    if completion_during_refresh:
+        monkeypatch.setattr(coordinator.store, "async_save_discovery", save_discovery_then_confirm)
+
+    async def run() -> None:
+        plan = await coordinator._async_update_data_locked(defer_execution=True)
+        release = next(action for action in plan.actions if action.kind == ActionKind.RELEASE_HVAC)
+        assert HVAC_DRY_ZONE_TARGETS_ABSENT in plan.input_issues
+        assert release.desired_state.get(HVAC_DRY_RELEASE_DURING_OFF_START, False) is (stored_loss is None)
+        assert control.get("required_evidence_lost") == stored_loss
+
+        # The earlier transaction can finish under the command lock before
+        # this release reaches the executor. Keep unrelated release reasons.
+        if not completion_during_refresh:
+            confirm_off_start()
+        executor = coordinator_module.Executor(
+            coordinator.store, hass=hass, entry_data=coordinator.entry_data, options=coordinator.options,
+        )
+        executor.async_release_hvac_control = AsyncMock()
+        coordinator.store.async_add_outcome = AsyncMock()
+        assert await executor.async_evaluate(plan) is release
+        if stored_loss is None:
+            executor.async_release_hvac_control.assert_not_awaited()
+            outcome = coordinator.store.async_add_outcome.await_args.args[0]
+            assert outcome.reason == "hvac_off_start_confirmed"
+        else:
+            executor.async_release_hvac_control.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("execution_observes_exit", [False, True])
+def test_transient_dry_refusal_invalidates_an_unchanged_plan(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, execution_observes_exit: bool,
+) -> None:
+    from custom_components.ha_energy_planner.preconditioning import current_status
+
+    head, zone = "climate.daikin", "climate.zone"
+    cool_states = {
+        head: FakeState("cool", {"temperature": 22}),
+        zone: FakeState("cool", {"zone_id": 0, "temperature": 22}),
+    }
+    hass = FakeHass(dict(cool_states))
+    daikin = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys(cool_states, daikin)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    now = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
+    monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
+    coordinator = _coordinator_for_runtime_services(
+        hass=hass,
+        entry_data={CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [zone]},
+        options={CONF_CLIMATE_CONTROL_ENABLED: True, CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True},
+    )
+    caplog.set_level(logging.INFO, logger=coordinator_module.__name__)
+
+    def observe_execution() -> None:
+        discovery = coordinator_module.CapabilityDiscovery(hass, coordinator.entry_data, coordinator.options)
+        coordinator._log_dry_takeover_transition(bool(discovery.dry_takeover_issues()))
+
+    async def run() -> None:
+        original = await coordinator._async_update_data_locked()
+        coordinator.data = original
+        original.device_plans.setdefault("climate", {})["preconditioning"] = {
+            "status": "scheduled", "reason": "preconditioning_planned",
+        }
+        hass.states.values[head] = FakeState("dry", {"temperature": 22})
+        hass.states.values[zone] = FakeState("dry", {"zone_id": 0})
+        observe_execution()
+        refusal = {
+            "plan_id": original.plan_id, "asset": "daikin", "kind": "set_hvac", "result": "rejected",
+            "reason": HVAC_DRY_ZONE_TARGETS_ABSENT, "capability_issues": [HVAC_DRY_ZONE_TARGETS_ABSENT],
+        }
+        coordinator.store.data["execution_audit"] = [refusal]
+        assert current_status(coordinator.store.data, original)["reason"] == HVAC_DRY_ZONE_TARGETS_ABSENT
+
+        hass.states.values.update(cool_states)
+        if execution_observes_exit:
+            observe_execution()
+        recovered = await coordinator._async_update_data_locked()
+        assert recovered.plan_id != original.plan_id
+        assert current_status(coordinator.store.data, recovered)["reason"] != HVAC_DRY_ZONE_TARGETS_ABSENT
+        assert refusal in coordinator.store.data["execution_audit"]
+        coordinator.data = recovered
+        assert await coordinator._async_update_data_locked() is recovered
+
+    asyncio.run(run())
+    assert caplog.messages.count("Daikin Dry mode no longer blocks HVAC takeover") == 1
 
 
 @pytest.mark.parametrize("recovered", [False, True])
@@ -4687,7 +4923,7 @@ def test_active_load_outage_bypasses_unchanged_fingerprint(
         now=coordinator.data.created_at,
     )
 
-    def reached_discovery(_self: object) -> None:
+    def reached_discovery(_self: object, **_kwargs: Any) -> None:
         raise RuntimeError("outage_was_replanned")
 
     monkeypatch.setattr(coordinator_module.CapabilityDiscovery, "inspect", reached_discovery)
@@ -4847,9 +5083,10 @@ def test_update_data_locked_records_dry_run_comparison(
     monkeypatch.setattr(
         "custom_components.ha_energy_planner.coordinator.CapabilityDiscovery",
         lambda hass, data, options: SimpleNamespace(
-            inspect=lambda: SimpleNamespace(
+            hvac_evidence_in_dry=lambda: None,
+            inspect=lambda **_: SimpleNamespace(
                 as_dict=lambda: {},
-                climate=SimpleNamespace(issues=["climate_zone_unavailable"]),
+                hvac=SimpleNamespace(issues=["climate_zone_unavailable"]),
             )
         ),
     )
@@ -8624,6 +8861,57 @@ def test_failed_unload_restarts_training_with_same_shared_entry_lock() -> None:
     assert coordinator.history_training is not old
     assert coordinator.history_training._lock is old._lock
     assert weather_module._parse_datetime_or_none(object()) is None
+
+
+@pytest.mark.parametrize("fault_moves", [False, True])
+def test_mixed_dry_availability_warning_names_only_faulty_zones(monkeypatch, caplog, fault_moves: bool) -> None:
+    head, dry_zone, malformed, offline = (
+        "climate.daikin", "climate.expected_dry", "climate.malformed", "switch.offline",
+    )
+    hass = FakeHass({
+        head: FakeState("dry", {"temperature": 21}),
+        dry_zone: FakeState("dry", {"zone_id": 0}),
+        malformed: FakeState("dry", {"zone_id": 1, "temperature": "malformed"}),
+        offline: FakeState("unavailable"),
+    })
+    registration = SimpleNamespace(platform="daikin", config_entry_id="daikin", device_id="airbase")
+    registry = dict.fromkeys((head, dry_zone, malformed, offline), registration)
+    monkeypatch.setattr(entity_registry, "async_get", lambda _hass: SimpleNamespace(async_get=registry.get))
+    entry_data = {CONF_DAIKIN_CLIMATE: head, CONF_CLIMATE_ZONES: [dry_zone, malformed, offline]}
+    discovery = coordinator_module.CapabilityDiscovery(hass, entry_data, {
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: True,
+    })
+    coordinator = _coordinator_for_runtime_services(entry_data=entry_data, hass=hass)
+    caplog.set_level(logging.INFO, logger=EnergyPlannerCoordinator.__module__)
+    dry_evidence = discovery.inspect().hvac
+    coordinator._log_availability_transition(dry_evidence.issues, hvac_details=dry_evidence.details)
+    hass.states.values[head] = FakeState("cool", {"temperature": 21})
+    hass.states.values[dry_zone] = FakeState("cool", {"zone_id": 0, "temperature": None if fault_moves else 21})
+    hass.states.values[malformed] = FakeState("cool", {"zone_id": 1, "temperature": 21 if fault_moves else "malformed"})
+    cool_evidence = discovery.inspect().hvac
+    coordinator._log_availability_transition(cool_evidence.issues, hvac_details=cool_evidence.details)
+    coordinator._log_availability_transition(cool_evidence.issues, hvac_details=cool_evidence.details)
+
+    warnings = [record.message.split("required_evidence_missing ", 1)[1]
+                for record in caplog.records if record.levelno == logging.WARNING]
+    expected = [
+        f"issue=climate_zone_target_unavailable entities={malformed}",
+        f"issue=climate_zone_unavailable entities={offline}",
+    ]
+    if fault_moves:
+        expected.append(f"issue=climate_zone_target_unavailable entities={dry_zone}")
+        assert f"required_evidence_restored issue=climate_zone_target_unavailable entities={malformed}" in caplog.text
+    assert warnings == expected
+    assert "required_evidence_changed" not in caplog.text
+
+
+def test_zone_warning_falls_back_to_configured_entities_without_zone_evidence(caplog) -> None:
+    zones = ["climate.zone_a", "climate.zone_b"]
+    coordinator = _coordinator_for_runtime_services(entry_data={CONF_CLIMATE_ZONES: zones})
+
+    coordinator._log_availability_transition(["climate_zone_unavailable"], hvac_details={})
+
+    assert f"issue=climate_zone_unavailable entities={','.join(zones)}" in caplog.text
 
 
 def test_availability_logs_per_input_recovery_duration_and_mapping_changes(caplog: Any, monkeypatch: Any) -> None:

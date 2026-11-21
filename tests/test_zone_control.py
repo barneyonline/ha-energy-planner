@@ -19,7 +19,13 @@ from test_zone_temperature import NOW, context
 from custom_components.ha_energy_planner import hvac_adapter as adapter_module
 from custom_components.ha_energy_planner.climate_inputs import read_climate_inputs, validate_climate_config
 from custom_components.ha_energy_planner.climate_runtime import economic_actions
-from custom_components.ha_energy_planner.const import CONF_HVAC_POLICY, DEFAULT_OPTIONS
+from custom_components.ha_energy_planner.const import (
+    CONF_HVAC_POLICY,
+    CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY,
+    DEFAULT_OPTIONS,
+    HVAC_DRY_TAKEOVER_SUMMARY,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+)
 from custom_components.ha_energy_planner.constraints import ConstraintValidator
 from custom_components.ha_energy_planner.coordinator import (
     _matches_climate_transaction,
@@ -27,11 +33,13 @@ from custom_components.ha_energy_planner.coordinator import (
     _pending_zone_hvac_manual_change_entity_id,
     _unambiguous_coupled_zone_entity_ids_match,
 )
+from custom_components.ha_energy_planner.discovery import CapabilityDiscovery
 from custom_components.ha_energy_planner.executor import Executor
 from custom_components.ha_energy_planner.hvac_adapter import DaikinHVACAdapter, HVACCommandResult
 from custom_components.ha_energy_planner.hvac_control import HVACOwnershipTransaction
-from custom_components.ha_energy_planner.models import OccupancyState
+from custom_components.ha_energy_planner.models import ActionAsset, ActionKind, OccupancyState
 from custom_components.ha_energy_planner.ownership import OwnershipState
+from custom_components.ha_energy_planner.planner import DryRunPlanner
 from custom_components.ha_energy_planner.planner_hvac import HVACPlanningPolicy
 from custom_components.ha_energy_planner.thermal_learning import sample, update
 from custom_components.ha_energy_planner.zone_control import desired_fields, evaluate, live_rejection, topology
@@ -181,6 +189,35 @@ def test_active_and_initial_satisfied_room_fallback_and_economic_guard():
     assert economic_actions(c, DEFAULT_OPTIONS, actions) == [
         action for action in actions if action.kind == "release_hvac"
     ]
+
+
+def test_dry_independent_zone_control_blocks_synchronized_preconditioning() -> None:
+    options = {
+        **DEFAULT_OPTIONS,
+        "planner_enabled": True,
+        "dry_run": False,
+        "climate_control_enabled": True,
+        "hvac_preconditioning_mode": "cooling_only",
+        "hvac_decision_policy": "legacy",
+        CONF_HVAC_PRECONDITION_CONFIGURED_ZONES_ONLY: False,
+    }
+    model = DryRunPlanner(options)
+    baseline = model.create_plan(room_context("dry"))
+    assert any(action.desired_state.get("configured_zones_only") for action in baseline.actions)
+
+    current = room_context("dry")
+    hass = device(current)
+    for index, zone in enumerate(PAIRS.values()):
+        hass.states.values[zone] = FakeState("dry", {"zone_id": index})
+    hvac = CapabilityDiscovery(hass, data(), options).inspect().hvac
+    current.input_issues.extend(hvac.issues)
+    planned = model.create_plan(current)
+
+    assert hvac.issues == [HVAC_DRY_ZONE_TARGETS_ABSENT]
+    assert hvac.details["zone_targets_absent_in_dry_mode"] == list(PAIRS.values())
+    assert not any(action.asset == ActionAsset.DAIKIN and action.kind == ActionKind.SET_HVAC
+                   for action in planned.actions)
+    assert planned.device_plans["climate"]["preconditioning"]["summary"] == HVAC_DRY_TAKEOVER_SUMMARY
 
 
 @pytest.mark.parametrize("change", ["sensor", "stale", "mapping", "bounds", "topology", "airflow", "mode"])

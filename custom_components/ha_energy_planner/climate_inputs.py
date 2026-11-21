@@ -6,7 +6,6 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from math import isfinite
 from typing import Any
 
 from .const import (
@@ -33,17 +32,23 @@ from .const import (
     CONF_WEATHER,
 )
 from .forecasts import tariff_source_intervals
+from .planner_values import finite_float
 
 
 def finite(value: Any) -> float | None:
-    """Reject booleans, NaN and infinity at numerical boundaries."""
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if isfinite(number) else None
+    """Return a finite numerical input, rejecting booleans."""
+    return None if isinstance(value, bool) else finite_float(value)
+
+
+def temperature_targets_match(observed: Any, expected: Any) -> bool:
+    """Compare two finite thermostat readings within the readback tolerance."""
+    observed_number, expected_number = finite_float(observed), finite_float(expected)
+    return observed_number is not None and expected_number is not None and abs(observed_number - expected_number) < 0.05
+
+
+def climate_storage_value(value: Any) -> Any:
+    """Drop integers outside the range supported by Home Assistant's JSON store."""
+    return None if type(value) is int and not -(2**63) <= value < 2**64 else value
 
 
 def instant(value: Any) -> datetime | None:
@@ -312,7 +317,7 @@ def read_climate_inputs(
         "tariff_intervals": tariff_intervals if tariff_intervals is not None else tariff_source_intervals(
             tariff, int(options.get(CONF_PLANNING_INTERVAL_MINUTES, 5)), slot_starts=[now, end],
         ),
-        "target": finite(attrs.get("temperature")),
+        "target": finite(climate_storage_value(attrs.get("temperature"))),
         "temperature_step": finite(attrs.get("target_temp_step")) or 0.5,
         "minimum_temperature": finite(attrs.get("min_temp")),
         "maximum_temperature": finite(attrs.get("max_temp")),

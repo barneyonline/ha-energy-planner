@@ -972,12 +972,139 @@ use throughout; the Docker and pull-request gates enforce that result.
   target, and failed acquisition restores the captured main mode and target before reporting
   rollback success. Options-aware discovery always validates the finite main
   rollback target and additionally validates configured-zone targets when
-  synchronisation is enabled. Off zones with entirely absent target attributes are
+  synchronisation is enabled. Discovery validates the target fields chosen by
+  rollback and rejects boolean setpoints, values outside the supported numeric
+  range, and malformed selected ranges, including reversed finite bounds.
+  Oversized setpoints remain reportable faults through discovery, state listeners,
+  and context construction. `tests/test_control_runtime.py` verifies that such
+  feedback still allows automation restoration and successful on-disk recovery.
+  A late Dry transition after a head or damper write also withholds further takeover
+  commands and retains the capability reason through restoration, manual overrides,
+  failures while saving or retiring an unsent intent, and transient Dry during
+  command readback. This includes generic zone switch and helper feedback. If
+  Dry interrupts an accepted write, Planner checks its feedback before
+  compensating. Dispatched zone and automation failures retain that check when
+  Dry or a manual override arrives during recovery preparation. A malformed zone
+  bound retains that zone's restoration baseline while other settings recover.
+  Verified Off starts can continue through a matching Dry recall only when dispatch
+  observed the head Off, subsequent feedback matches that recall, and concurrent
+  capability checks pass.
+  A same-interval refresh reports zone rollback faults when registry verification
+  enables independent synchronization without a change in entity state.
+  Off zones with entirely absent target attributes are
   deferred for that takeover, including provisional ownership persistence, retries,
   confirmation, and rollback; the planner never invents a rollback temperature.
   Main control, switch/helper takeover, and other zones remain eligible.
   `zone_targets_deferred` exposes this condition, and the next takeover reevaluates
-  recovered zones. Active, unavailable, or malformed-target zones retain safety checks.
+  recovered zones. Unavailable or malformed-target zones retain safety checks.
+  When a registered native Daikin head and zone on the same controller both
+  report Dry and the zone exposes no targets, `climate_zone_targets_absent_in_dry_mode`
+  blocks synchronized takeover, including verified independent-zone control with
+  the general synchronization option off. It is reported at INFO, including brief blocks discovered
+  by queued commands between refreshes. Concurrent faults still follow the
+  normal warning and notification paths. An otherwise healthy HVAC-only startup
+  waits and retries when Dry is the sole blocker without a persistent startup
+  fault notification. The sanitized Dry-mode replay covers
+  restoration of owned settings, Off recovery, and escalation when a target
+  stays missing in Cool. Planner excludes blocked takeover load from grid
+  projections and preserves independent EV confidence during load fallback
+  when the concurrent faults are limited to HVAC. The executor
+  and adapter recheck Dry after storing provisional ownership, during
+  automation suppression, and at the first head or zone write. Tests cover real
+  scheduler guard calls, a guard that fails as Dry starts, compensation after
+  the last automation is confirmed off, and supported Off starts that recall
+  Dry after activation. The audit distinguishes refusals after automation
+  suppression from refusals before dispatch. Successful actions count material
+  suppression only when the suppression call was dispatched. Planned and
+  queued refusals use the same explanation and surface concurrent rollback-target
+  faults first, including faults first observed during a late capability check.
+  A queued coast refusal reaches preconditioning status through the execution
+  audit without adding an outcome to preparation history.
+  The Dry explanation remains visible after a compensated automation failure,
+  which remains in the action audit.
+  The live queue checks for Dry before cycle and action validation and records
+  Dry refusals when an already-blocked continuation releases earlier ownership.
+  The execution audit retains concurrent faults and dispatch evidence if
+  automation suppression or restoration fails, including faults first observed
+  after automation restoration.
+  The adapter rechecks Dry after scheduler setup, at failed confirmation
+  persistence, and during readback before the first actuator write. Planner
+  saves only pending automation recovery before compensating a Dry-blocked
+  takeover, including when that compensation is interrupted.
+  For an unsent head command, confirmation and minimum-cycle intent are
+  retired in the same write as the narrowed recovery ownership.
+  An interrupted provisional ownership write in verified Dry retires the
+  unmodified climate snapshots. Unused Off-start metadata from the aborted
+  attempt cannot block automation recovery if AirBase becomes unavailable.
+  Queued Dry refusals stay visible while prior preconditioning is still
+  owned, and concurrent availability warnings name only faulted zones.
+  A local dispatch refusal creates no automation restoration ownership, and
+  a failed synchronized suppression retains only automation recovery before
+  compensation. A Dry transition during that compensation reaches the audit.
+  Cancelling acquisition in verified Dry before actuator dispatch retains only
+  prior ownership and attempted automation suppression. If an accepted suppression
+  is still awaiting feedback, Planner waits for Off after saving recovery so the
+  release retry can restore On. If readback times out or recovery is interrupted,
+  the saved suppression evidence makes release explicitly re-enable the automation
+  despite cached On, including while zone target restoration remains deferred.
+  A queued takeover after Dry ends resolves pending suppression before writing
+  to the HVAC, including when no thermostat baseline remains in ownership.
+  Post-dispatch compensation also rechecks Dry and concurrent
+  faults after restoring the automations. A manual override before any HVAC
+  dispatch uses the same automation-only recovery, including when Off feedback
+  times out or Dry begins during compensation. Emergency shutdown
+  remains available for an Off baseline when dispatch is uncertain or Dry is
+  unverified. Queued refusals also retain Dry and other capability evidence
+  when a concurrent manual override supersedes saved climate settings. Planner
+  rechecks Dry after saving and reconciling the supersession, including a failed
+  save before the first actuator write. It rechecks after the failed guard's
+  supersession save and after final readback while the HVAC is still untouched.
+  Rollback settles accepted automation and generic zone writes before compensating
+  for a head or sibling override. If Dry first appears while a supersession is
+  saved, a dispatched thermostat write settles under its original confirmation
+  deadline before compensation.
+  A scheduler guard failure before the first synchronized actuator dispatch
+  retires untouched snapshots and retains only outstanding automation recovery.
+  Synchronized takeover, including actions that explicitly request zone
+  synchronization, revalidates availability and live rollback targets
+  after the provisional ownership save and through the first actuator's
+  dispatch checks, including active zones with a previously saved baseline and
+  zones excluded while Off that report Heat or Cool before dispatch.
+  The audit records both Dry transitions observed by live checks. An episode
+  observed only by execution invalidates plan reuse after Dry ends. If recovery
+  observes the exit, INFO records it immediately and the audit retains the
+  earlier Dry refusal alongside any genuine target fault observed after the
+  exit. Current state keeps both zone classifications visible
+  even when a malformed target exceeds Recorder's numeric range.
+  A planning refresh during verified Off-start recall cannot produce a false
+  Dry exit while the head is still in Dry. A release queued solely from that
+  provisional Dry evidence is rechecked after the start confirms Heat or Cool,
+  including when confirmation finishes during the refresh. A recovery fault
+  saved before or after planning still triggers release.
+  Dry that starts while retiring an unsent confirmation blocks climate rollback
+  even if retirement fails. A superseded or already confirmed command is
+  excluded when preserving earlier readback uncertainty, including a head target
+  confirmed before the first zone write was prepared.
+  Recovery and ownership completion clear superseded climate baselines and
+  confirmations for overrides that arrive during either save, including when
+  cancellation interrupts ownership or accounting persistence after the adapter
+  returns. An interrupted provisional save also honors user changes with healthy
+  live capability. Errors retiring an unsent intent, releasing prior ownership,
+  or saving recovery preserve the original cancellation and attach the recovery
+  failure as its cause. A failed replacement before actuator dispatch restores suspended
+  automations and retains an earlier pending confirmation with its original
+  context, subject to manual supersession.
+  Audit marks a command as issued only after local service preflight, preserving
+  feedback evidence from earlier dispatches when a new target is rejected.
+  A locally rejected first actuator in a
+  synchronized takeover retires its untouched snapshots, even if the Dry
+  feedback arrives after the local rejection. Per-zone outage identity warns
+  on a new missing Cool target even when another zone was already faulted.
+  The notification checks live rollback-target faults before notifying, and both
+  state and action sensors list unavailable zones separately from Dry zones.
+  Discovery retains legacy head target validation when synchronization is disabled.
+  Changes to the verified zone set invalidate the plan fingerprint in Dry even
+  when the climate states and attributes are unchanged.
   Tests in `tests/test_discovery.py` and `tests/test_hvac_adapter.py` cover recovery,
   frozen exclusions, failed-command rollback, and target recovery during main-unit or zone-switch activation. Fresh-context recovery is accepted only for deferred configured zones during the explicit main turn-on phase or an unambiguous zone-switch call, with no user/parent attribution and compatible restored targets. Main-unit turn-on may restore the remembered mode before the requested mode is applied; zone-switch feedback must match the command-time head mode, or the requested mode when the head is off. Deferred zones may then follow the explicit main-unit mode command during its service/confirmation window, with no user or unrelated parent attribution, no auxiliary-setting changes, and only compatible recovered targets within the bounded command settling period. Regression coverage reproduces off/null-target to heat/restored-target feedback without aborting the adapter transaction, including a cooling request that first restores remembered heating; attributed changes, unrelated zones, inactive modes, active-zone target changes, auxiliary settings, invalid targets, and feedback outside startup retain manual-override handling. It publishes affected entity IDs in Current state
   and Next actions, hard-suppresses new HVAC takeover candidates while keeping

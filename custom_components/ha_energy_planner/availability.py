@@ -25,11 +25,17 @@ _DISCOVERY_KEYS = {
     "ev_start_control_unavailable": ("ev_charger_entity",),
     "ev_stop_control_unavailable": ("ev_charger_entity",),
 }
+_ZONE_FAULT_DETAILS = {
+    "climate_zone_unavailable": "unavailable_zones",
+    "climate_zone_target_unavailable": "zone_targets_unavailable",
+}
 
 type AvailabilityIdentity = tuple[tuple[str, ...], tuple[str, ...]]
 
 
-def availability_details(issues: list[str], entry_data: dict[str, Any]) -> dict[AvailabilityIdentity, str]:
+def availability_details(
+    issues: list[str], entry_data: dict[str, Any], *, hvac_details: dict[str, Any] | None = None,
+) -> dict[AvailabilityIdentity, str]:
     """Never put arbitrary issue text, configuration values or payloads in logs."""
     details: dict[AvailabilityIdentity, set[str]] = {}
     for issue in sorted(set(issues)):
@@ -50,8 +56,15 @@ def availability_details(issues: list[str], entry_data: dict[str, Any]) -> dict[
             for entity in values:
                 if isinstance(entity, str) and re.fullmatch(r"[a-z_]+\.[a-z0-9_]{1,100}", entity.strip()):
                     entities.add(entity.strip())
-        # An input remains in one outage when its reason changes or only some
-        # of its issues clear. A genuine entity remapping starts a new outage.
+        # Discovery can distinguish a new zone outage from a reason change
+        # affecting a zone that is already faulted.
+        zone_detail_key = _ZONE_FAULT_DETAILS.get(issue)
+        if hvac_details is not None and zone_detail_key is not None:
+            affected_zones = entities.intersection(hvac_details.get(zone_detail_key, ()))
+            if affected_zones:
+                for entity in affected_zones:
+                    details.setdefault((keys, (entity,)), set()).add(f"issue={issue} entities={entity}")
+                continue
         identity = (tuple(sorted(keys)), tuple(sorted(entities)))
         details.setdefault(identity, set()).add(
             f"issue={issue} entities={','.join(sorted(entities)[:4]) or 'not_configured'}"
