@@ -1450,6 +1450,15 @@ use throughout; the Docker and pull-request gates enforce that result.
   reservation. Missing legacy vehicle targets create a fixable Repairs issue. Repairs and Reconfigure share target validation and preserve legacy mappings. Repairs retries migration immediately through the public Home Assistant API. Repair and Reconfigure reject changes during migration and configurations from newer integration versions. Real failed-setup, repair, and restart evidence is in `tests/test_repairs.py`.
   Evidence: `tests/test_upgrade_runtime.py`, `tests/fixtures/upgrade/0.9.18.json`.
 - Entry deletion removes resolved per-entry storage and retains unresolved evidence.
+- Vehicle target migration repairs use Home Assistant's issue registry ownership
+  and refresh APIs. At startup `migration_recovery.py` reconciles only existing
+  `legacy_vehicle_target_` issue IDs, including saved ownerless records. It
+  adopts pending repairs in place and preserves their creation time and ignored
+  status, including repairs with a saved target and a failed migration retry.
+  Native refresh removes notices for removed or migrated entries and cancels
+  that cleanup if an update raises. Removal also clears any ownerless record for
+  the entry. `tests/test_repairs.py` covers startup, restart, disabled-entry
+  visibility, removal isolation, and interrupted refresh with the real registry.
 - The 1.4.0 minimum and pinned baseline were HA 2026.10.0. Migration recovery uses the
   public retry API directly; obsolete restart branches, strings and tests are
   removed. Schemas import Probatio directly; binary-sensor device classes use

@@ -763,7 +763,7 @@ rules:
         - tests/test_upgrade_runtime.py
   repair-issues:
     status: done
-    comment: Missing legacy vehicle targets create entry-specific translated Repairs issues. Shared validation preserves configuration; Repairs retries migration immediately via the public Home Assistant API. Issues clear after migration, setup or entry removal.
+    comment: Missing legacy vehicle targets create translated Repairs issues owned by the config entry. Startup adopts ownerless notices, preserves ignored pending repairs and removes stale records. Repairs uses shared validation and retries migration through the public Home Assistant API. Disabling an entry hides its notices and entry removal clears them.
     references:
       code:
         - custom_components/ha_energy_planner/repairs.py

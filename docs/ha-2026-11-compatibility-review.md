@@ -5,8 +5,8 @@ directly for EV price settings. This source review compares the release and
 contributor notes with the Core `2026.11.0` tag and Energy Planner source.
 [Core release tag](https://github.com/home-assistant/core/releases/tag/2026.11.0) · [Release notes](https://www.home-assistant.io/blog/2026/11/04/release-202611/) · [Contributor changes](https://www.home-assistant.io/blog/2026/11/04/release-202611/#backward-incompatible-changes)
 
-The config-entry ownership and refresh changes for migration repairs belong to
-the existing draft PR, which depends on this minimum-version bump. [Repair ownership and refresh PR #164](https://github.com/barneyonline/ha-energy-planner/pull/164).
+The 2026.11 minimum enables config-entry ownership and native refresh for migration
+repairs. [Repair ownership and refresh PR #164](https://github.com/barneyonline/ha-energy-planner/pull/164).
 
 ## Minimum-version changes
 

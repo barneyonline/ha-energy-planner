@@ -11,10 +11,36 @@ from .const import CONF_EV_SMART_CHARGING_TARGET_SOC, DOMAIN
 from .type_defs import EnergyPlannerConfigEntry
 from .vehicles import VEHICLE
 
+_MIGRATION_ISSUE_PREFIX = "legacy_vehicle_target_"
+
 
 def migration_issue_id(entry_id: str) -> str:
     """Keep a single issue throughout target selection and recovery."""
-    return f"legacy_vehicle_target_{entry_id}"
+    return f"{_MIGRATION_ISSUE_PREFIX}{entry_id}"
+
+
+def async_refresh_migration_issues(hass: HomeAssistant) -> None:
+    """Reconcile existing notices after startup, including legacy ownerless issues."""
+    from homeassistant.helpers import issue_registry as ir
+
+    if ir.DATA_REGISTRY not in hass.data:
+        return
+    issue_ids = [
+        issue_id for domain, issue_id in ir.async_get(hass).issues
+        if domain == DOMAIN and issue_id.startswith(_MIGRATION_ISSUE_PREFIX)
+    ]
+    pending = {
+        migration_issue_id(entry.entry_id): entry
+        for entry in hass.config_entries.async_entries(DOMAIN)
+        if entry.version < 4
+    }
+    # Select exact IDs without an owner filter to reconcile saved ownerless records as well.
+    with ir.async_refresh_issues(hass, DOMAIN, issue_ids=issue_ids):
+        for issue_id in issue_ids:
+            if (entry := pending.get(issue_id)) is not None:
+                # A saved target may still need a migration retry. Recreate the
+                # existing issue in place to adopt ownership and retain dismissal.
+                async_create_migration_issue(hass, entry)
 
 
 def async_clear_migration_issue(hass: HomeAssistant, entry_id: str) -> None:
@@ -31,6 +57,7 @@ def async_create_migration_issue(hass: HomeAssistant, entry: EnergyPlannerConfig
 
     ir.async_create_issue(
         hass, DOMAIN, migration_issue_id(entry.entry_id),
+        config_entry_id=entry.entry_id,
         is_fixable=True,
         is_persistent=False,
         severity=ir.IssueSeverity.ERROR,

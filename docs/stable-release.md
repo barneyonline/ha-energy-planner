@@ -144,6 +144,11 @@ values are compact audit codes, not free-form personal information.
    Recovery may keep Armed off while retaining Automatic control.
 5. Review the first plan and run the safety check before enabling new control.
 
+Migration repairs belong to their Energy Planner config entry. Disabling the
+entry hides its repair, and removing the entry clears it. Startup adopts saved
+notices from earlier versions, preserves ignored repairs that are still pending,
+and clears notices for migrated or removed entries.
+
 The Store envelope remains version 1; audit normalization removes the duplicate
 `outcomes` list in favor of `execution_audit`. A file-only downgrade is not a
 supported rollback procedure. Restore the complete matching pre-upgrade backup
