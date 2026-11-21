@@ -163,6 +163,25 @@ def tariff_blocks(
     ], None
 
 
+def _same_tariff_payload(snapshot: Any, live: Any) -> bool:
+    """Compare nested tariff data without conflating equal values of different types."""
+    if snapshot is live:
+        return True
+    if type(snapshot) is not type(live):
+        return False
+    if isinstance(snapshot, dict):
+        # Alias precedence can depend on the order in which keys are read.
+        return len(snapshot) == len(live) and all(
+            _same_tariff_payload(saved_key, live_key) and _same_tariff_payload(saved_value, live_value)
+            for (saved_key, saved_value), (live_key, live_value) in zip(snapshot.items(), live.items(), strict=True)
+        )
+    if isinstance(snapshot, (list, tuple)):
+        return len(snapshot) == len(live) and all(
+            _same_tariff_payload(saved, current) for saved, current in zip(snapshot, live, strict=True)
+        )
+    return bool(snapshot == live)
+
+
 class ExportTariffCache:
     """Retain at most one completely validated HA tariff source."""
 
@@ -174,7 +193,7 @@ class ExportTariffCache:
     def parse(
         self, state: State, attributes: dict[str, Any],
     ) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
-        if self._state is not state or self._attributes != attributes:
+        if self._state is not state or not _same_tariff_payload(self._attributes, attributes):
             self._result = _parse_blocks(attributes, state.attributes or {})
             # HA wraps the outer mapping. A provider can still edit nested
             # rows on the same State before the next planning or write check.
