@@ -1,7 +1,7 @@
 services:
   ha-runtime:
     profiles: [manual]
-    image: ${HEP_HA_IMAGE:-ghcr.io/home-assistant/home-assistant:2026.10.0}
+    image: ${HEP_HA_IMAGE:-ghcr.io/home-assistant/home-assistant:2026.11.0}
     container_name: ha-energy-planner-runtime
     volumes:
       - ./docker/homeassistant/config:/config

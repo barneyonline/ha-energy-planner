@@ -1,7 +1,7 @@
 # Cloud development
 
 The development image extends the official Home Assistant image selected by
-`scripts/support_policy.py image` (currently HA 2026.10.0 with Python 3.14).
+`scripts/support_policy.py image` (currently HA 2026.11.0 with Python 3.14).
 It installs pytest and coverage from `tests/requirements.txt`, and mypy and ruff
 from the support policy in `pyproject.toml`. This repository uses its own fakes
 and actual HA runtime contracts; no Home Assistant pytest plugin is required.
@@ -98,7 +98,7 @@ scripts/ha-dev.sh runtime-stop
 
 The Compose `ha-runtime` service has a manual profile and no automatic restart.
 The helper selects the same baseline image from the support policy. A direct
-Compose invocation defaults to HA 2026.10.0 rather than moving `stable`.
+Compose invocation defaults to HA 2026.11.0 rather than moving `stable`.
 Manual configuration/data lives under the ignored `docker/homeassistant/config`
 directory and survives container recreation. The integration is mounted read-only.
 Development startup does not start, modify or delete this runtime or its data.

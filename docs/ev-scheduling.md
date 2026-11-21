@@ -63,6 +63,15 @@ forecast evidence supports it.
 
 ## Charging observations
 
+If your vehicle sends telemetry to A Better Routeplanner (ABRP), you can map its
+percentage **SoC** entity to **Vehicle SOC sensor** in the tracked vehicle profile.
+Verify the percentage updates during home charging before relying on it for
+automatic planning. ABRP can continue to show its last value while the vehicle is
+parked. Use charger-side connection and fresh charging feedback for control and
+delivery verification. Map the target-SOC input separately and use ABRP only
+for the vehicle's SoC, since its charging state comes from the same telemetry.
+[A Better Routeplanner telemetry and update behavior](https://www.home-assistant.io/integrations/abrp/#data-updates)
+
 Optional measured charging power accepts W or kW. Optional cumulative energy
 accepts Wh or kWh. Observations older than ten minutes are not used for learning.
 Measured energy takes precedence over integrated power. The existing configured
