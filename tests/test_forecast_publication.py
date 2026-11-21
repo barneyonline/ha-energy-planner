@@ -92,7 +92,8 @@ def test_forecast_stays_aligned_during_refresh_persistence_and_listeners(
         )
         monkeypatch.setattr(coordinator_module.dt_util, "utcnow", lambda: now)
         monkeypatch.setattr(coordinator_module, "CapabilityDiscovery", lambda *args: SimpleNamespace(
-            inspect=lambda: SimpleNamespace(as_dict=lambda: {}),
+            hvac_evidence_in_dry=lambda: None,
+            inspect=lambda **_: SimpleNamespace(as_dict=lambda: {}, hvac=SimpleNamespace(issues=[])),
         ))
         monkeypatch.setattr(coordinator_module, "InputManager", lambda *args, **kwargs: SimpleNamespace(
             current_forecast_observations=lambda: {}, build_context=lambda overrides: context,

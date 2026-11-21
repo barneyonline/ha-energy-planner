@@ -18,6 +18,9 @@ from .const import (
     CONF_PV_FORECAST,
     CONF_WEATHER,
     DEFAULT_OPTIONS,
+    HVAC_CAPABILITY_ISSUES,
+    HVAC_DRY_ZONE_TARGETS_ABSENT,
+    HVAC_ROLLBACK_TARGET_FAULTS,
 )
 from .models import (
     ActionAsset,
@@ -53,11 +56,7 @@ def confidence_from_context(context: DecisionContext) -> float:
 def _hvac_rollback_capability_unavailable(context: DecisionContext) -> bool:
     """Return whether HVAC takeover lacks a required rollback target."""
     return any(
-        issue
-        in {
-            "main_climate_target_unavailable",
-            "climate_zone_target_unavailable",
-        }
+        issue in HVAC_ROLLBACK_TARGET_FAULTS or issue == HVAC_DRY_ZONE_TARGETS_ABSENT
         for issue in context.input_issues
     )
 
@@ -264,6 +263,8 @@ def _confidence_rejection_reason(
 def _only_load_fallback(context: DecisionContext) -> bool:
     """Economic uncertainty alone must not invalidate fresh EV/tariff/solar evidence."""
     material = {i for i in context.input_issues if not i.startswith("advisory_")}
+    if HVAC_DRY_ZONE_TARGETS_ABSENT in material:
+        material.difference_update(HVAC_CAPABILITY_ISSUES)
     return (context.input_health == InputHealth.DEGRADED
             and material == {"household_load_model_fallback_active"}
             and context.ev_evidence.get("load_fallback", {}).get("fallback_applied") is True)

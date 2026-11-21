@@ -13,11 +13,11 @@ from homeassistant.core import HomeAssistant
 
 from .action_limits import budget_history, reanchor_export_attempts, recent_attempts
 from .calendar_history import confirm_calendar_action, normalize_calendar_history, update_calendar_history
-from .climate_inputs import instant
+from .climate_inputs import climate_storage_value, instant
 from .const import STORE_KEY, STORE_VERSION
 from .durable_storage import DurableStore as Store
 from .models import ActionOutcome, EnergyPlan, Override, to_jsonable
-from .preconditioning import record_acquisition, record_outcome, record_plan
+from .preconditioning import outcome_capability_issues, record_acquisition, record_outcome, record_plan
 
 _LIST_FIELDS = {
     "ai_recommendations",
@@ -228,7 +228,7 @@ class PlannerStore:
             if key == "outcome"
             else _climate_audit_controls(value)
             if isinstance(value, dict)
-            else value
+            else climate_storage_value(value)
             for key, value in event.items()
             if key in allowed and value is not None
         }
@@ -616,7 +616,7 @@ def _climate_audit_controls(values: dict[str, Any]) -> dict[str, Any]:
         "climate_policy",
     }
     return {
-        field: setting
+        field: climate_storage_value(setting)
         for field, setting in list(values.items())[:100]
         if (field in controls or field.startswith(("climate.", "switch.", "input_boolean.", "automation.", "timer.")))
         and (setting is None or isinstance(setting, str | bool | int | float))
@@ -644,6 +644,8 @@ def _climate_audit_outcome(entry: dict[str, Any]) -> dict[str, Any]:
         outcome["desired_state"] = _climate_audit_controls(entry["desired_state"])
     if isinstance(entry.get("command_sent"), bool):
         outcome["command_sent"] = entry["command_sent"]
+    if issues := outcome_capability_issues(entry):
+        outcome["capability_issues"] = issues
     return outcome
 
 
@@ -689,6 +691,8 @@ def _audit_entry(outcome: ActionOutcome | dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(entry.get("command_sent"), bool):
         audit["command_sent"] = entry["command_sent"]
+    if issues := outcome_capability_issues(entry):
+        audit["capability_issues"] = issues
     if isinstance(entry.get("desired_state"), dict):
         audit["desired_state"] = _bounded_mapping(entry["desired_state"])
     if "occurrence_count" in entry:

@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .climate_inputs import finite, instant
 from .models import DecisionContext, InputHealth, OccupancyState
+
+if TYPE_CHECKING:
+    from homeassistant.helpers.entity_registry import RegistryEntry
 
 CONFIG_KEY = "hvac_zone_control"
 HYSTERESIS_C = 0.3
@@ -45,6 +48,18 @@ def topology(data: dict[str, Any]) -> dict[str, Any]:
             "reason": "installer_verified_open_sets"}
 
 
+def shares_registered_controller(head: RegistryEntry | None, entity: RegistryEntry | None) -> bool:
+    """Require shared platform, config entry, and device registry identity."""
+    return bool(
+        head is not None
+        and entity is not None
+        and head.config_entry_id
+        and head.device_id
+        and (head.platform, head.config_entry_id, head.device_id)
+        == (entity.platform, entity.config_entry_id, entity.device_id)
+    )
+
+
 def read_topology(hass: Any, data: dict[str, Any]) -> dict[str, Any]:
     """Require the head and every declared control to share registry ownership."""
     result = topology(data)
@@ -54,10 +69,7 @@ def read_topology(hass: Any, data: dict[str, Any]) -> dict[str, Any]:
     registry = entity_registry.async_get(hass)
     head = registry.async_get(data.get("daikin_climate_entity", ""))
     entities = [*result["pairs"], *result["pairs"].values()]
-    if (head is None or not head.config_entry_id or not head.device_id
-            or any((entry := registry.async_get(entity)) is None
-                   or (entry.config_entry_id, entry.device_id, entry.platform)
-                   != (head.config_entry_id, head.device_id, head.platform) for entity in entities)):
+    if not all(shares_registered_controller(head, registry.async_get(entity)) for entity in entities):
         return {**result, "supported": False, "reason": "zone_controller_registry_unproven"}
     return result
 
