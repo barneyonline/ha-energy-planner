@@ -1,0 +1,21 @@
+{
+  "name": "export_tariff_inferred_end_out_of_range",
+  "kind": "export_tariff",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "-0.1",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "unit_of_measurement": "$/kWh",
+      "forecast_interval_minutes": 30,
+      "forecasts": [
+        {
+          "start_time": "9999-12-31T23:45:00+00:00",
+          "per_kwh": -0.1
+        }
+      ]
+    }
+  },
+  "expected": [],
+  "expected_issue": "export_tariff_ambiguous_duration"
+}

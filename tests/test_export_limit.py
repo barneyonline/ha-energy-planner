@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -14,6 +16,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from aiohttp import ClientResponseError, ServerDisconnectedError
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.core import State
 from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.ha_energy_planner import enphase_export_limit as runtime
@@ -375,6 +378,7 @@ def test_amber_export_execution_confirms_sign_changes_without_repeating_commands
         (lambda s: s.attributes.update(forecasts=[-1]), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(start_time="2026-10-01T00:00:00"), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(per_kwh=float("nan")), "export_tariff_invalid"),
+        (lambda s: s.attributes["forecasts"][0].update(per_kwh=10**1000), "export_tariff_invalid"),
         (lambda s: s.attributes["forecasts"][0].update(end_time="bad"), "export_tariff_invalid"),
         (
             lambda s: s.attributes["forecasts"][0].update(end_time="2026-10-01T00:20:00+00:00"),
@@ -412,6 +416,28 @@ def test_explicit_cadence_gaps_and_dst():
     s = price_state((-1, 1), start=local.replace(minute=30))
     s.last_updated = local
     assert tariff_blocks(s, local, OPTIONS)[1] is None
+
+
+@pytest.mark.parametrize("path", sorted(
+    path for path in (Path(__file__).parent / "fixtures" / "live_schema").glob("export_tariff_*.json")
+    if path.name.startswith(("export_tariff_cadence_", "export_tariff_conflicting_"))
+    or "_out_of_range" in path.name
+), ids=lambda path: path.stem)
+def test_export_tariff_rejects_invalid_live_schema(path):
+    fixture = json.loads(path.read_text())
+    now = datetime.fromisoformat(fixture["now"])
+    state = SimpleNamespace(**fixture["state"])
+    state.last_updated = datetime.fromisoformat(state.last_updated)
+    assert tariff_blocks(state, now, OPTIONS) == (fixture["expected"], fixture["expected_issue"])
+
+
+@pytest.mark.parametrize("ignored", ["invalid", "sNaN", None, 0, "-1e999999999999999999999"])
+def test_export_continues_to_accept_agreeing_cadence_aliases(ignored):
+    state = price_state((-0.1,), explicit=False)
+    state.attributes.update(forecast_interval_minutes="30", forecastIntervalMinutes=30.0, interval_minutes=ignored)
+    blocks, issue = tariff_blocks(state, NOW, OPTIONS)
+    assert issue is None
+    assert blocks[0]["watts"] == 0
 
 
 def test_preview_transitions_and_price_only_planning(setup):
@@ -1802,13 +1828,19 @@ def test_resume_service_accepts_export_area(setup):
 
 
 @pytest.mark.parametrize(
-    "change", ["unarmed", "dry_run", "mapping", "registry", "pending", "external", "expired", "tariff"])
+    "change",
+    ["unarmed", "dry_run", "mapping", "registry", "pending", "external", "expired", "tariff", "nested_tariff"],
+)
 def test_dispatch_rechecks_after_persistence(setup, monkeypatch, change):
     from custom_components.ha_energy_planner.executor import Executor
     from custom_components.ha_energy_planner.preflight import production_evidence_fingerprint
 
     async def run():
         opts = {**OPTIONS, CONF_DRY_RUN: False}
+        if change == "nested_tariff":
+            entity = DATA[CONF_AMBER_EXPORT_PRICE]
+            raw = setup.states[entity]
+            setup.states[entity] = State(entity, raw.state, raw.attributes, last_updated=NOW)
         ctx = context(runtime.evidence(setup.hass, DATA, opts, NOW))
         plan = DryRunPlanner(opts).create_plan(ctx)
         plan.actions = plan.actions[:1]
@@ -1832,6 +1864,8 @@ def test_dispatch_rechecks_after_persistence(setup, monkeypatch, change):
                 setup.states[ENTITY] = limit_state(5000)
             elif change == "expired":
                 monkeypatch.setattr(runtime, "datetime", SimpleNamespace(now=lambda tz: NOW.replace(minute=30)))
+            elif change == "nested_tariff":
+                setup.states["sensor.export_price"].attributes["forecasts"][0]["per_kwh"] = 0.2
             else:
                 setup.states["sensor.export_price"] = price_state((0, 1, 1))
 
@@ -5212,6 +5246,7 @@ def test_export_cooldown_wakeup_survives_inflight_reconciliation(setup, monkeypa
     ("pause", "export_limit_retry_interrupted"),
     ("disarm", "export_limit_retry_interrupted"),
     ("tariff", "export_tariff_changed"),
+    ("nested_tariff", "export_tariff_changed"),
     ("rollover", "export_tariff_expired"),
     ("unavailable", "export_limit_entity_unavailable"),
     ("startup", "export_limit_retry_interrupted"),
@@ -5231,6 +5266,10 @@ def test_retry_rechecks_planner_authority_at_provider_write(setup, retry_owner, 
         timing_key = runtime.control_key(owned_identity)
         now = advance_clock(setup)
         setup.mode["value"] = "confirm"
+        if change == "nested_tariff":
+            entity = DATA[CONF_AMBER_EXPORT_PRICE]
+            raw = setup.states[entity]
+            setup.states[entity] = State(entity, raw.state, raw.attributes, last_updated=now)
         waiting = asyncio.Event()
         release = asyncio.Event()
         original = retry_owner.upstream.async_apply_guarded.side_effect
@@ -5269,6 +5308,8 @@ def test_retry_rechecks_planner_authority_at_provider_write(setup, retry_owner, 
             setup.store.data["production"]["dry_run_evidence_fingerprint"] = "changed"
         elif change == "rollover":
             now = advance_clock(setup, 15 * 60)
+        elif change == "nested_tariff":
+            setup.states[DATA[CONF_AMBER_EXPORT_PRICE]].attributes["forecasts"][0]["per_kwh"] = 0.15
         else:
             setup.states[DATA[CONF_AMBER_EXPORT_PRICE]] = price_state((0.15, 0.15))
             setup.states[DATA[CONF_AMBER_EXPORT_PRICE]].last_updated = now
