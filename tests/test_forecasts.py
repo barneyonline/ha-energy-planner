@@ -35,6 +35,21 @@ class FakeState:
     attributes: dict[str, Any] = field(default_factory=dict)
 
 
+@pytest.mark.parametrize("declared", [False, True])
+def test_unrepresentable_tariff_timestamp_leaves_a_gap(declared) -> None:
+    now = datetime(2026, 10, 1, tzinfo=UTC)
+    row = {"start_time": "9999-12-31T23:00:00-02:00", "per_kwh": -0.15}
+    if declared:
+        row.update(end_time="9999-12-31T23:30:00-02:00", duration=30)
+    state = FakeState("-0.15", {"forecasts": [row]})
+    series = forecast_series_from_state(
+        state, issued_at=now, horizon_hours=1, interval_minutes=30, value_keys=("per_kwh",), value_kind="price",
+    )
+    assert series == [None, None]
+    assert latest_forecast_valid_at_from_state(state, value_keys=("per_kwh",)) is None
+    assert forecast_timestamp_status_from_state(state, value_keys=("per_kwh",)) == "untimestamped"
+
+
 @pytest.mark.parametrize("kind", ["value", "cadence", "energy", "naive"])
 def test_oversized_forecasts_preserve_full_source_semantics(kind) -> None:
     now = datetime(2026, 6, 27, tzinfo=UTC)

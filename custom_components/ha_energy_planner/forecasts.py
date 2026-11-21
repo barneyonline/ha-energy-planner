@@ -26,6 +26,7 @@ FORECAST_HEALTHY_HOURS = 12.0
 FORECAST_DEGRADED_HOURS = 8.0
 MAX_FORECAST_SOURCE_ROWS = 2048
 _TARIFF_VALUE_KEYS = ("import_price", "general_price", "export_price", "feed_in_price", "per_kwh", "price", "value")
+_FORECAST_CADENCE_KEYS = ("forecast_interval_minutes", "interval_minutes", "resolution_minutes")
 _LATEST_FORECAST_END = datetime.max.replace(tzinfo=UTC)
 _MAX_FORECAST_INTERVAL_MINUTES = (_LATEST_FORECAST_END - datetime.min.replace(tzinfo=UTC)).total_seconds() / 60
 
@@ -60,7 +61,8 @@ def parse_forecast_source(
     parsed = [_parse_item(item, value_keys=value_keys, value_kind=value_kind, default_unit=default_unit)
               for item in raw_items]
     points = sorted(
-        [(_as_aware_utc(item[0]), item[1]) for item in parsed if item is not None and item[0] is not None],
+        [(at, item[1]) for item in parsed if item is not None and item[0] is not None
+         and (at := _utc_forecast_time(item[0])) is not None],
         key=itemgetter(0),
     )
     if explicit_interval is not None and explicit_interval >= _MAX_FORECAST_INTERVAL_MINUTES:
@@ -71,7 +73,10 @@ def parse_forecast_source(
         cadence = _conservative_cadence(
             points, explicit_cadence or timedelta(minutes=interval_minutes), maximum=explicit_cadence,
         )
-    ordered = [item[1] if item is not None else None for item in parsed] if not points and any(parsed) else []
+    ordered = (
+        [item[1] if item is not None and item[0] is None else None for item in parsed]
+        if not points and any(parsed) else []
+    )
     return ForecastSource(None, points, ordered, cadence, explicit_interval or float(interval_minutes))
 
 
@@ -228,7 +233,9 @@ def _declared_tariff_intervals(
             or type(item.get("per_kwh")) not in (int, float) or parsed is None or parsed[0] != start
         ):
             return [], 0
-        start, end = _as_aware_utc(start), _as_aware_utc(end)
+        start, end = _utc_forecast_time(start), _utc_forecast_time(end)
+        if start is None or end is None:
+            return [], 0
         canonical_start = _amber_half_hour_start(start, end, item)
         if (end - canonical_start != timedelta(minutes=duration)
                 or (maximum_minutes is not None and duration > maximum_minutes)):
@@ -334,7 +341,7 @@ def forecast_coverage_details(
 
 def _explicit_interval_minutes(attributes: dict[str, Any]) -> float | None:
     """Return a valid explicitly declared forecast cadence in minutes."""
-    for key in ("forecast_interval_minutes", "interval_minutes", "resolution_minutes"):
+    for key in _FORECAST_CADENCE_KEYS:
         raw_value = attributes.get(key)
         if raw_value is None:
             continue
@@ -387,8 +394,8 @@ def latest_forecast_valid_at_from_state(
                 break
         if valid_at is None:
             continue
-        valid_at = _as_aware_utc(valid_at)
-        if latest is None or valid_at > latest:
+        valid_at = _utc_forecast_time(valid_at)
+        if valid_at is not None and (latest is None or valid_at > latest):
             latest = valid_at
     return latest
 
@@ -417,9 +424,9 @@ def forecast_timestamp_status_from_state(
             valid_at = _parse_datetime_or_none(flattened[key])
             if valid_at is None:
                 continue
-            found = True
             if valid_at.tzinfo is None or valid_at.utcoffset() is None:
                 return "naive_timestamps"
+            found = found or _utc_forecast_time(valid_at) is not None
             break
     return "aware_timestamps" if found else "untimestamped"
 
@@ -754,3 +761,11 @@ def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _utc_forecast_time(value: datetime) -> datetime | None:
+    """Treat forecast timestamps outside the representable UTC range as missing."""
+    try:
+        return _as_aware_utc(value)
+    except OverflowError:
+        return None

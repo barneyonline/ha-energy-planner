@@ -1,0 +1,25 @@
+{
+  "name": "export_tariff_conflicting_row_duration_spellings",
+  "kind": "export_tariff",
+  "now": "2026-10-01T00:10:00+00:00",
+  "state": {
+    "state": "-0.1",
+    "last_updated": "2026-10-01T00:10:00+00:00",
+    "attributes": {
+      "unit_of_measurement": "$/kWh",
+      "forecast_interval_minutes": 30,
+      "interval_minutes": 30,
+      "detailedForecast": [
+        {
+          "start_time": "2026-10-01T00:00:00+00:00",
+          "end_time": "2026-10-01T00:30:00+00:00",
+          "duration": 30,
+          "per_kwh": -0.1,
+          "Duration": 15
+        }
+      ]
+    }
+  },
+  "expected": [],
+  "expected_issue": "export_tariff_overlap_or_duration"
+}

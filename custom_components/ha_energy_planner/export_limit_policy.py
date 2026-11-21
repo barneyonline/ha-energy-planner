@@ -2,20 +2,27 @@
 
 from __future__ import annotations
 
+import re
 from bisect import bisect_right
+from collections.abc import Iterator
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from math import isfinite
 from operator import itemgetter
+from sys import float_info
 from typing import TYPE_CHECKING, Any
 
 from .const import CONF_MIN_TARIFF_CONFIDENCE, CONF_PRICE_FRESHNESS_MINUTES
 from .forecasts import (
+    _FORECAST_CADENCE_KEYS,
     _amber_half_hour_start,
-    _explicit_interval_minutes,
+    _canonical_key,
     _flatten_item,
     _forecast_item_unit,
     _forecast_items,
     _parse_datetime_or_none,
+    _utc_forecast_time,
     _with_canonical_keys,
     normalize_scalar_value,
 )
@@ -29,6 +36,8 @@ PRICE_KEYS = ("export_price", "feed_in_price", "per_kwh", "price", "value")
 START_KEYS = ("start_time", "period_start", "valid_at", "datetime", "from", "time", "date", "nem_time")
 END_KEYS = ("end_time", "period_end", "valid_until", "to")
 BLOCK_DURATION = timedelta(minutes=30)
+_LAST_INFERRED_BLOCK_START = datetime.max.replace(tzinfo=UTC) - BLOCK_DURATION
+_SCIENTIFIC_NUMBER = re.compile(r"([+-]?(?:\d+(?:\.\d*)?|\.\d+))[eE][+-]?\d+")
 
 
 GATEWAY_UNVERIFIED = "export_limit_gateway_identity_unavailable"
@@ -87,7 +96,7 @@ def confirmed_feedback(state: Any, now: datetime) -> tuple[dict[str, Any], str |
 def aware_time(value: Any) -> datetime | None:
     """Reject ambiguous local timestamps, retaining absolute UTC instants."""
     result = value if isinstance(value, datetime) else _parse_datetime_or_none(value)
-    return result.astimezone(UTC) if result is not None and result.tzinfo is not None else None
+    return _utc_forecast_time(result) if result is not None and result.tzinfo is not None else None
 
 
 def block_time(value: Any) -> datetime:
@@ -141,7 +150,7 @@ def tariff_blocks(
     if cache is not None:
         parsed, issue = cache.parse(state, attributes)
     else:
-        parsed, issue = _parse_blocks(attributes)
+        parsed, issue = _parse_blocks(attributes, state.attributes or {})
     if issue is not None:
         return [], issue
     index = bisect_right(parsed, now, key=itemgetter(0)) - 1
@@ -159,19 +168,43 @@ class ExportTariffCache:
 
     def __init__(self) -> None:
         self._state: State | None = None
+        self._attributes: dict[str, Any] | None = None
         self._result: tuple[list[tuple[datetime, datetime, float]], str | None] = ([], None)
 
     def parse(
         self, state: State, attributes: dict[str, Any],
     ) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
-        if self._state is not state:
-            self._result = _parse_blocks(attributes)
+        if self._state is not state or self._attributes != attributes:
+            self._result = _parse_blocks(attributes, state.attributes or {})
+            # HA wraps the outer mapping. A provider can still edit nested
+            # rows on the same State before the next planning or write check.
+            self._attributes = deepcopy(attributes)
             self._state = state
         return self._result
 
 
-def _parse_blocks(attributes: dict[str, Any]) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
-    """Validate the complete immutable source before selecting its current block."""
+def _declared_cadences(attributes: dict[str, Any]) -> Iterator[int | float | Decimal | None]:
+    """Yield positive cadence declarations without rounding aliases together."""
+    for key, raw in attributes.items():
+        if _canonical_key(key) not in _FORECAST_CADENCE_KEYS:
+            continue
+        try:
+            value = Decimal(raw) if isinstance(raw, str) else raw
+        except InvalidOperation:
+            # An out-of-range exponent can still represent a positive number.
+            match = _SCIENTIFIC_NUMBER.fullmatch(raw.strip().replace("_", ""))
+            if match is not None and Decimal(match[1]) > 0:
+                yield None
+            continue
+        if isinstance(value, (int, float, Decimal)) and not (isinstance(value, Decimal) and value.is_nan()):
+            if value > 0:
+                yield value
+
+
+def _parse_blocks(
+    attributes: dict[str, Any], raw_attributes: dict[str, Any],
+) -> tuple[list[tuple[datetime, datetime, float]], str | None]:
+    """Validate the complete source before selecting its current block."""
     items = _forecast_items(attributes, PRICE_KEYS)
     parsed = []
     for raw in items:
@@ -181,7 +214,7 @@ def _parse_blocks(attributes: dict[str, Any]) -> tuple[list[tuple[datetime, date
         start = next((aware_time(item[key]) for key in START_KEYS if key in item), None)
         key = next((key for key in PRICE_KEYS if key in item), None)
         value: Any = item.get(key) if key is not None else None
-        if start is None or type(value) not in (int, float) or not isfinite(value):
+        if start is None or type(value) not in (int, float) or not -float_info.max <= value <= float_info.max:
             return [], "export_tariff_invalid"
         unit = _forecast_item_unit(item, key, str(attributes.get("unit_of_measurement", attributes.get("unit", ""))))
         price = normalize_scalar_value(value, value_kind="price", unit=unit)
@@ -189,21 +222,31 @@ def _parse_blocks(attributes: dict[str, Any]) -> tuple[list[tuple[datetime, date
         end = aware_time(item[end_key]) if end_key else None
         if end_key and end is None:
             return [], "export_tariff_invalid"
+        row_mappings = (raw, *(nested for name, nested in raw.items()
+                               if _canonical_key(name) in {"value", "values", "forecast", "data", "prediction"}))
+        if any(
+            type(duration) not in (int, float) or duration != 30
+            for fields in row_mappings if isinstance(fields, dict)
+            for name, duration in fields.items() if _canonical_key(name) == "duration"
+        ):
+            return [], "export_tariff_overlap_or_duration"
         start = _half_hour_start(start, end, item)
         parsed.append((start, end, price))
     parsed.sort(key=lambda value: value[0])
     blocks: list[tuple[datetime, datetime, float]] = []
-    cadence = _explicit_interval_minutes(attributes)
-    if cadence is not None and cadence != 30:
+    cadences = tuple(_declared_cadences(raw_attributes))
+    if any(minutes != 30 for minutes in cadences):
         return [], "export_tariff_ambiguous_duration"
     for index, (start, end, price) in enumerate(parsed):
         if end is None:
-            if cadence == 30 or (index + 1 < len(parsed) and parsed[index + 1][0] - start == BLOCK_DURATION):
-                end = start + BLOCK_DURATION
-            elif index > 0 and start - parsed[index - 1][0] == BLOCK_DURATION:
-                end = start + BLOCK_DURATION
-            else:
+            half_hour = (
+                bool(cadences)
+                or (index + 1 < len(parsed) and parsed[index + 1][0] - start == BLOCK_DURATION)
+                or (index > 0 and start - parsed[index - 1][0] == BLOCK_DURATION)
+            )
+            if not half_hour or start > _LAST_INFERRED_BLOCK_START:
                 return [], "export_tariff_ambiguous_duration"
+            end = start + BLOCK_DURATION
         if end - start != BLOCK_DURATION or (blocks and start < blocks[-1][1]):
             return [], "export_tariff_overlap_or_duration"
         if blocks and start > blocks[-1][1]:
